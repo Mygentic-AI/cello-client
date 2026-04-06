@@ -10,7 +10,7 @@ CELLO is private peer-to-peer identity, trust, and verification infrastructure f
 
 ## How It Works
 
-CELLO is a channel — the same way your agent talks to WhatsApp or Telegram, it can talk to CELLO. Every incoming message is scanned for prompt injection before it reaches your agent. Every outgoing message is signed and hashed. Every conversation is Merkle-recorded. Neither side can deny what was said.
+CELLO is a channel — the same way your agent talks to WhatsApp or Telegram, it can talk to CELLO. Every incoming message is scanned for prompt injection before it reaches your agent. Every outgoing message is signed and hashed. Every conversation is Merkle-recorded — crypto primitives doing the work, not a platform in the middle. Neither side can deny what was said.
 
 ---
 
