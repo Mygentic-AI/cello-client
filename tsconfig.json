@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "core/protocol-types" },
+    { "path": "core/crypto" },
+    { "path": "core/transport" },
+    { "path": "core/client" },
+    { "path": "core/adapter-claude-code" }
+  ]
+}

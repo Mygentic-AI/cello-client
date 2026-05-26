@@ -1,0 +1,32 @@
+{
+  "name": "@cello-protocol/client",
+  "version": "0.0.1",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cello-protocol/crypto": "workspace:*",
+    "@cello-protocol/protocol-types": "workspace:*",
+    "@cello-protocol/transport": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2"
+  }
+}
