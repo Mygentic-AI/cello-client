@@ -57,7 +57,7 @@ Watch the workflow at:
 https://github.com/Mygentic-AI/cello-client/actions
 
 The run should complete all steps including Publish. Look for:
-- "Successfully published @cello-protocol/connect@0.0.1" in the publish step output
+- "Successfully published @cello-protocol/connect@0.0.0-scaffold.1" in the publish step output
 - The package appearing at: https://www.npmjs.com/package/@cello-protocol/connect
 
 ## Step 3 — Verify the published package

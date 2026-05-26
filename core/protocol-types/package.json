@@ -17,6 +17,7 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": ["dist/", "package.json"],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"

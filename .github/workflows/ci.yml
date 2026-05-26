@@ -40,19 +40,27 @@ jobs:
       - name: Test
         run: pnpm run test -- --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1
 
-      # Tarball check 1: no server files leaked (directory, relay, infra, .env files must not be in the tarball)
+      # Tarball check 1: no server files leaked across all five publishable packages.
+      # With "files" allowlists in each package.json, only dist/ and package.json are included,
+      # so this check guards against any future misconfiguration that removes the allowlist.
       - name: Tarball check — no server files leaked
-        working-directory: core/adapter-claude-code
         run: |
-          OUTPUT=$(npm pack --dry-run 2>&1)
-          echo "$OUTPUT"
-          # This command must EXIT 1 (i.e., grep must find nothing)
-          echo "$OUTPUT" | grep -iE 'directory|relay|infra|\.env' && { echo "FAIL: server files found in tarball"; exit 1; } || echo "OK: no server files in tarball"
+          for pkg in core/protocol-types core/crypto core/transport core/client core/adapter-claude-code; do
+            echo "--- Checking $pkg ---"
+            OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
+            echo "$OUTPUT"
+            # Check filenames only (not content) by looking for suspicious paths in pack output
+            if echo "$OUTPUT" | grep -iE '^npm notice [0-9]' | grep -iE 'directory|relay|infra|\.env'; then
+              echo "FAIL: server files found in $pkg tarball"
+              exit 1
+            fi
+            echo "OK: no server files in $pkg tarball"
+          done
 
-      # Tarball check 2: SKILL.md present (soft check during scaffold phase — SKILL.md added in REPOSPLIT-002)
-      - name: Tarball check — SKILL.md present (soft check)
-        working-directory: core/adapter-claude-code
+      # Tarball check 2: SKILL.md present in connect package (soft check during scaffold phase — SKILL.md added in REPOSPLIT-002)
+      - name: Tarball check — SKILL.md present in connect package (soft check)
         run: |
+          cd core/adapter-claude-code
           OUTPUT=$(npm pack --dry-run 2>&1)
           echo "$OUTPUT"
           if echo "$OUTPUT" | grep -q 'SKILL.md'; then
