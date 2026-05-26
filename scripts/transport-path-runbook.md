@@ -23,7 +23,7 @@ within 10 seconds:
 
 ```bash
 aws logs filter-log-events \
-  --log-group-name /cello/directory \
+  --log-group-name /ecs/cello-relay-dev \
   --region us-east-1 \
   --start-time $(date -d '-30 seconds' +%s000) \
   --filter-pattern '"relay.message.forwarded"'
@@ -33,13 +33,13 @@ On macOS (BSD date):
 
 ```bash
 aws logs filter-log-events \
-  --log-group-name /cello/directory \
+  --log-group-name /ecs/cello-relay-dev \
   --region us-east-1 \
   --start-time $(( $(date +%s) - 30 ))000 \
   --filter-pattern '"relay.message.forwarded"'
 ```
 
-Or use the AWS console: CloudWatch → Log groups → `/cello/directory` →
+Or use the AWS console: CloudWatch → Log groups → `/ecs/cello-relay-dev` →
 Search for `relay.message.forwarded` with a time window of the last 1 minute.
 
 ### Post-deploy checklist for AC-007 dimension 2
