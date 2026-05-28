@@ -77,5 +77,33 @@ cello_backup()                   — export an encrypted key backup
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_KEY_FILE` | `~/.cello/key` | Your Ed25519 signing key. Created on first run. |
-| `CELLO_DIRECTORY_URL` | *(required)* | Directory node address. |
+| `CELLO_DIRECTORY_URL` | `https://directory-us1.cello.mygentic.ai` | Production directory endpoint. Override for local or staging deployments. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
+
+## Cross-repo development (pnpm link)
+
+cello-client consumes `@cello-protocol/interfaces` from npm. When you need
+to develop server-side interfaces alongside client code simultaneously, use
+`pnpm link` to override the npm resolution with your local trustless-cello
+workspace:
+
+```bash
+# In trustless-cello — build interfaces and make it linkable
+cd /path/to/trustless-cello/packages/interfaces
+pnpm run typecheck      # builds dist/
+pnpm link --global      # registers the package globally
+
+# In cello-client — link to the local version
+cd /path/to/cello-client
+pnpm link --global @cello-protocol/interfaces
+```
+
+To unlink (go back to the npm version):
+```bash
+cd /path/to/cello-client
+pnpm unlink @cello-protocol/interfaces
+pnpm install           # restores the npm version
+```
+
+This workflow lets interface changes in trustless-cello be immediately
+reflected in cello-client without a publish/install cycle.
