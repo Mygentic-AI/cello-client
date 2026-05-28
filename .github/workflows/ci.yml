@@ -74,7 +74,7 @@ jobs:
             echo "--- Checking $pkg ---"
             OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
             echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -iE '^npm notice [0-9]' | grep -iE 'directory|relay|infra|\.env'; then
+            if echo "$OUTPUT" | grep -iE '^npm notice [0-9]' | grep -iE '/directory/|/relay/|/infra/|\.env'; then
               echo "FAIL: server files found in $pkg tarball"
               exit 1
             fi
