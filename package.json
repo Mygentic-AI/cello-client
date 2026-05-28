@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc --build",
     "typecheck": "tsc --build --noEmit",
+    "lint": "eslint core/*/src",
     "test": "vitest run --passWithNoTests --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1"
   },
   "pnpm": {
@@ -29,6 +30,9 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.2",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
+    "eslint": "^9.39.4",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
   }
