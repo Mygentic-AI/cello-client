@@ -25,7 +25,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "3.1051.0",
     "@cello-protocol/crypto": "workspace:*",
-    "@cello-protocol/interfaces": "file:../../../trustless-cello/packages/interfaces",
+    "@cello-protocol/interfaces": "0.0.1",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
     "@journeyapps/sqlcipher": "^6.0.0",

@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@cello-protocol/interfaces': file:../trustless-cello/packages/interfaces
+
 importers:
 
   .:

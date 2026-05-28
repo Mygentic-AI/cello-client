@@ -11,6 +11,9 @@
     "test": "vitest run --passWithNoTests --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1"
   },
   "pnpm": {
+    "overrides": {
+      "@cello-protocol/interfaces": "file:../trustless-cello/packages/interfaces"
+    },
     "onlyBuiltDependencies": [
       "@journeyapps/sqlcipher",
       "@oqs/liboqs-js",
