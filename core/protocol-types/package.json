@@ -22,7 +22,13 @@
     "typecheck": "tsc --build",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@cello-protocol/crypto": "workspace:*",
+    "cbor-x": "^1.6.4"
+  },
   "devDependencies": {
+    "@cello-protocol/test-fixtures": "workspace:*",
+    "@claude-flow/testing": "3.0.0-alpha.6",
     "@types/node": "^25.6.2"
   }
 }

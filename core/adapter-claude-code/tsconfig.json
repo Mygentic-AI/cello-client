@@ -4,7 +4,7 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "include": ["src"],
+  "include": ["src", "src/bin"],
   "exclude": ["src/__tests__"],
   "references": [
     { "path": "../client" },

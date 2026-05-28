@@ -8,7 +8,21 @@
   "scripts": {
     "build": "tsc --build",
     "typecheck": "tsc --build --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@journeyapps/sqlcipher",
+      "@oqs/liboqs-js",
+      "agentdb",
+      "argon2",
+      "better-sqlite3",
+      "cbor-extract",
+      "esbuild",
+      "hnswlib-node",
+      "protobufjs",
+      "sharp"
+    ]
   },
   "devDependencies": {
     "@types/node": "^25.6.2",

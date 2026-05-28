@@ -4,6 +4,7 @@
     { "path": "core/protocol-types" },
     { "path": "core/crypto" },
     { "path": "core/transport" },
+    { "path": "core/test-fixtures" },
     { "path": "core/client" },
     { "path": "core/adapter-claude-code" }
   ]

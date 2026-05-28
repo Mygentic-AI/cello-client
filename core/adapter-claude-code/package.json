@@ -11,6 +11,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "cello-mcp": "./dist/bin/cello-mcp.js"
+  },
   "exports": {
     ".": {
       "import": "./dist/index.js",
@@ -25,9 +28,16 @@
   "dependencies": {
     "@cello-protocol/client": "workspace:*",
     "@cello-protocol/crypto": "workspace:*",
-    "@cello-protocol/transport": "workspace:*"
+    "@cello-protocol/interfaces": "file:../../../trustless-cello/packages/interfaces",
+    "@cello-protocol/transport": "workspace:*",
+    "@libp2p/peer-id": "^6.0.8",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.2"
   },
   "devDependencies": {
-    "@types/node": "^25.6.2"
+    "@claude-flow/testing": "3.0.0-alpha.6",
+    "@types/node": "^25.6.2",
+    "cbor-x": "^1.6.0",
+    "it-length-prefixed": "^10.0.1"
   }
 }

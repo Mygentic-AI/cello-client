@@ -15,6 +15,18 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./frost/frost-threshold-signer.js": {
+      "import": "./dist/frost/frost-threshold-signer.js",
+      "types": "./dist/frost/frost-threshold-signer.d.ts"
+    },
+    "./frost/stubs.js": {
+      "import": "./dist/frost/stubs.js",
+      "types": "./dist/frost/stubs.d.ts"
+    },
+    "./frost/types.js": {
+      "import": "./dist/frost/types.js",
+      "types": "./dist/frost/types.d.ts"
     }
   },
   "files": ["dist/", "package.json"],
@@ -23,9 +35,12 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/protocol-types": "workspace:*"
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "@oqs/liboqs-js": "^0.15.1"
   },
   "devDependencies": {
+    "@claude-flow/testing": "3.0.0-alpha.6",
     "@types/node": "^25.6.2"
   }
 }
