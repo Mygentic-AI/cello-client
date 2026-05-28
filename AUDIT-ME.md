@@ -3,7 +3,8 @@
 This document makes three verifiable claims about the privacy properties of the
 CELLO client. Each claim names specific source files that an investigator can
 read to verify the claim. File paths are relative to the cello-client repository
-root and will be valid after REPOSPLIT-002 extracts the packages.
+root. All paths listed are valid — packages were extracted from trustless-cello
+into cello-client by REPOSPLIT-002.
 
 ---
 
@@ -18,27 +19,31 @@ that could decrypt content.
 **How to verify:**
 
 The Noise XX handshake setup is in:
-- `core/transport/src/noise.ts` — Noise protocol configuration; shows
+- `core/transport/src/node.ts` — `createNode()` function; shows
   `connectionEncrypters: [noise()]` as the only allowed connection encrypter
-  with no plaintext fallback
-- `core/transport/src/node.ts` — `createNode()` function, which constructs
-  the libp2p node; shows that TCP and WebSocket transports always go through
+  with no plaintext fallback; TCP and WebSocket transports always go through
   the Noise encrypter — there is no unencrypted transport path
+- `core/transport/src/types.ts` — transport type definitions; Noise is
+  the only declared connection encrypter type
 
 Circuit relay fallback (when direct connection fails):
 - `core/transport/src/node.ts` — `circuitRelayTransport()` and
-  `circuitRelayServer()` configuration; shows that circuit-relayed connections
-  also go through Noise XX — the relay forwards encrypted blobs, not plaintext
+  `circuitRelayServer()` configuration; circuit-relayed connections also
+  go through Noise XX — the relay forwards encrypted blobs, not plaintext
+
+Backup encryption (SQLCipher database export):
+- `core/client/src/client-backup.ts` — AES-256-GCM envelope encryption
+  for encrypted database backups (PERSIST-011)
 
 **Verify:**
-1. `core/transport/src/noise.ts` — Noise encrypter is the only
-   connection encrypter; no `plaintext()` import
-2. `core/transport/src/node.ts` — `createNode()` has no plaintext
-   transport path
-3. `core/transport/src/node.ts` — circuit relay transport configuration;
+1. `core/transport/src/node.ts` — `createNode()` shows `connectionEncrypters: [noise()]`
+   and no `plaintext()` import; no unencrypted transport path
+2. `core/transport/src/node.ts` — circuit relay transport configuration;
    relay handles opaque encrypted streams
-4. `core/client/src/envelope.ts` — AES-GCM envelope encryption applied
-   before bytes reach the transport layer
+3. `core/client/src/client-backup.ts` — AES-256-GCM encryption with
+   fresh random 96-bit nonce per backup; backup key derived via HKDF
+4. `core/transport/src/types.ts` — transport type definitions; only
+   Noise is the declared connection encrypter
 
 ---
 
@@ -55,30 +60,31 @@ frame (ADR-0001).
 **How to verify:**
 
 Key generation and storage:
-- `core/crypto/src/key-provider.ts` — `FileKeyProvider.load()` reads the key
-  from a local file; `generateKeypair()` creates a new key and writes it with
-  `chmod 600`; `sign()` and `getPublicKey()` operate in memory; no network
-  calls
+- `core/crypto/src/ed25519.ts` — `FileKeyProvider.load()` reads the key
+  from a local file; `FileKeyProvider.generate()` creates a new key and writes
+  it with `chmod 600` (mode 0o600); `sign()` and `getPublicKey()` operate in
+  memory; no network calls
 
-FROST DKG client (threshold ceremony):
-- `core/client/src/frost-dkg.ts` — only the public commitments and signature
+FROST threshold ceremony (DKG):
+- `core/client/src/client.ts` — only public commitments and signature
   shares (never the private key scalar) are sent over the network during the
   DKG ceremony; K_local is the private input, threshold signature shares are
-  the outputs
+  the outputs; grep `#registerFrost` for the DKG flow
 
 Wire frame inspection:
-- `core/client/src/frames.ts` — all serialized frames carry public keys
-  (`sender_pubkey`, `signer_pubkey`) and signatures — never private key
+- `core/protocol-types/src/envelope.ts` — all serialized frames carry public
+  keys (`sender_pubkey`, `signer_pubkey`) and signatures — never private key
   material
+- `core/client/src/client.ts` — `buildEnvelope()` call; input is the message
+  bytes and sender_pubkey; private key stays inside the `KeyProvider.sign()` closure
 
 **Verify:**
-1. `core/crypto/src/key-provider.ts` — `FileKeyProvider.load()` reads key
-   material locally, `sign()` never returns the private scalar
-2. `core/client/src/frost-dkg.ts` — DKG messages contain public commitments
-   and signature shares, not private scalars
-3. `core/client/src/frames.ts` — wire frame types; grep for any field name
-   that could carry a private key (`privateKey`, `privKey`, `keyMaterial`,
-   `secret`) — none present
+1. `core/crypto/src/ed25519.ts` — `FileKeyProvider` class; `sign()` returns a
+   signature, never the private scalar; key file read with `readFile` at path
+2. `core/client/src/client.ts` — DKG messages: public commitments and signature
+   shares, not private scalars; grep `dkg_round1`, `dkg_round2`, `dkg_ready`
+3. `core/protocol-types/src/envelope.ts` — envelope type definition; grep for
+   private key field names (`privateKey`, `privKey`, `secret`) — none present
 4. `core/transport/src/node.ts` — `createNode()` generates a *separate*
    libp2p transport keypair; K_local from `keyProvider` is stored but never
    passed to libp2p's Noise handshake (ADR-0001 invariant)
@@ -99,11 +105,11 @@ All outbound network calls flow through libp2p streams to known peers:
 - `core/transport/src/node.ts` — only libp2p transports are registered (TCP,
   WebSocket, circuit relay); no `fetch()`, `http.request()`, or SDK clients
   for analytics services
-- `core/client/src/cello-client.ts` — all external calls are `node.dial()`
+- `core/client/src/client.ts` — all external calls are `node.dial()`
   to the directory multiaddr or relay multiaddr passed in at construction time;
-  caller controls both addresses
-- `core/adapter-claude-code/src/server.ts` — MCP server entry point; only
-  connects to the configured directory URL; no additional outbound calls
+  caller controls both addresses; grep `dial(` for every outbound connection
+- `core/adapter-claude-code/src/server.ts` — MCP server entry point; registers
+  tool handlers that call into the client; no additional outbound network calls
 
 There are no imports of telemetry SDKs (Sentry, Datadog, Segment, Mixpanel,
 PostHog, OpenTelemetry exporter) anywhere in the codebase:
@@ -111,10 +117,10 @@ PostHog, OpenTelemetry exporter) anywhere in the codebase:
 **Verify:**
 1. `core/transport/src/node.ts` — grep for `fetch`, `http.request`,
    `https.request` — none present
-2. `core/client/src/cello-client.ts` — all outbound calls are `dial()` to
-   the directory/relay addresses provided by the operator
+2. `core/client/src/client.ts` — all outbound calls are `dial()` to
+   the directory/relay addresses provided at construction time
 3. `core/adapter-claude-code/src/server.ts` — no analytics or telemetry
-   client imported
+   client imported; only `@modelcontextprotocol/sdk` and cello packages
 4. Root `package.json` and all `core/*/package.json` — grep for telemetry
    package names (sentry, datadog, segment, mixpanel, posthog, opentelemetry)
    — none present
@@ -141,6 +147,5 @@ grep -rn "fetch\|http\.request\|https\.request" core/*/src/  # should show only 
 
 ---
 
-*This document is updated as M6 decisions are made. The file paths above
-reference the cello-client layout (core/crypto, core/transport, etc.) and will
-be valid after REPOSPLIT-002 extracts the packages from trustless-cello.*
+*File paths reference the cello-client layout (core/crypto, core/transport,
+core/client, core/adapter-claude-code) and are valid as of REPOSPLIT-002.*
