@@ -6,8 +6,8 @@
  * dynamically assigned per-session by the directory.
  */
 
-/** Production directory HTTPS endpoint (ALB / Route53). */
-export const PRODUCTION_DIRECTORY_URL = "https://directory-us1.cello.mygentic.ai";
+/** Production directory HTTP endpoint (ALB / Route53 — ALB terminates TLS, internal HTTP). */
+export const PRODUCTION_DIRECTORY_URL = "http://directory-us1.cello.mygentic.ai";
 
 /**
  * Resolve the directory URL from the environment, falling back to the

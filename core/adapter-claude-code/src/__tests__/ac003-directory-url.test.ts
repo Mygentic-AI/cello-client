@@ -10,12 +10,12 @@ import { resolveDirectoryUrl, PRODUCTION_DIRECTORY_URL } from "../index.js";
 
 describe("AC-003: production directory URL configuration", () => {
   it("AC-003a: PRODUCTION_DIRECTORY_URL matches the production ALB endpoint from STATE.md", () => {
-    expect(PRODUCTION_DIRECTORY_URL).toBe("https://directory-us1.cello.mygentic.ai");
+    expect(PRODUCTION_DIRECTORY_URL).toBe("http://directory-us1.cello.mygentic.ai");
   });
 
   it("AC-003b: resolveDirectoryUrl() returns the production default when env var is unset", () => {
     const result = resolveDirectoryUrl({});
-    expect(result).toBe("https://directory-us1.cello.mygentic.ai");
+    expect(result).toBe("http://directory-us1.cello.mygentic.ai");
   });
 
   it("AC-003c: resolveDirectoryUrl() returns the override when CELLO_DIRECTORY_URL is set", () => {
