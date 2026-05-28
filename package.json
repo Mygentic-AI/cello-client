@@ -1,6 +1,6 @@
 {
   "name": "cello-client",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "engines": {
     "node": ">=24"
@@ -13,7 +13,7 @@
   },
   "pnpm": {
     "overrides": {
-      "@cello-protocol/interfaces": "file:../trustless-cello/packages/interfaces"
+      "@cello-protocol/interfaces": "0.0.3"
     },
     "onlyBuiltDependencies": [
       "@journeyapps/sqlcipher",

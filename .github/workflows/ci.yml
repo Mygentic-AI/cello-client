@@ -15,17 +15,6 @@ jobs:
     steps:
       - name: Checkout cello-client
         uses: actions/checkout@v4
-        with:
-          path: cello-client
-
-      # trustless-cello (CELLO repo) is checked out as a sibling directory so that
-      # the file:../trustless-cello/packages/interfaces pnpm lockfile entry resolves.
-      # This mirrors the developer's local setup where both repos sit side-by-side.
-      - name: Checkout trustless-cello (CELLO)
-        uses: actions/checkout@v4
-        with:
-          repository: Mygentic-AI/CELLO
-          path: trustless-cello
 
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
@@ -39,36 +28,23 @@ jobs:
           version: 10.33.2
           run_install: false
 
-      # Install trustless-cello workspace deps needed to build @cello-protocol/interfaces.
-      # interfaces → protocol-types → crypto. Only these three packages need installing.
-      - name: Install trustless-cello interfaces dependencies
-        working-directory: trustless-cello
-        run: pnpm install --frozen-lockfile --filter @cello-protocol/interfaces...
-
-      # Build @cello-protocol/interfaces (dist/ is gitignored in CELLO repo — must build here).
-      - name: Build @cello-protocol/interfaces
-        working-directory: trustless-cello
-        run: pnpm --filter @cello-protocol/interfaces run typecheck
-
-      - name: Install dependencies (cello-client)
-        working-directory: cello-client
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Build (tsc --build)
-        working-directory: cello-client
         run: pnpm run build
 
       - name: Typecheck
-        working-directory: cello-client
         run: pnpm run typecheck
 
+      - name: Lint
+        run: pnpm run lint
+
       - name: Test
-        working-directory: cello-client
-        run: pnpm run test -- --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1
+        run: pnpm run test
 
       # Tarball check 1: no server files leaked across all five publishable packages.
       - name: Tarball check — no server files leaked
-        working-directory: cello-client
         run: |
           for pkg in core/protocol-types core/crypto core/transport core/client core/adapter-claude-code; do
             echo "--- Checking $pkg ---"
@@ -83,7 +59,6 @@ jobs:
 
       # Tarball check 2: SKILL.md present in connect package (AC-004).
       - name: Tarball check — SKILL.md present in connect package
-        working-directory: cello-client
         run: |
           cd core/adapter-claude-code
           OUTPUT=$(npm pack --dry-run 2>&1)
@@ -96,8 +71,28 @@ jobs:
           fi
 
       # Publish step — only runs on version tags, requires NPM_TOKEN secret.
-      # Publishes @cello-protocol/interfaces from trustless-cello first, then all
-      # five public client packages from cello-client in dependency order.
+      # Checks out trustless-cello to publish @cello-protocol/interfaces via pnpm
+      # (so workspace:* specifiers are rewritten to real version numbers).
+      # All commands use || true for idempotency (E409 if version already exists).
+      - name: Checkout trustless-cello (for interfaces publish)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/checkout@v4
+        with:
+          repository: Mygentic-AI/CELLO
+          path: trustless-cello
+
+      - name: Install trustless-cello interfaces dependencies (for publish)
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: trustless-cello
+        run: pnpm install --frozen-lockfile --filter @cello-protocol/interfaces...
+
+      - name: Build @cello-protocol/interfaces (for publish)
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: trustless-cello
+        run: |
+          pnpm --filter @cello-protocol/interfaces run typecheck
+          test -d packages/interfaces/dist && test "$(ls -A packages/interfaces/dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
+
       - name: Publish to npm (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -110,15 +105,14 @@ jobs:
 
           # Publish @cello-protocol/interfaces from the trustless-cello workspace root
           # using pnpm so workspace:* specifiers are rewritten to real version numbers.
-          # The || true makes this idempotent (E409 if version already exists).
           (cd "$GITHUB_WORKSPACE/trustless-cello" && pnpm publish --filter @cello-protocol/interfaces --access public --no-git-checks --tag "$TAG") || true
 
           # Publish cello-client packages in dependency order.
-          cd "$GITHUB_WORKSPACE/cello-client"
-          pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG"
-          pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG"
-          pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG"
-          pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG"
-          pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG"
+          # || true makes each command idempotent (E409 if version already exists).
+          pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

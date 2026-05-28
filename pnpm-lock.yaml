@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@cello-protocol/interfaces': file:../trustless-cello/packages/interfaces
+  '@cello-protocol/interfaces': 0.0.3
 
 importers:
 
@@ -39,8 +39,8 @@ importers:
         specifier: workspace:*
         version: link:../crypto
       '@cello-protocol/interfaces':
-        specifier: file:../../../trustless-cello/packages/interfaces
-        version: file:../trustless-cello/packages/interfaces
+        specifier: 0.0.3
+        version: 0.0.3
       '@cello-protocol/transport':
         specifier: workspace:*
         version: link:../transport
@@ -56,7 +56,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -76,8 +76,8 @@ importers:
         specifier: workspace:*
         version: link:../crypto
       '@cello-protocol/interfaces':
-        specifier: file:../../../trustless-cello/packages/interfaces
-        version: file:../trustless-cello/packages/interfaces
+        specifier: 0.0.3
+        version: 0.0.3
       '@cello-protocol/protocol-types':
         specifier: workspace:*
         version: link:../protocol-types
@@ -114,7 +114,7 @@ importers:
         version: link:../test-fixtures
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -133,7 +133,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -152,7 +152,7 @@ importers:
         version: link:../test-fixtures
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -165,7 +165,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -223,7 +223,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -379,8 +379,16 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@cello-protocol/interfaces@file:../trustless-cello/packages/interfaces':
-    resolution: {directory: ../trustless-cello/packages/interfaces, type: directory}
+  '@cello-protocol/crypto@0.0.2':
+    resolution: {integrity: sha512-dl9EC/r6UY/unvbDzyuAgWslJG8DE79EsbH2WuNIWdUwDbmOymqn30VN7Esvz4rXWkBGNuLq7DjcNEF43NAiGg==}
+    engines: {node: '>=24'}
+
+  '@cello-protocol/interfaces@0.0.3':
+    resolution: {integrity: sha512-b4MmBEjOlj9E0QU/PIlM0GKznDIl11B03MAxB2V4vW/0bBxEoN/Tb8OLKApktiUJHIv38pm7HM5oZO0zo+ySrg==}
+    engines: {node: '>=24'}
+
+  '@cello-protocol/protocol-types@0.0.2':
+    resolution: {integrity: sha512-miUOSRvc6tbpzrFbz0LD/IrLB+TzchMBZ5/9ce7bXwbjq/FsmsyIf9VcVPelEZFcrp9o4YdWXz9cbNAPiD9Skg==}
     engines: {node: '>=24'}
 
   '@chainsafe/as-chacha20poly1305@0.1.0':
@@ -3450,9 +3458,20 @@ snapshots:
   '@cbor-extract/cbor-extract-win32-x64@2.2.2':
     optional: true
 
-  '@cello-protocol/interfaces@file:../trustless-cello/packages/interfaces':
+  '@cello-protocol/crypto@0.0.2':
     dependencies:
-      '@cello-protocol/protocol-types': link:core/protocol-types
+      '@noble/curves': 2.2.0
+      '@noble/hashes': 2.2.0
+      '@oqs/liboqs-js': 0.15.1
+
+  '@cello-protocol/interfaces@0.0.3':
+    dependencies:
+      '@cello-protocol/protocol-types': 0.0.2
+
+  '@cello-protocol/protocol-types@0.0.2':
+    dependencies:
+      '@cello-protocol/crypto': 0.0.2
+      cbor-x: 1.6.4
 
   '@chainsafe/as-chacha20poly1305@0.1.0': {}
 
@@ -3508,7 +3527,7 @@ snapshots:
 
   '@claude-flow/swarm@3.0.0-alpha.8': {}
 
-  '@claude-flow/testing@3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))':
+  '@claude-flow/testing@3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))':
     dependencies:
       '@claude-flow/memory': 3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3)
       '@claude-flow/shared': 3.0.0-alpha.8
