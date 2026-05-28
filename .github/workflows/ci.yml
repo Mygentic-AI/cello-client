@@ -74,7 +74,7 @@ jobs:
             echo "--- Checking $pkg ---"
             OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
             echo "$OUTPUT"
-            if echo "$OUTPUT" | grep -iE '^npm notice [0-9]' | grep -iE '/directory/|/relay/|/infra/|\.env'; then
+            if echo "$OUTPUT" | grep -iE '^npm notice [0-9]' | grep -iE '/directory/|/relay/|/infra/|/\.env'; then
               echo "FAIL: server files found in $pkg tarball"
               exit 1
             fi
@@ -108,9 +108,10 @@ jobs:
           fi
           echo "Publishing with tag: $TAG"
 
-          # Publish @cello-protocol/interfaces from trustless-cello.
+          # Publish @cello-protocol/interfaces from the trustless-cello workspace root
+          # using pnpm so workspace:* specifiers are rewritten to real version numbers.
           # The || true makes this idempotent (E409 if version already exists).
-          (cd "$GITHUB_WORKSPACE/trustless-cello/packages/interfaces" && npm publish --access public --tag "$TAG") || true
+          (cd "$GITHUB_WORKSPACE/trustless-cello" && pnpm publish --filter @cello-protocol/interfaces --access public --no-git-checks --tag "$TAG") || true
 
           # Publish cello-client packages in dependency order.
           cd "$GITHUB_WORKSPACE/cello-client"

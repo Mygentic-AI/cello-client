@@ -136,7 +136,7 @@ To verify all three claims after REPOSPLIT-002 extracts the packages:
 grep -r "plaintext" core/transport/src/  # should find nothing
 
 # Check K_local never on the wire
-grep -r "privateKey\|privKey\|keyMaterial" core/client/src/frames.ts  # should find nothing
+grep -r "privateKey\|privKey\|keyMaterial" core/protocol-types/src/envelope.ts core/client/src/  # should find nothing
 
 # Check no telemetry packages
 grep -r "sentry\|datadog\|segment\|mixpanel\|posthog" core/*/package.json  # should find nothing

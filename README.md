@@ -80,30 +80,33 @@ cello_backup()                   — export an encrypted key backup
 | `CELLO_DIRECTORY_URL` | `https://directory-us1.cello.mygentic.ai` | Production directory endpoint. Override for local or staging deployments. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
-## Cross-repo development (pnpm link)
+## Cross-repo development
 
-cello-client consumes `@cello-protocol/interfaces` from npm. When you need
-to develop server-side interfaces alongside client code simultaneously, use
-`pnpm link` to override the npm resolution with your local trustless-cello
-workspace:
+cello-client consumes `@cello-protocol/interfaces` from npm. The root
+`package.json` already has a `pnpm.overrides` entry that points to a local
+sibling checkout when both repos are checked out side-by-side:
 
-```bash
-# In trustless-cello — build interfaces and make it linkable
-cd /path/to/trustless-cello/packages/interfaces
-pnpm run typecheck      # builds dist/
-pnpm link --global      # registers the package globally
-
-# In cello-client — link to the local version
-cd /path/to/cello-client
-pnpm link --global @cello-protocol/interfaces
+```json
+"pnpm": {
+  "overrides": {
+    "@cello-protocol/interfaces": "file:../trustless-cello/packages/interfaces"
+  }
+}
 ```
 
-To unlink (go back to the npm version):
+When both repos are checked out as siblings (`trustless-cello/` and
+`cello-client/` in the same parent directory), this override is already
+active. You only need to build interfaces before running `pnpm install`:
+
 ```bash
+# In trustless-cello — build interfaces first
+cd /path/to/trustless-cello
+pnpm --filter @cello-protocol/interfaces run typecheck   # produces dist/
+
+# In cello-client — install resolves the sibling path automatically
 cd /path/to/cello-client
-pnpm unlink @cello-protocol/interfaces
-pnpm install           # restores the npm version
+pnpm install    # do NOT use --frozen-lockfile in local dev
 ```
 
-This workflow lets interface changes in trustless-cello be immediately
-reflected in cello-client without a publish/install cycle.
+Interface changes in trustless-cello are immediately reflected in
+cello-client after rebuilding interfaces — no publish cycle needed.
