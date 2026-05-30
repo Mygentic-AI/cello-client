@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/connect",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "private": false,
   "type": "module",
   "engines": {
@@ -20,7 +20,11 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist/", "package.json", "SKILL.md"],
+  "files": [
+    "dist/",
+    "package.json",
+    "SKILL.md"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
