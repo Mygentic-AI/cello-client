@@ -12,7 +12,7 @@
  *                             Overridable for local/staging deployments. Relay multiaddr is
  *                             dynamically assigned per-session — no relay constant is baked in.
  *   CELLO_DIRECTORY_MULTIADDR Directory libp2p multiaddr (optional; used when dialing libp2p directly)
- *   NODE_ENV=test             Enables FROST bootstrap (production will use real DKG)
+ *   NODE_ENV                  (unused — FROST bootstrap runs whenever CELLO_DIRECTORY_MULTIADDR is set)
  *   CELLO_ENV                 Deployment environment: local | dev | staging | production
  *   CELLO_DB_PATH             Path to local SQLCipher database (default: ~/.cello/client.db)
  *   BACKUP_S3_BUCKET          S3 bucket for encrypted backups (required for S3 backup)
@@ -191,7 +191,7 @@ let primaryPubkey: Uint8Array | undefined;
 
 process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} CELLO_DIRECTORY_URL=${directoryUrl} CELLO_DIRECTORY_MULTIADDR=${directoryMultiaddr ?? "(unset)"}\n`);
 
-if (process.env.NODE_ENV === "test") {
+{
   const ownPubkey = await kp.getPublicKey();
 
   if (directoryMultiaddr && directoryEndpoint) {
@@ -219,7 +219,6 @@ if (process.env.NODE_ENV === "test") {
       const msg = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack}` : JSON.stringify(err);
       process.stderr.write(`cello-mcp: FROST bootstrap FAILED: ${msg}\n`);
       process.stderr.write(`cello-mcp: falling back to in-process stubs\n`);
-      // Fall back to in-process stubs so the server starts but without directory FROST
       const stubs = createInProcessStubs(3);
       const ownPubkeyFresh = await kp.getPublicKey();
       const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
@@ -227,7 +226,7 @@ if (process.env.NODE_ENV === "test") {
       primaryPubkey = bootstrapResult.primaryPubkey;
     }
   } else {
-    // Fallback: in-process stubs (no directory reachable)
+    // No directory multiaddr configured — use in-process stubs
     const stubs = createInProcessStubs(3);
     const ownPubkeyFresh = await kp.getPublicKey();
     const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
