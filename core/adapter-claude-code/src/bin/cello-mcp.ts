@@ -317,17 +317,30 @@ if (dbKey) {
     process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Detect native module load failures (missing pre-built binary or ABI mismatch).
+    // Detect native module load failures (missing pre-built binary, ABI mismatch, missing system libs).
     const isNativeModuleError =
       msg.includes("Cannot find module") ||
       msg.includes("was compiled against a different Node.js version") ||
       msg.includes("NODE_MODULE_VERSION") ||
       msg.includes("invalid ELF header") ||
-      msg.includes("dlopen");
+      msg.includes("dlopen") ||
+      msg.includes("libcrypto") ||
+      msg.includes("libssl");
     if (isNativeModuleError) {
-      process.stderr.write(`cello-mcp: SQLCipher native module failed to load: ${msg}\n`);
-      process.stderr.write(`cello-mcp: Your platform may not have a pre-built binary available.\n`);
-      process.stderr.write(`cello-mcp: See https://github.com/Mygentic-AI/cello-client for supported platforms.\n`);
+      const platform = process.platform;
+      process.stderr.write(`cello-mcp: SQLCipher failed to load: ${msg}\n`);
+      if (platform === "win32") {
+        process.stderr.write(`cello-mcp: Windows requires a manual SQLCipher install.\n`);
+        process.stderr.write(`cello-mcp: Download and install SQLCipher from https://www.zetetic.net/sqlcipher/\n`);
+        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
+      } else if (platform === "linux") {
+        process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
+        process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
+        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
+      } else {
+        process.stderr.write(`cello-mcp: Your platform may be missing build tools (e.g. Xcode Command Line Tools on macOS).\n`);
+        process.stderr.write(`cello-mcp: See https://github.com/Mygentic-AI/cello-client for setup instructions.\n`);
+      }
       process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
     } else {
       process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
