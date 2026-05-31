@@ -116,7 +116,8 @@ import {
   decodeConnectionPackage, validateConnectionPackage,
 } from "@cello-protocol/protocol-types";
 import type { Structure2 } from "@cello-protocol/protocol-types";
-import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, mlDsaKeygen, mlDsaVerify, FileMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, mlDsaKeygen, mlDsaKeygenWithBytes, mlDsaVerify, FileMlDsaKeyProvider, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { LeafInput, IThresholdSigner } from "@cello-protocol/crypto";
 import { CELLO_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -130,6 +131,8 @@ import type {
   InitiateSessionResult,
 } from "./types.js";
 import type { Logger } from "@cello-protocol/interfaces";
+import type { ClientStatePersistence } from "./client-state-persistence.js";
+import { FrostThresholdSigner } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 
 const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 const AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
@@ -497,6 +500,9 @@ class CelloClientImpl implements CelloClient {
   // ─── PERSIST-014: Logger (injected, defaults to no-op) ───────────────────────
   readonly #logger: Logger;
 
+  // ─── PERSIST-024: Client state persistence (optional) ────────────────────────
+  #persistence: ClientStatePersistence | null = null;
+
   constructor(
     node: CelloNode,
     keyProvider: KeyProvider,
@@ -515,6 +521,7 @@ class CelloClientImpl implements CelloClient {
     onConnectionPendingReview?: (event: import("@cello-protocol/protocol-types").ConnectionRequestInbound) => void,
     crossCheckDirectoryOnInbound = false,
     logger?: Logger,
+    persistence?: ClientStatePersistence,
   ) {
     this.#node = node;
     this.#keyProvider = keyProvider;
@@ -533,6 +540,7 @@ class CelloClientImpl implements CelloClient {
     this.#onConnectionPendingReview = onConnectionPendingReview;
     this.#crossCheckDirectoryOnInbound = crossCheckDirectoryOnInbound;
     this.#logger = logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+    this.#persistence = persistence ?? null;
   }
 
   /**
@@ -545,8 +553,245 @@ class CelloClientImpl implements CelloClient {
     this.#myPrimaryPubkey = new Uint8Array(primaryPubkey);
   }
 
+  /**
+   * PERSIST-024: Load all durable state from the SQLCipher DB and populate in-memory state.
+   *
+   * Pseudocode:
+   *   1. Call persistence.loadStartupState() — emits client.startup.state.loaded
+   *   2. Restore FROST key share → call storeDkgResult to populate module-level key store;
+   *      reconstruct FrostThresholdSigner with same config used at registration
+   *   3. Restore ML-DSA keypair → reconstruct InMemoryMlDsaKeyProvider
+   *   4. Restore registration state → populate #registrationState
+   *   5. Restore connections → populate #connections and #connectionsByPeer
+   *   6. Restore connection policy → populate #connectionPolicy
+   *   7. Restore sessions → populate #sessions; load leaves per session
+   *   8. Restore peers → populate #peers
+   *   9. Restore decided requests → populate #decidedRequests
+   *
+   * Security invariants:
+   *   SI-001: signing_share bytes never appear in any log event.
+   *   SI-002: secret_key_blob bytes never appear in any log event.
+   *
+   * Crypto refs: RFC 9591 (FROST), NIST FIPS 204 (ML-DSA-44)
+   */
+  async loadPersistedState(): Promise<void> {
+    const p = this.#persistence;
+    if (!p) return;
+
+    await p.upsertAgent();
+    const state = await p.loadStartupState();
+
+    // ── 1. FROST key share ────────────────────────────────────────────────────
+    if (state.frostShare) {
+      const row = state.frostShare;
+      // Reconstruct FrostSecret: { identifier, signingShare }
+      const signingShareBytes = row.signing_share instanceof Buffer
+        ? new Uint8Array(row.signing_share)
+        : new Uint8Array(row.signing_share as Uint8Array);
+      const frostSecret = { identifier: row.identifier, signingShare: signingShareBytes };
+
+      // Reconstruct FrostPublic: { signers, commitments, verifyingShares }
+      // commitments_cbor is CBOR-encoded Uint8Array[]; verifying_shares_cbor is CBOR-encoded Record<string, Uint8Array>
+      let commitments: Uint8Array[] = [];
+      let verifyingShares: Record<string, Uint8Array> = {};
+      try {
+        const commitmentsCborBytes = row.commitments_cbor instanceof Buffer
+          ? row.commitments_cbor
+          : Buffer.from(row.commitments_cbor as Uint8Array);
+        const decodedCommitments = decode(commitmentsCborBytes) as unknown;
+        if (Array.isArray(decodedCommitments)) {
+          commitments = decodedCommitments.map((c: unknown) =>
+            c instanceof Uint8Array ? c : Buffer.isBuffer(c) ? new Uint8Array(c as Buffer) : new Uint8Array(0)
+          );
+        }
+        const verifyingSharesCborBytes = row.verifying_shares_cbor instanceof Buffer
+          ? row.verifying_shares_cbor
+          : Buffer.from(row.verifying_shares_cbor as Uint8Array);
+        const decodedVerifyingShares = decode(verifyingSharesCborBytes) as unknown;
+        if (decodedVerifyingShares && typeof decodedVerifyingShares === "object" && !Array.isArray(decodedVerifyingShares)) {
+          for (const [k, v] of Object.entries(decodedVerifyingShares as Record<string, unknown>)) {
+            verifyingShares[k] = v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : new Uint8Array(0);
+          }
+        }
+      } catch {
+        this.#logger.warn("client.startup.frost.deserialize.failed", {
+          agentPubkey: row.agent_pubkey,
+        });
+      }
+
+      const frostPublic = {
+        signers: { min: row.threshold, max: row.participants },
+        commitments,
+        verifyingShares,
+      };
+
+      const myPubkeyHex = row.agent_pubkey;
+      try {
+        // SI-001: storeDkgResult does not log the secret
+        storeDkgResult(myPubkeyHex, frostSecret as import("@noble/curves/abstract/frost.js").FrostSecret, frostPublic as import("@noble/curves/abstract/frost.js").FrostPublic);
+      } catch {
+        this.#logger.warn("client.startup.frost.restore.failed", {
+          agentPubkey: myPubkeyHex,
+        });
+      }
+
+      // Reconstruct FrostThresholdSigner (config only — secret is in module-level store)
+      if (!this.#thresholdSigner && this.#directoryEndpoint) {
+        this.#thresholdSigner = new FrostThresholdSigner(
+          {
+            threshold: row.threshold,
+            participants: row.participants,
+            directoryNodes: undefined,
+          },
+          Buffer.from(myPubkeyHex, "hex"),
+        );
+      }
+
+      // Set primary_pubkey from stored commitments[0]
+      if (commitments.length > 0 && !this.#myPrimaryPubkey) {
+        this.#myPrimaryPubkey = new Uint8Array(commitments[0]!);
+      }
+    }
+
+    // ── 2. ML-DSA keypair ─────────────────────────────────────────────────────
+    if (state.mlDsaKeypair) {
+      const row = state.mlDsaKeypair;
+      try {
+        const secretKeyBlob = row.secret_key_blob instanceof Buffer
+          ? new Uint8Array(row.secret_key_blob)
+          : new Uint8Array(row.secret_key_blob as Uint8Array);
+        const mlDsaPubkeyBytes = Buffer.from(row.ml_dsa_pubkey, "hex");
+        // SI-002: InMemoryMlDsaKeyProvider does not log secret key
+        this.#mlDsaProvider = new InMemoryMlDsaKeyProvider(mlDsaPubkeyBytes, secretKeyBlob);
+      } catch {
+        this.#logger.warn("client.startup.mldsa.restore.failed", {
+          agentPubkey: row.agent_pubkey,
+        });
+      }
+    }
+
+    // ── 3. Registration state ─────────────────────────────────────────────────
+    if (state.registrationState) {
+      const row = state.registrationState;
+      this.#registrationState = {
+        agent_id: row.agent_id,
+        primary_pubkey: row.primary_pubkey,
+        ml_dsa_pubkey: row.ml_dsa_pubkey,
+        registered_at: row.registered_at,
+        status: "active",
+      };
+    }
+
+    // ── 4. Connections ────────────────────────────────────────────────────────
+    for (const row of state.connections) {
+      if (!this.#connections.has(row.connection_id)) {
+        const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
+          connection_id: row.connection_id,
+          counterparty_primary_pubkey: row.counterparty_primary_pubkey ?? "",
+          counterparty_ml_dsa_pubkey: row.counterparty_ml_dsa_pubkey ?? "",
+          counterparty_pubkey: row.counterparty_pubkey,
+          established_at: row.established_at,
+          status: row.status as "active",
+        };
+        this.#connections.set(row.connection_id, record);
+        this.#connectionsByPeer.set(row.counterparty_pubkey, row.connection_id);
+        if (row.profile_unchecked) {
+          this.#profileUncheckedPeers.add(row.counterparty_pubkey);
+        }
+      }
+    }
+
+    // ── 5. Connection policy ──────────────────────────────────────────────────
+    if (state.connectionPolicy) {
+      this.#connectionPolicy = state.connectionPolicy;
+    }
+
+    // ── 6. Sessions + leaves ──────────────────────────────────────────────────
+    for (const row of state.sessions) {
+      const sessionIdHex = row.session_id;
+      if (this.#sessions.has(sessionIdHex)) continue;
+
+      const leaves = await p.loadSessionTreeLeaves(sessionIdHex);
+      const localTreeLeaves: SessionRecord["local_tree_leaves"] = leaves.map((l) => ({
+        kind: l.leaf_kind as "msg" | "ctrl",
+        s2_cbor: l.s2_cbor instanceof Buffer
+          ? new Uint8Array(l.s2_cbor)
+          : new Uint8Array(l.s2_cbor as Uint8Array),
+      }));
+
+      const counterpartyPubkey = row.counterparty_pubkey instanceof Buffer
+        ? new Uint8Array(row.counterparty_pubkey)
+        : new Uint8Array(row.counterparty_pubkey as Uint8Array);
+      const directoryPubkey = row.directory_pubkey instanceof Buffer
+        ? new Uint8Array(row.directory_pubkey)
+        : new Uint8Array(row.directory_pubkey as Uint8Array);
+      const genesisPrevRoot = row.genesis_prev_root instanceof Buffer
+        ? new Uint8Array(row.genesis_prev_root)
+        : new Uint8Array(row.genesis_prev_root as Uint8Array);
+
+      let counterpartyMultiaddrs: string[] = [];
+      let relayMultiaddrs: string[] = [];
+      let directoryMultiaddrs: string[] = [];
+      try { counterpartyMultiaddrs = JSON.parse(row.counterparty_multiaddrs) as string[]; } catch { /* ignore */ }
+      try { relayMultiaddrs = JSON.parse(row.relay_multiaddrs) as string[]; } catch { /* ignore */ }
+      try { directoryMultiaddrs = JSON.parse(row.directory_multiaddrs) as string[]; } catch { /* ignore */ }
+
+      const record: SessionRecord = {
+        session_id: Buffer.from(sessionIdHex, "hex"),
+        counterparty_pubkey: counterpartyPubkey,
+        counterparty_peer_id: row.counterparty_peer_id,
+        counterparty_multiaddrs: counterpartyMultiaddrs,
+        relay_endpoint: { peer_id: row.relay_peer_id, multiaddrs: relayMultiaddrs },
+        directory_endpoint: { peer_id: row.directory_peer_id, multiaddrs: directoryMultiaddrs },
+        directory_pubkey: directoryPubkey,
+        genesis_prev_root: genesisPrevRoot,
+        last_seen_seq: row.last_seen_seq,
+        last_sent_seq: row.last_sent_seq,
+        next_expected_seq: row.next_expected_seq,
+        status: row.status as SessionRecord["status"],
+        desynchronized: row.desynchronized !== 0,
+        local_tree_leaves: localTreeLeaves,
+        sealed_root: row.sealed_root
+          ? (row.sealed_root instanceof Buffer ? new Uint8Array(row.sealed_root) : new Uint8Array(row.sealed_root as Uint8Array))
+          : undefined,
+        seal_type: row.seal_type as SessionRecord["seal_type"] ?? undefined,
+        close_timestamp: row.close_timestamp ?? undefined,
+        frost_signature: row.frost_signature
+          ? (row.frost_signature instanceof Buffer ? new Uint8Array(row.frost_signature) : new Uint8Array(row.frost_signature as Uint8Array))
+          : undefined,
+        signer_pubkey: row.signer_pubkey
+          ? (row.signer_pubkey instanceof Buffer ? new Uint8Array(row.signer_pubkey) : new Uint8Array(row.signer_pubkey as Uint8Array))
+          : undefined,
+        directory_signature: row.directory_signature
+          ? (row.directory_signature instanceof Buffer ? new Uint8Array(row.directory_signature) : new Uint8Array(row.directory_signature as Uint8Array))
+          : undefined,
+      };
+
+      this.#sessions.set(sessionIdHex, record);
+      this.#sessionMessageQueues.set(sessionIdHex, []);
+    }
+
+    // ── 7. Peers ──────────────────────────────────────────────────────────────
+    for (const row of state.peers) {
+      if (!this.#peers.has(row.peer_pubkey_hex)) {
+        let multiaddrs: string[] = [];
+        try { multiaddrs = JSON.parse(row.multiaddrs) as string[]; } catch { /* ignore */ }
+        this.#peers.set(row.peer_pubkey_hex, { peerId: row.peer_id, multiaddrs, connected: false });
+      }
+    }
+
+    // ── 8. Decided requests ───────────────────────────────────────────────────
+    for (const row of state.decidedRequests) {
+      this.#decidedRequests.add(row.request_id);
+    }
+  }
+
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
     this.#peers.set(peerPubkeyHex, { peerId, multiaddrs, connected: true });
+    // PERSIST-024: persist peer to DB
+    if (this.#persistence) {
+      void this.#persistence.persistPeer({ peerPubkeyHex, peerId, multiaddrs });
+    }
   }
 
   async send(peerPubkeyHex: string, content: Uint8Array): Promise<SendResult> {
@@ -866,6 +1111,10 @@ class CelloClientImpl implements CelloClient {
       desynchronized: false,
     };
     this.#sessions.set(sessionIdHex, record);
+    // PERSIST-024: persist session to DB
+    if (this.#persistence) {
+      void this.#persistence.persistSession(sessionIdHex, record);
+    }
 
     // Store the relay stream and start the persistent reader loop (MSG-004)
     this.#relayStreams.set(sessionIdHex, relayStream);
@@ -2724,8 +2973,19 @@ class CelloClientImpl implements CelloClient {
       const kind: "msg" | "ctrl" = leaf_kind === 0x02 ? "ctrl" : "msg";
 
       // Append to local tree
+      const leafIndex = session.local_tree_leaves.length;
       session.local_tree_leaves.push({ kind, s2_cbor });
       session.next_expected_seq += 1;
+      // PERSIST-024: persist leaf to DB
+      if (this.#persistence) {
+        void this.#persistence.persistSessionTreeLeaf({
+          sessionIdHex,
+          leafIndex,
+          leafKind: kind,
+          s2Cbor: s2_cbor,
+          sequenceNumber: s2.sequence_number,
+        });
+      }
 
       // Compute leaf hash: SHA-256(leaf_kind_byte || s2_cbor) per MERKLE-001
       const leafHash = new Uint8Array(
@@ -3069,9 +3329,18 @@ class CelloClientImpl implements CelloClient {
     }
 
     // Step 2: generate or load ML-DSA-44 keypair (NIST FIPS 204)
-    const mlDsaProvider = this.#mlDsaKeyFile
-      ? await FileMlDsaKeyProvider.load(this.#mlDsaKeyFile)
-      : await mlDsaKeygen();
+    // PERSIST-024: use mlDsaKeygenWithBytes when persistence is enabled to capture raw secret bytes
+    let mlDsaProvider: import("@cello-protocol/crypto").MlDsaKeyProvider;
+    let mlDsaSecretKeyBlob: Uint8Array | null = null;
+    if (this.#mlDsaKeyFile) {
+      mlDsaProvider = await FileMlDsaKeyProvider.load(this.#mlDsaKeyFile);
+    } else if (this.#persistence) {
+      const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
+      mlDsaProvider = provider;
+      mlDsaSecretKeyBlob = secretKeyBlob;
+    } else {
+      mlDsaProvider = await mlDsaKeygen();
+    }
     const mlDsaPubkey = await mlDsaProvider.getPublicKey();
     const mlDsaPubkeyHex = Buffer.from(mlDsaPubkey).toString("hex");
 
@@ -3168,6 +3437,22 @@ class CelloClientImpl implements CelloClient {
       this.#thresholdSigner = dkgResult.signer;
       // SESSION-005: update primary_pubkey so seal verification uses the DKG-derived key.
       this.#myPrimaryPubkey = new Uint8Array(dkgResult.primaryPubkey);
+      // PERSIST-024: persist FROST key share to DB (SI-001: signingShare is raw bytes, never logged)
+      if (this.#persistence) {
+        const commitmentsCbor = CBOR_ENC.encode(dkgResult.commitments) as Uint8Array;
+        const verifyingSharesCbor = CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array;
+        void this.#persistence.persistFrostKeyShare({
+          epochId,
+          primaryPubkey: dkgPrimaryPubkeyHex,
+          identifier: dkgResult.identifier,
+          signingShare: dkgResult.signingShare,
+          threshold: dkgResult.threshold,
+          participants: dkgResult.participants,
+          commitmentsCbor,
+          verifyingSharesCbor,
+          dkgMethod: "network_dkg",
+        });
+      }
     } catch {
       return { error: "dkg_failed" };
     }
@@ -3233,6 +3518,21 @@ class CelloClientImpl implements CelloClient {
     this.#registrationState = state;
     // Store the ML-DSA key provider so MCP tools can build ConnectionPackages (CELLO-MCP-003).
     this.#mlDsaProvider = mlDsaProvider;
+    // PERSIST-024: persist ML-DSA keypair and registration state (SI-002: secretKeyBlob is raw bytes, never logged)
+    if (this.#persistence && mlDsaSecretKeyBlob) {
+      void this.#persistence.persistMlDsaKeypair({
+        mlDsaPubkey: mlDsaPubkeyHex,
+        secretKeyBlob: mlDsaSecretKeyBlob,
+      });
+    }
+    if (this.#persistence) {
+      void this.#persistence.persistRegistrationState({
+        agentId: state.agent_id,
+        primaryPubkey: state.primary_pubkey,
+        mlDsaPubkey: state.ml_dsa_pubkey,
+        registeredAt: state.registered_at,
+      });
+    }
     return state;
   }
 
@@ -3369,6 +3669,10 @@ class CelloClientImpl implements CelloClient {
    */
   setPolicy(policy: import("./connection-policy.js").SignalRequirementPolicy): void {
     this.#connectionPolicy = policy;
+    // PERSIST-024: persist policy to DB
+    if (this.#persistence) {
+      void this.#persistence.persistConnectionPolicy(policy);
+    }
   }
 
   /**
@@ -3725,6 +4029,14 @@ class CelloClientImpl implements CelloClient {
       };
       this.#connections.set(connectionId, record);
       this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+      // PERSIST-024: persist connection to DB
+      if (this.#persistence) {
+        void this.#persistence.persistConnection({
+          connectionId,
+          counterpartyPubkey,
+          establishedAt: record.established_at,
+        });
+      }
       this.#logger.info("connection.established", {
         connectionId,
         counterpartyPubkeyHex: counterpartyPubkey,
@@ -3757,6 +4069,14 @@ class CelloClientImpl implements CelloClient {
           };
           this.#connections.set(connectionId, record);
           this.#connectionsByPeer.set(targetPubkeyHex, connectionId);
+          // PERSIST-024: persist connection to DB
+          if (this.#persistence) {
+            void this.#persistence.persistConnection({
+              connectionId,
+              counterpartyPubkey: targetPubkeyHex,
+              establishedAt: record.established_at,
+            });
+          }
         }
         this.#logger.info("connection.established", {
           connectionId,
@@ -4910,6 +5230,15 @@ class CelloClientImpl implements CelloClient {
                 }
                 this.#connections.set(connectionId, record);
                 this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+                // PERSIST-024: persist connection to DB
+                if (this.#persistence) {
+                  void this.#persistence.persistConnection({
+                    connectionId,
+                    counterpartyPubkey,
+                    establishedAt: record.established_at,
+                    profileUnchecked: record.profile_unchecked,
+                  });
+                }
               }
               // Fire onConnectionEstablished handler (both A and B)
               const handler = this.#onConnectionEstablishedHandler;
@@ -5165,6 +5494,8 @@ export function createClient(
     crossCheckDirectoryOnInbound?: boolean;
     /** PERSIST-014: injected logger for observability events. */
     logger?: Logger;
+    /** PERSIST-024: optional persistence layer for structured SQLCipher state. */
+    persistence?: ClientStatePersistence;
   }
 ): CelloClient & {
   sendRaw(peerPubkeyHex: string, bytes: Uint8Array): Promise<SendResult>;
@@ -5221,6 +5552,8 @@ export function createClient(
   _pendingConnectionRequestResolverCount: number;
   /** TEST-ONLY: evaluate call counter (only incremented when trackEvaluateCount=true). */
   _evaluateCallCount: number;
+  /** PERSIST-024: load all durable state from the SQLCipher DB and populate in-memory state. */
+  loadPersistedState(): Promise<void>;
 } {
   return new CelloClientImpl(
     node,
@@ -5240,6 +5573,7 @@ export function createClient(
     opts?.onConnectionPendingReview,
     opts?.crossCheckDirectoryOnInbound,
     opts?.logger,
+    opts?.persistence,
   ) as unknown as CelloClient & {
     sendRaw(peerPubkeyHex: string, bytes: Uint8Array): Promise<SendResult>;
     openRawStream(peerPubkeyHex: string): Promise<Stream>;
@@ -5279,6 +5613,7 @@ export function createClient(
     _injectConnectionFrame(frame: Record<string, unknown>): void;
     _pendingConnectionRequestResolverCount: number;
     _evaluateCallCount: number;
+    loadPersistedState(): Promise<void>;
   };
 }
 

@@ -5,6 +5,7 @@ export {
   InMemoryMlDsaKeyProvider,
   FileMlDsaKeyProvider,
   mlDsaKeygen,
+  mlDsaKeygenWithBytes,
   mlDsaSign,
   mlDsaVerify,
   mlDsaEnsureLoaded,
