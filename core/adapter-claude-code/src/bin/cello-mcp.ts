@@ -50,7 +50,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider } from "@cello-protocol/client";
+import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, deriveDbKey } from "@cello-protocol/client";
 import { LocalCloudStorageProvider } from "@cello-protocol/interfaces/stubs";
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
@@ -150,6 +150,13 @@ const backupLogger = {
     process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(ctx ?? {})}\n`),
 };
 
+// PERSIST-024 (CRIT-1): Derive dbKey for SQLCipher from identity key before zeroing.
+// The dbKey is derived via HKDF (RFC 5869) from the Ed25519 seed (SI-003: never stored).
+let dbKey: Uint8Array | null = null;
+if (identityKeyBytes) {
+  dbKey = deriveDbKey(identityKeyBytes, agentId);
+}
+
 let clientBackupInstance: ClientBackup | undefined;
 if (identityKeyBytes) {
   clientBackupInstance = new ClientBackup({
@@ -223,6 +230,36 @@ process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} C
   }
 }
 
+// PERSIST-024 (CRIT-1): Construct and open the SQLCipher store, then wire ClientStatePersistence.
+// dbKey is derived from identityKeyBytes before it is zeroed (see above).
+let clientPersistence: ClientStatePersistence | undefined;
+if (dbKey) {
+  try {
+    const store = new SQLCipherClientStore(dbKey, {
+      dbPath,
+      agentId,
+      env: celloEnv,
+      logger: backupLogger,
+    });
+    await store.open();
+    clientPersistence = new ClientStatePersistence({
+      store,
+      agentPubkey: agentId,
+      keyFilePath: keyPath,
+      logger: backupLogger,
+    });
+    await clientPersistence.upsertAgent();
+    process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
+    // Non-fatal: client continues without persistence
+    clientPersistence = undefined;
+  }
+} else {
+  process.stderr.write(`cello-mcp: persistence: identity key not available — SQLCipher store disabled\n`);
+}
+
 // Late-bound server reference — set after createMcpServer returns.
 // The closure captures the box; notifications fired before server is assigned are dropped.
 let mcpServer: McpServer | undefined;
@@ -231,6 +268,7 @@ let mcpServer: McpServer | undefined;
 const client = createClient(node, kp, {
   thresholdSigner,
   directoryEndpoint,
+  persistence: clientPersistence,
   onMessageQueued: (senderHex) => {
     if (mcpServer) void pushChannelNotification(mcpServer, senderHex);
   },
@@ -249,6 +287,10 @@ if (primaryPubkey) {
 // inside createMcpSessionServer (single canonical registration path).
 const server = createMcpSessionServer(node, client, kp, { clientBackup: clientBackupInstance });
 mcpServer = server;
+
+// PERSIST-024 (CRIT-1): Load persisted state before accepting any MCP tool calls.
+// This must happen before server.connect() so the first tool call sees restored state.
+await client.loadPersistedState();
 
 // Connect stdio transport and register handler
 await server.connect(new StdioServerTransport());

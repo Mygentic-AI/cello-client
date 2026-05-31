@@ -645,8 +645,10 @@ class CelloClientImpl implements CelloClient {
         return;
       }
 
-      // Reconstruct FrostThresholdSigner (config only — secret is in module-level store)
-      if (!this.#thresholdSigner && this.#directoryEndpoint) {
+      // Reconstruct FrostThresholdSigner (config only — secret is in module-level store).
+      // HIGH-1: directoryEndpoint is NOT required for construction — the signer can verify
+      // signatures even without a live directory. Pass undefined for directoryNodes.
+      if (!this.#thresholdSigner) {
         this.#thresholdSigner = new FrostThresholdSigner(
           {
             threshold: row.threshold,
@@ -671,6 +673,14 @@ class CelloClientImpl implements CelloClient {
       });
     }
 
+    // HIGH-3: emit alarm when registration exists but no FROST share found
+    if (!state.frostShare && state.registrationState) {
+      this.#logger.error("client.frost.share.missing", {
+        agentPubkey: state.registrationState.agent_pubkey,
+        reason: "no_active_share_in_db",
+      });
+    }
+
     // ── 2. ML-DSA keypair ─────────────────────────────────────────────────────
     if (state.mlDsaKeypair) {
       const row = state.mlDsaKeypair;
@@ -686,10 +696,11 @@ class CelloClientImpl implements CelloClient {
           agentPubkey: row.agent_pubkey,
           mlDsaPubkey: row.ml_dsa_pubkey,
         });
-      } catch {
+      } catch (err: unknown) {
         // Story specifies level: error for this event
         this.#logger.error("client.mldsa.load.failed", {
           agentPubkey: row.agent_pubkey,
+          reason: err instanceof Error ? err.message : String(err),
         });
       }
     }
@@ -799,6 +810,16 @@ class CelloClientImpl implements CelloClient {
 
       this.#sessions.set(sessionIdHex, record);
       this.#sessionMessageQueues.set(sessionIdHex, []);
+
+      // HIGH-4: emit alarm when loaded leaf count doesn't match sessions.leaf_count
+      if (leaves.length !== row.leaf_count) {
+        this.#logger.error("client.session.leaves.mismatch", {
+          agentPubkey: row.agent_pubkey,
+          sessionId: sessionIdHex,
+          expectedLeafCount: row.leaf_count,
+          actualLeafCount: leaves.length,
+        });
+      }
     }
 
     // ── 7. Peers ──────────────────────────────────────────────────────────────
@@ -3509,6 +3530,19 @@ class CelloClientImpl implements CelloClient {
         };
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
+        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        if (this.#persistence && mlDsaSecretKeyBlob) {
+          void this.#persistence.persistMlDsaKeypair({
+            mlDsaPubkey: mlDsaPubkeyHex,
+            secretKeyBlob: mlDsaSecretKeyBlob,
+          });
+          void this.#persistence.persistRegistrationState({
+            agentId: state.agent_id,
+            primaryPubkey: state.primary_pubkey,
+            mlDsaPubkey: state.ml_dsa_pubkey,
+            registeredAt: state.registered_at,
+          });
+        }
         return state;
       }
       return { error: reason };
@@ -3606,6 +3640,19 @@ class CelloClientImpl implements CelloClient {
         };
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
+        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        if (this.#persistence && mlDsaSecretKeyBlob) {
+          void this.#persistence.persistMlDsaKeypair({
+            mlDsaPubkey: mlDsaPubkeyHex,
+            secretKeyBlob: mlDsaSecretKeyBlob,
+          });
+          void this.#persistence.persistRegistrationState({
+            agentId: state.agent_id,
+            primaryPubkey: state.primary_pubkey,
+            mlDsaPubkey: state.ml_dsa_pubkey,
+            registeredAt: state.registered_at,
+          });
+        }
         return state;
       }
       return { error: reason };

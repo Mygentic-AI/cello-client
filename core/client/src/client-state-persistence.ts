@@ -444,7 +444,7 @@ export class ClientStatePersistence {
     s2Cbor: Uint8Array;
     sequenceNumber: number;
   }): Promise<void> {
-    await this.#store.run(
+    const result = await this.#store.run(
       `INSERT OR IGNORE INTO session_tree_leaves
        (session_id, agent_pubkey, leaf_index, leaf_kind, s2_cbor, sequence_number, accepted_at)
        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`,
@@ -453,13 +453,22 @@ export class ClientStatePersistence {
         opts.leafKind, Buffer.from(opts.s2Cbor), opts.sequenceNumber,
       ],
     );
-    this.#logger.debug("client.leaf.persisted", {
-      agentPubkey: this.#agentPubkey,
-      sessionId: opts.sessionIdHex,
-      leafIndex: opts.leafIndex,
-      leafKind: opts.leafKind,
-      sequenceNumber: opts.sequenceNumber,
-    });
+    // MED-3: INSERT OR IGNORE silently drops duplicates. Warn so duplicates are observable.
+    if (result.changes === 0) {
+      this.#logger.warn("client.leaf.duplicate", {
+        agentPubkey: this.#agentPubkey,
+        sessionId: opts.sessionIdHex,
+        leafIndex: opts.leafIndex,
+      });
+    } else {
+      this.#logger.debug("client.leaf.persisted", {
+        agentPubkey: this.#agentPubkey,
+        sessionId: opts.sessionIdHex,
+        leafIndex: opts.leafIndex,
+        leafKind: opts.leafKind,
+        sequenceNumber: opts.sequenceNumber,
+      });
+    }
   }
 
   /** Load all leaves for a session in order. */
@@ -603,17 +612,27 @@ export class ClientStatePersistence {
     );
   }
 
-  /** Remove from pending and insert into decided. */
+  /** Remove from pending and insert into decided (atomic — wrapped in a transaction). */
   async decidePendingConnectionRequest(requestId: string, decision: "accepted" | "rejected" | "more_disclosure"): Promise<void> {
-    await this.#store.run(
-      `DELETE FROM pending_connection_requests WHERE request_id = ? AND agent_pubkey = ?`,
-      [requestId, this.#agentPubkey],
-    );
-    await this.#store.run(
-      `INSERT OR IGNORE INTO decided_connection_requests (request_id, agent_pubkey, decision)
-       VALUES (?, ?, ?)`,
-      [requestId, this.#agentPubkey, decision],
-    );
+    // CRIT-2: Both operations must be atomic. A crash between DELETE and INSERT would leave
+    // the request invisible on restart (not in pending, not in decided), enabling double-decision
+    // on relay replay.
+    await this.#store.run("BEGIN");
+    try {
+      await this.#store.run(
+        `DELETE FROM pending_connection_requests WHERE request_id = ? AND agent_pubkey = ?`,
+        [requestId, this.#agentPubkey],
+      );
+      await this.#store.run(
+        `INSERT OR IGNORE INTO decided_connection_requests (request_id, agent_pubkey, decision)
+         VALUES (?, ?, ?)`,
+        [requestId, this.#agentPubkey, decision],
+      );
+      await this.#store.run("COMMIT");
+    } catch (err) {
+      await this.#store.run("ROLLBACK").catch(() => {});
+      throw err;
+    }
   }
 
   /** Load pending connection requests. */

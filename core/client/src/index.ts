@@ -1,4 +1,7 @@
 export { createClient } from "./client.js";
+export { SQLCipherClientStore } from "./sqlcipher-client-store.js";
+export type { SQLCipherClientStoreOptions } from "./sqlcipher-client-store.js";
+export { deriveDbKey } from "./db-key-derivation.js";
 export { ClientStatePersistence } from "./client-state-persistence.js";
 export type { ClientStatePersistenceOptions, FrostKeyShareRow, MlDsaKeypairRow, RegistrationStateRow, ConnectionRow, SessionRow, SessionTreeLeafRow, PeerRow, PendingHashRow } from "./client-state-persistence.js";
 export { S3CloudStorageProvider } from "./s3-cloud-storage-provider.js";
