@@ -338,8 +338,10 @@ if (dbKey) {
         process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
         process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
       } else {
-        process.stderr.write(`cello-mcp: Your platform may be missing build tools (e.g. Xcode Command Line Tools on macOS).\n`);
-        process.stderr.write(`cello-mcp: See https://github.com/Mygentic-AI/cello-client for setup instructions.\n`);
+        // macOS: Xcode Command Line Tools (~500MB) are required to compile SQLCipher.
+        process.stderr.write(`cello-mcp: Xcode Command Line Tools are required on macOS.\n`);
+        process.stderr.write(`cello-mcp: Run: xcode-select --install\n`);
+        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
       }
       process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
     } else {
