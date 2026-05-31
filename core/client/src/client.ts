@@ -507,6 +507,13 @@ class CelloClientImpl implements CelloClient {
   #endorsements: Array<Record<string, unknown>> = [];
   #attestations: Array<Record<string, unknown>> = [];
 
+  // ─── PERSIST-024 FINDING-4: pending hashes loaded on startup ────────────────
+  // These are populated by loadPersistedState() from the DB pending_hashes table.
+  // The caller (composition root) is responsible for passing them to AgentHashQueue
+  // so they are resubmitted to the relay on reconnect (AC-008).
+  // Access via getLoadedPendingHashes() after loadPersistedState() returns.
+  #loadedPendingHashes: Array<{ sessionId: string; hashHex: string; enqueuedAt: number }> = [];
+
   constructor(
     node: CelloNode,
     keyProvider: KeyProvider,
@@ -896,8 +903,47 @@ class CelloClientImpl implements CelloClient {
       this.#myPubkeyHex = state.registrationState.agent_pubkey;
     }
 
+    // ── PERSIST-024 FINDING-4: store loaded pending hashes for caller consumption ──
+    // The caller (composition root) must pass these to AgentHashQueue so they are
+    // resubmitted to the relay on reconnect (AC-008). CelloClientImpl does not hold
+    // an AgentHashQueue directly — that is a composition-root concern.
+    this.#loadedPendingHashes = state.pendingHashes.map((row) => ({
+      sessionId: row.session_id,
+      hashHex: row.hash_hex,
+      enqueuedAt: row.enqueued_at,
+    }));
+
     // M-5: upsertAgent at the END of startup so last_seen_at only reflects a fully successful boot.
     await p.upsertAgent();
+
+    // PERSIST-024 FINDING-3: emit client.startup.state.loaded AFTER all in-memory structures
+    // are populated. AC-013 requires this event to fire only after the full startup sequence.
+    // The event is not emitted by loadStartupState() (which only loads DB rows).
+    this.#logger.info("client.startup.state.loaded", {
+      agentPubkey: this.#myPubkeyHex ?? state.registrationState?.agent_pubkey ?? "unknown",
+      connectionCount: state.connectionCount,
+      sessionCount: state.sessionCount,
+      leafCount: state.leafCount,
+      pendingHashCount: state.pendingHashCount,
+      hasFrostShare: state.hasFrostShare,
+      hasMlDsaKeypair: state.hasMlDsaKeypair,
+      hasRegistration: state.hasRegistration,
+      hasPolicy: state.hasPolicy,
+    });
+  }
+
+  /**
+   * PERSIST-024 FINDING-4: Return the pending hashes loaded during startup.
+   *
+   * Call after loadPersistedState() to retrieve hashes that were pending relay
+   * submission when the agent last shut down. The composition root must pass these
+   * to AgentHashQueue.enqueue() so they are resubmitted to the relay on reconnect.
+   *
+   * Returns an empty array if loadPersistedState() has not yet been called, if
+   * no persistence is configured, or if no hashes were pending.
+   */
+  getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }> {
+    return this.#loadedPendingHashes;
   }
 
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
@@ -3126,6 +3172,9 @@ class CelloClientImpl implements CelloClient {
         // Own-send echo: fire the send lock release and advance own-seq tracker.
         // Do NOT enqueue into receiveMessage queues — callers don't "receive" their own sends.
         session.last_sent_seq = s2.sequence_number;
+        // PERSIST-024 FINDING-1: persist sequence counters after last_sent_seq mutation
+        // so a crash between leaf accepts does not leave the reloaded session with stale counters.
+        void this.#persistence?.persistSession(sessionIdHex, session);
         echo_resolve?.();
       } else {
         // last_seen_seq = highest counterparty relay seq confirmed on this session.
@@ -3136,6 +3185,9 @@ class CelloClientImpl implements CelloClient {
           // SESSION-003: non-initiator auto-response to counterparty's SEAL leaf.
           // Transition to sealing and submit our own SEAL leaf asynchronously.
           session.status = "sealing";
+          // PERSIST-024 FINDING-2: persist the responder's sealing status so a crash here
+          // does not reload the session as "active". Must happen after status mutation.
+          void this.#persistence?.persistSession(sessionIdHex, session);
           void this.#submitSealLeaf(sessionIdHex, session, "responder").then((result) => {
             if (!result.ok) {
               const s = this.#sessions.get(sessionIdHex);
@@ -3144,6 +3196,8 @@ class CelloClientImpl implements CelloClient {
           });
         } else {
           // Counterparty message: enqueue for receiveMessage callers.
+          // PERSIST-024 FINDING-1: persist sequence counters after last_seen_seq mutation.
+          void this.#persistence?.persistSession(sessionIdHex, session);
           const msg: ReceivedMessage = {
             type: "message",
             content: content_bytes,

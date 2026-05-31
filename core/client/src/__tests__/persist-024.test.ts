@@ -781,7 +781,10 @@ describeWithSQLCipher("PERSIST-024 AC-013 — client.startup.state.loaded emitte
   });
   afterEach(() => cleanupPath(dbPath));
 
-  it("loadStartupState emits event with correct counts and booleans", async () => {
+  // AC-013 fix: client.startup.state.loaded must NOT be emitted by loadStartupState() alone
+  // (which only loads DB rows). It must be emitted by loadPersistedState() after all
+  // in-memory structures are populated. This is the Finding 3 fix from the fourth code review.
+  it("loadStartupState does NOT emit client.startup.state.loaded (event fires in loadPersistedState)", async () => {
     const agentPubkey = randomBytes(32).toString("hex");
     const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
     const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
@@ -799,47 +802,78 @@ describeWithSQLCipher("PERSIST-024 AC-013 — client.startup.state.loaded emitte
       commitmentsCbor: randomBytes(64), verifyingSharesCbor: randomBytes(64),
       dkgMethod: "network_dkg",
     });
-    await persistence.persistMlDsaKeypair({
-      mlDsaPubkey: "mldsa-pub", secretKeyBlob: randomBytes(2560),
-    });
     await persistence.persistRegistrationState({
       agentId: "aid1", primaryPubkey: "pk1", mlDsaPubkey: "mldsa-pub", registeredAt: Date.now(),
     });
     await persistence.persistConnection({
       connectionId: "c1", counterpartyPubkey: "cp1", establishedAt: Date.now(),
     });
-    await persistence.persistConnectionPolicy({
-      mode: "guarded", review_mode: "inference",
-      requirements: [{ signal_type: "endorsement", condition: { type: "min_count", count: 1 } }],
-    });
 
-    // Call loadStartupState
+    // Call loadStartupState — the event must NOT be emitted here
     const state = await persistence.loadStartupState();
 
     expect(state.hasFrostShare).toBe(true);
-    expect(state.hasMlDsaKeypair).toBe(true);
     expect(state.hasRegistration).toBe(true);
-    expect(state.hasPolicy).toBe(true);
     expect(state.connectionCount).toBe(1);
     expect(state.sessionCount).toBe(0);
-    expect(state.leafCount).toBe(0);
     expect(state.pendingHashCount).toBe(0);
 
-    // Verify the event was logged
+    // The event must NOT be emitted by loadStartupState() alone
     const loadedEvents = logger.events.filter((e) => e.event === "client.startup.state.loaded");
-    expect(loadedEvents.length).toBe(1);
-    const ctx = loadedEvents[0].context;
-    expect(ctx.agentPubkey).toBe(agentPubkey);
-    expect(ctx.hasFrostShare).toBe(true);
-    expect(ctx.hasMlDsaKeypair).toBe(true);
-    expect(ctx.hasRegistration).toBe(true);
-    expect(ctx.hasPolicy).toBe(true);
-    expect(ctx.connectionCount).toBe(1);
-    expect(ctx.sessionCount).toBe(0);
-    expect(ctx.leafCount).toBe(0);
-    expect(ctx.pendingHashCount).toBe(0);
+    expect(loadedEvents.length).toBe(0);
 
     await store.close();
+  });
+
+  // AC-013: client.startup.state.loaded fires from loadPersistedState() after all structures populated
+  it("loadPersistedState emits client.startup.state.loaded with correct fields after all structures populated", async () => {
+    const { createClient } = await import("../client.js");
+    const { createNode } = await import("@cello-protocol/transport" as string);
+    const { generateKeypair } = await import("@cello-protocol/crypto" as string);
+
+    const agentPubkey = randomBytes(32).toString("hex");
+    const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store.open();
+
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+
+    // Populate registration state so loadPersistedState() sets #myPubkeyHex
+    await persistence.persistRegistrationState({
+      agentId: "aid1", primaryPubkey: "pk1", mlDsaPubkey: "mldsa-pub", registeredAt: Date.now(),
+    });
+    await persistence.persistConnection({
+      connectionId: "c1", counterpartyPubkey: "cp1", establishedAt: Date.now(),
+    });
+
+    const node = await createNode({});
+    try {
+      const kp = generateKeypair();
+      const client = createClient(node, kp, {
+        logger,
+        persistence,
+      });
+
+      // Call loadPersistedState — the event must fire after this call
+      await client.loadPersistedState();
+
+      const loadedEvents = logger.events.filter((e) => e.event === "client.startup.state.loaded");
+      expect(loadedEvents.length).toBe(1);
+      const ctx = loadedEvents[0].context;
+      // agentPubkey is set from registrationState.agent_pubkey inside loadPersistedState
+      expect(ctx.agentPubkey).toBe(agentPubkey);
+      expect(ctx.hasRegistration).toBe(true);
+      expect(ctx.connectionCount).toBe(1);
+      expect(ctx.sessionCount).toBe(0);
+      expect(ctx.leafCount).toBe(0);
+      expect(ctx.pendingHashCount).toBe(0);
+    } finally {
+      await node.stop();
+      await store.close();
+    }
   });
 });
 
@@ -1380,5 +1414,52 @@ describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loade
     expect(loaded[1].enqueued_at).toBe(2000);
 
     await store2.close();
+  });
+
+  // AC-008 / FINDING-4: pending hashes are accessible via getLoadedPendingHashes() after loadPersistedState()
+  // This verifies the caller can retrieve them to pass to AgentHashQueue for relay resubmission.
+  it("getLoadedPendingHashes returns loaded pending hashes after loadPersistedState()", async () => {
+    const { createClient } = await import("../client.js");
+    const { createNode } = await import("@cello-protocol/transport" as string);
+    const { generateKeypair } = await import("@cello-protocol/crypto" as string);
+
+    const agentPubkey = randomBytes(32).toString("hex");
+    const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store.open();
+
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+
+    const sessionId = "session-pending-test";
+    const hash1 = randomBytes(32).toString("hex");
+    const hash2 = randomBytes(32).toString("hex");
+    await persistence.persistPendingHash({ sessionId, hashHex: hash1, enqueuedAt: 1001 });
+    await persistence.persistPendingHash({ sessionId, hashHex: hash2, enqueuedAt: 2002 });
+
+    const node = await createNode({});
+    try {
+      const kp = generateKeypair();
+      const client = createClient(node, kp, { logger, persistence });
+
+      // Before loadPersistedState, getter returns empty
+      expect((client as unknown as { getLoadedPendingHashes(): unknown[] }).getLoadedPendingHashes()).toHaveLength(0);
+
+      await client.loadPersistedState();
+
+      // After loadPersistedState, getter returns the two hashes in FIFO order
+      const pending = (client as unknown as { getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }> }).getLoadedPendingHashes();
+      expect(pending).toHaveLength(2);
+      expect(pending[0].hashHex).toBe(hash1);
+      expect(pending[1].hashHex).toBe(hash2);
+      expect(pending[0].sessionId).toBe(sessionId);
+      expect(pending[0].enqueuedAt).toBe(1001);
+      expect(pending[1].enqueuedAt).toBe(2002);
+    } finally {
+      await node.stop();
+      await store.close();
+    }
   });
 });

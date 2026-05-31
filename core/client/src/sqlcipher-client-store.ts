@@ -329,11 +329,11 @@ export class SQLCipherClientStore implements ClientStore {
     // PERSIST-024: Emit batch-level V2 summary event
     if (v2Applied) {
       const executionTimeMs = Date.now() - v2StartTime;
-      // MED-2: tableCount must match the number of tables defined in V2__client_schema_structured.sql.
-      // If the V2 migration is modified, update this constant to match.
+      // MED-2: tableCount must match the number of CREATE TABLE statements in
+      // V2__client_schema_structured.sql. If that migration is modified, update this number.
       this.#logger.info("client.db.v2.migration.applied", {
         agentPubkey: this.#agentId,
-        tableCount: 18,
+        tableCount: 18, // must equal CREATE TABLE count in V2__client_schema_structured.sql
         executionTimeMs,
       });
     } else if (appliedVersions.has("V2__client_schema_structured")) {

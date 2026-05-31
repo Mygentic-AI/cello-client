@@ -741,7 +741,10 @@ export class ClientStatePersistence {
       leafCount += s.leaf_count;
     }
 
-    const result = {
+    // NOTE: client.startup.state.loaded is NOT emitted here.
+    // It is emitted by CelloClientImpl.loadPersistedState() after all in-memory structures
+    // have been populated — AC-013 requires the event to fire only after that point.
+    return {
       hasFrostShare: frostShare !== undefined,
       hasMlDsaKeypair: mlDsaKeypair !== undefined,
       hasRegistration: registrationState !== undefined,
@@ -763,19 +766,5 @@ export class ClientStatePersistence {
       endorsements,
       attestations,
     };
-
-    this.#logger.info("client.startup.state.loaded", {
-      agentPubkey: this.#agentPubkey,
-      connectionCount: result.connectionCount,
-      sessionCount: result.sessionCount,
-      leafCount: result.leafCount,
-      pendingHashCount: result.pendingHashCount,
-      hasFrostShare: result.hasFrostShare,
-      hasMlDsaKeypair: result.hasMlDsaKeypair,
-      hasRegistration: result.hasRegistration,
-      hasPolicy: result.hasPolicy,
-    });
-
-    return result;
   }
 }
