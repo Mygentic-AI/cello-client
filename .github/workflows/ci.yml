@@ -96,10 +96,12 @@ jobs:
       - name: Publish to npm (tags only)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          # Set the tag: 'latest' for stable, 'beta' for pre-release tags (*-beta*).
-          TAG="latest"
-          if [[ "${{ github.ref_name }}" == *"-beta"* ]]; then
-            TAG="beta"
+          # Always publish to 'beta' until M6-E2E-001 AC-008 explicitly promotes to latest.
+          # Rule: only a tag of exactly vX.Y.Z (no pre-release suffix) publishes to 'latest'.
+          # Any tag with a suffix (-beta, -rc, etc.) publishes to 'beta'.
+          TAG="beta"
+          if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            TAG="latest"
           fi
           echo "Publishing with tag: $TAG"
 
