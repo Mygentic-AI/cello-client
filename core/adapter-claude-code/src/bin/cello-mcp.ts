@@ -50,8 +50,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, deriveDbKey } from "@cello-protocol/client";
-import { LocalCloudStorageProvider } from "@cello-protocol/interfaces/stubs";
+import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, AgentHashQueue, deriveDbKey } from "@cello-protocol/client";
+import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/interfaces/stubs";
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
 import { resolveDirectoryUrl } from "../config.js";
@@ -157,6 +157,11 @@ if (identityKeyBytes) {
   dbKey = deriveDbKey(identityKeyBytes, agentId);
 }
 
+// PERSIST-024 (MED-2): clientPersistence is declared later (after SQLCipher store opens).
+// The setMetadata callback closes over the variable reference so it picks up the value
+// that is assigned later, at the point backup() is actually called.
+let clientPersistenceRef: ClientStatePersistence | undefined;
+
 let clientBackupInstance: ClientBackup | undefined;
 if (identityKeyBytes) {
   clientBackupInstance = new ClientBackup({
@@ -166,6 +171,40 @@ if (identityKeyBytes) {
     cloudStorage: cloudStorageForBackup,
     logger: backupLogger,
     destinationType: celloEnv === "local" ? "local" : (backupS3Bucket ? "s3" : "local"),
+    // PERSIST-024 (MED-2): persist backup metadata to structured DB table after successful upload.
+    setMetadata: async (_key: string, value: Uint8Array) => {
+      if (!clientPersistenceRef) return;
+      try {
+        const meta = JSON.parse(Buffer.from(value).toString("utf8")) as {
+          timestamp: number;
+          destinationUrl: string;
+          checksum: string;
+        };
+        await clientPersistenceRef.persistBackupMetadata({
+          completedAt: new Date(meta.timestamp).toISOString(),
+          destinationUrl: meta.destinationUrl,
+          checksum: meta.checksum,
+        });
+      } catch {
+        // Non-fatal: metadata write failure does not affect the backup blob
+      }
+    },
+    // PERSIST-024 (MED-2): read backup metadata from structured DB table for restore.
+    getMetadata: async (_key: string): Promise<Uint8Array | undefined> => {
+      if (!clientPersistenceRef) return undefined;
+      try {
+        const row = await clientPersistenceRef.loadBackupMetadata();
+        if (!row) return undefined;
+        const meta = {
+          timestamp: new Date(row.completed_at).getTime(),
+          destinationUrl: row.destination_url,
+          checksum: row.checksum,
+        };
+        return new Uint8Array(Buffer.from(JSON.stringify(meta), "utf8"));
+      } catch {
+        return undefined;
+      }
+    },
   });
   // Zero the identity key bytes immediately after construction — it must not linger in memory (SI-001)
   identityKeyBytes.fill(0);
@@ -249,6 +288,8 @@ if (dbKey) {
       keyFilePath: keyPath,
       logger: backupLogger,
     });
+    // PERSIST-024 (MED-2): expose to backup setMetadata/getMetadata callbacks (late binding)
+    clientPersistenceRef = clientPersistence;
     // Note: upsertAgent() is NOT called here. loadPersistedState() calls it after all
     // state loading completes — that is the authoritative call site that updates last_seen_at
     // only on a fully successful startup.
@@ -296,16 +337,21 @@ mcpServer = server;
 // This must happen before server.connect() so the first tool call sees restored state.
 await client.loadPersistedState();
 
-// PERSIST-024: Pending hashes are persisted in the `pending_hashes` SQL table by
-// ClientStatePersistence (loaded above via client.loadPersistedState()). The
-// AgentHashQueue KV-based persistence is superseded by that SQL table — re-enqueueing
-// through AgentHashQueue at startup is wrong and crashes because SQLCipherClientStore.set()
-// throws unconditionally after the V2 migration. The relay resubmission mechanism reads
-// client.getLoadedPendingHashes() when reconnecting to the relay; no action is needed here.
+// PERSIST-024 AC-008: Build an in-memory AgentHashQueue and populate it from the pending_hashes
+// DB table. Using LocalClientStore (in-memory) avoids the SQLCipherClientStore.set() throw.
+// The queue is wired into the client so #reconnectRelayStream can check it on relay reconnect.
 const loadedPendingHashes = client.getLoadedPendingHashes();
+const hashQueue = new AgentHashQueue({
+  store: new LocalClientStore(),
+  agentId,
+  logger: backupLogger,
+});
 if (loadedPendingHashes.length > 0) {
-  process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded from DB — relay resubmission will occur on reconnect\n`);
+  await hashQueue.loadPending(loadedPendingHashes);
+  process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded into AgentHashQueue — relay resubmission will occur on reconnect\n`);
 }
+// Wire queue into client so relay reconnect can access pending hashes (AC-008)
+(client as unknown as { setHashQueue(q: AgentHashQueue): void }).setHashQueue(hashQueue);
 
 // Connect stdio transport and register handler
 await server.connect(new StdioServerTransport());

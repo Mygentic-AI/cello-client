@@ -27,6 +27,8 @@ import { randomBytes } from "node:crypto";
 import { rmSync, mkdirSync, existsSync } from "node:fs";
 import { Encoder } from "cbor-x";
 import { deriveDbKey } from "../db-key-derivation.js";
+import { AgentHashQueue } from "../agent-hash-queue.js";
+import { LocalClientStore } from "@cello-protocol/interfaces/stubs";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -1376,10 +1378,10 @@ describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loade
   });
   afterEach(() => cleanupPath(dbPath));
 
-  // M-4: This test verifies the persistence precondition (hashes survive restart in FIFO order).
-  // The relay resubmission behavior (AgentHashQueue loading pending hashes and resubmitting to
-  // relay on reconnect) is integration-tested in the e2e-tests package where a real relay is
-  // available — it cannot be meaningfully unit-tested here without a live relay node.
+  // AC-008: Hashes survive restart in FIFO order AND are enqueued in AgentHashQueue.
+  // Verifies the full AC-008 persistence + enqueueing contract:
+  //   1. pending_hashes rows survive restart in FIFO order
+  //   2. loadPending() populates AgentHashQueue so getPending() returns them
   it("pending hashes survive restart in FIFO order", async () => {
     const agentPubkey = randomBytes(32).toString("hex");
     const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
@@ -1412,6 +1414,25 @@ describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loade
     expect(loaded[1].hash_hex).toBe(hash2);
     expect(loaded[0].enqueued_at).toBe(1000);
     expect(loaded[1].enqueued_at).toBe(2000);
+
+    // AC-008 core: loaded hashes must be enqueueable into AgentHashQueue via loadPending().
+    // After loadPending(), getPending(sessionId) must return them in FIFO order.
+    const queue = new AgentHashQueue({
+      store: new LocalClientStore(),
+      agentId: agentPubkey,
+      logger,
+    });
+    await queue.loadPending(loaded.map((r) => ({
+      sessionId: r.session_id,
+      hashHex: r.hash_hex,
+      enqueuedAt: r.enqueued_at,
+    })));
+    const pending = await queue.getPending(sessionId);
+    expect(pending).toHaveLength(2);
+    expect(pending[0].hashHex).toBe(hash1);
+    expect(pending[1].hashHex).toBe(hash2);
+    expect(pending[0].enqueuedAt).toBe(1000);
+    expect(pending[1].enqueuedAt).toBe(2000);
 
     await store2.close();
   });

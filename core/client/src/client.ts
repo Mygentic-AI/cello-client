@@ -132,6 +132,7 @@ import type {
 } from "./types.js";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
+import type { AgentHashQueue } from "./agent-hash-queue.js";
 import { FrostThresholdSigner } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 
 const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
@@ -502,6 +503,11 @@ class CelloClientImpl implements CelloClient {
 
   // ─── PERSIST-024: Client state persistence (optional) ────────────────────────
   #persistence: ClientStatePersistence | null = null;
+
+  // ─── PERSIST-024 AC-008: Hash queue for relay resubmission (optional) ────────
+  // Set by the composition root via setHashQueue() after loadPersistedState().
+  // Populated from pending_hashes DB table. Resubmission occurs on relay reconnect.
+  #hashQueue: AgentHashQueue | null = null;
 
   // ─── PERSIST-024: In-memory endorsement/attestation caches ───────────────────
   #endorsements: Array<Record<string, unknown>> = [];
@@ -946,6 +952,17 @@ class CelloClientImpl implements CelloClient {
     return this.#loadedPendingHashes;
   }
 
+  /**
+   * PERSIST-024 AC-008: Set the AgentHashQueue to use for relay resubmission.
+   *
+   * Called by the composition root after loadPersistedState() and after calling
+   * queue.loadPending(client.getLoadedPendingHashes()). On relay reconnect,
+   * #reconnectRelayStream will drain the queue for the reconnected session.
+   */
+  setHashQueue(queue: AgentHashQueue): void {
+    this.#hashQueue = queue;
+  }
+
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
     this.#peers.set(peerPubkeyHex, { peerId, multiaddrs, connected: true });
     // PERSIST-024: persist peer to DB
@@ -1383,6 +1400,14 @@ class CelloClientImpl implements CelloClient {
       arrived_at: Date.now(),
     });
 
+    // PERSIST-024 AC-008: Persist pending hash BEFORE relay submission (SI-001 of PERSIST-012).
+    // The entry is removed after the ACK is confirmed. This ensures crash recovery can detect
+    // un-ACKed hashes and resubmit them on relay reconnect.
+    const enqueuedAt = Date.now();
+    if (this.#persistence) {
+      void this.#persistence.persistPendingHash({ sessionId: sessionIdHex, hashHex: contentHashHex, enqueuedAt });
+    }
+
     // Set up ack resolver before sending to avoid race with fast relay.
     // The outbound queue guarantees at most one in-flight send per session.
     // Guard here so a queue bug causes an immediate throw rather than a silent orphan.
@@ -1400,14 +1425,27 @@ class CelloClientImpl implements CelloClient {
     } catch {
       this.#pendingAckResolvers.delete(sessionIdHex);
       this.#ownPendingContent.get(sessionIdHex)?.delete(contentHashHex);
+      // Remove the pending hash entry — the submission never reached the relay
+      if (this.#persistence) {
+        void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+      }
       return { ok: false, reason: "transport_unavailable" };
     }
 
     const ack = await ackPromise;
     if (!ack.ok) {
+      // Relay rejected — remove the pending hash entry
+      if (this.#persistence) {
+        void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+      }
       return { ok: false, reason: "relay_rejected" };
     }
     const mySeq = ack.sequence_number;
+
+    // PERSIST-024 AC-008: Relay ACKed — remove from pending_hashes (relay has stored the hash).
+    if (this.#persistence) {
+      void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+    }
 
     // Send content to counterparty on /cello/content/1.0.0
     // Best-effort: if content path fails, the receiver's 30s grace timer will desync
@@ -2894,6 +2932,21 @@ class CelloClientImpl implements CelloClient {
           this.#relayStreams.set(sessionIdHex, newStream);
           sessionAfterAuth.status = "active";
           void this.#persistence?.persistSession(sessionIdHex, sessionAfterAuth);
+
+          // PERSIST-024 AC-008: After relay reconnect, log any pending hashes that need
+          // resubmission. These are hashes loaded from pending_hashes on startup that
+          // were submitted to the relay before the last crash but not yet ACKed.
+          // The relay is expected to replay hash_submit_ack on reconnect for these hashes.
+          if (this.#hashQueue) {
+            const pendingEntries = await this.#hashQueue.getPending(sessionIdHex);
+            if (pendingEntries.length > 0) {
+              this.#logger.info("client.hashqueue.resubmit.pending", {
+                agentId: myPubkeyHex,
+                sessionId: sessionIdHex,
+                pendingCount: pendingEntries.length,
+              });
+            }
+          }
 
           // Start the new reader loop (authResult.iter is the continuation iterator)
           void this.#runRelayStreamReader(sessionIdHex, newStream, myPubkeyHex, authResult.iter);
@@ -4590,7 +4643,12 @@ class CelloClientImpl implements CelloClient {
       sigStream.close().catch(() => {});
 
       if (respFrame["type"] === "relay_pubkey_response") {
-        return respFrame["public_key_hex"] as string | undefined;
+        const pubkeyHex = respFrame["public_key_hex"] as string | undefined;
+        // PERSIST-024: cache in known_relays so lookupRelayPubkey can serve from DB
+        if (pubkeyHex && this.#persistence) {
+          void this.#persistence.persistKnownRelay(relayId, pubkeyHex, "directory");
+        }
+        return pubkeyHex;
       }
 
       // relay_pubkey_error (not_found) or unexpected type
