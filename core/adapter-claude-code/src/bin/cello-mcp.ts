@@ -49,8 +49,6 @@ import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
-import { bootstrapKeyShares } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
-import { createInProcessStubs } from "@cello-protocol/crypto/frost/stubs.js";
 import { createNode } from "@cello-protocol/transport";
 import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider } from "@cello-protocol/client";
 import { LocalCloudStorageProvider } from "@cello-protocol/interfaces/stubs";
