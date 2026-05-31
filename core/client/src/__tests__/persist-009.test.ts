@@ -171,10 +171,13 @@ describeWithSQLCipher("PERSIST-009 AC-002 — SQLCipher encryption opacity", () 
     const dbPath = makeTmpDbPath();
 
     try {
-      // Write a record with the correct key
+      // Write a record with the correct key (use structured table after V2)
       const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-opacity-test", logger });
       await store.open();
-      await store.set("secret", new Uint8Array([42, 99]));
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-1", "abcd", "test"],
+      );
       await store.close();
 
       // Now attempt to open with a different (wrong) key
@@ -198,8 +201,11 @@ describeWithSQLCipher("PERSIST-009 AC-002 — SQLCipher encryption opacity", () 
 
       const recoveredStore = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-opacity-test", logger });
       await recoveredStore.open();
-      const recovered = await recoveredStore.get("secret");
-      expect(recovered).toEqual(new Uint8Array([42, 99]));
+      const rows = await recoveredStore.allRows<{ relay_id: string }>(
+        `SELECT relay_id FROM known_relays WHERE relay_id = ?`, ["relay-1"],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].relay_id).toBe("relay-1");
       await recoveredStore.close();
     } finally {
       cleanupPath(dbPath);
@@ -215,7 +221,10 @@ describeWithSQLCipher("PERSIST-009 AC-002 — SQLCipher encryption opacity", () 
       // Create an encrypted database
       const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-plaintext-check", logger });
       await store.open();
-      await store.set("k", new Uint8Array([1, 2, 3]));
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-1", "abcd", "test"],
+      );
       await store.close();
 
       // Attempt to read as plain SQLite (empty/null key)
@@ -239,57 +248,66 @@ describeWithSQLCipher("PERSIST-009 AC-003 — Persistence across restarts", () =
     cleanupPath(dbPath);
   });
 
-  it("5 records written, new store instance reads all 5 back", async () => {
+  it("5 records written to structured tables, new store instance reads all 5 back", async () => {
     const logger = makeSpyLogger();
     const dbKey = deriveDbKey(randomBytes(32), "agent-persistence-test");
-    const records: Array<{ key: string; value: Uint8Array }> = [
-      { key: "session:aaa", value: new Uint8Array([1, 2, 3]) },
-      { key: "session:bbb", value: new Uint8Array([4, 5, 6]) },
-      { key: "trust:ccc", value: new Uint8Array([7, 8, 9]) },
-      { key: "key_material:ddd", value: new Uint8Array([10, 11, 12]) },
-      { key: "session:eee", value: new Uint8Array([13, 14, 15, 16]) },
-    ];
 
-    // Write all 5 records
+    // Write 5 known_relays records (structured table available after V2)
     const storeA = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-persistence-test", logger });
     await storeA.open();
-    for (const r of records) {
-      await storeA.set(r.key, r.value);
+    for (let i = 0; i < 5; i++) {
+      await storeA.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        [`relay-${i}`, `pubkey-${i}`, "test"],
+      );
     }
     await storeA.close();
 
     // "Restart" — new instance, same key and path
     const storeB = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-persistence-test", logger });
     await storeB.open();
-    for (const r of records) {
-      const retrieved = await storeB.get(r.key);
-      expect(retrieved).toEqual(r.value);
+    const rows = await storeB.allRows<{ relay_id: string }>(`SELECT relay_id FROM known_relays ORDER BY relay_id`);
+    expect(rows.length).toBe(5);
+    for (let i = 0; i < 5; i++) {
+      expect(rows[i].relay_id).toBe(`relay-${i}`);
     }
     await storeB.close();
   });
 
-  it("set overwrites existing value", async () => {
+  it("INSERT OR REPLACE overwrites existing value", async () => {
     const logger = makeSpyLogger();
     const dbKey = deriveDbKey(randomBytes(32), "agent-overwrite-test");
     const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-overwrite-test", logger });
     await store.open();
-    await store.set("mykey", new Uint8Array([1]));
-    await store.set("mykey", new Uint8Array([2, 3]));
-    const val = await store.get("mykey");
-    expect(val).toEqual(new Uint8Array([2, 3]));
+    await store.run(
+      `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+      ["relay-x", "pub-1", "test"],
+    );
+    await store.run(
+      `INSERT OR REPLACE INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+      ["relay-x", "pub-2", "test"],
+    );
+    const row = await store.getRow<{ relay_pubkey_hex: string }>(
+      `SELECT relay_pubkey_hex FROM known_relays WHERE relay_id = ?`, ["relay-x"],
+    );
+    expect(row!.relay_pubkey_hex).toBe("pub-2");
     await store.close();
   });
 
-  it("delete removes the record", async () => {
+  it("DELETE removes the record", async () => {
     const logger = makeSpyLogger();
     const dbKey = deriveDbKey(randomBytes(32), "agent-delete-test");
     const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-delete-test", logger });
     await store.open();
-    await store.set("delme", new Uint8Array([5, 6, 7]));
-    expect(await store.has("delme")).toBe(true);
-    await store.delete("delme");
-    expect(await store.has("delme")).toBe(false);
-    expect(await store.get("delme")).toBeUndefined();
+    await store.run(
+      `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+      ["relay-del", "pub", "test"],
+    );
+    const before = await store.getRow(`SELECT 1 as x FROM known_relays WHERE relay_id = ?`, ["relay-del"]);
+    expect(before).toBeDefined();
+    await store.run(`DELETE FROM known_relays WHERE relay_id = ?`, ["relay-del"]);
+    const after = await store.getRow(`SELECT 1 as x FROM known_relays WHERE relay_id = ?`, ["relay-del"]);
+    expect(after).toBeUndefined();
     await store.close();
   });
 });
@@ -363,42 +381,36 @@ describeWithSQLCipher("PERSIST-009 AC-006 — Observability", () => {
 });
 
 describeWithSQLCipher("PERSIST-009 AC-007 — Migration runner", () => {
-  it("schema_migrations table exists and has a V1 entry after open (verified via persistence)", async () => {
-    // Verify indirectly: write 5 records, open a new instance on the same file,
-    // assert all 5 records are readable. If migration did not run, the client_store
-    // table would not exist and all reads would fail.
+  it("schema_migrations table exists and has V1+V2 entries after open (verified via persistence)", async () => {
+    // Verify: write records to a structured table, re-open, read them back.
     const dbPath = makeTmpDbPath();
     const logger = makeSpyLogger();
     const dbKey = deriveDbKey(randomBytes(32), "agent-migration-schema-test");
-    const records: Array<{ key: string; value: Uint8Array }> = [
-      { key: "ac007:a", value: new Uint8Array([10]) },
-      { key: "ac007:b", value: new Uint8Array([20]) },
-      { key: "ac007:c", value: new Uint8Array([30]) },
-      { key: "ac007:d", value: new Uint8Array([40]) },
-      { key: "ac007:e", value: new Uint8Array([50]) },
-    ];
 
     try {
-      // Write records with storeA
+      // Write records with storeA (using structured known_relays table)
       const storeA = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-migration-schema-test", logger });
       await storeA.open();
-      for (const r of records) {
-        await storeA.set(r.key, r.value);
+      for (let i = 0; i < 5; i++) {
+        await storeA.run(
+          `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+          [`relay-${i}`, `pub-${i}`, "test"],
+        );
       }
       await storeA.close();
 
-      // Read back with storeB — proves V1 migration applied correctly
+      // Read back with storeB — proves V2 migration applied correctly
       const storeB = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-migration-schema-test", logger });
       await storeB.open();
-      for (const r of records) {
-        const retrieved = await storeB.get(r.key);
-        expect(retrieved).toEqual(r.value);
-      }
+      const rows = await storeB.allRows<{ relay_id: string }>(
+        `SELECT relay_id FROM known_relays ORDER BY relay_id`,
+      );
+      expect(rows.length).toBe(5);
       await storeB.close();
 
-      // Also verify that V1 migration.applied log event was fired on first open
+      // Verify migration.applied log events
       const migrationEvents = logger.events.filter((e) => e.event === "client.store.migration.applied");
-      expect(migrationEvents.length).toBeGreaterThanOrEqual(1);
+      expect(migrationEvents.length).toBeGreaterThanOrEqual(2); // V1 and V2
       expect(migrationEvents[0].context.version).toMatch(/^V1/);
     } finally {
       cleanupPath(dbPath);
@@ -420,7 +432,10 @@ describeWithSQLCipher("PERSIST-009 SI-001 — db_key never in logs", () => {
 
     try {
       await store.open();
-      await store.set("k", new Uint8Array([1]));
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-1", "pub", "test"],
+      );
       await store.close();
     } finally {
       cleanupPath(dbPath);
@@ -441,7 +456,10 @@ describeWithSQLCipher("PERSIST-009 SI-001 — db_key never in logs", () => {
     const goodKey = deriveDbKey(randomBytes(32), "agent-si001-fail");
     const goodStore = new SQLCipherClientStore(goodKey, { dbPath, agentId: "agent-si001-fail", logger });
     await goodStore.open();
-    await goodStore.set("k", new Uint8Array([1]));
+    await goodStore.run(
+      `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+      ["relay-1", "pub", "test"],
+    );
     await goodStore.close();
 
     // Now try with wrong key — triggers client.store.open.failed
@@ -525,7 +543,10 @@ describeWithSQLCipher("PERSIST-009 SI-003 — No weakening PRAGMA cipher setting
     try {
       const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-si003-opaque", logger });
       await store.open();
-      await store.set("probe", new Uint8Array([1, 2, 3]));
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-1", "pub", "test"],
+      );
       await store.close();
 
       // Attempt with zero key — must fail
@@ -644,7 +665,10 @@ describeWithSQLCipher("PERSIST-009 SI-002 — identity_key != db_key (adversaria
         logger,
       });
       await store.open();
-      await store.set("si002-record", new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-si002", "pub", "test"],
+      );
       await store.close();
 
       // Step 4: attempt to open the SAME file using identity_key_A directly as the db_key.
@@ -686,7 +710,10 @@ describeWithSQLCipher("PERSIST-009 DB-001 — halt on corrupt/wrong-key; no over
       // Write original data with the correct key
       const storeA = new SQLCipherClientStore(correctKey, { dbPath, agentId: "agent-db001-test", logger });
       await storeA.open();
-      await storeA.set("original", new Uint8Array([0x01, 0x02, 0x03]));
+      await storeA.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        ["relay-orig", "pub-orig", "test"],
+      );
       await storeA.close();
 
       // Attempt open with wrong key — must fail
@@ -700,8 +727,11 @@ describeWithSQLCipher("PERSIST-009 DB-001 — halt on corrupt/wrong-key; no over
       // File not overwritten: re-open with the correct key and assert original data intact
       const storeB = new SQLCipherClientStore(correctKey, { dbPath, agentId: "agent-db001-test", logger });
       await storeB.open();
-      const retrieved = await storeB.get("original");
-      expect(retrieved).toEqual(new Uint8Array([0x01, 0x02, 0x03]));
+      const row = await storeB.getRow<{ relay_pubkey_hex: string }>(
+        `SELECT relay_pubkey_hex FROM known_relays WHERE relay_id = ?`, ["relay-orig"],
+      );
+      expect(row).toBeDefined();
+      expect(row!.relay_pubkey_hex).toBe("pub-orig");
       await storeB.close();
     } finally {
       cleanupPath(dbPath);

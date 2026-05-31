@@ -218,20 +218,10 @@ process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} C
     } catch (err: unknown) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack}` : JSON.stringify(err);
       process.stderr.write(`cello-mcp: FROST bootstrap FAILED: ${msg}\n`);
-      process.stderr.write(`cello-mcp: falling back to in-process stubs\n`);
-      const stubs = createInProcessStubs(3);
-      const ownPubkeyFresh = await kp.getPublicKey();
-      const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
-      thresholdSigner = new FrostThresholdSigner({ threshold: 2, participants: 3, directoryNodeStubs: stubs }, ownPubkeyFresh);
-      primaryPubkey = bootstrapResult.primaryPubkey;
+      process.stderr.write(`cello-mcp: continuing without threshold signer (already-registered agents use persistent signaling stream)\n`);
     }
   } else {
-    // No directory multiaddr configured — use in-process stubs
-    const stubs = createInProcessStubs(3);
-    const ownPubkeyFresh = await kp.getPublicKey();
-    const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
-    thresholdSigner = new FrostThresholdSigner({ threshold: 2, participants: 3, directoryNodeStubs: stubs }, ownPubkeyFresh);
-    primaryPubkey = bootstrapResult.primaryPubkey;
+    process.stderr.write(`cello-mcp: no directory multiaddr configured — threshold signing unavailable\n`);
   }
 }
 

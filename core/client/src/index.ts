@@ -1,4 +1,6 @@
 export { createClient } from "./client.js";
+export { ClientStatePersistence } from "./client-state-persistence.js";
+export type { ClientStatePersistenceOptions, FrostKeyShareRow, MlDsaKeypairRow, RegistrationStateRow, ConnectionRow, SessionRow, SessionTreeLeafRow, PeerRow, PendingHashRow } from "./client-state-persistence.js";
 export { S3CloudStorageProvider } from "./s3-cloud-storage-provider.js";
 export type { S3CloudStorageConfig } from "./s3-cloud-storage-provider.js";
 export {
