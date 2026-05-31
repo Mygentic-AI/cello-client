@@ -17,7 +17,7 @@
  *   directory cannot feed a bad multiaddr to the FROST bootstrap.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { fetchBootstrapMultiaddr } from "../config.js";
 
 const VALID_MULTIADDR = "/dns4/directory-us1.cello.mygentic.ai/tcp/80/ws/p2p/12D3KooWTestPeerId0000";
@@ -95,6 +95,20 @@ describe("fetchBootstrapMultiaddr: trailing-slash URL", () => {
     const result = await fetchBootstrapMultiaddr("http://localhost:9090/", mockFetch as typeof fetch);
     expect(calledUrl).toBe("http://localhost:9090/bootstrap");
     expect(result).toBe(VALID_MULTIADDR);
+  });
+});
+
+// ─── Finding 3: resp.json() abort/hang path ───────────────────────────────────
+
+describe("fetchBootstrapMultiaddr: body-read abort", () => {
+  it("returns null when resp.json() throws AbortError (body read hangs past timeout)", async () => {
+    const abortError = Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockRejectedValue(abortError),
+    } as unknown as Response);
+    const result = await fetchBootstrapMultiaddr("http://localhost:9090", mockFetch as unknown as typeof fetch);
+    expect(result).toBeNull();
   });
 });
 

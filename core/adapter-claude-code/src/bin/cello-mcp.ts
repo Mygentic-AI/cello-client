@@ -8,7 +8,7 @@
  * Environment variables:
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
- *   CELLO_DIRECTORY_URL       Production directory HTTP endpoint (default: https://directory-us1.cello.mygentic.ai)
+ *   CELLO_DIRECTORY_URL       Production directory HTTP endpoint (default: http://directory-us1.cello.mygentic.ai)
  *                             Overridable for local/staging deployments. Relay multiaddr is
  *                             dynamically assigned per-session — no relay constant is baked in.
  *   CELLO_DIRECTORY_MULTIADDR Directory libp2p multiaddr (optional; used when dialing libp2p directly)
