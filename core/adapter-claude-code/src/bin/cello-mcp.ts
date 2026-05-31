@@ -50,7 +50,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, deriveDbKey, AgentHashQueue } from "@cello-protocol/client";
+import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, deriveDbKey } from "@cello-protocol/client";
 import { LocalCloudStorageProvider } from "@cello-protocol/interfaces/stubs";
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
@@ -296,22 +296,15 @@ mcpServer = server;
 // This must happen before server.connect() so the first tool call sees restored state.
 await client.loadPersistedState();
 
-// PERSIST-024 FINDING-1 (AC-008): Re-enqueue hashes that were pending relay submission
-// when the agent last shut down. The AgentHashQueue persists pending hashes so they survive
-// restarts. Without this step the relay resubmission mechanism never sees them.
-if (sqlCipherStore) {
-  const hashQueue = new AgentHashQueue({
-    store: sqlCipherStore,
-    agentId,
-    logger: backupLogger,
-  });
-  const pendingHashes = client.getLoadedPendingHashes();
-  if (pendingHashes.length > 0) {
-    process.stderr.write(`cello-mcp: resubmitting ${pendingHashes.length} pending hash(es) loaded from DB\n`);
-    for (const { sessionId, hashHex } of pendingHashes) {
-      await hashQueue.enqueue(sessionId, hashHex, sessionId);
-    }
-  }
+// PERSIST-024: Pending hashes are persisted in the `pending_hashes` SQL table by
+// ClientStatePersistence (loaded above via client.loadPersistedState()). The
+// AgentHashQueue KV-based persistence is superseded by that SQL table — re-enqueueing
+// through AgentHashQueue at startup is wrong and crashes because SQLCipherClientStore.set()
+// throws unconditionally after the V2 migration. The relay resubmission mechanism reads
+// client.getLoadedPendingHashes() when reconnecting to the relay; no action is needed here.
+const loadedPendingHashes = client.getLoadedPendingHashes();
+if (loadedPendingHashes.length > 0) {
+  process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded from DB — relay resubmission will occur on reconnect\n`);
 }
 
 // Connect stdio transport and register handler
