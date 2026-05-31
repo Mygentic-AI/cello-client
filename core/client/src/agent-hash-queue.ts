@@ -204,6 +204,38 @@ export class AgentHashQueue {
     this.#hashQueueMaxAgeMs = opts.hashQueueMaxAgeMs ?? 24 * 60 * 60 * 1000;
   }
 
+  // ─── Startup load ─────────────────────────────────────────────────────────
+
+  /**
+   * PERSIST-024 AC-008: Pre-populate the queue from hashes loaded out of the
+   * pending_hashes SQL table on startup.
+   *
+   * Unlike enqueue(), this method does NOT emit log events and does NOT call
+   * ClientStatePersistence — the entries are already durable in the SQL table.
+   * It writes them directly into the backing ClientStore so that getPending()
+   * and pollDepth() see them, and so that subsequent relay reconnect can
+   * resubmit them.
+   *
+   * Must be called AFTER loadPersistedState() and BEFORE relay reconnect (AC-008).
+   *
+   * @param entries - hashes loaded from pending_hashes for this agent
+   */
+  async loadPending(entries: Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>): Promise<void> {
+    // Group by sessionId for efficient batch writes
+    const bySession = new Map<string, PendingHashEntry[]>();
+    for (const e of entries) {
+      const list = bySession.get(e.sessionId) ?? [];
+      list.push({ sessionId: e.sessionId, hashHex: e.hashHex, enqueuedAt: e.enqueuedAt });
+      bySession.set(e.sessionId, list);
+    }
+    for (const [sessionId, pendingEntries] of bySession) {
+      // Add session to the sessions index so pollDepth() and #loadAllPending() see it
+      await this.#addToSessionsIndex(sessionId);
+      // Write the pending entries directly to the store
+      await this.#savePending(sessionId, pendingEntries);
+    }
+  }
+
   // ─── Enqueue ───────────────────────────────────────────────────────────────
 
   /**

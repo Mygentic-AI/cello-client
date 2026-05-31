@@ -287,6 +287,25 @@ export async function mlDsaKeygen(): Promise<InMemoryMlDsaKeyProvider> {
 }
 
 /**
+ * PERSIST-024: Generate a new ML-DSA-44 keypair and return both the provider
+ * and the raw secret key bytes for DB persistence.
+ *
+ * SI-002: the returned secretKeyBlob must never appear in any log event.
+ * Callers are responsible for zeroing secretKeyBlob after persistence completes.
+ */
+export async function mlDsaKeygenWithBytes(): Promise<{
+  provider: InMemoryMlDsaKeyProvider;
+  secretKeyBlob: Uint8Array;
+}> {
+  const wasm = await _getWasm();
+  const { publicKey, secretKey } = wasm.generateKeyPair();
+  return {
+    provider: new InMemoryMlDsaKeyProvider(publicKey, secretKey),
+    secretKeyBlob: new Uint8Array(secretKey),
+  };
+}
+
+/**
  * Sign a message with an ML-DSA-44 secret key.
  * Returns a 2420-byte signature.
  *

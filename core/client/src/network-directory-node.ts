@@ -541,7 +541,17 @@ export async function runNetworkDkg(
     /** OPS-AGENT-001: Pre-authorization token to present in Round 1 frame. */
     preAuthToken?: string;
   },
-): Promise<{ signer: FrostThresholdSigner; primaryPubkey: Uint8Array }> {
+): Promise<{
+  signer: FrostThresholdSigner;
+  primaryPubkey: Uint8Array;
+  /** PERSIST-024: serializable FROST share data for DB persistence. SI-001: never log signingShare. */
+  signingShare: Uint8Array;
+  identifier: string;
+  commitments: Uint8Array[];
+  verifyingShares: Record<string, Uint8Array>;
+  threshold: number;
+  participants: number;
+}> {
   const agentPubkeyHex = Buffer.from(agentPubkey).toString("hex");
   // Client identifier: same derivation as used in bootstrapKeyShares for consistency
   const clientIdStr = `client:${agentPubkeyHex}`;
@@ -687,5 +697,23 @@ export async function runNetworkDkg(
     agentPubkey,
   );
 
-  return { signer, primaryPubkey };
+  // PERSIST-024: extract serializable FROST share data for DB persistence (SI-001: never log signingShare)
+  const serializedSecret = clientKey.secret as unknown as { identifier: string; signingShare: Uint8Array };
+  const serializedPub = clientKey.public as unknown as {
+    commitments: Uint8Array[];
+    verifyingShares: Record<string, Uint8Array>;
+  };
+
+  return {
+    signer,
+    primaryPubkey,
+    signingShare: new Uint8Array(serializedSecret.signingShare),
+    identifier: serializedSecret.identifier,
+    commitments: serializedPub.commitments.map((c) => new Uint8Array(c)),
+    verifyingShares: Object.fromEntries(
+      Object.entries(serializedPub.verifyingShares).map(([k, v]) => [k, new Uint8Array(v)])
+    ),
+    threshold: opts.threshold,
+    participants: opts.participants,
+  };
 }

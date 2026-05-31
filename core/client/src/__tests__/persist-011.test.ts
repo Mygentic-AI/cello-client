@@ -305,14 +305,17 @@ describeWithSQLCipher("PERSIST-011 AC-003 — full restore roundtrip with SQLCip
     const store = new SQLCipherClientStore(dbKey, { dbPath, agentId, logger });
     await store.open();
 
-    const testRecords = [
-      { key: "session:001", value: new Uint8Array([1, 2, 3, 4]) },
-      { key: "trust:002", value: new Uint8Array([5, 6, 7, 8]) },
-      { key: "merkle:003", value: new Uint8Array([9, 10, 11, 12]) },
+    const testRelays = [
+      { relay_id: "relay-001", relay_pubkey_hex: "pub1", source: "test" },
+      { relay_id: "relay-002", relay_pubkey_hex: "pub2", source: "test" },
+      { relay_id: "relay-003", relay_pubkey_hex: "pub3", source: "test" },
     ];
 
-    for (const record of testRecords) {
-      await store.set(record.key, record.value);
+    for (const r of testRelays) {
+      await store.run(
+        `INSERT INTO known_relays (relay_id, relay_pubkey_hex, source) VALUES (?, ?, ?)`,
+        [r.relay_id, r.relay_pubkey_hex, r.source],
+      );
     }
     await store.close();
 
@@ -334,16 +337,19 @@ describeWithSQLCipher("PERSIST-011 AC-003 — full restore roundtrip with SQLCip
         });
         await verifyStore.open();
 
-        // Verify all test records are present and match expected values
-        for (const record of testRecords) {
-          const retrieved = await verifyStore.get(record.key);
-          if (retrieved === undefined) {
+        // Verify all test relay records are present
+        for (const relay of testRelays) {
+          const rows = await verifyStore.allRows<{ relay_pubkey_hex: string }>(
+            `SELECT relay_pubkey_hex FROM known_relays WHERE relay_id = ?`,
+            [relay.relay_id],
+          );
+          if (rows.length === 0) {
             await verifyStore.close();
-            throw new Error(`Record ${record.key} not found after restore`);
+            throw new Error(`Relay ${relay.relay_id} not found after restore`);
           }
-          if (Buffer.compare(Buffer.from(retrieved), Buffer.from(record.value)) !== 0) {
+          if (rows[0].relay_pubkey_hex !== relay.relay_pubkey_hex) {
             await verifyStore.close();
-            throw new Error(`Record ${record.key} value mismatch after restore`);
+            throw new Error(`Relay ${relay.relay_id} value mismatch after restore`);
           }
         }
 
@@ -366,10 +372,13 @@ describeWithSQLCipher("PERSIST-011 AC-003 — full restore roundtrip with SQLCip
     const finalStore = new SQLCipherClientStore(dbKey, { dbPath, agentId, logger });
     await finalStore.open();
 
-    for (const record of testRecords) {
-      const retrieved = await finalStore.get(record.key);
-      expect(retrieved).toBeDefined();
-      expect(Buffer.from(retrieved!)).toEqual(Buffer.from(record.value));
+    for (const relay of testRelays) {
+      const rows = await finalStore.allRows<{ relay_pubkey_hex: string }>(
+        `SELECT relay_pubkey_hex FROM known_relays WHERE relay_id = ?`,
+        [relay.relay_id],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].relay_pubkey_hex).toBe(relay.relay_pubkey_hex);
     }
 
     await finalStore.close();

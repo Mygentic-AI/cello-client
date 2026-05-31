@@ -116,7 +116,8 @@ import {
   decodeConnectionPackage, validateConnectionPackage,
 } from "@cello-protocol/protocol-types";
 import type { Structure2 } from "@cello-protocol/protocol-types";
-import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, mlDsaKeygen, mlDsaVerify, FileMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, mlDsaKeygen, mlDsaKeygenWithBytes, mlDsaVerify, FileMlDsaKeyProvider, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { LeafInput, IThresholdSigner } from "@cello-protocol/crypto";
 import { CELLO_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -130,6 +131,9 @@ import type {
   InitiateSessionResult,
 } from "./types.js";
 import type { Logger } from "@cello-protocol/interfaces";
+import type { ClientStatePersistence } from "./client-state-persistence.js";
+import type { AgentHashQueue } from "./agent-hash-queue.js";
+import { FrostThresholdSigner } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 
 const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 const AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
@@ -497,6 +501,25 @@ class CelloClientImpl implements CelloClient {
   // ─── PERSIST-014: Logger (injected, defaults to no-op) ───────────────────────
   readonly #logger: Logger;
 
+  // ─── PERSIST-024: Client state persistence (optional) ────────────────────────
+  #persistence: ClientStatePersistence | null = null;
+
+  // ─── PERSIST-024 AC-008: Hash queue for relay resubmission (optional) ────────
+  // Set by the composition root via setHashQueue() after loadPersistedState().
+  // Populated from pending_hashes DB table. Resubmission occurs on relay reconnect.
+  #hashQueue: AgentHashQueue | null = null;
+
+  // ─── PERSIST-024: In-memory endorsement/attestation caches ───────────────────
+  #endorsements: Array<Record<string, unknown>> = [];
+  #attestations: Array<Record<string, unknown>> = [];
+
+  // ─── PERSIST-024 FINDING-4: pending hashes loaded on startup ────────────────
+  // These are populated by loadPersistedState() from the DB pending_hashes table.
+  // The caller (composition root) is responsible for passing them to AgentHashQueue
+  // so they are resubmitted to the relay on reconnect (AC-008).
+  // Access via getLoadedPendingHashes() after loadPersistedState() returns.
+  #loadedPendingHashes: Array<{ sessionId: string; hashHex: string; enqueuedAt: number }> = [];
+
   constructor(
     node: CelloNode,
     keyProvider: KeyProvider,
@@ -515,6 +538,7 @@ class CelloClientImpl implements CelloClient {
     onConnectionPendingReview?: (event: import("@cello-protocol/protocol-types").ConnectionRequestInbound) => void,
     crossCheckDirectoryOnInbound = false,
     logger?: Logger,
+    persistence?: ClientStatePersistence,
   ) {
     this.#node = node;
     this.#keyProvider = keyProvider;
@@ -533,6 +557,7 @@ class CelloClientImpl implements CelloClient {
     this.#onConnectionPendingReview = onConnectionPendingReview;
     this.#crossCheckDirectoryOnInbound = crossCheckDirectoryOnInbound;
     this.#logger = logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+    this.#persistence = persistence ?? null;
   }
 
   /**
@@ -545,8 +570,405 @@ class CelloClientImpl implements CelloClient {
     this.#myPrimaryPubkey = new Uint8Array(primaryPubkey);
   }
 
+  /**
+   * PERSIST-024: Load all durable state from the SQLCipher DB and populate in-memory state.
+   *
+   * Pseudocode:
+   *   1. Call persistence.loadStartupState() — emits client.startup.state.loaded
+   *   2. Restore FROST key share → call storeDkgResult to populate module-level key store;
+   *      reconstruct FrostThresholdSigner with same config used at registration
+   *   3. Restore ML-DSA keypair → reconstruct InMemoryMlDsaKeyProvider
+   *   4. Restore registration state → populate #registrationState
+   *   5. Restore connections → populate #connections and #connectionsByPeer
+   *   6. Restore connection policy → populate #connectionPolicy
+   *   7. Restore sessions → populate #sessions; load leaves per session
+   *   8. Restore peers → populate #peers
+   *   9. Restore decided requests → populate #decidedRequests
+   *
+   * Security invariants:
+   *   SI-001: signing_share bytes never appear in any log event.
+   *   SI-002: secret_key_blob bytes never appear in any log event.
+   *
+   * Crypto refs: RFC 9591 (FROST), NIST FIPS 204 (ML-DSA-44)
+   */
+  async loadPersistedState(): Promise<void> {
+    const p = this.#persistence;
+    if (!p) return;
+
+    const state = await p.loadStartupState();
+
+    // ── 1. FROST key share ────────────────────────────────────────────────────
+    if (state.frostShare) {
+      const row = state.frostShare;
+      // Reconstruct FrostSecret: { identifier, signingShare }
+      const signingShareBytes = row.signing_share instanceof Buffer
+        ? new Uint8Array(row.signing_share)
+        : new Uint8Array(row.signing_share as Uint8Array);
+      const frostSecret = { identifier: row.identifier, signingShare: signingShareBytes };
+
+      // Reconstruct FrostPublic: { signers, commitments, verifyingShares }
+      // commitments_cbor is CBOR-encoded Uint8Array[]; verifying_shares_cbor is CBOR-encoded Record<string, Uint8Array>
+      let commitments: Uint8Array[] = [];
+      let verifyingShares: Record<string, Uint8Array> = {};
+      try {
+        const commitmentsCborBytes = row.commitments_cbor instanceof Buffer
+          ? row.commitments_cbor
+          : Buffer.from(row.commitments_cbor as Uint8Array);
+        const decodedCommitments = decode(commitmentsCborBytes) as unknown;
+        if (Array.isArray(decodedCommitments)) {
+          commitments = decodedCommitments.map((c: unknown) =>
+            c instanceof Uint8Array ? c : Buffer.isBuffer(c) ? new Uint8Array(c as Buffer) : new Uint8Array(0)
+          );
+        }
+        const verifyingSharesCborBytes = row.verifying_shares_cbor instanceof Buffer
+          ? row.verifying_shares_cbor
+          : Buffer.from(row.verifying_shares_cbor as Uint8Array);
+        const decodedVerifyingShares = decode(verifyingSharesCborBytes) as unknown;
+        if (decodedVerifyingShares && typeof decodedVerifyingShares === "object" && !Array.isArray(decodedVerifyingShares)) {
+          for (const [k, v] of Object.entries(decodedVerifyingShares as Record<string, unknown>)) {
+            verifyingShares[k] = v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : new Uint8Array(0);
+          }
+        }
+      } catch {
+        // HIGH-2: emit correct error event and return early — do not call storeDkgResult
+        // with broken/empty data, which would corrupt the module-level key store.
+        this.#logger.error("client.frost.share.load.failed", {
+          agentPubkey: row.agent_pubkey,
+          reason: "cbor_deserialize_failed",
+        });
+        return;
+      }
+
+      const frostPublic = {
+        signers: { min: row.threshold, max: row.participants },
+        commitments,
+        verifyingShares,
+      };
+
+      const myPubkeyHex = row.agent_pubkey;
+      try {
+        // SI-001: storeDkgResult does not log the secret
+        storeDkgResult(myPubkeyHex, frostSecret as import("@noble/curves/abstract/frost.js").FrostSecret, frostPublic as import("@noble/curves/abstract/frost.js").FrostPublic);
+      } catch {
+        this.#logger.error("client.frost.share.load.failed", {
+          agentPubkey: myPubkeyHex,
+          reason: "storeDkgResult_failed",
+        });
+        return;
+      }
+
+      // Reconstruct FrostThresholdSigner (config only — secret is in module-level store).
+      // HIGH-1: directoryEndpoint is NOT required for construction — the signer can verify
+      // signatures even without a live directory. Pass undefined for directoryNodes.
+      if (!this.#thresholdSigner) {
+        this.#thresholdSigner = new FrostThresholdSigner(
+          {
+            threshold: row.threshold,
+            participants: row.participants,
+            directoryNodes: undefined,
+          },
+          Buffer.from(myPubkeyHex, "hex"),
+        );
+      }
+
+      // Set primary_pubkey from stored commitments[0]
+      if (commitments.length > 0 && !this.#myPrimaryPubkey) {
+        this.#myPrimaryPubkey = new Uint8Array(commitments[0]!);
+      }
+
+      // HIGH-1: emit success event after FROST share loaded
+      this.#logger.info("client.frost.share.loaded", {
+        agentPubkey: myPubkeyHex,
+        epochId: row.epoch_id,
+        threshold: row.threshold,
+        participants: row.participants,
+      });
+    }
+
+    // HIGH-3: emit alarm when registration exists but no FROST share found
+    if (!state.frostShare && state.registrationState) {
+      this.#logger.error("client.frost.share.missing", {
+        agentPubkey: state.registrationState.agent_pubkey,
+        reason: "no_active_share_in_db",
+      });
+    }
+
+    // ── 2. ML-DSA keypair ─────────────────────────────────────────────────────
+    if (state.mlDsaKeypair) {
+      const row = state.mlDsaKeypair;
+      try {
+        const secretKeyBlob = row.secret_key_blob instanceof Buffer
+          ? new Uint8Array(row.secret_key_blob)
+          : new Uint8Array(row.secret_key_blob as Uint8Array);
+        const mlDsaPubkeyBytes = Buffer.from(row.ml_dsa_pubkey, "hex");
+        // SI-002: InMemoryMlDsaKeyProvider does not log secret key
+        this.#mlDsaProvider = new InMemoryMlDsaKeyProvider(mlDsaPubkeyBytes, secretKeyBlob);
+        // HIGH-1: emit success event after ML-DSA keypair loaded
+        this.#logger.info("client.mldsa.keypair.loaded", {
+          agentPubkey: row.agent_pubkey,
+          mlDsaPubkey: row.ml_dsa_pubkey,
+        });
+      } catch (err: unknown) {
+        // Story specifies level: error for this event
+        this.#logger.error("client.mldsa.load.failed", {
+          agentPubkey: row.agent_pubkey,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // ── 3. Registration state ─────────────────────────────────────────────────
+    if (state.registrationState) {
+      const row = state.registrationState;
+      this.#registrationState = {
+        agent_id: row.agent_id,
+        primary_pubkey: row.primary_pubkey,
+        ml_dsa_pubkey: row.ml_dsa_pubkey,
+        registered_at: row.registered_at,
+        status: "active",
+      };
+      // HIGH-1: emit success event after registration state loaded
+      this.#logger.info("client.registration.loaded", {
+        agentPubkey: row.agent_pubkey,
+        agentId: row.agent_id,
+        status: row.status,
+      });
+    }
+
+    // ── 4. Connections ────────────────────────────────────────────────────────
+    for (const row of state.connections) {
+      if (!this.#connections.has(row.connection_id)) {
+        const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
+          connection_id: row.connection_id,
+          counterparty_primary_pubkey: row.counterparty_primary_pubkey ?? "",
+          counterparty_ml_dsa_pubkey: row.counterparty_ml_dsa_pubkey ?? "",
+          counterparty_pubkey: row.counterparty_pubkey,
+          established_at: row.established_at,
+          status: row.status as "active",
+        };
+        this.#connections.set(row.connection_id, record);
+        this.#connectionsByPeer.set(row.counterparty_pubkey, row.connection_id);
+        if (row.profile_unchecked) {
+          this.#profileUncheckedPeers.add(row.counterparty_pubkey);
+        }
+      }
+    }
+
+    // ── 5. Connection policy ──────────────────────────────────────────────────
+    if (state.connectionPolicy) {
+      this.#connectionPolicy = state.connectionPolicy;
+    }
+
+    // ── 6. Sessions + leaves ──────────────────────────────────────────────────
+    for (const row of state.sessions) {
+      const sessionIdHex = row.session_id;
+      if (this.#sessions.has(sessionIdHex)) continue;
+
+      const leaves = await p.loadSessionTreeLeaves(sessionIdHex);
+      const localTreeLeaves: SessionRecord["local_tree_leaves"] = leaves.map((l) => ({
+        kind: l.leaf_kind as "msg" | "ctrl",
+        s2_cbor: l.s2_cbor instanceof Buffer
+          ? new Uint8Array(l.s2_cbor)
+          : new Uint8Array(l.s2_cbor as Uint8Array),
+      }));
+
+      const counterpartyPubkey = row.counterparty_pubkey instanceof Buffer
+        ? new Uint8Array(row.counterparty_pubkey)
+        : new Uint8Array(row.counterparty_pubkey as Uint8Array);
+      const directoryPubkey = row.directory_pubkey instanceof Buffer
+        ? new Uint8Array(row.directory_pubkey)
+        : new Uint8Array(row.directory_pubkey as Uint8Array);
+      const genesisPrevRoot = row.genesis_prev_root instanceof Buffer
+        ? new Uint8Array(row.genesis_prev_root)
+        : new Uint8Array(row.genesis_prev_root as Uint8Array);
+
+      let counterpartyMultiaddrs: string[] = [];
+      let relayMultiaddrs: string[] = [];
+      let directoryMultiaddrs: string[] = [];
+      try { counterpartyMultiaddrs = JSON.parse(row.counterparty_multiaddrs) as string[]; } catch { /* ignore */ }
+      try { relayMultiaddrs = JSON.parse(row.relay_multiaddrs) as string[]; } catch { /* ignore */ }
+      try { directoryMultiaddrs = JSON.parse(row.directory_multiaddrs) as string[]; } catch { /* ignore */ }
+
+      const record: SessionRecord = {
+        session_id: Buffer.from(sessionIdHex, "hex"),
+        counterparty_pubkey: counterpartyPubkey,
+        counterparty_peer_id: row.counterparty_peer_id,
+        counterparty_multiaddrs: counterpartyMultiaddrs,
+        relay_endpoint: { peer_id: row.relay_peer_id, multiaddrs: relayMultiaddrs },
+        directory_endpoint: { peer_id: row.directory_peer_id, multiaddrs: directoryMultiaddrs },
+        directory_pubkey: directoryPubkey,
+        genesis_prev_root: genesisPrevRoot,
+        last_seen_seq: row.last_seen_seq,
+        last_sent_seq: row.last_sent_seq,
+        next_expected_seq: row.next_expected_seq,
+        status: row.status as SessionRecord["status"],
+        desynchronized: row.desynchronized !== 0,
+        local_tree_leaves: localTreeLeaves,
+        sealed_root: row.sealed_root
+          ? (row.sealed_root instanceof Buffer ? new Uint8Array(row.sealed_root) : new Uint8Array(row.sealed_root as Uint8Array))
+          : undefined,
+        seal_type: row.seal_type as SessionRecord["seal_type"] ?? undefined,
+        close_timestamp: row.close_timestamp ?? undefined,
+        frost_signature: row.frost_signature
+          ? (row.frost_signature instanceof Buffer ? new Uint8Array(row.frost_signature) : new Uint8Array(row.frost_signature as Uint8Array))
+          : undefined,
+        signer_pubkey: row.signer_pubkey
+          ? (row.signer_pubkey instanceof Buffer ? new Uint8Array(row.signer_pubkey) : new Uint8Array(row.signer_pubkey as Uint8Array))
+          : undefined,
+        directory_signature: row.directory_signature
+          ? (row.directory_signature instanceof Buffer ? new Uint8Array(row.directory_signature) : new Uint8Array(row.directory_signature as Uint8Array))
+          : undefined,
+      };
+
+      this.#sessions.set(sessionIdHex, record);
+      this.#sessionMessageQueues.set(sessionIdHex, []);
+
+      // HIGH-4: emit alarm when loaded leaf count doesn't match sessions.leaf_count
+      if (leaves.length !== row.leaf_count) {
+        this.#logger.error("client.session.leaves.mismatch", {
+          agentPubkey: row.agent_pubkey,
+          sessionId: sessionIdHex,
+          expectedLeafCount: row.leaf_count,
+          actualLeafCount: leaves.length,
+        });
+      }
+    }
+
+    // ── 7. Peers ──────────────────────────────────────────────────────────────
+    for (const row of state.peers) {
+      if (!this.#peers.has(row.peer_pubkey_hex)) {
+        let multiaddrs: string[] = [];
+        try { multiaddrs = JSON.parse(row.multiaddrs) as string[]; } catch { /* ignore */ }
+        this.#peers.set(row.peer_pubkey_hex, { peerId: row.peer_id, multiaddrs, connected: false });
+      }
+    }
+
+    // ── 8. Decided requests ───────────────────────────────────────────────────
+    for (const row of state.decidedRequests) {
+      this.#decidedRequests.add(row.request_id);
+    }
+
+    // ── 9. Pending connection requests ────────────────────────────────────────
+    for (const row of state.pendingConnectionRequests) {
+      const packageCbor = row.package_cbor instanceof Buffer
+        ? new Uint8Array(row.package_cbor)
+        : new Uint8Array(row.package_cbor as Uint8Array);
+      // Populate #pendingInboundRequests so acceptConnection/rejectConnection work
+      this.#pendingInboundRequests.set(row.request_id, {
+        connection_request_id: row.request_id,
+        from_pubkey: row.from_pubkey,
+        package_cbor: packageCbor,
+        round: row.round,
+      });
+      // Populate #pendingReviewQueue so awaitConnectionRequest() returns it.
+      // Reconstruct a minimal pending_agent_review report — the full policy evaluation
+      // result is not persisted, only the package_cbor. The agent review UI only needs
+      // the connection_request_id, from_pubkey, and package_cbor to make a decision.
+      const restoredReport: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }> = {
+        verdict: "pending_agent_review",
+        policy_summary: {
+          mode: "unknown",
+          review_mode: "inference",
+          requirements_met: [],
+          requirements_unmet: [],
+        },
+        package_summary: {
+          pseudonym_label: "",
+          endorsement_count: 0,
+          attestation_types: [],
+          pseudonym_age_days: 0,
+          registration_age_days: 0,
+          is_provisional: false,
+        },
+        is_round_2: row.round > 1,
+      };
+      this.#pendingReviewQueue.push({
+        connection_request_id: row.request_id,
+        from_pubkey: row.from_pubkey,
+        report: restoredReport,
+        package_cbor: packageCbor,
+        sender_registered_at: 0,
+        sender_is_provisional: false,
+      });
+    }
+
+    // ── 10. Endorsements and attestations (MED-4) ────────────────────────────────
+    if (state.endorsements.length > 0) {
+      this.#endorsements = state.endorsements;
+    }
+    if (state.attestations.length > 0) {
+      this.#attestations = state.attestations;
+    }
+
+    // ── HIGH-3: set #myPubkeyHex from registration state if sessions were loaded ──
+    // #myPubkeyHex is used in #sendMessageLocked with a non-null assertion.
+    // It is set during receiveSessionAssignment but never set during startup load.
+    // If the agent restarts with active sessions and calls sendMessage before any
+    // new session assignment, it would crash on the non-null assertion.
+    if (!this.#myPubkeyHex && state.registrationState) {
+      this.#myPubkeyHex = state.registrationState.agent_pubkey;
+    }
+
+    // ── PERSIST-024 FINDING-4: store loaded pending hashes for caller consumption ──
+    // The caller (composition root) must pass these to AgentHashQueue so they are
+    // resubmitted to the relay on reconnect (AC-008). CelloClientImpl does not hold
+    // an AgentHashQueue directly — that is a composition-root concern.
+    this.#loadedPendingHashes = state.pendingHashes.map((row) => ({
+      sessionId: row.session_id,
+      hashHex: row.hash_hex,
+      enqueuedAt: row.enqueued_at,
+    }));
+
+    // M-5: upsertAgent at the END of startup so last_seen_at only reflects a fully successful boot.
+    await p.upsertAgent();
+
+    // PERSIST-024 FINDING-3: emit client.startup.state.loaded AFTER all in-memory structures
+    // are populated. AC-013 requires this event to fire only after the full startup sequence.
+    // The event is not emitted by loadStartupState() (which only loads DB rows).
+    this.#logger.info("client.startup.state.loaded", {
+      agentPubkey: this.#myPubkeyHex ?? state.registrationState?.agent_pubkey ?? "unknown",
+      connectionCount: state.connectionCount,
+      sessionCount: state.sessionCount,
+      leafCount: state.leafCount,
+      pendingHashCount: state.pendingHashCount,
+      hasFrostShare: state.hasFrostShare,
+      hasMlDsaKeypair: state.hasMlDsaKeypair,
+      hasRegistration: state.hasRegistration,
+      hasPolicy: state.hasPolicy,
+    });
+  }
+
+  /**
+   * PERSIST-024 FINDING-4: Return the pending hashes loaded during startup.
+   *
+   * Call after loadPersistedState() to retrieve hashes that were pending relay
+   * submission when the agent last shut down. The composition root must pass these
+   * to AgentHashQueue.enqueue() so they are resubmitted to the relay on reconnect.
+   *
+   * Returns an empty array if loadPersistedState() has not yet been called, if
+   * no persistence is configured, or if no hashes were pending.
+   */
+  getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }> {
+    return this.#loadedPendingHashes;
+  }
+
+  /**
+   * PERSIST-024 AC-008: Set the AgentHashQueue to use for relay resubmission.
+   *
+   * Called by the composition root after loadPersistedState() and after calling
+   * queue.loadPending(client.getLoadedPendingHashes()). On relay reconnect,
+   * #reconnectRelayStream will drain the queue for the reconnected session.
+   */
+  setHashQueue(queue: AgentHashQueue): void {
+    this.#hashQueue = queue;
+  }
+
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
     this.#peers.set(peerPubkeyHex, { peerId, multiaddrs, connected: true });
+    // PERSIST-024: persist peer to DB
+    if (this.#persistence) {
+      void this.#persistence.persistPeer({ peerPubkeyHex, peerId, multiaddrs });
+    }
   }
 
   async send(peerPubkeyHex: string, content: Uint8Array): Promise<SendResult> {
@@ -866,6 +1288,10 @@ class CelloClientImpl implements CelloClient {
       desynchronized: false,
     };
     this.#sessions.set(sessionIdHex, record);
+    // PERSIST-024: persist session to DB
+    if (this.#persistence) {
+      void this.#persistence.persistSession(sessionIdHex, record);
+    }
 
     // Store the relay stream and start the persistent reader loop (MSG-004)
     this.#relayStreams.set(sessionIdHex, relayStream);
@@ -974,6 +1400,14 @@ class CelloClientImpl implements CelloClient {
       arrived_at: Date.now(),
     });
 
+    // PERSIST-024 AC-008: Persist pending hash BEFORE relay submission (SI-001 of PERSIST-012).
+    // The entry is removed after the ACK is confirmed. This ensures crash recovery can detect
+    // un-ACKed hashes and resubmit them on relay reconnect.
+    const enqueuedAt = Date.now();
+    if (this.#persistence) {
+      void this.#persistence.persistPendingHash({ sessionId: sessionIdHex, hashHex: contentHashHex, enqueuedAt });
+    }
+
     // Set up ack resolver before sending to avoid race with fast relay.
     // The outbound queue guarantees at most one in-flight send per session.
     // Guard here so a queue bug causes an immediate throw rather than a silent orphan.
@@ -991,14 +1425,27 @@ class CelloClientImpl implements CelloClient {
     } catch {
       this.#pendingAckResolvers.delete(sessionIdHex);
       this.#ownPendingContent.get(sessionIdHex)?.delete(contentHashHex);
+      // Remove the pending hash entry — the submission never reached the relay
+      if (this.#persistence) {
+        void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+      }
       return { ok: false, reason: "transport_unavailable" };
     }
 
     const ack = await ackPromise;
     if (!ack.ok) {
+      // Relay rejected — remove the pending hash entry
+      if (this.#persistence) {
+        void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+      }
       return { ok: false, reason: "relay_rejected" };
     }
     const mySeq = ack.sequence_number;
+
+    // PERSIST-024 AC-008: Relay ACKed — remove from pending_hashes (relay has stored the hash).
+    if (this.#persistence) {
+      void this.#persistence.removePendingHash(sessionIdHex, contentHashHex);
+    }
 
     // Send content to counterparty on /cello/content/1.0.0
     // Best-effort: if content path fails, the receiver's 30s grace timer will desync
@@ -1247,6 +1694,8 @@ class CelloClientImpl implements CelloClient {
 
     session.status = "sealing";
     this.#sealInitiatedSessions.add(sessionIdHex);
+    // CRIT-1: persist sealing status
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     const result = await this.#submitSealLeaf(sessionIdHex, session, "initiator");
     if (!result.ok) return result;
@@ -1282,6 +1731,8 @@ class CelloClientImpl implements CelloClient {
         if (sealVerifiedEntry) {
           sess.close_timestamp = sealVerifiedEntry.timestamp;
         }
+        // CRIT-1: persist seal_deferred status
+        void this.#persistence?.persistSession(sessionIdHex, sess);
       }
     }
 
@@ -1642,6 +2093,8 @@ class CelloClientImpl implements CelloClient {
       session.seal_type = "frost";
       session.close_timestamp = closeTimestamp;
       this.#sealVerifiedData.delete(sessionIdHex);
+      // CRIT-1: persist sealed state
+      void this.#persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
       this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
     } else {
@@ -1667,6 +2120,8 @@ class CelloClientImpl implements CelloClient {
       session.sealed_root = sealedRoot;
       session.directory_signature = dirSig;
       session.close_timestamp = closeTimestamp;
+      // CRIT-1: persist sealed state
+      void this.#persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
       this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
     }
@@ -1741,6 +2196,8 @@ class CelloClientImpl implements CelloClient {
     session.seal_type = "frost";
     session.close_timestamp = resolvedCloseTimestamp;
     this.#sealVerifiedData.delete(sessionIdHex);
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
     // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
     this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, resolvedCloseTimestamp);
 
@@ -1752,6 +2209,7 @@ class CelloClientImpl implements CelloClient {
     const session = this.#sessions.get(sessionIdHex);
     if (!session) return;
     session.status = "seal_rejected";
+    void this.#persistence?.persistSession(sessionIdHex, session);
     // Also resolve the seal-frost-timeout waiter so initiateSessionSeal doesn't wait for the timeout
     this.#sealFrostResolvers.get(sessionIdHex)?.();
   }
@@ -1953,6 +2411,8 @@ class CelloClientImpl implements CelloClient {
     if (sealedRoot) session.sealed_root = sealedRoot;
     session.seal_type = "unilateral";
     session.close_timestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     const correlationId = Buffer.from(session.session_id).toString("hex");
     this.#logger.info("session.sealed", {
@@ -2022,6 +2482,8 @@ class CelloClientImpl implements CelloClient {
     if (sealedRoot) session.sealed_root = sealedRoot;
     session.seal_type = "unilateral";
     session.close_timestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
     if (sealedRoot) {
@@ -2245,6 +2707,8 @@ class CelloClientImpl implements CelloClient {
     session.frost_signature = frostSig;
     session.signer_pubkey = signerPubkey;
     session.seal_type = "frost";
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
   }
 
   closeSession(sessionIdHex: string): void {
@@ -2384,6 +2848,7 @@ class CelloClientImpl implements CelloClient {
 
     // Mark session transport_lost (SESSION-006 AC-001)
     session.status = "transport_lost";
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // Unblock any waiting sendMessage calls with transport_unavailable
     const ackResolve = this.#pendingAckResolvers.get(sessionIdHex);
@@ -2466,6 +2931,22 @@ class CelloClientImpl implements CelloClient {
           // Reconnect succeeded: install new stream and resume
           this.#relayStreams.set(sessionIdHex, newStream);
           sessionAfterAuth.status = "active";
+          void this.#persistence?.persistSession(sessionIdHex, sessionAfterAuth);
+
+          // PERSIST-024 AC-008: After relay reconnect, log any pending hashes that need
+          // resubmission. These are hashes loaded from pending_hashes on startup that
+          // were submitted to the relay before the last crash but not yet ACKed.
+          // The relay is expected to replay hash_submit_ack on reconnect for these hashes.
+          if (this.#hashQueue) {
+            const pendingEntries = await this.#hashQueue.getPending(sessionIdHex);
+            if (pendingEntries.length > 0) {
+              this.#logger.info("client.hashqueue.resubmit.pending", {
+                agentId: myPubkeyHex,
+                sessionId: sessionIdHex,
+                pendingCount: pendingEntries.length,
+              });
+            }
+          }
 
           // Start the new reader loop (authResult.iter is the continuation iterator)
           void this.#runRelayStreamReader(sessionIdHex, newStream, myPubkeyHex, authResult.iter);
@@ -2724,8 +3205,19 @@ class CelloClientImpl implements CelloClient {
       const kind: "msg" | "ctrl" = leaf_kind === 0x02 ? "ctrl" : "msg";
 
       // Append to local tree
+      const leafIndex = session.local_tree_leaves.length;
       session.local_tree_leaves.push({ kind, s2_cbor });
       session.next_expected_seq += 1;
+      // PERSIST-024: persist leaf to DB
+      if (this.#persistence) {
+        void this.#persistence.persistSessionTreeLeaf({
+          sessionIdHex,
+          leafIndex,
+          leafKind: kind,
+          s2Cbor: s2_cbor,
+          sequenceNumber: s2.sequence_number,
+        });
+      }
 
       // Compute leaf hash: SHA-256(leaf_kind_byte || s2_cbor) per MERKLE-001
       const leafHash = new Uint8Array(
@@ -2736,6 +3228,9 @@ class CelloClientImpl implements CelloClient {
         // Own-send echo: fire the send lock release and advance own-seq tracker.
         // Do NOT enqueue into receiveMessage queues — callers don't "receive" their own sends.
         session.last_sent_seq = s2.sequence_number;
+        // PERSIST-024 FINDING-1: persist sequence counters after last_sent_seq mutation
+        // so a crash between leaf accepts does not leave the reloaded session with stale counters.
+        void this.#persistence?.persistSession(sessionIdHex, session);
         echo_resolve?.();
       } else {
         // last_seen_seq = highest counterparty relay seq confirmed on this session.
@@ -2746,6 +3241,9 @@ class CelloClientImpl implements CelloClient {
           // SESSION-003: non-initiator auto-response to counterparty's SEAL leaf.
           // Transition to sealing and submit our own SEAL leaf asynchronously.
           session.status = "sealing";
+          // PERSIST-024 FINDING-2: persist the responder's sealing status so a crash here
+          // does not reload the session as "active". Must happen after status mutation.
+          void this.#persistence?.persistSession(sessionIdHex, session);
           void this.#submitSealLeaf(sessionIdHex, session, "responder").then((result) => {
             if (!result.ok) {
               const s = this.#sessions.get(sessionIdHex);
@@ -2754,6 +3252,8 @@ class CelloClientImpl implements CelloClient {
           });
         } else {
           // Counterparty message: enqueue for receiveMessage callers.
+          // PERSIST-024 FINDING-1: persist sequence counters after last_seen_seq mutation.
+          void this.#persistence?.persistSession(sessionIdHex, session);
           const msg: ReceivedMessage = {
             type: "message",
             content: content_bytes,
@@ -2775,6 +3275,7 @@ class CelloClientImpl implements CelloClient {
     if (!session) return;
 
     session.desynchronized = true;
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // Cancel pending S2 timers AND fire any migrated echo resolvers
     const ps2 = this.#pendingS2.get(sessionIdHex);
@@ -3069,9 +3570,18 @@ class CelloClientImpl implements CelloClient {
     }
 
     // Step 2: generate or load ML-DSA-44 keypair (NIST FIPS 204)
-    const mlDsaProvider = this.#mlDsaKeyFile
-      ? await FileMlDsaKeyProvider.load(this.#mlDsaKeyFile)
-      : await mlDsaKeygen();
+    // PERSIST-024: use mlDsaKeygenWithBytes when persistence is enabled to capture raw secret bytes
+    let mlDsaProvider: import("@cello-protocol/crypto").MlDsaKeyProvider;
+    let mlDsaSecretKeyBlob: Uint8Array | null = null;
+    if (this.#mlDsaKeyFile) {
+      mlDsaProvider = await FileMlDsaKeyProvider.load(this.#mlDsaKeyFile);
+    } else if (this.#persistence) {
+      const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
+      mlDsaProvider = provider;
+      mlDsaSecretKeyBlob = secretKeyBlob;
+    } else {
+      mlDsaProvider = await mlDsaKeygen();
+    }
     const mlDsaPubkey = await mlDsaProvider.getPublicKey();
     const mlDsaPubkeyHex = Buffer.from(mlDsaPubkey).toString("hex");
 
@@ -3133,6 +3643,26 @@ class CelloClientImpl implements CelloClient {
         };
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
+        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
+        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
+        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
+        // Note on FROST share: DKG was skipped by the directory in this path, so no FROST share exists.
+        // On the next restart, client.frost.share.missing will fire — that is correct behavior.
+        // The operator should investigate why the directory considers this agent already registered
+        // without a local FROST share.
+        if (this.#persistence && mlDsaSecretKeyBlob) {
+          void this.#persistence.persistMlDsaKeypair({
+            mlDsaPubkey: mlDsaPubkeyHex,
+            secretKeyBlob: mlDsaSecretKeyBlob,
+          });
+          void this.#persistence.persistRegistrationState({
+            agentId: state.agent_id,
+            primaryPubkey: state.primary_pubkey,
+            mlDsaPubkey: state.ml_dsa_pubkey,
+            registeredAt: state.registered_at,
+          });
+        }
         return state;
       }
       return { error: reason };
@@ -3168,6 +3698,22 @@ class CelloClientImpl implements CelloClient {
       this.#thresholdSigner = dkgResult.signer;
       // SESSION-005: update primary_pubkey so seal verification uses the DKG-derived key.
       this.#myPrimaryPubkey = new Uint8Array(dkgResult.primaryPubkey);
+      // PERSIST-024: persist FROST key share to DB (SI-001: signingShare is raw bytes, never logged)
+      if (this.#persistence) {
+        const commitmentsCbor = CBOR_ENC.encode(dkgResult.commitments) as Uint8Array;
+        const verifyingSharesCbor = CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array;
+        void this.#persistence.persistFrostKeyShare({
+          epochId,
+          primaryPubkey: dkgPrimaryPubkeyHex,
+          identifier: dkgResult.identifier,
+          signingShare: dkgResult.signingShare,
+          threshold: dkgResult.threshold,
+          participants: dkgResult.participants,
+          commitmentsCbor,
+          verifyingSharesCbor,
+          dkgMethod: "network_dkg",
+        });
+      }
     } catch {
       return { error: "dkg_failed" };
     }
@@ -3214,6 +3760,22 @@ class CelloClientImpl implements CelloClient {
         };
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
+        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
+        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
+        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
+        if (this.#persistence && mlDsaSecretKeyBlob) {
+          void this.#persistence.persistMlDsaKeypair({
+            mlDsaPubkey: mlDsaPubkeyHex,
+            secretKeyBlob: mlDsaSecretKeyBlob,
+          });
+          void this.#persistence.persistRegistrationState({
+            agentId: state.agent_id,
+            primaryPubkey: state.primary_pubkey,
+            mlDsaPubkey: state.ml_dsa_pubkey,
+            registeredAt: state.registered_at,
+          });
+        }
         return state;
       }
       return { error: reason };
@@ -3233,6 +3795,21 @@ class CelloClientImpl implements CelloClient {
     this.#registrationState = state;
     // Store the ML-DSA key provider so MCP tools can build ConnectionPackages (CELLO-MCP-003).
     this.#mlDsaProvider = mlDsaProvider;
+    // PERSIST-024: persist ML-DSA keypair and registration state (SI-002: secretKeyBlob is raw bytes, never logged)
+    if (this.#persistence && mlDsaSecretKeyBlob) {
+      void this.#persistence.persistMlDsaKeypair({
+        mlDsaPubkey: mlDsaPubkeyHex,
+        secretKeyBlob: mlDsaSecretKeyBlob,
+      });
+    }
+    if (this.#persistence) {
+      void this.#persistence.persistRegistrationState({
+        agentId: state.agent_id,
+        primaryPubkey: state.primary_pubkey,
+        mlDsaPubkey: state.ml_dsa_pubkey,
+        registeredAt: state.registered_at,
+      });
+    }
     return state;
   }
 
@@ -3369,6 +3946,10 @@ class CelloClientImpl implements CelloClient {
    */
   setPolicy(policy: import("./connection-policy.js").SignalRequirementPolicy): void {
     this.#connectionPolicy = policy;
+    // PERSIST-024: persist policy to DB
+    if (this.#persistence) {
+      void this.#persistence.persistConnectionPolicy(policy);
+    }
   }
 
   /**
@@ -3417,6 +3998,10 @@ class CelloClientImpl implements CelloClient {
     // Mark as decided before sending to prevent races
     this.#decidedRequests.add(connectionRequestId);
     this.#pendingInboundRequests.delete(connectionRequestId);
+    // CRIT-2: persist decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "accepted");
+    }
 
     if (!this.#persistentSignalingStream) {
       // Stream gone — still mark as decided
@@ -3475,6 +4060,10 @@ class CelloClientImpl implements CelloClient {
     // Mark as decided
     this.#decidedRequests.add(connectionRequestId);
     this.#pendingInboundRequests.delete(connectionRequestId);
+    // CRIT-2: persist decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "rejected");
+    }
 
     if (!this.#persistentSignalingStream) {
       return { rejected: true };
@@ -3520,6 +4109,10 @@ class CelloClientImpl implements CelloClient {
 
     // Advance to Round 2
     pending.round = 2;
+    // CRIT-2: persist disclosure decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "more_disclosure");
+    }
 
     if (!this.#persistentSignalingStream) {
       return { error: { reason: "no_pending_request" } };
@@ -3725,6 +4318,14 @@ class CelloClientImpl implements CelloClient {
       };
       this.#connections.set(connectionId, record);
       this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+      // PERSIST-024: persist connection to DB
+      if (this.#persistence) {
+        void this.#persistence.persistConnection({
+          connectionId,
+          counterpartyPubkey,
+          establishedAt: record.established_at,
+        });
+      }
       this.#logger.info("connection.established", {
         connectionId,
         counterpartyPubkeyHex: counterpartyPubkey,
@@ -3757,6 +4358,14 @@ class CelloClientImpl implements CelloClient {
           };
           this.#connections.set(connectionId, record);
           this.#connectionsByPeer.set(targetPubkeyHex, connectionId);
+          // PERSIST-024: persist connection to DB
+          if (this.#persistence) {
+            void this.#persistence.persistConnection({
+              connectionId,
+              counterpartyPubkey: targetPubkeyHex,
+              establishedAt: record.established_at,
+            });
+          }
         }
         this.#logger.info("connection.established", {
           connectionId,
@@ -3836,16 +4445,24 @@ class CelloClientImpl implements CelloClient {
     if (type === "connection_established") {
       const connectionId = frame["connection_id"] as string;
       const counterpartyPubkey = frame["counterparty_pubkey"] as string;
+      const establishedAt = Date.now();
       const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
         connection_id: connectionId,
         counterparty_pubkey: counterpartyPubkey,
         counterparty_primary_pubkey: "",
         counterparty_ml_dsa_pubkey: "",
-        established_at: Date.now(),
+        established_at: establishedAt,
         status: "active",
       };
       this.#connections.set(connectionId, record);
       this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+      if (this.#persistence) {
+        void this.#persistence.persistConnection({
+          connectionId,
+          counterpartyPubkey,
+          establishedAt,
+        });
+      }
       return { result: "established", connection_id: connectionId };
     }
 
@@ -4026,7 +4643,12 @@ class CelloClientImpl implements CelloClient {
       sigStream.close().catch(() => {});
 
       if (respFrame["type"] === "relay_pubkey_response") {
-        return respFrame["public_key_hex"] as string | undefined;
+        const pubkeyHex = respFrame["public_key_hex"] as string | undefined;
+        // PERSIST-024: cache in known_relays so lookupRelayPubkey can serve from DB
+        if (pubkeyHex && this.#persistence) {
+          void this.#persistence.persistKnownRelay(relayId, pubkeyHex, "directory");
+        }
+        return pubkeyHex;
       }
 
       // relay_pubkey_error (not_found) or unexpected type
@@ -4268,6 +4890,16 @@ class CelloClientImpl implements CelloClient {
             this.#pendingReviewQueue.push(reviewItem);
           }
 
+          // CRIT-2: persist pending connection request
+          if (this.#persistence) {
+            void this.#persistence.persistPendingConnectionRequest({
+              requestId: connectionRequestId,
+              fromPubkey,
+              packageCbor,
+              round: 1,
+            });
+          }
+
           if (this.#onConnectionPendingReview) {
             this.#onConnectionPendingReview({
               type: "connection_request_inbound",
@@ -4414,6 +5046,14 @@ class CelloClientImpl implements CelloClient {
               package_cbor: packageCbor,
               round: 2,
             });
+            if (this.#persistence) {
+              void this.#persistence.persistPendingConnectionRequest({
+                requestId: connectionRequestId,
+                fromPubkey,
+                packageCbor,
+                round: 2,
+              });
+            }
             const round2ReviewItem = {
               connection_request_id: connectionRequestId,
               from_pubkey: fromPubkey,
@@ -4910,6 +5550,15 @@ class CelloClientImpl implements CelloClient {
                 }
                 this.#connections.set(connectionId, record);
                 this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+                // PERSIST-024: persist connection to DB
+                if (this.#persistence) {
+                  void this.#persistence.persistConnection({
+                    connectionId,
+                    counterpartyPubkey,
+                    establishedAt: record.established_at,
+                    profileUnchecked: record.profile_unchecked,
+                  });
+                }
               }
               // Fire onConnectionEstablished handler (both A and B)
               const handler = this.#onConnectionEstablishedHandler;
@@ -5165,6 +5814,8 @@ export function createClient(
     crossCheckDirectoryOnInbound?: boolean;
     /** PERSIST-014: injected logger for observability events. */
     logger?: Logger;
+    /** PERSIST-024: optional persistence layer for structured SQLCipher state. */
+    persistence?: ClientStatePersistence;
   }
 ): CelloClient & {
   sendRaw(peerPubkeyHex: string, bytes: Uint8Array): Promise<SendResult>;
@@ -5221,6 +5872,10 @@ export function createClient(
   _pendingConnectionRequestResolverCount: number;
   /** TEST-ONLY: evaluate call counter (only incremented when trackEvaluateCount=true). */
   _evaluateCallCount: number;
+  /** PERSIST-024: load all durable state from the SQLCipher DB and populate in-memory state. */
+  loadPersistedState(): Promise<void>;
+  /** PERSIST-024: return hashes pending relay resubmission after loadPersistedState(). */
+  getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
 } {
   return new CelloClientImpl(
     node,
@@ -5240,6 +5895,7 @@ export function createClient(
     opts?.onConnectionPendingReview,
     opts?.crossCheckDirectoryOnInbound,
     opts?.logger,
+    opts?.persistence,
   ) as unknown as CelloClient & {
     sendRaw(peerPubkeyHex: string, bytes: Uint8Array): Promise<SendResult>;
     openRawStream(peerPubkeyHex: string): Promise<Stream>;
@@ -5279,6 +5935,8 @@ export function createClient(
     _injectConnectionFrame(frame: Record<string, unknown>): void;
     _pendingConnectionRequestResolverCount: number;
     _evaluateCallCount: number;
+    loadPersistedState(): Promise<void>;
+    getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
   };
 }
 

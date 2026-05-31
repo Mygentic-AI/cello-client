@@ -190,69 +190,20 @@ export class SQLCipherClientStore implements ClientStore {
 
   // ─── ClientStore interface ─────────────────────────────────────────────────
 
-  async set(key: string, value: Uint8Array): Promise<void> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<void>((resolve, reject) => {
-      db.run(
-        `INSERT INTO client_store (key, value, updated_at)
-         VALUES (?, ?, datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        [key, Buffer.from(value)],
-        function (err) {
-          if (err) reject(err);
-          else resolve();
-        },
-      );
-    });
+  async set(_key: string, _value: Uint8Array): Promise<void> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async get(key: string): Promise<Uint8Array | undefined> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<Uint8Array | undefined>((resolve, reject) => {
-      db.get(
-        `SELECT value FROM client_store WHERE key = ?`,
-        [key],
-        (err, row) => {
-          if (err) return reject(err);
-          if (row === undefined) return resolve(undefined);
-          // SQLite BLOB comes back as a Node.js Buffer.
-          // Buffer is a Uint8Array subclass, but callers expect a plain Uint8Array.
-          // Use the copy constructor `new Uint8Array(raw)` — NOT the ArrayBuffer view
-          // form `new Uint8Array(raw.buffer, byteOffset, byteLength)` which shares the
-          // underlying memory. A copy is required so callers cannot mutate stored data.
-          const raw = (row as { value: Buffer | Uint8Array }).value;
-          resolve(new Uint8Array(raw));
-        },
-      );
-    });
+  async get(_key: string): Promise<Uint8Array | undefined> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async delete(key: string): Promise<void> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<void>((resolve, reject) => {
-      db.run(`DELETE FROM client_store WHERE key = ?`, [key], function (err) {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+  async delete(_key: string): Promise<void> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async has(key: string): Promise<boolean> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<boolean>((resolve, reject) => {
-      db.get(
-        `SELECT 1 as exists_flag FROM client_store WHERE key = ? LIMIT 1`,
-        [key],
-        (err, row) => {
-          if (err) return reject(err);
-          resolve(row !== undefined);
-        },
-      );
-    });
+  async has(_key: string): Promise<boolean> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
   // ─── Private helpers ───────────────────────────────────────────────────────
@@ -344,6 +295,8 @@ export class SQLCipherClientStore implements ClientStore {
     const appliedVersions = await this.#queryAppliedVersions(db);
 
     // Step 4-6: apply pending migrations in order
+    let v2Applied = false;
+    const v2StartTime = Date.now();
     for (const { filename, version, description } of migrationFiles) {
       if (appliedVersions.has(version)) continue;
 
@@ -358,15 +311,36 @@ export class SQLCipherClientStore implements ClientStore {
           description,
           executionTime,
         });
+        if (version === "V2__client_schema_structured") {
+          v2Applied = true;
+        }
       } catch (err: unknown) {
         const reason = err instanceof Error ? err.message : String(err);
         this.#logger.error("client.store.migration.failed", {
           version,
           description,
           reason,
+          agentPubkey: this.#agentId,
         });
         throw err;
       }
+    }
+
+    // PERSIST-024: Emit batch-level V2 summary event
+    if (v2Applied) {
+      const executionTimeMs = Date.now() - v2StartTime;
+      // MED-2: tableCount must match the number of CREATE TABLE statements in
+      // V2__client_schema_structured.sql. If that migration is modified, update this number.
+      this.#logger.info("client.db.v2.migration.applied", {
+        agentPubkey: this.#agentId,
+        tableCount: 18, // must equal CREATE TABLE count in V2__client_schema_structured.sql
+        executionTimeMs,
+      });
+    } else if (appliedVersions.has("V2__client_schema_structured")) {
+      this.#logger.info("client.db.v2.migration.skipped", {
+        agentPubkey: this.#agentId,
+        currentVersion: "V2__client_schema_structured",
+      });
     }
   }
 
@@ -455,5 +429,65 @@ export class SQLCipherClientStore implements ClientStore {
         else resolve();
       });
     });
+  }
+
+  // ─── Structured DB access (PERSIST-024) ───────────────────────────────────────
+
+  /**
+   * Execute a parameterized SQL statement (INSERT, UPDATE, DELETE).
+   * Returns { lastID, changes }.
+   */
+  async run(sql: string, params: unknown[] = []): Promise<{ lastID: number; changes: number }> {
+    this.#assertOpen();
+    const db = this.#db!;
+    return new Promise<{ lastID: number; changes: number }>((resolve, reject) => {
+      db.run(sql, params, function (err) {
+        if (err) reject(err);
+        else resolve({ lastID: this.lastID, changes: this.changes });
+      });
+    });
+  }
+
+  /**
+   * Execute a parameterized query returning a single row (or undefined).
+   */
+  async getRow<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | undefined> {
+    this.#assertOpen();
+    const db = this.#db!;
+    return new Promise<T | undefined>((resolve, reject) => {
+      db.get(sql, params, (err, row) => {
+        if (err) return reject(err);
+        resolve(row as T | undefined);
+      });
+    });
+  }
+
+  /**
+   * Execute a parameterized query returning all matching rows.
+   */
+  async allRows<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+    this.#assertOpen();
+    const db = this.#db!;
+    return new Promise<T[]>((resolve, reject) => {
+      db.all(sql, params, (err, rows) => {
+        if (err) return reject(err);
+        resolve((rows ?? []) as T[]);
+      });
+    });
+  }
+
+  /**
+   * Execute raw SQL without parameters (for multi-statement DDL or pragmas).
+   */
+  async exec(sql: string): Promise<void> {
+    this.#assertOpen();
+    return this.#execSql(this.#db!, sql);
+  }
+
+  /**
+   * Check if the database is open.
+   */
+  isOpen(): boolean {
+    return this.#db !== null;
   }
 }

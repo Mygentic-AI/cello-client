@@ -49,11 +49,9 @@ import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
-import { bootstrapKeyShares } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
-import { createInProcessStubs } from "@cello-protocol/crypto/frost/stubs.js";
 import { createNode } from "@cello-protocol/transport";
-import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider } from "@cello-protocol/client";
-import { LocalCloudStorageProvider } from "@cello-protocol/interfaces/stubs";
+import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNetworkKeyShares, ClientBackup, S3CloudStorageProvider, SQLCipherClientStore, ClientStatePersistence, AgentHashQueue, deriveDbKey } from "@cello-protocol/client";
+import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/interfaces/stubs";
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
 import { resolveDirectoryUrl } from "../config.js";
@@ -152,6 +150,18 @@ const backupLogger = {
     process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(ctx ?? {})}\n`),
 };
 
+// PERSIST-024 (CRIT-1): Derive dbKey for SQLCipher from identity key before zeroing.
+// The dbKey is derived via HKDF (RFC 5869) from the Ed25519 seed (SI-003: never stored).
+let dbKey: Uint8Array | null = null;
+if (identityKeyBytes) {
+  dbKey = deriveDbKey(identityKeyBytes, agentId);
+}
+
+// PERSIST-024 (MED-2): clientPersistence is declared later (after SQLCipher store opens).
+// The setMetadata callback closes over the variable reference so it picks up the value
+// that is assigned later, at the point backup() is actually called.
+let clientPersistenceRef: ClientStatePersistence | undefined;
+
 let clientBackupInstance: ClientBackup | undefined;
 if (identityKeyBytes) {
   clientBackupInstance = new ClientBackup({
@@ -161,6 +171,40 @@ if (identityKeyBytes) {
     cloudStorage: cloudStorageForBackup,
     logger: backupLogger,
     destinationType: celloEnv === "local" ? "local" : (backupS3Bucket ? "s3" : "local"),
+    // PERSIST-024 (MED-2): persist backup metadata to structured DB table after successful upload.
+    setMetadata: async (_key: string, value: Uint8Array) => {
+      if (!clientPersistenceRef) return;
+      try {
+        const meta = JSON.parse(Buffer.from(value).toString("utf8")) as {
+          timestamp: number;
+          destinationUrl: string;
+          checksum: string;
+        };
+        await clientPersistenceRef.persistBackupMetadata({
+          completedAt: new Date(meta.timestamp).toISOString(),
+          destinationUrl: meta.destinationUrl,
+          checksum: meta.checksum,
+        });
+      } catch {
+        // Non-fatal: metadata write failure does not affect the backup blob
+      }
+    },
+    // PERSIST-024 (MED-2): read backup metadata from structured DB table for restore.
+    getMetadata: async (_key: string): Promise<Uint8Array | undefined> => {
+      if (!clientPersistenceRef) return undefined;
+      try {
+        const row = await clientPersistenceRef.loadBackupMetadata();
+        if (!row) return undefined;
+        const meta = {
+          timestamp: new Date(row.completed_at).getTime(),
+          destinationUrl: row.destination_url,
+          checksum: row.checksum,
+        };
+        return new Uint8Array(Buffer.from(JSON.stringify(meta), "utf8"));
+      } catch {
+        return undefined;
+      }
+    },
   });
   // Zero the identity key bytes immediately after construction — it must not linger in memory (SI-001)
   identityKeyBytes.fill(0);
@@ -218,21 +262,47 @@ process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} C
     } catch (err: unknown) {
       const msg = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack}` : JSON.stringify(err);
       process.stderr.write(`cello-mcp: FROST bootstrap FAILED: ${msg}\n`);
-      process.stderr.write(`cello-mcp: falling back to in-process stubs\n`);
-      const stubs = createInProcessStubs(3);
-      const ownPubkeyFresh = await kp.getPublicKey();
-      const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
-      thresholdSigner = new FrostThresholdSigner({ threshold: 2, participants: 3, directoryNodeStubs: stubs }, ownPubkeyFresh);
-      primaryPubkey = bootstrapResult.primaryPubkey;
+      process.stderr.write(`cello-mcp: continuing without threshold signer (already-registered agents use persistent signaling stream)\n`);
     }
   } else {
-    // No directory multiaddr configured — use in-process stubs
-    const stubs = createInProcessStubs(3);
-    const ownPubkeyFresh = await kp.getPublicKey();
-    const bootstrapResult = await bootstrapKeyShares(ownPubkeyFresh, { threshold: 2, participants: 3, directoryNodeStubs: stubs });
-    thresholdSigner = new FrostThresholdSigner({ threshold: 2, participants: 3, directoryNodeStubs: stubs }, ownPubkeyFresh);
-    primaryPubkey = bootstrapResult.primaryPubkey;
+    process.stderr.write(`cello-mcp: no directory multiaddr configured — threshold signing unavailable\n`);
   }
+}
+
+// PERSIST-024 (CRIT-1): Construct and open the SQLCipher store, then wire ClientStatePersistence.
+// dbKey is derived from identityKeyBytes before it is zeroed (see above).
+let clientPersistence: ClientStatePersistence | undefined;
+let sqlCipherStore: SQLCipherClientStore | undefined;
+if (dbKey) {
+  try {
+    sqlCipherStore = new SQLCipherClientStore(dbKey, {
+      dbPath,
+      agentId,
+      env: celloEnv,
+      logger: backupLogger,
+    });
+    await sqlCipherStore.open();
+    clientPersistence = new ClientStatePersistence({
+      store: sqlCipherStore,
+      agentPubkey: agentId,
+      keyFilePath: keyPath,
+      logger: backupLogger,
+    });
+    // PERSIST-024 (MED-2): expose to backup setMetadata/getMetadata callbacks (late binding)
+    clientPersistenceRef = clientPersistence;
+    // Note: upsertAgent() is NOT called here. loadPersistedState() calls it after all
+    // state loading completes — that is the authoritative call site that updates last_seen_at
+    // only on a fully successful startup.
+    process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
+    // Non-fatal: client continues without persistence
+    clientPersistence = undefined;
+    sqlCipherStore = undefined;
+  }
+} else {
+  process.stderr.write(`cello-mcp: persistence: identity key not available — SQLCipher store disabled\n`);
 }
 
 // Late-bound server reference — set after createMcpServer returns.
@@ -243,6 +313,7 @@ let mcpServer: McpServer | undefined;
 const client = createClient(node, kp, {
   thresholdSigner,
   directoryEndpoint,
+  persistence: clientPersistence,
   onMessageQueued: (senderHex) => {
     if (mcpServer) void pushChannelNotification(mcpServer, senderHex);
   },
@@ -261,6 +332,26 @@ if (primaryPubkey) {
 // inside createMcpSessionServer (single canonical registration path).
 const server = createMcpSessionServer(node, client, kp, { clientBackup: clientBackupInstance });
 mcpServer = server;
+
+// PERSIST-024 (CRIT-1): Load persisted state before accepting any MCP tool calls.
+// This must happen before server.connect() so the first tool call sees restored state.
+await client.loadPersistedState();
+
+// PERSIST-024 AC-008: Build an in-memory AgentHashQueue and populate it from the pending_hashes
+// DB table. Using LocalClientStore (in-memory) avoids the SQLCipherClientStore.set() throw.
+// The queue is wired into the client so #reconnectRelayStream can check it on relay reconnect.
+const loadedPendingHashes = client.getLoadedPendingHashes();
+const hashQueue = new AgentHashQueue({
+  store: new LocalClientStore(),
+  agentId,
+  logger: backupLogger,
+});
+if (loadedPendingHashes.length > 0) {
+  await hashQueue.loadPending(loadedPendingHashes);
+  process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded into AgentHashQueue — relay resubmission will occur on reconnect\n`);
+}
+// Wire queue into client so relay reconnect can access pending hashes (AC-008)
+(client as unknown as { setHashQueue(q: AgentHashQueue): void }).setHashQueue(hashQueue);
 
 // Connect stdio transport and register handler
 await server.connect(new StdioServerTransport());
