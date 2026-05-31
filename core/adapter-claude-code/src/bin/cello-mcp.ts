@@ -54,7 +54,7 @@ import { createClient, createMcpSessionServer, NetworkDirectoryNode, bootstrapNe
 import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/interfaces/stubs";
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
-import { resolveDirectoryUrl } from "../config.js";
+import { resolveDirectoryUrl, fetchBootstrapMultiaddr } from "../config.js";
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");
 const listenAddr = process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0";
@@ -211,16 +211,36 @@ if (identityKeyBytes) {
   identityKeyBytes = null;
 }
 
-// Parse directory endpoint from CELLO_DIRECTORY_MULTIADDR (if set)
+// Parse directory endpoint from CELLO_DIRECTORY_MULTIADDR (if set).
+// When not set, auto-fetch the multiaddr from GET /bootstrap on the directory HTTP endpoint.
+// Pseudocode:
+//   1. If CELLO_DIRECTORY_MULTIADDR is set → use it directly (existing behaviour)
+//   2. Else → GET ${directoryUrl}/bootstrap with 5s timeout
+//      a. Success + valid multiaddr → use it as if CELLO_DIRECTORY_MULTIADDR was set
+//      b. 503 / network error / invalid JSON → log warning, continue without threshold signing
+
+let resolvedDirectoryMultiaddr: string | undefined = directoryMultiaddr;
+
+if (!resolvedDirectoryMultiaddr) {
+  process.stderr.write(`cello-mcp: auto-discovering directory multiaddr from ${directoryUrl}/bootstrap\n`);
+  const discovered = await fetchBootstrapMultiaddr(directoryUrl);
+  if (discovered) {
+    resolvedDirectoryMultiaddr = discovered;
+    process.stderr.write(`cello-mcp: bootstrap fetch succeeded — multiaddr=${resolvedDirectoryMultiaddr}\n`);
+  } else {
+    process.stderr.write(`cello-mcp: bootstrap fetch failed — threshold signing unavailable\n`);
+  }
+}
+
 let directoryEndpoint: { peer_id: string; multiaddrs: string[] } | undefined = undefined;
-if (directoryMultiaddr) {
-  const parts = directoryMultiaddr.split("/");
+if (resolvedDirectoryMultiaddr) {
+  const parts = resolvedDirectoryMultiaddr.split("/");
   const p2pIndex = parts.findIndex((p) => p === "p2p");
   const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
   if (peerId) {
-    directoryEndpoint = { peer_id: peerId, multiaddrs: [directoryMultiaddr] };
+    directoryEndpoint = { peer_id: peerId, multiaddrs: [resolvedDirectoryMultiaddr] };
   } else {
-    process.stderr.write("cello-mcp: CELLO_DIRECTORY_MULTIADDR must include /p2p/<peer-id>\n");
+    process.stderr.write("cello-mcp: directory multiaddr must include /p2p/<peer-id>\n");
   }
 }
 
@@ -233,12 +253,12 @@ await node.start();
 let thresholdSigner: FrostThresholdSigner | undefined;
 let primaryPubkey: Uint8Array | undefined;
 
-process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} CELLO_DIRECTORY_URL=${directoryUrl} CELLO_DIRECTORY_MULTIADDR=${directoryMultiaddr ?? "(unset)"}\n`);
+process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} CELLO_DIRECTORY_URL=${directoryUrl} CELLO_DIRECTORY_MULTIADDR=${resolvedDirectoryMultiaddr ?? "(unset)"}\n`);
 
 {
   const ownPubkey = await kp.getPublicKey();
 
-  if (directoryMultiaddr && directoryEndpoint) {
+  if (resolvedDirectoryMultiaddr && directoryEndpoint) {
     process.stderr.write(`cello-mcp: bootstrapping FROST via network directory...\n`);
     try {
       await node.dial(directoryEndpoint.multiaddrs[0]!);
