@@ -28,7 +28,7 @@
     "@cello-protocol/interfaces": "0.0.3",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
-    "@journeyapps/sqlcipher": "^6.0.0",
+    "@journeyapps/sqlcipher": "^5.3.1",
     "@libp2p/interface": "^3.2.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@noble/curves": "^2.2.0",

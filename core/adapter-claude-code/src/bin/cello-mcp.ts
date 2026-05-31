@@ -317,7 +317,21 @@ if (dbKey) {
     process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
+    // Detect native module load failures (missing pre-built binary or ABI mismatch).
+    const isNativeModuleError =
+      msg.includes("Cannot find module") ||
+      msg.includes("was compiled against a different Node.js version") ||
+      msg.includes("NODE_MODULE_VERSION") ||
+      msg.includes("invalid ELF header") ||
+      msg.includes("dlopen");
+    if (isNativeModuleError) {
+      process.stderr.write(`cello-mcp: SQLCipher native module failed to load: ${msg}\n`);
+      process.stderr.write(`cello-mcp: Your platform may not have a pre-built binary available.\n`);
+      process.stderr.write(`cello-mcp: See https://github.com/Mygentic-AI/cello-client for supported platforms.\n`);
+      process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
+    } else {
+      process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
+    }
     // Non-fatal: client continues without persistence
     clientPersistence = undefined;
     sqlCipherStore = undefined;
