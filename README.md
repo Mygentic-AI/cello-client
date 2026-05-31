@@ -71,6 +71,16 @@ cello_initiate_session({ target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" })
 
 The demo agent is running on `directory-us1.cello.mygentic.ai` (us-east-1).
 
+## Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| **macOS** (Apple Silicon + Intel) | ✅ Supported | Requires Xcode Command Line Tools (`xcode-select --install`) |
+| **Linux** (Ubuntu 20.04+, Debian 11+) | ✅ Supported | Requires `sudo apt-get install build-essential libssl-dev` |
+| **Windows** | 🚧 Coming soon | Not supported in the current beta |
+
+SQLCipher compiles from source on first install. The one-time build takes ~30 seconds.
+
 ## Privacy audit
 
 See [AUDIT-ME.md](./AUDIT-ME.md) for verifiable claims about what CELLO does
