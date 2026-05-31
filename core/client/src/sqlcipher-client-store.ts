@@ -190,69 +190,20 @@ export class SQLCipherClientStore implements ClientStore {
 
   // ─── ClientStore interface ─────────────────────────────────────────────────
 
-  async set(key: string, value: Uint8Array): Promise<void> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<void>((resolve, reject) => {
-      db.run(
-        `INSERT INTO client_store (key, value, updated_at)
-         VALUES (?, ?, datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-        [key, Buffer.from(value)],
-        function (err) {
-          if (err) reject(err);
-          else resolve();
-        },
-      );
-    });
+  async set(_key: string, _value: Uint8Array): Promise<void> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async get(key: string): Promise<Uint8Array | undefined> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<Uint8Array | undefined>((resolve, reject) => {
-      db.get(
-        `SELECT value FROM client_store WHERE key = ?`,
-        [key],
-        (err, row) => {
-          if (err) return reject(err);
-          if (row === undefined) return resolve(undefined);
-          // SQLite BLOB comes back as a Node.js Buffer.
-          // Buffer is a Uint8Array subclass, but callers expect a plain Uint8Array.
-          // Use the copy constructor `new Uint8Array(raw)` — NOT the ArrayBuffer view
-          // form `new Uint8Array(raw.buffer, byteOffset, byteLength)` which shares the
-          // underlying memory. A copy is required so callers cannot mutate stored data.
-          const raw = (row as { value: Buffer | Uint8Array }).value;
-          resolve(new Uint8Array(raw));
-        },
-      );
-    });
+  async get(_key: string): Promise<Uint8Array | undefined> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async delete(key: string): Promise<void> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<void>((resolve, reject) => {
-      db.run(`DELETE FROM client_store WHERE key = ?`, [key], function (err) {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+  async delete(_key: string): Promise<void> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
-  async has(key: string): Promise<boolean> {
-    this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<boolean>((resolve, reject) => {
-      db.get(
-        `SELECT 1 as exists_flag FROM client_store WHERE key = ? LIMIT 1`,
-        [key],
-        (err, row) => {
-          if (err) return reject(err);
-          resolve(row !== undefined);
-        },
-      );
-    });
+  async has(_key: string): Promise<boolean> {
+    throw new Error("client_store has been removed by V2 migration — use ClientStatePersistence instead");
   }
 
   // ─── Private helpers ───────────────────────────────────────────────────────
@@ -360,7 +311,7 @@ export class SQLCipherClientStore implements ClientStore {
           description,
           executionTime,
         });
-        if (version.startsWith("V2")) {
+        if (version === "V2__client_schema_structured") {
           v2Applied = true;
         }
       } catch (err: unknown) {

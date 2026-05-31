@@ -323,26 +323,33 @@ export class ClientStatePersistence {
 
   // ─── Connection policy ──────────────────────────────────────────────────────
 
-  /** Persist connection policy (upsert mode + requirements in a transaction). */
+  /** Persist connection policy (upsert mode + requirements in a single transaction). */
   async persistConnectionPolicy(policy: SignalRequirementPolicy): Promise<void> {
-    await this.#store.run(
-      `INSERT OR REPLACE INTO connection_policy (agent_pubkey, mode, review_mode, updated_at)
-       VALUES (?, ?, ?, datetime('now'))`,
-      [this.#agentPubkey, policy.mode, policy.review_mode],
-    );
-    // Delete existing requirements
-    await this.#store.run(
-      `DELETE FROM connection_policy_requirements WHERE agent_pubkey = ?`,
-      [this.#agentPubkey],
-    );
-    // Insert new requirements in position order
-    for (let i = 0; i < policy.requirements.length; i++) {
-      const req = policy.requirements[i];
+    await this.#store.run("BEGIN");
+    try {
       await this.#store.run(
-        `INSERT INTO connection_policy_requirements (agent_pubkey, position, signal_type, condition_json)
-         VALUES (?, ?, ?, ?)`,
-        [this.#agentPubkey, i, req.signal_type, JSON.stringify(req.condition)],
+        `INSERT OR REPLACE INTO connection_policy (agent_pubkey, mode, review_mode, updated_at)
+         VALUES (?, ?, ?, datetime('now'))`,
+        [this.#agentPubkey, policy.mode, policy.review_mode],
       );
+      // Delete existing requirements
+      await this.#store.run(
+        `DELETE FROM connection_policy_requirements WHERE agent_pubkey = ?`,
+        [this.#agentPubkey],
+      );
+      // Insert new requirements in position order
+      for (let i = 0; i < policy.requirements.length; i++) {
+        const req = policy.requirements[i];
+        await this.#store.run(
+          `INSERT INTO connection_policy_requirements (agent_pubkey, position, signal_type, condition_json)
+           VALUES (?, ?, ?, ?)`,
+          [this.#agentPubkey, i, req.signal_type, JSON.stringify(req.condition)],
+        );
+      }
+      await this.#store.run("COMMIT");
+    } catch (err) {
+      await this.#store.run("ROLLBACK").catch(() => {});
+      throw err;
     }
     this.#logger.info("client.policy.persisted", {
       agentPubkey: this.#agentPubkey,
@@ -691,6 +698,8 @@ export class ClientStatePersistence {
     pendingHashes: PendingHashRow[];
     decidedRequests: DecidedConnectionRequestRow[];
     pendingConnectionRequests: PendingConnectionRequestRow[];
+    endorsements: Array<Record<string, unknown>>;
+    attestations: Array<Record<string, unknown>>;
   }> {
     const frostShare = await this.loadActiveFrostKeyShare();
     const mlDsaKeypair = await this.loadMlDsaKeypair();
@@ -702,6 +711,8 @@ export class ClientStatePersistence {
     const pendingHashes = await this.loadPendingHashes();
     const decidedRequests = await this.loadDecidedConnectionRequests();
     const pendingConnectionRequests = await this.loadPendingConnectionRequests();
+    const endorsements = await this.loadEndorsements(Date.now());
+    const attestations = await this.loadAttestations(Date.now());
 
     // Count total leaves
     let leafCount = 0;
@@ -728,6 +739,8 @@ export class ClientStatePersistence {
       pendingHashes,
       decidedRequests,
       pendingConnectionRequests,
+      endorsements,
+      attestations,
     };
 
     this.#logger.info("client.startup.state.loaded", {

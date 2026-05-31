@@ -874,6 +874,148 @@ describeWithSQLCipher("PERSIST-024 SI-003 — db_key never stored or logged", ()
   });
 });
 
+// ─── AC-009: Endorsements and attestations ───────────────────────────────────
+
+describeWithSQLCipher("PERSIST-024 AC-009 — Endorsements and attestations loaded with expiry filter", () => {
+  let dbPath: string;
+  let logger: ReturnType<typeof makeSpyLogger>;
+
+  beforeEach(() => {
+    dbPath = makeTmpDbPath();
+    logger = makeSpyLogger();
+  });
+  afterEach(() => cleanupPath(dbPath));
+
+  it("loadStartupState includes unexpired endorsements and attestations, excludes expired ones", async () => {
+    const agentPubkey = randomBytes(32).toString("hex");
+    const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store.open();
+
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+
+    const now = Date.now();
+    const futureExpiry = now + 86400_000; // 1 day from now
+    const pastExpiry = now - 1_000;       // 1 second ago (expired)
+
+    const endorserPubkey1 = randomBytes(32).toString("hex");
+    const endorserPubkey2 = randomBytes(32).toString("hex");
+    const attesterPubkey1 = randomBytes(32).toString("hex");
+    const attesterPubkey2 = randomBytes(32).toString("hex");
+
+    // Insert unexpired endorsement
+    await store.run(
+      `INSERT INTO endorsements
+       (agent_pubkey, endorser_pubkey, endorser_ml_dsa_pubkey, target_pubkey, endorsement_type, created_at, expires_at, endorser_ml_dsa_sig)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [agentPubkey, endorserPubkey1, Buffer.from(randomBytes(32)), agentPubkey, "trust", now, futureExpiry, Buffer.from(randomBytes(64))],
+    );
+    // Insert expired endorsement
+    await store.run(
+      `INSERT INTO endorsements
+       (agent_pubkey, endorser_pubkey, endorser_ml_dsa_pubkey, target_pubkey, endorsement_type, created_at, expires_at, endorser_ml_dsa_sig)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [agentPubkey, endorserPubkey2, Buffer.from(randomBytes(32)), agentPubkey, "trust", now - 10000, pastExpiry, Buffer.from(randomBytes(64))],
+    );
+    // Insert unexpired attestation
+    await store.run(
+      `INSERT INTO attestations
+       (agent_pubkey, attester_pubkey, attestation_type, attester_ml_dsa_pubkey, attestation_data, created_at, expires_at, attester_ml_dsa_sig)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [agentPubkey, attesterPubkey1, "registration_age", Buffer.from(randomBytes(32)), Buffer.from("{}"), now, futureExpiry, Buffer.from(randomBytes(64))],
+    );
+    // Insert expired attestation
+    await store.run(
+      `INSERT INTO attestations
+       (agent_pubkey, attester_pubkey, attestation_type, attester_ml_dsa_pubkey, attestation_data, created_at, expires_at, attester_ml_dsa_sig)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [agentPubkey, attesterPubkey2, "endorsement_count", Buffer.from(randomBytes(32)), Buffer.from("{}"), now - 10000, pastExpiry, Buffer.from(randomBytes(64))],
+    );
+
+    const state = await persistence.loadStartupState();
+
+    // Only unexpired items are returned
+    expect(state.endorsements.length).toBe(1);
+    expect(state.endorsements[0]["endorser_pubkey"]).toBe(endorserPubkey1);
+
+    expect(state.attestations.length).toBe(1);
+    expect(state.attestations[0]["attester_pubkey"]).toBe(attesterPubkey1);
+
+    await store.close();
+  });
+});
+
+// ─── AC-010: Pending connection requests survive restart ─────────────────────
+
+describeWithSQLCipher("PERSIST-024 AC-010 — pending connection requests survive restart", () => {
+  let dbPath: string;
+  let logger: ReturnType<typeof makeSpyLogger>;
+
+  beforeEach(() => {
+    dbPath = makeTmpDbPath();
+    logger = makeSpyLogger();
+  });
+  afterEach(() => cleanupPath(dbPath));
+
+  it("pending request is persisted, loads after restart, moves to decided on decision", async () => {
+    const agentPubkey = randomBytes(32).toString("hex");
+    const dbKey = deriveDbKey(randomBytes(32), agentPubkey);
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store.open();
+
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+
+    const requestId = randomBytes(16).toString("hex");
+    const fromPubkey = randomBytes(32).toString("hex");
+    const packageCbor = randomBytes(128);
+
+    // Persist a pending connection request
+    await persistence.persistPendingConnectionRequest({
+      requestId,
+      fromPubkey,
+      packageCbor,
+      round: 1,
+    });
+
+    // Simulate restart
+    await store.close();
+    const store2 = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store2.open();
+    const persistence2 = new ClientStatePersistence({
+      store: store2, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+
+    // Verify the pending request survives restart
+    const pending = await persistence2.loadPendingConnectionRequests();
+    expect(pending.length).toBe(1);
+    expect(pending[0].request_id).toBe(requestId);
+    expect(pending[0].from_pubkey).toBe(fromPubkey);
+    expect(Buffer.from(pending[0].package_cbor as Buffer)).toEqual(Buffer.from(packageCbor));
+    expect(pending[0].round).toBe(1);
+
+    // Decide the request (accept)
+    await persistence2.decidePendingConnectionRequest(requestId, "accepted");
+
+    // Verify it moves to decided_connection_requests
+    const decided = await persistence2.loadDecidedConnectionRequests();
+    expect(decided.length).toBe(1);
+    expect(decided[0].request_id).toBe(requestId);
+    expect(decided[0].decision).toBe("accepted");
+
+    // Verify it is gone from pending_connection_requests
+    const pendingAfter = await persistence2.loadPendingConnectionRequests();
+    expect(pendingAfter.length).toBe(0);
+
+    await store2.close();
+  });
+});
+
 // ─── AC-008: Pending hashes ──────────────────────────────────────────────────
 
 describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loaded", () => {

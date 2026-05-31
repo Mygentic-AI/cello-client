@@ -503,6 +503,10 @@ class CelloClientImpl implements CelloClient {
   // ─── PERSIST-024: Client state persistence (optional) ────────────────────────
   #persistence: ClientStatePersistence | null = null;
 
+  // ─── PERSIST-024: In-memory endorsement/attestation caches ───────────────────
+  #endorsements: Array<Record<string, unknown>> = [];
+  #attestations: Array<Record<string, unknown>> = [];
+
   constructor(
     node: CelloNode,
     keyProvider: KeyProvider,
@@ -614,9 +618,13 @@ class CelloClientImpl implements CelloClient {
           }
         }
       } catch {
-        this.#logger.warn("client.startup.frost.deserialize.failed", {
+        // HIGH-2: emit correct error event and return early — do not call storeDkgResult
+        // with broken/empty data, which would corrupt the module-level key store.
+        this.#logger.error("client.frost.share.load.failed", {
           agentPubkey: row.agent_pubkey,
+          reason: "cbor_deserialize_failed",
         });
+        return;
       }
 
       const frostPublic = {
@@ -630,9 +638,11 @@ class CelloClientImpl implements CelloClient {
         // SI-001: storeDkgResult does not log the secret
         storeDkgResult(myPubkeyHex, frostSecret as import("@noble/curves/abstract/frost.js").FrostSecret, frostPublic as import("@noble/curves/abstract/frost.js").FrostPublic);
       } catch {
-        this.#logger.warn("client.startup.frost.restore.failed", {
+        this.#logger.error("client.frost.share.load.failed", {
           agentPubkey: myPubkeyHex,
+          reason: "storeDkgResult_failed",
         });
+        return;
       }
 
       // Reconstruct FrostThresholdSigner (config only — secret is in module-level store)
@@ -651,6 +661,14 @@ class CelloClientImpl implements CelloClient {
       if (commitments.length > 0 && !this.#myPrimaryPubkey) {
         this.#myPrimaryPubkey = new Uint8Array(commitments[0]!);
       }
+
+      // HIGH-1: emit success event after FROST share loaded
+      this.#logger.info("client.frost.share.loaded", {
+        agentPubkey: myPubkeyHex,
+        epochId: row.epoch_id,
+        threshold: row.threshold,
+        participants: row.participants,
+      });
     }
 
     // ── 2. ML-DSA keypair ─────────────────────────────────────────────────────
@@ -663,8 +681,14 @@ class CelloClientImpl implements CelloClient {
         const mlDsaPubkeyBytes = Buffer.from(row.ml_dsa_pubkey, "hex");
         // SI-002: InMemoryMlDsaKeyProvider does not log secret key
         this.#mlDsaProvider = new InMemoryMlDsaKeyProvider(mlDsaPubkeyBytes, secretKeyBlob);
+        // HIGH-1: emit success event after ML-DSA keypair loaded
+        this.#logger.info("client.mldsa.keypair.loaded", {
+          agentPubkey: row.agent_pubkey,
+          mlDsaPubkey: row.ml_dsa_pubkey,
+        });
       } catch {
-        this.#logger.warn("client.startup.mldsa.restore.failed", {
+        // HIGH-1: emit correct error event name
+        this.#logger.warn("client.mldsa.load.failed", {
           agentPubkey: row.agent_pubkey,
         });
       }
@@ -680,6 +704,12 @@ class CelloClientImpl implements CelloClient {
         registered_at: row.registered_at,
         status: "active",
       };
+      // HIGH-1: emit success event after registration state loaded
+      this.#logger.info("client.registration.loaded", {
+        agentPubkey: row.agent_pubkey,
+        agentId: row.agent_id,
+        status: row.status,
+      });
     }
 
     // ── 4. Connections ────────────────────────────────────────────────────────
@@ -783,6 +813,67 @@ class CelloClientImpl implements CelloClient {
     // ── 8. Decided requests ───────────────────────────────────────────────────
     for (const row of state.decidedRequests) {
       this.#decidedRequests.add(row.request_id);
+    }
+
+    // ── 9. Pending connection requests ────────────────────────────────────────
+    for (const row of state.pendingConnectionRequests) {
+      const packageCbor = row.package_cbor instanceof Buffer
+        ? new Uint8Array(row.package_cbor)
+        : new Uint8Array(row.package_cbor as Uint8Array);
+      // Populate #pendingInboundRequests so acceptConnection/rejectConnection work
+      this.#pendingInboundRequests.set(row.request_id, {
+        connection_request_id: row.request_id,
+        from_pubkey: row.from_pubkey,
+        package_cbor: packageCbor,
+        round: row.round,
+      });
+      // Populate #pendingReviewQueue so awaitConnectionRequest() returns it.
+      // Reconstruct a minimal pending_agent_review report — the full policy evaluation
+      // result is not persisted, only the package_cbor. The agent review UI only needs
+      // the connection_request_id, from_pubkey, and package_cbor to make a decision.
+      const restoredReport: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }> = {
+        verdict: "pending_agent_review",
+        policy_summary: {
+          mode: "unknown",
+          review_mode: "inference",
+          requirements_met: [],
+          requirements_unmet: [],
+        },
+        package_summary: {
+          pseudonym_label: "",
+          endorsement_count: 0,
+          attestation_types: [],
+          pseudonym_age_days: 0,
+          registration_age_days: 0,
+          is_provisional: false,
+        },
+        is_round_2: row.round > 1,
+      };
+      this.#pendingReviewQueue.push({
+        connection_request_id: row.request_id,
+        from_pubkey: row.from_pubkey,
+        report: restoredReport,
+        package_cbor: packageCbor,
+        sender_registered_at: 0,
+        sender_is_provisional: false,
+      });
+    }
+
+    // ── 10. Endorsements and attestations (MED-4) ────────────────────────────────
+    if (state.endorsements.length > 0) {
+      this.#endorsements = state.endorsements;
+    }
+    if (state.attestations.length > 0) {
+      this.#attestations = state.attestations;
+    }
+
+    // ── HIGH-3: set #myPubkeyHex from registration state if sessions were loaded ──
+    // #myPubkeyHex is used in #sendMessageLocked with a non-null assertion.
+    // It is set during receiveSessionAssignment but never set during startup load.
+    // If the agent restarts with active sessions and calls sendMessage before any
+    // new session assignment, it would crash on the non-null assertion.
+    if (!this.#myPubkeyHex && state.registrationState) {
+      this.#myPubkeyHex = state.registrationState.agent_pubkey;
     }
   }
 
@@ -1496,6 +1587,8 @@ class CelloClientImpl implements CelloClient {
 
     session.status = "sealing";
     this.#sealInitiatedSessions.add(sessionIdHex);
+    // CRIT-1: persist sealing status
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     const result = await this.#submitSealLeaf(sessionIdHex, session, "initiator");
     if (!result.ok) return result;
@@ -1531,6 +1624,8 @@ class CelloClientImpl implements CelloClient {
         if (sealVerifiedEntry) {
           sess.close_timestamp = sealVerifiedEntry.timestamp;
         }
+        // CRIT-1: persist seal_deferred status
+        void this.#persistence?.persistSession(sessionIdHex, sess);
       }
     }
 
@@ -1891,6 +1986,8 @@ class CelloClientImpl implements CelloClient {
       session.seal_type = "frost";
       session.close_timestamp = closeTimestamp;
       this.#sealVerifiedData.delete(sessionIdHex);
+      // CRIT-1: persist sealed state
+      void this.#persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
       this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
     } else {
@@ -1916,6 +2013,8 @@ class CelloClientImpl implements CelloClient {
       session.sealed_root = sealedRoot;
       session.directory_signature = dirSig;
       session.close_timestamp = closeTimestamp;
+      // CRIT-1: persist sealed state
+      void this.#persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
       this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
     }
@@ -1990,6 +2089,8 @@ class CelloClientImpl implements CelloClient {
     session.seal_type = "frost";
     session.close_timestamp = resolvedCloseTimestamp;
     this.#sealVerifiedData.delete(sessionIdHex);
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
     // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
     this.#enqueueSessionSealedEvent(sessionIdHex, sealedRoot, resolvedCloseTimestamp);
 
@@ -2202,6 +2303,8 @@ class CelloClientImpl implements CelloClient {
     if (sealedRoot) session.sealed_root = sealedRoot;
     session.seal_type = "unilateral";
     session.close_timestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     const correlationId = Buffer.from(session.session_id).toString("hex");
     this.#logger.info("session.sealed", {
@@ -2271,6 +2374,8 @@ class CelloClientImpl implements CelloClient {
     if (sealedRoot) session.sealed_root = sealedRoot;
     session.seal_type = "unilateral";
     session.close_timestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
     if (sealedRoot) {
@@ -2494,6 +2599,8 @@ class CelloClientImpl implements CelloClient {
     session.frost_signature = frostSig;
     session.signer_pubkey = signerPubkey;
     session.seal_type = "frost";
+    // CRIT-1: persist sealed state
+    void this.#persistence?.persistSession(sessionIdHex, session);
   }
 
   closeSession(sessionIdHex: string): void {
@@ -3721,6 +3828,10 @@ class CelloClientImpl implements CelloClient {
     // Mark as decided before sending to prevent races
     this.#decidedRequests.add(connectionRequestId);
     this.#pendingInboundRequests.delete(connectionRequestId);
+    // CRIT-2: persist decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "accepted");
+    }
 
     if (!this.#persistentSignalingStream) {
       // Stream gone — still mark as decided
@@ -3779,6 +3890,10 @@ class CelloClientImpl implements CelloClient {
     // Mark as decided
     this.#decidedRequests.add(connectionRequestId);
     this.#pendingInboundRequests.delete(connectionRequestId);
+    // CRIT-2: persist decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "rejected");
+    }
 
     if (!this.#persistentSignalingStream) {
       return { rejected: true };
@@ -3824,6 +3939,10 @@ class CelloClientImpl implements CelloClient {
 
     // Advance to Round 2
     pending.round = 2;
+    // CRIT-2: persist disclosure decision
+    if (this.#persistence) {
+      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "more_disclosure");
+    }
 
     if (!this.#persistentSignalingStream) {
       return { error: { reason: "no_pending_request" } };
@@ -4586,6 +4705,16 @@ class CelloClientImpl implements CelloClient {
           } else {
             // No caller waiting — enqueue for future awaitConnectionRequest() poll
             this.#pendingReviewQueue.push(reviewItem);
+          }
+
+          // CRIT-2: persist pending connection request
+          if (this.#persistence) {
+            void this.#persistence.persistPendingConnectionRequest({
+              requestId: connectionRequestId,
+              fromPubkey,
+              packageCbor,
+              round: 1,
+            });
           }
 
           if (this.#onConnectionPendingReview) {
