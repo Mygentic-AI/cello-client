@@ -687,8 +687,8 @@ class CelloClientImpl implements CelloClient {
           mlDsaPubkey: row.ml_dsa_pubkey,
         });
       } catch {
-        // HIGH-1: emit correct error event name
-        this.#logger.warn("client.mldsa.load.failed", {
+        // Story specifies level: error for this event
+        this.#logger.error("client.mldsa.load.failed", {
           agentPubkey: row.agent_pubkey,
         });
       }

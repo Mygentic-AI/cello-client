@@ -25,7 +25,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { rmSync, mkdirSync, existsSync } from "node:fs";
+import { Encoder } from "cbor-x";
 import { deriveDbKey } from "../db-key-derivation.js";
+
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 // ─── Dynamic import for SQLCipher ────────────────────────────────────────────
 
@@ -1013,6 +1016,307 @@ describeWithSQLCipher("PERSIST-024 AC-010 — pending connection requests surviv
     expect(pendingAfter.length).toBe(0);
 
     await store2.close();
+  });
+});
+
+// ─── AC-012: Multi-agent-per-device isolation ────────────────────────────────
+
+describeWithSQLCipher("PERSIST-024 AC-012 — multi-agent-per-device: two separate stores at different paths", () => {
+  it("each store only returns its own data and rejects the other agent's db_key", async () => {
+    // Two distinct identity keys → two distinct db_keys → two distinct DB files
+    const identityKey1 = randomBytes(32);
+    const identityKey2 = randomBytes(32);
+    const agentPubkey1 = randomBytes(32).toString("hex");
+    const agentPubkey2 = randomBytes(32).toString("hex");
+
+    const dir1 = join(tmpdir(), `cello-ac012-agent1-${randomBytes(8).toString("hex")}`);
+    const dir2 = join(tmpdir(), `cello-ac012-agent2-${randomBytes(8).toString("hex")}`);
+    mkdirSync(dir1, { recursive: true });
+    mkdirSync(dir2, { recursive: true });
+    const dbPath1 = join(dir1, "agent1.db");
+    const dbPath2 = join(dir2, "agent2.db");
+
+    const dbKey1 = deriveDbKey(identityKey1, agentPubkey1);
+    const dbKey2 = deriveDbKey(identityKey2, agentPubkey2);
+
+    const logger = makeSpyLogger();
+
+    // Open both stores
+    const store1 = new SQLCipherClientStore(dbKey1, { dbPath: dbPath1, agentId: agentPubkey1, logger });
+    const store2 = new SQLCipherClientStore(dbKey2, { dbPath: dbPath2, agentId: agentPubkey2, logger });
+    await store1.open();
+    await store2.open();
+
+    const p1 = new ClientStatePersistence({ store: store1, agentPubkey: agentPubkey1, keyFilePath: "/tmp/key1", logger });
+    const p2 = new ClientStatePersistence({ store: store2, agentPubkey: agentPubkey2, keyFilePath: "/tmp/key2", logger });
+    await p1.upsertAgent();
+    await p2.upsertAgent();
+
+    // Persist distinct registration states in each store
+    const primaryPubkey1 = randomBytes(32).toString("hex");
+    const primaryPubkey2 = randomBytes(32).toString("hex");
+
+    await p1.persistRegistrationState({
+      agentId: "agent-id-1",
+      primaryPubkey: primaryPubkey1,
+      mlDsaPubkey: randomBytes(1312).toString("hex"),
+      registeredAt: 1_000_000,
+    });
+    await p2.persistRegistrationState({
+      agentId: "agent-id-2",
+      primaryPubkey: primaryPubkey2,
+      mlDsaPubkey: randomBytes(1312).toString("hex"),
+      registeredAt: 2_000_000,
+    });
+
+    // Verify each store only returns its own data
+    const reg1 = await p1.loadRegistrationState();
+    const reg2 = await p2.loadRegistrationState();
+
+    expect(reg1).toBeDefined();
+    expect(reg2).toBeDefined();
+    expect(reg1!.agent_id).toBe("agent-id-1");
+    expect(reg1!.primary_pubkey).toBe(primaryPubkey1);
+    expect(reg2!.agent_id).toBe("agent-id-2");
+    expect(reg2!.primary_pubkey).toBe(primaryPubkey2);
+
+    // Verify cross-isolation: agent1's primary_pubkey must not appear in agent2's store
+    const reg1InStore2 = await store2.getRow<{ agent_id: string }>(
+      `SELECT agent_id FROM registration_state WHERE primary_pubkey = ?`,
+      [primaryPubkey1],
+    );
+    expect(reg1InStore2).toBeUndefined();
+
+    await store1.close();
+    await store2.close();
+
+    // Adversarial condition: opening store1's DB file with store2's db_key MUST fail.
+    // SQLCipher uses the key for AES encryption — wrong key → "file is not a database".
+    const storeWrongKey = new SQLCipherClientStore(dbKey2, { dbPath: dbPath1, agentId: agentPubkey1, logger });
+    await expect(storeWrongKey.open()).rejects.toThrow();
+
+    // Cleanup
+    try { rmSync(dir1, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { rmSync(dir2, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+});
+
+// ─── BLOCKING-1 + MED: loadPersistedState() with real FROST material ──────────
+//
+// This test exercises the full CBOR deserialization path in loadPersistedState():
+//   commitments_cbor → CBOR decode → Uint8Array[] → storeDkgResult
+// It verifies events client.frost.share.loaded, client.mldsa.keypair.loaded,
+// and client.registration.loaded are emitted by loadPersistedState().
+//
+// We use ed25519_FROST.trustedDealer directly to get the actual client signing
+// share bytes (not zeros) so that storeDkgResult's validateSecret passes.
+
+describeWithSQLCipher("PERSIST-024 AC-001 (real FROST round-trip) — loadPersistedState() deserializes real FROST material", () => {
+  let dbPath: string;
+  let logger: ReturnType<typeof makeSpyLogger>;
+
+  beforeEach(() => {
+    dbPath = makeTmpDbPath();
+    logger = makeSpyLogger();
+  });
+  afterEach(async () => {
+    // clearTestShares evicts module-level FROST shares seeded by bootstrapKeyShares.
+    const { clearTestShares } = await import(
+      "@cello-protocol/crypto/frost/frost-threshold-signer.js" as string
+    );
+    clearTestShares();
+    cleanupPath(dbPath);
+  });
+
+  it("loadPersistedState() with real FROST share emits client.frost.share.loaded, client.mldsa.keypair.loaded, client.registration.loaded", async () => {
+    const [
+      { ed25519_FROST, mlDsaKeygenWithBytes, generateKeypair, FrostThresholdSigner },
+      { storeDkgResult, clearTestShares: _clearTestShares },
+      { createClient },
+      { createNode },
+    ] = await Promise.all([
+      import("@cello-protocol/crypto" as string),
+      import("@cello-protocol/crypto/frost/frost-threshold-signer.js" as string),
+      import("../client.js"),
+      import("@cello-protocol/transport" as string),
+    ]);
+
+    // ─── 1. Generate real FROST material via trustedDealer ────────────────────
+    // We create one "client" participant + 2 "stub" participants (threshold 2 of 3).
+    // trustedDealer gives us the actual signing share for the client participant.
+    const agentKeypair = generateKeypair();
+    const agentPubkeyBytes = await agentKeypair.getPublicKey();
+    const agentPubkeyHex = Buffer.from(agentPubkeyBytes).toString("hex");
+
+    const clientIdStr = `client:${agentPubkeyHex}`;
+    const clientIdentifier = ed25519_FROST.Identifier.derive(clientIdStr);
+    const stub0Id = "cello-test-node-0000";
+    const stub1Id = "cello-test-node-0001";
+    const stub0Identifier = ed25519_FROST.Identifier.derive(stub0Id);
+    const stub1Identifier = ed25519_FROST.Identifier.derive(stub1Id);
+
+    // trustedDealer: 2-of-3 threshold
+    const deal = ed25519_FROST.trustedDealer(
+      { min: 2, max: 3 },
+      [clientIdentifier, stub0Identifier, stub1Identifier],
+    );
+
+    // Extract the client's actual signing share (passes validateSecret)
+    const clientSecret = deal.secretShares[clientIdentifier];
+    if (!clientSecret) throw new Error("No share generated for client");
+    const frostPub = deal.public;
+
+    // primaryPubkey = commitments[0]
+    const primaryPubkeyBytes = new Uint8Array(frostPub.commitments[0]);
+    const primaryPubkeyHex = Buffer.from(primaryPubkeyBytes).toString("hex");
+
+    // Store the share in the module-level key store so FrostThresholdSigner can use it.
+    // storeDkgResult is the production path (no NODE_ENV guard).
+    storeDkgResult(agentPubkeyHex, clientSecret, frostPub);
+
+    // CBOR-encode commitments and verifyingShares exactly as client.ts does
+    const commitmentsCbor = CBOR_ENC.encode(frostPub.commitments) as Uint8Array;
+    const verifyingSharesCbor = CBOR_ENC.encode(frostPub.verifyingShares) as Uint8Array;
+
+    // ─── 2. Persist state into DB ────────────────────────────────────────────────
+    const dbKey = deriveDbKey(randomBytes(32), agentPubkeyHex);
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkeyHex, logger });
+    await store.open();
+
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey: agentPubkeyHex, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+
+    // Persist real FROST key share with actual signing share bytes.
+    // IMPORTANT: identifier must be the serialized hex scalar (clientSecret.identifier),
+    // not the raw string clientIdStr — loadPersistedState() passes it directly to storeDkgResult.
+    await persistence.persistFrostKeyShare({
+      epochId: `${agentPubkeyHex}:epoch:1`,
+      primaryPubkey: primaryPubkeyHex,
+      identifier: clientSecret.identifier as string,
+      signingShare: new Uint8Array(clientSecret.signingShare),
+      threshold: 2,
+      participants: 3,
+      commitmentsCbor,
+      verifyingSharesCbor,
+      dkgMethod: "network_dkg",
+    });
+
+    // Persist real ML-DSA keypair
+    const { secretKeyBlob, provider: mlDsaProvider } = await mlDsaKeygenWithBytes();
+    const mlDsaPubkeyHex = Buffer.from(await mlDsaProvider.getPublicKey()).toString("hex");
+    await persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob });
+
+    // Persist registration state
+    await persistence.persistRegistrationState({
+      agentId: "reg-test-agent-id",
+      primaryPubkey: primaryPubkeyHex,
+      mlDsaPubkey: mlDsaPubkeyHex,
+      registeredAt: Date.now(),
+    });
+
+    await store.close();
+
+    // Clear the module-level store so loadPersistedState() must re-populate it.
+    _clearTestShares();
+
+    // ─── 3. Open a fresh CelloClientImpl and call loadPersistedState() ────────────
+    const node = await createNode({ keyProvider: agentKeypair, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    await node.start();
+    try {
+      const store2 = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkeyHex, logger });
+      await store2.open();
+
+      const persistence2 = new ClientStatePersistence({
+        store: store2, agentPubkey: agentPubkeyHex, keyFilePath: "/tmp/test-key", logger,
+      });
+
+      const thresholdSigner = new FrostThresholdSigner(
+        { threshold: 2, participants: 3 },
+        agentPubkeyBytes,
+      );
+
+      const client = createClient(node, agentKeypair, {
+        logger,
+        persistence: persistence2,
+        thresholdSigner,
+      });
+
+      // Call loadPersistedState() — this exercises the CBOR deserialization path
+      await client.loadPersistedState();
+
+      // ─── 4. Verify events emitted ─────────────────────────────────────────────
+      const frostLoadedEvents = logger.events.filter((e) => e.event === "client.frost.share.loaded");
+      const mlDsaLoadedEvents = logger.events.filter((e) => e.event === "client.mldsa.keypair.loaded");
+      const regLoadedEvents = logger.events.filter((e) => e.event === "client.registration.loaded");
+
+      // client.frost.share.loaded must be emitted (real CBOR deserialization succeeded)
+      expect(frostLoadedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(frostLoadedEvents[0].context.agentPubkey).toBe(agentPubkeyHex);
+      expect(frostLoadedEvents[0].context.threshold).toBe(2);
+      expect(frostLoadedEvents[0].context.participants).toBe(3);
+
+      // client.mldsa.keypair.loaded must be emitted
+      expect(mlDsaLoadedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(mlDsaLoadedEvents[0].context.agentPubkey).toBe(agentPubkeyHex);
+      expect(mlDsaLoadedEvents[0].context.mlDsaPubkey).toBe(mlDsaPubkeyHex);
+
+      // client.registration.loaded must be emitted
+      expect(regLoadedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(regLoadedEvents[0].context.agentId).toBe("reg-test-agent-id");
+
+      // ─── 5. Verify primary_pubkey round-trips correctly ────────────────────────
+      // After loadPersistedState(), thresholdSigner.getPrimaryPubkey() must return
+      // the same primary_pubkey that was persisted (loaded from commitments[0]).
+      const loadedPrimaryPubkey = thresholdSigner.getPrimaryPubkey();
+      expect(Buffer.from(loadedPrimaryPubkey).toString("hex")).toBe(primaryPubkeyHex);
+
+      // ─── 6. Verify hasFrostShare=true, hasMlDsaKeypair=true, hasRegistration=true ─
+      const state = await persistence2.loadStartupState();
+      expect(state.hasFrostShare).toBe(true);
+      expect(state.hasMlDsaKeypair).toBe(true);
+      expect(state.hasRegistration).toBe(true);
+
+      await store2.close();
+    } finally {
+      await node.stop();
+    }
+  });
+});
+
+// ─── SI-003 adversarial: wrong db_key cannot open the DB ─────────────────────
+
+describeWithSQLCipher("PERSIST-024 SI-003 (adversarial) — wrong db_key cannot open the DB", () => {
+  it("opening a populated DB with a different db_key throws SQLITE_NOTADB or 'file is not a database'", async () => {
+    const dbPath = makeTmpDbPath();
+    const logger = makeSpyLogger();
+    const identityKey = randomBytes(32);
+    const agentPubkey = randomBytes(32).toString("hex");
+    const dbKey = deriveDbKey(identityKey, agentPubkey);
+
+    // Create and populate a store with the correct key
+    const store = new SQLCipherClientStore(dbKey, { dbPath, agentId: agentPubkey, logger });
+    await store.open();
+    const persistence = new ClientStatePersistence({
+      store, agentPubkey, keyFilePath: "/tmp/test-key", logger,
+    });
+    await persistence.upsertAgent();
+    await persistence.persistRegistrationState({
+      agentId: "test-agent", primaryPubkey: "pk1",
+      mlDsaPubkey: "mlpk1", registeredAt: Date.now(),
+    });
+    await store.close();
+
+    // Derive a DIFFERENT db_key (different identity key → different HKDF output)
+    const wrongIdentityKey = randomBytes(32);
+    const wrongDbKey = deriveDbKey(wrongIdentityKey, agentPubkey);
+
+    // Attempting to open the same DB file with the wrong key MUST throw.
+    const storeWrongKey = new SQLCipherClientStore(wrongDbKey, { dbPath, agentId: agentPubkey, logger });
+    await expect(storeWrongKey.open()).rejects.toThrow();
+
+    cleanupPath(dbPath);
   });
 });
 
