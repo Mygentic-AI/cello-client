@@ -2171,6 +2171,7 @@ class CelloClientImpl implements CelloClient {
     const session = this.#sessions.get(sessionIdHex);
     if (!session) return;
     session.status = "seal_rejected";
+    void this.#persistence?.persistSession(sessionIdHex, session);
     // Also resolve the seal-frost-timeout waiter so initiateSessionSeal doesn't wait for the timeout
     this.#sealFrostResolvers.get(sessionIdHex)?.();
   }
@@ -2809,6 +2810,7 @@ class CelloClientImpl implements CelloClient {
 
     // Mark session transport_lost (SESSION-006 AC-001)
     session.status = "transport_lost";
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // Unblock any waiting sendMessage calls with transport_unavailable
     const ackResolve = this.#pendingAckResolvers.get(sessionIdHex);
@@ -2891,6 +2893,7 @@ class CelloClientImpl implements CelloClient {
           // Reconnect succeeded: install new stream and resume
           this.#relayStreams.set(sessionIdHex, newStream);
           sessionAfterAuth.status = "active";
+          void this.#persistence?.persistSession(sessionIdHex, sessionAfterAuth);
 
           // Start the new reader loop (authResult.iter is the continuation iterator)
           void this.#runRelayStreamReader(sessionIdHex, newStream, myPubkeyHex, authResult.iter);
@@ -3219,6 +3222,7 @@ class CelloClientImpl implements CelloClient {
     if (!session) return;
 
     session.desynchronized = true;
+    void this.#persistence?.persistSession(sessionIdHex, session);
 
     // Cancel pending S2 timers AND fire any migrated echo resolvers
     const ps2 = this.#pendingS2.get(sessionIdHex);
@@ -4388,16 +4392,24 @@ class CelloClientImpl implements CelloClient {
     if (type === "connection_established") {
       const connectionId = frame["connection_id"] as string;
       const counterpartyPubkey = frame["counterparty_pubkey"] as string;
+      const establishedAt = Date.now();
       const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
         connection_id: connectionId,
         counterparty_pubkey: counterpartyPubkey,
         counterparty_primary_pubkey: "",
         counterparty_ml_dsa_pubkey: "",
-        established_at: Date.now(),
+        established_at: establishedAt,
         status: "active",
       };
       this.#connections.set(connectionId, record);
       this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
+      if (this.#persistence) {
+        void this.#persistence.persistConnection({
+          connectionId,
+          counterpartyPubkey,
+          establishedAt,
+        });
+      }
       return { result: "established", connection_id: connectionId };
     }
 
@@ -4976,6 +4988,14 @@ class CelloClientImpl implements CelloClient {
               package_cbor: packageCbor,
               round: 2,
             });
+            if (this.#persistence) {
+              void this.#persistence.persistPendingConnectionRequest({
+                requestId: connectionRequestId,
+                fromPubkey,
+                packageCbor,
+                round: 2,
+              });
+            }
             const round2ReviewItem = {
               connection_request_id: connectionRequestId,
               from_pubkey: fromPubkey,
@@ -5796,6 +5816,8 @@ export function createClient(
   _evaluateCallCount: number;
   /** PERSIST-024: load all durable state from the SQLCipher DB and populate in-memory state. */
   loadPersistedState(): Promise<void>;
+  /** PERSIST-024: return hashes pending relay resubmission after loadPersistedState(). */
+  getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
 } {
   return new CelloClientImpl(
     node,
@@ -5856,6 +5878,7 @@ export function createClient(
     _pendingConnectionRequestResolverCount: number;
     _evaluateCallCount: number;
     loadPersistedState(): Promise<void>;
+    getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
   };
 }
 
