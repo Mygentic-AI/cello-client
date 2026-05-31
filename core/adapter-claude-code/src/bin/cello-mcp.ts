@@ -330,9 +330,8 @@ if (dbKey) {
       const platform = process.platform;
       process.stderr.write(`cello-mcp: SQLCipher failed to load: ${msg}\n`);
       if (platform === "win32") {
-        process.stderr.write(`cello-mcp: Windows requires a manual SQLCipher install.\n`);
-        process.stderr.write(`cello-mcp: Download and install SQLCipher from https://www.zetetic.net/sqlcipher/\n`);
-        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
+        process.stderr.write(`cello-mcp: Windows is not yet supported in the CELLO beta.\n`);
+        process.stderr.write(`cello-mcp: Windows support is on the roadmap. Follow https://github.com/Mygentic-AI/cello-client for updates.\n`);
       } else if (platform === "linux") {
         process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
         process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
