@@ -223,6 +223,7 @@ let resolvedDirectoryMultiaddr: string | undefined = directoryMultiaddr;
 
 if (!resolvedDirectoryMultiaddr) {
   process.stderr.write(`cello-mcp: auto-discovering directory multiaddr from ${directoryUrl}/bootstrap\n`);
+  // fetchFn defaults to global fetch; injectable in tests via config.ts
   const discovered = await fetchBootstrapMultiaddr(directoryUrl);
   if (discovered) {
     resolvedDirectoryMultiaddr = discovered;

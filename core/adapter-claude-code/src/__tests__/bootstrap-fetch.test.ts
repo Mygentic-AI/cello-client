@@ -82,6 +82,22 @@ describe("fetchBootstrapMultiaddr: AC-3 network error", () => {
   });
 });
 
+// ─── L-3: trailing slash in directoryUrl is stripped ─────────────────────────
+
+describe("fetchBootstrapMultiaddr: trailing-slash URL", () => {
+  it("strips trailing slash so the URL does not contain //bootstrap", async () => {
+    let calledUrl = "";
+    const mockFetch = async (url: string, _opts?: RequestInit): Promise<Response> => {
+      calledUrl = url as string;
+      return new Response(JSON.stringify({ multiaddr: VALID_MULTIADDR }), { status: 200 });
+    };
+
+    const result = await fetchBootstrapMultiaddr("http://localhost:9090/", mockFetch as typeof fetch);
+    expect(calledUrl).toBe("http://localhost:9090/bootstrap");
+    expect(result).toBe(VALID_MULTIADDR);
+  });
+});
+
 // ─── AC-4: invalid multiaddr rejected ─────────────────────────────────────────
 
 describe("fetchBootstrapMultiaddr: AC-4 invalid multiaddr rejected", () => {

@@ -35,16 +35,11 @@ export async function fetchBootstrapMultiaddr(
   directoryUrl: string,
   fetchFn: typeof fetch = fetch,
 ): Promise<string | null> {
-  const bootstrapUrl = `${directoryUrl}/bootstrap`;
+  const bootstrapUrl = `${directoryUrl.replace(/\/$/, "")}/bootstrap`;
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), 5000);
   try {
-    const ac = new AbortController();
-    const timeout = setTimeout(() => ac.abort(), 5000);
-    let resp: Response;
-    try {
-      resp = await fetchFn(bootstrapUrl, { signal: ac.signal });
-    } finally {
-      clearTimeout(timeout);
-    }
+    const resp = await fetchFn(bootstrapUrl, { signal: ac.signal });
     if (!resp.ok) {
       return null;
     }
@@ -55,5 +50,7 @@ export async function fetchBootstrapMultiaddr(
     return null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }
