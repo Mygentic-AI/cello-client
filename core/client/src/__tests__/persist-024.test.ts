@@ -145,6 +145,8 @@ describeWithSQLCipher("PERSIST-024 AC-000 — V2 migration creates 18 tables and
 
     const appliedEvents = logger.events.filter((e) => e.event === "client.db.v2.migration.applied");
     expect(appliedEvents.length).toBe(1);
+    // M-2: assert tableCount matches the 18 tables created by the V2 migration SQL
+    expect(appliedEvents[0].context.tableCount).toBe(18);
 
     // Second open — V2 should be skipped
     const store2 = new SQLCipherClientStore(dbKey, { dbPath, agentId: "agent-ac000-idempotent", logger });
@@ -154,7 +156,8 @@ describeWithSQLCipher("PERSIST-024 AC-000 — V2 migration creates 18 tables and
     const skippedEvents = logger.events.filter((e) => e.event === "client.db.v2.migration.skipped");
     expect(skippedEvents.length).toBe(1);
     expect(skippedEvents[0].context).toHaveProperty("agentPubkey");
-    expect(skippedEvents[0].context).toHaveProperty("currentVersion");
+    // L-1: currentVersion must match the full migration key stored in schema_migrations
+    expect(skippedEvents[0].context.currentVersion).toBe("V2__client_schema_structured");
   });
 });
 
@@ -1022,6 +1025,21 @@ describeWithSQLCipher("PERSIST-024 AC-010 — pending connection requests surviv
 // ─── AC-012: Multi-agent-per-device isolation ────────────────────────────────
 
 describeWithSQLCipher("PERSIST-024 AC-012 — multi-agent-per-device: two separate stores at different paths", () => {
+  let dir1: string;
+  let dir2: string;
+
+  beforeEach(() => {
+    dir1 = join(tmpdir(), `cello-ac012-agent1-${randomBytes(8).toString("hex")}`);
+    dir2 = join(tmpdir(), `cello-ac012-agent2-${randomBytes(8).toString("hex")}`);
+    mkdirSync(dir1, { recursive: true });
+    mkdirSync(dir2, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(dir1, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { rmSync(dir2, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
   it("each store only returns its own data and rejects the other agent's db_key", async () => {
     // Two distinct identity keys → two distinct db_keys → two distinct DB files
     const identityKey1 = randomBytes(32);
@@ -1029,10 +1047,6 @@ describeWithSQLCipher("PERSIST-024 AC-012 — multi-agent-per-device: two separa
     const agentPubkey1 = randomBytes(32).toString("hex");
     const agentPubkey2 = randomBytes(32).toString("hex");
 
-    const dir1 = join(tmpdir(), `cello-ac012-agent1-${randomBytes(8).toString("hex")}`);
-    const dir2 = join(tmpdir(), `cello-ac012-agent2-${randomBytes(8).toString("hex")}`);
-    mkdirSync(dir1, { recursive: true });
-    mkdirSync(dir2, { recursive: true });
     const dbPath1 = join(dir1, "agent1.db");
     const dbPath2 = join(dir2, "agent2.db");
 
@@ -1094,10 +1108,6 @@ describeWithSQLCipher("PERSIST-024 AC-012 — multi-agent-per-device: two separa
     // SQLCipher uses the key for AES encryption — wrong key → "file is not a database".
     const storeWrongKey = new SQLCipherClientStore(dbKey2, { dbPath: dbPath1, agentId: agentPubkey1, logger });
     await expect(storeWrongKey.open()).rejects.toThrow();
-
-    // Cleanup
-    try { rmSync(dir1, { recursive: true, force: true }); } catch { /* ignore */ }
-    try { rmSync(dir2, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 });
 
@@ -1332,6 +1342,10 @@ describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loade
   });
   afterEach(() => cleanupPath(dbPath));
 
+  // M-4: This test verifies the persistence precondition (hashes survive restart in FIFO order).
+  // The relay resubmission behavior (AgentHashQueue loading pending hashes and resubmitting to
+  // relay on reconnect) is integration-tested in the e2e-tests package where a real relay is
+  // available — it cannot be meaningfully unit-tested here without a live relay node.
   it("pending hashes survive restart in FIFO order", async () => {
     const agentPubkey = randomBytes(32).toString("hex");
     const dbKey = deriveDbKey(randomBytes(32), agentPubkey);

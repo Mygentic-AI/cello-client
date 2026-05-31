@@ -248,7 +248,9 @@ if (dbKey) {
       keyFilePath: keyPath,
       logger: backupLogger,
     });
-    await clientPersistence.upsertAgent();
+    // Note: upsertAgent() is NOT called here. loadPersistedState() calls it after all
+    // state loading completes — that is the authoritative call site that updates last_seen_at
+    // only on a fully successful startup.
     process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

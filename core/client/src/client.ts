@@ -582,7 +582,6 @@ class CelloClientImpl implements CelloClient {
     const p = this.#persistence;
     if (!p) return;
 
-    await p.upsertAgent();
     const state = await p.loadStartupState();
 
     // ── 1. FROST key share ────────────────────────────────────────────────────
@@ -896,6 +895,9 @@ class CelloClientImpl implements CelloClient {
     if (!this.#myPubkeyHex && state.registrationState) {
       this.#myPubkeyHex = state.registrationState.agent_pubkey;
     }
+
+    // M-5: upsertAgent at the END of startup so last_seen_at only reflects a fully successful boot.
+    await p.upsertAgent();
   }
 
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
@@ -3531,6 +3533,13 @@ class CelloClientImpl implements CelloClient {
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
         // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
+        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
+        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
+        // Note on FROST share: DKG was skipped by the directory in this path, so no FROST share exists.
+        // On the next restart, client.frost.share.missing will fire — that is correct behavior.
+        // The operator should investigate why the directory considers this agent already registered
+        // without a local FROST share.
         if (this.#persistence && mlDsaSecretKeyBlob) {
           void this.#persistence.persistMlDsaKeypair({
             mlDsaPubkey: mlDsaPubkeyHex,
@@ -3641,6 +3650,9 @@ class CelloClientImpl implements CelloClient {
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
         // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
+        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
+        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
+        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
         if (this.#persistence && mlDsaSecretKeyBlob) {
           void this.#persistence.persistMlDsaKeypair({
             mlDsaPubkey: mlDsaPubkeyHex,

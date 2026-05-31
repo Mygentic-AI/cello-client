@@ -339,7 +339,7 @@ export class SQLCipherClientStore implements ClientStore {
     } else if (appliedVersions.has("V2__client_schema_structured")) {
       this.#logger.info("client.db.v2.migration.skipped", {
         agentPubkey: this.#agentId,
-        currentVersion: "V2",
+        currentVersion: "V2__client_schema_structured",
       });
     }
   }

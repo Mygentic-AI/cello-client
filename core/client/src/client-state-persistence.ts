@@ -325,7 +325,7 @@ export class ClientStatePersistence {
 
   /** Persist connection policy (upsert mode + requirements in a single transaction). */
   async persistConnectionPolicy(policy: SignalRequirementPolicy): Promise<void> {
-    await this.#store.run("BEGIN");
+    await this.#store.run("SAVEPOINT sp_connection_policy");
     try {
       await this.#store.run(
         `INSERT OR REPLACE INTO connection_policy (agent_pubkey, mode, review_mode, updated_at)
@@ -346,9 +346,9 @@ export class ClientStatePersistence {
           [this.#agentPubkey, i, req.signal_type, JSON.stringify(req.condition)],
         );
       }
-      await this.#store.run("COMMIT");
+      await this.#store.run("RELEASE sp_connection_policy");
     } catch (err) {
-      await this.#store.run("ROLLBACK").catch(() => {});
+      await this.#store.run("ROLLBACK TO SAVEPOINT sp_connection_policy").catch(() => {});
       throw err;
     }
     this.#logger.info("client.policy.persisted", {
@@ -423,6 +423,7 @@ export class ClientStatePersistence {
       sessionId: sessionIdHex,
       counterpartyPubkey: Buffer.from(record.counterparty_pubkey).toString("hex"),
       status: record.status,
+      correlationId: sessionIdHex,
     });
   }
 
@@ -467,6 +468,7 @@ export class ClientStatePersistence {
         leafIndex: opts.leafIndex,
         leafKind: opts.leafKind,
         sequenceNumber: opts.sequenceNumber,
+        correlationId: opts.sessionIdHex,
       });
     }
   }
@@ -617,7 +619,7 @@ export class ClientStatePersistence {
     // CRIT-2: Both operations must be atomic. A crash between DELETE and INSERT would leave
     // the request invisible on restart (not in pending, not in decided), enabling double-decision
     // on relay replay.
-    await this.#store.run("BEGIN");
+    await this.#store.run("SAVEPOINT sp_decide_request");
     try {
       await this.#store.run(
         `DELETE FROM pending_connection_requests WHERE request_id = ? AND agent_pubkey = ?`,
@@ -628,9 +630,9 @@ export class ClientStatePersistence {
          VALUES (?, ?, ?)`,
         [requestId, this.#agentPubkey, decision],
       );
-      await this.#store.run("COMMIT");
+      await this.#store.run("RELEASE sp_decide_request");
     } catch (err) {
-      await this.#store.run("ROLLBACK").catch(() => {});
+      await this.#store.run("ROLLBACK TO SAVEPOINT sp_decide_request").catch(() => {});
       throw err;
     }
   }
