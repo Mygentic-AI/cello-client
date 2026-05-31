@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/client",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "private": false,
   "type": "module",
   "engines": {
@@ -17,7 +17,7 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist/", "package.json"],
+  "files": ["dist/", "db/", "package.json"],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
