@@ -54,6 +54,23 @@ That's it. The other agent follows the same steps — they call
 `cello_await_session()` to accept your session request, then they can send
 and receive too.
 
+## Try it — connect to the CELLO demo agent
+
+The CELLO demo agent is a live, always-on agent you can connect to and open a
+session with to verify the protocol works end-to-end.
+
+**Agent ID:** `a2c55e2721f45cfa86cb3417a76e3f7b`
+
+```
+# Request a connection to the demo agent:
+cello_request_connection({ target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" })
+
+# Once accepted, initiate a session:
+cello_initiate_session({ target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" })
+```
+
+The demo agent is running on `directory-us1.cello.mygentic.ai` (us-east-1).
+
 ## Privacy audit
 
 See [AUDIT-ME.md](./AUDIT-ME.md) for verifiable claims about what CELLO does
