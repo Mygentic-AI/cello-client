@@ -364,8 +364,9 @@ describe("AC-002: cello_register on already-registered agent returns already_reg
     const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true });
     scope.addCleanup(cleanup);
 
+    // DX-001: cello_register now takes { token: '...' } instead of { phone_stub: '...' }
     const result = parseResult(
-      await mcpClient.callTool({ name: "cello_register", arguments: { phone_stub: "+1234567890" } })
+      await mcpClient.callTool({ name: "cello_register", arguments: { token: "DEV-test-token" } })
     ) as Record<string, unknown>;
 
     expect(result["error"]).toBeDefined();
@@ -486,7 +487,8 @@ describe("AC-008: cello_reject_connection returns rejected:true; second call ret
   });
 
   it("AC-008c: reject_connection with no_pending_request → error", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003();
+    // DX-001: requires registered:true because isRegistered() check added in AC-004
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122" });
     scope.addCleanup(cleanup);
 
     const result = parseResult(
@@ -616,7 +618,7 @@ describe("AC-010: cello_request_more_disclosure on Round 2 → { error: { reason
 
 describe("AC-011: cello_set_policy sets mode/review_mode/requirements; cello_get_policy returns them", () => {
   it("AC-011a: set_policy mode=selective, review_mode=inference, 1 requirement → get_policy returns them", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003();
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122" });
     scope.addCleanup(cleanup);
 
     const setResult = parseResult(
@@ -647,7 +649,7 @@ describe("AC-011: cello_set_policy sets mode/review_mode/requirements; cello_get
   });
 
   it("AC-011b: set_policy mode=open, review_mode=deterministic, no requirements → get_policy returns it", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003();
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122" });
     scope.addCleanup(cleanup);
 
     await mcpClient.callTool({
@@ -665,7 +667,7 @@ describe("AC-011: cello_set_policy sets mode/review_mode/requirements; cello_get
   });
 
   it("AC-011c: set_policy mode=closed → get_policy returns closed", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003();
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122" });
     scope.addCleanup(cleanup);
 
     await mcpClient.callTool({
@@ -685,7 +687,7 @@ describe("AC-011: cello_set_policy sets mode/review_mode/requirements; cello_get
 
 describe("AC-012: cello_await_connection_request with timeout_ms: 200 → { type: 'timeout' } after ~200ms", () => {
   it("AC-012: empty queue + 200ms timeout → { type: 'timeout' }", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003();
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122" });
     scope.addCleanup(cleanup);
 
     const start = Date.now();
@@ -708,7 +710,8 @@ describe("AC-012: cello_await_connection_request with timeout_ms: 200 → { type
 
 describe("AC-014: cello_initiate_session without connection → { error: { reason: 'no_connection' } }", () => {
   it("AC-014: initiate_session with valid hex pubkey but no connection record → blocked, no_connection", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ connections: [] });
+    // DX-001: requires registered:true because isRegistered() check added in AC-004
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122", connections: [] });
     scope.addCleanup(cleanup);
 
     const fakePubkey = "a".repeat(64);
@@ -779,8 +782,8 @@ describe("AC-015: cello_status includes registered, agent_id, connection_count, 
 
 // ─── AC-016: tool set equality (19 tools total) ──────────────────────────────
 
-describe("AC-016: both InMemoryTransport instances register identical tool set (all 20 tools)", () => {
-  it("AC-016: two server instances have identical 20-tool set", async () => {
+describe("AC-016: both InMemoryTransport instances register identical tool set (all tools)", () => {
+  it("AC-016: two server instances have identical tool set", async () => {
     const kpA = generateKeypair();
     const kpB = generateKeypair();
     const nodeA = makeStubNode(true);
@@ -824,9 +827,7 @@ describe("AC-016: both InMemoryTransport instances register identical tool set (
     const toolsA = sortByName((await mcpA.listTools()).tools);
     const toolsB = sortByName((await mcpB.listTools()).tools);
 
-    // 22 tools total: 9 from MCP-002 + 10 new from MCP-003 + 1 renamed from SESSION-007
-    //                 + 2 from PERSIST-022 (cello_backup, cello_restore)
-    // cello_receive = any-session default; cello_receive_session = session-locked
+    // DX-001: 23 tools total (22 from MCP-003 + cello_setup_guidance from DX-001)
     const expectedTools = [
       "cello_accept_connection",
       "cello_await_connection_request",
@@ -849,6 +850,7 @@ describe("AC-016: both InMemoryTransport instances register identical tool set (
       "cello_restore",
       "cello_send",
       "cello_set_policy",
+      "cello_setup_guidance",
       "cello_status",
     ];
 
@@ -869,7 +871,8 @@ describe("SI-001: No ML-DSA secret key material in any tool response", () => {
     scope.addCleanup(cleanup);
 
     const result = parseResult(
-      await mcpClient.callTool({ name: "cello_register", arguments: { phone_stub: "+1" } })
+      // DX-001: cello_register now takes { token: '...' }
+      await mcpClient.callTool({ name: "cello_register", arguments: { token: "DEV-test" } })
     ) as Record<string, unknown>;
 
     const resultStr = JSON.stringify(result);
@@ -904,7 +907,8 @@ describe("SI-001: No ML-DSA secret key material in any tool response", () => {
 
 describe("SI-002: initiate_session with valid hex pubkey but no connection → blocked, directory not contacted", () => {
   it("SI-002: 64-char hex pubkey with no local connection record → returns no_connection immediately", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ connections: [] });
+    // DX-001: requires registered:true because isRegistered() check added in AC-004
+    const { mcpClient, cleanup } = await makeServerAndClientMcp003({ registered: true, agentId: "aabb1122", connections: [] });
     scope.addCleanup(cleanup);
 
     // Use a valid-looking 64-char hex pubkey

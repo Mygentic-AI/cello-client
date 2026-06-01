@@ -658,14 +658,25 @@ class CelloClientImpl implements CelloClient {
       }
 
       // Reconstruct FrostThresholdSigner (config only — secret is in module-level store).
-      // HIGH-1: directoryEndpoint is NOT required for construction — the signer can verify
-      // signatures even without a live directory. Pass undefined for directoryNodes.
+      // AC-003 (DX-001): directoryNodeStubs MUST be populated from the current directoryEndpoint
+      // so that the signer can participate in FROST signing ceremonies (round-trip frames
+      // to directory via libp2p). Without directoryNodeStubs, the signer can verify but cannot
+      // participate in ceremonies — causing directory_below_threshold on session initiation.
       if (!this.#thresholdSigner) {
+        let directoryNodeStubsForSigner: NetworkDirectoryNode[] | undefined;
+        if (this.#directoryEndpoint) {
+          directoryNodeStubsForSigner = [new NetworkDirectoryNode({
+            id: this.#directoryEndpoint.peer_id,
+            node: this.#node,
+            directoryPeerId: this.#directoryEndpoint.peer_id,
+            directoryMultiaddrs: this.#directoryEndpoint.multiaddrs,
+          })];
+        }
         this.#thresholdSigner = new FrostThresholdSigner(
           {
             threshold: row.threshold,
             participants: row.participants,
-            directoryNodes: undefined,
+            directoryNodeStubs: directoryNodeStubsForSigner,
           },
           Buffer.from(myPubkeyHex, "hex"),
         );
@@ -3563,7 +3574,7 @@ class CelloClientImpl implements CelloClient {
    *
    * Crypto refs: NIST FIPS 204 (ML-DSA-44), RFC 9591 (FROST), FIPS 180-4 (SHA-256)
    */
-  async register(phoneStub: string, preAuthToken?: string): Promise<RegistrationState | { error: string }> {
+  async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
     // Step 1: already registered — return error
     if (this.#registrationState) {
       return { error: "already_registered" };

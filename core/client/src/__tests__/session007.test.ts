@@ -468,6 +468,8 @@ describe("MCP: cello_receive_session surfaces session_sealed inline", () => {
 
     const celloClient = createClient(node, kp) as unknown as TestClient;
     await celloClient.registerHandler();
+    // DX-001: inject stub registration state so isRegistered() returns true in tool handlers
+    (celloClient as unknown as Record<string, unknown>).getRegistrationState = () => ({ agent_id: "testregisteredagent00000000000000" });
 
     const server = createMcpSessionServer(node, celloClient as unknown as CelloClient, kp);
     const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
@@ -524,6 +526,8 @@ describe("MCP: cello_receive (any-session) tool", () => {
 
     const celloClient = createClient(node, kp) as unknown as CelloClient;
     await celloClient.registerHandler();
+    // DX-001: inject stub registration state so isRegistered() returns true
+    (celloClient as unknown as Record<string, unknown>).getRegistrationState = () => ({ agent_id: "testregisteredagent00000000000000" });
 
     const server = createMcpSessionServer(node, celloClient, kp);
     const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
@@ -557,6 +561,8 @@ describe("MCP: cello_receive (any-session) tool", () => {
 
     const celloClient = createClient(node, kp) as unknown as TestClient;
     await celloClient.registerHandler();
+    // DX-001: inject stub registration state so isRegistered() returns true
+    (celloClient as unknown as Record<string, unknown>).getRegistrationState = () => ({ agent_id: "testregisteredagent00000000000000" });
 
     const server = createMcpSessionServer(node, celloClient as unknown as CelloClient, kp);
     const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
