@@ -194,7 +194,7 @@ cello_receive({ session_id: "<hex>", timeout_ms: 60000 })
 
 ### Step 5 — Detect seal
 
-**Do not call `cello_close_session`** — that's Agent A's call. Keep receiving in your loop. When A seals, your next receive returns:
+**Do not call `cello_close_session`** — that is the initiating-party-only tool. Agent A calls it to start the FROST seal ceremony. Keep receiving in your loop. When A seals, your next receive returns:
 ```
 { type: "session_sealed", sealed_root: "<64-hex>", checkpoint_status: "pending" }
 ```
