@@ -304,7 +304,6 @@ void (async () => {
     const t0Db = Date.now();
     if (dbKey) {
       try {
-        const t0 = Date.now();
         sqlCipherStore = new SQLCipherClientStore(dbKey, {
           dbPath,
           agentId,
@@ -322,7 +321,7 @@ void (async () => {
         clientPersistenceRef = clientPersistence;
         // Wire persistence into client
         (client as unknown as { setPersistence(p: ClientStatePersistence): void }).setPersistence?.(clientPersistence);
-        const durationMs = Date.now() - t0;
+        const durationMs = Date.now() - t0Db;
         // AC-001: report schema version and table count when available
         const schemaInfo = (sqlCipherStore as unknown as { getSchemaInfo?: () => { version: number; tableCount: number } }).getSchemaInfo?.();
         if (schemaInfo) {
@@ -432,9 +431,16 @@ void (async () => {
     // directoryEndpoint is already set, so directoryNodeStubs will be populated.
     process.stderr.write("cello: loading agent state...");
     const t0LoadState = Date.now();
-    await client.loadPersistedState();
-    process.stderr.write(" ok\n");
-    backupLogger.info("client.startup.progress", { step: "loading_agent_state", outcome: "ok", durationMs: Date.now() - t0LoadState });
+    try {
+      await client.loadPersistedState();
+      process.stderr.write(" ok\n");
+      backupLogger.info("client.startup.progress", { step: "loading_agent_state", outcome: "ok", durationMs: Date.now() - t0LoadState });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(` failed: ${msg}\n`);
+      backupLogger.warn("client.startup.progress", { step: "loading_agent_state", outcome: "failed", reason: msg, durationMs: Date.now() - t0LoadState });
+      throw err;
+    }
 
     // PERSIST-024 AC-008: Build AgentHashQueue
     const loadedPendingHashes = client.getLoadedPendingHashes();
@@ -507,13 +513,13 @@ void (async () => {
     }
 
     // Step 5: Emit final ready message (use regStateAfterLoad from loadPersistedState)
-    const t0Ready = Date.now();
     if (regStateAfterLoad) {
       process.stderr.write(`cello: ready (registered as ${regStateAfterLoad.agent_id})\n`);
     } else {
       process.stderr.write(`cello: ready (not registered — call cello_setup_guidance for setup)\n`);
     }
-    backupLogger.info("client.startup.progress", { step: "ready", outcome: "ok", durationMs: Date.now() - t0Ready });
+    // durationMs: 0 — "ready" is a completion marker, not a timed operation.
+    backupLogger.info("client.startup.progress", { step: "ready", outcome: "ok", durationMs: 0 });
 
     readyResolve();
   } catch (err: unknown) {
