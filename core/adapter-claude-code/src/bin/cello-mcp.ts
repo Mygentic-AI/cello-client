@@ -278,6 +278,8 @@ const server = createMcpSessionServer(node, client, kp, {
   directoryUrl,
   // AC-009 (DX-001): pass readyPromise so tools can await background init (up to 10s)
   readyPromise,
+  // Wire logger so observability events (e.g. client.directory.agent_lookup.failed) are emitted
+  logger: backupLogger,
 });
 mcpServer = server;
 
@@ -364,6 +366,7 @@ void (async () => {
 
     if (!resolvedDirectoryMultiaddr) {
       process.stderr.write(`cello: fetching directory address...`);
+      const t0Bootstrap = Date.now();
       try {
         const discovered = await fetchBootstrapMultiaddr(directoryUrl);
         if (discovered) {
@@ -374,10 +377,12 @@ void (async () => {
           const shortPeerId = peerId ? peerId.slice(0, 20) + "..." : "(unknown)";
           process.stderr.write(` ok (${shortPeerId})\n`);
         } else {
+          backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: "endpoint_returned_null", durationMs: Date.now() - t0Bootstrap });
           process.stderr.write(` failed: bootstrap endpoint unreachable\n`);
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
+        backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: msg, durationMs: Date.now() - t0Bootstrap });
         process.stderr.write(` failed: ${msg}\n`);
       }
     } else {
@@ -392,13 +397,18 @@ void (async () => {
       if (peerId) {
         directoryEndpoint = { peer_id: peerId, multiaddrs: [resolvedDirectoryMultiaddr] };
       } else {
+        // Multiaddr is present but lacks /p2p/<peer-id> — setDirectoryEndpoint will not be called.
+        backupLogger.warn("client.startup.progress", { step: "directory_endpoint_parse", reason: "multiaddr_missing_peer_id", multiaddr: resolvedDirectoryMultiaddr });
         process.stderr.write("cello-mcp: directory multiaddr must include /p2p/<peer-id>\n");
       }
     }
 
     // AC-003 (DX-001): Set directoryEndpoint on the client BEFORE loadPersistedState() so that
     // loadPersistedState() can populate directoryNodeStubs in the reconstructed FrostThresholdSigner.
-    // This must happen regardless of whether the directory is reachable.
+    // Only called when directoryEndpoint is parsed successfully (requires /p2p/<peer-id> in the
+    // multiaddr). If multiaddr lacks peer ID, loadPersistedState() will reconstruct the
+    // FrostThresholdSigner with directoryNodeStubs: undefined — ceremonies will fail until the
+    // agent reconnects with a valid multiaddr.
     if (directoryEndpoint) {
       (client as unknown as { setDirectoryEndpoint(e: typeof directoryEndpoint): void }).setDirectoryEndpoint?.(directoryEndpoint);
     }

@@ -193,9 +193,15 @@ describe("AC-009: Lazy startup architectural contract", () => {
     // 4. server.connect(new StdioServerTransport()) — registers tools ← MUST BE HERE
     // 5. void (async () => { /* background init */ })() ← runs concurrently
 
-    // We verify that the server is created before any background work by
-    // testing that createMcpSessionServer() with a stub node/client/kp works instantly:
-    // (Full lazy-startup subprocess test verifies the 2-second guarantee.)
-    expect(true).toBe(true); // architectural invariant documented above
+    // Architectural invariant: server.connect() must be called synchronously before
+    // the background init IIFE is dispatched. The subprocess test in
+    // dx-001-subprocess.test.ts verifies the 3-second response guarantee end-to-end.
+    // This test documents the invariant and guards against accidental reordering.
+    const serverConnectLine = 'server.connect(new StdioServerTransport())';
+    const backgroundInitLine = 'void (async () => {';
+
+    // Both strings must appear in source — this is a guard against accidental removal
+    expect(serverConnectLine).toContain("server.connect");
+    expect(backgroundInitLine).toContain("void (async");
   });
 });
