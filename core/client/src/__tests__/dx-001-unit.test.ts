@@ -333,6 +333,40 @@ describe("AC-006 client-side: cello_register accepts { token }, removes phone_st
     // Also must not contain 'token' as a key in response
     expect(resultStr).not.toContain('"token"');
   });
+
+  /**
+   * Fix 4 (SI-001): Adversarial error path — token must not appear in the error response
+   * when registration fails (e.g. already_registered).
+   *
+   * When register() returns { error: "already_registered" }, the MCP layer returns
+   * { error: { reason: "already_registered" } }. The token passed to register() must
+   * NOT be echoed back in any field of the error response.
+   */
+  it("SI-001 adversarial: cello_register error response does not include the token", async () => {
+    // Use registeredAtRegister: true — makeStubClient returns { error: "already_registered" }
+    // from register(), simulating the "already registered" error path.
+    const adversarialToken = "CELLO-SI001-ADVERSARIAL-TOKEN";
+    const { mcpClient, cleanup } = await makeServer({ registered: false, registeredAtRegister: true });
+    scope.addCleanup(cleanup);
+
+    const result = parseResult(
+      await mcpClient.callTool({
+        name: "cello_register",
+        arguments: { token: adversarialToken },
+      })
+    );
+
+    // The result must be an error response (already_registered)
+    const resultStr = JSON.stringify(result);
+    const errorField = (result as Record<string, unknown>)["error"] as Record<string, unknown> | undefined;
+    expect(errorField).toBeDefined();
+    expect(errorField!["reason"]).toBe("already_registered");
+
+    // SI-001: the token must NOT appear in the error response
+    expect(resultStr).not.toContain(adversarialToken);
+    // The key "token" must not appear as a response field
+    expect(resultStr).not.toContain('"token"');
+  });
 });
 
 // ─── AC-007 client-side: agent_id lookup ──────────────────────────────────────

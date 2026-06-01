@@ -41,7 +41,19 @@ const BINARY_PATH = resolve(__dirname, "../../dist/bin/cello-mcp.js");
  *   2. Send initialized notification (required by MCP spec before any other request)
  *   3. Send tools/list (id: 2) — wait for response id: 2 and resolve with result.tools
  */
-async function runToolsList(timeoutMs: number): Promise<unknown[]> {
+/**
+ * Spawn cello-mcp, complete the MCP handshake, run a sequence of requests, and resolve
+ * with the collected results. The `requests` callback receives a `send` function to
+ * dispatch JSON-RPC messages and an `onResponse` function to register response handlers.
+ *
+ * This is the shared subprocess harness for all AC-009 tests.
+ */
+interface SubprocessResult {
+  tools: unknown[];
+  statusResult: Record<string, unknown> | null;
+}
+
+async function runSubprocessHarness(timeoutMs: number): Promise<SubprocessResult> {
   const tmpDir = mkdtempSync(`${tmpdir()}/cello-test-subprocess-`);
 
   return new Promise((resolve, reject) => {
@@ -59,23 +71,27 @@ async function runToolsList(timeoutMs: number): Promise<unknown[]> {
     let stdoutBuf = "";
     let done = false;
     let initDone = false;
+    let toolsListDone = false;
+
+    let toolsResult: unknown[] = [];
+    let statusResult: Record<string, unknown> | null = null;
 
     function cleanup(): void {
       try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
     }
 
-    function finish(result: unknown[] | Error): void {
+    function finish(err?: Error): void {
       if (done) return;
       done = true;
       clearTimeout(timer);
       proc.kill();
       cleanup();
-      if (result instanceof Error) reject(result);
-      else resolve(result);
+      if (err) reject(err);
+      else resolve({ tools: toolsResult, statusResult });
     }
 
     const timer = setTimeout(() => {
-      finish(new Error(`tools/list did not respond within ${timeoutMs}ms`));
+      finish(new Error(`subprocess did not respond within ${timeoutMs}ms`));
     }, timeoutMs);
 
     proc.stdout.on("data", (chunk: Buffer) => {
@@ -90,17 +106,40 @@ async function runToolsList(timeoutMs: number): Promise<unknown[]> {
         try { msg = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
 
         if (msg["id"] === 1 && !initDone) {
-          // initialize response received — send initialized notification + tools/list
+          // initialize response received — send initialized notification + tools/list + cello_status
           initDone = true;
           const initialized = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n";
           const toolsList = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) + "\n";
+          // AC-009 Fix 3: immediately send cello_status (id: 3) — must respond before background init
+          const statusCall = JSON.stringify({
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "cello_status", arguments: {} },
+          }) + "\n";
           proc.stdin.write(initialized);
           proc.stdin.write(toolsList);
+          proc.stdin.write(statusCall);
         } else if (msg["id"] === 2) {
-          // tools/list response — this is what AC-009 requires
+          // tools/list response
           const result = (msg["result"] as Record<string, unknown> | undefined);
           const tools = result?.["tools"];
-          finish(Array.isArray(tools) ? tools : []);
+          toolsResult = Array.isArray(tools) ? tools : [];
+          toolsListDone = true;
+          // If statusResult already arrived, we're done
+          if (statusResult !== null) finish();
+        } else if (msg["id"] === 3) {
+          // cello_status response — parse the JSON text from the MCP content array
+          const result = (msg["result"] as Record<string, unknown> | undefined);
+          const content = result?.["content"] as Array<{ type: string; text: string }> | undefined;
+          const text = content?.find((c) => c.type === "text")?.text;
+          try {
+            statusResult = text ? (JSON.parse(text) as Record<string, unknown>) : null;
+          } catch {
+            statusResult = null;
+          }
+          // If toolsListDone already, we're done
+          if (toolsListDone) finish();
         }
       }
     });
@@ -128,9 +167,33 @@ describe("AC-009: cello-mcp responds to tools/list before background init comple
     // AC-009 requires tools to be registered and callable BEFORE background I/O completes.
     // We verify this by completing the full MCP handshake and asserting tools/list
     // returns a non-empty array — all within 3s (AC specifies 2s; we give 1s margin).
-    const tools = await runToolsList(3000);
+    const { tools } = await runSubprocessHarness(3000);
 
     expect(Array.isArray(tools)).toBe(true);
     expect(tools.length).toBeGreaterThan(0);
+  }, 6000); // vitest timeout: 6s
+
+  /**
+   * Fix 3: AC-009 — cello_status responds before background init completes.
+   *
+   * The AC notes require verifying that cello_status (not just tools/list) also responds
+   * before background init completes. Specifically:
+   *   - transport_started: true  (the libp2p node has started)
+   *   - directory_reachable: false  (background init hasn't connected yet — unreachable URL)
+   *
+   * We spawn with CELLO_DIRECTORY_URL pointing at a non-existent server so background init
+   * fails fast or hasn't completed by the time we send the tools/call request.
+   */
+  it("cello_status responds with transport_started:true and directory_reachable:false before background init completes", async () => {
+    // Both tools/list (id: 2) and cello_status (id: 3) are dispatched immediately after
+    // the MCP handshake completes. Background init starts concurrently and points at an
+    // unreachable directory URL, so directory_reachable stays false.
+    const { statusResult } = await runSubprocessHarness(3000);
+
+    expect(statusResult).not.toBeNull();
+    // transport_started: true — the libp2p node opened its TCP port before server.connect()
+    expect(statusResult!["transport_started"]).toBe(true);
+    // directory_reachable: false — background init has not (and cannot) connect to 127.0.0.1:19999
+    expect(statusResult!["directory_reachable"]).toBe(false);
   }, 6000); // vitest timeout: 6s
 });
