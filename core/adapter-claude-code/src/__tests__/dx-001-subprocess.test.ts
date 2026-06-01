@@ -33,9 +33,8 @@ const BINARY_PATH = resolve(__dirname, "../../dist/bin/cello-mcp.js");
  * Send a tools/list JSON-RPC request to the MCP binary via stdin and collect
  * the first valid JSON-RPC response from stdout within timeoutMs.
  *
- * The MCP protocol uses newline-delimited JSON or Content-Length framing.
- * The SDK's StdioServerTransport uses Content-Length framing on stdout.
- * We parse the Content-Length header and read the exact body bytes.
+ * SDK v1.29.0 StdioServerTransport uses newline-delimited JSON (not Content-Length framing).
+ * serializeMessage() outputs JSON.stringify(msg) + '\n'; ReadBuffer splits on '\n'.
  */
 async function sendToolsList(timeoutMs: number): Promise<unknown> {
   // Create a temp dir for the key file so the binary doesn't exit on ENOENT
@@ -76,24 +75,19 @@ async function sendToolsList(timeoutMs: number): Promise<unknown> {
     proc.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
 
-      // Parse Content-Length framed JSON-RPC from accumulated output.
-      // Format: "Content-Length: N\r\n\r\n{...json...}"
-      const match = stdout.match(/Content-Length:\s*(\d+)\r\n\r\n/);
-      if (match) {
-        const contentLength = parseInt(match[1]!, 10);
-        const bodyStart = stdout.indexOf("\r\n\r\n") + 4;
-        const body = stdout.slice(bodyStart, bodyStart + contentLength);
-        if (body.length >= contentLength) {
-          clearTimeout(timer);
-          if (!resolved) {
-            resolved = true;
-            proc.kill();
-            cleanup();
-            try {
-              resolve(JSON.parse(body));
-            } catch {
-              reject(new Error(`Failed to parse JSON-RPC response: ${body.slice(0, 200)}`));
-            }
+      // SDK v1.29.0: newline-delimited JSON. Each line is a complete JSON-RPC message.
+      const newlineIdx = stdout.indexOf("\n");
+      if (newlineIdx !== -1) {
+        const line = stdout.slice(0, newlineIdx).trim();
+        clearTimeout(timer);
+        if (!resolved) {
+          resolved = true;
+          proc.kill();
+          cleanup();
+          try {
+            resolve(JSON.parse(line));
+          } catch {
+            reject(new Error(`Failed to parse JSON-RPC response: ${line.slice(0, 200)}`));
           }
         }
       }
@@ -117,7 +111,8 @@ async function sendToolsList(timeoutMs: number): Promise<unknown> {
       }
     });
 
-    // Send initialize request first (required by MCP protocol before tools/list)
+    // SDK v1.29.0: newline-delimited JSON framing (no Content-Length headers).
+    // Send initialize first, then tools/list after a short delay.
     const initRequest = JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -127,12 +122,11 @@ async function sendToolsList(timeoutMs: number): Promise<unknown> {
         capabilities: {},
         clientInfo: { name: "test-client", version: "0.0.1" },
       },
-    });
-    const initFrame = `Content-Length: ${Buffer.byteLength(initRequest)}\r\n\r\n${initRequest}`;
-    proc.stdin.write(initFrame);
+    }) + "\n";
+    proc.stdin.write(initRequest);
 
-    // After initialize, send tools/list (we watch for either response on stdout)
-    // Give a small delay for initialize to be processed, then send tools/list
+    // Give initialize a moment to be processed, then send tools/list.
+    // We watch stdout for whichever response arrives first.
     setTimeout(() => {
       if (!resolved) {
         const listRequest = JSON.stringify({
@@ -140,9 +134,8 @@ async function sendToolsList(timeoutMs: number): Promise<unknown> {
           id: 2,
           method: "tools/list",
           params: {},
-        });
-        const listFrame = `Content-Length: ${Buffer.byteLength(listRequest)}\r\n\r\n${listRequest}`;
-        proc.stdin.write(listFrame);
+        }) + "\n";
+        proc.stdin.write(listRequest);
       }
     }, 100);
   });
