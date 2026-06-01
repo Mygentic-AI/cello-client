@@ -1291,7 +1291,7 @@ export function createMcpSessionServer(
       }
       if (result.result === "timeout") {
         // AC-008: stage-specific error messages
-        const stage = (result as unknown as { stage?: string }).stage;
+        const stage = result.stage;
         if (stage === "dial") {
           return jsonText({ error: { reason: "directory_unreachable_timeout", message: "Could not reach directory. Check your network connection." } });
         }

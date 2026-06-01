@@ -396,54 +396,19 @@ void (async () => {
       }
     }
 
-    // Step 3: Connect to directory
-    let thresholdSigner: FrostThresholdSigner | undefined;
-    let primaryPubkey: Uint8Array | undefined;
-
-    if (resolvedDirectoryMultiaddr && directoryEndpoint) {
-      process.stderr.write(`cello: connecting to directory...`);
-      try {
-        await node.dial(directoryEndpoint.multiaddrs[0]!);
-
-        const ownPubkey = await kp.getPublicKey();
-        const networkNodes = [new NetworkDirectoryNode({
-          id: `cello-test-node-0000`,
-          node,
-          directoryPeerId: directoryEndpoint.peer_id,
-          directoryMultiaddrs: directoryEndpoint.multiaddrs,
-        })];
-
-        const bootstrap = await bootstrapNetworkKeyShares(ownPubkey, {
-          threshold: 2,
-          participants: 1,
-          directoryNodes: networkNodes,
-        });
-        thresholdSigner = bootstrap.signer;
-        primaryPubkey = bootstrap.primaryPubkey;
-        process.stderr.write(` ok\n`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? `${err.name}: ${err.message}` : JSON.stringify(err);
-        process.stderr.write(` failed: ${msg}\n`);
-        process.stderr.write(`cello-mcp: continuing without threshold signer\n`);
-      }
-    } else {
-      process.stderr.write(`cello: connecting to directory... failed: no multiaddr configured\n`);
-    }
-
-    // Wire directory endpoint and threshold signer into client (now that they're available)
+    // AC-003 (DX-001): Set directoryEndpoint on the client BEFORE loadPersistedState() so that
+    // loadPersistedState() can populate directoryNodeStubs in the reconstructed FrostThresholdSigner.
+    // This must happen regardless of whether the directory is reachable.
     if (directoryEndpoint) {
       (client as unknown as { setDirectoryEndpoint(e: typeof directoryEndpoint): void }).setDirectoryEndpoint?.(directoryEndpoint);
     }
-    if (thresholdSigner) {
-      (client as unknown as { setThresholdSigner(s: FrostThresholdSigner): void }).setThresholdSigner?.(thresholdSigner);
-    }
-    if (primaryPubkey) {
-      client.setPrimaryPubkey(primaryPubkey);
-    }
 
-    // Step 4: Load agent state
-    process.stderr.write("cello: loading agent state...\n");
+    // Step 3: Load agent state (moved BEFORE directory connection/bootstrap)
+    // Registered agents will have their FrostThresholdSigner reconstructed from DB here.
+    // directoryEndpoint is already set, so directoryNodeStubs will be populated.
+    process.stderr.write("cello: loading agent state...");
     await client.loadPersistedState();
+    process.stderr.write(" ok\n");
 
     // PERSIST-024 AC-008: Build AgentHashQueue
     const loadedPendingHashes = client.getLoadedPendingHashes();
@@ -458,12 +423,62 @@ void (async () => {
     }
     (client as unknown as { setHashQueue(q: AgentHashQueue): void }).setHashQueue(hashQueue);
 
-    // Step 5: Emit final ready message
-    const regState = typeof (client as unknown as { getRegistrationState?: () => { agent_id: string } | null }).getRegistrationState === "function"
+    // Check if the agent is already registered (FROST share was loaded from DB).
+    // If so, skip bootstrap — the signer is already reconstructed from the DB.
+    const regStateAfterLoad = typeof (client as unknown as { getRegistrationState?: () => { agent_id: string } | null }).getRegistrationState === "function"
       ? (client as unknown as { getRegistrationState: () => { agent_id: string } | null }).getRegistrationState()
       : null;
-    if (regState) {
-      process.stderr.write(`cello: ready (registered as ${regState.agent_id})\n`);
+
+    // Step 4: Connect to directory and bootstrap ONLY if not already registered
+    let thresholdSigner: FrostThresholdSigner | undefined;
+    let primaryPubkey: Uint8Array | undefined;
+
+    if (resolvedDirectoryMultiaddr && directoryEndpoint) {
+      process.stderr.write(`cello: connecting to directory...`);
+      try {
+        await node.dial(directoryEndpoint.multiaddrs[0]!);
+
+        if (!regStateAfterLoad) {
+          // Not yet registered — run bootstrap to initialize FROST key shares.
+          // Registered agents already have their signer from loadPersistedState().
+          const ownPubkey = await kp.getPublicKey();
+          const networkNodes = [new NetworkDirectoryNode({
+            id: `cello-test-node-0000`,
+            node,
+            directoryPeerId: directoryEndpoint.peer_id,
+            directoryMultiaddrs: directoryEndpoint.multiaddrs,
+          })];
+
+          const bootstrap = await bootstrapNetworkKeyShares(ownPubkey, {
+            threshold: 2,
+            participants: 1,
+            directoryNodes: networkNodes,
+          });
+          thresholdSigner = bootstrap.signer;
+          primaryPubkey = bootstrap.primaryPubkey;
+        }
+        process.stderr.write(` ok\n`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? `${err.name}: ${err.message}` : JSON.stringify(err);
+        process.stderr.write(` failed: ${msg}\n`);
+        process.stderr.write(`cello-mcp: continuing without threshold signer\n`);
+      }
+    } else {
+      process.stderr.write(`cello: connecting to directory... failed: no multiaddr configured\n`);
+    }
+
+    // Wire threshold signer into client only when bootstrap ran (unregistered agents).
+    // Registered agents already have their signer from loadPersistedState().
+    if (thresholdSigner) {
+      (client as unknown as { setThresholdSigner(s: FrostThresholdSigner): void }).setThresholdSigner?.(thresholdSigner);
+    }
+    if (primaryPubkey) {
+      client.setPrimaryPubkey(primaryPubkey);
+    }
+
+    // Step 5: Emit final ready message (use regStateAfterLoad from loadPersistedState)
+    if (regStateAfterLoad) {
+      process.stderr.write(`cello: ready (registered as ${regStateAfterLoad.agent_id})\n`);
     } else {
       process.stderr.write(`cello: ready (not registered — call cello_setup_guidance for setup)\n`);
     }
