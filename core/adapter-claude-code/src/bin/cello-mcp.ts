@@ -5,6 +5,11 @@
  * One key file. One libp2p node. One client. One MCP server.
  * Two agents = two separate processes, each running this binary with their own CELLO_KEY_FILE.
  *
+ * AC-002 (DX-001): TTY detection — if stdin is a TTY, print install instructions and exit.
+ * AC-009 (DX-001): Lazy startup — MCP server connects and registers tools immediately;
+ *   bootstrap fetch, directory dial, SQLCipher open, and loadPersistedState move to background.
+ * AC-001 (DX-001): Startup progress lines emitted to stderr at each step.
+ *
  * Environment variables:
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
@@ -26,6 +31,21 @@
 
 import { homedir } from "node:os";
 import { createWriteStream, readFileSync } from "node:fs";
+
+// AC-002 (DX-001): TTY detection — BEFORE anything else.
+// If stdin is a TTY, the binary was run directly in a terminal, not as an MCP subprocess.
+// Print install instructions to stdout and exit cleanly.
+if (process.stdin.isTTY) {
+  process.stdout.write(
+    "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
+    "\n" +
+    "To install, run:\n" +
+    "  claude mcp add cello npx @cello-protocol/connect\n" +
+    "\n" +
+    "Then restart Claude Code to activate CELLO.\n",
+  );
+  process.exit(0);
+}
 
 // Tee stderr to a log file for diagnostics (especially [sigstream] instrumentation)
 const stderrLog = createWriteStream("/tmp/cello-mcp-stderr.log", { flags: "a" });
@@ -55,6 +75,10 @@ import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/int
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
 import { resolveDirectoryUrl, fetchBootstrapMultiaddr } from "../config.js";
+
+// AC-001 (DX-001): Startup progress — emit one line per step to stderr.
+// Format: 'cello: <step>... <outcome>'
+process.stderr.write("cello: starting...\n");
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");
 const listenAddr = process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0";
@@ -126,14 +150,11 @@ if (celloEnv === "local") {
   // Local: use filesystem-backed provider in ~/.cello/backups
   const localBackupDir = join(homedir(), ".cello", "backups");
   cloudStorageForBackup = new LocalCloudStorageProvider(localBackupDir);
-  process.stderr.write(`cello-mcp: backup: using LocalCloudStorageProvider at ${localBackupDir}\n`);
 } else if (backupS3Bucket) {
   // Non-local with bucket configured: use S3
   cloudStorageForBackup = new S3CloudStorageProvider({ bucket: backupS3Bucket, region: awsRegion });
-  process.stderr.write(`cello-mcp: backup: using S3CloudStorageProvider, bucket=${backupS3Bucket}, region=${awsRegion}\n`);
 } else {
   // Non-local without bucket: no backup configured — ClientBackup will log client.backup.not.configured
-  process.stderr.write(`cello-mcp: backup: BACKUP_S3_BUCKET not set — backup not configured\n`);
 }
 
 // PERSIST-022: Construct ClientBackup (only if identity key is available)
@@ -146,8 +167,13 @@ const backupLogger = {
     process.stderr.write(`cello-mcp: [info] ${event} ${JSON.stringify(ctx ?? {})}\n`),
   warn: (event: string, ctx?: Record<string, unknown>) =>
     process.stderr.write(`cello-mcp: [warn] ${event} ${JSON.stringify(ctx ?? {})}\n`),
-  error: (event: string, ctx?: Record<string, unknown>) =>
-    process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(ctx ?? {})}\n`),
+  error: (event: string, errorOrContext?: Error | Record<string, unknown>, context?: Record<string, unknown>) => {
+    if (errorOrContext instanceof Error) {
+      process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify({ message: errorOrContext.message, stack: errorOrContext.stack, ...context })}\n`);
+    } else {
+      process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(errorOrContext ?? {})}\n`);
+    }
+  },
 };
 
 // PERSIST-024 (CRIT-1): Derive dbKey for SQLCipher from identity key before zeroing.
@@ -211,166 +237,38 @@ if (identityKeyBytes) {
   identityKeyBytes = null;
 }
 
-// Parse directory endpoint from CELLO_DIRECTORY_MULTIADDR (if set).
-// When not set, auto-fetch the multiaddr from GET /bootstrap on the directory HTTP endpoint.
-// Pseudocode:
-//   1. If CELLO_DIRECTORY_MULTIADDR is set → use it directly (existing behaviour)
-//   2. Else → GET ${directoryUrl}/bootstrap with 5s timeout
-//      a. Success + valid multiaddr → use it as if CELLO_DIRECTORY_MULTIADDR was set
-//      b. 503 / network error / invalid JSON → log warning, continue without threshold signing
+// AC-009 (DX-001): Lazy startup.
+// Create the libp2p node synchronously (fast — no network), then create the client and MCP server.
+// The heavy operations (bootstrap fetch, directory dial, SQLCipher open, loadPersistedState)
+// move to a background async task. Tools that need the directory/FROST await readyPromise.
 
-let resolvedDirectoryMultiaddr: string | undefined = directoryMultiaddr;
-
-if (!resolvedDirectoryMultiaddr) {
-  process.stderr.write(`cello-mcp: auto-discovering directory multiaddr from ${directoryUrl}/bootstrap\n`);
-  // fetchFn defaults to global fetch; injectable in tests via config.ts
-  const discovered = await fetchBootstrapMultiaddr(directoryUrl);
-  if (discovered) {
-    resolvedDirectoryMultiaddr = discovered;
-    process.stderr.write(`cello-mcp: bootstrap fetch succeeded — multiaddr=${resolvedDirectoryMultiaddr}\n`);
-  } else {
-    process.stderr.write(`cello-mcp: bootstrap fetch failed — threshold signing unavailable\n`);
-  }
-}
-
-let directoryEndpoint: { peer_id: string; multiaddrs: string[] } | undefined = undefined;
-if (resolvedDirectoryMultiaddr) {
-  const parts = resolvedDirectoryMultiaddr.split("/");
-  const p2pIndex = parts.findIndex((p) => p === "p2p");
-  const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
-  if (peerId) {
-    directoryEndpoint = { peer_id: peerId, multiaddrs: [resolvedDirectoryMultiaddr] };
-  } else {
-    process.stderr.write("cello-mcp: directory multiaddr must include /p2p/<peer-id>\n");
-  }
-}
-
-// Create and start single node
+// Create and start single node (fast — just opens a TCP port)
 const node = await createNode({ keyProvider: kp, listenAddresses: [listenAddr] });
 await node.start();
-
-// Bootstrap FROST key shares (test-only shortcut)
-// In production (M3+), real DKG ceremony replaces this.
-let thresholdSigner: FrostThresholdSigner | undefined;
-let primaryPubkey: Uint8Array | undefined;
-
-process.stderr.write(`cello-mcp: NODE_ENV=${process.env.NODE_ENV ?? "(unset)"} CELLO_DIRECTORY_URL=${directoryUrl} CELLO_DIRECTORY_MULTIADDR=${resolvedDirectoryMultiaddr ?? "(unset)"}\n`);
-
-{
-  const ownPubkey = await kp.getPublicKey();
-
-  if (resolvedDirectoryMultiaddr && directoryEndpoint) {
-    process.stderr.write(`cello-mcp: bootstrapping FROST via network directory...\n`);
-    try {
-      await node.dial(directoryEndpoint.multiaddrs[0]!);
-      process.stderr.write(`cello-mcp: node dialed directory OK\n`);
-
-      const networkNodes = [new NetworkDirectoryNode({
-        id: `cello-test-node-0000`,
-        node,
-        directoryPeerId: directoryEndpoint.peer_id,
-        directoryMultiaddrs: directoryEndpoint.multiaddrs,
-      })];
-
-      const bootstrap = await bootstrapNetworkKeyShares(ownPubkey, {
-        threshold: 2,
-        participants: 1,
-        directoryNodes: networkNodes,
-      });
-      thresholdSigner = bootstrap.signer;
-      primaryPubkey = bootstrap.primaryPubkey;
-      process.stderr.write(`cello-mcp: FROST bootstrap OK, primaryPubkey=${Buffer.from(primaryPubkey).toString("hex").slice(0, 16)}...\n`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack}` : JSON.stringify(err);
-      process.stderr.write(`cello-mcp: FROST bootstrap FAILED: ${msg}\n`);
-      process.stderr.write(`cello-mcp: continuing without threshold signer (already-registered agents use persistent signaling stream)\n`);
-    }
-  } else {
-    process.stderr.write(`cello-mcp: no directory multiaddr configured — threshold signing unavailable\n`);
-  }
-}
-
-// PERSIST-024 (CRIT-1): Construct and open the SQLCipher store, then wire ClientStatePersistence.
-// dbKey is derived from identityKeyBytes before it is zeroed (see above).
-let clientPersistence: ClientStatePersistence | undefined;
-let sqlCipherStore: SQLCipherClientStore | undefined;
-if (dbKey) {
-  try {
-    sqlCipherStore = new SQLCipherClientStore(dbKey, {
-      dbPath,
-      agentId,
-      env: celloEnv,
-      logger: backupLogger,
-    });
-    await sqlCipherStore.open();
-    clientPersistence = new ClientStatePersistence({
-      store: sqlCipherStore,
-      agentPubkey: agentId,
-      keyFilePath: keyPath,
-      logger: backupLogger,
-    });
-    // PERSIST-024 (MED-2): expose to backup setMetadata/getMetadata callbacks (late binding)
-    clientPersistenceRef = clientPersistence;
-    // Note: upsertAgent() is NOT called here. loadPersistedState() calls it after all
-    // state loading completes — that is the authoritative call site that updates last_seen_at
-    // only on a fully successful startup.
-    process.stderr.write(`cello-mcp: persistence: SQLCipher store opened at ${dbPath}\n`);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Detect native module load failures (missing pre-built binary, ABI mismatch, missing system libs).
-    const isNativeModuleError =
-      msg.includes("Cannot find module") ||
-      msg.includes("was compiled against a different Node.js version") ||
-      msg.includes("NODE_MODULE_VERSION") ||
-      msg.includes("invalid ELF header") ||
-      msg.includes("dlopen") ||
-      msg.includes("libcrypto") ||
-      msg.includes("libssl");
-    if (isNativeModuleError) {
-      const platform = process.platform;
-      process.stderr.write(`cello-mcp: SQLCipher failed to load: ${msg}\n`);
-      if (platform === "win32") {
-        process.stderr.write(`cello-mcp: Windows is not yet supported in the CELLO beta.\n`);
-        process.stderr.write(`cello-mcp: Windows support is on the roadmap. Follow https://github.com/Mygentic-AI/cello-client for updates.\n`);
-      } else if (platform === "linux") {
-        process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
-        process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
-        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
-      } else {
-        // macOS: Xcode Command Line Tools (~500MB) are required to compile SQLCipher.
-        process.stderr.write(`cello-mcp: Xcode Command Line Tools are required on macOS.\n`);
-        process.stderr.write(`cello-mcp: Run: xcode-select --install\n`);
-        process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
-      }
-      process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
-    } else {
-      process.stderr.write(`cello-mcp: persistence: failed to open SQLCipher store — ${msg}\n`);
-    }
-    // Non-fatal: client continues without persistence
-    clientPersistence = undefined;
-    sqlCipherStore = undefined;
-  }
-} else {
-  process.stderr.write(`cello-mcp: persistence: identity key not available — SQLCipher store disabled\n`);
-}
 
 // Late-bound server reference — set after createMcpServer returns.
 // The closure captures the box; notifications fired before server is assigned are dropped.
 let mcpServer: McpServer | undefined;
 
-// Create single client
+// AC-009: readySignal — resolved when background init completes (or fails).
+// Tools that require the directory await this with a 10s timeout.
+let readyResolve: (value: void) => void = () => {};
+let readyReject: (reason?: unknown) => void = () => {};
+const readyPromise = new Promise<void>((resolve, reject) => {
+  readyResolve = resolve;
+  readyReject = reject;
+});
+
+// Create client with no thresholdSigner initially — background task populates it.
+// directoryEndpoint is also populated in the background task.
 const client = createClient(node, kp, {
-  thresholdSigner,
-  directoryEndpoint,
-  persistence: clientPersistence,
+  thresholdSigner: undefined,
+  directoryEndpoint: undefined,
+  persistence: undefined, // wired in background task after SQLCipher opens
   onMessageQueued: (senderHex) => {
     if (mcpServer) void pushChannelNotification(mcpServer, senderHex);
   },
 });
-
-if (primaryPubkey) {
-  client.setPrimaryPubkey(primaryPubkey);
-}
 
 // Create server with single identity.
 // PERSIST-017: checkpointStatusProvider is not available in the cello-mcp binary
@@ -379,29 +277,254 @@ if (primaryPubkey) {
 // Passing undefined is a safe fallback — the tools return M1 stub responses.
 // PERSIST-022: clientBackupInstance passed so cello_backup/cello_restore are registered
 // inside createMcpSessionServer (single canonical registration path).
-const server = createMcpSessionServer(node, client, kp, { clientBackup: clientBackupInstance });
-mcpServer = server;
-
-// PERSIST-024 (CRIT-1): Load persisted state before accepting any MCP tool calls.
-// This must happen before server.connect() so the first tool call sees restored state.
-await client.loadPersistedState();
-
-// PERSIST-024 AC-008: Build an in-memory AgentHashQueue and populate it from the pending_hashes
-// DB table. Using LocalClientStore (in-memory) avoids the SQLCipherClientStore.set() throw.
-// The queue is wired into the client so #reconnectRelayStream can check it on relay reconnect.
-const loadedPendingHashes = client.getLoadedPendingHashes();
-const hashQueue = new AgentHashQueue({
-  store: new LocalClientStore(),
-  agentId,
+const server = createMcpSessionServer(node, client, kp, {
+  clientBackup: clientBackupInstance,
+  // AC-007 (DX-001): pass directoryUrl so agent_id lookup works in tool handlers
+  directoryUrl,
+  // AC-009 (DX-001): pass readyPromise so tools can await background init (up to 10s)
+  readyPromise,
+  // Wire logger so observability events (e.g. client.directory.agent_lookup.failed) are emitted
   logger: backupLogger,
 });
-if (loadedPendingHashes.length > 0) {
-  await hashQueue.loadPending(loadedPendingHashes);
-  process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded into AgentHashQueue — relay resubmission will occur on reconnect\n`);
-}
-// Wire queue into client so relay reconnect can access pending hashes (AC-008)
-(client as unknown as { setHashQueue(q: AgentHashQueue): void }).setHashQueue(hashQueue);
+mcpServer = server;
 
-// Connect stdio transport and register handler
+// AC-009 (DX-001): Connect stdio transport NOW — before any network operations.
+// This ensures tools/list responds within 2s of process start.
 await server.connect(new StdioServerTransport());
 await client.registerHandler();
+
+// AC-009 (DX-001): Background init task — runs concurrently with MCP tool calls.
+// All network and disk I/O happens here, not on the critical path of server startup.
+void (async () => {
+  try {
+    // Step 1: Open SQLCipher database
+    process.stderr.write("cello: opening database...");
+    let clientPersistence: ClientStatePersistence | undefined;
+    let sqlCipherStore: SQLCipherClientStore | undefined;
+    const t0Db = Date.now();
+    if (dbKey) {
+      try {
+        sqlCipherStore = new SQLCipherClientStore(dbKey, {
+          dbPath,
+          agentId,
+          env: celloEnv,
+          logger: backupLogger,
+        });
+        await sqlCipherStore.open();
+        clientPersistence = new ClientStatePersistence({
+          store: sqlCipherStore,
+          agentPubkey: agentId,
+          keyFilePath: keyPath,
+          logger: backupLogger,
+        });
+        // PERSIST-024 (MED-2): expose to backup setMetadata/getMetadata callbacks (late binding)
+        clientPersistenceRef = clientPersistence;
+        // Wire persistence into client
+        (client as unknown as { setPersistence(p: ClientStatePersistence): void }).setPersistence?.(clientPersistence);
+        const durationMs = Date.now() - t0Db;
+        // AC-001: report schema version and table count when available
+        const schemaInfo = (sqlCipherStore as unknown as { getSchemaInfo?: () => { version: number; tableCount: number } }).getSchemaInfo?.();
+        if (schemaInfo) {
+          process.stderr.write(` ok (V${schemaInfo.version}, ${schemaInfo.tableCount} tables)\n`);
+        } else {
+          process.stderr.write(` ok (${durationMs}ms)\n`);
+        }
+        backupLogger.info("client.startup.progress", { step: "opening_database", outcome: "ok", durationMs });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(` failed: ${msg}\n`);
+        backupLogger.warn("client.startup.progress", { step: "opening_database", outcome: "failed", reason: msg, durationMs: Date.now() - t0Db });
+        // Detect native module load failures
+        const isNativeModuleError =
+          msg.includes("Cannot find module") ||
+          msg.includes("was compiled against a different Node.js version") ||
+          msg.includes("NODE_MODULE_VERSION") ||
+          msg.includes("invalid ELF header") ||
+          msg.includes("dlopen") ||
+          msg.includes("libcrypto") ||
+          msg.includes("libssl");
+        if (isNativeModuleError) {
+          const platform = process.platform;
+          if (platform === "win32") {
+            process.stderr.write(`cello-mcp: Windows is not yet supported in the CELLO beta.\n`);
+            process.stderr.write(`cello-mcp: Windows support is on the roadmap. Follow https://github.com/Mygentic-AI/cello-client for updates.\n`);
+          } else if (platform === "linux") {
+            process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
+            process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
+          } else {
+            process.stderr.write(`cello-mcp: Xcode Command Line Tools are required on macOS.\n`);
+            process.stderr.write(`cello-mcp: Run: xcode-select --install\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npx @cello-protocol/connect\n`);
+          }
+          process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
+        }
+        // Non-fatal: client continues without persistence
+        clientPersistence = undefined;
+        sqlCipherStore = undefined;
+      }
+    } else {
+      process.stderr.write(` failed: identity key not available\n`);
+      backupLogger.warn("client.startup.progress", { step: "opening_database", outcome: "failed", reason: "identity key not available", durationMs: Date.now() - t0Db });
+    }
+
+    // Step 2: Fetch directory address
+    let resolvedDirectoryMultiaddr: string | undefined = directoryMultiaddr;
+    let directoryEndpoint: { peer_id: string; multiaddrs: string[] } | undefined = undefined;
+
+    if (!resolvedDirectoryMultiaddr) {
+      process.stderr.write(`cello: fetching directory address...`);
+      const t0Bootstrap = Date.now();
+      try {
+        const discovered = await fetchBootstrapMultiaddr(directoryUrl);
+        if (discovered) {
+          resolvedDirectoryMultiaddr = discovered;
+          const parts = resolvedDirectoryMultiaddr.split("/");
+          const p2pIndex = parts.findIndex((p) => p === "p2p");
+          const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
+          const shortPeerId = peerId ? peerId.slice(0, 20) + "..." : "(unknown)";
+          process.stderr.write(` ok (${shortPeerId})\n`);
+          backupLogger.info("client.startup.progress", { step: "fetching_directory_address", outcome: "ok", durationMs: Date.now() - t0Bootstrap });
+        } else {
+          const reason = "bootstrap endpoint unreachable";
+          backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: "endpoint_returned_null", durationMs: Date.now() - t0Bootstrap });
+          process.stderr.write(` failed: ${reason}\n`);
+          backupLogger.warn("client.startup.progress", { step: "fetching_directory_address", outcome: "failed", reason, durationMs: Date.now() - t0Bootstrap });
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: msg, durationMs: Date.now() - t0Bootstrap });
+        process.stderr.write(` failed: ${msg}\n`);
+        backupLogger.warn("client.startup.progress", { step: "fetching_directory_address", outcome: "failed", reason: msg, durationMs: Date.now() - t0Bootstrap });
+      }
+    } else {
+      // CELLO_DIRECTORY_MULTIADDR is set — use it directly
+      process.stderr.write(`cello: fetching directory address... ok (from CELLO_DIRECTORY_MULTIADDR)\n`);
+      backupLogger.info("client.startup.progress", { step: "fetching_directory_address", outcome: "ok", durationMs: 0 });
+    }
+
+    if (resolvedDirectoryMultiaddr) {
+      const parts = resolvedDirectoryMultiaddr.split("/");
+      const p2pIndex = parts.findIndex((p) => p === "p2p");
+      const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
+      if (peerId) {
+        directoryEndpoint = { peer_id: peerId, multiaddrs: [resolvedDirectoryMultiaddr] };
+      } else {
+        // Multiaddr is present but lacks /p2p/<peer-id> — setDirectoryEndpoint will not be called.
+        backupLogger.warn("client.startup.multiaddr_parse.failed", { reason: "multiaddr_missing_peer_id", multiaddr: resolvedDirectoryMultiaddr });
+        process.stderr.write("cello-mcp: directory multiaddr must include /p2p/<peer-id>\n");
+      }
+    }
+
+    // AC-003 (DX-001): Set directoryEndpoint on the client BEFORE loadPersistedState() so that
+    // loadPersistedState() can populate directoryNodeStubs in the reconstructed FrostThresholdSigner.
+    // Only called when directoryEndpoint is parsed successfully (requires /p2p/<peer-id> in the
+    // multiaddr). If multiaddr lacks peer ID, loadPersistedState() will reconstruct the
+    // FrostThresholdSigner with directoryNodeStubs: undefined — ceremonies will fail until the
+    // agent reconnects with a valid multiaddr.
+    if (directoryEndpoint) {
+      (client as unknown as { setDirectoryEndpoint(e: typeof directoryEndpoint): void }).setDirectoryEndpoint?.(directoryEndpoint);
+    }
+
+    // Step 3: Load agent state (moved BEFORE directory connection/bootstrap)
+    // Registered agents will have their FrostThresholdSigner reconstructed from DB here.
+    // directoryEndpoint is already set, so directoryNodeStubs will be populated.
+    process.stderr.write("cello: loading agent state...");
+    const t0LoadState = Date.now();
+    try {
+      await client.loadPersistedState();
+      process.stderr.write(" ok\n");
+      backupLogger.info("client.startup.progress", { step: "loading_agent_state", outcome: "ok", durationMs: Date.now() - t0LoadState });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(` failed: ${msg}\n`);
+      backupLogger.warn("client.startup.progress", { step: "loading_agent_state", outcome: "failed", reason: msg, durationMs: Date.now() - t0LoadState });
+      throw err;
+    }
+
+    // PERSIST-024 AC-008: Build AgentHashQueue
+    const loadedPendingHashes = client.getLoadedPendingHashes();
+    const hashQueue = new AgentHashQueue({
+      store: new LocalClientStore(),
+      agentId,
+      logger: backupLogger,
+    });
+    if (loadedPendingHashes.length > 0) {
+      await hashQueue.loadPending(loadedPendingHashes);
+      process.stderr.write(`cello-mcp: ${loadedPendingHashes.length} pending hash(es) loaded into AgentHashQueue\n`);
+    }
+    (client as unknown as { setHashQueue(q: AgentHashQueue): void }).setHashQueue(hashQueue);
+
+    // Check if the agent is already registered (FROST share was loaded from DB).
+    // If so, skip bootstrap — the signer is already reconstructed from the DB.
+    const regStateAfterLoad = typeof (client as unknown as { getRegistrationState?: () => { agent_id: string } | null }).getRegistrationState === "function"
+      ? (client as unknown as { getRegistrationState: () => { agent_id: string } | null }).getRegistrationState()
+      : null;
+
+    // Step 4: Connect to directory and bootstrap ONLY if not already registered
+    let thresholdSigner: FrostThresholdSigner | undefined;
+    let primaryPubkey: Uint8Array | undefined;
+
+    const t0Connect = Date.now();
+    if (resolvedDirectoryMultiaddr && directoryEndpoint) {
+      process.stderr.write(`cello: connecting to directory...`);
+      try {
+        await node.dial(directoryEndpoint.multiaddrs[0]!);
+
+        if (!regStateAfterLoad) {
+          // Not yet registered — run bootstrap to initialize FROST key shares.
+          // Registered agents already have their signer from loadPersistedState().
+          const ownPubkey = await kp.getPublicKey();
+          const networkNodes = [new NetworkDirectoryNode({
+            id: `cello-test-node-0000`,
+            node,
+            directoryPeerId: directoryEndpoint.peer_id,
+            directoryMultiaddrs: directoryEndpoint.multiaddrs,
+          })];
+
+          const bootstrap = await bootstrapNetworkKeyShares(ownPubkey, {
+            threshold: 2,
+            participants: 1,
+            directoryNodes: networkNodes,
+          });
+          thresholdSigner = bootstrap.signer;
+          primaryPubkey = bootstrap.primaryPubkey;
+        }
+        process.stderr.write(` ok\n`);
+        backupLogger.info("client.startup.progress", { step: "connecting_to_directory", outcome: "ok", durationMs: Date.now() - t0Connect });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? `${err.name}: ${err.message}` : JSON.stringify(err);
+        process.stderr.write(` failed: ${msg}\n`);
+        process.stderr.write(`cello-mcp: continuing without threshold signer\n`);
+        backupLogger.warn("client.startup.progress", { step: "connecting_to_directory", outcome: "failed", reason: msg, durationMs: Date.now() - t0Connect });
+      }
+    } else {
+      process.stderr.write(`cello: connecting to directory... failed: no multiaddr configured\n`);
+      backupLogger.warn("client.startup.progress", { step: "connecting_to_directory", outcome: "failed", reason: "no multiaddr configured", durationMs: Date.now() - t0Connect });
+    }
+
+    // Wire threshold signer into client only when bootstrap ran (unregistered agents).
+    // Registered agents already have their signer from loadPersistedState().
+    if (thresholdSigner) {
+      (client as unknown as { setThresholdSigner(s: FrostThresholdSigner): void }).setThresholdSigner?.(thresholdSigner);
+    }
+    if (primaryPubkey) {
+      client.setPrimaryPubkey(primaryPubkey);
+    }
+
+    // Step 5: Emit final ready message (use regStateAfterLoad from loadPersistedState)
+    if (regStateAfterLoad) {
+      process.stderr.write(`cello: ready (registered as ${regStateAfterLoad.agent_id})\n`);
+    } else {
+      process.stderr.write(`cello: ready (not registered — call cello_setup_guidance for setup)\n`);
+    }
+    // durationMs: 0 — "ready" is a completion marker, not a timed operation.
+    backupLogger.info("client.startup.progress", { step: "ready", outcome: "ok", durationMs: 0 });
+
+    readyResolve();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`cello-mcp: background init failed: ${msg}\n`);
+    readyReject(err);
+  }
+})();

@@ -135,7 +135,9 @@ function makeStubClient(opts: StubClientOptions = {}): CelloClient {
     initiateSession: async () => ({ ok: false, reason: "directory_unreachable" as const }),
     register: async () => ({ error: "not_implemented" }),
     // ─── MCP-003 additions ─────────────────────────────────────────────────
-    getRegistrationState: () => null,
+    // DX-001: stub returns registered state so AC-004 not_registered guard doesn't block these tests.
+    // The mcp002 tests predate DX-001 and test tool behavior assuming a registered agent.
+    getRegistrationState: () => ({ agent_id: "stubagentid0000000000000000000000" } as unknown as import("@cello-protocol/protocol-types").RegistrationState),
     getDirectoryPeerId: () => {
       const active = sessions.find((s) => s.status === "active" && s.directory_endpoint?.peer_id);
       return active?.directory_endpoint?.peer_id ?? null;
@@ -380,8 +382,7 @@ describe("AC-009: createMcpSessionServer registers identical M1 tool set under b
     const toolsA = sortByName((await mcpA.listTools()).tools);
     const toolsB = sortByName((await mcpB.listTools()).tools);
 
-    // SESSION-007: cello_receive (any-session default) + cello_receive_session (session-locked)
-    // PERSIST-022: cello_backup + cello_restore = 22 total
+    // DX-001: 23 tools total (22 from MCP-003 + cello_setup_guidance from DX-001)
     const expectedTools = [
       "cello_accept_connection",
       "cello_await_connection_request",
@@ -404,6 +405,7 @@ describe("AC-009: createMcpSessionServer registers identical M1 tool set under b
       "cello_restore",
       "cello_send",
       "cello_set_policy",
+      "cello_setup_guidance",
       "cello_status",
     ];
 

@@ -318,7 +318,7 @@ class CelloClientImpl implements CelloClient {
   // ─── ADAPTER-003: persistent directory signaling stream ────────────────────
 
   /** Configured directory endpoint (required for initiateSession). ADAPTER-003. */
-  readonly #directoryEndpoint: { peer_id: string; multiaddrs: string[] } | null;
+  #directoryEndpoint: { peer_id: string; multiaddrs: string[] } | null;
 
   /** Single persistent signaling stream shared across all session_request outbound calls
    * and inbound session_assignment / session_sealed events. ADAPTER-003. */
@@ -658,14 +658,25 @@ class CelloClientImpl implements CelloClient {
       }
 
       // Reconstruct FrostThresholdSigner (config only — secret is in module-level store).
-      // HIGH-1: directoryEndpoint is NOT required for construction — the signer can verify
-      // signatures even without a live directory. Pass undefined for directoryNodes.
+      // AC-003 (DX-001): directoryNodeStubs MUST be populated from the current directoryEndpoint
+      // so that the signer can participate in FROST signing ceremonies (round-trip frames
+      // to directory via libp2p). Without directoryNodeStubs, the signer can verify but cannot
+      // participate in ceremonies — causing directory_below_threshold on session initiation.
       if (!this.#thresholdSigner) {
+        let directoryNodeStubsForSigner: NetworkDirectoryNode[] | undefined;
+        if (this.#directoryEndpoint) {
+          directoryNodeStubsForSigner = [new NetworkDirectoryNode({
+            id: this.#directoryEndpoint.peer_id,
+            node: this.#node,
+            directoryPeerId: this.#directoryEndpoint.peer_id,
+            directoryMultiaddrs: this.#directoryEndpoint.multiaddrs,
+          })];
+        }
         this.#thresholdSigner = new FrostThresholdSigner(
           {
             threshold: row.threshold,
             participants: row.participants,
-            directoryNodes: undefined,
+            directoryNodeStubs: directoryNodeStubsForSigner,
           },
           Buffer.from(myPubkeyHex, "hex"),
         );
@@ -961,6 +972,32 @@ class CelloClientImpl implements CelloClient {
    */
   setHashQueue(queue: AgentHashQueue): void {
     this.#hashQueue = queue;
+  }
+
+  /**
+   * AC-003 (DX-001): Set directory endpoint after construction (composition root pattern).
+   * Called by cello-mcp.ts background task before loadPersistedState() so that
+   * loadPersistedState() can populate directoryNodeStubs in the reconstructed FrostThresholdSigner.
+   */
+  setDirectoryEndpoint(endpoint: { peer_id: string; multiaddrs: string[] }): void {
+    this.#directoryEndpoint = endpoint;
+  }
+
+  /**
+   * AC-003 (DX-001): Wire threshold signer after construction.
+   * Called by cello-mcp.ts background task only when the agent is not yet registered
+   * (bootstrap ran). Registered agents reconstruct the signer from DB in loadPersistedState().
+   */
+  setThresholdSigner(signer: IThresholdSigner): void {
+    this.#thresholdSigner = signer;
+  }
+
+  /**
+   * PERSIST-024: Wire persistence layer after construction.
+   * Called by cello-mcp.ts background task after SQLCipher store opens.
+   */
+  setPersistence(persistence: ClientStatePersistence): void {
+    this.#persistence = persistence;
   }
 
   addPeer(peerPubkeyHex: string, peerId: string, multiaddrs: string[]): void {
@@ -3563,7 +3600,7 @@ class CelloClientImpl implements CelloClient {
    *
    * Crypto refs: NIST FIPS 204 (ML-DSA-44), RFC 9591 (FROST), FIPS 180-4 (SHA-256)
    */
-  async register(phoneStub: string, preAuthToken?: string): Promise<RegistrationState | { error: string }> {
+  async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
     // Step 1: already registered — return error
     if (this.#registrationState) {
       return { error: "already_registered" };
@@ -4220,18 +4257,29 @@ class CelloClientImpl implements CelloClient {
    *   { result: 'rejected', reason } — target rejected
    *   { result: 'insufficient', unmet_requirements } — target found requirements unmet
    *   { result: 'disclosure_requested', connection_request_id, requested_items } — Round 2 request (unblocks sender)
-   *   { result: 'timeout' } — no response within connectionTimeoutMs
+   *   { result: 'timeout', stage } — no response within timeout; stage identifies which phase timed out
    *   { result: 'error', reason } — directory-level error (not_registered, target_not_found, etc.)
+   *
+   * AC-008 (DX-001): per-stage timeouts:
+   *   dialTimeoutMs  — stage 'dial':  timeout for opening the persistent signaling stream (default: connectionTimeoutMs)
+   *   sendTimeoutMs  — stage 'send':  timeout for sending the frame (default: connectionTimeoutMs)
+   *   waitTimeoutMs  — stage 'wait':  timeout for target response (default: connectionTimeoutMs)
    */
   async cello_request_connection(opts: {
     target_pubkey: string;
     package_cbor: Uint8Array;
+    /** AC-008 (DX-001): stage 1 timeout — dial directory signaling stream, ms. Default: connectionTimeoutMs */
+    dialTimeoutMs?: number;
+    /** AC-008 (DX-001): stage 2 timeout — deliver connection_request frame, ms. Default: connectionTimeoutMs */
+    sendTimeoutMs?: number;
+    /** AC-008 (DX-001): stage 3 timeout — wait for target response, ms. Default: connectionTimeoutMs */
+    waitTimeoutMs?: number;
   }): Promise<
     | { result: "established"; connection_id: string }
     | { result: "rejected"; reason: string }
     | { result: "insufficient"; unmet_requirements: unknown[] }
     | { result: "disclosure_requested"; connection_request_id: string; requested_items: unknown[] }
-    | { result: "timeout" }
+    | { result: "timeout"; stage: "dial" | "send" | "wait" }
     | { result: "error"; reason: string }
   > {
     const targetPubkeyHex = opts.target_pubkey;
@@ -4254,12 +4302,23 @@ class CelloClientImpl implements CelloClient {
     });
     this.#pendingConnectionRequestResolvers.set(targetPubkeyHex, resolveOutcome);
 
-    // Ensure the persistent signaling stream is open
+    // AC-008 (DX-001): per-stage timeouts. Fall back to #connectionTimeoutMs if not provided.
+    const dialTimeoutMs = opts.dialTimeoutMs ?? this.#connectionTimeoutMs;
+    const sendTimeoutMs = opts.sendTimeoutMs ?? this.#connectionTimeoutMs;
+    const waitTimeoutMs = opts.waitTimeoutMs ?? this.#connectionTimeoutMs;
+
+    // Stage 1 — dial: Ensure the persistent signaling stream is open within dialTimeoutMs.
     if (!this.#persistentSignalingStream) {
-      const opened = await this.#openPersistentSignalingStream();
-      if (!opened) {
+      let dialTimedOut = false;
+      let opened = false;
+      await Promise.race([
+        this.#openPersistentSignalingStream().then((result) => { opened = result; }),
+        new Promise<void>((resolve) => setTimeout(() => { dialTimedOut = true; resolve(); }, dialTimeoutMs)),
+      ]);
+      if (dialTimedOut || !opened) {
         this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
-        return { result: "error", reason: "directory_unreachable" };
+        this.#logger.warn("client.connection.request.stage.timeout", { stage: "dial", timeoutMs: dialTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
+        return { result: "timeout", stage: "dial" };
       }
     }
 
@@ -4276,20 +4335,39 @@ class CelloClientImpl implements CelloClient {
       package_cbor: opts.package_cbor,
     }) as Uint8Array;
 
-    try {
-      this.#persistentSignalingStream!.send(lp.encode.single(frameBytes));
-    } catch {
+    // Stage 2 — send: Deliver the frame within sendTimeoutMs.
+    // The .send() call is synchronous but may throw if the stream has disconnected.
+    // Wrap in a race so an unresponsive stream doesn't block indefinitely.
+    let sendTimedOut = false;
+    let sendError = false;
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        try {
+          this.#persistentSignalingStream!.send(lp.encode.single(frameBytes));
+        } catch {
+          sendError = true;
+        }
+        resolve();
+      }),
+      new Promise<void>((resolve) => setTimeout(() => { sendTimedOut = true; resolve(); }, sendTimeoutMs)),
+    ]);
+    if (sendTimedOut) {
+      this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
+      this.#logger.warn("client.connection.request.stage.timeout", { stage: "send", timeoutMs: sendTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
+      return { result: "timeout", stage: "send" };
+    }
+    if (sendError) {
       this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
       return { result: "error", reason: "directory_unreachable" };
     }
 
-    // Race: outcome vs connectionTimeoutMs
+    // Stage 3 — wait: Race outcome vs waitTimeoutMs (was: connectionTimeoutMs).
     // DB-001: timeout cleans this slot without affecting concurrent requests to other targets.
     let frame: Record<string, unknown> | null = null;
     let timedOut = false;
     await Promise.race([
       outcomePromise.then((f) => { frame = f; }),
-      new Promise<void>((resolve) => setTimeout(() => { timedOut = true; resolve(); }, this.#connectionTimeoutMs)),
+      new Promise<void>((resolve) => setTimeout(() => { timedOut = true; resolve(); }, waitTimeoutMs)),
     ]);
 
     // Clean up this target's resolver slot on timeout
@@ -4299,7 +4377,8 @@ class CelloClientImpl implements CelloClient {
     }
 
     if (timedOut || !frame) {
-      return { result: "timeout" };
+      this.#logger.warn("client.connection.request.stage.timeout", { stage: "wait", timeoutMs: waitTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
+      return { result: "timeout", stage: "wait" };
     }
 
     const type = frame["type"] as string;
@@ -5830,13 +5909,15 @@ export function createClient(
   injectTestSession(sessionIdHex: string, sessionId: Uint8Array, myPubkeyHex: string, directoryPubkey: Uint8Array, status?: SessionRecord["status"], opts?: { isInitiator?: boolean }): void;
   /** CONNREQ-002: list active connection records. */
   listConnections(): import("@cello-protocol/protocol-types").ClientConnectionRecord[];
-  /** CONNREQ-002: send connection_request to target B and await final outcome. */
-  cello_request_connection(opts: { target_pubkey: string; package_cbor: Uint8Array }): Promise<
+  /** CONNREQ-002 / AC-008 (DX-001): send connection_request to target B and await final outcome.
+   * Per-stage timeouts: dialTimeoutMs (stage 'dial'), sendTimeoutMs (stage 'send'),
+   * waitTimeoutMs (stage 'wait'). Timeout result includes the stage that fired. */
+  cello_request_connection(opts: { target_pubkey: string; package_cbor: Uint8Array; dialTimeoutMs?: number; sendTimeoutMs?: number; waitTimeoutMs?: number }): Promise<
     | { result: "established"; connection_id: string }
     | { result: "rejected"; reason: string }
     | { result: "insufficient"; unmet_requirements: unknown[] }
     | { result: "disclosure_requested"; connection_request_id: string; requested_items: unknown[] }
-    | { result: "timeout" }
+    | { result: "timeout"; stage: "dial" | "send" | "wait" }
     | { result: "error"; reason: string }
   >;
   /** CONNREQ-002: respond to disclosure_request (Round 2 sender side). */
@@ -5906,12 +5987,12 @@ export function createClient(
     injectRelayDisconnect(sessionIdHex: string): void;
     injectTestSession(sessionIdHex: string, sessionId: Uint8Array, myPubkeyHex: string, directoryPubkey: Uint8Array, status?: SessionRecord["status"], opts?: { isInitiator?: boolean }): void;
     listConnections(): import("@cello-protocol/protocol-types").ClientConnectionRecord[];
-    cello_request_connection(opts: { target_pubkey: string; package_cbor: Uint8Array }): Promise<
+    cello_request_connection(opts: { target_pubkey: string; package_cbor: Uint8Array; dialTimeoutMs?: number; sendTimeoutMs?: number; waitTimeoutMs?: number }): Promise<
       | { result: "established"; connection_id: string }
       | { result: "rejected"; reason: string }
       | { result: "insufficient"; unmet_requirements: unknown[] }
       | { result: "disclosure_requested"; connection_request_id: string; requested_items: unknown[] }
-      | { result: "timeout" }
+      | { result: "timeout"; stage: "dial" | "send" | "wait" }
       | { result: "error"; reason: string }
     >;
     cello_respond_to_disclosure_request(opts: { connection_request_id: string; package_cbor: Uint8Array }): Promise<

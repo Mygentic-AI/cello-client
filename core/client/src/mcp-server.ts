@@ -269,7 +269,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalRequirement } from "./connection-policy.js";
 import { buildPseudonymBinding, encodeConnectionPackage } from "@cello-protocol/protocol-types";
 import type { ConnectionPackage } from "@cello-protocol/protocol-types";
-import type { CheckpointStatusProvider } from "@cello-protocol/interfaces";
+import type { CheckpointStatusProvider, Logger } from "@cello-protocol/interfaces";
 import type { ClientBackup } from "./client-backup.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -279,6 +279,29 @@ function jsonText(value: unknown): { content: [{ type: "text"; text: string }] }
 }
 
 const TRANSPORT_NOT_STARTED = jsonText({ error: { reason: "transport_not_started" } });
+
+/**
+ * AC-004 (DX-001): Structured not_registered error returned when any tool that requires
+ * registration is called before the agent has completed registration.
+ * SI-001: must not include the pre-auth token in any error message.
+ */
+const NOT_REGISTERED_ERROR = jsonText({
+  error: {
+    reason: "not_registered",
+    message:
+      "This agent is not yet registered with the CELLO directory. " +
+      "To register: (1) Get a token from @CelloConnectStagingBot on Telegram, " +
+      "(2) call cello_register({ token: 'CELLO-...' }). " +
+      "Call cello_setup_guidance() for the full 6-step setup guide.",
+  },
+});
+
+/**
+ * AC-005 (DX-001): Default demo agent ID — the CELLO demo agent that strangers can connect to.
+ * Overridable via CELLO_DEMO_AGENT_ID env var without a code change.
+ * Must NOT be hardcoded as a string literal in tool implementations.
+ */
+export const DEFAULT_DEMO_AGENT_ID = "a2c55e2721f45cfa86cb3417a76e3f7b";
 
 function toHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex");
@@ -297,10 +320,41 @@ export function createMcpSessionServer(
   node: CelloNode,
   client: CelloClient,
   keyProvider: KeyProvider,
-  opts?: { checkpointStatusProvider?: CheckpointStatusProvider; clientBackup?: ClientBackup },
+  opts?: {
+    checkpointStatusProvider?: CheckpointStatusProvider;
+    clientBackup?: ClientBackup;
+    /** AC-007 (DX-001): Directory HTTP URL for /agent-lookup endpoint. */
+    directoryUrl?: string;
+    /**
+     * AC-009 (DX-001): Promise that resolves when background init (DB open, directory dial,
+     * loadPersistedState) has completed. Tools that require the directory/FROST await this
+     * with a 10s timeout before proceeding.
+     */
+    readyPromise?: Promise<void>;
+    /** Structured logger for observability events (e.g. client.directory.agent_lookup.failed). */
+    logger?: Logger;
+  },
 ): McpServer {
   const checkpointStatusProvider = opts?.checkpointStatusProvider;
   const clientBackup = opts?.clientBackup;
+  const directoryHttpUrl = opts?.directoryUrl;
+  const logger = opts?.logger;
+  const readyPromise = opts?.readyPromise;
+
+  /**
+   * AC-009 (DX-001): Await background init with a 10s timeout.
+   * Tools that require the directory/FROST (cello_initiate_session, cello_request_connection)
+   * call this before proceeding. cello_status and cello_setup_guidance do NOT await this.
+   */
+  async function awaitReady(): Promise<void> {
+    if (!readyPromise) return;
+    await Promise.race([
+      readyPromise,
+      new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error("background_init_timeout")), 10_000),
+      ),
+    ]);
+  }
   const startedAt = Date.now();
 
   // FIFO queue of inbound session assignment events.
@@ -309,6 +363,17 @@ export function createMcpSessionServer(
 
   function transportStarted(): boolean {
     return node.listenAddresses().length > 0;
+  }
+
+  /**
+   * AC-004 (DX-001): Returns true if the agent is registered (registration state exists).
+   * Used by all tools that require registration to return NOT_REGISTERED_ERROR if not registered.
+   */
+  function isRegistered(): boolean {
+    const regState = typeof (client as unknown as { getRegistrationState?: () => unknown }).getRegistrationState === "function"
+      ? (client as unknown as { getRegistrationState: () => unknown }).getRegistrationState()
+      : null;
+    return regState !== null;
   }
 
   function directoryReachable(): boolean {
@@ -352,20 +417,57 @@ export function createMcpSessionServer(
   server.registerTool(
     "cello_initiate_session",
     {
-      description: "Initiate a session with a target agent by their K_local public key. Requires an existing connection (M3+).",
+      description: "Initiate a session with a target agent. Accepts either target_pubkey (64 hex chars) or target_agent_id (32 hex chars). Requires an existing connection (M3+).",
       inputSchema: {
-        target_pubkey: z.string().describe("Target agent K_local pubkey as lowercase hex (64 chars)"),
+        target_pubkey: z.string().optional().describe("Target agent K_local pubkey as lowercase hex (64 chars)"),
+        target_agent_id: z.string().optional().describe("Target agent's agent_id as lowercase hex (32 chars). Resolved to pubkey via directory /agent-lookup."),
         timeout_ms: z.number().int().min(0).optional().describe("Optional timeout in milliseconds"),
       },
     },
-    async ({ target_pubkey, timeout_ms }) => {
+    async ({ target_pubkey, target_agent_id, timeout_ms }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
+      // AC-009 (DX-001): await background init (directory connection, loadPersistedState)
+      try { await awaitReady(); } catch { /* proceed — may return directory_unreachable if needed */ }
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
-      if (!client.hasConnection(target_pubkey)) {
+      // AC-007b (DX-001): resolve target_agent_id to target_pubkey via /agent-lookup
+      let resolvedTargetPubkey = target_pubkey;
+      if (!resolvedTargetPubkey && target_agent_id) {
+        if (!/^[0-9a-f]{32}$/i.test(target_agent_id)) {
+          return jsonText({ ok: false, reason: "invalid_target_agent_id", agent_id: target_agent_id });
+        }
+        if (!directoryHttpUrl) {
+          return jsonText({ ok: false, reason: "directory_not_configured", agent_id: target_agent_id });
+        }
+        const t0Lookup = Date.now();
+        try {
+          const resp = await fetch(`${directoryHttpUrl}/agent-lookup?agent_id=${target_agent_id}`, { signal: AbortSignal.timeout(10_000) });
+          if (!resp.ok) {
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
+            return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
+          }
+          const body = await resp.json() as { k_local_pubkey?: string };
+          if (!body.k_local_pubkey) {
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
+            return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
+          }
+          resolvedTargetPubkey = body.k_local_pubkey;
+        } catch (e: unknown) {
+          const reason = e instanceof Error ? e.message : String(e);
+          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: 0, reason, durationMs: Date.now() - t0Lookup });
+          return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
+        }
+      }
+
+      if (!resolvedTargetPubkey) {
+        return jsonText({ ok: false, reason: "missing_target", message: "Provide either target_pubkey (64 hex) or target_agent_id (32 hex)." });
+      }
+
+      if (!client.hasConnection(resolvedTargetPubkey)) {
         return jsonText({ ok: false, reason: "no_connection" });
       }
 
-      const result = await client.initiateSession(target_pubkey, { timeoutMs: timeout_ms });
+      const result = await client.initiateSession(resolvedTargetPubkey, { timeoutMs: timeout_ms });
 
       if (result.ok) {
         return jsonText({
@@ -392,6 +494,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ timeout_ms }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       const deadline = Date.now() + timeout_ms;
@@ -430,6 +533,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ session_id, content }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       const contentBytes = new TextEncoder().encode(content);
@@ -481,6 +585,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ session_id, timeout_ms }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       const msg = await client.receiveSessionMessageAsync(session_id, timeout_ms);
@@ -537,6 +642,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ timeout_ms }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       const result = await client.receiveMessageAsync(timeout_ms);
@@ -594,6 +700,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ session_id }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       const result = await client.initiateSessionSeal(session_id);
@@ -685,6 +792,7 @@ export function createMcpSessionServer(
       inputSchema: {},
     },
     async () => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const records = client.listSessions();
       const sessions = records.map((s) => ({
         session_id: toHex(s.session_id),
@@ -772,6 +880,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ session_id }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const record = client.listSessions().find(
         (s) => toHex(s.session_id) === session_id
       );
@@ -857,6 +966,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ session_id, leaf_index }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       // PERSIST-017: if CheckpointStatusProvider is wired in, check MMR checkpoint status first.
       // Returns the pending/confirmed/error response based on staging table state.
       if (checkpointStatusProvider) {
@@ -944,6 +1054,89 @@ export function createMcpSessionServer(
     },
   );
 
+  // ── cello_setup_guidance ──────────────────────────────────────────────────
+  //
+  // AC-005 (DX-001): Returns the full 6-step CELLO setup guide (always shown,
+  // never collapsed) followed by a 'Your current status' section.
+  // Available to unregistered agents — does NOT require registration.
+
+  server.registerTool(
+    "cello_setup_guidance",
+    {
+      description: "Get the full CELLO setup guide and your current status. Always shows all 6 steps. Call this first to understand how to use CELLO.",
+      inputSchema: {},
+    },
+    async () => {
+      // AC-005 (DX-001): Demo agent ID from env var or constant — NOT hardcoded inline.
+      const demoAgentId = process.env["CELLO_DEMO_AGENT_ID"] ?? DEFAULT_DEMO_AGENT_ID;
+
+      // Gather current status
+      const regStateRaw = typeof (client as unknown as { getRegistrationState?: () => unknown }).getRegistrationState === "function"
+        ? (client as unknown as { getRegistrationState: () => { agent_id: string } | null }).getRegistrationState()
+        : null;
+      const registered = regStateRaw !== null;
+      const agentIdStr = registered ? regStateRaw!.agent_id : null;
+      const connections = typeof client.listConnections === "function" ? client.listConnections() : [];
+      const sessions = client.listSessions().filter((s) => s.status === "active");
+      const dirReachable = directoryReachable();
+
+      // Determine current step for the pointer
+      let currentStep = 1;
+      let nextAction = "Call cello_register({ token: '<your token>' }) to register.";
+      if (registered && connections.length === 0) {
+        currentStep = 2;
+        nextAction = `Call cello_request_connection({ target_agent_id: '${demoAgentId}' }) to connect to the demo agent.`;
+      } else if (registered && connections.length > 0 && sessions.length === 0) {
+        currentStep = 3;
+        const firstConn = connections[0]!;
+        nextAction = `Call cello_initiate_session({ target_agent_id: '${demoAgentId}' }) (or target_pubkey: '${firstConn.counterparty_pubkey}') to start a session.`;
+      } else if (registered && sessions.length > 0) {
+        currentStep = 4;
+        const firstSession = sessions[0]!;
+        nextAction = `Call cello_send({ session_id: '${toHex(firstSession.session_id)}', content: 'Hello!' }) to send a message.`;
+      }
+
+      const guide = [
+        "# CELLO Setup Guide",
+        "",
+        "## Step 1: Get your registration token",
+        "Message @CelloConnectStagingBot on Telegram. Say 'register me' and it will send you a one-time token.",
+        "",
+        "## Step 2: Register with the directory",
+        "Call: cello_register({ token: 'CELLO-<your token>' })",
+        "This runs a cryptographic key ceremony (FROST DKG) with the directory. Takes 5-10 seconds.",
+        "",
+        "## Step 3: Connect to another agent",
+        `Call: cello_request_connection({ target_agent_id: '${demoAgentId}' })`,
+        `Or connect to any other agent by their agent_id (32 hex chars) or pubkey (64 hex chars).`,
+        "The demo agent is always online and will accept your connection automatically.",
+        "",
+        "## Step 4: Start a session",
+        `Call: cello_initiate_session({ target_agent_id: '${demoAgentId}' })`,
+        "A session is an encrypted, tamper-evident message channel.",
+        "",
+        "## Step 5: Send and receive messages",
+        "Call: cello_send({ session_id: '<session_id>', content: 'Hello!' })",
+        "Call: cello_receive({ timeout_ms: 10000 }) to receive replies",
+        "",
+        "## Step 6: Close the session and get your permanent record",
+        "Call: cello_close_session({ session_id: '<session_id>' })",
+        "Call: cello_get_sealed_receipt({ session_id: '<session_id>' }) for a cryptographic proof",
+        "",
+        "---",
+        "## Your current status",
+        `Registered: ${registered ? `YES (agent_id: ${agentIdStr})` : "NO"}`,
+        `Connections: ${connections.length}`,
+        `Active sessions: ${sessions.length}`,
+        `Directory reachable: ${dirReachable ? "YES" : "NO"}`,
+        "",
+        `→ You are at Step ${currentStep}. ${nextAction}`,
+      ].join("\n");
+
+      return { content: [{ type: "text" as const, text: guide }] };
+    },
+  );
+
   // ── cello_register ────────────────────────────────────────────────────────
   //
   // REG-001: DKG registration. Idempotent — second call returns already_registered.
@@ -952,14 +1145,18 @@ export function createMcpSessionServer(
   server.registerTool(
     "cello_register",
     {
-      description: "Register this agent with the CELLO directory. Runs the REG-001 DKG ceremony. Idempotent — returns already_registered if already done.",
+      description: "Register this agent with the CELLO directory. Runs the REG-001 DKG ceremony. Idempotent — returns already_registered if already done. Obtain your token from @CelloConnectStagingBot on Telegram.",
       inputSchema: {
-        phone_stub: z.string().describe("Phone stub for identity binding (format: +E.164 or hex stub)"),
-        pre_auth_token: z.string().optional().describe("OPS-AGENT-001: Pre-authorization token issued by POST /internal/pre-authorize. Required in M6+. Use any 'DEV-' prefixed token in CELLO_ENV=local."),
+        // AC-006 (DX-001): phone_stub removed from user-facing schema; token renamed from pre_auth_token.
+        // The client sends phone_stub='' internally (directory accepts empty when token is present).
+        token: z.string().describe("Pre-authorization token from @CelloConnectStagingBot on Telegram. Format: CELLO-<33 base58 chars> (production) or DEV-<...> (local). SI-001: this token must not appear in any log or response."),
       },
     },
-    async ({ phone_stub, pre_auth_token }) => {
-      const result = await client.register(phone_stub, pre_auth_token);
+    async ({ token }) => {
+      // AC-006 (DX-001): phone_stub is not a user-facing parameter.
+      // Send '' as the wire value — the directory accepts empty phone_stub when pre_auth_token is valid.
+      // SI-001: the token must NOT appear in any log event, error message, or MCP tool response.
+      const result = await client.register("", token);
       if ("error" in result) {
         return jsonText({ error: { reason: result.error } });
       }
@@ -976,38 +1173,79 @@ export function createMcpSessionServer(
   // ── cello_request_connection ───────────────────────────────────────────────
   //
   // CONNREQ-002: Send Round 1 connection_request to target B.
-  // Blocks up to 5 min (directory default). Returns accepted/rejected/etc.
+  // AC-004 (DX-001): requires registration.
+  // AC-007 (DX-001): accepts target_agent_id (32 hex) in addition to target_pubkey (64 hex).
+  // AC-008 (DX-001): per-stage timeouts (10s dial, 10s send, 90s wait).
 
   server.registerTool(
     "cello_request_connection",
     {
-      description: "Send a connection request to a target agent. Blocks until the target responds (up to 5 minutes).",
+      description: "Send a connection request to a target agent. Accepts either target_pubkey (64 hex chars) or target_agent_id (32 hex chars — looks up pubkey from directory). Blocks until the target responds or timeouts per stage.",
       inputSchema: {
-        target_pubkey: z.string().describe("Target agent's own_pubkey (Ed25519 identity key) as lowercase hex (64 chars). This is the value from cello_status().own_pubkey on the target agent — NOT their primary_pubkey."),
+        target_pubkey: z.string().optional().describe("Target agent's K_local pubkey as lowercase hex (64 chars). Use this if you know the raw pubkey."),
+        target_agent_id: z.string().optional().describe("Target agent's agent_id as lowercase hex (32 chars). The directory resolves this to a pubkey automatically."),
         include_endorsements: z.boolean().optional().describe("Include endorsements in the connection package"),
         include_attestations: z.boolean().optional().describe("Include attestations in the connection package"),
       },
     },
-    async ({ target_pubkey }) => {
+    async ({ target_pubkey, target_agent_id }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
+      // AC-009 (DX-001): await background init before attempting connection
+      try { await awaitReady(); } catch { /* proceed — per-stage timeouts handle directory_unreachable */ }
+
       const extendedClient = client as unknown as {
-        cello_request_connection: (opts: { target_pubkey: string; package_cbor: Uint8Array }) => Promise<
+        cello_request_connection: (opts: { target_pubkey: string; package_cbor: Uint8Array; dialTimeoutMs?: number; sendTimeoutMs?: number; waitTimeoutMs?: number }) => Promise<
           | { result: "established"; connection_id: string }
           | { result: "rejected"; reason: string }
           | { result: "insufficient"; unmet_requirements: unknown[] }
           | { result: "disclosure_requested"; connection_request_id: string; requested_items: unknown[] }
-          | { result: "timeout" }
+          | { result: "timeout"; stage: "dial" | "send" | "wait" }
           | { result: "error"; reason: string }
         >;
         getRegistrationState?: () => import("@cello-protocol/protocol-types").RegistrationState | null;
         getMlDsaProvider?: () => MlDsaKeyProvider | null;
       };
 
+      // AC-007 (DX-001): resolve target_agent_id to target_pubkey via /agent-lookup
+      // This runs BEFORE the cello_request_connection function check so that agent_id
+      // and missing_target errors are returned with clear messages in all cases.
+      let resolvedTargetPubkey = target_pubkey;
+      if (!resolvedTargetPubkey && target_agent_id) {
+        if (!/^[0-9a-f]{32}$/i.test(target_agent_id)) {
+          return jsonText({ error: { reason: "invalid_target_agent_id", message: "target_agent_id must be exactly 32 lowercase hex chars" } });
+        }
+        if (!directoryHttpUrl) {
+          return jsonText({ error: { reason: "directory_not_configured", message: "Cannot resolve agent_id: directory URL is not configured." } });
+        }
+        const t0Lookup = Date.now();
+        try {
+          const resp = await fetch(`${directoryHttpUrl}/agent-lookup?agent_id=${target_agent_id}`, { signal: AbortSignal.timeout(10_000) });
+          if (!resp.ok) {
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
+            return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
+          }
+          const body = await resp.json() as { k_local_pubkey?: string };
+          if (!body.k_local_pubkey) {
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
+            return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
+          }
+          resolvedTargetPubkey = body.k_local_pubkey;
+        } catch (e: unknown) {
+          const reason = e instanceof Error ? e.message : String(e);
+          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: 0, reason, durationMs: Date.now() - t0Lookup });
+          return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
+        }
+      }
+
+      if (!resolvedTargetPubkey) {
+        return jsonText({ error: { reason: "missing_target", message: "Provide either target_pubkey (64 hex) or target_agent_id (32 hex)." } });
+      }
+
       if (typeof extendedClient.cello_request_connection !== "function") {
-        return jsonText({ error: { reason: "not_registered" } });
+        return jsonText({ error: { reason: "not_implemented" } });
       }
 
       // Build a real ConnectionPackage (pseudonym binding) from registration state.
-      // Falls back to an empty package if the agent is not yet registered.
       let packageCbor: Uint8Array = new Uint8Array(0);
       const regState = typeof extendedClient.getRegistrationState === "function"
         ? extendedClient.getRegistrationState()
@@ -1040,8 +1278,12 @@ export function createMcpSessionServer(
       }
 
       const result = await extendedClient.cello_request_connection({
-        target_pubkey,
+        target_pubkey: resolvedTargetPubkey,
         package_cbor: packageCbor,
+        // AC-008 (DX-001): per-stage timeouts
+        dialTimeoutMs: 10_000,
+        sendTimeoutMs: 10_000,
+        waitTimeoutMs: 90_000,
       });
 
       if (result.result === "established") {
@@ -1061,7 +1303,16 @@ export function createMcpSessionServer(
         });
       }
       if (result.result === "timeout") {
-        return jsonText({ result: "timeout" });
+        // AC-008: stage-specific error messages
+        const stage = result.stage;
+        if (stage === "dial") {
+          return jsonText({ error: { reason: "directory_unreachable_timeout", message: "Could not reach directory. Check your network connection." } });
+        }
+        if (stage === "send") {
+          return jsonText({ error: { reason: "request_delivery_timeout", message: "Connection request not delivered to directory." } });
+        }
+        // Default: target response timeout
+        return jsonText({ error: { reason: "target_response_timeout", message: "Target agent did not respond within 90s. The agent may be offline. Try again with cello_request_connection." } });
       }
       return jsonText({ error: { reason: result.reason } });
     },
@@ -1082,6 +1333,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ connection_request_id }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const extendedClient = client as unknown as {
         cello_respond_to_disclosure_request: (opts: { connection_request_id: string; package_cbor: Uint8Array }) => Promise<
           | { result: "established"; connection_id: string }
@@ -1163,6 +1415,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ timeout_ms }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const result = await client.awaitConnectionRequest(timeout_ms ?? 30_000);
       if (result.type === "timeout") {
         return jsonText({ type: "timeout" });
@@ -1190,6 +1443,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ connection_request_id }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const result = await client.acceptConnection(connection_request_id);
       if ("error" in result) {
         return jsonText({ error: result.error });
@@ -1212,6 +1466,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ connection_request_id, reason }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const result = await client.rejectConnection(connection_request_id, reason);
       if ("error" in result) {
         return jsonText({ error: result.error });
@@ -1235,6 +1490,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ connection_request_id, requested_items }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const result = await client.requestMoreDisclosure(connection_request_id, requested_items);
       if ("error" in result) {
         return jsonText({ error: result.error });
@@ -1254,6 +1510,7 @@ export function createMcpSessionServer(
       inputSchema: {},
     },
     async () => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const records = client.listConnections();
       const connections = records.map((c) => ({
         connection_id: c.connection_id,
@@ -1284,6 +1541,7 @@ export function createMcpSessionServer(
       },
     },
     async ({ mode, review_mode, requirements }) => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const policy = {
         mode,
         review_mode,
@@ -1315,6 +1573,7 @@ export function createMcpSessionServer(
       inputSchema: {},
     },
     async () => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       const getFn = (client as unknown as { getPolicy?: () => { mode: string; review_mode: string; requirements: unknown[] } }).getPolicy;
       const policy = typeof getFn === "function"
         ? getFn.call(client)
@@ -1343,6 +1602,7 @@ export function createMcpSessionServer(
       inputSchema: {},
     },
     async () => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!clientBackup) {
         return jsonText({ ok: false, reason: "not_configured" });
       }
@@ -1371,6 +1631,7 @@ export function createMcpSessionServer(
       inputSchema: {},
     },
     async () => {
+      if (!isRegistered()) return NOT_REGISTERED_ERROR;
       if (!clientBackup) {
         return jsonText({ ok: false, reason: "not_configured" });
       }
