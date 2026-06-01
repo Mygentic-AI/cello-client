@@ -167,8 +167,13 @@ const backupLogger = {
     process.stderr.write(`cello-mcp: [info] ${event} ${JSON.stringify(ctx ?? {})}\n`),
   warn: (event: string, ctx?: Record<string, unknown>) =>
     process.stderr.write(`cello-mcp: [warn] ${event} ${JSON.stringify(ctx ?? {})}\n`),
-  error: (event: string, ctx?: Record<string, unknown>) =>
-    process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(ctx ?? {})}\n`),
+  error: (event: string, errorOrContext?: Error | Record<string, unknown>, context?: Record<string, unknown>) => {
+    if (errorOrContext instanceof Error) {
+      process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify({ message: errorOrContext.message, stack: errorOrContext.stack, ...context })}\n`);
+    } else {
+      process.stderr.write(`cello-mcp: [error] ${event} ${JSON.stringify(errorOrContext ?? {})}\n`);
+    }
+  },
 };
 
 // PERSIST-024 (CRIT-1): Derive dbKey for SQLCipher from identity key before zeroing.
@@ -398,7 +403,7 @@ void (async () => {
         directoryEndpoint = { peer_id: peerId, multiaddrs: [resolvedDirectoryMultiaddr] };
       } else {
         // Multiaddr is present but lacks /p2p/<peer-id> — setDirectoryEndpoint will not be called.
-        backupLogger.warn("client.startup.progress", { step: "directory_endpoint_parse", reason: "multiaddr_missing_peer_id", multiaddr: resolvedDirectoryMultiaddr });
+        backupLogger.warn("client.startup.multiaddr_parse.failed", { reason: "multiaddr_missing_peer_id", multiaddr: resolvedDirectoryMultiaddr });
         process.stderr.write("cello-mcp: directory multiaddr must include /p2p/<peer-id>\n");
       }
     }

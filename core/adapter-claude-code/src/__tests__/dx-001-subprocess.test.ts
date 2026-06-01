@@ -30,130 +30,107 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const BINARY_PATH = resolve(__dirname, "../../dist/bin/cello-mcp.js");
 
 /**
- * Send a tools/list JSON-RPC request to the MCP binary via stdin and collect
- * the first valid JSON-RPC response from stdout within timeoutMs.
+ * Spawn the cello-mcp binary, complete the MCP handshake, send tools/list,
+ * and return the tools/list result within timeoutMs.
  *
  * SDK v1.29.0 StdioServerTransport uses newline-delimited JSON (not Content-Length framing).
  * serializeMessage() outputs JSON.stringify(msg) + '\n'; ReadBuffer splits on '\n'.
+ *
+ * Sequence:
+ *   1. Send initialize (id: 1) — wait for response id: 1
+ *   2. Send initialized notification (required by MCP spec before any other request)
+ *   3. Send tools/list (id: 2) — wait for response id: 2 and resolve with result.tools
  */
-async function sendToolsList(timeoutMs: number): Promise<unknown> {
-  // Create a temp dir for the key file so the binary doesn't exit on ENOENT
+async function runToolsList(timeoutMs: number): Promise<unknown[]> {
   const tmpDir = mkdtempSync(`${tmpdir()}/cello-test-subprocess-`);
 
   return new Promise((resolve, reject) => {
     const proc = spawn(process.execPath, [BINARY_PATH], {
       env: {
         ...process.env,
-        // Use a temp directory for the key file so key generation succeeds
         CELLO_KEY_FILE: `${tmpDir}/test-key`,
-        // Point directory at a non-existent URL so bootstrap fails fast (non-blocking)
         CELLO_DIRECTORY_URL: "http://127.0.0.1:19999",
-        // Skip SQLCipher DB: use a temp path so it doesn't conflict with real data
         CELLO_DB_PATH: `${tmpDir}/test-client.db`,
-        // Local env so no S3 backup is attempted
         CELLO_ENV: "local",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    let stdout = "";
-    let resolved = false;
+    let stdoutBuf = "";
+    let done = false;
+    let initDone = false;
 
     function cleanup(): void {
       try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
     }
 
+    function finish(result: unknown[] | Error): void {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      proc.kill();
+      cleanup();
+      if (result instanceof Error) reject(result);
+      else resolve(result);
+    }
+
     const timer = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        proc.kill();
-        cleanup();
-        reject(new Error(`tools/list did not respond within ${timeoutMs}ms`));
-      }
+      finish(new Error(`tools/list did not respond within ${timeoutMs}ms`));
     }, timeoutMs);
 
     proc.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdoutBuf += chunk.toString();
+      // Process all complete lines (newline-delimited JSON per SDK v1.29.0)
+      let nl: number;
+      while ((nl = stdoutBuf.indexOf("\n")) !== -1) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (!line) continue;
+        let msg: Record<string, unknown>;
+        try { msg = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
 
-      // SDK v1.29.0: newline-delimited JSON. Each line is a complete JSON-RPC message.
-      const newlineIdx = stdout.indexOf("\n");
-      if (newlineIdx !== -1) {
-        const line = stdout.slice(0, newlineIdx).trim();
-        clearTimeout(timer);
-        if (!resolved) {
-          resolved = true;
-          proc.kill();
-          cleanup();
-          try {
-            resolve(JSON.parse(line));
-          } catch {
-            reject(new Error(`Failed to parse JSON-RPC response: ${line.slice(0, 200)}`));
-          }
+        if (msg["id"] === 1 && !initDone) {
+          // initialize response received — send initialized notification + tools/list
+          initDone = true;
+          const initialized = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n";
+          const toolsList = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }) + "\n";
+          proc.stdin.write(initialized);
+          proc.stdin.write(toolsList);
+        } else if (msg["id"] === 2) {
+          // tools/list response — this is what AC-009 requires
+          const result = (msg["result"] as Record<string, unknown> | undefined);
+          const tools = result?.["tools"];
+          finish(Array.isArray(tools) ? tools : []);
         }
       }
     });
 
-    proc.on("error", (err) => {
-      clearTimeout(timer);
-      if (!resolved) {
-        resolved = true;
-        cleanup();
-        reject(err);
-      }
-    });
-
+    proc.on("error", (err) => finish(err));
     proc.on("exit", (code) => {
-      clearTimeout(timer);
-      if (!resolved) {
-        resolved = true;
-        cleanup();
-        reject(new Error(`Binary exited with code ${code} before responding. stdout: ${stdout.slice(0, 500)}`));
-      }
+      if (!done) finish(new Error(`Binary exited with code ${code} before responding`));
     });
 
-    // SDK v1.29.0: newline-delimited JSON framing (no Content-Length headers).
-    // Send initialize first, then tools/list after a short delay.
+    // Send initialize immediately — AC-009 requires tools to be registered before background I/O
     const initRequest = JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "test-client", version: "0.0.1" },
-      },
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test-client", version: "0.0.1" } },
     }) + "\n";
     proc.stdin.write(initRequest);
-
-    // Give initialize a moment to be processed, then send tools/list.
-    // We watch stdout for whichever response arrives first.
-    setTimeout(() => {
-      if (!resolved) {
-        const listRequest = JSON.stringify({
-          jsonrpc: "2.0",
-          id: 2,
-          method: "tools/list",
-          params: {},
-        }) + "\n";
-        proc.stdin.write(listRequest);
-      }
-    }, 100);
   });
 }
 
 // ─── AC-009: subprocess tools/list within 3 seconds ──────────────────────────
 
 describe("AC-009: cello-mcp responds to tools/list before background init completes", () => {
-  it("binary responds to initialize within 3 seconds of spawning", async () => {
-    // 3-second timeout — AC-009 requires response within 2s, we give 3s margin here
-    const response = await sendToolsList(3000) as Record<string, unknown>;
+  it("tools/list returns a non-empty tools array within 3 seconds of spawning", async () => {
+    // AC-009 requires tools to be registered and callable BEFORE background I/O completes.
+    // We verify this by completing the full MCP handshake and asserting tools/list
+    // returns a non-empty array — all within 3s (AC specifies 2s; we give 1s margin).
+    const tools = await runToolsList(3000);
 
-    // The response must be valid JSON-RPC
-    expect(response).toBeDefined();
-    expect(response.jsonrpc).toBe("2.0");
-    // initialize response has result with serverInfo and capabilities, OR
-    // tools/list response has result with tools array.
-    // Either is acceptable — what matters is that the server responded.
-    expect(response.result).toBeDefined();
-  }, 6000); // vitest timeout: 6s (2x the expected response time)
+    expect(Array.isArray(tools)).toBe(true);
+    expect(tools.length).toBeGreaterThan(0);
+  }, 6000); // vitest timeout: 6s
 });
