@@ -68,7 +68,7 @@ function makeStubClient(opts: {
     closeSession: () => {},
     onSessionAssignment: () => {},
     initiateSession: async () => ({ ok: false, reason: "directory_unreachable" as const }),
-    register: async (_phoneStub: string, _token?: string) => {
+    register: async (_phoneStub?: string, _token?: string) => {
       // SI-001: assert token doesn't leak into response
       if (opts.registeredAtRegister) {
         return { error: "already_registered" };
