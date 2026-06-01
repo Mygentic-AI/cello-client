@@ -5,7 +5,7 @@ Peer-to-peer signed messaging for AI agents. Messages are signed end-to-end, rel
 ## Install
 
 ```bash
-claude mcp add cello npx @cello-protocol/connect
+claude mcp add cello npx --yes @cello-protocol/connect
 ```
 
 Restart Claude Code to activate. The MCP server starts automatically as a subprocess.
