@@ -301,6 +301,7 @@ void (async () => {
     process.stderr.write("cello: opening database...");
     let clientPersistence: ClientStatePersistence | undefined;
     let sqlCipherStore: SQLCipherClientStore | undefined;
+    const t0Db = Date.now();
     if (dbKey) {
       try {
         const t0 = Date.now();
@@ -329,9 +330,11 @@ void (async () => {
         } else {
           process.stderr.write(` ok (${durationMs}ms)\n`);
         }
+        backupLogger.info("client.startup.progress", { step: "opening_database", outcome: "ok", durationMs });
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(` failed: ${msg}\n`);
+        backupLogger.warn("client.startup.progress", { step: "opening_database", outcome: "failed", reason: msg, durationMs: Date.now() - t0Db });
         // Detect native module load failures
         const isNativeModuleError =
           msg.includes("Cannot find module") ||
@@ -363,6 +366,7 @@ void (async () => {
       }
     } else {
       process.stderr.write(` failed: identity key not available\n`);
+      backupLogger.warn("client.startup.progress", { step: "opening_database", outcome: "failed", reason: "identity key not available", durationMs: Date.now() - t0Db });
     }
 
     // Step 2: Fetch directory address
@@ -381,18 +385,23 @@ void (async () => {
           const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
           const shortPeerId = peerId ? peerId.slice(0, 20) + "..." : "(unknown)";
           process.stderr.write(` ok (${shortPeerId})\n`);
+          backupLogger.info("client.startup.progress", { step: "fetching_directory_address", outcome: "ok", durationMs: Date.now() - t0Bootstrap });
         } else {
+          const reason = "bootstrap endpoint unreachable";
           backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: "endpoint_returned_null", durationMs: Date.now() - t0Bootstrap });
-          process.stderr.write(` failed: bootstrap endpoint unreachable\n`);
+          process.stderr.write(` failed: ${reason}\n`);
+          backupLogger.warn("client.startup.progress", { step: "fetching_directory_address", outcome: "failed", reason, durationMs: Date.now() - t0Bootstrap });
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         backupLogger.warn("client.bootstrap.fetch.failed", { directoryUrl, reason: msg, durationMs: Date.now() - t0Bootstrap });
         process.stderr.write(` failed: ${msg}\n`);
+        backupLogger.warn("client.startup.progress", { step: "fetching_directory_address", outcome: "failed", reason: msg, durationMs: Date.now() - t0Bootstrap });
       }
     } else {
       // CELLO_DIRECTORY_MULTIADDR is set — use it directly
       process.stderr.write(`cello: fetching directory address... ok (from CELLO_DIRECTORY_MULTIADDR)\n`);
+      backupLogger.info("client.startup.progress", { step: "fetching_directory_address", outcome: "ok", durationMs: 0 });
     }
 
     if (resolvedDirectoryMultiaddr) {
@@ -422,8 +431,10 @@ void (async () => {
     // Registered agents will have their FrostThresholdSigner reconstructed from DB here.
     // directoryEndpoint is already set, so directoryNodeStubs will be populated.
     process.stderr.write("cello: loading agent state...");
+    const t0LoadState = Date.now();
     await client.loadPersistedState();
     process.stderr.write(" ok\n");
+    backupLogger.info("client.startup.progress", { step: "loading_agent_state", outcome: "ok", durationMs: Date.now() - t0LoadState });
 
     // PERSIST-024 AC-008: Build AgentHashQueue
     const loadedPendingHashes = client.getLoadedPendingHashes();
@@ -448,6 +459,7 @@ void (async () => {
     let thresholdSigner: FrostThresholdSigner | undefined;
     let primaryPubkey: Uint8Array | undefined;
 
+    const t0Connect = Date.now();
     if (resolvedDirectoryMultiaddr && directoryEndpoint) {
       process.stderr.write(`cello: connecting to directory...`);
       try {
@@ -473,13 +485,16 @@ void (async () => {
           primaryPubkey = bootstrap.primaryPubkey;
         }
         process.stderr.write(` ok\n`);
+        backupLogger.info("client.startup.progress", { step: "connecting_to_directory", outcome: "ok", durationMs: Date.now() - t0Connect });
       } catch (err: unknown) {
         const msg = err instanceof Error ? `${err.name}: ${err.message}` : JSON.stringify(err);
         process.stderr.write(` failed: ${msg}\n`);
         process.stderr.write(`cello-mcp: continuing without threshold signer\n`);
+        backupLogger.warn("client.startup.progress", { step: "connecting_to_directory", outcome: "failed", reason: msg, durationMs: Date.now() - t0Connect });
       }
     } else {
       process.stderr.write(`cello: connecting to directory... failed: no multiaddr configured\n`);
+      backupLogger.warn("client.startup.progress", { step: "connecting_to_directory", outcome: "failed", reason: "no multiaddr configured", durationMs: Date.now() - t0Connect });
     }
 
     // Wire threshold signer into client only when bootstrap ran (unregistered agents).
@@ -492,11 +507,13 @@ void (async () => {
     }
 
     // Step 5: Emit final ready message (use regStateAfterLoad from loadPersistedState)
+    const t0Ready = Date.now();
     if (regStateAfterLoad) {
       process.stderr.write(`cello: ready (registered as ${regStateAfterLoad.agent_id})\n`);
     } else {
       process.stderr.write(`cello: ready (not registered — call cello_setup_guidance for setup)\n`);
     }
+    backupLogger.info("client.startup.progress", { step: "ready", outcome: "ok", durationMs: Date.now() - t0Ready });
 
     readyResolve();
   } catch (err: unknown) {

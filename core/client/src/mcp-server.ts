@@ -443,18 +443,18 @@ export function createMcpSessionServer(
         try {
           const resp = await fetch(`${directoryHttpUrl}/agent-lookup?agent_id=${target_agent_id}`, { signal: AbortSignal.timeout(10_000) });
           if (!resp.ok) {
-            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, statusCode: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
             return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
           }
           const body = await resp.json() as { k_local_pubkey?: string };
           if (!body.k_local_pubkey) {
-            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, statusCode: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
             return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
           }
           resolvedTargetPubkey = body.k_local_pubkey;
         } catch (e: unknown) {
           const reason = e instanceof Error ? e.message : String(e);
-          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, reason, durationMs: Date.now() - t0Lookup });
+          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: 0, reason, durationMs: Date.now() - t0Lookup });
           return jsonText({ ok: false, reason: "agent_not_found", agent_id: target_agent_id });
         }
       }
@@ -1221,18 +1221,18 @@ export function createMcpSessionServer(
         try {
           const resp = await fetch(`${directoryHttpUrl}/agent-lookup?agent_id=${target_agent_id}`, { signal: AbortSignal.timeout(10_000) });
           if (!resp.ok) {
-            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, statusCode: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "http_error", durationMs: Date.now() - t0Lookup });
             return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
           }
           const body = await resp.json() as { k_local_pubkey?: string };
           if (!body.k_local_pubkey) {
-            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, statusCode: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
+            logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: resp.status, reason: "missing_pubkey_in_response", durationMs: Date.now() - t0Lookup });
             return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
           }
           resolvedTargetPubkey = body.k_local_pubkey;
         } catch (e: unknown) {
           const reason = e instanceof Error ? e.message : String(e);
-          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, reason, durationMs: Date.now() - t0Lookup });
+          logger?.warn("client.directory.agent_lookup.failed", { agentId: target_agent_id, endpoint: `${directoryHttpUrl}/agent-lookup`, httpStatus: 0, reason, durationMs: Date.now() - t0Lookup });
           return jsonText({ error: { reason: "agent_not_found", agent_id: target_agent_id } });
         }
       }
