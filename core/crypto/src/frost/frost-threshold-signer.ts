@@ -347,6 +347,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
     const msg = frameMessage(context, tbs);
 
     const { pub } = localShare;
+    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: pub.signers=${JSON.stringify((pub as unknown as { signers: unknown }).signers)} pub.commitments.length=${(pub as unknown as { commitments: unknown[] }).commitments?.length}\n`);
     const clientId = ed25519_FROST.Identifier.derive(
       `client:${toHex(this.#agentPubkey)}`,
     );
@@ -513,7 +514,24 @@ export class FrostThresholdSigner implements IThresholdSigner {
       // All selected stubs provided valid partial sigs. Compute client's partial sig.
       let clientSig: Uint8Array;
       try {
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: calling client signShare attempt=${attempt + 1}\n`);
+        // Log everything before signShare so a throw gives full context
+        const pubRec = pub as unknown as Record<string, unknown>;
+        const secretRec = localShare.secret as unknown as Record<string, unknown>;
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: PRE-signShare attempt=${attempt + 1}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   pub.signers=${JSON.stringify(pubRec.signers)}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   pub.commitments.length=${Array.isArray(pubRec.commitments) ? pubRec.commitments.length : "NOT_ARRAY"}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   pub.commitments[0] type=${Array.isArray(pubRec.commitments) ? typeof pubRec.commitments[0] : "N/A"} isUint8Array=${Array.isArray(pubRec.commitments) ? pubRec.commitments[0] instanceof Uint8Array : "N/A"}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   secret.identifier=${String(secretRec.identifier)} type=${typeof secretRec.identifier}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   secret.signingShare type=${typeof secretRec.signingShare} isUint8Array=${secretRec.signingShare instanceof Uint8Array}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   localNonce.nonces type=${typeof localNonce.nonces} keys=${typeof localNonce.nonces === "object" && localNonce.nonces ? Object.keys(localNonce.nonces as object).join(",") : "N/A"}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   commitmentList.length=${commitmentList.length}\n`);
+        commitmentList.forEach((c, i) => {
+          const cr = c as unknown as Record<string, unknown>;
+          process.stderr.write(`[CLIENT-DEBUG]   commitmentList[${i}]: identifier=${String(cr.identifier)} hiding.isUint8Array=${cr.hiding instanceof Uint8Array} binding.isUint8Array=${cr.binding instanceof Uint8Array}\n`);
+        });
+        process.stderr.write(`[CLIENT-DEBUG]   msg.length=${msg.length} isUint8Array=${msg instanceof Uint8Array}\n`);
+        process.stderr.write(`[CLIENT-DEBUG]   clientId type=${typeof clientId} value=${String(clientId).slice(0,20)}\n`);
+
         clientSig = ed25519_FROST.signShare(
           localShare.secret,
           pub,
