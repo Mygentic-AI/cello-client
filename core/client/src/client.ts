@@ -2653,7 +2653,15 @@ class CelloClientImpl implements CelloClient {
     stream: Stream,
     frame: Record<string, unknown>,
   ): Promise<void> {
-    if (!this.#thresholdSigner) return;
+    process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: thresholdSigner=${this.#thresholdSigner ? "SET" : "NULL"}\n`);
+    if (!this.#thresholdSigner) {
+      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ABORT thresholdSigner is null — sending null ceremony_result\n`);
+      const ceremonyId = frame["ceremony_id"] as string | undefined;
+      if (ceremonyId) {
+        stream.send(lp.encode.single(CBOR_ENC.encode({ type: "ceremony_result", ceremony_id: ceremonyId, signature: null })));
+      }
+      return;
+    }
 
     const ceremonyId = frame["ceremony_id"] as string | undefined;
     const tbsRaw = frame["tbs"];
@@ -2661,14 +2669,21 @@ class CelloClientImpl implements CelloClient {
       : Buffer.isBuffer(tbsRaw) ? new Uint8Array(tbsRaw as Buffer) : null;
     const context = frame["context"] as string | undefined;
 
-    if (!ceremonyId || !tbs || !context) return;
+    process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ceremonyId=${ceremonyId?.slice(0,16)} tbs=${tbs ? `Uint8Array(${tbs.length})` : "NULL"} context=${context}\n`);
+
+    if (!ceremonyId || !tbs || !context) {
+      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ABORT missing fields ceremonyId=${!!ceremonyId} tbs=${!!tbs} context=${!!context}\n`);
+      return;
+    }
 
     try {
+      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: calling participateInCeremony\n`);
       const result = await this.#thresholdSigner.participateInCeremony(
         ceremonyId,
         tbs,
         context as import("@cello-protocol/crypto/frost/types.js").FrostContext,
       );
+      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: participateInCeremony returned ok=${result.ok} reason=${!result.ok ? (result as { error: { reason: string } }).error?.reason : "N/A"}\n`);
 
       const sig = result.ok ? result.signature : null;
       stream.send(lp.encode.single(CBOR_ENC.encode({
@@ -2676,7 +2691,9 @@ class CelloClientImpl implements CelloClient {
         ceremony_id: ceremonyId,
         signature: sig ? new Uint8Array(sig) : null,
       })));
-    } catch {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: CAUGHT ERROR: ${msg}\n`);
       stream.send(lp.encode.single(CBOR_ENC.encode({
         type: "ceremony_result",
         ceremony_id: ceremonyId,

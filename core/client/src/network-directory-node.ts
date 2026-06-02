@@ -119,7 +119,9 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   }
 
   async generateCommitment(): Promise<StubCommitment> {
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.generateCommitment: agent=${this.#agentPubkeyHex?.slice(0,16)} epochId=${this.#epochId} directoryPeerId=${this.#directoryPeerId?.slice(0,16)}\n`);
     if (!this.#agentPubkeyHex || !this.#epochId) {
+      process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.generateCommitment: ABORT missing context agentPubkeyHex=${!!this.#agentPubkeyHex} epochId=${!!this.#epochId}\n`);
       throw new Error("NetworkDirectoryNode: setBootstrapContext must be called before generateCommitment");
     }
 
@@ -130,7 +132,9 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       peerIdString: this.#node.getPeerId(),
     });
 
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.generateCommitment: opening stream to directoryPeerId=${this.#directoryPeerId?.slice(0,16)} multiaddr=${this.#directoryMultiaddrs[0]}\n`);
     const stream = await this.#openStream();
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.generateCommitment: stream opened\n`);
     try {
       stream.send(lp.encode.single(frame));
       await stream.close();
@@ -145,6 +149,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
           nonceCommitment?: StubCommitment["nonceCommitment"];
         };
 
+        process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.generateCommitment: response ok=${resp.ok} reason=${resp.reason} nodeId=${resp.nodeId?.slice(0,16)}\n`);
         if (!resp.ok) {
           throw new Error(`NetworkDirectoryNode: commit request failed: ${resp.reason}`);
         }
@@ -163,7 +168,9 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   }
 
   async signRound(params: StubSignParams): Promise<Uint8Array | null> {
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.signRound: agent=${this.#agentPubkeyHex?.slice(0,16)} epochId=${this.#epochId} ceremonyId=${params.ceremonyId?.slice(0,16)}\n`);
     if (!this.#agentPubkeyHex || !this.#epochId) {
+      process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.signRound: ABORT missing context\n`);
       throw new Error("NetworkDirectoryNode: setBootstrapContext must be called before signRound");
     }
 
@@ -171,14 +178,15 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       type: "frost_sign_request",
       agentPubkey: this.#agentPubkeyHex,
       epochId: this.#epochId,
-      framedMsg: params.msg, // already framed (context\0tbs) by the coordinator
+      framedMsg: params.msg,
       commitmentList: params.commitmentList,
       ceremonyId: params.ceremonyId,
-      // Use ceremonyId as peerIdString to match directory's markInFlight registration
       peerIdString: params.ceremonyId,
     });
 
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.signRound: opening stream\n`);
     const stream = await this.#openStream();
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.signRound: stream opened, sending sign request\n`);
     try {
       stream.send(lp.encode.single(frame));
       await stream.close();
@@ -192,8 +200,9 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
           partialSignature?: Uint8Array;
         };
 
+        process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.signRound: response ok=${resp.ok} reason=${resp.reason} sigLength=${resp.partialSignature ? (resp.partialSignature as Uint8Array).length : "null"}\n`);
         if (!resp.ok) {
-          return null; // treat as timeout — coordinator will exclude this node
+          return null;
         }
 
         const sig = resp.partialSignature;
@@ -219,13 +228,25 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   }
 
   async #openStream(): Promise<import("@libp2p/interface").Stream> {
-    // Ensure we have a connection to the directory node
+    process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: peerId=${this.#directoryPeerId?.slice(0,16)} multiaddr=${this.#directoryMultiaddrs[0]}\n`);
     try {
-      return await this.#node.newStream(this.#directoryPeerId, FROST_PROTOCOL_ID);
-    } catch {
-      // Try dialing first if not connected
-      await this.#node.dial(this.#directoryMultiaddrs[0]!);
-      return await this.#node.newStream(this.#directoryPeerId, FROST_PROTOCOL_ID);
+      const s = await this.#node.newStream(this.#directoryPeerId, FROST_PROTOCOL_ID);
+      process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: newStream OK\n`);
+      return s;
+    } catch (err1: unknown) {
+      const msg1 = err1 instanceof Error ? err1.message : String(err1);
+      process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: newStream failed (${msg1}), trying dial first\n`);
+      try {
+        await this.#node.dial(this.#directoryMultiaddrs[0]!);
+        process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: dial OK, retrying newStream\n`);
+        const s = await this.#node.newStream(this.#directoryPeerId, FROST_PROTOCOL_ID);
+        process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: newStream after dial OK\n`);
+        return s;
+      } catch (err2: unknown) {
+        const msg2 = err2 instanceof Error ? err2.message : String(err2);
+        process.stderr.write(`[CLIENT-DEBUG] NetworkDirectoryNode.#openStream: FAILED after dial: ${msg2}\n`);
+        throw err2;
+      }
     }
   }
 }
