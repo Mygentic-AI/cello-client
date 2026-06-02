@@ -95,7 +95,7 @@ describe("AC-002: TTY detection output format", () => {
     expect(iTtyPos).toBeLessThan(serverConnectPos);
 
     // The TTY output must contain the install command (catches accidental removal/truncation)
-    const installCmdPos = source.indexOf("claude mcp add cello npx @cello-protocol/connect");
+    const installCmdPos = source.indexOf("claude mcp add cello npx --yes @cello-protocol/connect");
     expect(installCmdPos).toBeGreaterThan(-1);
     // The install command must be inside the isTTY block (before server.connect)
     expect(installCmdPos).toBeLessThan(serverConnectPos);
