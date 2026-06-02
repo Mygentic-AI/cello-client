@@ -513,6 +513,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
       // All selected stubs provided valid partial sigs. Compute client's partial sig.
       let clientSig: Uint8Array;
       try {
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: calling client signShare attempt=${attempt + 1}\n`);
         clientSig = ed25519_FROST.signShare(
           localShare.secret,
           pub,
@@ -520,22 +521,31 @@ export class FrostThresholdSigner implements IThresholdSigner {
           commitmentList,
           msg,
         );
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: client signShare OK sigLength=${clientSig.length}\n`);
         sigShares[String(clientId)] = clientSig;
         partialSigCount++;
         onProgress?.({ type: "partial_sig_collected", index: partialSigCount, total: totalParticipants });
-      } catch {
+      } catch (err: unknown) {
+        const msg2 = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: client signShare THREW: ${msg2}\n`);
         continue;
       }
 
+      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: sigShares count=${Object.keys(sigShares).length} threshold=${threshold}\n`);
       if (Object.keys(sigShares).length < threshold) {
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: not enough sigShares, continuing\n`);
         continue;
       }
 
       // Aggregate
       let signature: Uint8Array;
       try {
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: calling aggregate sigShareKeys=${Object.keys(sigShares).map(k=>k.slice(0,8)).join(",")}\n`);
         signature = ed25519_FROST.aggregate(pub, commitmentList, msg, sigShares);
-      } catch {
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: aggregate OK sigLength=${signature.length}\n`);
+      } catch (err: unknown) {
+        const msg2 = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: aggregate THREW: ${msg2}\n`);
         continue;
       }
 
