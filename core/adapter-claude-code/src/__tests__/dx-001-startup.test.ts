@@ -158,7 +158,7 @@ describe("AC-001: Startup progress line format", () => {
   });
 
   it("'cello: ready (registered as ...)' line includes the agent_id", () => {
-    const agentId = "a2c55e2721f45cfa86cb3417a76e3f7b";
+    const agentId = "c684a3d274ad4ecc716d1d6fd420545c";
     const readyLine = `cello: ready (registered as ${agentId})\n`;
     expect(readyLine).toContain("ready");
     expect(readyLine).toContain(agentId);

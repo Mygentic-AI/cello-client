@@ -383,7 +383,7 @@ describe("AC-007 client-side: target_agent_id resolves via /agent-lookup", () =>
     const result = parseResult(
       await mcpClient.callTool({
         name: "cello_request_connection",
-        arguments: { target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" },
+        arguments: { target_agent_id: "c684a3d274ad4ecc716d1d6fd420545c" },
       })
     ) as Record<string, unknown>;
 
@@ -402,7 +402,7 @@ describe("AC-007 client-side: target_agent_id resolves via /agent-lookup", () =>
     const result = parseResult(
       await mcpClient.callTool({
         name: "cello_initiate_session",
-        arguments: { target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" },
+        arguments: { target_agent_id: "c684a3d274ad4ecc716d1d6fd420545c" },
       })
     ) as Record<string, unknown>;
 
@@ -546,7 +546,7 @@ describe("AC-008: Per-stage timeouts returned with specific error reasons", () =
   });
 
   it("DEFAULT_DEMO_AGENT_ID constant is exported and matches expected value", () => {
-    expect(DEFAULT_DEMO_AGENT_ID).toBe("a2c55e2721f45cfa86cb3417a76e3f7b");
+    expect(DEFAULT_DEMO_AGENT_ID).toBe("c684a3d274ad4ecc716d1d6fd420545c");
     expect(DEFAULT_DEMO_AGENT_ID).toHaveLength(32);
   });
 });
@@ -577,7 +577,7 @@ describe("AC-005: DEFAULT_DEMO_AGENT_ID constant", () => {
   it("DEFAULT_DEMO_AGENT_ID is exported as a named constant (not inline literal)", () => {
     // This test verifies that the constant is exported from mcp-server.ts
     expect(typeof DEFAULT_DEMO_AGENT_ID).toBe("string");
-    expect(DEFAULT_DEMO_AGENT_ID).toBe("a2c55e2721f45cfa86cb3417a76e3f7b");
+    expect(DEFAULT_DEMO_AGENT_ID).toBe("c684a3d274ad4ecc716d1d6fd420545c");
   });
 });
 
