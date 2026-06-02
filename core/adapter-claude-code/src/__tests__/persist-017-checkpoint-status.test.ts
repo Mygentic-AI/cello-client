@@ -79,6 +79,7 @@ function makeStubClient(): CelloClient {
     addPeer() {},
     async send() { return { delivered: false, reason: "peer_not_connected" }; },
     async registerHandler() {},
+      async announceToDirectory() {},
     receive() { return null; },
     peekAll() { return []; },
     async receiveSessionAssignment() { return { ok: false, reason: "frost_signature_invalid" }; },

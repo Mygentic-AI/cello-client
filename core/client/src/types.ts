@@ -318,6 +318,12 @@ export interface CelloClient {
   registerHandler(): Promise<void>;
 
   /**
+   * Open the persistent signaling stream to the directory if not already open.
+   * Call after setDirectoryEndpoint() to announce presence. Safe to call multiple times.
+   */
+  announceToDirectory(): Promise<void>;
+
+  /**
    * Dequeue the oldest received envelope from a given sender.
    * Returns null if the queue is empty.
    */

@@ -3574,6 +3574,18 @@ class CelloClientImpl implements CelloClient {
     }
   }
 
+  /**
+   * Open the persistent signaling stream to the directory if not already open.
+   * Call this after setDirectoryEndpoint() to announce presence to the directory.
+   * Safe to call multiple times — no-op if stream is already open.
+   * Best-effort: failure is non-fatal.
+   */
+  async announceToDirectory(): Promise<void> {
+    if (this.#directoryEndpoint && !this.#persistentSignalingStream) {
+      await this.#openPersistentSignalingStream().catch(() => {});
+    }
+  }
+
   // ─── REG-001: Agent registration ─────────────────────────────────────────────
 
   /**
@@ -5957,6 +5969,8 @@ export function createClient(
   loadPersistedState(): Promise<void>;
   /** PERSIST-024: return hashes pending relay resubmission after loadPersistedState(). */
   getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
+  /** Open the persistent signaling stream to the directory if not already open. Call after setDirectoryEndpoint(). */
+  announceToDirectory(): Promise<void>;
 } {
   return new CelloClientImpl(
     node,

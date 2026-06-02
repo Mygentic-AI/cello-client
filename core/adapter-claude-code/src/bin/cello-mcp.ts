@@ -471,6 +471,13 @@ void (async () => {
       try {
         await node.dial(directoryEndpoint.multiaddrs[0]!);
 
+        // Announce to the directory immediately after dial so the directory registers
+        // this agent in its #streams map. Without this, the directory considers the
+        // agent offline even though the libp2p TCP connection succeeded.
+        // registerHandler() was called before directoryEndpoint was set, so the
+        // proactive announce inside it was skipped — this call makes up for that.
+        await (client as unknown as { announceToDirectory(): Promise<void> }).announceToDirectory();
+
         if (!regStateAfterLoad) {
           // Not yet registered — run bootstrap to initialize FROST key shares.
           // Registered agents already have their signer from loadPersistedState().
