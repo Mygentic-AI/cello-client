@@ -665,12 +665,14 @@ class CelloClientImpl implements CelloClient {
       if (!this.#thresholdSigner) {
         let directoryNodeStubsForSigner: NetworkDirectoryNode[] | undefined;
         if (this.#directoryEndpoint) {
-          directoryNodeStubsForSigner = [new NetworkDirectoryNode({
+          const stub = new NetworkDirectoryNode({
             id: this.#directoryEndpoint.peer_id,
             node: this.#node,
             directoryPeerId: this.#directoryEndpoint.peer_id,
             directoryMultiaddrs: this.#directoryEndpoint.multiaddrs,
-          })];
+          });
+          stub.setBootstrapContext(myPubkeyHex, `${myPubkeyHex}:epoch:1`);
+          directoryNodeStubsForSigner = [stub];
         }
         this.#thresholdSigner = new FrostThresholdSigner(
           {
