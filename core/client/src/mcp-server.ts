@@ -301,7 +301,7 @@ const NOT_REGISTERED_ERROR = jsonText({
  * Overridable via CELLO_DEMO_AGENT_ID env var without a code change.
  * Must NOT be hardcoded as a string literal in tool implementations.
  */
-export const DEFAULT_DEMO_AGENT_ID = "c684a3d274ad4ecc716d1d6fd420545c";
+export const DEFAULT_DEMO_AGENT_ID = "ba493e6eca98924f02378ac1a5de81d3";
 
 function toHex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex");
