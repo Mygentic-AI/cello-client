@@ -640,7 +640,7 @@ class CelloClientImpl implements CelloClient {
       }
 
       const frostPublic = {
-        signers: { min: row.threshold, max: row.participants },
+        signers: { min: row.threshold, max: row.participants + 1 },
         commitments,
         verifyingShares,
       };
