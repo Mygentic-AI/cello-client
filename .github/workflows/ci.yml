@@ -123,3 +123,29 @@ jobs:
           pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify all published versions match local
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          FAILED=0
+          for pkg in protocol-types crypto transport client; do
+            local_ver=$(node -p "require('./core/$pkg/package.json').version")
+            npm_ver=$(npm view @cello-protocol/$pkg version 2>/dev/null || echo "missing")
+            if [ "$local_ver" != "$npm_ver" ]; then
+              echo "FAIL: @cello-protocol/$pkg local=$local_ver npm=$npm_ver — bump the version before tagging"
+              FAILED=1
+            else
+              echo "OK: @cello-protocol/$pkg@$local_ver"
+            fi
+          done
+          local_ver=$(node -p "require('./core/adapter-claude-code/package.json').version")
+          npm_ver=$(npm view @cello-protocol/connect version 2>/dev/null || echo "missing")
+          if [ "$local_ver" != "$npm_ver" ]; then
+            echo "FAIL: @cello-protocol/connect local=$local_ver npm=$npm_ver — bump the version before tagging"
+            FAILED=1
+          else
+            echo "OK: @cello-protocol/connect@$local_ver"
+          fi
+          exit $FAILED
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
