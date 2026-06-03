@@ -10,6 +10,11 @@
  *           must derive db_key via deriveDbKey() before constructing this store.
  *   SI-003: No PRAGMA cipher_* commands that would weaken AES-256-CBC defaults.
  *
+ * Security invariants (CELLO-M6B-005):
+ *   SI-001 (M6B-005): WAL mode PRAGMA is issued only AFTER key verification.
+ *           Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL,
+ *           (4) migrations. Ensures WAL files are encrypted at rest.
+ *
  * Degraded behavior (DB-001):
  *   On corrupt file or wrong key, logs client.store.open.failed and throws.
  *   Never creates a new empty database over a corrupt file.
@@ -148,7 +153,7 @@ export class SQLCipherClientStore implements ClientStore {
       // If the key is wrong or the file is corrupt, this will fail.
       await this.#verifyKey(db);
 
-      // SI-001: WAL mode is set AFTER key verification and BEFORE migrations.
+      // SI-001 (M6B-005): WAL mode is set AFTER key verification and BEFORE migrations.
       // Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL, (4) migrations.
       // WAL mode is issued on a key-verified database — attackers with filesystem access
       // see encrypted WAL files, not plaintext.
@@ -279,7 +284,7 @@ export class SQLCipherClientStore implements ClientStore {
    * PRAGMA journal_mode=WAL is issued in a single `db.get()` call, which both
    * sets the mode and returns the active journal mode as a result row.
    *
-   * Implements SI-001 from CELLO-M6B-005: Must only be called AFTER #verifyKey() succeeds.
+   * Implements SI-001 (M6B-005): Must only be called AFTER #verifyKey() succeeds.
    * WAL mode on an unverified database would operate on plaintext; by calling this after
    * key verification, we guarantee WAL files are encrypted at rest.
    *
