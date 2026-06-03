@@ -1731,6 +1731,33 @@ class CelloClientImpl implements CelloClient {
     if (!session) return { ok: false, reason: "session_not_found" };
     if (session.status !== "active") return { ok: false, reason: "session_not_active" };
 
+    // Fix 1: ensure the signaling stream is alive before mutating session state.
+    // The directory replies (seal_verified / session_frost_sealed) on this stream.
+    // If the stream dropped silently (libp2p TCP idle disconnect), the reply is lost,
+    // the 15-second FROST timeout fires, and the session permanently ends as seal_deferred.
+    // Reconnecting first guarantees the directory's response lands on a live reader loop.
+    // Status mutation is deferred until after reconnect succeeds to avoid a sealing-stuck
+    // crash window (if the process restarts between the persist and the rollback, the session
+    // would be permanently unresealable).
+    if (!this.#persistentSignalingStream) {
+      const correlationId = Buffer.from(session.session_id).toString("hex");
+      this.#logger.info("seal.reconnect.attempted", { sessionId: sessionIdHex, correlationId });
+      const opened = await this.#openPersistentSignalingStream();
+      if (!opened || !this.#persistentSignalingStream) {
+        return { ok: false, reason: "directory_unreachable" };
+      }
+      // Re-validate after the async reconnect: a concurrent caller may have already
+      // mutated session status while this call was awaiting the stream open.
+      // TypeScript narrows session.status to "active" at this point (line 1732 guard), but
+      // async suspension means the actual value may have changed — re-read via a typed cast.
+      // Mirror the guard at #sendMessageLocked: sealing/sealed/seal_deferred → "session_sealed".
+      const statusNow = (session as SessionRecord).status;
+      if (statusNow === "sealing" || statusNow === "sealed" || statusNow === "seal_deferred") {
+        return { ok: false, reason: "session_sealed" };
+      }
+      if (statusNow !== "active") return { ok: false, reason: "session_not_active" };
+    }
+
     session.status = "sealing";
     this.#sealInitiatedSessions.add(sessionIdHex);
     // CRIT-1: persist sealing status
@@ -5776,6 +5803,27 @@ class CelloClientImpl implements CelloClient {
     for (const [targetPubkey, pendingResolve] of this.#pendingConnectionRequestResolvers) {
       this.#pendingConnectionRequestResolvers.delete(targetPubkey);
       pendingResolve({ type: "connection_request_error", reason: "directory_unreachable", target_pubkey: targetPubkey });
+    }
+
+    // Fix 2: if any session is in sealing or seal_deferred status, the directory may have
+    // a queued seal_verified notification that it couldn't deliver (stream was gone).
+    // Reconnect so the directory drains its notification queue and the FROST ceremony
+    // can complete. sealing sessions are included because the stream may drop during the
+    // active 15-second FROST timeout window; reconnect-delivered seal_verified resolves the
+    // in-flight Promise.race, or if the timeout already fired, session_frost_sealed upgrades
+    // seal_deferred → sealed via #handleSessionFrostSealed. The 200ms delay ensures at least
+    // one event-loop tick between close and reconnect — a permanently-down directory terminates
+    // after one failed open attempt (no further scheduling), and a flapping directory retries at
+    // ~200ms intervals (no exponential backoff applied here).
+    const pendingSealSessions = Array.from(this.#sessions.entries())
+      .filter(([, s]) => s.status === "sealing" || s.status === "seal_deferred")
+      .map(([id]) => id);
+    if (pendingSealSessions.length > 0 && this.#directoryEndpoint) {
+      this.#logger.info("seal.stream.closed.reconnect.scheduled", {
+        pendingSealSessions,
+        correlationId: "stream-close",
+      });
+      setTimeout(() => void this.#openPersistentSignalingStream(), 200);
     }
   }
 }
