@@ -364,11 +364,12 @@ export function createMcpServer(
       if (client == null) return CLIENT_NOT_INITIALIZED;
 
       // Every completed session must end with a seal — attempt before teardown.
-      // If the session is already sealing/sealed/deferred, skip the attempt.
+      // If the session is already sealing/sealed/deferred/rejected, skip the attempt.
       const sessions = client.listSessions();
       const session = sessions.find((s) => Buffer.from(s.session_id).toString("hex") === session_id);
       const alreadySealing = session &&
-        (session.status === "sealing" || session.status === "sealed" || session.status === "seal_deferred");
+        (session.status === "sealing" || session.status === "sealed" ||
+         session.status === "seal_deferred" || session.status === "seal_rejected");
 
       let sealResult: { ok: boolean; reason?: string } | undefined;
       if (!alreadySealing && session?.status === "active") {

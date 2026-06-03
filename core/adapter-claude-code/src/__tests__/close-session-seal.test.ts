@@ -162,7 +162,7 @@ describe("AC-002: cello_close_session closes even when seal fails", () => {
 // ─── AC-003: skips seal when already sealed/sealing/deferred ─────────────────
 
 describe("AC-003: cello_close_session skips seal when already sealing/sealed/deferred", () => {
-  for (const status of ["sealing", "sealed", "seal_deferred"] as const) {
+  for (const status of ["sealing", "sealed", "seal_deferred", "seal_rejected"] as const) {
     it(`does not call initiateSessionSeal when session status is '${status}'`, async () => {
       const kp = generateKeypair();
       const node = await createNode({ keyProvider: kp, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });

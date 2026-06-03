@@ -3350,10 +3350,18 @@ class CelloClientImpl implements CelloClient {
                 return;
               }
             }
-            const result = await this.#submitSealLeaf(sessionIdHex, session, "responder");
+            // Re-fetch session after any async suspend — state may have been mutated by concurrent
+            // callers (desync, close, reconciliation). Using the stale pre-reconnect reference could
+            // produce the wrong Merkle root in the TBS and cause seal_rejected_tree_mismatch.
+            const freshSession = this.#sessions.get(sessionIdHex);
+            if (!freshSession || freshSession.status !== "sealing") return;
+            const result = await this.#submitSealLeaf(sessionIdHex, freshSession, "responder");
             if (!result.ok) {
               const s = this.#sessions.get(sessionIdHex);
-              if (s && s.status === "sealing") s.status = "seal_rejected";
+              if (s && s.status === "sealing") {
+                s.status = "seal_rejected";
+                void this.#persistence?.persistSession(sessionIdHex, s);
+              }
             }
           })();
         } else {

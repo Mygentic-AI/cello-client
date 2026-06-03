@@ -38,19 +38,25 @@ function makeSpyLogger() {
 
 type StreamLike = ReturnType<typeof makeStream> | null;
 
+type SessionStatus = "sealing" | "active" | "sealed" | "seal_deferred" | "seal_rejected";
+
 // Simulates the responder path logic added in 0.0.25:
 //   1. If signaling stream is dead, reconnect.
 //   2. If reconnect fails → set status to seal_deferred, return.
-//   3. Otherwise call submitSealLeaf.
+//   3. Re-fetch session status after async reconnect (may have changed during await).
+//   4. Otherwise call submitSealLeaf with the fresh session reference.
 async function responderSealPath(opts: {
   signalingStream: StreamLike;
   openSignalingStream: () => Promise<{ stream: StreamLike; ok: boolean }>;
   submitSealLeaf: () => Promise<{ ok: boolean; reason?: string }>;
   logger: ReturnType<typeof makeSpyLogger>;
   sessionId: string;
+  // Status after the reconnect await — simulates concurrent mutation during the await.
+  sessionStatusAfterReconnect?: SessionStatus;
 }): Promise<{ status: "sealing" | "seal_deferred" | "seal_rejected" }> {
   const { logger, sessionId } = opts;
   let stream = opts.signalingStream;
+  let currentStatus: SessionStatus = "sealing";
 
   if (!stream || stream.status !== "open") {
     logger.info("seal.reconnect.attempted", { sessionId, correlationId: sessionId, role: "responder" });
@@ -58,6 +64,11 @@ async function responderSealPath(opts: {
     stream = result.stream;
     if (!result.ok || !stream) {
       return { status: "seal_deferred" };
+    }
+    // Re-validate: simulate concurrent mutation during the reconnect await.
+    currentStatus = opts.sessionStatusAfterReconnect ?? "sealing";
+    if (currentStatus !== "sealing") {
+      return { status: currentStatus === "seal_deferred" ? "seal_deferred" : "seal_rejected" };
     }
   }
 
@@ -167,5 +178,47 @@ describe("Bug 1 fix: responder seal path reconnects dead signaling stream", () =
     await expect(
       responderSealPath({ signalingStream: null, openSignalingStream, submitSealLeaf, logger, sessionId })
     ).resolves.not.toThrow();
+  });
+
+  it("aborts seal if session was closed during reconnect await", async () => {
+    // Simulates: session deleted (closeSession called) while reconnect was awaited.
+    // After reconnect, session is gone — submitSealLeaf must not be called.
+    const logger = makeSpyLogger();
+    const sessionId = Buffer.from(randomBytes(16)).toString("hex");
+    const newStream = makeStream({ open: true });
+    const submitSealLeaf = vi.fn(async () => ({ ok: true as const }));
+    const openSignalingStream = vi.fn(async () => ({ stream: newStream, ok: true }));
+
+    const result = await responderSealPath({
+      signalingStream: null,
+      openSignalingStream,
+      submitSealLeaf,
+      logger,
+      sessionId,
+      sessionStatusAfterReconnect: "seal_deferred",
+    });
+
+    expect(submitSealLeaf).not.toHaveBeenCalled();
+    expect(result.status).toBe("seal_deferred");
+  });
+
+  it("aborts seal if session was desync-closed to seal_rejected during reconnect await", async () => {
+    const logger = makeSpyLogger();
+    const sessionId = Buffer.from(randomBytes(16)).toString("hex");
+    const newStream = makeStream({ open: true });
+    const submitSealLeaf = vi.fn(async () => ({ ok: true as const }));
+    const openSignalingStream = vi.fn(async () => ({ stream: newStream, ok: true }));
+
+    const result = await responderSealPath({
+      signalingStream: null,
+      openSignalingStream,
+      submitSealLeaf,
+      logger,
+      sessionId,
+      sessionStatusAfterReconnect: "seal_rejected",
+    });
+
+    expect(submitSealLeaf).not.toHaveBeenCalled();
+    expect(result.status).toBe("seal_rejected");
   });
 });
