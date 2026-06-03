@@ -30,7 +30,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/client": "0.0.16",
+    "@cello-protocol/client": "workspace:*",
     "@cello-protocol/crypto": "workspace:*",
     "@cello-protocol/interfaces": "0.0.3",
     "@cello-protocol/transport": "workspace:*",
