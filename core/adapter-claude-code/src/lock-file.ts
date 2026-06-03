@@ -29,7 +29,25 @@
  */
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+
+/**
+ * Get the lock file path for a given agent name.
+ * Used by both cello-mcp.ts and tests to ensure path logic is consistent.
+ *
+ * @param agentName - Optional agent name (M7+ multi-agent support)
+ * @param baseDir - Base directory for .cello (defaults to homedir())
+ * @returns Absolute path to the lock file
+ */
+export function getLockFilePath(
+  agentName: string | null,
+  baseDir = homedir(),
+): string {
+  return agentName
+    ? join(baseDir, ".cello", "agents", agentName, "cello-mcp.pid")
+    : join(baseDir, ".cello", "cello-mcp.pid");
+}
 
 export interface LockFileOptions {
   /**
@@ -124,7 +142,17 @@ export async function acquireLockFile(
       const startTime = Date.now();
       const timeout = 5000;
       let stillRunning = true;
-      while (Date.now() - startTime < timeout) {
+
+      // Check immediately after SIGTERM (most processes exit quickly)
+      try {
+        killFn(priorPid, 0);
+        stillRunning = true;
+      } catch {
+        stillRunning = false;
+      }
+
+      // Only poll if still running after immediate check
+      while (stillRunning && Date.now() - startTime < timeout) {
         await new Promise((resolve) => setTimeout(resolve, 100));
         try {
           killFn(priorPid, 0);
@@ -165,6 +193,7 @@ export async function acquireLockFile(
   try {
     mkdirSync(dirname(lockFilePath), { recursive: true });
     writeFileSync(lockFilePath, String(process.pid), "utf8");
+    logger?.info("client.startup.lock.acquired", { lockFilePath });
   } catch (err: unknown) {
     // Lock file write failure is non-fatal (orphan detection will be broken, but process runs)
     logger?.warn("client.startup.lock.write.failed", {

@@ -31,7 +31,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "no
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { acquireLockFile } from "../lock-file.js";
+import { acquireLockFile, getLockFilePath } from "../lock-file.js";
 
 let testDir: string;
 
@@ -203,10 +203,10 @@ describe("AC-003: Lock file cleanup on exit", () => {
 
 describe("AC-005: M7 multi-agent lock file paths", () => {
   it("different agent names produce different lock file paths", () => {
-    const baseDir = join(testDir, ".cello");
+    const baseDir = testDir;
 
-    const aliceLockPath = join(baseDir, "agents", "alice", "cello-mcp.pid");
-    const bobLockPath = join(baseDir, "agents", "bob", "cello-mcp.pid");
+    const aliceLockPath = getLockFilePath("alice", baseDir);
+    const bobLockPath = getLockFilePath("bob", baseDir);
 
     // Verify paths are distinct
     expect(aliceLockPath).not.toBe(bobLockPath);
@@ -241,49 +241,60 @@ describe("AC-001: Kill prior running process (integration)", () => {
       // Block indefinitely
       setInterval(() => {}, 1000);
     `;
-    const processA = spawn(process.execPath, ["-e", scriptA], {
-      stdio: "ignore",
-      detached: false,
-    });
+    let processA: ReturnType<typeof spawn> | undefined;
+    let cleanup: (() => void) | undefined;
 
-    // Wait for process A to write its PID
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(existsSync(lockFilePath)).toBe(true);
-    const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
-    expect(priorPid).toBe(processA.pid);
-
-    // Process B acquires the lock (should kill process A)
-    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
-    const logger = {
-      info: (event: string, context: Record<string, unknown>) =>
-        events.push({ event, context }),
-      warn: (event: string, context: Record<string, unknown>) =>
-        events.push({ event, context }),
-    };
-
-    const cleanup = await acquireLockFile(lockFilePath, { logger });
-
-    // Lock file now contains process B's PID (this test process)
-    const newPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
-    expect(newPid).toBe(process.pid);
-
-    // Process A should be killed
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    let isARunning = true;
     try {
-      process.kill(processA.pid!, 0);
-    } catch {
-      isARunning = false;
+      processA = spawn(process.execPath, ["-e", scriptA], {
+        stdio: "ignore",
+        detached: false,
+      });
+
+      // Wait for process A to write its PID
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(existsSync(lockFilePath)).toBe(true);
+      const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
+      expect(priorPid).toBe(processA.pid);
+
+      // Process B acquires the lock (should kill process A)
+      const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+      const logger = {
+        info: (event: string, context: Record<string, unknown>) =>
+          events.push({ event, context }),
+        warn: (event: string, context: Record<string, unknown>) =>
+          events.push({ event, context }),
+      };
+
+      cleanup = await acquireLockFile(lockFilePath, { logger });
+
+      // Lock file now contains process B's PID (this test process)
+      const newPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
+      expect(newPid).toBe(process.pid);
+
+      // Process A should be killed
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      let isARunning = true;
+      try {
+        process.kill(processA.pid!, 0);
+      } catch {
+        isARunning = false;
+      }
+      expect(isARunning).toBe(false);
+
+      // client.startup.prior.process.killed event was logged
+      const killedEvent = events.find((e) => e.event === "client.startup.prior.process.killed");
+      expect(killedEvent).toBeDefined();
+      expect(killedEvent?.context.priorPid).toBe(priorPid);
+      expect(killedEvent?.context.signal).toMatch(/SIGTERM|SIGKILL/);
+    } finally {
+      // Guaranteed cleanup
+      if (processA) {
+        try { processA.kill("SIGKILL"); } catch {}
+      }
+      if (cleanup) {
+        cleanup();
+      }
     }
-    expect(isARunning).toBe(false);
-
-    // client.startup.prior.process.killed event was logged
-    const killedEvent = events.find((e) => e.event === "client.startup.prior.process.killed");
-    expect(killedEvent).toBeDefined();
-    expect(killedEvent?.context.priorPid).toBe(priorPid);
-    expect(killedEvent?.context.signal).toMatch(/SIGTERM|SIGKILL/);
-
-    cleanup();
   }, 10000); // 10s timeout for process spawn/kill
 
   it("when prior process does not exit after SIGTERM, SIGKILL is sent (logged at warn)", async () => {
@@ -300,44 +311,55 @@ describe("AC-001: Kill prior running process (integration)", () => {
       });
       setInterval(() => {}, 1000);
     `;
-    const processA = spawn(process.execPath, ["-e", scriptIgnoreSigterm], {
-      stdio: "ignore",
-      detached: false,
-    });
+    let processA: ReturnType<typeof spawn> | undefined;
+    let cleanup: (() => void) | undefined;
 
-    // Wait for lock file to be written
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
-
-    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
-    const logger = {
-      info: (event: string, context: Record<string, unknown>) =>
-        events.push({ event, context }),
-      warn: (event: string, context: Record<string, unknown>) =>
-        events.push({ event, context }),
-    };
-
-    // Acquire lock — should escalate to SIGKILL
-    const cleanup = await acquireLockFile(lockFilePath, { logger });
-
-    // Process A should be killed (SIGKILL cannot be ignored)
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    let isARunning = true;
     try {
-      process.kill(processA.pid!, 0);
-    } catch {
-      isARunning = false;
+      processA = spawn(process.execPath, ["-e", scriptIgnoreSigterm], {
+        stdio: "ignore",
+        detached: false,
+      });
+
+      // Wait for lock file to be written
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
+
+      const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+      const logger = {
+        info: (event: string, context: Record<string, unknown>) =>
+          events.push({ event, context }),
+        warn: (event: string, context: Record<string, unknown>) =>
+          events.push({ event, context }),
+      };
+
+      // Acquire lock — should escalate to SIGKILL
+      cleanup = await acquireLockFile(lockFilePath, { logger });
+
+      // Process A should be killed (SIGKILL cannot be ignored)
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      let isARunning = true;
+      try {
+        process.kill(processA.pid!, 0);
+      } catch {
+        isARunning = false;
+      }
+      expect(isARunning).toBe(false);
+
+      // SIGKILL event was logged at warn level
+      const killedEvent = events.find(
+        (e) => e.event === "client.startup.prior.process.killed" && e.context.signal === "SIGKILL",
+      );
+      expect(killedEvent).toBeDefined();
+      expect(killedEvent?.context.priorPid).toBe(priorPid);
+    } finally {
+      // Guaranteed cleanup
+      if (processA) {
+        try { processA.kill("SIGKILL"); } catch {}
+      }
+      if (cleanup) {
+        cleanup();
+      }
     }
-    expect(isARunning).toBe(false);
-
-    // SIGKILL event was logged at warn level
-    const killedEvent = events.find(
-      (e) => e.event === "client.startup.prior.process.killed" && e.context.signal === "SIGKILL",
-    );
-    expect(killedEvent).toBeDefined();
-    expect(killedEvent?.context.priorPid).toBe(priorPid);
-
-    cleanup();
   }, 10000); // 10s timeout (5s wait + spawn overhead)
 });
 

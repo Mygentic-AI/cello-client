@@ -81,7 +81,7 @@ import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/int
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
 import { resolveDirectoryUrl, fetchBootstrapMultiaddr } from "../config.js";
-import { acquireLockFile } from "../lock-file.js";
+import { acquireLockFile, getLockFilePath } from "../lock-file.js";
 
 // AC-001 (DX-001): Startup progress — emit one line per step to stderr.
 // Format: 'cello: <step>... <outcome>'
@@ -92,10 +92,7 @@ process.stderr.write("cello: starting...\n");
 // one cello-mcp per agent at all times. The cleanup function is registered to
 // release the lock on SIGTERM/SIGINT/normal exit.
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
-const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ??
-  (agentName
-    ? join(homedir(), ".cello", "agents", agentName, "cello-mcp.pid")
-    : join(homedir(), ".cello", "cello-mcp.pid"));
+const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
 
 const releaseLock = await acquireLockFile(lockFilePath, {
   logger: {

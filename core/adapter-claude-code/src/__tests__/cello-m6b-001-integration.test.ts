@@ -7,6 +7,10 @@
  *
  * Test type: integration (spawns real cello-mcp child processes)
  * MANDATORY: --pool-options.threads.maxThreads=1
+ *
+ * PREREQUISITE: This test spawns the compiled binary at dist/bin/cello-mcp.js.
+ *   Run `pnpm run build` before running this test if the binary doesn't exist.
+ *   The test will fail with ENOENT if dist/ hasn't been built.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -70,84 +74,89 @@ describe("AC-004: Kill prior process BEFORE opening DB", () => {
       // Block indefinitely
       setInterval(() => {}, 1000);
     `;
-    const processA = spawn(process.execPath, ["-e", scriptA], {
-      stdio: "ignore",
-      detached: false,
-    });
+    let processA: ReturnType<typeof spawn> | undefined;
+    let processB: ReturnType<typeof spawn> | undefined;
 
-    // Wait for process A to write the lock file
-    await new Promise<void>((resolve) => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const fs = require("fs");
-      const interval = setInterval(() => {
-        try {
-          if (fs.existsSync(lockFilePath)) {
+    try {
+      processA = spawn(process.execPath, ["-e", scriptA], {
+        stdio: "ignore",
+        detached: false,
+      });
+
+      // Wait for process A to write the lock file
+      await new Promise<void>((resolve) => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const fs = require("fs");
+        const interval = setInterval(() => {
+          try {
+            if (fs.existsSync(lockFilePath)) {
+              clearInterval(interval);
+              resolve();
+            }
+          } catch {
+            // File doesn't exist yet
+          }
+        }, 50);
+      });
+
+      // Spawn process B — the real cello-mcp binary, should kill process A, then open its own DB
+      const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
+      processB = spawn(process.execPath, [binPath], {
+        stdio: ["ignore", "ignore", "pipe"], // stderr only
+        env: {
+          ...process.env,
+          CELLO_KEY_FILE: keyFile,
+          CELLO_DB_PATH: dbPath,
+          CELLO_ENV: "local",
+          CELLO_LOCK_FILE_PATH: lockFilePath,
+        },
+      });
+
+      let stderrB = "";
+      processB.stderr?.on("data", (chunk) => {
+        stderrB += chunk.toString();
+      });
+
+      // Wait for process B to complete startup (or fail)
+      await new Promise<void>((resolve) => {
+        processB!.on("exit", () => resolve());
+        // Also resolve if we see "cello: ready" or a DB open line
+        const interval = setInterval(() => {
+          if (stderrB.includes("cello: opening database") || stderrB.includes("cello: ready")) {
             clearInterval(interval);
             resolve();
           }
-        } catch {
-          // File doesn't exist yet
-        }
-      }, 50);
-    });
-
-    // Spawn process B — the real cello-mcp binary, should kill process A, then open its own DB
-    const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
-    const processB = spawn(process.execPath, [binPath], {
-      stdio: ["ignore", "ignore", "pipe"], // stderr only
-      env: {
-        ...process.env,
-        CELLO_KEY_FILE: keyFile,
-        CELLO_DB_PATH: dbPath,
-        CELLO_ENV: "local",
-        CELLO_LOCK_FILE_PATH: lockFilePath,
-      },
-    });
-
-    let stderrB = "";
-    processB.stderr?.on("data", (chunk) => {
-      stderrB += chunk.toString();
-    });
-
-    // Wait for process B to complete startup (or fail)
-    await new Promise<void>((resolve) => {
-      processB.on("exit", () => resolve());
-      // Also resolve if we see "cello: ready" or a DB open line
-      const interval = setInterval(() => {
-        if (stderrB.includes("cello: opening database") || stderrB.includes("cello: ready")) {
+        }, 100);
+        // Timeout after 10s
+        setTimeout(() => {
           clearInterval(interval);
           resolve();
-        }
-      }, 100);
-      // Timeout after 10s
-      setTimeout(() => {
-        clearInterval(interval);
-        resolve();
-      }, 10000);
-    });
+        }, 10000);
+      });
 
-    // Kill both processes (cleanup)
-    try {
-      processA.kill("SIGKILL");
-    } catch {}
-    try {
-      processB.kill("SIGKILL");
-    } catch {}
+      // ── Assertion: kill event appears BEFORE DB-open event ──
+      const killEventPattern = /client\.startup\.prior\.process\.killed/;
+      const dbOpenPattern = /cello: opening database/;
 
-    // ── Assertion: kill event appears BEFORE DB-open event ──
-    const killEventPattern = /client\.startup\.prior\.process\.killed/;
-    const dbOpenPattern = /cello: opening database/;
+      const killMatch = stderrB.match(killEventPattern);
+      const dbOpenMatch = stderrB.match(dbOpenPattern);
 
-    const killMatch = stderrB.match(killEventPattern);
-    const dbOpenMatch = stderrB.match(dbOpenPattern);
+      // Both must be present
+      expect(killMatch).not.toBeNull();
+      expect(dbOpenMatch).not.toBeNull();
 
-    // Both must be present
-    expect(killMatch).not.toBeNull();
-    expect(dbOpenMatch).not.toBeNull();
-
-    // Kill event must appear before DB open
-    const killPos = stderrB.indexOf(killMatch![0]);
-    const dbOpenPos = stderrB.indexOf(dbOpenMatch![0]);
-    expect(killPos).toBeLessThan(dbOpenPos);
+      // Kill event must appear before DB open
+      const killPos = stderrB.indexOf(killMatch![0]);
+      const dbOpenPos = stderrB.indexOf(dbOpenMatch![0]);
+      expect(killPos).toBeLessThan(dbOpenPos);
+    } finally {
+      // Guaranteed cleanup
+      if (processA) {
+        try { processA.kill("SIGKILL"); } catch {}
+      }
+      if (processB) {
+        try { processB.kill("SIGKILL"); } catch {}
+      }
+    }
   }, 15000); // 15s timeout for dual process spawn
 });
