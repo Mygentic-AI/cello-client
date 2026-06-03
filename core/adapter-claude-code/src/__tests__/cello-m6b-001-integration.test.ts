@@ -100,6 +100,7 @@ describe("AC-004: Kill prior process BEFORE opening DB", () => {
         CELLO_KEY_FILE: keyFile,
         CELLO_DB_PATH: dbPath,
         CELLO_ENV: "local",
+        CELLO_LOCK_FILE_PATH: lockFilePath,
       },
     });
 

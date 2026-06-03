@@ -14,6 +14,7 @@
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
  *   CELLO_AGENT_NAME          Named agent identifier (M7+); lock file is per-agent
  *                             (default: null → ~/.cello/cello-mcp.pid; with name → ~/.cello/agents/<name>/cello-mcp.pid)
+ *   CELLO_LOCK_FILE_PATH      Override lock file path (for testing; default: computed from CELLO_AGENT_NAME)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
  *   CELLO_ANNOUNCE_ADDRS      comma-separated libp2p announce multiaddrs (optional)
  *                             Required when the node is behind NAT/EIP and must advertise
@@ -91,9 +92,10 @@ process.stderr.write("cello: starting...\n");
 // one cello-mcp per agent at all times. The cleanup function is registered to
 // release the lock on SIGTERM/SIGINT/normal exit.
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
-const lockFilePath = agentName
-  ? join(homedir(), ".cello", "agents", agentName, "cello-mcp.pid")
-  : join(homedir(), ".cello", "cello-mcp.pid");
+const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ??
+  (agentName
+    ? join(homedir(), ".cello", "agents", agentName, "cello-mcp.pid")
+    : join(homedir(), ".cello", "cello-mcp.pid"));
 
 const releaseLock = await acquireLockFile(lockFilePath, {
   logger: {
@@ -105,7 +107,6 @@ const releaseLock = await acquireLockFile(lockFilePath, {
 });
 
 // Register cleanup on exit signals
-process.on("exit", releaseLock);
 process.on("SIGTERM", () => {
   releaseLock();
   process.exit(0);
