@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/connect",
-  "version": "0.0.23",
+  "version": "0.0.24",
   "private": false,
   "type": "module",
   "engines": {
@@ -30,7 +30,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/client": "workspace:*",
+    "@cello-protocol/client": "0.0.16",
     "@cello-protocol/crypto": "workspace:*",
     "@cello-protocol/interfaces": "0.0.3",
     "@cello-protocol/transport": "workspace:*",

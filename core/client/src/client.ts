@@ -1739,9 +1739,11 @@ class CelloClientImpl implements CelloClient {
     // Status mutation is deferred until after reconnect succeeds to avoid a sealing-stuck
     // crash window (if the process restarts between the persist and the rollback, the session
     // would be permanently unresealable).
-    if (!this.#persistentSignalingStream) {
+    if (!this.#persistentSignalingStream || this.#persistentSignalingStream.status !== "open") {
       const correlationId = Buffer.from(session.session_id).toString("hex");
       this.#logger.info("seal.reconnect.attempted", { sessionId: sessionIdHex, correlationId });
+      this.#persistentSignalingStream = null;
+      this.#persistentSignalingIter = null;
       const opened = await this.#openPersistentSignalingStream();
       if (!opened || !this.#persistentSignalingStream) {
         return { ok: false, reason: "directory_unreachable" };
@@ -1819,7 +1821,9 @@ class CelloClientImpl implements CelloClient {
       return { ok: false, reason: "session_not_active" };
     }
 
-    if (!this.#persistentSignalingStream) {
+    if (!this.#persistentSignalingStream || this.#persistentSignalingStream.status !== "open") {
+      this.#persistentSignalingStream = null;
+      this.#persistentSignalingIter = null;
       const opened = await this.#openPersistentSignalingStream();
       if (!opened || !this.#persistentSignalingStream) {
         return { ok: false, reason: "directory_unreachable" };
