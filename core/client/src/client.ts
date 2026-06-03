@@ -3331,12 +3331,31 @@ class CelloClientImpl implements CelloClient {
           // PERSIST-024 FINDING-2: persist the responder's sealing status so a crash here
           // does not reload the session as "active". Must happen after status mutation.
           void this.#persistence?.persistSession(sessionIdHex, session);
-          void this.#submitSealLeaf(sessionIdHex, session, "responder").then((result) => {
+          void (async () => {
+            // Mirror the initiator path: ensure the signaling stream is alive before
+            // submitting the SEAL leaf. The directory replies (seal_verified) on this
+            // stream. If dead, reconnect first — else seal_verified is never received,
+            // the 15-second FROST timeout fires, and the session ends as seal_deferred.
+            if (!this.#persistentSignalingStream || this.#persistentSignalingStream.status !== "open") {
+              this.#logger.info("seal.reconnect.attempted", { sessionId: sessionIdHex, correlationId: sessionIdHex, role: "responder" });
+              this.#persistentSignalingStream = null;
+              this.#persistentSignalingIter = null;
+              const opened = await this.#openPersistentSignalingStream();
+              if (!opened || !this.#persistentSignalingStream) {
+                const s = this.#sessions.get(sessionIdHex);
+                if (s && s.status === "sealing") {
+                  s.status = "seal_deferred";
+                  void this.#persistence?.persistSession(sessionIdHex, s);
+                }
+                return;
+              }
+            }
+            const result = await this.#submitSealLeaf(sessionIdHex, session, "responder");
             if (!result.ok) {
               const s = this.#sessions.get(sessionIdHex);
               if (s && s.status === "sealing") s.status = "seal_rejected";
             }
-          });
+          })();
         } else {
           // Counterparty message: enqueue for receiveMessage callers.
           // PERSIST-024 FINDING-1: persist sequence counters after last_seen_seq mutation.

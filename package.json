@@ -7,7 +7,7 @@
   },
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build --noEmit",
+    "typecheck": "tsc --build",
     "lint": "eslint core/*/src",
     "test": "vitest run --passWithNoTests --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1"
   },

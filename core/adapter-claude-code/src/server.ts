@@ -362,6 +362,19 @@ export function createMcpServer(
     },
     async ({ session_id }) => {
       if (client == null) return CLIENT_NOT_INITIALIZED;
+
+      // Every completed session must end with a seal — attempt before teardown.
+      // If the session is already sealing/sealed/deferred, skip the attempt.
+      const sessions = client.listSessions();
+      const session = sessions.find((s) => Buffer.from(s.session_id).toString("hex") === session_id);
+      const alreadySealing = session &&
+        (session.status === "sealing" || session.status === "sealed" || session.status === "seal_deferred");
+
+      let sealResult: { ok: boolean; reason?: string } | undefined;
+      if (!alreadySealing && session?.status === "active") {
+        sealResult = await client.initiateSessionSeal(session_id);
+      }
+
       client.closeSession(session_id);
 
       // PERSIST-017: include checkpoint_status if CheckpointStatusProvider is wired in.
@@ -381,6 +394,12 @@ export function createMcpServer(
         }
       }
 
+      if (sealResult && !sealResult.ok) {
+        return jsonText({ closed: true, seal_status: "failed", seal_reason: sealResult.reason });
+      }
+      if (sealResult?.ok) {
+        return jsonText({ closed: true, seal_status: "initiated" });
+      }
       return jsonText({ closed: true });
     }
   );
