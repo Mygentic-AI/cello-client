@@ -298,12 +298,17 @@ describeWithSQLCipher("CELLO-M6B-005 AC-004 — WAL mode enables concurrent read
     // two-store approach:
     //   1. Open storeA and perform an operation (migrations done, WAL mode set).
     //   2. Close storeA (so its connection is freed — WAL journal file now exists).
-    //   3. Open a direct SQLCipher connection as the "stale writer" that begins a transaction.
-    //   4. While the writer holds BEGIN EXCLUSIVE, open storeB and measure the time.
-    //   5. StoreB must open within 5s.
+    //   3. Open a direct SQLCipher connection as the "stale writer" that begins an
+    //      uncommitted write transaction (BEGIN — not BEGIN EXCLUSIVE, which would
+    //      block readers even in WAL mode and would defeat the test).
+    //   4. While the writer holds the open transaction, open storeB and measure the time.
+    //   5. StoreB must open within 5s. In WAL mode, readers see the last committed
+    //      state without waiting for the uncommitted write.
     //   6. Clean up both.
     //
     // This proves WAL mode allows readers to proceed concurrently with a writer.
+    // NOTE: BEGIN EXCLUSIVE is intentionally NOT used here — it blocks readers even
+    // in WAL mode and would make this test measure lock contention, not WAL concurrency.
 
     const dbPath = makeTmpDbPath();
     const logger = makeSpyLogger();
@@ -356,10 +361,13 @@ describeWithSQLCipher("CELLO-M6B-005 AC-004 — WAL mode enables concurrent read
           writerDb.close((err) => (err ? rej(err) : res())),
         );
 
-      // Apply key and begin an exclusive transaction — simulates the stale process
+      // Apply key and begin an uncommitted write transaction — simulates the stale process.
+      // BEGIN (not BEGIN EXCLUSIVE) is correct here: WAL mode allows readers to read
+      // the last committed snapshot while a writer holds an uncommitted transaction.
+      // BEGIN EXCLUSIVE would block readers even in WAL mode and would be wrong.
       await writerRun(`PRAGMA key = "x'${keyHex}'"`);
       await writerGet("SELECT count(*) FROM sqlite_master"); // verify key
-      await writerRun("BEGIN EXCLUSIVE");
+      await writerRun("BEGIN");
 
       // Step 3: Open storeB while the writer holds the transaction
       const storeB = new SQLCipherClientStore(dbKey, {

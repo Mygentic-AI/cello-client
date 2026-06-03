@@ -299,7 +299,7 @@ export class SQLCipherClientStore implements ClientStore {
         }
         const mode = String((row as { journal_mode: string }).journal_mode);
         if (mode !== "wal") {
-          return reject(new Error(`WAL mode failed: expected 'wal', got '${mode}'`));
+          return reject(new Error(`WAL mode failed: expected 'wal', got '${mode}'. This may occur on network filesystems (NFS, SMB). Move your CELLO_DB_PATH to a local filesystem.`));
         }
         resolve(mode);
       });
