@@ -43,9 +43,13 @@ if (process.stdin.isTTY) {
     "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
     "\n" +
     "To install, run:\n" +
-    "  claude mcp add cello npx --yes @cello-protocol/connect\n" +
+    "  npm install -g @cello-protocol/connect\n" +
+    "  claude mcp add cello -- cello-mcp\n" +
     "\n" +
-    "Then restart Claude Code to activate CELLO.\n",
+    "To upgrade to the latest version:\n" +
+    "  npm install -g @cello-protocol/connect@latest\n" +
+    "\n" +
+    "Then restart Claude Code (or run /mcp) to activate CELLO.\n",
   );
   process.exit(0);
 }
@@ -361,11 +365,11 @@ void (async () => {
           } else if (platform === "linux") {
             process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
             process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
-            process.stderr.write(`cello-mcp: Then re-run: npx --yes @cello-protocol/connect\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npm install -g @cello-protocol/connect@latest\n`);
           } else {
             process.stderr.write(`cello-mcp: Xcode Command Line Tools are required on macOS.\n`);
             process.stderr.write(`cello-mcp: Run: xcode-select --install\n`);
-            process.stderr.write(`cello-mcp: Then re-run: npx --yes @cello-protocol/connect\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npm install -g @cello-protocol/connect@latest\n`);
           }
           process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
         }
