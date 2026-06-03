@@ -1,0 +1,152 @@
+/**
+ * CELLO-M6B-001 — Integration tests for cello-mcp PID lock file
+ *
+ * AC-004: Verify that client.startup.prior.process.killed appears in stderr
+ *   BEFORE any DB-open log event. This proves the kill-prior-process step
+ *   executes before opening SQLCipher.
+ *
+ * Test type: integration (spawns real cello-mcp child processes)
+ * MANDATORY: --pool-options.threads.maxThreads=1
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+let testDir: string;
+
+beforeEach(() => {
+  testDir = mkdtempSync(join(tmpdir(), "cello-m6b-001-"));
+});
+
+afterEach(() => {
+  try {
+    rmSync(testDir, { recursive: true, force: true });
+  } catch {
+    // Silent cleanup
+  }
+});
+
+// ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
+
+describe("AC-004: Kill prior process BEFORE opening DB", () => {
+  it("client.startup.prior.process.killed appears before DB-open log in stderr", async () => {
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    const keyFile = join(testDir, "key");
+    const dbPath = join(testDir, "client.db");
+
+    // Generate a throwaway key file
+    const keyGenScript = `
+      const crypto = require("crypto");
+      const fs = require("fs");
+      const KEY_FILE_MAGIC = Buffer.from([0xce, 0x11, 0x0e, 0x01]);
+      const KEY_FILE_VERSION = 0x01;
+      const seed = crypto.randomBytes(32);
+      const buf = Buffer.concat([KEY_FILE_MAGIC, Buffer.from([KEY_FILE_VERSION]), seed]);
+      fs.writeFileSync("${keyFile.replace(/\\/g, "\\\\")}", buf);
+    `;
+    await new Promise<void>((resolve, reject) => {
+      const keygen = spawn(process.execPath, ["-e", keyGenScript], { stdio: "ignore" });
+      keygen.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("keygen failed"))));
+    });
+
+    // Spawn process A — a simple Node.js script that holds the lock and blocks indefinitely
+    // (this is more reliable than spawning the full cello-mcp binary, which might fail
+    // before acquiring the lock due to missing dependencies or config issues)
+    const scriptA = `
+      const fs = require("fs");
+      const path = require("path");
+      const lockPath = "${lockFilePath.replace(/\\/g, "\\\\")}";
+      // Create lock directory if needed
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      // Write PID to lock file
+      fs.writeFileSync(lockPath, String(process.pid), "utf8");
+      // Block indefinitely
+      setInterval(() => {}, 1000);
+    `;
+    const processA = spawn(process.execPath, ["-e", scriptA], {
+      stdio: "ignore",
+      detached: false,
+    });
+
+    // Wait for process A to write the lock file
+    await new Promise<void>((resolve) => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require("fs");
+      const interval = setInterval(() => {
+        try {
+          if (fs.existsSync(lockFilePath)) {
+            clearInterval(interval);
+            resolve();
+          }
+        } catch {
+          // File doesn't exist yet
+        }
+      }, 50);
+    });
+
+    // Spawn process B — the real cello-mcp binary, should kill process A, then open its own DB
+    const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
+    const processB = spawn(process.execPath, [binPath], {
+      stdio: ["ignore", "ignore", "pipe"], // stderr only
+      env: {
+        ...process.env,
+        CELLO_KEY_FILE: keyFile,
+        CELLO_DB_PATH: dbPath,
+        CELLO_ENV: "local",
+      },
+    });
+
+    let stderrB = "";
+    processB.stderr?.on("data", (chunk) => {
+      stderrB += chunk.toString();
+    });
+
+    // Wait for process B to complete startup (or fail)
+    await new Promise<void>((resolve) => {
+      processB.on("exit", () => resolve());
+      // Also resolve if we see "cello: ready" or a DB open line
+      const interval = setInterval(() => {
+        if (stderrB.includes("cello: opening database") || stderrB.includes("cello: ready")) {
+          clearInterval(interval);
+          resolve();
+        }
+      }, 100);
+      // Timeout after 10s
+      setTimeout(() => {
+        clearInterval(interval);
+        resolve();
+      }, 10000);
+    });
+
+    // Kill both processes (cleanup)
+    try {
+      processA.kill("SIGKILL");
+    } catch {}
+    try {
+      processB.kill("SIGKILL");
+    } catch {}
+
+    // ── Assertion: kill event appears BEFORE DB-open event ──
+    const killEventPattern = /client\.startup\.prior\.process\.killed/;
+    const dbOpenPattern = /cello: opening database/;
+
+    const killMatch = stderrB.match(killEventPattern);
+    const dbOpenMatch = stderrB.match(dbOpenPattern);
+
+    // Both must be present
+    expect(killMatch).not.toBeNull();
+    expect(dbOpenMatch).not.toBeNull();
+
+    // Kill event must appear before DB open
+    const killPos = stderrB.indexOf(killMatch![0]);
+    const dbOpenPos = stderrB.indexOf(dbOpenMatch![0]);
+    expect(killPos).toBeLessThan(dbOpenPos);
+  }, 15000); // 15s timeout for dual process spawn
+});
