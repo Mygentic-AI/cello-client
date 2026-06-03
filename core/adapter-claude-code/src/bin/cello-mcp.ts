@@ -106,7 +106,10 @@ const releaseLock = await acquireLockFile(lockFilePath, {
   },
 });
 
-// Register cleanup on exit signals
+// Register cleanup on exit signals and normal exit
+process.on("exit", () => {
+  releaseLock();
+});
 process.on("SIGTERM", () => {
   releaseLock();
   process.exit(0);
