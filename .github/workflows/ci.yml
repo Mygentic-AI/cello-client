@@ -130,18 +130,18 @@ jobs:
           FAILED=0
           for pkg in protocol-types crypto transport client; do
             local_ver=$(node -p "require('./core/$pkg/package.json').version")
-            npm_ver=$(npm view @cello-protocol/$pkg version 2>/dev/null || echo "missing")
+            npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
             if [ "$local_ver" != "$npm_ver" ]; then
-              echo "FAIL: @cello-protocol/$pkg local=$local_ver npm=$npm_ver — bump the version before tagging"
+              echo "FAIL: @cello-protocol/$pkg local=$local_ver beta=$npm_ver — bump the version before tagging"
               FAILED=1
             else
               echo "OK: @cello-protocol/$pkg@$local_ver"
             fi
           done
           local_ver=$(node -p "require('./core/adapter-claude-code/package.json').version")
-          npm_ver=$(npm view @cello-protocol/connect version 2>/dev/null || echo "missing")
+          npm_ver=$(npm view @cello-protocol/connect@beta version 2>/dev/null || echo "missing")
           if [ "$local_ver" != "$npm_ver" ]; then
-            echo "FAIL: @cello-protocol/connect local=$local_ver npm=$npm_ver — bump the version before tagging"
+            echo "FAIL: @cello-protocol/connect local=$local_ver beta=$npm_ver — bump the version before tagging"
             FAILED=1
           else
             echo "OK: @cello-protocol/connect@$local_ver"
