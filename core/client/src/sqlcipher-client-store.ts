@@ -294,9 +294,13 @@ export class SQLCipherClientStore implements ClientStore {
     return new Promise<string>((resolve, reject) => {
       db.get("PRAGMA journal_mode=WAL", [], (err, row) => {
         if (err) return reject(err);
-        const mode = row !== undefined
-          ? String((row as { journal_mode: string }).journal_mode)
-          : "unknown";
+        if (!row) {
+          return reject(new Error("PRAGMA journal_mode=WAL returned no result"));
+        }
+        const mode = String((row as { journal_mode: string }).journal_mode);
+        if (mode !== "wal") {
+          return reject(new Error(`WAL mode failed: expected 'wal', got '${mode}'`));
+        }
         resolve(mode);
       });
     });
