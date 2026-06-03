@@ -5390,6 +5390,9 @@ class CelloClientImpl implements CelloClient {
       if (reason === "relay_unavailable") return { ok: false, reason: "relay_unavailable" };
       if (reason === "frost_signer_not_configured") return { ok: false, reason: "frost_signer_not_configured" };
       if (reason === "directory_below_threshold") return { ok: false, reason: "directory_below_threshold" };
+      // M6B-002: New FROST ceremony failure reasons
+      if (reason === "ceremony_timeout") return { ok: false, reason: "ceremony_timeout" };
+      if (reason === "ceremony_exhausted") return { ok: false, reason: "ceremony_exhausted" };
       if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
       if (reason === "no_connection") return { ok: false, reason: "no_connection" };
       if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };

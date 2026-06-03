@@ -193,10 +193,12 @@ export interface ReceivedEnvelope {
  *   target_busy          — simultaneous initiation: target is already mid-handshake.
  *   timeout              — no directory response within the configured timeout.
  *   directory_unreachable — cannot open or authenticate the signaling stream.
+ *   ceremony_timeout     — M6B-002: FROST ceremony timed out waiting for client response.
+ *   ceremony_exhausted   — M6B-002: FROST ceremony ran but returned null (agent not bootstrapped).
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_conflict" | "no_connection" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 
