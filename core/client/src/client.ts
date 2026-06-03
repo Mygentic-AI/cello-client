@@ -1752,9 +1752,9 @@ class CelloClientImpl implements CelloClient {
       // mutated session status while this call was awaiting the stream open.
       // TypeScript narrows session.status to "active" at this point (line 1732 guard), but
       // async suspension means the actual value may have changed — re-read via a typed cast.
-      // Mirror the guard at #sendMessageLocked: sealing/sealed/seal_deferred → "session_sealed".
+      // Mirror the guard at #sendMessageLocked: sealing/sealed/seal_deferred/seal_rejected → "session_sealed".
       const statusNow = (session as SessionRecord).status;
-      if (statusNow === "sealing" || statusNow === "sealed" || statusNow === "seal_deferred") {
+      if (statusNow === "sealing" || statusNow === "sealed" || statusNow === "seal_deferred" || statusNow === "seal_rejected") {
         return { ok: false, reason: "session_sealed" };
       }
       if (statusNow !== "active") return { ok: false, reason: "session_not_active" };
