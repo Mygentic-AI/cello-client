@@ -42,34 +42,47 @@ describe("AC-002: TTY detection output format", () => {
     // The TTY detection code at the top of cello-mcp.ts writes this message.
     // We verify the expected string exists in the binary source — this acts as
     // a guard test against accidental removal.
-    const expectedCommand = "claude mcp add cello npx @cello-protocol/connect";
+    // M6B-005: global install pattern — binary name, not npx version-pinned form
+    const expectedCommand = "claude mcp add cello -- cello-mcp";
     // Verify the format: what cello-mcp.ts writes to stdout on TTY
     const installMessage =
       "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
       "\n" +
       "To install, run:\n" +
+      "  npm install -g @cello-protocol/connect\n" +
       `  ${expectedCommand}\n` +
       "\n" +
-      "Then restart Claude Code to activate CELLO.\n";
+      "To upgrade to the latest version:\n" +
+      "  npm install -g @cello-protocol/connect@latest\n" +
+      "\n" +
+      "Then restart Claude Code (or run /mcp) to activate CELLO.\n";
 
     expect(installMessage).toContain(expectedCommand);
     expect(installMessage).toContain("claude mcp add");
+    expect(installMessage).toContain("npm install -g");
     // Message goes to stdout (not stderr), process exits 0
   });
 
-  it("install message does not mention any binary names other than 'cello'", () => {
+  it("install message does not mention any binary names other than 'cello' and 'cello-mcp'", () => {
     // Ensure the install message is clean and correct
+    // M6B-005: global install pattern
     const installMessage =
       "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
       "\n" +
       "To install, run:\n" +
-      "  claude mcp add cello npx @cello-protocol/connect\n" +
+      "  npm install -g @cello-protocol/connect\n" +
+      "  claude mcp add cello -- cello-mcp\n" +
       "\n" +
-      "Then restart Claude Code to activate CELLO.\n";
+      "To upgrade to the latest version:\n" +
+      "  npm install -g @cello-protocol/connect@latest\n" +
+      "\n" +
+      "Then restart Claude Code (or run /mcp) to activate CELLO.\n";
 
     // Must NOT say "exit" or "kill" or confuse the user
     expect(installMessage).not.toContain("exit");
     expect(installMessage).toContain("restart Claude Code");
+    // Must NOT contain old npx version-pinned form (AC-006 M6B-005)
+    expect(installMessage).not.toContain("npx");
   });
 
   /**
@@ -95,7 +108,8 @@ describe("AC-002: TTY detection output format", () => {
     expect(iTtyPos).toBeLessThan(serverConnectPos);
 
     // The TTY output must contain the install command (catches accidental removal/truncation)
-    const installCmdPos = source.indexOf("claude mcp add cello npx --yes @cello-protocol/connect");
+    // M6B-005: global install pattern — binary name, not npx version-pinned form
+    const installCmdPos = source.indexOf("claude mcp add cello -- cello-mcp");
     expect(installCmdPos).toBeGreaterThan(-1);
     // The install command must be inside the isTTY block (before server.connect)
     expect(installCmdPos).toBeLessThan(serverConnectPos);

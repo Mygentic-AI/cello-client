@@ -35,11 +35,29 @@
 import { homedir } from "node:os";
 import { createWriteStream, readFileSync } from "node:fs";
 
+// AC-001 (M6B-005): --version flag — exit cleanly with the package version.
+// Must precede TTY detection so `cello-mcp --version` works in any context.
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  // Read version from the package.json that ships with the npm package.
+  // At runtime the compiled JS is in dist/bin/, package.json is at the package root.
+  const { createRequire: cr } = await import("node:module");
+  const req = cr(import.meta.url);
+  const pkg = req("../../package.json") as { version: string };
+  process.stdout.write(`${pkg.version}\n`);
+  process.exit(0);
+}
+
 // AC-002 (DX-001): TTY detection — BEFORE anything else.
 // If stdin is a TTY, the binary was run directly in a terminal, not as an MCP subprocess.
 // Print install instructions to stdout and exit cleanly.
 if (process.stdin.isTTY) {
+  // Read version for the TTY banner (AC-001 M6B-005)
+  const { createRequire: cr } = await import("node:module");
+  const req = cr(import.meta.url);
+  const pkg = req("../../package.json") as { version: string };
   process.stdout.write(
+    `cello-mcp v${pkg.version}\n` +
+    "\n" +
     "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
     "\n" +
     "To install, run:\n" +

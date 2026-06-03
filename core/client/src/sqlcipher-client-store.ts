@@ -148,6 +148,12 @@ export class SQLCipherClientStore implements ClientStore {
       // If the key is wrong or the file is corrupt, this will fail.
       await this.#verifyKey(db);
 
+      // SI-001 (CELLO-M6B-005): WAL mode is set AFTER key verification and BEFORE migrations.
+      // Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL, (4) migrations.
+      // WAL mode is issued on a key-verified database — attackers with filesystem access
+      // see encrypted WAL files, not plaintext.
+      const journalMode = await this.#setWalMode(db);
+
       // Key is verified — safe to make the database accessible to other methods.
       this.#db = db;
 
@@ -158,6 +164,7 @@ export class SQLCipherClientStore implements ClientStore {
         env: this.#env,
         dbPath: this.#dbPath,
         agentId: this.#agentId,
+        journalMode,
       });
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -262,6 +269,30 @@ export class SQLCipherClientStore implements ClientStore {
       db.get(`SELECT count(*) as c FROM sqlite_master`, [], (err, _row) => {
         if (err) reject(err);
         else resolve();
+      });
+    });
+  }
+
+  /**
+   * Enable WAL (Write-Ahead Log) journal mode on the database.
+   *
+   * PRAGMA journal_mode=WAL is issued in a single `db.get()` call, which both
+   * sets the mode and returns the active journal mode as a result row.
+   *
+   * SI-001 (CELLO-M6B-005): Must only be called AFTER #verifyKey() succeeds. WAL mode on
+   * an unverified database would operate on plaintext; by calling this after key
+   * verification, we guarantee WAL files are encrypted at rest.
+   *
+   * Returns the active journal mode string (normally 'wal').
+   */
+  async #setWalMode(db: SqlCipherDatabase): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      db.get("PRAGMA journal_mode=WAL", [], (err, row) => {
+        if (err) return reject(err);
+        const mode = row !== undefined
+          ? String((row as { journal_mode: string }).journal_mode)
+          : "unknown";
+        resolve(mode);
       });
     });
   }
