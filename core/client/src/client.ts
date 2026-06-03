@@ -1393,7 +1393,7 @@ class CelloClientImpl implements CelloClient {
     const session = this.#sessions.get(sessionIdHex);
     if (!session) return { ok: false, reason: "session_not_found" };
     if (session.desynchronized) return { ok: false, reason: "session_desynchronized" };
-    if (session.status === "sealing" || session.status === "sealed" || session.status === "seal_deferred") return { ok: false, reason: "session_sealed" };
+    if (session.status === "sealing" || session.status === "sealed" || session.status === "seal_deferred" || session.status === "seal_rejected") return { ok: false, reason: "session_sealed" };
     // SESSION-006 AC-001/AC-003: transport_lost means relay stream is gone or being reconnected
     if (session.status === "transport_lost") return { ok: false, reason: "transport_unavailable" };
 

@@ -159,9 +159,9 @@ describe("AC-002: cello_close_session closes even when seal fails", () => {
   }, 10_000);
 });
 
-// ─── AC-003: skips seal when already sealed/sealing/deferred ─────────────────
+// ─── AC-003: skips seal when already sealing/sealed/deferred/rejected ────────
 
-describe("AC-003: cello_close_session skips seal when already sealing/sealed/deferred", () => {
+describe("AC-003: cello_close_session skips seal when already sealing/sealed/deferred/seal_rejected", () => {
   for (const status of ["sealing", "sealed", "seal_deferred", "seal_rejected"] as const) {
     it(`does not call initiateSessionSeal when session status is '${status}'`, async () => {
       const kp = generateKeypair();
