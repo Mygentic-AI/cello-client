@@ -13,6 +13,9 @@
  * Environment variables:
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
+ *   CELLO_ANNOUNCE_ADDRS      comma-separated libp2p announce multiaddrs (optional)
+ *                             Required when the node is behind NAT/EIP and must advertise
+ *                             its public address (e.g. /ip4/32.196.100.165/tcp/4001 on EC2)
  *   CELLO_DIRECTORY_URL       Production directory HTTP endpoint (default: http://directory-us1.cello.mygentic.ai)
  *                             Overridable for local/staging deployments. Relay multiaddr is
  *                             dynamically assigned per-session — no relay constant is baked in.
@@ -82,6 +85,9 @@ process.stderr.write("cello: starting...\n");
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");
 const listenAddr = process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0";
+const announceAddrs = process.env["CELLO_ANNOUNCE_ADDRS"]
+  ? process.env["CELLO_ANNOUNCE_ADDRS"].split(",").map((a) => a.trim()).filter(Boolean)
+  : [];
 // AC-003 (REPOSPLIT-002): production directory endpoint baked in as default; overridable by env.
 // Relay multiaddr is dynamically assigned per-session — no relay constant is baked in.
 const directoryUrl = resolveDirectoryUrl(process.env);
@@ -243,7 +249,11 @@ if (identityKeyBytes) {
 // move to a background async task. Tools that need the directory/FROST await readyPromise.
 
 // Create and start single node (fast — just opens a TCP port)
-const node = await createNode({ keyProvider: kp, listenAddresses: [listenAddr] });
+const node = await createNode({
+  keyProvider: kp,
+  listenAddresses: [listenAddr],
+  ...(announceAddrs.length ? { announceAddresses: announceAddrs } : {}),
+});
 await node.start();
 
 // Late-bound server reference — set after createMcpServer returns.

@@ -30,6 +30,14 @@ export interface CreateNodeOptions {
    */
   listenAddresses: string[];
   /**
+   * Optional announce multiaddrs. When set, these are advertised to peers instead
+   * of (or in addition to) the addresses derived from listenAddresses. Required when
+   * the node is behind NAT/EIP and the listen address is a private IP (e.g. EC2
+   * instance with an Elastic IP — the EIP is not on the interface, so libp2p would
+   * announce the private IP without this override).
+   */
+  announceAddresses?: string[];
+  /**
    * Optional pre-generated transport private key (raw Ed25519 seed, 32 bytes).
    * When provided, the node uses this key for its libp2p Peer ID instead of
    * generating a fresh one. Use this for services (directory, relay) that need

@@ -279,6 +279,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     privateKey: transportKey,
     addresses: {
       listen: opts.listenAddresses,
+      ...(opts.announceAddresses?.length ? { announce: opts.announceAddresses } : {}),
     },
     transports: [
       tcp(),
