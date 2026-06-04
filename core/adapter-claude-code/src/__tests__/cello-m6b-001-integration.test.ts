@@ -12,15 +12,37 @@
  *   Run `pnpm run build` before running this test if the binary doesn't exist.
  *   The test will fail with ENOENT if dist/ hasn't been built.
  *
- * LIMITATION: This test spawns a simple Node.js script (processA) that writes
- *   the lock file but does NOT open a SQLCipher database. AC-004 requirement
- *   states processA must have "an open SQLCipher write lock". Current test
- *   verifies stderr event ordering within processB but cannot detect if
- *   cello-mcp.ts code is reordered to open DB before acquiring lock (the 30s
- *   timeout bug would return undetected). Full AC-004 validation requires
- *   spawning a real cello-mcp process for processA that opens SQLCipher and
- *   blocks, which is complex to set up in a test environment. This test provides
- *   partial coverage of AC-004 (ordering within processB is verified).
+ * CRITICAL-3 LIMITATION: AC-004 Coverage Gap
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * This test spawns a simple Node.js script (processA) that writes the lock file
+ * but does NOT open a SQLCipher database. AC-004 requirement states processA
+ * must have "an open SQLCipher write lock". Current test verifies stderr event
+ * ordering within processB but cannot detect if cello-mcp.ts code is reordered
+ * to open DB before acquiring lock (the 30s timeout bug would return undetected).
+ *
+ * Full AC-004 validation requires spawning a real cello-mcp process for processA
+ * that opens SQLCipher and blocks, which is complex to set up in automated tests:
+ * - Requires a valid Ed25519 key file (37 bytes, magic + version + seed)
+ * - Requires SQLCipher native module (may fail to load in CI environments)
+ * - Requires dbKey derivation and SQLCipher PRAGMA key= handshake
+ * - Requires reliable detection of when processA has acquired the DB write lock
+ * - Timeout behavior (30s) makes the test slow and unreliable
+ *
+ * This test provides partial coverage — ordering within processB is verified.
+ *
+ * Manual Verification Procedure for AC-004 (Required Before Production):
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 1. Start processA (cello-mcp) with CELLO_ENV=local and valid key file
+ * 2. Wait for "cello: opening database... ok" in processA stderr (confirms DB lock held)
+ * 3. Start processB (cello-mcp) with same CELLO_LOCK_FILE_PATH and CELLO_DB_PATH
+ * 4. Verify in processB stderr:
+ *    a. "client.startup.prior.process.killed" appears
+ *    b. "cello: opening database..." appears AFTER the kill event
+ *    c. No 30-second timeout or "database is locked" error
+ * 5. Verify processA is terminated (ps aux | grep <processA-PID> returns nothing)
+ *
+ * If step 4c fails (30s timeout observed), the bug has returned — lock acquisition
+ * is happening after DB open. The code ordering in cello-mcp.ts must be fixed.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -48,16 +70,7 @@ afterEach(() => {
 });
 
 // ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
-// CRITICAL-3: This test verifies event ordering within process B's stderr output,
-// but does NOT fully verify AC-004's requirement that the kill happens before SQLCipher
-// lock contention. The test spawns a lightweight Node.js script (process A) that holds
-// the PID lock but does NOT open a SQLCipher database. Therefore, this test cannot
-// detect if the cello-mcp.ts code is reordered to open DB before acquiring lock
-// (which would reintroduce the 30s timeout bug). Full verification would require
-// spawning a real cello-mcp process for process A with SQLCipher open and blocking,
-// which is too complex for automated testing. This provides partial coverage — the
-// kill→DB ordering within process B is verified, but SQLCipher lock contention
-// prevention must be validated via manual testing or production monitoring.
+// See file header for CRITICAL-3 limitation and manual verification procedure.
 
 describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () => {
   it("client.startup.prior.process.killed appears before DB-open log in stderr", async () => {
@@ -68,19 +81,24 @@ describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () =
       return;
     }
 
-    const lockFilePath = join(testDir, "cello-mcp.pid");
-    const keyFile = join(testDir, "key");
-    const dbPath = join(testDir, "client.db");
+    // Create a proper .cello directory structure in the test dir to satisfy path validation
+    const celloDir = join(testDir, ".cello");
+    const lockFilePath = join(celloDir, "cello-mcp.pid");
+    const keyFile = join(celloDir, "key");
+    const dbPath = join(celloDir, "client.db");
 
     // Generate a throwaway key file
     const keyGenScript = `
       const crypto = require("crypto");
       const fs = require("fs");
+      const path = require("path");
       const KEY_FILE_MAGIC = Buffer.from([0xce, 0x11, 0x0e, 0x01]);
       const KEY_FILE_VERSION = 0x01;
       const seed = crypto.randomBytes(32);
       const buf = Buffer.concat([KEY_FILE_MAGIC, Buffer.from([KEY_FILE_VERSION]), seed]);
-      fs.writeFileSync("${keyFile.replace(/\\/g, "\\\\")}", buf);
+      const keyPath = "${keyFile.replace(/\\/g, "\\\\")}";
+      fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+      fs.writeFileSync(keyPath, buf);
     `;
     await new Promise<void>((resolve, reject) => {
       const keygen = spawn(process.execPath, ["-e", keyGenScript], { stdio: "ignore" });
@@ -127,14 +145,16 @@ describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () =
       });
 
       // Spawn process B — the real cello-mcp binary, should kill process A, then open its own DB
+      // Use HOME override to make the binary use testDir as the home directory (avoids path validation rejection)
       processB = spawn(process.execPath, [binPath], {
         stdio: ["ignore", "ignore", "pipe"], // stderr only
         env: {
           ...process.env,
+          HOME: testDir,
           CELLO_KEY_FILE: keyFile,
           CELLO_DB_PATH: dbPath,
           CELLO_ENV: "local",
-          CELLO_LOCK_FILE_PATH: lockFilePath,
+          // Don't set CELLO_LOCK_FILE_PATH — let it compute the default path from HOME
         },
       });
 
@@ -166,6 +186,13 @@ describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () =
 
       const killMatch = stderrB.match(killEventPattern);
       const dbOpenMatch = stderrB.match(dbOpenPattern);
+
+      // Debug: print stderr if test fails
+      if (!killMatch || !dbOpenMatch) {
+        console.error("=== STDERR from processB ===");
+        console.error(stderrB);
+        console.error("=== END STDERR ===");
+      }
 
       // Both must be present
       expect(killMatch).not.toBeNull();

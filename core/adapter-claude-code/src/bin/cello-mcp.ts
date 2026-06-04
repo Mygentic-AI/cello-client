@@ -14,7 +14,7 @@
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
  *   CELLO_AGENT_NAME          Named agent identifier (M7+); lock file is per-agent
  *                             (default: null → ~/.cello/cello-mcp.pid; with name → ~/.cello/agents/<name>/cello-mcp.pid)
- *   CELLO_LOCK_FILE_PATH      Override lock file path (for testing; default: computed from CELLO_AGENT_NAME)
+ *   CELLO_LOCK_FILE_PATH      Override lock file path (test only; default: computed from CELLO_AGENT_NAME)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
  *   CELLO_ANNOUNCE_ADDRS      comma-separated libp2p announce multiaddrs (optional)
  *                             Required when the node is behind NAT/EIP and must advertise
@@ -71,7 +71,7 @@ process.stderr.write = (
   }
   return origWrite(chunk as string);
 };
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
@@ -97,8 +97,8 @@ let lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentN
 // CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/
 if (process.env["CELLO_LOCK_FILE_PATH"]) {
   const userHome = homedir();
-  const celloDir = join(userHome, ".cello");
-  const resolvedLockPath = join(lockFilePath); // Normalize path
+  const celloDir = resolve(join(userHome, ".cello")); // Resolve both paths for comparison
+  const resolvedLockPath = resolve(lockFilePath); // Resolve symlinks and .. components
   if (!resolvedLockPath.startsWith(celloDir)) {
     process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
     process.stderr.write(`cello-mcp: Got: ${lockFilePath}\n`);

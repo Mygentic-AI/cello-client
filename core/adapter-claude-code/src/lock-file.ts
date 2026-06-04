@@ -193,6 +193,7 @@ export async function acquireLockFile(
   try {
     mkdirSync(dirname(lockFilePath), { recursive: true });
     writeFileSync(lockFilePath, String(process.pid), "utf8");
+    logger?.info("client.startup.lock.acquired", { lockFilePath });
   } catch (err: unknown) {
     // Lock file write failure is non-fatal (orphan detection will be broken, but process runs)
     logger?.warn("client.startup.lock.write.failed", {
