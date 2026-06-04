@@ -27,7 +27,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
@@ -403,6 +403,162 @@ describe("AC-004: acquireLockFile completes before caller proceeds to DB open", 
 
     // Should complete in <100ms (no network, no DB)
     expect(duration).toBeLessThan(100);
+
+    cleanup();
+  });
+});
+
+// ─── Observability events: remaining untested paths ──────────────────────────
+
+describe("Observability: client.startup.lock.write.failed (non-fatal)", () => {
+  it("when writeFileSync fails (read-only parent dir), logs warn event and returns no-op cleanup", async () => {
+    // Create a read-only directory so writeFileSync inside it fails with EACCES
+    const roDir = join(testDir, "readonly");
+    mkdirSync(roDir, { recursive: true });
+    chmodSync(roDir, 0o444); // read-only
+
+    const lockFilePath = join(roDir, "cello-mcp.pid");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // acquireLockFile must NOT throw — the write.failed event is non-fatal
+    const cleanup = await acquireLockFile(lockFilePath, { logger });
+
+    // The warn event must be logged
+    const writeFailedEvent = events.find((e) => e.event === "client.startup.lock.write.failed");
+    expect(writeFailedEvent, "client.startup.lock.write.failed event must be logged").toBeDefined();
+    expect(writeFailedEvent?.context.reason).toBeTruthy();
+
+    // No lock.acquired event since write failed
+    const acquiredEvent = events.find((e) => e.event === "client.startup.lock.acquired");
+    expect(acquiredEvent).toBeUndefined();
+
+    // Cleanup must be a no-op (not throw)
+    expect(() => cleanup()).not.toThrow();
+
+    // Restore directory permissions for cleanup
+    chmodSync(roDir, 0o755);
+  });
+});
+
+describe("Observability: client.startup.lock.read.failed (non-ENOENT read error)", () => {
+  it("when readFileSync fails with non-ENOENT error (EISDIR), logs warn event and continues", async () => {
+    // Create a directory at the lock file path — readFileSync will throw EISDIR (not ENOENT)
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    mkdirSync(lockFilePath, { recursive: true });
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // acquireLockFile will also fail to write (lockFilePath is a dir) — non-fatal
+    await acquireLockFile(lockFilePath, { logger });
+
+    const readFailedEvent = events.find((e) => e.event === "client.startup.lock.read.failed");
+    expect(readFailedEvent, "client.startup.lock.read.failed event must be logged").toBeDefined();
+    expect(readFailedEvent?.context.reason).toBeTruthy();
+  });
+});
+
+describe("Observability: client.startup.lock.check.failed (unknown kill error)", () => {
+  it("when kill(pid, 0) throws unknown error code, logs warn event and startup continues", async () => {
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    const unknownPid = 54321;
+    writeFileSync(lockFilePath, String(unknownPid), "utf8");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // Inject a killFn that throws with an unknown error code
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      if (pid === unknownPid && signal === 0) {
+        const err = new Error("Unknown OS error") as NodeJS.ErrnoException;
+        err.code = "EUNKNOWN";
+        throw err;
+      }
+      process.kill(pid, signal);
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn, logger });
+
+    const checkFailedEvent = events.find((e) => e.event === "client.startup.lock.check.failed");
+    expect(checkFailedEvent, "client.startup.lock.check.failed event must be logged").toBeDefined();
+    expect(checkFailedEvent?.context.priorPid).toBe(unknownPid);
+    expect(checkFailedEvent?.context.reason).toBeTruthy();
+
+    // Startup still proceeded — lock file has our PID
+    const content = readFileSync(lockFilePath, "utf8").trim();
+    expect(content).toBe(String(process.pid));
+
+    cleanup();
+  });
+});
+
+describe("Observability: client.startup.prior.kill.failed (kill throws on SIGTERM)", () => {
+  it("when killFn throws on SIGTERM (process exited between check and kill), logs warn and startup continues", async () => {
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    const targetPid = 67890;
+    writeFileSync(lockFilePath, String(targetPid), "utf8");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // Inject killFn: signal 0 first check returns (running), SIGTERM throws ESRCH
+    // (race: process exited between the existence check and the kill call)
+    let checkCount = 0;
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      if (pid === targetPid) {
+        if (signal === 0) {
+          checkCount++;
+          if (checkCount === 1) {
+            return; // first check: appears running
+          }
+          // subsequent checks: gone
+          const err = new Error("No such process") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+        if (signal === "SIGTERM") {
+          // Race: process exited just before we sent SIGTERM
+          const err = new Error("No such process") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+      }
+      process.kill(pid, signal);
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn, logger });
+
+    const killFailedEvent = events.find((e) => e.event === "client.startup.prior.kill.failed");
+    expect(killFailedEvent, "client.startup.prior.kill.failed event must be logged").toBeDefined();
+    expect(killFailedEvent?.context.priorPid).toBe(targetPid);
+    expect(killFailedEvent?.context.signal).toBe("SIGTERM");
+    expect(killFailedEvent?.context.reason).toBeTruthy();
+
+    // Startup still proceeded — lock file has our PID
+    const content = readFileSync(lockFilePath, "utf8").trim();
+    expect(content).toBe(String(process.pid));
 
     cleanup();
   });
