@@ -36,7 +36,7 @@
  */
 
 import { homedir } from "node:os";
-import { createWriteStream, readFileSync } from "node:fs";
+import { createWriteStream, readFileSync, realpathSync } from "node:fs";
 
 // AC-002 (DX-001): TTY detection — BEFORE anything else.
 // If stdin is a TTY, the binary was run directly in a terminal, not as an MCP subprocess.
@@ -71,7 +71,7 @@ process.stderr.write = (
   }
   return origWrite(chunk as string);
 };
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
@@ -94,17 +94,26 @@ process.stderr.write("cello: starting...\n");
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
 let lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
 
-// CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production
-// but allow flexibility in test/local environments for isolated test fixtures
+// CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production.
+// Use realpathSync to follow symlinks and prevent path traversal attacks where an attacker
+// sets CELLO_LOCK_FILE_PATH to a symlink that resolves inside ~/.cello/ but targets an
+// arbitrary location outside it (e.g., /tmp/evil.pid or /var/log/system.log).
+// Test/local environments allow flexibility for isolated test fixtures.
 if (process.env["CELLO_LOCK_FILE_PATH"]) {
   const isTestOrLocal = process.env["NODE_ENV"] === "test" || (process.env["CELLO_ENV"] ?? "local") === "local";
   if (!isTestOrLocal) {
     const userHome = homedir();
-    const celloDir = resolve(join(userHome, ".cello")); // Resolve both paths for comparison
-    const resolvedLockPath = resolve(lockFilePath); // Resolve symlinks and .. components
-    if (!resolvedLockPath.startsWith(celloDir)) {
-      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
-      process.stderr.write(`cello-mcp: Got: ${lockFilePath}\n`);
+    try {
+      const celloDir = realpathSync(join(userHome, ".cello"));
+      const resolvedLockPath = realpathSync(lockFilePath);
+      if (!resolvedLockPath.startsWith(celloDir)) {
+        process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
+        process.stderr.write(`cello-mcp: Got: ${lockFilePath} (resolved to ${resolvedLockPath})\n`);
+        process.exit(1);
+      }
+    } catch (err: unknown) {
+      // realpathSync fails if path doesn't exist or symlink is broken — reject
+      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH validation failed: ${(err as Error).message}\n`);
       process.exit(1);
     }
   }
@@ -120,9 +129,11 @@ const releaseLock = await acquireLockFile(lockFilePath, {
 });
 
 // CRITICAL-1: Register cleanup on exit signals and normal exit.
-// Only the "exit" handler calls releaseLock() — it runs on all exit paths.
+// The "exit" handler calls releaseLock() and runs on normal exit.
 // Signal handlers call process.exit() which triggers the exit handler.
-// Exception handlers re-throw (triggering exit handler) without calling releaseLock() directly.
+// Exception handlers MUST call releaseLock() before re-throwing because
+// Node.js terminates immediately on uncaught exceptions without firing
+// the "exit" event. Without this, every cello-mcp crash leaves a stale lock.
 //
 // NOTE: In-flight backup operations (cello_backup tool) are NOT awaited on SIGTERM/SIGINT.
 // This is acceptable risk for M6B scope because:
@@ -144,9 +155,11 @@ process.on("SIGINT", () => {
   process.exit(0);
 });
 process.on("uncaughtException", (err) => {
+  releaseLock();
   throw err;
 });
 process.on("unhandledRejection", (reason) => {
+  releaseLock();
   throw reason;
 });
 

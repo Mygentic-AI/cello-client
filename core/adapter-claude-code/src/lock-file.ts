@@ -190,18 +190,20 @@ export async function acquireLockFile(
   }
 
   // Step 7-8: Write own PID to lock file
+  // IMPORTANT-1: Lock file write failure MUST be fatal. If orphan detection fails,
+  // multiple cello-mcp processes will accumulate and compete for FROST ceremonies,
+  // causing intermittent failures with no diagnostic signal. The entire point of
+  // CELLO-M6B-001 is to prevent N concurrent processes — allowing startup without
+  // the lock immediately reintroduces the bug.
   try {
     mkdirSync(dirname(lockFilePath), { recursive: true });
     writeFileSync(lockFilePath, String(process.pid), "utf8");
     logger?.info("client.startup.lock.acquired", { pid: process.pid });
   } catch (err: unknown) {
-    // Lock file write failure is non-fatal (orphan detection will be broken, but process runs)
     logger?.warn("client.startup.lock.write.failed", {
       reason: (err as Error).message,
     });
-    // Emit actionable warning to stderr
-    process.stderr.write(`cello-mcp: WARNING — unable to write lock file at ${lockFilePath}\n`);
-    process.stderr.write(`cello-mcp: Orphan process detection is disabled. Check directory permissions.\n`);
+    throw new Error(`Failed to acquire lock file at ${lockFilePath}: ${(err as Error).message}`);
   }
 
   // Step 9: Return cleanup function
