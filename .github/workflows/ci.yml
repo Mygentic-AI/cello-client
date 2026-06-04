@@ -28,11 +28,6 @@ jobs:
           version: 10.33.2
           run_install: false
 
-      - name: Install build tools (required by @journeyapps/sqlcipher on Linux)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential libssl-dev
-
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

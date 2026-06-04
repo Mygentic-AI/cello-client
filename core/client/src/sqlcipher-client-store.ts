@@ -4,6 +4,22 @@
  * PERSIST-009: Implements the ClientStore interface backed by SQLCipher-encrypted SQLite.
  * Used only by the composition root. Never exported from packages/client/src/index.ts.
  *
+ * CELLO-M6B-013: Replaced @journeyapps/sqlcipher (always compiles from source, 20-40s)
+ * with @signalapp/sqlcipher (ships prebuilt binaries for darwin-arm64, darwin-x64,
+ * linux-arm64, linux-x64, win32-arm64, win32-x64). The prebuilt binaries are bundled
+ * inside the npm tarball — no node-gyp invocation occurs on install.
+ *
+ * @signalapp/sqlcipher is a SQLCipher 4 binding with the same AES-256-CBC defaults
+ * as @journeyapps/sqlcipher. Databases created by @journeyapps/sqlcipher are readable
+ * by @signalapp/sqlcipher using the same PRAGMA key = "x'<hexkey>'" format. Verified
+ * by the cross-library compatibility test in m6b-013-sqlcipher-compat.test.ts (AC-002).
+ *
+ * API: @signalapp/sqlcipher uses a synchronous better-sqlite3-style API:
+ *   db.prepare(sql).run([params]) / .get([params]) / .all([params])
+ *   db.exec(sql)
+ *   db.pragma(source, { simple: true })
+ *   db.transaction(fn)
+ *
  * Security invariants (PERSIST-009):
  *   SI-001: db_key is NEVER logged, serialized, or included in any error message.
  *   SI-002: Constructor takes db_key (Uint8Array), NOT identity_key. The caller
@@ -26,34 +42,35 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ClientStore, Logger } from "@cello-protocol/interfaces";
 
-// ─── Type shim for @journeyapps/sqlcipher ───────────────────────────────────
+// ─── Type shim for @signalapp/sqlcipher ─────────────────────────────────────
 
-interface SqlCipherRunResult {
-  lastID: number;
+// @signalapp/sqlcipher ships its own .d.ts in dist/lib/index.d.ts.
+// We use a local type alias to keep this file self-contained and avoid
+// importing the full type at module level (the module may not load in local env).
+
+interface SignalRunResult {
   changes: number;
+  lastInsertRowid: number;
 }
 
-interface SqlCipherRow {
-  [key: string]: unknown;
+interface SignalStatement {
+  run(params?: unknown[] | Record<string, unknown>): SignalRunResult;
+  get<T = Record<string, unknown>>(params?: unknown[] | Record<string, unknown>): T | undefined;
+  all<T = Record<string, unknown>>(params?: unknown[] | Record<string, unknown>): T[];
+  close(): void;
 }
 
-interface SqlCipherDatabase {
-  serialize(callback: () => void): void;
-  run(sql: string, params?: unknown[], callback?: (this: SqlCipherRunResult, err: Error | null) => void): SqlCipherDatabase;
-  get(sql: string, params?: unknown[], callback?: (err: Error | null, row?: SqlCipherRow) => void): SqlCipherDatabase;
-  all(sql: string, params?: unknown[], callback?: (err: Error | null, rows?: SqlCipherRow[]) => void): SqlCipherDatabase;
-  exec(sql: string, callback?: (err: Error | null) => void): SqlCipherDatabase;
-  close(callback?: (err: Error | null) => void): void;
+interface SignalDatabase {
+  exec(sql: string): void;
+  prepare(sql: string): SignalStatement;
+  pragma(source: string, options?: { simple?: boolean }): unknown;
+  transaction<T>(fn: () => T): () => T;
+  close(): void;
 }
 
-interface SqlCipherModule {
-  Database: new (
-    filename: string,
-    mode: number,
-    callback: (err: Error | null) => void,
-  ) => SqlCipherDatabase;
-  OPEN_READWRITE: number;
-  OPEN_CREATE: number;
+interface SignalModule {
+  default: new (path: string) => SignalDatabase;
+  Database: new (path: string) => SignalDatabase;
 }
 
 // ─── Constructor options ──────────────────────────────────────────────────────
@@ -92,7 +109,7 @@ export class SQLCipherClientStore implements ClientStore {
   readonly #logger: Logger;
 
   // Mutable state set during open()
-  #db: SqlCipherDatabase | null = null;
+  #db: SignalDatabase | null = null;
 
   /**
    * @param dbKey   - 32-byte database encryption key derived from identity_key via HKDF.
@@ -130,40 +147,50 @@ export class SQLCipherClientStore implements ClientStore {
    * database over the corrupt file (DB-001).
    */
   async open(): Promise<void> {
-    // Load the native module. Using createRequire because @journeyapps/sqlcipher
+    // Load the native module. Using createRequire because @signalapp/sqlcipher
     // is a CJS module and this file is ESM.
     const require = createRequire(import.meta.url);
-    let sqlite3Module: SqlCipherModule;
+    let signalModule: SignalModule;
     try {
-      sqlite3Module = require("@journeyapps/sqlcipher") as SqlCipherModule;
+      signalModule = require("@signalapp/sqlcipher") as SignalModule;
     } catch (loadErr: unknown) {
       const reason = loadErr instanceof Error ? loadErr.message : String(loadErr);
       this.#logger.error("client.store.open.failed", { reason: `SQLCipher native module unavailable: ${reason}`, agentId: this.#agentId });
       throw new Error(`SQLCipher native module unavailable: ${reason}`);
     }
 
-    const db = await this.#openDatabase(sqlite3Module);
-    // NOTE: do not assign this.#db yet — #applyKey and #verifyKey must succeed first.
+    // @signalapp/sqlcipher exports { default: Database, Database, setLogger }
+    // The Database constructor takes a file path.
+    const DatabaseCtor = signalModule.Database ?? signalModule.default;
+    let db: SignalDatabase;
+    try {
+      db = new DatabaseCtor(this.#dbPath);
+    } catch (openErr: unknown) {
+      const reason = openErr instanceof Error ? openErr.message : String(openErr);
+      this.#logger.error("client.store.open.failed", { reason, agentId: this.#agentId });
+      throw openErr;
+    }
 
+    // NOTE: do not assign this.#db yet — #applyKey and #verifyKey must succeed first.
     try {
       // Apply PRAGMA key (SI-003: only the key PRAGMA — no weakening cipher settings)
-      await this.#applyKey(db);
+      this.#applyKey(db);
 
       // Verify the key is correct by reading the sqlite_master table.
-      // If the key is wrong or the file is corrupt, this will fail.
-      await this.#verifyKey(db);
+      // If the key is wrong or the file is corrupt, this will throw.
+      this.#verifyKey(db);
 
       // SI-001 (M6B-005): WAL mode is set AFTER key verification and BEFORE migrations.
       // Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL, (4) migrations.
       // WAL mode is issued on a key-verified database — attackers with filesystem access
       // see encrypted WAL files, not plaintext.
-      const journalMode = await this.#setWalMode(db);
+      const journalMode = this.#setWalMode(db);
 
       // Key is verified — safe to make the database accessible to other methods.
       this.#db = db;
 
       // Run migration runner — applies pending V{n}__*.sql files
-      await this.#runMigrations(db);
+      this.#runMigrations(db);
 
       this.#logger.info("client.store.opened", {
         env: this.#env,
@@ -179,9 +206,7 @@ export class SQLCipherClientStore implements ClientStore {
         agentId: this.#agentId,
       });
       // Close the DB to release the file handle
-      await new Promise<void>((resolve) => {
-        db.close(() => resolve());
-      });
+      try { db.close(); } catch { /* ignore close error */ }
       this.#db = null;
       throw err;
     }
@@ -192,12 +217,7 @@ export class SQLCipherClientStore implements ClientStore {
     if (this.#db === null) return;
     const db = this.#db;
     this.#db = null;
-    await new Promise<void>((resolve, reject) => {
-      db.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    db.close();
   }
 
   // ─── ClientStore interface ─────────────────────────────────────────────────
@@ -226,39 +246,20 @@ export class SQLCipherClientStore implements ClientStore {
     }
   }
 
-  /** Open the SQLite database file. Returns the Database instance on success. */
-  async #openDatabase(sqlite3Module: SqlCipherModule): Promise<SqlCipherDatabase> {
-    return new Promise<SqlCipherDatabase>((resolve, reject) => {
-      // OPEN_CREATE creates the file if absent (first run). On an existing corrupt file,
-      // SQLite opens it without error at the OS level; #verifyKey detects the corruption
-      // and throws without writing to the file — satisfying DB-001 (never overwrite a
-      // corrupt database).
-      const mode = sqlite3Module.OPEN_READWRITE | sqlite3Module.OPEN_CREATE;
-      const db = new sqlite3Module.Database(this.#dbPath, mode, (err) => {
-        if (err) reject(err);
-        else resolve(db);
-      });
-    });
-  }
-
   /**
    * Apply the SQLCipher PRAGMA key using the raw hex format.
    * The key is passed as x'<hex>' which is the SQLCipher raw key format.
    * SI-001: The key hex is used only in the PRAGMA string and never logged.
    * SI-003: Only the `key` PRAGMA is set — no cipher_* weakening PRAGMAs.
+   *
+   * @signalapp/sqlcipher's synchronous pragma() throws on error — no callback needed.
    */
-  async #applyKey(db: SqlCipherDatabase): Promise<void> {
+  #applyKey(db: SignalDatabase): void {
     const keyHex = Buffer.from(this.#dbKey).toString("hex");
-    const pragmaSql = `PRAGMA key = "x'${keyHex}'"`;
+    const pragmaSource = `key = "x'${keyHex}'"`;
     // SI-001: keyHex is used only in the PRAGMA string and is never logged.
     // SI-003: only the `key` PRAGMA is issued — no cipher_* weakening PRAGMAs.
-
-    return new Promise<void>((resolve, reject) => {
-      db.run(pragmaSql, [], function (err) {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    db.pragma(pragmaSource);
   }
 
   /**
@@ -269,20 +270,15 @@ export class SQLCipherClientStore implements ClientStore {
    * DB-001: We do NOT catch and recover here — the error propagates to open()
    * which logs client.store.open.failed and throws, halting the client.
    */
-  async #verifyKey(db: SqlCipherDatabase): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      db.get(`SELECT count(*) as c FROM sqlite_master`, [], (err, _row) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+  #verifyKey(db: SignalDatabase): void {
+    db.prepare(`SELECT count(*) as c FROM sqlite_master`).get([]);
   }
 
   /**
    * Enable WAL (Write-Ahead Log) journal mode on the database.
    *
-   * PRAGMA journal_mode=WAL is issued in a single `db.get()` call, which both
-   * sets the mode and returns the active journal mode as a result row.
+   * @signalapp/sqlcipher's synchronous pragma() with { simple: true } returns
+   * the first column of the first result row directly.
    *
    * Implements SI-001 (M6B-005): Must only be called AFTER #verifyKey() succeeds.
    * WAL mode on an unverified database would operate on plaintext; by calling this after
@@ -290,20 +286,12 @@ export class SQLCipherClientStore implements ClientStore {
    *
    * Returns the active journal mode string (normally 'wal').
    */
-  async #setWalMode(db: SqlCipherDatabase): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      db.get("PRAGMA journal_mode=WAL", [], (err, row) => {
-        if (err) return reject(err);
-        if (!row) {
-          return reject(new Error("PRAGMA journal_mode=WAL returned no result"));
-        }
-        const mode = String((row as { journal_mode: string }).journal_mode);
-        if (mode !== "wal") {
-          return reject(new Error(`WAL mode failed: expected 'wal', got '${mode}'. This may occur on network filesystems (NFS, SMB). Move your CELLO_DB_PATH to a local filesystem.`));
-        }
-        resolve(mode);
-      });
-    });
+  #setWalMode(db: SignalDatabase): string {
+    const mode = db.pragma("journal_mode=WAL", { simple: true }) as string;
+    if (mode !== "wal") {
+      throw new Error(`WAL mode failed: expected 'wal', got '${mode}'. This may occur on network filesystems (NFS, SMB). Move your CELLO_DB_PATH to a local filesystem.`);
+    }
+    return mode;
   }
 
   /**
@@ -317,11 +305,11 @@ export class SQLCipherClientStore implements ClientStore {
    *   5. Record the version in schema_migrations.
    *   6. Log client.store.migration.applied for each applied migration.
    */
-  async #runMigrations(db: SqlCipherDatabase): Promise<void> {
+  #runMigrations(db: SignalDatabase): void {
     // Bootstrap the migrations table before any migration runs — this is not a migration
     // itself and must not be inside a migration transaction.
     // Step 1: bootstrap the schema_migrations table itself
-    await this.#execSql(db,
+    db.exec(
       `CREATE TABLE IF NOT EXISTS schema_migrations (
          version    TEXT PRIMARY KEY,
          applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -332,7 +320,7 @@ export class SQLCipherClientStore implements ClientStore {
     const migrationFiles = this.#readMigrationFiles();
 
     // Step 3: find already-applied migrations
-    const appliedVersions = await this.#queryAppliedVersions(db);
+    const appliedVersions = this.#queryAppliedVersions(db);
 
     // Step 4-6: apply pending migrations in order
     let v2Applied = false;
@@ -344,7 +332,7 @@ export class SQLCipherClientStore implements ClientStore {
       const startTime = Date.now();
 
       try {
-        await this.#applyMigration(db, sql, version);
+        this.#applyMigration(db, sql, version);
         const executionTime = Date.now() - startTime;
         this.#logger.info("client.store.migration.applied", {
           version,
@@ -412,63 +400,25 @@ export class SQLCipherClientStore implements ClientStore {
   }
 
   /** Query the schema_migrations table and return the set of applied version strings. */
-  async #queryAppliedVersions(db: SqlCipherDatabase): Promise<Set<string>> {
-    return new Promise<Set<string>>((resolve, reject) => {
-      db.all(`SELECT version FROM schema_migrations`, [], (err, rows) => {
-        if (err) return reject(err);
-        const versions = new Set<string>((rows ?? []).map((r) => String((r as { version: string }).version)));
-        resolve(versions);
-      });
-    });
+  #queryAppliedVersions(db: SignalDatabase): Set<string> {
+    const rows = db.prepare(`SELECT version FROM schema_migrations`).all<{ version: string }>([]);
+    return new Set(rows.map((r) => r.version));
   }
 
   /**
    * Apply a single migration SQL within a transaction and record it in schema_migrations.
    *
-   * Implementation note: db.serialize() enqueues all db.run/db.exec calls synchronously
-   * before any callbacks fire, so error recovery inside serialize() is broken — the INSERT
-   * and COMMIT are already queued when a ROLLBACK fires. This method uses a linear await
-   * chain instead, which gives correct sequencing with real error propagation.
+   * @signalapp/sqlcipher's synchronous db.transaction(fn) wraps fn in a BEGIN/COMMIT pair.
+   * If fn throws, the transaction is automatically rolled back.
    */
-  async #applyMigration(db: SqlCipherDatabase, sql: string, version: string): Promise<void> {
-    const run = (stmt: string, params: unknown[] = []): Promise<void> =>
-      new Promise<void>((res, rej) =>
-        db.run(stmt, params, function (err) {
-          if (err) rej(err);
-          else res();
-        }),
-      );
-    const exec = (stmt: string): Promise<void> =>
-      new Promise<void>((res, rej) =>
-        db.exec(stmt, (err) => {
-          if (err) rej(err);
-          else res();
-        }),
-      );
-
-    await run("BEGIN");
-    try {
-      await exec(sql);
-      await run(
+  #applyMigration(db: SignalDatabase, sql: string, version: string): void {
+    const applyFn = db.transaction(() => {
+      db.exec(sql);
+      db.prepare(
         `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))`,
-        [version],
-      );
-      await run("COMMIT");
-    } catch (err) {
-      // Best-effort rollback — if ROLLBACK itself fails we still re-throw the original error.
-      await run("ROLLBACK").catch(() => {});
-      throw err;
-    }
-  }
-
-  /** Execute a SQL statement with no parameters. */
-  async #execSql(db: SqlCipherDatabase, sql: string): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      db.exec(sql, (err) => {
-        if (err) reject(err);
-        else resolve();
-      });
+      ).run([version]);
     });
+    (applyFn as () => void)();
   }
 
   // ─── Structured DB access (PERSIST-024) ───────────────────────────────────────
@@ -479,13 +429,8 @@ export class SQLCipherClientStore implements ClientStore {
    */
   async run(sql: string, params: unknown[] = []): Promise<{ lastID: number; changes: number }> {
     this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<{ lastID: number; changes: number }>((resolve, reject) => {
-      db.run(sql, params, function (err) {
-        if (err) reject(err);
-        else resolve({ lastID: this.lastID, changes: this.changes });
-      });
-    });
+    const result = this.#db!.prepare(sql).run(params);
+    return { lastID: result.lastInsertRowid, changes: result.changes };
   }
 
   /**
@@ -493,13 +438,7 @@ export class SQLCipherClientStore implements ClientStore {
    */
   async getRow<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | undefined> {
     this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<T | undefined>((resolve, reject) => {
-      db.get(sql, params, (err, row) => {
-        if (err) return reject(err);
-        resolve(row as T | undefined);
-      });
-    });
+    return this.#db!.prepare(sql).get<T>(params);
   }
 
   /**
@@ -507,13 +446,7 @@ export class SQLCipherClientStore implements ClientStore {
    */
   async allRows<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
     this.#assertOpen();
-    const db = this.#db!;
-    return new Promise<T[]>((resolve, reject) => {
-      db.all(sql, params, (err, rows) => {
-        if (err) return reject(err);
-        resolve((rows ?? []) as T[]);
-      });
-    });
+    return this.#db!.prepare(sql).all<T>(params);
   }
 
   /**
@@ -521,7 +454,7 @@ export class SQLCipherClientStore implements ClientStore {
    */
   async exec(sql: string): Promise<void> {
     this.#assertOpen();
-    return this.#execSql(this.#db!, sql);
+    this.#db!.exec(sql);
   }
 
   /**
