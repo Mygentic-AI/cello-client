@@ -31,7 +31,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { acquireLockFile, getLockFilePath } from "../lock-file.js";
+import { acquireLockFile, getLockFilePath, releaseLockFile } from "../lock-file.js";
 
 let testDir: string;
 
@@ -53,8 +53,12 @@ afterEach(() => {
 
 describe("AC-002: Stale lock file handling", () => {
   it("when lock file contains a non-running PID, startup proceeds without error", async () => {
+    // Use a mock killFn that throws ESRCH for the existence check (signal 0) —
+    // this deterministically simulates a stale PID without relying on the system
+    // not having a process at a specific PID number (which is non-deterministic
+    // on Linux systems with elevated max PID values).
     const lockFilePath = join(testDir, "cello-mcp.pid");
-    const stalePid = 999999; // Extremely unlikely to be a real running process
+    const stalePid = 54321; // Arbitrary — killFn mock makes it stale regardless
     writeFileSync(lockFilePath, String(stalePid), "utf8");
 
     const events: Array<{ event: string; context: Record<string, unknown> }> = [];
@@ -65,7 +69,17 @@ describe("AC-002: Stale lock file handling", () => {
         events.push({ event, context }),
     };
 
-    const cleanup = await acquireLockFile(lockFilePath, { logger });
+    // Inject killFn: throws ESRCH for any signal to stalePid (simulates stale/dead process)
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      if (pid === stalePid) {
+        const err = new Error("No such process") as NodeJS.ErrnoException;
+        err.code = "ESRCH";
+        throw err;
+      }
+      process.kill(pid, signal);
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn, logger });
 
     // Lock file now contains our PID
     const content = readFileSync(lockFilePath, "utf8").trim();
@@ -688,5 +702,128 @@ describe("Observability: client.startup.prior.kill.failed (kill throws on SIGTER
     expect(content).toBe(String(process.pid));
 
     cleanup();
+  });
+});
+
+// ─── Observability: client.startup.prior.process.killed NOT emitted on SIGTERM race ─
+
+describe("Observability: prior.process.killed not emitted when SIGTERM threw (I-1 regression)", () => {
+  it("when SIGTERM throws (race: process already dead), prior.process.killed is NOT emitted", async () => {
+    // Regression test for the double-event scenario:
+    // If SIGTERM throws (process exited between existence check and kill),
+    // the implementation must NOT emit prior.process.killed, because the
+    // taxonomy says this event fires "after successfully killing a prior process."
+    // Emitting it when the kill failed contradicts the "successfully" qualifier.
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    const targetPid = 88888;
+    writeFileSync(lockFilePath, String(targetPid), "utf8");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // killFn: signal 0 succeeds (process appears running), SIGTERM throws ESRCH
+    // This simulates the race where the process dies between the check and the kill.
+    let checkCount = 0;
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      if (pid === targetPid) {
+        if (signal === 0) {
+          checkCount++;
+          if (checkCount === 1) {
+            return; // first check: appears running
+          }
+          // subsequent checks: gone (after SIGTERM race-throw, polling sees ESRCH)
+          const err = new Error("No such process") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+        if (signal === "SIGTERM") {
+          // Race: process already dead when we try to send SIGTERM
+          const err = new Error("No such process") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+      }
+      process.kill(pid, signal);
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn, logger });
+
+    // prior.kill.failed was logged (correct — kill attempt failed)
+    const killFailedEvent = events.find((e) => e.event === "client.startup.prior.kill.failed");
+    expect(killFailedEvent, "prior.kill.failed must be logged when SIGTERM throws").toBeDefined();
+
+    // prior.process.killed must NOT be logged — we didn't successfully kill the process
+    const killedEvent = events.find((e) => e.event === "client.startup.prior.process.killed");
+    expect(killedEvent, "prior.process.killed must NOT be emitted when SIGTERM threw").toBeUndefined();
+
+    cleanup();
+  });
+});
+
+// ─── Observability: client.startup.lock.release.failed (non-ENOENT unlink failure) ─
+
+describe("Observability: client.startup.lock.release.failed (non-ENOENT unlink failure)", () => {
+  it("when unlinkSync fails with EACCES, logs warn event and does not throw", () => {
+    // Uses dependency injection for unlinkFn — tests the non-ENOENT error path in
+    // releaseLockFile without needing to manipulate real filesystem permissions.
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    // Inject unlinkFn that throws EACCES (read-only filesystem, permission denied)
+    const unlinkFn = (_path: string): void => {
+      const err = new Error("Permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    };
+
+    // releaseLockFile must NOT throw — the process is already exiting
+    expect(() => releaseLockFile(lockFilePath, logger, unlinkFn)).not.toThrow();
+
+    // lock.release.failed must be logged at warn level
+    const releaseFailedEvent = events.find((e) => e.event === "client.startup.lock.release.failed");
+    expect(releaseFailedEvent, "client.startup.lock.release.failed must be logged").toBeDefined();
+    expect(releaseFailedEvent?.context.reason).toBeTruthy();
+    expect(releaseFailedEvent?.context.pid).toBe(process.pid);
+  });
+
+  it("when unlinkSync throws ENOENT (already deleted), no event is logged and no throw", () => {
+    // ENOENT is the idempotent case — lock file already removed by a prior cleanup call.
+    // Verify it is silently ignored (no event, no throw).
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    const unlinkFn = (_path: string): void => {
+      const err = new Error("No such file or directory") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      throw err;
+    };
+
+    expect(() => releaseLockFile(lockFilePath, logger, unlinkFn)).not.toThrow();
+
+    // No event logged for ENOENT — it is the expected idempotent case
+    const releaseFailedEvent = events.find((e) => e.event === "client.startup.lock.release.failed");
+    expect(releaseFailedEvent).toBeUndefined();
+    // And no released event either — unlock didn't succeed
+    const releasedEvent = events.find((e) => e.event === "client.startup.lock.released");
+    expect(releasedEvent).toBeUndefined();
   });
 });

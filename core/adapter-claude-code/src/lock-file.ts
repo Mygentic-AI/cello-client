@@ -130,10 +130,17 @@ export async function acquireLockFile(
 
     if (isRunning) {
       // Step 4: Send SIGTERM
+      // Track whether SIGTERM was successfully delivered. If the kill call throws
+      // (race: process exited between the existence check and the kill call), we
+      // know the process is already gone — we must NOT emit prior.process.killed,
+      // because the taxonomy entry says "after successfully killing a prior process."
+      let sigTermDelivered = false;
       try {
         killFn(priorPid, "SIGTERM");
+        sigTermDelivered = true;
       } catch (err: unknown) {
-        // Kill failed (race: process exited between check and kill) — non-fatal
+        // Kill failed (race: process exited between check and kill) — non-fatal.
+        // The process is already gone; skip the polling phase and proceed to write.
         logger?.warn("client.startup.prior.kill.failed", {
           priorPid,
           signal: "SIGTERM",
@@ -141,29 +148,33 @@ export async function acquireLockFile(
         });
       }
 
-      // Step 5: Poll for up to 5 seconds
-      const startTime = Date.now();
-      const timeout = 5000;
-      let stillRunning = true;
+      // Only poll if SIGTERM was actually delivered
+      let stillRunning = sigTermDelivered;
 
-      // Check immediately after SIGTERM (most processes exit quickly)
-      try {
-        killFn(priorPid, 0);
-        stillRunning = true;
-      } catch {
-        stillRunning = false;
-      }
+      if (sigTermDelivered) {
+        // Step 5: Poll for up to 5 seconds
+        const startTime = Date.now();
+        const timeout = 5000;
 
-      // Only poll if still running after immediate check
-      while (stillRunning && Date.now() - startTime < timeout) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        // Check immediately after SIGTERM (most processes exit quickly)
         try {
           killFn(priorPid, 0);
           stillRunning = true;
         } catch {
-          // Process exited
           stillRunning = false;
-          break;
+        }
+
+        // Only poll if still running after immediate check
+        while (stillRunning && Date.now() - startTime < timeout) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          try {
+            killFn(priorPid, 0);
+            stillRunning = true;
+          } catch {
+            // Process exited
+            stillRunning = false;
+            break;
+          }
         }
       }
 
@@ -203,8 +214,11 @@ export async function acquireLockFile(
             reason: (err as Error).message,
           });
         }
-      } else {
-        // Graceful exit (SIGTERM succeeded)
+      } else if (sigTermDelivered) {
+        // Graceful exit — SIGTERM was delivered and the process exited on its own.
+        // Only emit this event when we successfully sent the signal (sigTermDelivered=true)
+        // and the process is confirmed gone (stillRunning=false). Do NOT emit when
+        // SIGTERM threw (the process was already dead before we could send the signal).
         logger?.info("client.startup.prior.process.killed", {
           priorPid,
           signal: "SIGTERM",
@@ -246,6 +260,10 @@ export async function acquireLockFile(
 /**
  * Release the lock file. Called on SIGTERM/SIGINT/normal exit.
  * AC-003
+ *
+ * @param lockFilePath - Path to the lock file to remove
+ * @param logger - Optional logger for observability events
+ * @param unlinkFn - Injected unlink function for testing (defaults to fs.unlinkSync)
  */
 export function releaseLockFile(
   lockFilePath: string,
@@ -253,9 +271,10 @@ export function releaseLockFile(
     info: (event: string, context: Record<string, unknown>) => void;
     warn: (event: string, context: Record<string, unknown>) => void;
   },
+  unlinkFn: (path: string) => void = unlinkSync,
 ): void {
   try {
-    unlinkSync(lockFilePath);
+    unlinkFn(lockFilePath);
     logger?.info("client.startup.lock.released", { pid: process.pid });
   } catch (err: unknown) {
     // ENOENT is expected if cleanup ran twice — silent
