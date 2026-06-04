@@ -199,6 +199,30 @@ describe("AC-003: Lock file cleanup on exit", () => {
   });
 });
 
+// ─── Observability: client.startup.lock.acquired (positive path) ───────────────
+
+describe("Observability: client.startup.lock.acquired on successful write", () => {
+  it("emits client.startup.lock.acquired with pid on a successful acquireLockFile call", async () => {
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const logger = {
+      info: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+      warn: (event: string, context: Record<string, unknown>) =>
+        events.push({ event, context }),
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { logger });
+
+    const acquiredEvent = events.find((e) => e.event === "client.startup.lock.acquired");
+    expect(acquiredEvent, "client.startup.lock.acquired must be emitted on success").toBeDefined();
+    expect(acquiredEvent?.context.pid).toBe(process.pid);
+
+    cleanup();
+  });
+});
+
 // ─── AC-005: M7 multi-agent lock file paths ────────────────────────────────────
 
 describe("AC-005: M7 multi-agent lock file paths", () => {
@@ -385,16 +409,17 @@ describe("AC-001: Kill prior running process (integration)", () => {
   }, 10000); // 10s timeout (5s wait + spawn overhead)
 });
 
-// ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
+// ─── acquireLockFile contract: no external I/O inside the call ─────────────────
 
 /**
- * AC-004: The kill-prior-process step must happen BEFORE opening SQLCipher.
- * This is verified in the cello-mcp.ts integration test by checking stderr output.
- * Here we verify the lock-file module's contract: acquireLockFile completes
- * synchronously (no async DB operations inside it).
+ * Verifies the lock-file module's internal contract: acquireLockFile completes
+ * without blocking on external I/O (network, DB). This is a precondition for the
+ * AC-004 ordering invariant that is tested at integration level in
+ * cello-m6b-001-integration.test.ts (where the real binary is spawned and the
+ * kill event is verified to precede the DB-open event in stderr).
  */
-describe("AC-004: acquireLockFile completes before caller proceeds to DB open", () => {
-  it("acquireLockFile returns immediately (does not block on external I/O)", async () => {
+describe("acquireLockFile: no external I/O blocking", () => {
+  it("acquireLockFile returns immediately when no prior process is present", async () => {
     const lockFilePath = join(testDir, "cello-mcp.pid");
 
     const t0 = Date.now();

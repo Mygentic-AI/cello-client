@@ -1,6 +1,12 @@
 /**
  * CELLO-M6B-001 — Integration tests for cello-mcp PID lock file
  *
+ * AC-003: When cello-mcp receives SIGTERM, the lock file is removed.
+ *   Spawns the real cello-mcp binary, sends SIGTERM, waits for process exit,
+ *   then asserts the lock file is absent. This tests the signal handler wiring
+ *   in cello-mcp.ts (process.on("SIGTERM", () => process.exit(0))) which triggers
+ *   the "exit" event handler that calls releaseLock().
+ *
  * AC-004: Verify that client.startup.prior.process.killed appears in stderr
  *   BEFORE any DB-open log event. This proves the kill-prior-process step
  *   executes before opening SQLCipher.
@@ -210,4 +216,84 @@ describe("AC-004: Kill prior process BEFORE opening DB", () => {
       }
     }
   }, 15000);
+});
+
+// ─── AC-003: Lock file cleanup on SIGTERM (integration) ────────────────────────
+
+describe("AC-003: Lock file removed when cello-mcp receives SIGTERM (integration)", () => {
+  it("lock file does not exist after cello-mcp is sent SIGTERM and exits", async () => {
+    const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
+    if (!existsSync(binPath)) {
+      console.warn(`Skipping AC-003 integration test: binary not built at ${binPath}. Run 'pnpm run build' first.`);
+      return;
+    }
+
+    // Set up HOME override so getLockFilePath() writes to our test dir.
+    // CELLO_LOCK_FILE_PATH is set explicitly so we know exactly where the lock file is.
+    const celloDir = join(testDir, ".cello");
+    const lockFilePath = join(celloDir, "cello-mcp.pid");
+    const keyFile = join(celloDir, "key");
+    const dbPath = join(celloDir, "client.db");
+
+    buildKeyFile(keyFile);
+
+    const celloMcp = spawn(process.execPath, [binPath], {
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        HOME: testDir,
+        CELLO_KEY_FILE: keyFile,
+        CELLO_DB_PATH: dbPath,
+        CELLO_ENV: "local",
+        CELLO_LOCK_FILE_PATH: lockFilePath,
+      },
+    });
+
+    let stderr = "";
+    celloMcp.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    // Wait until cello-mcp has written the lock file (poll every 50ms, up to 10s).
+    // We look for either the lock file appearing OR "cello: opening database" in stderr,
+    // which is emitted just before the DB is opened (after the lock is already acquired).
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 10000;
+      const interval = setInterval(() => {
+        if (existsSync(lockFilePath)) {
+          clearInterval(interval);
+          resolve();
+        } else if (Date.now() > deadline) {
+          clearInterval(interval);
+          reject(new Error(`lock file was not created within 10s. stderr so far:\n${stderr}`));
+        }
+      }, 50);
+      celloMcp.on("exit", (code) => {
+        clearInterval(interval);
+        // If process exited before creating the lock file, it may have crashed.
+        reject(new Error(`cello-mcp exited (code ${code}) before creating lock file. stderr:\n${stderr}`));
+      });
+    });
+
+    // Lock file now exists — the process is running and holds it.
+    expect(existsSync(lockFilePath), "lock file must exist while cello-mcp is running").toBe(true);
+
+    // Send SIGTERM — the handler calls process.exit(0), which triggers the "exit"
+    // handler that calls releaseLock(), which removes the lock file.
+    celloMcp.kill("SIGTERM");
+
+    // Wait for the process to exit (up to 5s).
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("cello-mcp did not exit within 5s after SIGTERM"));
+      }, 5000);
+      celloMcp.on("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
+    // Lock file must be absent after the process exits.
+    expect(existsSync(lockFilePath), "lock file must be removed after SIGTERM").toBe(false);
+  }, 20000);
 });

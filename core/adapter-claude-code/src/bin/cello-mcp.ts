@@ -92,7 +92,7 @@ process.stderr.write("cello: starting...\n");
 // one cello-mcp per agent at all times. The cleanup function is registered to
 // release the lock on SIGTERM/SIGINT/normal exit.
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
-let lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
+const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
 
 // CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production.
 // Use path.normalize (without realpathSync) so this works on first run before the lock file
