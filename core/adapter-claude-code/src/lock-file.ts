@@ -172,6 +172,11 @@ export async function acquireLockFile(
             priorPid,
             signal: "SIGKILL",
           });
+          // Brief wait after SIGKILL: SIGKILL is unblockable but kernel process
+          // cleanup (releasing file locks, closing fd) is not instantaneous on all
+          // platforms. A 100ms yield gives the kernel time to reap the process before
+          // we proceed to write the lock file.
+          await new Promise((resolve) => setTimeout(resolve, 100));
         } catch (err: unknown) {
           logger?.warn("client.startup.prior.kill.failed", {
             priorPid,
@@ -190,11 +195,10 @@ export async function acquireLockFile(
   }
 
   // Step 7-8: Write own PID to lock file
-  // IMPORTANT-1: Lock file write failure MUST be fatal. If orphan detection fails,
-  // multiple cello-mcp processes will accumulate and compete for FROST ceremonies,
-  // causing intermittent failures with no diagnostic signal. The entire point of
-  // CELLO-M6B-001 is to prevent N concurrent processes — allowing startup without
-  // the lock immediately reintroduces the bug.
+  // Per canonical taxonomy and story observability spec: lock file write failure is
+  // NON-FATAL. Log at warn level and proceed — orphan detection is disabled but the
+  // process can still serve MCP tool calls. The operator will see the warn event and
+  // can diagnose the filesystem permission issue separately.
   try {
     mkdirSync(dirname(lockFilePath), { recursive: true });
     writeFileSync(lockFilePath, String(process.pid), "utf8");
@@ -203,11 +207,21 @@ export async function acquireLockFile(
     logger?.warn("client.startup.lock.write.failed", {
       reason: (err as Error).message,
     });
-    throw new Error(`Failed to acquire lock file at ${lockFilePath}: ${(err as Error).message}`);
+    // Non-fatal: return a no-op cleanup since we have no lock to release
+    return () => {};
   }
 
-  // Step 9: Return cleanup function
-  return () => releaseLockFile(lockFilePath, logger);
+  // Step 9: Return idempotent cleanup function.
+  // The function may be called from multiple paths (exit event + signal/exception handler).
+  // The released flag suppresses the second call to prevent a duplicate
+  // client.startup.lock.released log event in the wild (I-3 finding).
+  let released = false;
+  return () => {
+    if (!released) {
+      released = true;
+      releaseLockFile(lockFilePath, logger);
+    }
+  };
 }
 
 /**

@@ -250,8 +250,19 @@ describe("AC-001: Kill prior running process (integration)", () => {
         detached: false,
       });
 
-      // Wait for process A to write its PID
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Poll until process A writes its PID (avoids fixed-wait flake in slow CI)
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const interval = setInterval(() => {
+          if (existsSync(lockFilePath)) {
+            clearInterval(interval);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(interval);
+            reject(new Error("processA did not write lock file within 5s"));
+          }
+        }, 50);
+      });
       expect(existsSync(lockFilePath)).toBe(true);
       const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
       expect(priorPid).toBe(processA.pid);
@@ -320,8 +331,19 @@ describe("AC-001: Kill prior running process (integration)", () => {
         detached: false,
       });
 
-      // Wait for lock file to be written
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Poll until processA writes its PID (avoids fixed-wait flake in slow CI)
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const interval = setInterval(() => {
+          if (existsSync(lockFilePath)) {
+            clearInterval(interval);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(interval);
+            reject(new Error("processA did not write lock file within 5s"));
+          }
+        }, 50);
+      });
       const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
 
       const events: Array<{ event: string; context: Record<string, unknown> }> = [];

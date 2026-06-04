@@ -36,7 +36,8 @@
  */
 
 import { homedir } from "node:os";
-import { createWriteStream, readFileSync, realpathSync } from "node:fs";
+import { join, normalize } from "node:path";
+import { createWriteStream, readFileSync } from "node:fs";
 
 // AC-002 (DX-001): TTY detection — BEFORE anything else.
 // If stdin is a TTY, the binary was run directly in a terminal, not as an MCP subprocess.
@@ -71,7 +72,6 @@ process.stderr.write = (
   }
   return origWrite(chunk as string);
 };
-import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
@@ -95,25 +95,23 @@ const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
 let lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
 
 // CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production.
-// Use realpathSync to follow symlinks and prevent path traversal attacks where an attacker
-// sets CELLO_LOCK_FILE_PATH to a symlink that resolves inside ~/.cello/ but targets an
-// arbitrary location outside it (e.g., /tmp/evil.pid or /var/log/system.log).
+// Use path.normalize (without realpathSync) so this works on first run before the lock file
+// or ~/.cello/ directory exists. The normalized path is checked against the normalized ~/.cello/
+// prefix — this catches directory traversal ("../") in the raw path without requiring the file
+// to exist. Note: symlink-based path traversal requires the symlink to already exist at the
+// exact lock file path; if an attacker can already write arbitrary symlinks to ~/.cello/ they
+// have broader access. The normalize check prevents the common env-var injection attack where
+// CELLO_LOCK_FILE_PATH=~/../../../etc/passwd is set directly.
 // Test/local environments allow flexibility for isolated test fixtures.
 if (process.env["CELLO_LOCK_FILE_PATH"]) {
   const isTestOrLocal = process.env["NODE_ENV"] === "test" || (process.env["CELLO_ENV"] ?? "local") === "local";
   if (!isTestOrLocal) {
     const userHome = homedir();
-    try {
-      const celloDir = realpathSync(join(userHome, ".cello"));
-      const resolvedLockPath = realpathSync(lockFilePath);
-      if (!resolvedLockPath.startsWith(celloDir)) {
-        process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
-        process.stderr.write(`cello-mcp: Got: ${lockFilePath} (resolved to ${resolvedLockPath})\n`);
-        process.exit(1);
-      }
-    } catch (err: unknown) {
-      // realpathSync fails if path doesn't exist or symlink is broken — reject
-      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH validation failed: ${(err as Error).message}\n`);
+    const celloDir = normalize(join(userHome, ".cello")) + "/";
+    const normalizedLockPath = normalize(lockFilePath);
+    if (!normalizedLockPath.startsWith(celloDir)) {
+      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
+      process.stderr.write(`cello-mcp: Got: ${lockFilePath} (normalized to ${normalizedLockPath})\n`);
       process.exit(1);
     }
   }
@@ -154,13 +152,13 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   process.exit(0);
 });
-process.on("uncaughtException", (err) => {
+process.on("uncaughtException", () => {
   releaseLock();
-  throw err;
+  process.exit(1);
 });
-process.on("unhandledRejection", (reason) => {
+process.on("unhandledRejection", () => {
   releaseLock();
-  throw reason;
+  process.exit(1);
 });
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");

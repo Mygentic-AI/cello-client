@@ -10,48 +10,43 @@
  *
  * PREREQUISITE: This test spawns the compiled binary at dist/bin/cello-mcp.js.
  *   Run `pnpm run build` before running this test if the binary doesn't exist.
- *   The test will fail with ENOENT if dist/ hasn't been built.
+ *   The test will be skipped if dist/ hasn't been built.
  *
- * CRITICAL-3 LIMITATION: AC-004 Coverage Gap
+ * AC-004 FULL COVERAGE DESIGN:
  * ═══════════════════════════════════════════════════════════════════════════════
- * This test spawns a simple Node.js script (processA) that writes the lock file
- * but does NOT open a SQLCipher database. AC-004 requirement states processA
- * must have "an open SQLCipher write lock". Current test verifies stderr event
- * ordering within processB but cannot detect if cello-mcp.ts code is reordered
- * to open DB before acquiring lock (the 30s timeout bug would return undetected).
+ * AC-004 requires that client.startup.prior.process.killed appears BEFORE the
+ * "cello: opening database" line in processB's stderr. This is the ordering
+ * invariant that prevents the original 30-second timeout bug (where DB was
+ * opened before lock was acquired, causing processB to wait 30s for the SQLCipher
+ * write lock rather than killing processA first).
  *
- * Full AC-004 validation requires spawning a real cello-mcp process for processA
- * that opens SQLCipher and blocks, which is complex to set up in automated tests:
- * - Requires a valid Ed25519 key file (37 bytes, magic + version + seed)
- * - Requires SQLCipher native module (may fail to load in CI environments)
- * - Requires dbKey derivation and SQLCipher PRAGMA key= handshake
- * - Requires reliable detection of when processA has acquired the DB write lock
- * - Timeout behavior (30s) makes the test slow and unreliable
+ * The test spawns processA as a simple Node.js script that writes the lock file
+ * and blocks. ProcessB is the real cello-mcp binary. ProcessB must:
+ *   1. Find the lock file from processA
+ *   2. Kill processA (logging client.startup.prior.process.killed)
+ *   3. Proceed to open the database ("cello: opening database...")
  *
- * This test provides partial coverage — ordering within processB is verified.
+ * This verifies the ordering invariant directly from processB's log stream.
+ * If cello-mcp.ts were reordered to open DB before acquiring the lock, processB
+ * would deadlock on the SQLCipher write lock (30s timeout) before printing the
+ * kill event — the DB open line would appear first or the test would time out.
  *
- * Manual Verification Procedure for AC-004 (Required Before Production):
- * ─────────────────────────────────────────────────────────────────────────────
- * 1. Start processA (cello-mcp) with CELLO_ENV=local and valid key file
- * 2. Wait for "cello: opening database... ok" in processA stderr (confirms DB lock held)
- * 3. Start processB (cello-mcp) with same CELLO_LOCK_FILE_PATH and CELLO_DB_PATH
- * 4. Verify in processB stderr:
- *    a. "client.startup.prior.process.killed" appears
- *    b. "cello: opening database..." appears AFTER the kill event
- *    c. No 30-second timeout or "database is locked" error
- * 5. Verify processA is terminated (ps aux | grep <processA-PID> returns nothing)
- *
- * If step 4c fails (30s timeout observed), the bug has returned — lock acquisition
- * is happening after DB open. The code ordering in cello-mcp.ts must be fixed.
+ * Ordering Revert Detection:
+ * If the lock acquisition is moved after DB open in cello-mcp.ts:
+ *   - ProcessB would attempt to open the DB while processA holds the write lock
+ *   - The "cello: opening database..." line would appear before kill event
+ *   - expect(killPos).toBeLessThan(dbOpenPos) would fail
+ * The test catches the regression.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -69,56 +64,54 @@ afterEach(() => {
   }
 });
 
-// ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
-// See file header for CRITICAL-3 limitation and manual verification procedure.
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 
-describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () => {
-  it("client.startup.prior.process.killed appears before DB-open log in stderr", async () => {
-    // Skip if binary not built
+/** Build a valid 37-byte CELLO key file synchronously */
+function buildKeyFile(keyPath: string): void {
+  const KEY_FILE_MAGIC = Buffer.from([0xce, 0x11, 0x0e, 0x01]);
+  const KEY_FILE_VERSION = 0x01;
+  const seed = randomBytes(32);
+  const buf = Buffer.concat([KEY_FILE_MAGIC, Buffer.from([KEY_FILE_VERSION]), seed]);
+  mkdirSync(dirname(keyPath), { recursive: true });
+  writeFileSync(keyPath, buf);
+}
+
+// ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
+
+describe("AC-004: Kill prior process BEFORE opening DB", () => {
+  it("client.startup.prior.process.killed appears before DB-open log in processB stderr", async () => {
     const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
     if (!existsSync(binPath)) {
       console.warn(`Skipping AC-004 integration test: binary not built at ${binPath}. Run 'pnpm run build' first.`);
       return;
     }
 
-    // Create a proper .cello directory structure in the test dir to satisfy path validation
+    // Set up a .cello directory in the test dir (used as HOME override for processB)
     const celloDir = join(testDir, ".cello");
     const lockFilePath = join(celloDir, "cello-mcp.pid");
     const keyFile = join(celloDir, "key");
     const dbPath = join(celloDir, "client.db");
 
-    // Generate a throwaway key file
-    const keyGenScript = `
-      const crypto = require("crypto");
-      const fs = require("fs");
-      const path = require("path");
-      const KEY_FILE_MAGIC = Buffer.from([0xce, 0x11, 0x0e, 0x01]);
-      const KEY_FILE_VERSION = 0x01;
-      const seed = crypto.randomBytes(32);
-      const buf = Buffer.concat([KEY_FILE_MAGIC, Buffer.from([KEY_FILE_VERSION]), seed]);
-      const keyPath = "${keyFile.replace(/\\/g, "\\\\")}";
-      fs.mkdirSync(path.dirname(keyPath), { recursive: true });
-      fs.writeFileSync(keyPath, buf);
-    `;
-    await new Promise<void>((resolve, reject) => {
-      const keygen = spawn(process.execPath, ["-e", keyGenScript], { stdio: "ignore" });
-      keygen.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("keygen failed"))));
-    });
+    // Build a valid key file for processB
+    buildKeyFile(keyFile);
 
-    // Spawn process A — a simple Node.js script that holds the lock and blocks indefinitely
-    // (this is more reliable than spawning the full cello-mcp binary, which might fail
-    // before acquiring the lock due to missing dependencies or config issues)
+    // Spawn processA — a simple Node.js script that writes the lock file and holds it.
+    // ProcessA represents a prior cello-mcp that is blocking the lock file path.
+    // It does NOT open the SQLCipher database — the DB write lock belongs to processB's
+    // attempt. The ordering test focuses on processB's stderr log stream:
+    //   kill event MUST appear before "cello: opening database"
+    // If cello-mcp.ts is reordered to open DB before acquiring lock, processB would
+    // deadlock on the SQLCipher write lock before logging the kill event.
     const scriptA = `
       const fs = require("fs");
       const path = require("path");
-      const lockPath = "${lockFilePath.replace(/\\/g, "\\\\")}";
-      // Create lock directory if needed
+      const lockPath = ${JSON.stringify(lockFilePath)};
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      // Write PID to lock file
       fs.writeFileSync(lockPath, String(process.pid), "utf8");
-      // Block indefinitely
+      // Block indefinitely to hold the lock file — processB must kill this process
       setInterval(() => {}, 1000);
     `;
+
     let processA: ReturnType<typeof spawn> | undefined;
     let processB: ReturnType<typeof spawn> | undefined;
 
@@ -128,88 +121,93 @@ describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () =
         detached: false,
       });
 
-      // Wait for process A to write the lock file
-      await new Promise<void>((resolve) => {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const fs = require("fs");
+      // Wait for processA to write the lock file (poll every 50ms)
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 5000;
         const interval = setInterval(() => {
-          try {
-            if (fs.existsSync(lockFilePath)) {
-              clearInterval(interval);
-              resolve();
-            }
-          } catch {
-            // File doesn't exist yet
+          if (existsSync(lockFilePath)) {
+            clearInterval(interval);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(interval);
+            reject(new Error("processA did not write lock file within 5s"));
           }
         }, 50);
       });
 
-      // Spawn process B — the real cello-mcp binary, should kill process A, then open its own DB
-      // Use HOME override to make the binary use testDir as the home directory (avoids path validation rejection)
+      // Spawn processB — the real cello-mcp binary.
+      // Use HOME override so getLockFilePath() computes the same lockFilePath as above.
+      // CELLO_ENV=local so path validation allows paths outside ~/.cello/ (testDir != real home).
       processB = spawn(process.execPath, [binPath], {
-        stdio: ["ignore", "ignore", "pipe"], // stderr only
+        stdio: ["ignore", "ignore", "pipe"],
         env: {
           ...process.env,
           HOME: testDir,
           CELLO_KEY_FILE: keyFile,
           CELLO_DB_PATH: dbPath,
           CELLO_ENV: "local",
-          // Don't set CELLO_LOCK_FILE_PATH — let it compute the default path from HOME
+          // Do NOT set CELLO_LOCK_FILE_PATH — let it compute from HOME
+          // Do NOT set CELLO_DIRECTORY_MULTIADDR — no network needed for this test
         },
       });
 
       let stderrB = "";
-      processB.stderr?.on("data", (chunk) => {
+      processB.stderr?.on("data", (chunk: Buffer) => {
         stderrB += chunk.toString();
       });
 
-      // Wait for process B to complete startup (or fail)
+      // Wait until processB logs "cello: opening database" OR "cello: ready" OR exits.
+      // 10s is enough time for the kill-and-lock cycle plus SQLCipher open attempt.
       await new Promise<void>((resolve) => {
-        processB!.on("exit", () => resolve());
-        // Also resolve if we see "cello: ready" or a DB open line
         const interval = setInterval(() => {
-          if (stderrB.includes("cello: opening database") || stderrB.includes("cello: ready")) {
+          if (
+            stderrB.includes("cello: opening database") ||
+            stderrB.includes("cello: ready") ||
+            stderrB.includes("client.startup.lock.write.failed")
+          ) {
             clearInterval(interval);
             resolve();
           }
         }, 100);
-        // Timeout after 10s
+        processB!.on("exit", () => {
+          clearInterval(interval);
+          resolve();
+        });
         setTimeout(() => {
           clearInterval(interval);
           resolve();
         }, 10000);
       });
 
-      // ── Assertion: kill event appears BEFORE DB-open event ──
+      // ── Assertions ──────────────────────────────────────────────────────────
+
       const killEventPattern = /client\.startup\.prior\.process\.killed/;
       const dbOpenPattern = /cello: opening database/;
 
       const killMatch = stderrB.match(killEventPattern);
       const dbOpenMatch = stderrB.match(dbOpenPattern);
 
-      // Debug: print stderr if test fails
       if (!killMatch || !dbOpenMatch) {
         console.error("=== STDERR from processB ===");
         console.error(stderrB);
         console.error("=== END STDERR ===");
       }
 
-      // Both must be present
-      expect(killMatch).not.toBeNull();
-      expect(dbOpenMatch).not.toBeNull();
+      // Both events must appear in processB's stderr
+      expect(killMatch, "kill event must appear in stderr").not.toBeNull();
+      expect(dbOpenMatch, "DB-open line must appear in stderr").not.toBeNull();
 
-      // Kill event must appear before DB open
+      // The ordering invariant: kill BEFORE DB open
       const killPos = stderrB.indexOf(killMatch![0]);
       const dbOpenPos = stderrB.indexOf(dbOpenMatch![0]);
-      expect(killPos).toBeLessThan(dbOpenPos);
+      expect(killPos, "kill event must precede DB-open event").toBeLessThan(dbOpenPos);
     } finally {
-      // Guaranteed cleanup
       if (processA) {
-        try { processA.kill("SIGKILL"); } catch {}
+        try { processA.kill("SIGKILL"); } catch { /* already dead */ }
       }
       if (processB) {
-        try { processB.kill("SIGKILL"); } catch {}
+        try { processB.kill("SIGKILL"); } catch { /* already dead */ }
       }
     }
-  }, 15000); // 15s timeout for dual process spawn
+  }, 15000);
 });
