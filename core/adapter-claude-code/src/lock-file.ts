@@ -160,8 +160,12 @@ export async function acquireLockFile(
         try {
           killFn(priorPid, 0);
           stillRunning = true;
-        } catch {
-          stillRunning = false;
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+            // ESRCH = no such process — process is gone
+            stillRunning = false;
+          }
+          // EPERM or unknown — process may still exist; treat as still running
         }
 
         // Only poll if still running after immediate check
@@ -170,10 +174,13 @@ export async function acquireLockFile(
           try {
             killFn(priorPid, 0);
             stillRunning = true;
-          } catch {
-            // Process exited
-            stillRunning = false;
-            break;
+          } catch (err: unknown) {
+            if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+              // ESRCH = no such process — process is gone
+              stillRunning = false;
+              break;
+            }
+            // EPERM or unknown — process may still exist; treat as still running
           }
         }
       }
@@ -193,10 +200,13 @@ export async function acquireLockFile(
             try {
               killFn(priorPid, 0);
               // Still running — keep polling
-            } catch {
-              // Process is gone — reaping complete
-              reaped = true;
-              break;
+            } catch (err: unknown) {
+              if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+                // ESRCH = no such process — reaping confirmed
+                reaped = true;
+                break;
+              }
+              // EPERM or unknown — not yet confirmed reaped; continue polling
             }
           }
           // Log a single event regardless of whether reaping was confirmed.

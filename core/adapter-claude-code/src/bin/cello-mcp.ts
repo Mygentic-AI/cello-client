@@ -104,8 +104,12 @@ const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agen
 // CELLO_LOCK_FILE_PATH=~/../../../etc/passwd is set directly.
 // Test/local environments allow flexibility for isolated test fixtures.
 if (process.env["CELLO_LOCK_FILE_PATH"]) {
-  const isTestOrLocal = process.env["NODE_ENV"] === "test" || (process.env["CELLO_ENV"] ?? "local") === "local";
-  if (!isTestOrLocal) {
+  // CELLO_LOCK_FILE_PATH is documented as "test only". Bypass validation only in NODE_ENV=test
+  // (unit/integration test runners set this). Do NOT bypass for CELLO_ENV=local — operators
+  // running in local mode are not running tests, and a misconfigured shell env var should
+  // still be rejected to prevent path traversal in the most common installation scenario.
+  const isTestEnv = process.env["NODE_ENV"] === "test";
+  if (!isTestEnv) {
     const userHome = homedir();
     const celloDir = normalize(join(userHome, ".cello")) + "/";
     const normalizedLockPath = normalize(lockFilePath);
