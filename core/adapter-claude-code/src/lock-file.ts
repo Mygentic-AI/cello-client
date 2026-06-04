@@ -171,16 +171,12 @@ export async function acquireLockFile(
       if (stillRunning) {
         try {
           killFn(priorPid, "SIGKILL");
-          logger?.warn("client.startup.prior.process.killed", {
-            priorPid,
-            signal: "SIGKILL",
-          });
           // Poll after SIGKILL to verify the kernel has reaped the process before
           // we write the lock file. SIGKILL is unblockable but process cleanup
           // (releasing file locks, closing fds) is not instantaneous — especially
           // on loaded systems. Poll up to 500ms in 50ms intervals.
           const sigkillDeadline = Date.now() + 500;
-          let killedConfirmed = false;
+          let reaped = false;
           while (Date.now() < sigkillDeadline) {
             await new Promise((resolve) => setTimeout(resolve, 50));
             try {
@@ -188,20 +184,18 @@ export async function acquireLockFile(
               // Still running — keep polling
             } catch {
               // Process is gone — reaping complete
-              killedConfirmed = true;
+              reaped = true;
               break;
             }
           }
-          if (!killedConfirmed) {
-            // SIGKILL sent but process not yet reaped — proceed anyway (best effort).
-            // This is theoretically impossible for same-user processes, but on a very
-            // loaded system we log at warn to surface the anomaly.
-            logger?.warn("client.startup.prior.kill.failed", {
-              priorPid,
-              signal: "SIGKILL",
-              reason: "process did not exit within 500ms after SIGKILL",
-            });
-          }
+          // Log a single event regardless of whether reaping was confirmed.
+          // reaped=false on a very loaded system means SIGKILL was sent but the kernel
+          // hasn't cleaned up within 500ms — the process is dying, we proceed anyway.
+          logger?.warn("client.startup.prior.process.killed", {
+            priorPid,
+            signal: "SIGKILL",
+            reaped,
+          });
         } catch (err: unknown) {
           logger?.warn("client.startup.prior.kill.failed", {
             priorPid,

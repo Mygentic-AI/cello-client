@@ -263,8 +263,15 @@ describe("AC-003: Lock file removed when cello-mcp receives SIGTERM (integration
       }, 50);
       celloMcp.on("exit", (code) => {
         clearInterval(interval);
-        // If process exited before creating the lock file, it may have crashed.
-        reject(new Error(`cello-mcp exited (code ${code}) before creating lock file. stderr:\n${stderr}`));
+        // Check whether the lock file already exists before deciding to reject.
+        // Without this guard, a process that exits after writing the lock file but
+        // before the next 50ms interval tick would cause a false reject even though
+        // the lock was successfully created (race between exit event and poll tick).
+        if (existsSync(lockFilePath)) {
+          resolve();
+        } else {
+          reject(new Error(`cello-mcp exited (code ${code}) before creating lock file. stderr:\n${stderr}`));
+        }
       });
     });
 
@@ -335,7 +342,13 @@ describe("AC-003: Lock file removed when cello-mcp receives SIGINT (integration)
       }, 50);
       celloMcp.on("exit", (code) => {
         clearInterval(interval);
-        reject(new Error(`cello-mcp exited (code ${code}) before creating lock file. stderr:\n${stderr}`));
+        // Guard against the race where the process writes the lock file and exits
+        // before the next 50ms poll tick fires. Check the file before rejecting.
+        if (existsSync(lockFilePath)) {
+          resolve();
+        } else {
+          reject(new Error(`cello-mcp exited (code ${code}) before creating lock file. stderr:\n${stderr}`));
+        }
       });
     });
 
