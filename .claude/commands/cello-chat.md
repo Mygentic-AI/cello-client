@@ -20,8 +20,9 @@ You need a registration token. Get one from **@CelloConnectStagingBot** on Teleg
 3. Keep it handy for `cello_register`
 
 The MCP server must already be running. If `cello_status` fails with a tool-not-found error, install first:
-```
-claude mcp add cello npx --yes @cello-protocol/connect
+```bash
+npm install -g @cello-protocol/connect
+claude mcp add cello -- cello-mcp
 ```
 Then restart Claude Code and try again.
 

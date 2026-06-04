@@ -10,6 +10,11 @@
  *           must derive db_key via deriveDbKey() before constructing this store.
  *   SI-003: No PRAGMA cipher_* commands that would weaken AES-256-CBC defaults.
  *
+ * Security invariants (CELLO-M6B-005):
+ *   SI-001 (M6B-005): WAL mode PRAGMA is issued only AFTER key verification.
+ *           Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL,
+ *           (4) migrations. Ensures WAL files are encrypted at rest.
+ *
  * Degraded behavior (DB-001):
  *   On corrupt file or wrong key, logs client.store.open.failed and throws.
  *   Never creates a new empty database over a corrupt file.
@@ -148,6 +153,12 @@ export class SQLCipherClientStore implements ClientStore {
       // If the key is wrong or the file is corrupt, this will fail.
       await this.#verifyKey(db);
 
+      // SI-001 (M6B-005): WAL mode is set AFTER key verification and BEFORE migrations.
+      // Order: (1) PRAGMA key, (2) verify key, (3) PRAGMA journal_mode=WAL, (4) migrations.
+      // WAL mode is issued on a key-verified database — attackers with filesystem access
+      // see encrypted WAL files, not plaintext.
+      const journalMode = await this.#setWalMode(db);
+
       // Key is verified — safe to make the database accessible to other methods.
       this.#db = db;
 
@@ -158,6 +169,7 @@ export class SQLCipherClientStore implements ClientStore {
         env: this.#env,
         dbPath: this.#dbPath,
         agentId: this.#agentId,
+        journalMode,
       });
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -262,6 +274,34 @@ export class SQLCipherClientStore implements ClientStore {
       db.get(`SELECT count(*) as c FROM sqlite_master`, [], (err, _row) => {
         if (err) reject(err);
         else resolve();
+      });
+    });
+  }
+
+  /**
+   * Enable WAL (Write-Ahead Log) journal mode on the database.
+   *
+   * PRAGMA journal_mode=WAL is issued in a single `db.get()` call, which both
+   * sets the mode and returns the active journal mode as a result row.
+   *
+   * Implements SI-001 (M6B-005): Must only be called AFTER #verifyKey() succeeds.
+   * WAL mode on an unverified database would operate on plaintext; by calling this after
+   * key verification, we guarantee WAL files are encrypted at rest.
+   *
+   * Returns the active journal mode string (normally 'wal').
+   */
+  async #setWalMode(db: SqlCipherDatabase): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      db.get("PRAGMA journal_mode=WAL", [], (err, row) => {
+        if (err) return reject(err);
+        if (!row) {
+          return reject(new Error("PRAGMA journal_mode=WAL returned no result"));
+        }
+        const mode = String((row as { journal_mode: string }).journal_mode);
+        if (mode !== "wal") {
+          return reject(new Error(`WAL mode failed: expected 'wal', got '${mode}'. This may occur on network filesystems (NFS, SMB). Move your CELLO_DB_PATH to a local filesystem.`));
+        }
+        resolve(mode);
       });
     });
   }

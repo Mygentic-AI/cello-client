@@ -39,17 +39,39 @@ import { homedir } from "node:os";
 import { join, normalize } from "node:path";
 import { createWriteStream, readFileSync } from "node:fs";
 
+// AC-001 (M6B-005): --version flag — exit cleanly with the package version.
+// Must precede TTY detection so `cello-mcp --version` works in any context.
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  // Read version from the package.json that ships with the npm package.
+  // At runtime the compiled JS is in dist/bin/, package.json is at the package root.
+  const { createRequire: cr } = await import("node:module");
+  const req = cr(import.meta.url);
+  const pkg = req("../../package.json") as { version: string };
+  process.stdout.write(`${pkg.version}\n`);
+  process.exit(0);
+}
+
 // AC-002 (DX-001): TTY detection — BEFORE anything else.
 // If stdin is a TTY, the binary was run directly in a terminal, not as an MCP subprocess.
 // Print install instructions to stdout and exit cleanly.
 if (process.stdin.isTTY) {
+  // Read version for the TTY banner (AC-001 M6B-005)
+  const { createRequire: cr } = await import("node:module");
+  const req = cr(import.meta.url);
+  const pkg = req("../../package.json") as { version: string };
   process.stdout.write(
+    `cello-mcp v${pkg.version}\n` +
+    "\n" +
     "This is a CELLO MCP server. It is designed to run as a subprocess of Claude Code.\n" +
     "\n" +
     "To install, run:\n" +
-    "  claude mcp add cello npx --yes @cello-protocol/connect\n" +
+    "  npm install -g @cello-protocol/connect\n" +
+    "  claude mcp add cello -- cello-mcp\n" +
     "\n" +
-    "Then restart Claude Code to activate CELLO.\n",
+    "To upgrade to the latest version:\n" +
+    "  npm install -g @cello-protocol/connect@latest\n" +
+    "\n" +
+    "Then restart Claude Code (or run /mcp) to activate CELLO.\n",
   );
   process.exit(0);
 }
@@ -447,11 +469,11 @@ void (async () => {
           } else if (platform === "linux") {
             process.stderr.write(`cello-mcp: Missing OpenSSL build dependencies on Linux.\n`);
             process.stderr.write(`cello-mcp: Run: sudo apt-get install build-essential libssl-dev\n`);
-            process.stderr.write(`cello-mcp: Then re-run: npx --yes @cello-protocol/connect\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npm install -g @cello-protocol/connect@latest\n`);
           } else {
             process.stderr.write(`cello-mcp: Xcode Command Line Tools are required on macOS.\n`);
             process.stderr.write(`cello-mcp: Run: xcode-select --install\n`);
-            process.stderr.write(`cello-mcp: Then re-run: npx --yes @cello-protocol/connect\n`);
+            process.stderr.write(`cello-mcp: Then re-run: npm install -g @cello-protocol/connect@latest\n`);
           }
           process.stderr.write(`cello-mcp: Continuing without persistence — data will not survive restarts.\n`);
         }

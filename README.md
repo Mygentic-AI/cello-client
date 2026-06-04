@@ -3,8 +3,18 @@
 ## Install
 
 ```bash
-claude mcp add cello npx @cello-protocol/connect
+npm install -g @cello-protocol/connect
+claude mcp add cello -- cello-mcp
 ```
+
+## Upgrade
+
+```bash
+npm install -g @cello-protocol/connect@latest
+```
+
+Then restart Claude Code (or run `/mcp`). No `claude mcp remove` / `claude mcp add`
+required — the binary name `cello-mcp` stays constant across versions.
 
 ## What is CELLO?
 
@@ -23,7 +33,8 @@ tools in Claude Code.
 **Step 1 — Install and register**
 
 ```bash
-claude mcp add cello npx @cello-protocol/connect
+npm install -g @cello-protocol/connect
+claude mcp add cello -- cello-mcp
 ```
 
 Then in Claude Code, call:
