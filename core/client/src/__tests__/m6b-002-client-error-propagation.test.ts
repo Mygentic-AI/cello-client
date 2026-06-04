@@ -18,6 +18,7 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpSessionServer } from "../mcp-server.js";
+import { mapSessionRequestErrorFrame } from "../client.js";
 import type { InitiateSessionResult, CelloClient } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -116,30 +117,40 @@ async function makeServerAndClient(
 
 describe("CELLO-M6B-002: Client-side error propagation", () => {
   // ─── AC-005: client.ts ceremony_timeout mapping ──────────────────────────────
+  // Tests the RUNTIME behavior of mapSessionRequestErrorFrame (extracted from
+  // initiateSession). If lines 5394-5395 of client.ts were deleted or typo'd,
+  // this test fails — unlike a pure compile-time type assertion.
 
-  it("AC-005: InitiateSessionResult failure union includes ceremony_timeout", () => {
-    // Type-level test: if ceremony_timeout is not a valid member, this will fail at compile time
-    const result: InitiateSessionResult = { ok: false, reason: "ceremony_timeout" };
+  it("AC-005: mapSessionRequestErrorFrame maps ceremony_timeout wire reason to InitiateSessionResult", () => {
+    const frame = { type: "session_request_error", reason: "ceremony_timeout" };
+    const result = mapSessionRequestErrorFrame(frame);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("ceremony_timeout");
+      // Must NOT map to any existing reason
+      expect(result.reason).not.toBe("directory_below_threshold");
+      expect(result.reason).not.toBe("directory_unreachable");
     }
   });
 
   // ─── AC-006: client.ts ceremony_exhausted mapping ────────────────────────────
 
-  it("AC-006: InitiateSessionResult failure union includes ceremony_exhausted", () => {
-    const result: InitiateSessionResult = { ok: false, reason: "ceremony_exhausted" };
+  it("AC-006: mapSessionRequestErrorFrame maps ceremony_exhausted wire reason to InitiateSessionResult", () => {
+    const frame = { type: "session_request_error", reason: "ceremony_exhausted" };
+    const result = mapSessionRequestErrorFrame(frame);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("ceremony_exhausted");
+      // Must NOT map to any existing reason
+      expect(result.reason).not.toBe("directory_below_threshold");
+      expect(result.reason).not.toBe("directory_unreachable");
     }
   });
 
   // ─── AC-007: types.ts union completeness ─────────────────────────────────────
 
   it("AC-007: InitiateSessionResult type allows ceremony_timeout and ceremony_exhausted", () => {
-    // Compile-time check that both new reasons are valid members
+    // Compile-time check that both new reasons are valid members of InitiateSessionResult
     const timeout: InitiateSessionResult = { ok: false, reason: "ceremony_timeout" };
     const exhausted: InitiateSessionResult = { ok: false, reason: "ceremony_exhausted" };
     const existing: InitiateSessionResult = { ok: false, reason: "directory_below_threshold" };
@@ -147,6 +158,27 @@ describe("CELLO-M6B-002: Client-side error propagation", () => {
     expect(timeout.ok).toBe(false);
     expect(exhausted.ok).toBe(false);
     expect(existing.ok).toBe(false);
+  });
+
+  // ─── AC-005/AC-006 companion: existing reasons still map correctly ───────────
+
+  it("AC-005/AC-006: mapSessionRequestErrorFrame preserves all pre-existing reasons", () => {
+    const cases: Array<[string, string]> = [
+      ["target_offline", "target_offline"],
+      ["relay_unavailable", "relay_unavailable"],
+      ["frost_signer_not_configured", "frost_signer_not_configured"],
+      ["directory_below_threshold", "directory_below_threshold"],
+      ["ceremony_conflict", "ceremony_conflict"],
+      ["no_connection", "no_connection"],
+      ["unknown_future_reason", "directory_unreachable"],
+    ];
+    for (const [wireReason, expectedReason] of cases) {
+      const result = mapSessionRequestErrorFrame({ type: "session_request_error", reason: wireReason });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe(expectedReason);
+      }
+    }
   });
 });
 

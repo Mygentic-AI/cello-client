@@ -5385,18 +5385,7 @@ class CelloClientImpl implements CelloClient {
     const frame = responseFrame!;
 
     if (frame["type"] === "session_request_error") {
-      const reason = frame["reason"];
-      if (reason === "target_offline") return { ok: false, reason: "target_offline" };
-      if (reason === "relay_unavailable") return { ok: false, reason: "relay_unavailable" };
-      if (reason === "frost_signer_not_configured") return { ok: false, reason: "frost_signer_not_configured" };
-      if (reason === "directory_below_threshold") return { ok: false, reason: "directory_below_threshold" };
-      // M6B-002: New FROST ceremony failure reasons
-      if (reason === "ceremony_timeout") return { ok: false, reason: "ceremony_timeout" };
-      if (reason === "ceremony_exhausted") return { ok: false, reason: "ceremony_exhausted" };
-      if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
-      if (reason === "no_connection") return { ok: false, reason: "no_connection" };
-      if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
-      return { ok: false, reason: "directory_unreachable" };
+      return mapSessionRequestErrorFrame(frame);
     }
 
     if (frame["type"] === "session_assignment") {
@@ -5970,6 +5959,29 @@ function parseStringArray(v: unknown): string[] | null {
   if (!Array.isArray(v)) return null;
   if (!v.every((x) => typeof x === "string")) return null;
   return v as string[];
+}
+
+// ─── Session request error mapping ───────────────────────────────────────────
+
+/**
+ * Map a raw decoded session_request_error frame to an InitiateSessionResult.
+ * Exported for direct unit testing (AC-005, AC-006).
+ * The frame must have type === "session_request_error".
+ */
+export function mapSessionRequestErrorFrame(
+  frame: Record<string, unknown>,
+): import("./types.js").InitiateSessionResult {
+  const reason = frame["reason"];
+  if (reason === "target_offline") return { ok: false, reason: "target_offline" };
+  if (reason === "relay_unavailable") return { ok: false, reason: "relay_unavailable" };
+  if (reason === "frost_signer_not_configured") return { ok: false, reason: "frost_signer_not_configured" };
+  if (reason === "directory_below_threshold") return { ok: false, reason: "directory_below_threshold" };
+  if (reason === "ceremony_timeout") return { ok: false, reason: "ceremony_timeout" };
+  if (reason === "ceremony_exhausted") return { ok: false, reason: "ceremony_exhausted" };
+  if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
+  if (reason === "no_connection") return { ok: false, reason: "no_connection" };
+  if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
+  return { ok: false, reason: "directory_unreachable" };
 }
 
 // ─── Factory ─────────────────────────────────────────────────────────────────
