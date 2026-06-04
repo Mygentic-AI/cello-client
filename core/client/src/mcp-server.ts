@@ -476,6 +476,31 @@ export function createMcpSessionServer(
           genesis_prev_root: toHex(result.genesisPrevRoot),
         });
       }
+
+      // M6B-002: Add descriptive message fields for new ceremony failure reasons
+      if (result.reason === "ceremony_timeout") {
+        return jsonText({
+          ok: false,
+          reason: result.reason,
+          message: "The FROST signing ceremony timed out. Verify the agent MCP process is responsive and retry.",
+        });
+      }
+      if (result.reason === "ceremony_exhausted") {
+        // Get the K_local pubkey — this is the agent_id column in agent_key_shares
+        const ownPubkeyHex = toHex(await keyProvider.getPublicKey());
+        const pubkeyPrefix = ownPubkeyHex.slice(0, 8);
+
+        return jsonText({
+          ok: false,
+          reason: result.reason,
+          message: `FROST ceremony exhausted — K_server share mismatch or missing. To fix:
+1. DELETE FROM agent_key_shares WHERE agent_id='${ownPubkeyHex}'; (in directory DB)
+2. DELETE FROM agent_profiles WHERE k_local_pubkey LIKE '${pubkeyPrefix}%';
+3. Restart the directory ECS task (aws ecs stop-task) to flush in-memory share cache
+4. pkill -f cello-mcp && rm ~/.cello/client.db && get a fresh token from Telegram && call cello_register`,
+        });
+      }
+
       return jsonText({ ok: false, reason: result.reason });
     },
   );

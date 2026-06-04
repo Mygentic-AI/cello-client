@@ -1,4 +1,4 @@
-export { createClient } from "./client.js";
+export { createClient, mapSessionRequestErrorFrame } from "./client.js";
 export { SQLCipherClientStore } from "./sqlcipher-client-store.js";
 export type { SQLCipherClientStoreOptions } from "./sqlcipher-client-store.js";
 export { deriveDbKey } from "./db-key-derivation.js";
