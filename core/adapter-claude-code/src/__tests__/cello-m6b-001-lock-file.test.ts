@@ -91,6 +91,54 @@ describe("AC-002: Stale lock file handling", () => {
     cleanup();
   });
 
+  it("when lock file contains PID 0, no signal is sent and startup proceeds", async () => {
+    // POSIX: process.kill(0, signal) sends signal to the entire process group —
+    // which includes the Claude Code parent. This must be treated as an invalid/dangerous
+    // PID and rejected before any kill attempt.
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    writeFileSync(lockFilePath, "0", "utf8");
+
+    const signals: Array<{ pid: number; signal: number | NodeJS.Signals }> = [];
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      signals.push({ pid, signal });
+      // Do NOT call process.kill — we're asserting no kill attempt is made
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn });
+
+    // No signal was sent — PID 0 was treated as stale/invalid
+    expect(signals).toHaveLength(0);
+
+    // Lock file now contains our PID
+    const content = readFileSync(lockFilePath, "utf8").trim();
+    expect(content).toBe(String(process.pid));
+
+    cleanup();
+  });
+
+  it("when lock file contains a negative PID (-1), no signal is sent and startup proceeds", async () => {
+    // POSIX: process.kill(-1, signal) sends signal to all processes the current user
+    // can signal — equivalent to a broadcast kill. Must be rejected as invalid.
+    const lockFilePath = join(testDir, "cello-mcp.pid");
+    writeFileSync(lockFilePath, "-1", "utf8");
+
+    const signals: Array<{ pid: number; signal: number | NodeJS.Signals }> = [];
+    const killFn = (pid: number, signal: number | NodeJS.Signals): void => {
+      signals.push({ pid, signal });
+    };
+
+    const cleanup = await acquireLockFile(lockFilePath, { killFn });
+
+    // No signal was sent — negative PID was treated as stale/invalid
+    expect(signals).toHaveLength(0);
+
+    // Lock file now contains our PID
+    const content = readFileSync(lockFilePath, "utf8").trim();
+    expect(content).toBe(String(process.pid));
+
+    cleanup();
+  });
+
   it("when lock file does not exist, startup proceeds", async () => {
     const lockFilePath = join(testDir, "cello-mcp.pid");
 
@@ -289,7 +337,12 @@ describe("AC-001: Kill prior running process (integration)", () => {
       });
       expect(existsSync(lockFilePath)).toBe(true);
       const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
-      expect(priorPid).toBe(processA.pid);
+      // processA.pid is the PID from spawn — cross-check with what was written to disk
+      if (processA.pid !== undefined) {
+        expect(priorPid).toBe(processA.pid);
+      } else {
+        throw new Error("processA failed to spawn (pid is undefined)");
+      }
 
       // Process B acquires the lock (should kill process A)
       const events: Array<{ event: string; context: Record<string, unknown> }> = [];
@@ -308,9 +361,10 @@ describe("AC-001: Kill prior running process (integration)", () => {
 
       // Process A should be killed
       await new Promise((resolve) => setTimeout(resolve, 200));
+      const processAPid = processA.pid;
       let isARunning = true;
       try {
-        process.kill(processA.pid!, 0);
+        process.kill(processAPid, 0);
       } catch {
         isARunning = false;
       }
@@ -368,6 +422,9 @@ describe("AC-001: Kill prior running process (integration)", () => {
           }
         }, 50);
       });
+      if (processA.pid === undefined) {
+        throw new Error("processA failed to spawn (pid is undefined)");
+      }
       const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
 
       const events: Array<{ event: string; context: Record<string, unknown> }> = [];
@@ -383,9 +440,10 @@ describe("AC-001: Kill prior running process (integration)", () => {
 
       // Process A should be killed (SIGKILL cannot be ignored)
       await new Promise((resolve) => setTimeout(resolve, 200));
+      const processAPid = processA.pid;
       let isARunning = true;
       try {
-        process.kill(processA.pid!, 0);
+        process.kill(processAPid, 0);
       } catch {
         isARunning = false;
       }

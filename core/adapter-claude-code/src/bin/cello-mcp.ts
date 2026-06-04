@@ -152,11 +152,15 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   process.exit(0);
 });
-process.on("uncaughtException", () => {
+process.on("uncaughtException", (err: Error) => {
+  process.stderr.write(`cello-mcp: [error] process.uncaught.exception ${JSON.stringify({ message: err.message, stack: err.stack })}\n`);
   releaseLock();
   process.exit(1);
 });
-process.on("unhandledRejection", () => {
+process.on("unhandledRejection", (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  process.stderr.write(`cello-mcp: [error] process.unhandled.rejection ${JSON.stringify({ reason: msg, stack })}\n`);
   releaseLock();
   process.exit(1);
 });

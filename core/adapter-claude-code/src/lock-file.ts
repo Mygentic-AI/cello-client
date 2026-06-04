@@ -82,8 +82,11 @@ export async function acquireLockFile(
   try {
     const content = readFileSync(lockFilePath, "utf8").trim();
     priorPid = parseInt(content, 10);
-    if (isNaN(priorPid)) {
-      // Invalid PID in file — treat as stale
+    if (isNaN(priorPid) || priorPid <= 0) {
+      // Invalid or dangerous PID — treat as stale.
+      // priorPid === 0: process.kill(0, ...) sends signal to the entire process group.
+      // priorPid < 0: process.kill(-1, ...) sends signal to all processes the user can signal.
+      // Both are POSIX semantics — neither refers to the intended prior cello-mcp instance.
       priorPid = null;
     }
   } catch (err: unknown) {
@@ -172,11 +175,33 @@ export async function acquireLockFile(
             priorPid,
             signal: "SIGKILL",
           });
-          // Brief wait after SIGKILL: SIGKILL is unblockable but kernel process
-          // cleanup (releasing file locks, closing fd) is not instantaneous on all
-          // platforms. A 100ms yield gives the kernel time to reap the process before
-          // we proceed to write the lock file.
-          await new Promise((resolve) => setTimeout(resolve, 100));
+          // Poll after SIGKILL to verify the kernel has reaped the process before
+          // we write the lock file. SIGKILL is unblockable but process cleanup
+          // (releasing file locks, closing fds) is not instantaneous — especially
+          // on loaded systems. Poll up to 500ms in 50ms intervals.
+          const sigkillDeadline = Date.now() + 500;
+          let killedConfirmed = false;
+          while (Date.now() < sigkillDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            try {
+              killFn(priorPid, 0);
+              // Still running — keep polling
+            } catch {
+              // Process is gone — reaping complete
+              killedConfirmed = true;
+              break;
+            }
+          }
+          if (!killedConfirmed) {
+            // SIGKILL sent but process not yet reaped — proceed anyway (best effort).
+            // This is theoretically impossible for same-user processes, but on a very
+            // loaded system we log at warn to surface the anomaly.
+            logger?.warn("client.startup.prior.kill.failed", {
+              priorPid,
+              signal: "SIGKILL",
+              reason: "process did not exit within 500ms after SIGKILL",
+            });
+          }
         } catch (err: unknown) {
           logger?.warn("client.startup.prior.kill.failed", {
             priorPid,
@@ -230,7 +255,10 @@ export async function acquireLockFile(
  */
 export function releaseLockFile(
   lockFilePath: string,
-  logger?: { info: (event: string, context: Record<string, unknown>) => void },
+  logger?: {
+    info: (event: string, context: Record<string, unknown>) => void;
+    warn: (event: string, context: Record<string, unknown>) => void;
+  },
 ): void {
   try {
     unlinkSync(lockFilePath);
@@ -238,7 +266,11 @@ export function releaseLockFile(
   } catch (err: unknown) {
     // ENOENT is expected if cleanup ran twice — silent
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      // Unexpected error — non-fatal
+      // Unexpected unlink failure (EACCES, EROFS, etc.) — non-fatal but observable
+      logger?.warn("client.startup.lock.release.failed", {
+        reason: (err as Error).message,
+        pid: process.pid,
+      });
     }
   }
 }
