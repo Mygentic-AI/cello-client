@@ -92,7 +92,19 @@ process.stderr.write("cello: starting...\n");
 // one cello-mcp per agent at all times. The cleanup function is registered to
 // release the lock on SIGTERM/SIGINT/normal exit.
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
-const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
+let lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
+
+// CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/
+if (process.env["CELLO_LOCK_FILE_PATH"]) {
+  const userHome = homedir();
+  const celloDir = join(userHome, ".cello");
+  const resolvedLockPath = join(lockFilePath); // Normalize path
+  if (!resolvedLockPath.startsWith(celloDir)) {
+    process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
+    process.stderr.write(`cello-mcp: Got: ${lockFilePath}\n`);
+    process.exit(1);
+  }
+}
 
 const releaseLock = await acquireLockFile(lockFilePath, {
   logger: {
@@ -103,24 +115,23 @@ const releaseLock = await acquireLockFile(lockFilePath, {
   },
 });
 
-// Register cleanup on exit signals and normal exit
+// CRITICAL-1: Register cleanup on exit signals and normal exit.
+// Only the "exit" handler calls releaseLock() — it runs on all exit paths.
+// Signal handlers call process.exit() which triggers the exit handler.
+// Exception handlers re-throw (triggering exit handler) without calling releaseLock() directly.
 process.on("exit", () => {
   releaseLock();
 });
 process.on("SIGTERM", () => {
-  releaseLock();
   process.exit(0);
 });
 process.on("SIGINT", () => {
-  releaseLock();
   process.exit(0);
 });
 process.on("uncaughtException", (err) => {
-  releaseLock();
   throw err;
 });
 process.on("unhandledRejection", (reason) => {
-  releaseLock();
   throw reason;
 });
 

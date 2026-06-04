@@ -48,8 +48,18 @@ afterEach(() => {
 });
 
 // ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
+// CRITICAL-3: This test verifies event ordering within process B's stderr output,
+// but does NOT fully verify AC-004's requirement that the kill happens before SQLCipher
+// lock contention. The test spawns a lightweight Node.js script (process A) that holds
+// the PID lock but does NOT open a SQLCipher database. Therefore, this test cannot
+// detect if the cello-mcp.ts code is reordered to open DB before acquiring lock
+// (which would reintroduce the 30s timeout bug). Full verification would require
+// spawning a real cello-mcp process for process A with SQLCipher open and blocking,
+// which is too complex for automated testing. This provides partial coverage — the
+// kill→DB ordering within process B is verified, but SQLCipher lock contention
+// prevention must be validated via manual testing or production monitoring.
 
-describe("AC-004: Kill prior process BEFORE opening DB", () => {
+describe("AC-004: Kill prior process BEFORE opening DB (partial coverage)", () => {
   it("client.startup.prior.process.killed appears before DB-open log in stderr", async () => {
     // Skip if binary not built
     const binPath = resolve(__dirname, "../../dist/bin/cello-mcp.js");
