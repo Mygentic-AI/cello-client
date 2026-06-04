@@ -115,6 +115,14 @@ process.on("SIGINT", () => {
   releaseLock();
   process.exit(0);
 });
+process.on("uncaughtException", (err) => {
+  releaseLock();
+  throw err;
+});
+process.on("unhandledRejection", (reason) => {
+  releaseLock();
+  throw reason;
+});
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");
 const listenAddr = process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0";

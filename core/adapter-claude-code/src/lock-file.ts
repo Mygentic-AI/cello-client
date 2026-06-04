@@ -193,12 +193,14 @@ export async function acquireLockFile(
   try {
     mkdirSync(dirname(lockFilePath), { recursive: true });
     writeFileSync(lockFilePath, String(process.pid), "utf8");
-    logger?.info("client.startup.lock.acquired", { lockFilePath });
   } catch (err: unknown) {
     // Lock file write failure is non-fatal (orphan detection will be broken, but process runs)
     logger?.warn("client.startup.lock.write.failed", {
       reason: (err as Error).message,
     });
+    // Emit actionable warning to stderr
+    process.stderr.write(`cello-mcp: WARNING — unable to write lock file at ${lockFilePath}\n`);
+    process.stderr.write(`cello-mcp: Orphan process detection is disabled. Check directory permissions.\n`);
   }
 
   // Step 9: Return cleanup function
