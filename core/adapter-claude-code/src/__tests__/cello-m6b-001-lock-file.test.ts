@@ -296,6 +296,40 @@ describe("AC-005: M7 multi-agent lock file paths", () => {
 
     cleanup();
   });
+
+  it("acquiring alice's lock and bob's lock are independent: each holds its own PID, neither cleanup affects the other", async () => {
+    // This test verifies the non-interference guarantee for M7 multi-agent deployments.
+    // If the path logic were ever changed to share a single lock file, one of the
+    // acquireLockFile calls would kill the other agent's process (SIGTERM on our own PID)
+    // and the assertions below would detect the regression.
+    const aliceLockPath = getLockFilePath("alice", testDir);
+    const bobLockPath = getLockFilePath("bob", testDir);
+
+    // Acquire alice's lock first
+    const cleanupAlice = await acquireLockFile(aliceLockPath);
+
+    // Acquire bob's lock while alice's lock file exists — must NOT trigger a kill
+    // (bob's path is different, so the prior-PID check never reads alice's file)
+    const cleanupBob = await acquireLockFile(bobLockPath);
+
+    // Both lock files exist with the current PID (this test process)
+    expect(existsSync(aliceLockPath), "alice lock file must exist").toBe(true);
+    expect(existsSync(bobLockPath), "bob lock file must exist").toBe(true);
+
+    const alicePid = parseInt(readFileSync(aliceLockPath, "utf8").trim(), 10);
+    const bobPid = parseInt(readFileSync(bobLockPath, "utf8").trim(), 10);
+    expect(alicePid).toBe(process.pid);
+    expect(bobPid).toBe(process.pid);
+
+    // Releasing alice must not affect bob's lock file
+    cleanupAlice();
+    expect(existsSync(aliceLockPath), "alice lock file must be removed after alice cleanup").toBe(false);
+    expect(existsSync(bobLockPath), "bob lock file must survive alice cleanup").toBe(true);
+
+    // Releasing bob must not affect alice's (already released) lock file
+    cleanupBob();
+    expect(existsSync(bobLockPath), "bob lock file must be removed after bob cleanup").toBe(false);
+  });
 });
 
 // ─── AC-001: Kill prior process integration test ───────────────────────────────
@@ -344,13 +378,15 @@ describe("AC-001: Kill prior running process (integration)", () => {
         throw new Error("processA failed to spawn (pid is undefined)");
       }
 
-      // Process B acquires the lock (should kill process A)
-      const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+      // Process B acquires the lock (should kill process A).
+      // Event collector records the log level alongside the event so we can assert
+      // that SIGTERM kills are logged at info (clean exit) vs SIGKILL at warn (force kill).
+      const events: Array<{ level: "info" | "warn"; event: string; context: Record<string, unknown> }> = [];
       const logger = {
         info: (event: string, context: Record<string, unknown>) =>
-          events.push({ event, context }),
+          events.push({ level: "info", event, context }),
         warn: (event: string, context: Record<string, unknown>) =>
-          events.push({ event, context }),
+          events.push({ level: "warn", event, context }),
       };
 
       cleanup = await acquireLockFile(lockFilePath, { logger });
@@ -375,6 +411,10 @@ describe("AC-001: Kill prior running process (integration)", () => {
       expect(killedEvent).toBeDefined();
       expect(killedEvent?.context.priorPid).toBe(priorPid);
       expect(killedEvent?.context.signal).toMatch(/SIGTERM|SIGKILL/);
+      // SIGTERM = graceful exit = logged at info level
+      if (killedEvent?.context.signal === "SIGTERM") {
+        expect(killedEvent?.level, "SIGTERM kill must be logged at info level").toBe("info");
+      }
     } finally {
       // Guaranteed cleanup
       if (processA) {
@@ -427,12 +467,14 @@ describe("AC-001: Kill prior running process (integration)", () => {
       }
       const priorPid = parseInt(readFileSync(lockFilePath, "utf8").trim(), 10);
 
-      const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+      // Event collector records both the event name and the log level (info vs warn)
+      // so that a future regression that changes warn→info for SIGKILL is caught.
+      const events: Array<{ level: "info" | "warn"; event: string; context: Record<string, unknown> }> = [];
       const logger = {
         info: (event: string, context: Record<string, unknown>) =>
-          events.push({ event, context }),
+          events.push({ level: "info", event, context }),
         warn: (event: string, context: Record<string, unknown>) =>
-          events.push({ event, context }),
+          events.push({ level: "warn", event, context }),
       };
 
       // Acquire lock — should escalate to SIGKILL
@@ -449,12 +491,14 @@ describe("AC-001: Kill prior running process (integration)", () => {
       }
       expect(isARunning).toBe(false);
 
-      // SIGKILL event was logged at warn level
+      // SIGKILL event was logged at warn level (not info — spec says "logged at warn
+      // level to distinguish a force-kill from a clean exit")
       const killedEvent = events.find(
         (e) => e.event === "client.startup.prior.process.killed" && e.context.signal === "SIGKILL",
       );
-      expect(killedEvent).toBeDefined();
+      expect(killedEvent, "SIGKILL kill event must be logged").toBeDefined();
       expect(killedEvent?.context.priorPid).toBe(priorPid);
+      expect(killedEvent?.level, "SIGKILL must be logged at warn level, not info").toBe("warn");
     } finally {
       // Guaranteed cleanup
       if (processA) {
