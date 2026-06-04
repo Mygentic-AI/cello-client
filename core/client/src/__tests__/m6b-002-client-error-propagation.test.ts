@@ -95,8 +95,9 @@ function makeStubClientWithInitiateSession(
  */
 async function makeServerAndClient(
   initiateSessionResult: InitiateSessionResult,
-): Promise<{ mcpClient: Client; cleanup: () => Promise<void> }> {
+): Promise<{ mcpClient: Client; ownPubkeyHex: string; cleanup: () => Promise<void> }> {
   const kp = generateKeypair();
+  const ownPubkeyHex = Buffer.from(await kp.getPublicKey()).toString("hex");
   const node = makeStubNode();
   const celloClient = makeStubClientWithInitiateSession(initiateSessionResult);
   const server = createMcpSessionServer(node, celloClient, kp);
@@ -112,7 +113,7 @@ async function makeServerAndClient(
     try { await server.close(); } catch {}
   };
 
-  return { mcpClient, cleanup };
+  return { mcpClient, ownPubkeyHex, cleanup };
 }
 
 describe("CELLO-M6B-002: Client-side error propagation", () => {
@@ -215,7 +216,7 @@ describe("CELLO-M6B-002: MCP tool error messages", () => {
   // ─── AC-010: ceremony_exhausted 4-step recipe ────────────────────────────────
 
   it("AC-010: cello_initiate_session returns ceremony_exhausted with 4-step re-registration recipe", async () => {
-    const { mcpClient, cleanup } = await makeServerAndClient({
+    const { mcpClient, ownPubkeyHex, cleanup } = await makeServerAndClient({
       ok: false,
       reason: "ceremony_exhausted",
     });
@@ -233,7 +234,13 @@ describe("CELLO-M6B-002: MCP tool error messages", () => {
 
       const msg = result["message"] as string;
       expect(msg).toContain("FROST ceremony exhausted");
-      expect(msg).toContain("1. DELETE FROM agent_key_shares");
+
+      // The first SQL statement must use the K_local pubkey hex (64 chars), not the
+      // 16-byte registration ID (32 chars). This is the fix for the bug where
+      // agentIdHex (32-char reg ID) was used instead of ownPubkeyHex (64-char pubkey).
+      expect(ownPubkeyHex).toHaveLength(64);
+      expect(msg).toContain(`agent_id='${ownPubkeyHex}'`);
+
       expect(msg).toContain("2. DELETE FROM agent_profiles");
       expect(msg).toContain("3. Restart the directory ECS task");
       expect(msg).toContain("4. pkill -f cello-mcp");

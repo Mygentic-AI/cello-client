@@ -486,13 +486,7 @@ export function createMcpSessionServer(
         });
       }
       if (result.reason === "ceremony_exhausted") {
-        // Get the operator's agent_id from registration state for the copy-paste recipe
-        const regState = typeof (client as unknown as { getRegistrationState?: () => unknown }).getRegistrationState === "function"
-          ? (client as unknown as { getRegistrationState: () => { agent_id: string } | null }).getRegistrationState()
-          : null;
-        const agentIdHex = regState?.agent_id ?? "<your-agent-id>";
-
-        // Get the K_local pubkey for the second SQL statement
+        // Get the K_local pubkey — this is the agent_id column in agent_key_shares
         const ownPubkeyHex = toHex(await keyProvider.getPublicKey());
         const pubkeyPrefix = ownPubkeyHex.slice(0, 8);
 
@@ -500,7 +494,7 @@ export function createMcpSessionServer(
           ok: false,
           reason: result.reason,
           message: `FROST ceremony exhausted — K_server share mismatch or missing. To fix:
-1. DELETE FROM agent_key_shares WHERE agent_id='${agentIdHex}'; (in directory DB)
+1. DELETE FROM agent_key_shares WHERE agent_id='${ownPubkeyHex}'; (in directory DB)
 2. DELETE FROM agent_profiles WHERE k_local_pubkey LIKE '${pubkeyPrefix}%';
 3. Restart the directory ECS task (aws ecs stop-task) to flush in-memory share cache
 4. pkill -f cello-mcp && rm ~/.cello/client.db && get a fresh token from Telegram && call cello_register`,
