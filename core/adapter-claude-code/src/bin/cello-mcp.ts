@@ -12,6 +12,9 @@
  *
  * Environment variables:
  *   CELLO_KEY_FILE            Path to Ed25519 key file (default: ~/.cello/key)
+ *   CELLO_AGENT_NAME          Named agent identifier (M7+); lock file is per-agent
+ *                             (default: null → ~/.cello/cello-mcp.pid; with name → ~/.cello/agents/<name>/cello-mcp.pid)
+ *   CELLO_LOCK_FILE_PATH      Override lock file path (test only; default: computed from CELLO_AGENT_NAME)
  *   CELLO_LISTEN_ADDR         libp2p listen address (default: /ip4/0.0.0.0/tcp/0)
  *   CELLO_ANNOUNCE_ADDRS      comma-separated libp2p announce multiaddrs (optional)
  *                             Required when the node is behind NAT/EIP and must advertise
@@ -33,6 +36,7 @@
  */
 
 import { homedir } from "node:os";
+import { join, normalize } from "node:path";
 import { createWriteStream, readFileSync } from "node:fs";
 
 // AC-002 (DX-001): TTY detection — BEFORE anything else.
@@ -68,7 +72,6 @@ process.stderr.write = (
   }
   return origWrite(chunk as string);
 };
-import { join } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { FileKeyProvider, FrostThresholdSigner } from "@cello-protocol/crypto";
@@ -78,10 +81,93 @@ import { LocalCloudStorageProvider, LocalClientStore } from "@cello-protocol/int
 import type { CloudStorageProvider } from "@cello-protocol/interfaces";
 import { pushChannelNotification } from "../notifications.js";
 import { resolveDirectoryUrl, fetchBootstrapMultiaddr } from "../config.js";
+import { acquireLockFile, getLockFilePath } from "../lock-file.js";
 
 // AC-001 (DX-001): Startup progress — emit one line per step to stderr.
 // Format: 'cello: <step>... <outcome>'
 process.stderr.write("cello: starting...\n");
+
+// CELLO-M6B-001: Acquire PID lock file BEFORE any DB operations.
+// This kills any prior cello-mcp process holding the same lock, ensuring exactly
+// one cello-mcp per agent at all times. The cleanup function is registered to
+// release the lock on SIGTERM/SIGINT/normal exit.
+const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
+const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
+
+// CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production.
+// Use path.normalize (without realpathSync) so this works on first run before the lock file
+// or ~/.cello/ directory exists. The normalized path is checked against the normalized ~/.cello/
+// prefix — this catches directory traversal ("../") in the raw path without requiring the file
+// to exist. Note: symlink-based path traversal requires the symlink to already exist at the
+// exact lock file path; if an attacker can already write arbitrary symlinks to ~/.cello/ they
+// have broader access. The normalize check prevents the common env-var injection attack where
+// CELLO_LOCK_FILE_PATH=~/../../../etc/passwd is set directly.
+// Test/local environments allow flexibility for isolated test fixtures.
+if (process.env["CELLO_LOCK_FILE_PATH"]) {
+  // CELLO_LOCK_FILE_PATH is documented as "test only". Bypass validation only in NODE_ENV=test
+  // (unit/integration test runners set this). Do NOT bypass for CELLO_ENV=local — operators
+  // running in local mode are not running tests, and a misconfigured shell env var should
+  // still be rejected to prevent path traversal in the most common installation scenario.
+  const isTestEnv = process.env["NODE_ENV"] === "test";
+  if (!isTestEnv) {
+    const userHome = homedir();
+    const celloDir = normalize(join(userHome, ".cello")) + "/";
+    const normalizedLockPath = normalize(lockFilePath);
+    if (!normalizedLockPath.startsWith(celloDir)) {
+      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
+      process.stderr.write(`cello-mcp: Got: ${lockFilePath} (normalized to ${normalizedLockPath})\n`);
+      process.exit(1);
+    }
+  }
+}
+
+const releaseLock = await acquireLockFile(lockFilePath, {
+  logger: {
+    info: (event: string, ctx: Record<string, unknown>) =>
+      process.stderr.write(`cello-mcp: [info] ${event} ${JSON.stringify(ctx)}\n`),
+    warn: (event: string, ctx: Record<string, unknown>) =>
+      process.stderr.write(`cello-mcp: [warn] ${event} ${JSON.stringify(ctx)}\n`),
+  },
+});
+
+// CRITICAL-1: Register cleanup on exit signals and normal exit.
+// The "exit" handler calls releaseLock() and runs on normal exit.
+// Signal handlers call process.exit() which triggers the exit handler.
+// Exception handlers MUST call releaseLock() before re-throwing because
+// Node.js terminates immediately on uncaught exceptions without firing
+// the "exit" event. Without this, every cello-mcp crash leaves a stale lock.
+//
+// NOTE: In-flight backup operations (cello_backup tool) are NOT awaited on SIGTERM/SIGINT.
+// This is acceptable risk for M6B scope because:
+// 1. Backups are idempotent (checksummed, retried on next run)
+// 2. Backup upload failures are logged and return error to the user
+// 3. Partial S3 uploads are eventually consistent and can be retried
+// 4. Adding graceful shutdown tracking requires wiring state across tool calls (out of scope)
+// If graceful shutdown becomes necessary, add a ClientBackup.shutdown() method that:
+// - Sets a shuttingDown flag
+// - Waits up to 5s for in-flight backup() calls to complete
+// - Then allows process.exit(0) to proceed
+process.on("exit", () => {
+  releaseLock();
+});
+process.on("SIGTERM", () => {
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  process.exit(0);
+});
+process.on("uncaughtException", (err: Error) => {
+  process.stderr.write(`cello-mcp: [error] process.uncaught.exception ${JSON.stringify({ message: err.message, stack: err.stack })}\n`);
+  releaseLock();
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason: unknown) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  process.stderr.write(`cello-mcp: [error] process.unhandled.rejection ${JSON.stringify({ reason: msg, stack })}\n`);
+  releaseLock();
+  process.exit(1);
+});
 
 const keyPath = process.env["CELLO_KEY_FILE"] ?? join(homedir(), ".cello", "key");
 const listenAddr = process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0";
