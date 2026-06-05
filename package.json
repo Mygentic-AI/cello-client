@@ -17,6 +17,7 @@
     },
     "onlyBuiltDependencies": [
       "@journeyapps/sqlcipher",
+      "@signalapp/sqlcipher",
       "@oqs/liboqs-js",
       "agentdb",
       "argon2",

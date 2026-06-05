@@ -105,53 +105,30 @@ describeWithSQLCipher("CELLO-M6B-005 AC-003 — WAL mode enabled after open()", 
     await store.open();
     await store.close();
 
-    // Open the same database file directly via SQLCipher to read back journal_mode.
+    // Open the same database file directly via @signalapp/sqlcipher to read back journal_mode.
     // This proves WAL mode is persisted at the database level, not just active in memory.
-    interface RawDb {
-      run: (sql: string, params: unknown[], cb: (err: Error | null) => void) => void;
-      get: (sql: string, params: unknown[], cb: (err: Error | null, row?: Record<string, unknown>) => void) => void;
-      close: (cb: (err: Error | null) => void) => void;
-    }
-    interface RawSqlCipher {
-      Database: new (f: string, m: number, cb: (e: Error | null) => void) => RawDb;
-      OPEN_READWRITE: number;
-      OPEN_CREATE: number;
-    }
-
+    // @signalapp/sqlcipher uses a synchronous better-sqlite3-style API.
     const req = createRequireFn(import.meta.url);
-    const sqlite3 = req("@journeyapps/sqlcipher") as RawSqlCipher;
+    const { Database: SignalDatabase } = req("@signalapp/sqlcipher") as {
+      Database: new (path: string) => {
+        pragma(source: string, options?: { simple?: boolean }): unknown;
+        prepare(sql: string): { get(params?: unknown[]): Record<string, unknown> | undefined };
+        close(): void;
+      };
+    };
 
     const keyHex = Buffer.from(dbKey).toString("hex");
-    const db = await new Promise<RawDb>((resolve, reject) => {
-      const d = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE, (err) => {
-        if (err) reject(err);
-        else resolve(d);
-      });
-    });
-
-    const run = (sql: string): Promise<void> =>
-      new Promise<void>((res, rej) =>
-        db.run(sql, [], (err) => (err ? rej(err) : res())),
-      );
-    const get = (sql: string): Promise<Record<string, unknown> | undefined> =>
-      new Promise<Record<string, unknown> | undefined>((res, rej) =>
-        db.get(sql, [], (err, row) => (err ? rej(err) : res(row))),
-      );
-    const close = (): Promise<void> =>
-      new Promise<void>((res, rej) =>
-        db.close((err) => (err ? rej(err) : res())),
-      );
+    const db = new SignalDatabase(dbPath);
 
     try {
-      await run(`PRAGMA key = "x'${keyHex}'"`);
+      db.pragma(`key = "x'${keyHex}'"`);
       // Verify key accepted
-      await get("SELECT count(*) FROM sqlite_master");
+      db.prepare("SELECT count(*) FROM sqlite_master").get([]);
 
-      const row = await get("PRAGMA journal_mode");
-      expect(row).toBeDefined();
-      expect((row as { journal_mode: string }).journal_mode).toBe("wal");
+      const journalMode = db.pragma("journal_mode", { simple: true });
+      expect(journalMode).toBe("wal");
     } finally {
-      await close();
+      db.close();
     }
   });
 
@@ -326,48 +303,27 @@ describeWithSQLCipher("CELLO-M6B-005 AC-004 — WAL mode enables concurrent read
       await storeA.close();
 
       // Step 2: Open a direct SQLCipher connection as the "stale writer"
-      interface RawDb {
-        run: (sql: string, params: unknown[], cb: (err: Error | null) => void) => void;
-        get: (sql: string, params: unknown[], cb: (err: Error | null, row?: Record<string, unknown>) => void) => void;
-        close: (cb: (err: Error | null) => void) => void;
-      }
-      interface RawSqlCipher {
-        Database: new (f: string, m: number, cb: (e: Error | null) => void) => RawDb;
-        OPEN_READWRITE: number;
-        OPEN_CREATE: number;
-      }
-
+      // Uses @signalapp/sqlcipher (the replacement library) with its synchronous API.
       const req = createRequireFn(import.meta.url);
-      const sqlite3 = req("@journeyapps/sqlcipher") as RawSqlCipher;
+      const { Database: SignalWriterDatabase } = req("@signalapp/sqlcipher") as {
+        Database: new (path: string) => {
+          pragma(source: string, options?: { simple?: boolean }): unknown;
+          prepare(sql: string): { get(params?: unknown[]): Record<string, unknown> | undefined; run(params?: unknown[]): { changes: number; lastInsertRowid: number } };
+          exec(sql: string): void;
+          close(): void;
+        };
+      };
 
       const keyHex = Buffer.from(dbKey).toString("hex");
-      const writerDb = await new Promise<RawDb>((resolve, reject) => {
-        const d = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE, (err) => {
-          if (err) reject(err);
-          else resolve(d);
-        });
-      });
-
-      const writerRun = (sql: string): Promise<void> =>
-        new Promise<void>((res, rej) =>
-          writerDb.run(sql, [], (err) => (err ? rej(err) : res())),
-        );
-      const writerGet = (sql: string): Promise<Record<string, unknown> | undefined> =>
-        new Promise<Record<string, unknown> | undefined>((res, rej) =>
-          writerDb.get(sql, [], (err, row) => (err ? rej(err) : res(row))),
-        );
-      const writerClose = (): Promise<void> =>
-        new Promise<void>((res, rej) =>
-          writerDb.close((err) => (err ? rej(err) : res())),
-        );
+      const writerDb = new SignalWriterDatabase(dbPath);
 
       // Apply key and begin an uncommitted write transaction — simulates the stale process.
       // BEGIN (not BEGIN EXCLUSIVE) is correct here: WAL mode allows readers to read
       // the last committed snapshot while a writer holds an uncommitted transaction.
       // BEGIN EXCLUSIVE would block readers even in WAL mode and would be wrong.
-      await writerRun(`PRAGMA key = "x'${keyHex}'"`);
-      await writerGet("SELECT count(*) FROM sqlite_master"); // verify key
-      await writerRun("BEGIN");
+      writerDb.pragma(`key = "x'${keyHex}'"`);
+      writerDb.prepare("SELECT count(*) FROM sqlite_master").get([]); // verify key
+      writerDb.exec("BEGIN");
 
       // Step 3: Open storeB while the writer holds the transaction
       const storeB = new SQLCipherClientStore(dbKey, {
@@ -388,8 +344,8 @@ describeWithSQLCipher("CELLO-M6B-005 AC-004 — WAL mode enables concurrent read
       await storeB.close();
 
       // Clean up the writer
-      await writerRun("ROLLBACK");
-      await writerClose();
+      writerDb.exec("ROLLBACK");
+      writerDb.close();
 
       // Assert storeB opened within 5 seconds
       expect(elapsed).toBeLessThan(5000);

@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/client",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "private": false,
   "type": "module",
   "engines": {
@@ -17,7 +17,11 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist/", "db/", "package.json"],
+  "files": [
+    "dist/",
+    "db/",
+    "package.json"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
@@ -28,18 +32,19 @@
     "@cello-protocol/interfaces": "0.0.3",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
-    "@journeyapps/sqlcipher": "^6.0.0",
     "@libp2p/interface": "^3.2.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@noble/curves": "^2.2.0",
+    "@signalapp/sqlcipher": "^3.3.5",
     "cbor-x": "^1.6.0",
     "it-length-prefixed": "^10.0.1",
     "it-pipe": "^3.0.1",
     "zod": "^4.4.2"
   },
   "devDependencies": {
-    "@claude-flow/testing": "3.0.0-alpha.6",
     "@cello-protocol/test-fixtures": "workspace:*",
+    "@claude-flow/testing": "3.0.0-alpha.6",
+    "@journeyapps/sqlcipher": "^6.0.0",
     "@types/node": "^25.6.2"
   }
 }

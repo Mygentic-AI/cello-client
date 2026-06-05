@@ -563,24 +563,18 @@ describeWithSQLCipher("PERSIST-009 SI-003 — No weakening PRAGMA cipher setting
     // If any weakening PRAGMA (e.g., PRAGMA kdf_iter = 1) had been issued, this
     // assertion would fail. SQLCipher 4 default is 256000 iterations of PBKDF2.
     //
-    // Note: PRAGMA cipher_settings is not available in all SQLCipher builds. We use
-    // PRAGMA kdf_iter directly as the best available proxy in @journeyapps/sqlcipher.
-
-    // Minimal types for the raw SQLCipher database handle used only in this test.
-    interface RawDb {
-      run: (sql: string, params: unknown[], cb: (err: Error | null) => void) => void;
-      get: (sql: string, params: unknown[], cb: (err: Error | null, row?: Record<string, unknown>) => void) => void;
-      close: (cb: (err: Error | null) => void) => void;
-    }
-    interface RawSqlCipher {
-      Database: new (f: string, m: number, cb: (e: Error | null) => void) => RawDb;
-      OPEN_READWRITE: number;
-      OPEN_CREATE: number;
-    }
+    // Uses @signalapp/sqlcipher (the replacement library) directly to read kdf_iter.
+    // This library uses a synchronous better-sqlite3-style API.
 
     const { createRequire } = await import("node:module");
     const req = createRequire(import.meta.url);
-    const sqlite3 = req("@journeyapps/sqlcipher") as RawSqlCipher;
+    const { Database: SignalDatabase } = req("@signalapp/sqlcipher") as {
+      Database: new (path: string) => {
+        pragma(source: string, options?: { simple?: boolean }): unknown;
+        prepare(sql: string): { get(params?: unknown[]): Record<string, unknown> | undefined };
+        close(): void;
+      };
+    };
 
     const dbPath = makeTmpDbPath();
     const logger = makeSpyLogger();
@@ -593,44 +587,21 @@ describeWithSQLCipher("PERSIST-009 SI-003 — No weakening PRAGMA cipher setting
       await store.open();
       await store.close();
 
-      // Now open the same file directly via the SQLCipher module to query kdf_iter.
+      // Now open the same file directly via @signalapp/sqlcipher to query kdf_iter.
       // This bypasses SQLCipherClientStore to read the actual pragma value from the db.
       const keyHex = Buffer.from(dbKey).toString("hex");
-      const db = await new Promise<RawDb>((resolve, reject) => {
-        const d = new sqlite3.Database(
-          dbPath,
-          sqlite3.OPEN_READWRITE,
-          (err: Error | null) => { if (err) reject(err); else resolve(d); },
-        );
-      });
+      const db = new SignalDatabase(dbPath);
 
-      const run = (sql: string): Promise<void> =>
-        new Promise<void>((res, rej) =>
-          db.run(sql, [], (err: Error | null) => (err ? rej(err) : res())),
-        );
-      const get = (sql: string): Promise<Record<string, unknown> | undefined> =>
-        new Promise<Record<string, unknown> | undefined>((res, rej) =>
-          db.get(sql, [], (err: Error | null, row?: Record<string, unknown>) =>
-            (err ? rej(err) : res(row)),
-          ),
-        );
-      const close = (): Promise<void> =>
-        new Promise<void>((res, rej) =>
-          db.close((err: Error | null) => (err ? rej(err) : res())),
-        );
-
-      await run(`PRAGMA key = "x'${keyHex}'"`);
+      db.pragma(`key = "x'${keyHex}'"`);
       // Verify key is accepted
-      await get("SELECT count(*) FROM sqlite_master");
-
-      const row = await get("PRAGMA kdf_iter");
-      await close();
+      db.prepare(`SELECT count(*) FROM sqlite_master`).get([]);
 
       // SQLCipher 4 default is 256000 iterations. If it were weakened, this would differ.
-      // Note: PRAGMA results from @journeyapps/sqlcipher may come back as string or number
-      // depending on the build; coerce to number before comparing.
-      expect(row).toBeDefined();
-      expect(Number((row as { kdf_iter: number | string }).kdf_iter)).toBe(256000);
+      const kdfIter = db.pragma("kdf_iter", { simple: true });
+      db.close();
+
+      expect(kdfIter).toBeDefined();
+      expect(Number(kdfIter)).toBe(256000);
     } finally {
       cleanupPath(dbPath);
     }

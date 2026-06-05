@@ -84,9 +84,6 @@ importers:
       '@cello-protocol/transport':
         specifier: workspace:*
         version: link:../transport
-      '@journeyapps/sqlcipher':
-        specifier: ^6.0.0
-        version: 6.0.0
       '@libp2p/interface':
         specifier: ^3.2.2
         version: 3.2.2
@@ -96,6 +93,9 @@ importers:
       '@noble/curves':
         specifier: ^2.2.0
         version: 2.2.0
+      '@signalapp/sqlcipher':
+        specifier: ^3.3.5
+        version: 3.3.5
       cbor-x:
         specifier: ^1.6.0
         version: 1.6.4
@@ -115,6 +115,9 @@ importers:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
         version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+      '@journeyapps/sqlcipher':
+        specifier: ^6.0.0
+        version: 6.0.0
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -1411,6 +1414,9 @@ packages:
   '@ruvector/sona@0.1.6':
     resolution: {integrity: sha512-LW40r28yQxXz3vt1fOLRWVV5nln4rzw6a/Yy11EJJdeEN9q4wZG1Glwf9leTp4SjQjuIJ5hklNW8OVMwgyzd5w==}
     engines: {node: '>= 16'}
+
+  '@signalapp/sqlcipher@3.3.5':
+    resolution: {integrity: sha512-0kkHQixiaFOFYCXP6J8zsvXeq7REf5nucX+BMY8Gy5E6F2BEM2Ap9NsDNaB+wHZ6QqqsItQRvSE4PaYhTtWGIg==}
 
   '@sindresorhus/fnv1a@3.1.0':
     resolution: {integrity: sha512-KV321z5m/0nuAg83W1dPLy85HpHDk7Sdi4fJbwvacWsEhAh+rZUW4ZfGcXmUIvjZg4ss2bcwNlRhJ7GBEUG08w==}
@@ -4521,6 +4527,11 @@ snapshots:
       '@ruvector/sona-win32-x64-msvc': 0.1.4
     optional: true
 
+  '@signalapp/sqlcipher@3.3.5':
+    dependencies:
+      node-addon-api: 8.8.0
+      node-gyp-build: 4.8.4
+
   '@sindresorhus/fnv1a@3.1.0': {}
 
   '@smithy/core@3.24.5':
@@ -5822,8 +5833,7 @@ snapshots:
       detect-libc: 2.1.2
     optional: true
 
-  node-gyp-build@4.8.4:
-    optional: true
+  node-gyp-build@4.8.4: {}
 
   object-assign@4.1.1: {}
 
