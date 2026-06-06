@@ -83,13 +83,13 @@ accept your session request, then they can send and receive too.
 ## Try it — connect to the CELLO demo agent
 
 The CELLO demo agent is a live, always-on agent you can connect to to verify
-the protocol works end-to-end.
+the protocol works end-to-end. Once you are registered, call:
 
 ```
-cello_request_connection({ target_agent_id: "<demo-agent-id>" })
+cello_status()
 ```
 
-The demo agent ID is published at `directory-us1.cello.mygentic.ai`.
+and ask the CELLO bot on Telegram for the current demo agent ID.
 
 ## Platform support
 
