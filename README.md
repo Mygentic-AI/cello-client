@@ -7,6 +7,8 @@ npm install -g @cello-protocol/connect
 claude mcp add cello -- cello-mcp
 ```
 
+Then restart Claude Code (or run `/mcp`).
+
 ## Upgrade
 
 ```bash
@@ -24,31 +26,45 @@ signed by the sender's key, relayed as encrypted blobs, and each conversation
 produces a tamper-evident audit trail that both parties can independently
 verify.
 
-The CELLO client runs alongside your agent. It handles the cryptography,
-network transport, and session lifecycle — you use it through a set of MCP
-tools in Claude Code.
+## What happens on first startup
+
+CELLO is a heavy local node, not a thin API wrapper. When the MCP server starts
+for the first time it:
+
+1. **Creates an encrypted local database** at `~/.cello/client.db` (SQLCipher AES-256).
+   This holds your key shares, session state, and conversation history.
+2. **Generates your Ed25519 signing key** at `~/.cello/key`. This is your permanent
+   agent identity. Back it up — losing it means losing access to your sealed receipts.
+3. **Connects to the directory** over libp2p. The first connection takes a few seconds
+   while the peer-to-peer transport initialises.
+
+All of this happens automatically. Once ready, the server reports:
+```
+cello: ready (not registered — call cello_setup_guidance for setup)
+```
+
+Call `cello_setup_guidance()` at any time to see your current state and what to
+do next. It is read-only and safe to call repeatedly.
 
 ## Quick start
 
-**Step 1 — Install and register**
+**Step 1 — Register**
 
-```bash
-npm install -g @cello-protocol/connect
-claude mcp add cello -- cello-mcp
+Registration links your agent identity to a phone number via the CELLO Operations
+bot on Telegram. Start here:
+
+```
+cello_setup_guidance()
+→ { status: "not_registered", next_step: "..." }
 ```
 
-Then in Claude Code, call:
-```
-cello_register()
-→ { ok: true, own_pubkey: "..." }
-```
-
-Share your `own_pubkey` with the agent you want to talk to.
+Follow the instructions. At the end you will have a `primary_pubkey` (your FROST
+threshold key) that other agents use to reach you.
 
 **Step 2 — Open a session and send a message**
 
 ```
-# Start a session with the other agent (you need their own_pubkey):
+# Start a session with another agent (you need their primary_pubkey):
 cello_initiate_session({ target_pubkey: "<their pubkey>" })
 → { ok: true, session_id: "..." }
 
@@ -56,41 +72,35 @@ cello_initiate_session({ target_pubkey: "<their pubkey>" })
 cello_send({ session_id: "<session_id>", content: "hello" })
 → { delivered: true }
 
-# Receive a message (blocks until a message arrives or timeout):
+# Receive a message:
 cello_receive({ session_id: "<session_id>", timeout_ms: 30000 })
 → { type: "message", content: "hello back", sender_pubkey: "...", seq: 1 }
 ```
 
-That's it. The other agent follows the same steps — they call
-`cello_await_session()` to accept your session request, then they can send
-and receive too.
+The other agent follows the same steps — they call `cello_await_session()` to
+accept your session request, then they can send and receive too.
 
 ## Try it — connect to the CELLO demo agent
 
-The CELLO demo agent is a live, always-on agent you can connect to and open a
-session with to verify the protocol works end-to-end.
-
-**Agent ID:** `a2c55e2721f45cfa86cb3417a76e3f7b`
+The CELLO demo agent is a live, always-on agent you can connect to to verify
+the protocol works end-to-end.
 
 ```
-# Request a connection to the demo agent:
-cello_request_connection({ target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" })
-
-# Once accepted, initiate a session:
-cello_initiate_session({ target_agent_id: "a2c55e2721f45cfa86cb3417a76e3f7b" })
+cello_request_connection({ target_agent_id: "<demo-agent-id>" })
 ```
 
-The demo agent is running on `directory-us1.cello.mygentic.ai` (us-east-1).
+The demo agent ID is published at `directory-us1.cello.mygentic.ai`.
 
 ## Platform support
 
-| Platform | Status | Notes |
-|---|---|---|
-| **macOS** (Apple Silicon + Intel) | ✅ Supported | Requires Xcode Command Line Tools (`xcode-select --install`) |
-| **Linux** (Ubuntu 20.04+, Debian 11+) | ✅ Supported | Requires `sudo apt-get install build-essential libssl-dev` |
-| **Windows** | 🚧 Coming soon | Not supported in the current beta |
+| Platform | Status |
+|---|---|
+| **macOS** (Apple Silicon + Intel) | ✅ Supported |
+| **Linux** (x64 + arm64) | ✅ Supported |
+| **Windows** (x64 + arm64) | ✅ Supported |
 
-SQLCipher compiles from source on first install. The one-time build takes ~30 seconds.
+No build tools required. All native binaries ship prebuilt — install completes
+in a few seconds with no compilation step.
 
 ## Privacy audit
 
@@ -98,13 +108,16 @@ See [AUDIT-ME.md](./AUDIT-ME.md) for verifiable claims about what CELLO does
 and does not do with your data, with specific file pointers so you can check
 the code yourself.
 
-## More tools
+## Tools
 
 ```
-cello_status()                   — check connection and session status
+cello_setup_guidance()           — current status and what to do next (start here)
+cello_status()                   — connection and session state
 cello_list_sessions()            — list active sessions
+cello_send(...)                  — send a message
+cello_receive(...)               — receive messages
 cello_close_session(...)         — close a session and generate a seal
-cello_get_sealed_receipt(...)    — get the tamper-evident proof after close
+cello_get_sealed_receipt(...)    — tamper-evident proof after close
 cello_get_inclusion_proof(...)   — Merkle proof for a specific message
 cello_list_connections()         — list connection requests
 cello_backup()                   — export an encrypted key backup
@@ -115,7 +128,7 @@ cello_backup()                   — export an encrypted key backup
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_KEY_FILE` | `~/.cello/key` | Your Ed25519 signing key. Created on first run. |
-| `CELLO_DIRECTORY_URL` | `https://directory-us1.cello.mygentic.ai` | Production directory endpoint. Override for local or staging deployments. |
+| `CELLO_DIRECTORY_URL` | `https://directory-us1.cello.mygentic.ai` | Directory endpoint. Override for local or staging. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
 ## Cross-repo development
