@@ -5533,24 +5533,40 @@ class CelloClientImpl implements CelloClient {
     stream: Stream,
     iter: AsyncIterator<Uint8Array>,
   ): Promise<void> {
+    process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: ENTERED loop\n`);
     try {
       while (true) {
         let result: IteratorResult<Uint8Array>;
         try {
           result = await iter.next();
-        } catch { break; }
-        if (result.done || result.value === undefined) break;
+        } catch (iterErr) {
+          const msg = iterErr instanceof Error ? iterErr.message : String(iterErr);
+          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: iter.next() THREW — breaking loop. error="${msg}"\n`);
+          break;
+        }
+        if (result.done || result.value === undefined) {
+          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: iter.next() returned done=${result.done} value=${result.value === undefined ? "undefined" : "present"} — breaking loop\n`);
+          break;
+        }
 
         let frame: Record<string, unknown>;
         try {
           frame = decode(toU8(result.value as unknown)) as Record<string, unknown>;
-        } catch { continue; }
+        } catch (decErr) {
+          const msg = decErr instanceof Error ? decErr.message : String(decErr);
+          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: CBOR decode failed — skipping frame. error="${msg}"\n`);
+          continue;
+        }
+
+        process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: received frame type="${String(frame["type"])}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}\n`);
 
         if (frame["type"] === "session_assignment" || frame["type"] === "session_request_error") {
           // Route to pending session_request resolver (if one is waiting)
           const resolve = this.#pendingSessionRequestResolve;
+          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: routing ${String(frame["type"])} — resolve=${resolve ? "SET" : "NULL"}\n`);
           if (resolve) {
             this.#pendingSessionRequestResolve = null;
+            process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: calling resolve() with frame type="${String(frame["type"])}"\n`);
             resolve(frame);
           } else if (frame["type"] === "session_assignment") {
             // No pending outbound request — this is an inbound assignment (participant B role).
@@ -5791,17 +5807,26 @@ class CelloClientImpl implements CelloClient {
           void this.#handleDisclosureResponse(frame);
         }
       }
-    } catch { /* stream closed */ }
+    } catch (outerErr) {
+      const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: outer catch fired — stream closed with error. error="${msg}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}\n`);
+    }
+
+    process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: LOOP EXITED — stream is closing. isSameStream=${this.#persistentSignalingStream === stream} pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"} pendingRegisterResolve=${this.#pendingRegisterResolve ? "SET" : "NULL"} pendingDkgReadyResolve=${this.#pendingDkgReadyResolve ? "SET" : "NULL"} pendingConnectionRequestResolvers.size=${this.#pendingConnectionRequestResolvers.size}\n`);
 
     // Stream closed — clear persistent stream ref
     if (this.#persistentSignalingStream === stream) {
       this.#persistentSignalingStream = null;
       this.#persistentSignalingIter = null;
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: cleared #persistentSignalingStream ref\n`);
+    } else {
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: #persistentSignalingStream was ALREADY replaced (different stream object) — not clearing\n`);
     }
 
     // If a register() call is pending (dkg_ready phase), unblock it with a synthetic error
     const dkgReadyResolve = this.#pendingDkgReadyResolve;
     if (dkgReadyResolve) {
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: unblocking pendingDkgReadyResolve with register_error/stream_closed\n`);
       this.#pendingDkgReadyResolve = null;
       dkgReadyResolve({ type: "register_error", reason: "stream_closed" });
     }
@@ -5809,6 +5834,7 @@ class CelloClientImpl implements CelloClient {
     // If a register() call is pending (register_success phase), unblock it with a synthetic error
     const regResolve = this.#pendingRegisterResolve;
     if (regResolve) {
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: unblocking pendingRegisterResolve with register_error/stream_closed\n`);
       this.#pendingRegisterResolve = null;
       regResolve({ type: "register_error", reason: "stream_closed" });
     }
@@ -5816,8 +5842,11 @@ class CelloClientImpl implements CelloClient {
     // If a session_request is pending, unblock it with a synthetic error
     const resolve = this.#pendingSessionRequestResolve;
     if (resolve) {
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: FIRING synthetic session_request_error/directory_unreachable — THIS IS THE BUG PATH\n`);
       this.#pendingSessionRequestResolve = null;
       resolve({ type: "session_request_error", reason: "directory_unreachable" });
+    } else {
+      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: no pending session request resolver — stream closed cleanly or after resolution\n`);
     }
 
     // CONNREQ-003: Unblock all pending connection request resolvers (AC-005)
