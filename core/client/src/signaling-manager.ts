@@ -166,6 +166,7 @@ export class SignalingManager {
       this.#ctx.logger.warn("signaling.stream.closed.with_pending_session_request", {
         note: "stream closed while session request was in-flight — synthetic directory_unreachable fired",
       });
+      process.stderr.write("[DIAG-A] onStreamClosed fired synthetic directory_unreachable — stream died before session_assignment arrived\n");
       this.#pendingSessionRequestResolve = null;
       sessionResolve({ type: "session_request_error", reason: "directory_unreachable" });
     }
@@ -634,6 +635,7 @@ export class SignalingManager {
     }
 
     const frame = responseFrame!;
+    process.stderr.write(`[DIAG-B] responseFrame received type="${String(frame["type"])}"\n`);
 
     if (frame["type"] === "session_request_error") {
       return mapSessionRequestErrorFrame(frame);
