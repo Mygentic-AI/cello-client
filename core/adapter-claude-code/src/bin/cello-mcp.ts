@@ -116,27 +116,27 @@ process.stderr.write("cello: starting...\n");
 const agentName = process.env["CELLO_AGENT_NAME"] ?? null;
 const lockFilePath = process.env["CELLO_LOCK_FILE_PATH"] ?? getLockFilePath(agentName);
 
-// CRITICAL-2: Validate CELLO_LOCK_FILE_PATH if set — reject paths outside ~/.cello/ in production.
+// CRITICAL-2: Validate the final lock file path — reject paths outside ~/.cello/ in production.
+// This guard applies regardless of which env var sourced the path (CELLO_LOCK_FILE_PATH or
+// CELLO_AGENT_NAME), so a traversal-containing agent name (e.g. "../../../tmp/attack") is
+// rejected with the same check as a bad CELLO_LOCK_FILE_PATH.
 // Use path.normalize (without realpathSync) so this works on first run before the lock file
 // or ~/.cello/ directory exists. The normalized path is checked against the normalized ~/.cello/
 // prefix — this catches directory traversal ("../") in the raw path without requiring the file
 // to exist. Note: symlink-based path traversal requires the symlink to already exist at the
 // exact lock file path; if an attacker can already write arbitrary symlinks to ~/.cello/ they
 // have broader access. The normalize check prevents the common env-var injection attack where
-// CELLO_LOCK_FILE_PATH=~/../../../etc/passwd is set directly.
-// Test/local environments allow flexibility for isolated test fixtures.
-if (process.env["CELLO_LOCK_FILE_PATH"]) {
-  // CELLO_LOCK_FILE_PATH is documented as "test only". Bypass validation only in NODE_ENV=test
-  // (unit/integration test runners set this). Do NOT bypass for CELLO_ENV=local — operators
-  // running in local mode are not running tests, and a misconfigured shell env var should
-  // still be rejected to prevent path traversal in the most common installation scenario.
+// CELLO_LOCK_FILE_PATH=~/../../../etc/passwd or CELLO_AGENT_NAME=../../tmp/attack is set.
+// Bypass only in NODE_ENV=test (integration test runners set this). Do NOT bypass for
+// CELLO_ENV=local — operators running in local mode are not running tests.
+{
   const isTestEnv = process.env["NODE_ENV"] === "test";
   if (!isTestEnv) {
     const userHome = homedir();
     const celloDir = normalize(join(userHome, ".cello")) + "/";
     const normalizedLockPath = normalize(lockFilePath);
     if (!normalizedLockPath.startsWith(celloDir)) {
-      process.stderr.write(`cello-mcp: CELLO_LOCK_FILE_PATH must be within ~/.cello/ directory\n`);
+      process.stderr.write(`cello-mcp: lock file path must be within ~/.cello/ directory\n`);
       process.stderr.write(`cello-mcp: Got: ${lockFilePath} (normalized to ${normalizedLockPath})\n`);
       process.exit(1);
     }
