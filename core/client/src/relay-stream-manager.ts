@@ -838,7 +838,7 @@ export class RelayStreamManager {
       ackResolve({ ok: false, reason });
     }
 
-    console.warn(`[cello-client] session_desynchronized: ${sessionIdHex} reason=${reason}`);
+    this.#ctx.logger.warn("session.relay.desynchronized", { sessionId: sessionIdHex, reason });
   }
 
   // ─── Gap fill (PERSIST-014) ──────────────────────────────────────────────────

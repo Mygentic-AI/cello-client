@@ -1465,6 +1465,7 @@ export function createClient(
     _evaluateCallCount: number;
     loadPersistedState(): Promise<void>;
     getLoadedPendingHashes(): Array<{ sessionId: string; hashHex: string; enqueuedAt: number }>;
+    announceToDirectory(): Promise<void>;
   };
 }
 

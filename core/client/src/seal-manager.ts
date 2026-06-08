@@ -391,7 +391,7 @@ export class SealManager {
     if (this.#ctx.getThresholdSigner()) {
       // SI-003: reject M1-era single-key seal notarizations in M2 mode
       if (signatureType === "single") {
-        console.warn(`[cello-client] unsupported_signature_type: single on session ${sessionIdHex}`);
+        this.#ctx.logger.warn("seal.signature.type.unsupported", { sessionId: sessionIdHex, signatureType: "single" });
         return;
       }
       if (signatureType !== "frost") {
@@ -445,7 +445,7 @@ export class SealManager {
       const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp);
 
       if (!verifyFrostSignature(frostSig, tbs, "cello-frost-seal-v1", signerPubkey)) {
-        console.warn(`[cello-client] frost_signature_invalid on session_sealed: ${sessionIdHex}`);
+        this.#ctx.logger.warn("seal.frost.signature.invalid", { sessionId: sessionIdHex, path: "m1_compat_frost" });
         return;
       }
 
@@ -475,7 +475,7 @@ export class SealManager {
       ]) as Uint8Array;
 
       if (!verify(directoryPubkey, tbs, dirSig)) {
-        console.warn(`[cello-client] directory_signature_invalid on session_sealed: ${sessionIdHex}`);
+        this.#ctx.logger.warn("seal.directory.signature.invalid", { sessionId: sessionIdHex });
         return;
       }
 
@@ -539,7 +539,7 @@ export class SealManager {
     if (isFrostInitiator) {
       const myPrimaryPubkey = this.#myPrimaryPubkey;
       if (!myPrimaryPubkey) {
-        console.warn(`[cello-client] no primary_pubkey set on initiator for session ${sessionIdHex}`);
+        this.#ctx.logger.warn("seal.frost.initiator.no.primary.pubkey", { sessionId: sessionIdHex });
         return;
       }
       verifyKey = myPrimaryPubkey;
@@ -549,7 +549,7 @@ export class SealManager {
 
     // SI-001: verify FROST signature before transitioning to sealed.
     if (!this.#ctx.getThresholdSigner()!.verifySignature(frostSig, tbs, "cello-frost-seal-v1", verifyKey)) {
-      console.warn(`[cello-client] seal_signature_invalid on session ${sessionIdHex}`);
+      this.#ctx.logger.warn("seal.frost.signature.invalid", { sessionId: sessionIdHex, path: "m2_frost" });
       return;
     }
 
@@ -925,7 +925,7 @@ export class SealManager {
     // Without it we cannot reconstruct the exact TBS and verification would be unsound.
     const closeTimestamp = session.close_timestamp ?? sealVerifiedEntry?.timestamp;
     if (closeTimestamp === undefined) {
-      console.warn(`[cello-client] session_frost_sealed: no close_timestamp for ${sessionIdHex}, cannot verify TBS`);
+      this.#ctx.logger.warn("seal.frost.sealed.missing.close.timestamp", { sessionId: sessionIdHex });
       return;
     }
     const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp);
@@ -941,7 +941,7 @@ export class SealManager {
     }
 
     if (!thresholdSigner.verifySignature(frostSig, tbs, "cello-frost-seal-v1", verifyKey)) {
-      console.warn(`[cello-client] session_frost_sealed: seal_signature_invalid on session ${sessionIdHex}`);
+      this.#ctx.logger.warn("seal.frost.sealed.signature.invalid", { sessionId: sessionIdHex });
       return;
     }
 
