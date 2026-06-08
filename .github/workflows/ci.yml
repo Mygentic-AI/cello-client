@@ -84,7 +84,7 @@ jobs:
       - name: Install trustless-cello interfaces dependencies (for publish)
         if: startsWith(github.ref, 'refs/tags/')
         working-directory: trustless-cello
-        run: pnpm install --frozen-lockfile --filter @cello-protocol/interfaces...
+        run: pnpm install --no-frozen-lockfile --filter @cello-protocol/interfaces...
 
       - name: Build @cello-protocol/interfaces (for publish)
         if: startsWith(github.ref, 'refs/tags/')
