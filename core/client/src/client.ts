@@ -113,14 +113,13 @@ import * as lp from "it-length-prefixed";
 import {
   buildEnvelope, serializeEnvelope, deserializeEnvelope, validateEnvelope,
   computeGenesisPrevRoot, encodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs,
-  decodeConnectionPackage, validateConnectionPackage,
 } from "@cello-protocol/protocol-types";
 import type { Structure2 } from "@cello-protocol/protocol-types";
-import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, mlDsaKeygen, mlDsaKeygenWithBytes, mlDsaVerify, FileMlDsaKeyProvider, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
 import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { LeafInput, IThresholdSigner } from "@cello-protocol/crypto";
 import { CELLO_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
-import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
+import { NetworkDirectoryNode } from "./network-directory-node.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -134,6 +133,10 @@ import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
 import type { AgentHashQueue } from "./agent-hash-queue.js";
 import { FrostThresholdSigner } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
+import { RegistrationManager } from "./registration-manager.js";
+import type { RegistrationContext } from "./registration-manager.js";
+import { ConnectionManager } from "./connection-manager.js";
+import type { ConnectionContext } from "./connection-manager.js";
 
 const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 const AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
@@ -408,95 +411,21 @@ class CelloClientImpl implements CelloClient {
   /** Callback fired when a disclosure_request_inbound arrives. */
   #onDisclosureRequestedHandler: ((event: import("@cello-protocol/protocol-types").DisclosureRequestInbound) => void) | undefined;
 
-  /**
-   * CONNREQ-003: Multi-slot resolver map for concurrent outbound connection requests.
-   * Keyed by target pubkey hex — one slot per unique target.
-   * Replaces the former single-slot #pendingConnectionRequestResolve field.
-   * Resolves when connection_established, connection_rejected, connection_insufficient,
-   * connection_request_error, or disclosure_request_inbound arrives for that target.
-   *
-   * Pseudocode (Phase P):
-   *   requestConnection(target):
-   *     if map.has(target) → log warn "connection.request.duplicate" → return error immediately
-   *     mint correlationId ; log info "connection.request.sent"
-   *     map.set(target, resolve)
-   *     await outcome / timeout
-   *     map.delete(target)
-   *     on established: log info "connection.established"
-   *     on error: log error "connection.request.failed"
-   *
-   *   signalingReader(connection_established):
-   *     target = frame.counterparty_pubkey
-   *     resolve = map.get(target) ; map.delete(target) ; resolve(frame)
-   *     (if no resolver: B's side — fires #onConnectionEstablishedHandler)
-   */
-  readonly #pendingConnectionRequestResolvers = new Map<string, (frame: Record<string, unknown>) => void>();
+  // Connection request resolver state moved to ConnectionManager
 
   /**
    * CONNREQ-003: TEST-ONLY escape hatch exposing resolver map size for memory-leak assertions.
    * Read by connreq-003 tests via (client as any)._pendingConnectionRequestResolverCount.
    */
   get _pendingConnectionRequestResolverCount(): number {
-    return this.#pendingConnectionRequestResolvers.size;
+    return this.#connectionManager.pendingConnectionRequestResolverCount;
   }
 
-  /**
-   * CONNREQ-003: Promise queue for concurrent awaitConnectionRequest() callers.
-   * Each entry is the resolve fn from one awaitConnectionRequest() call.
-   * When an inbound request arrives, the first queued resolver is called (FIFO).
-   * Replaces the polling-based single-caller pattern for the inbound side.
-   *
-   * Pseudocode (Phase P):
-   *   awaitConnectionRequest(timeoutMs):
-   *     if queue not empty: shift → return immediately with pending_review item
-   *     create Promise, push resolve fn to #pendingAwaitConnectionRequestResolvers
-   *     race against timeout
-   *     on item arrival: first resolver in queue receives the item (FIFO)
-   *
-   *   #handleInboundConnectionRequest (after queuing to #pendingReviewQueue):
-   *     if #pendingAwaitConnectionRequestResolvers.length > 0:
-   *       resolver = shift ; resolver(item) ; return (don't add to #pendingReviewQueue)
-   *     else: add to #pendingReviewQueue as before
-   */
-  readonly #pendingAwaitConnectionRequestResolvers: Array<(item: {
-    connection_request_id: string;
-    from_pubkey: string;
-    report: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }>;
-  }) => void> = [];
+  // Connection request await/inbound/review/decided state moved to ConnectionManager
 
-  /** Pending disclosure_response → resolver (connection_request_id → resolve for cello_respond_to_disclosure_request) */
-  readonly #pendingDisclosureResolvers = new Map<string, (result: Record<string, unknown>) => void>();
-
-  /**
-   * In-process pending connection requests (for B's side).
-   * connection_request_id → state tracking for responding/requesting disclosure.
-   */
-  readonly #pendingInboundRequests = new Map<string, {
-    connection_request_id: string;
-    from_pubkey: string;
-    package_cbor: Uint8Array;
-    round: number; // 1 = Round 1; 2 = Round 2 in-flight
-  }>();
-
-  /**
-   * FIFO queue of inbound connection requests that need agent review.
-   * Populated by #handleInboundConnectionRequest when verdict is pending_agent_review.
-   * Drained by awaitConnectionRequest(). CELLO-MCP-003.
-   */
-  readonly #pendingReviewQueue: Array<{
-    connection_request_id: string;
-    from_pubkey: string;
-    report: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }>;
-    package_cbor: Uint8Array;
-    sender_registered_at: number;
-    sender_is_provisional: boolean;
-  }> = [];
-
-  /**
-   * Tracks which connection_request_ids have been decided (accepted, rejected, or requested disclosure).
-   * Used to prevent double-decisions. CELLO-MCP-003.
-   */
-  readonly #decidedRequests = new Set<string>();
+  // ─── Managers (extracted method groups) ──────────────────────────────────────
+  readonly #registrationManager: RegistrationManager;
+  readonly #connectionManager: ConnectionManager;
 
   // ─── PERSIST-014: Logger (injected, defaults to no-op) ───────────────────────
   readonly #logger: Logger;
@@ -558,6 +487,55 @@ class CelloClientImpl implements CelloClient {
     this.#crossCheckDirectoryOnInbound = crossCheckDirectoryOnInbound;
     this.#logger = logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
     this.#persistence = persistence ?? null;
+
+    // Wire up RegistrationManager with narrow context interface
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    const regCtx: RegistrationContext = {
+      get node() { return self.#node; },
+      get keyProvider() { return self.#keyProvider; },
+      get logger() { return self.#logger; },
+      get persistence() { return self.#persistence; },
+      get mlDsaKeyFile() { return self.#mlDsaKeyFile; },
+      getMyPubkeyHex: () => self.#myPubkeyHex,
+      setMyPubkeyHex: (hex: string) => { self.#myPubkeyHex = hex; },
+      getDirectoryEndpoint: () => self.#directoryEndpoint,
+      getThresholdSigner: () => self.#thresholdSigner,
+      setThresholdSigner: (signer: IThresholdSigner) => { self.#thresholdSigner = signer; },
+      getRegistrationState: () => self.#registrationState,
+      setRegistrationState: (state: RegistrationState | null) => { self.#registrationState = state; },
+      getMlDsaProvider: () => self.#mlDsaProvider,
+      setMlDsaProvider: (provider: import("@cello-protocol/crypto").MlDsaKeyProvider | null) => { self.#mlDsaProvider = provider; },
+      getMyPrimaryPubkey: () => self.#myPrimaryPubkey,
+      setMyPrimaryPubkey: (pubkey: Uint8Array) => { self.#myPrimaryPubkey = new Uint8Array(pubkey); },
+      getPersistentSignalingStream: () => self.#persistentSignalingStream,
+      openPersistentSignalingStream: () => self.#openPersistentSignalingStream(),
+      setPendingDkgReadyResolve: (resolve) => { self.#pendingDkgReadyResolve = resolve; },
+      setPendingRegisterResolve: (resolve) => { self.#pendingRegisterResolve = resolve; },
+    };
+    this.#registrationManager = new RegistrationManager(regCtx);
+
+    // Wire up ConnectionManager with narrow context interface
+    const connCtx: ConnectionContext = {
+      get logger() { return self.#logger; },
+      get persistence() { return self.#persistence; },
+      get connectionTimeoutMs() { return self.#connectionTimeoutMs; },
+      get round2TimeoutMs() { return self.#round2TimeoutMs; },
+      get trackEvaluateCount() { return self.#trackEvaluateCount; },
+      get whitelist() { return self.#whitelist; },
+      get crossCheckDirectoryOnInbound() { return self.#crossCheckDirectoryOnInbound; },
+      get connectionPolicy() { return self.#connectionPolicy; },
+      get onConnectionPendingReview() { return self.#onConnectionPendingReview; },
+      get onConnectionEstablishedHandler() { return self.#onConnectionEstablishedHandler; },
+      get onDisclosureRequestedHandler() { return self.#onDisclosureRequestedHandler; },
+      getPersistentSignalingStream: () => self.#persistentSignalingStream,
+      openPersistentSignalingStream: () => self.#openPersistentSignalingStream(),
+      getConnectionsByPeer: () => self.#connectionsByPeer,
+      getConnections: () => self.#connections,
+      getProfileUncheckedPeers: () => self.#profileUncheckedPeers,
+      incrementEvaluateCallCount: () => { self._evaluateCallCount++; },
+    };
+    this.#connectionManager = new ConnectionManager(connCtx);
   }
 
   /**
@@ -858,7 +836,7 @@ class CelloClientImpl implements CelloClient {
 
     // ── 8. Decided requests ───────────────────────────────────────────────────
     for (const row of state.decidedRequests) {
-      this.#decidedRequests.add(row.request_id);
+      this.#connectionManager.restoreDecidedRequest(row.request_id);
     }
 
     // ── 9. Pending connection requests ────────────────────────────────────────
@@ -866,14 +844,14 @@ class CelloClientImpl implements CelloClient {
       const packageCbor = row.package_cbor instanceof Buffer
         ? new Uint8Array(row.package_cbor)
         : new Uint8Array(row.package_cbor as Uint8Array);
-      // Populate #pendingInboundRequests so acceptConnection/rejectConnection work
-      this.#pendingInboundRequests.set(row.request_id, {
+      // Populate ConnectionManager#pendingInboundRequests so acceptConnection/rejectConnection work
+      this.#connectionManager.restorePendingInboundRequest({
         connection_request_id: row.request_id,
         from_pubkey: row.from_pubkey,
         package_cbor: packageCbor,
         round: row.round,
       });
-      // Populate #pendingReviewQueue so awaitConnectionRequest() returns it.
+      // Populate ConnectionManager#pendingReviewQueue so awaitConnectionRequest() returns it.
       // Reconstruct a minimal pending_agent_review report — the full policy evaluation
       // result is not persisted, only the package_cbor. The agent review UI only needs
       // the connection_request_id, from_pubkey, and package_cbor to make a decision.
@@ -895,7 +873,7 @@ class CelloClientImpl implements CelloClient {
         },
         is_round_2: row.round > 1,
       };
-      this.#pendingReviewQueue.push({
+      this.#connectionManager.restoreReviewQueueItem({
         connection_request_id: row.request_id,
         from_pubkey: row.from_pubkey,
         report: restoredReport,
@@ -2684,9 +2662,9 @@ class CelloClientImpl implements CelloClient {
     stream: Stream,
     frame: Record<string, unknown>,
   ): Promise<void> {
-    process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: thresholdSigner=${this.#thresholdSigner ? "SET" : "NULL"}\n`);
+    this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: thresholdSigner=${this.#thresholdSigner ? "SET" : "NULL"}` });
     if (!this.#thresholdSigner) {
-      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ABORT thresholdSigner is null — sending null ceremony_result\n`);
+      this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: ABORT thresholdSigner is null — sending null ceremony_result` });
       const ceremonyId = frame["ceremony_id"] as string | undefined;
       if (ceremonyId) {
         stream.send(lp.encode.single(CBOR_ENC.encode({ type: "ceremony_result", ceremony_id: ceremonyId, signature: null })));
@@ -2700,21 +2678,21 @@ class CelloClientImpl implements CelloClient {
       : Buffer.isBuffer(tbsRaw) ? new Uint8Array(tbsRaw as Buffer) : null;
     const context = frame["context"] as string | undefined;
 
-    process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ceremonyId=${ceremonyId?.slice(0,16)} tbs=${tbs ? `Uint8Array(${tbs.length})` : "NULL"} context=${context}\n`);
+    this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: ceremonyId=${ceremonyId?.slice(0,16)} tbs=${tbs ? `Uint8Array(${tbs.length})` : "NULL"} context=${context}` });
 
     if (!ceremonyId || !tbs || !context) {
-      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: ABORT missing fields ceremonyId=${!!ceremonyId} tbs=${!!tbs} context=${!!context}\n`);
+      this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: ABORT missing fields ceremonyId=${!!ceremonyId} tbs=${!!tbs} context=${!!context}` });
       return;
     }
 
     try {
-      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: calling participateInCeremony\n`);
+      this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: calling participateInCeremony` });
       const result = await this.#thresholdSigner.participateInCeremony(
         ceremonyId,
         tbs,
         context as import("@cello-protocol/crypto/frost/types.js").FrostContext,
       );
-      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: participateInCeremony returned ok=${result.ok} reason=${!result.ok ? (result as { error: { reason: string } }).error?.reason : "N/A"}\n`);
+      this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: participateInCeremony returned ok=${result.ok} reason=${!result.ok ? (result as { error: { reason: string } }).error?.reason : "N/A"}` });
 
       const sig = result.ok ? result.signature : null;
       stream.send(lp.encode.single(CBOR_ENC.encode({
@@ -2724,7 +2702,7 @@ class CelloClientImpl implements CelloClient {
       })));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`[CLIENT-DEBUG] handleCeremonyRequest: CAUGHT ERROR: ${msg}\n`);
+      this.#logger.debug("frost.ceremony.debug", { message: `handleCeremonyRequest: CAUGHT ERROR: ${msg}` });
       stream.send(lp.encode.single(CBOR_ENC.encode({
         type: "ceremony_result",
         ceremony_id: ceremonyId,
@@ -3690,253 +3668,7 @@ class CelloClientImpl implements CelloClient {
    * Crypto refs: NIST FIPS 204 (ML-DSA-44), RFC 9591 (FROST), FIPS 180-4 (SHA-256)
    */
   async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
-    // Step 1: already registered — return error
-    if (this.#registrationState) {
-      return { error: "already_registered" };
-    }
-
-    // Step 2: generate or load ML-DSA-44 keypair (NIST FIPS 204)
-    // PERSIST-024: use mlDsaKeygenWithBytes when persistence is enabled to capture raw secret bytes
-    let mlDsaProvider: import("@cello-protocol/crypto").MlDsaKeyProvider;
-    let mlDsaSecretKeyBlob: Uint8Array | null = null;
-    if (this.#mlDsaKeyFile) {
-      mlDsaProvider = await FileMlDsaKeyProvider.load(this.#mlDsaKeyFile);
-    } else if (this.#persistence) {
-      const { provider, secretKeyBlob } = await mlDsaKeygenWithBytes();
-      mlDsaProvider = provider;
-      mlDsaSecretKeyBlob = secretKeyBlob;
-    } else {
-      mlDsaProvider = await mlDsaKeygen();
-    }
-    const mlDsaPubkey = await mlDsaProvider.getPublicKey();
-    const mlDsaPubkeyHex = Buffer.from(mlDsaPubkey).toString("hex");
-
-    // Step 3: open persistent signaling stream (handles auth including auth_ok wait)
-    const opened = await this.#openPersistentSignalingStream();
-    if (!opened || !this.#persistentSignalingStream) {
-      return { error: "directory_unreachable" };
-    }
-
-    // Step 4: get K_local pubkey hex
-    if (!this.#myPubkeyHex) {
-      const pubkey = await this.#keyProvider.getPublicKey();
-      this.#myPubkeyHex = Buffer.from(pubkey).toString("hex");
-    }
-    const kLocalPubkeyHex = this.#myPubkeyHex;
-
-    // Step 5: send register_request
-    const regRequestFrame = CBOR_ENC.encode({
-      type: "register_request",
-      phone_stub: phoneStub,
-      k_local_pubkey: kLocalPubkeyHex,
-      ml_dsa_pubkey: mlDsaPubkeyHex,
-    }) as Uint8Array;
-    this.#persistentSignalingStream.send(lp.encode.single(regRequestFrame));
-
-    // Step 5a: await dkg_ready from directory (routed by #runPersistentSignalingReader)
-    const DKG_READY_TIMEOUT_MS = 15_000;
-    let dkgReadyTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const dkgReadyFrame = await Promise.race<Record<string, unknown>>([
-      new Promise<Record<string, unknown>>((resolve) => {
-        this.#pendingDkgReadyResolve = resolve;
-      }),
-      new Promise<Record<string, unknown>>((resolve) => {
-        dkgReadyTimeoutHandle = setTimeout(() => {
-          this.#pendingDkgReadyResolve = null;
-          resolve({ type: "register_error", reason: "timeout" });
-        }, DKG_READY_TIMEOUT_MS);
-      }),
-    ]);
-    clearTimeout(dkgReadyTimeoutHandle);
-
-    if (dkgReadyFrame["type"] !== "dkg_ready") {
-      const reason = (dkgReadyFrame["reason"] as string | undefined) ?? "unknown";
-      // already_registered: directory skips dkg_ready and sends register_error directly.
-      // Reconstruct RegistrationState from profile fields in the error frame.
-      if (
-        reason === "already_registered" &&
-        dkgReadyFrame["agent_id"] &&
-        dkgReadyFrame["primary_pubkey"]
-      ) {
-        const state: RegistrationState = {
-          agent_id: dkgReadyFrame["agent_id"] as string,
-          primary_pubkey: dkgReadyFrame["primary_pubkey"] as string,
-          ml_dsa_pubkey: (dkgReadyFrame["ml_dsa_pubkey"] as string | undefined) ?? mlDsaPubkeyHex,
-          // registered_at is set to now — the already_registered frame does not carry the
-          // original timestamp. Callers must not treat this as the canonical registration time.
-          registered_at: Date.now(),
-          status: "active",
-        };
-        this.#registrationState = state;
-        this.#mlDsaProvider = mlDsaProvider;
-        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
-        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
-        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
-        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
-        // Note on FROST share: DKG was skipped by the directory in this path, so no FROST share exists.
-        // On the next restart, client.frost.share.missing will fire — that is correct behavior.
-        // The operator should investigate why the directory considers this agent already registered
-        // without a local FROST share.
-        if (this.#persistence && mlDsaSecretKeyBlob) {
-          void this.#persistence.persistMlDsaKeypair({
-            mlDsaPubkey: mlDsaPubkeyHex,
-            secretKeyBlob: mlDsaSecretKeyBlob,
-          });
-          void this.#persistence.persistRegistrationState({
-            agentId: state.agent_id,
-            primaryPubkey: state.primary_pubkey,
-            mlDsaPubkey: state.ml_dsa_pubkey,
-            registeredAt: state.registered_at,
-          });
-        }
-        return state;
-      }
-      return { error: reason };
-    }
-
-    // Step 5b: run real FROST DKG over /cello/frost/1.0.0 (RFC 9591)
-    const epochId = dkgReadyFrame["epochId"] as string;
-    const participants = dkgReadyFrame["participants"] as number;
-    const threshold = dkgReadyFrame["threshold"] as number;
-    if (!this.#directoryEndpoint) {
-      return { error: "directory_unreachable" };
-    }
-    const dirNode = new NetworkDirectoryNode({
-      id: this.#directoryEndpoint.peer_id,
-      node: this.#node,
-      directoryPeerId: this.#directoryEndpoint.peer_id,
-      directoryMultiaddrs: this.#directoryEndpoint.multiaddrs,
-    });
-    // epochId is noted here for tracing; runNetworkDkg derives its own epochId internally
-    void epochId;
-    const kLocalPubkeyBytes = Buffer.from(kLocalPubkeyHex, "hex");
-    let dkgPrimaryPubkeyHex: string;
-    try {
-      const dkgResult = await runNetworkDkg(kLocalPubkeyBytes, {
-        threshold,
-        participants,
-        directoryNodes: [dirNode],
-        preAuthToken,
-      });
-      dkgPrimaryPubkeyHex = Buffer.from(dkgResult.primaryPubkey).toString("hex");
-      // Store the threshold signer so ceremony_request frames can be handled.
-      // The signer holds the client's local FROST share and the directory as a stub.
-      this.#thresholdSigner = dkgResult.signer;
-      // SESSION-005: update primary_pubkey so seal verification uses the DKG-derived key.
-      this.#myPrimaryPubkey = new Uint8Array(dkgResult.primaryPubkey);
-      // PERSIST-024: persist FROST key share to DB (SI-001: signingShare is raw bytes, never logged)
-      if (this.#persistence) {
-        const commitmentsCbor = CBOR_ENC.encode(dkgResult.commitments) as Uint8Array;
-        const verifyingSharesCbor = CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array;
-        void this.#persistence.persistFrostKeyShare({
-          epochId,
-          primaryPubkey: dkgPrimaryPubkeyHex,
-          identifier: dkgResult.identifier,
-          signingShare: dkgResult.signingShare,
-          threshold: dkgResult.threshold,
-          participants: dkgResult.participants,
-          commitmentsCbor,
-          verifyingSharesCbor,
-          dkgMethod: "network_dkg",
-        });
-      }
-    } catch {
-      return { error: "dkg_failed" };
-    }
-
-    // Step 5c: send dkg_complete with the agreed primary_pubkey
-    const dkgCompleteFrame = CBOR_ENC.encode({
-      type: "dkg_complete",
-      primary_pubkey: dkgPrimaryPubkeyHex,
-    }) as Uint8Array;
-    this.#persistentSignalingStream.send(lp.encode.single(dkgCompleteFrame));
-
-    // Step 6: await register_success or register_error (routed by #runPersistentSignalingReader)
-    const REGISTER_TIMEOUT_MS = 15_000;
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const responseWithTimeout = await Promise.race<Record<string, unknown>>([
-      new Promise<Record<string, unknown>>((resolve) => {
-        this.#pendingRegisterResolve = resolve;
-      }),
-      new Promise<Record<string, unknown>>((resolve) => {
-        timeoutHandle = setTimeout(() => {
-          this.#pendingRegisterResolve = null;
-          resolve({ type: "register_error", reason: "timeout" });
-        }, REGISTER_TIMEOUT_MS);
-      }),
-    ]);
-    clearTimeout(timeoutHandle);
-
-    if (responseWithTimeout["type"] !== "register_success") {
-      const reason = (responseWithTimeout["reason"] as string | undefined) ?? "unknown";
-      // already_registered: directory persisted the profile from a prior session.
-      // Reconstruct RegistrationState from the profile data included in the error frame
-      // so the agent can continue without a new DKG ceremony.
-      if (
-        reason === "already_registered" &&
-        responseWithTimeout["agent_id"] &&
-        responseWithTimeout["primary_pubkey"]
-      ) {
-        const state: RegistrationState = {
-          agent_id: responseWithTimeout["agent_id"] as string,
-          primary_pubkey: responseWithTimeout["primary_pubkey"] as string,
-          ml_dsa_pubkey: (responseWithTimeout["ml_dsa_pubkey"] as string | undefined) ?? mlDsaPubkeyHex,
-          registered_at: Date.now(),
-          status: "active",
-        };
-        this.#registrationState = state;
-        this.#mlDsaProvider = mlDsaProvider;
-        // HIGH-5: persist ML-DSA keypair and registration state on already_registered fast-return
-        // Note: the guard is `this.#persistence && mlDsaSecretKeyBlob`. When #mlDsaKeyFile is set,
-        // the agent uses FileMlDsaKeyProvider which manages its own file-based key persistence —
-        // mlDsaSecretKeyBlob will be null in that path and the SQLCipher persistence skip is intentional.
-        if (this.#persistence && mlDsaSecretKeyBlob) {
-          void this.#persistence.persistMlDsaKeypair({
-            mlDsaPubkey: mlDsaPubkeyHex,
-            secretKeyBlob: mlDsaSecretKeyBlob,
-          });
-          void this.#persistence.persistRegistrationState({
-            agentId: state.agent_id,
-            primaryPubkey: state.primary_pubkey,
-            mlDsaPubkey: state.ml_dsa_pubkey,
-            registeredAt: state.registered_at,
-          });
-        }
-        return state;
-      }
-      return { error: reason };
-    }
-
-    // Step 7: build RegistrationState and cache
-    const agentId = responseWithTimeout["agent_id"] as string;
-    const primaryPubkey = responseWithTimeout["primary_pubkey"] as string;
-
-    const state: RegistrationState = {
-      agent_id: agentId,
-      primary_pubkey: primaryPubkey,
-      ml_dsa_pubkey: mlDsaPubkeyHex,
-      registered_at: Date.now(),
-      status: "active",
-    };
-    this.#registrationState = state;
-    // Store the ML-DSA key provider so MCP tools can build ConnectionPackages (CELLO-MCP-003).
-    this.#mlDsaProvider = mlDsaProvider;
-    // PERSIST-024: persist ML-DSA keypair and registration state (SI-002: secretKeyBlob is raw bytes, never logged)
-    if (this.#persistence && mlDsaSecretKeyBlob) {
-      void this.#persistence.persistMlDsaKeypair({
-        mlDsaPubkey: mlDsaPubkeyHex,
-        secretKeyBlob: mlDsaSecretKeyBlob,
-      });
-    }
-    if (this.#persistence) {
-      void this.#persistence.persistRegistrationState({
-        agentId: state.agent_id,
-        primaryPubkey: state.primary_pubkey,
-        mlDsaPubkey: state.ml_dsa_pubkey,
-        registeredAt: state.registered_at,
-      });
-    }
-    return state;
+    return this.#registrationManager.register(phoneStub, preAuthToken);
   }
 
   async #handleInbound(stream: Stream): Promise<void> {
@@ -4110,171 +3842,23 @@ class CelloClientImpl implements CelloClient {
     | { accepted: true; connection_id: string }
     | { error: { reason: "no_pending_request" | "already_decided" } }
   > {
-    const pending = this.#pendingInboundRequests.get(connectionRequestId);
-    if (!pending) {
-      if (this.#decidedRequests.has(connectionRequestId)) {
-        return { error: { reason: "already_decided" } };
-      }
-      return { error: { reason: "no_pending_request" } };
-    }
-    if (this.#decidedRequests.has(connectionRequestId)) {
-      return { error: { reason: "already_decided" } };
-    }
-
-    // Mark as decided before sending to prevent races
-    this.#decidedRequests.add(connectionRequestId);
-    this.#pendingInboundRequests.delete(connectionRequestId);
-    // CRIT-2: persist decision
-    if (this.#persistence) {
-      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "accepted");
-    }
-
-    if (!this.#persistentSignalingStream) {
-      // Stream gone — still mark as decided
-      return { error: { reason: "no_pending_request" } };
-    }
-
-    const responseFrame = CBOR_ENC.encode({
-      type: "connection_response",
-      connection_request_id: connectionRequestId,
-      verdict: "accept",
-    }) as Uint8Array;
-
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(responseFrame));
-    } catch {
-      return { error: { reason: "no_pending_request" } };
-    }
-
-    // Wait for connection_established to arrive via the signaling reader loop.
-    // The signaling reader will store the connection record and fire onConnectionEstablished.
-    // Poll #connections until the connection appears (or timeout).
-    const deadline = Date.now() + this.#connectionTimeoutMs;
-    while (Date.now() < deadline) {
-      const connectionId = this.#connectionsByPeer.get(pending.from_pubkey);
-      if (connectionId) {
-        return { accepted: true, connection_id: connectionId };
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(20, remaining)));
-    }
-
-    return { error: { reason: "no_pending_request" } };
+    return this.#connectionManager.acceptConnection(connectionRequestId);
   }
 
-  /**
-   * Reject a pending inbound connection request (inference review mode).
-   * Sends connection_response { verdict: 'reject' } to the directory.
-   * CELLO-MCP-003.
-   */
   async rejectConnection(connectionRequestId: string, reason?: string): Promise<
     | { rejected: true }
     | { error: { reason: "no_pending_request" | "already_decided" } }
   > {
-    const pending = this.#pendingInboundRequests.get(connectionRequestId);
-    if (!pending) {
-      if (this.#decidedRequests.has(connectionRequestId)) {
-        return { error: { reason: "already_decided" } };
-      }
-      return { error: { reason: "no_pending_request" } };
-    }
-    if (this.#decidedRequests.has(connectionRequestId)) {
-      return { error: { reason: "already_decided" } };
-    }
-
-    // Mark as decided
-    this.#decidedRequests.add(connectionRequestId);
-    this.#pendingInboundRequests.delete(connectionRequestId);
-    // CRIT-2: persist decision
-    if (this.#persistence) {
-      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "rejected");
-    }
-
-    if (!this.#persistentSignalingStream) {
-      return { rejected: true };
-    }
-
-    const payload: Record<string, unknown> = {
-      type: "connection_response",
-      connection_request_id: connectionRequestId,
-      verdict: "reject",
-    };
-    if (reason !== undefined) payload["reason"] = reason;
-
-    const responseFrame = CBOR_ENC.encode(payload) as Uint8Array;
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(responseFrame));
-    } catch { /* stream closed */ }
-
-    return { rejected: true };
+    return this.#connectionManager.rejectConnection(connectionRequestId, reason);
   }
 
-  /**
-   * Request more disclosure from sender (Round 2 initiation by target).
-   * Only valid when in Round 1 pending state.
-   * CELLO-MCP-003.
-   */
   async requestMoreDisclosure(connectionRequestId: string, requestedItems: unknown[]): Promise<
     | { request_sent: true }
     | { error: { reason: "no_pending_request" | "already_decided" | "max_rounds_reached" } }
   > {
-    const pending = this.#pendingInboundRequests.get(connectionRequestId);
-    if (!pending) {
-      if (this.#decidedRequests.has(connectionRequestId)) {
-        return { error: { reason: "already_decided" } };
-      }
-      return { error: { reason: "no_pending_request" } };
-    }
-    if (this.#decidedRequests.has(connectionRequestId)) {
-      return { error: { reason: "already_decided" } };
-    }
-    if (pending.round >= 2) {
-      return { error: { reason: "max_rounds_reached" } };
-    }
-
-    // Advance to Round 2
-    pending.round = 2;
-    // CRIT-2: persist disclosure decision
-    if (this.#persistence) {
-      void this.#persistence.decidePendingConnectionRequest(connectionRequestId, "more_disclosure");
-    }
-
-    if (!this.#persistentSignalingStream) {
-      return { error: { reason: "no_pending_request" } };
-    }
-
-    const disclosureFrame = CBOR_ENC.encode({
-      type: "disclosure_request",
-      connection_request_id: connectionRequestId,
-      requested_items: requestedItems,
-    }) as Uint8Array;
-
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(disclosureFrame));
-    } catch {
-      return { error: { reason: "no_pending_request" } };
-    }
-
-    return { request_sent: true };
+    return this.#connectionManager.requestMoreDisclosure(connectionRequestId, requestedItems);
   }
 
-  /**
-   * Block until an inbound connection request arrives for agent review,
-   * or until timeoutMs elapses. CELLO-MCP-003.
-   *
-   * CONNREQ-003: Supports multiple concurrent callers via Promise queue
-   * (#pendingAwaitConnectionRequestResolvers). Each caller gets its own Promise.
-   * When a new inbound request arrives, the first waiting resolver is called (FIFO).
-   * If #pendingReviewQueue already has items, the caller returns immediately.
-   *
-   * Pseudocode (Phase P):
-   *   1. if #pendingReviewQueue.length > 0: shift item and return immediately
-   *   2. create Promise with timeout
-   *   3. push resolve fn to #pendingAwaitConnectionRequestResolvers
-   *   4. await Promise.race([itemArrived, timeout])
-   *   5. on arrival: return pending_review ; on timeout: return { type: 'timeout' }
-   */
   async awaitConnectionRequest(timeoutMs = 30_000): Promise<
     | {
         type: "pending_review";
@@ -4284,84 +3868,14 @@ class CelloClientImpl implements CelloClient {
       }
     | { type: "timeout" }
   > {
-    // Fast path: if items already queued, return immediately (no Promise overhead)
-    if (this.#pendingReviewQueue.length > 0) {
-      const item = this.#pendingReviewQueue.shift()!;
-      return {
-        type: "pending_review",
-        connection_request_id: item.connection_request_id,
-        from_pubkey: item.from_pubkey,
-        report: item.report,
-      };
-    }
-
-    // CONNREQ-003: multi-slot await via Promise queue.
-    // Each caller registers its resolve fn; when an inbound request arrives,
-    // #handleInboundConnectionRequest calls the first waiting resolver (FIFO).
-    type AwaitItem = {
-      connection_request_id: string;
-      from_pubkey: string;
-      report: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }>;
-    };
-
-    let resolveItem!: (item: AwaitItem) => void;
-    const itemPromise = new Promise<AwaitItem>((resolve) => {
-      resolveItem = resolve;
-    });
-    this.#pendingAwaitConnectionRequestResolvers.push(resolveItem);
-
-    const result: { item: AwaitItem | null } = { item: null };
-    let timedOut = false;
-    await Promise.race([
-      itemPromise.then((i) => { result.item = i; }),
-      new Promise<void>((resolve) => setTimeout(() => { timedOut = true; resolve(); }, timeoutMs)),
-    ]);
-
-    // On timeout: remove our resolver from the queue if it hasn't been consumed yet
-    if (timedOut) {
-      const idx = this.#pendingAwaitConnectionRequestResolvers.indexOf(resolveItem);
-      if (idx !== -1) {
-        this.#pendingAwaitConnectionRequestResolvers.splice(idx, 1);
-      }
-      return { type: "timeout" };
-    }
-
-    const item = result.item;
-    if (!item) {
-      return { type: "timeout" };
-    }
-
-    return {
-      type: "pending_review",
-      connection_request_id: item.connection_request_id,
-      from_pubkey: item.from_pubkey,
-      report: item.report,
-    };
+    return this.#connectionManager.awaitConnectionRequest(timeoutMs);
   }
 
-  /**
-   * Send a connection_request to target B and wait for a final outcome.
-   * Returns:
-   *   { result: 'established', connection_id } — connection created
-   *   { result: 'rejected', reason } — target rejected
-   *   { result: 'insufficient', unmet_requirements } — target found requirements unmet
-   *   { result: 'disclosure_requested', connection_request_id, requested_items } — Round 2 request (unblocks sender)
-   *   { result: 'timeout', stage } — no response within timeout; stage identifies which phase timed out
-   *   { result: 'error', reason } — directory-level error (not_registered, target_not_found, etc.)
-   *
-   * AC-008 (DX-001): per-stage timeouts:
-   *   dialTimeoutMs  — stage 'dial':  timeout for opening the persistent signaling stream (default: connectionTimeoutMs)
-   *   sendTimeoutMs  — stage 'send':  timeout for sending the frame (default: connectionTimeoutMs)
-   *   waitTimeoutMs  — stage 'wait':  timeout for target response (default: connectionTimeoutMs)
-   */
   async cello_request_connection(opts: {
     target_pubkey: string;
     package_cbor: Uint8Array;
-    /** AC-008 (DX-001): stage 1 timeout — dial directory signaling stream, ms. Default: connectionTimeoutMs */
     dialTimeoutMs?: number;
-    /** AC-008 (DX-001): stage 2 timeout — deliver connection_request frame, ms. Default: connectionTimeoutMs */
     sendTimeoutMs?: number;
-    /** AC-008 (DX-001): stage 3 timeout — wait for target response, ms. Default: connectionTimeoutMs */
     waitTimeoutMs?: number;
   }): Promise<
     | { result: "established"; connection_id: string }
@@ -4371,197 +3885,9 @@ class CelloClientImpl implements CelloClient {
     | { result: "timeout"; stage: "dial" | "send" | "wait" }
     | { result: "error"; reason: string }
   > {
-    const targetPubkeyHex = opts.target_pubkey;
-
-    // CONNREQ-003 AC-002: reject duplicate concurrent requests to same target immediately.
-    // A second call for the same target while the first is still in flight would overwrite
-    // the first resolver, losing it. Instead, return an error immediately.
-    if (this.#pendingConnectionRequestResolvers.has(targetPubkeyHex)) {
-      this.#logger.warn("connection.request.duplicate", { targetPubkeyHex });
-      return { result: "error", reason: "connection_request_in_flight" };
-    }
-
-    // CONNREQ-003: Reserve this target's slot in the map BEFORE any async work.
-    // This is the earliest possible moment — before stream-open and before the
-    // frame is sent — so that a concurrent duplicate call (AC-002) is rejected
-    // even if the stream open is still in progress.
-    let resolveOutcome!: (result: Record<string, unknown>) => void;
-    const outcomePromise = new Promise<Record<string, unknown>>((resolve) => {
-      resolveOutcome = resolve;
-    });
-    this.#pendingConnectionRequestResolvers.set(targetPubkeyHex, resolveOutcome);
-
-    // AC-008 (DX-001): per-stage timeouts. Fall back to #connectionTimeoutMs if not provided.
-    const dialTimeoutMs = opts.dialTimeoutMs ?? this.#connectionTimeoutMs;
-    const sendTimeoutMs = opts.sendTimeoutMs ?? this.#connectionTimeoutMs;
-    const waitTimeoutMs = opts.waitTimeoutMs ?? this.#connectionTimeoutMs;
-
-    // Stage 1 — dial: Ensure the persistent signaling stream is open within dialTimeoutMs.
-    if (!this.#persistentSignalingStream) {
-      let dialTimedOut = false;
-      let opened = false;
-      await Promise.race([
-        this.#openPersistentSignalingStream().then((result) => { opened = result; }),
-        new Promise<void>((resolve) => setTimeout(() => { dialTimedOut = true; resolve(); }, dialTimeoutMs)),
-      ]);
-      if (dialTimedOut || !opened) {
-        this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
-        this.#logger.warn("client.connection.request.stage.timeout", { stage: "dial", timeoutMs: dialTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
-        return { result: "timeout", stage: "dial" };
-      }
-    }
-
-    // Mint a correlationId for this outbound connection request flow.
-    // Threaded through all log events in this flow (CONNREQ-003 observability ACs).
-    const correlationId = `connreq-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-
-    this.#logger.info("connection.request.sent", { targetPubkeyHex, correlationId });
-
-    // Build the frame
-    const frameBytes = CBOR_ENC.encode({
-      type: "connection_request",
-      target_pubkey: targetPubkeyHex,
-      package_cbor: opts.package_cbor,
-    }) as Uint8Array;
-
-    // Stage 2 — send: Deliver the frame within sendTimeoutMs.
-    // The .send() call is synchronous but may throw if the stream has disconnected.
-    // Wrap in a race so an unresponsive stream doesn't block indefinitely.
-    let sendTimedOut = false;
-    let sendError = false;
-    await Promise.race([
-      new Promise<void>((resolve) => {
-        try {
-          this.#persistentSignalingStream!.send(lp.encode.single(frameBytes));
-        } catch {
-          sendError = true;
-        }
-        resolve();
-      }),
-      new Promise<void>((resolve) => setTimeout(() => { sendTimedOut = true; resolve(); }, sendTimeoutMs)),
-    ]);
-    if (sendTimedOut) {
-      this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
-      this.#logger.warn("client.connection.request.stage.timeout", { stage: "send", timeoutMs: sendTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
-      return { result: "timeout", stage: "send" };
-    }
-    if (sendError) {
-      this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
-      return { result: "error", reason: "directory_unreachable" };
-    }
-
-    // Stage 3 — wait: Race outcome vs waitTimeoutMs (was: connectionTimeoutMs).
-    // DB-001: timeout cleans this slot without affecting concurrent requests to other targets.
-    let frame: Record<string, unknown> | null = null;
-    let timedOut = false;
-    await Promise.race([
-      outcomePromise.then((f) => { frame = f; }),
-      new Promise<void>((resolve) => setTimeout(() => { timedOut = true; resolve(); }, waitTimeoutMs)),
-    ]);
-
-    // Clean up this target's resolver slot on timeout
-    // (on successful resolution, the signaling reader already deleted it)
-    if (this.#pendingConnectionRequestResolvers.get(targetPubkeyHex) === resolveOutcome) {
-      this.#pendingConnectionRequestResolvers.delete(targetPubkeyHex);
-    }
-
-    if (timedOut || !frame) {
-      this.#logger.warn("client.connection.request.stage.timeout", { stage: "wait", timeoutMs: waitTimeoutMs, targetPubkeyOrAgentId: targetPubkeyHex });
-      return { result: "timeout", stage: "wait" };
-    }
-
-    const type = frame["type"] as string;
-
-    if (type === "connection_established") {
-      const connectionId = frame["connection_id"] as string;
-      const counterpartyPubkey = frame["counterparty_pubkey"] as string;
-      // Store connection record locally
-      const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
-        connection_id: connectionId,
-        counterparty_pubkey: counterpartyPubkey,
-        counterparty_primary_pubkey: "",
-        counterparty_ml_dsa_pubkey: "",
-        established_at: Date.now(),
-        status: "active",
-      };
-      this.#connections.set(connectionId, record);
-      this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
-      // PERSIST-024: persist connection to DB
-      if (this.#persistence) {
-        void this.#persistence.persistConnection({
-          connectionId,
-          counterpartyPubkey,
-          establishedAt: record.established_at,
-        });
-      }
-      this.#logger.info("connection.established", {
-        connectionId,
-        counterpartyPubkeyHex: counterpartyPubkey,
-        correlationId,
-      });
-      return { result: "established", connection_id: connectionId };
-    }
-
-    if (type === "connection_rejected") {
-      return { result: "rejected", reason: (frame["reason"] as string) ?? "rejected" };
-    }
-
-    if (type === "connection_insufficient") {
-      return { result: "insufficient", unmet_requirements: (frame["unmet_requirements"] as unknown[]) ?? [] };
-    }
-
-    if (type === "connection_request_error") {
-      const reason = (frame["reason"] as string) ?? "unknown";
-      // already_connected: hydrate the existing connection so the caller can proceed.
-      if (reason === "already_connected" && frame["connection_id"]) {
-        const connectionId = frame["connection_id"] as string;
-        if (!this.#connections.has(connectionId)) {
-          const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
-            connection_id: connectionId,
-            counterparty_pubkey: targetPubkeyHex,
-            counterparty_primary_pubkey: "",
-            counterparty_ml_dsa_pubkey: "",
-            established_at: Date.now(),
-            status: "active",
-          };
-          this.#connections.set(connectionId, record);
-          this.#connectionsByPeer.set(targetPubkeyHex, connectionId);
-          // PERSIST-024: persist connection to DB
-          if (this.#persistence) {
-            void this.#persistence.persistConnection({
-              connectionId,
-              counterpartyPubkey: targetPubkeyHex,
-              establishedAt: record.established_at,
-            });
-          }
-        }
-        this.#logger.info("connection.established", {
-          connectionId,
-          counterpartyPubkeyHex: targetPubkeyHex,
-          correlationId,
-        });
-        return { result: "established", connection_id: connectionId };
-      }
-      this.#logger.error("connection.request.failed", { targetPubkeyHex, reason, correlationId });
-      return { result: "error", reason };
-    }
-
-    if (type === "disclosure_request_inbound") {
-      return {
-        result: "disclosure_requested",
-        connection_request_id: frame["connection_request_id"] as string,
-        requested_items: (frame["requested_items"] as unknown[]) ?? [],
-      };
-    }
-
-    return { result: "error", reason: "unknown" };
+    return this.#connectionManager.cello_request_connection(opts);
   }
 
-  /**
-   * Respond to a disclosure request from the target (Round 2 sender side).
-   * Called after cello_request_connection returns { result: 'disclosure_requested' }.
-   * Sends disclosure_response and waits for the final connection outcome.
-   */
   async cello_respond_to_disclosure_request(opts: {
     connection_request_id: string;
     package_cbor: Uint8Array;
@@ -4572,115 +3898,14 @@ class CelloClientImpl implements CelloClient {
     | { result: "timeout" }
     | { result: "error"; reason: string }
   > {
-    if (!this.#persistentSignalingStream) {
-      return { result: "error", reason: "directory_unreachable" };
-    }
-
-    const frameBytes = CBOR_ENC.encode({
-      type: "disclosure_response",
-      connection_request_id: opts.connection_request_id,
-      package_cbor: opts.package_cbor,
-    }) as Uint8Array;
-
-    let resolveOutcome!: (result: Record<string, unknown>) => void;
-    const outcomePromise = new Promise<Record<string, unknown>>((resolve) => {
-      resolveOutcome = resolve;
-    });
-    this.#pendingDisclosureResolvers.set(opts.connection_request_id, resolveOutcome);
-
-    try {
-      this.#persistentSignalingStream!.send(lp.encode.single(frameBytes));
-    } catch {
-      this.#pendingDisclosureResolvers.delete(opts.connection_request_id);
-      return { result: "error", reason: "directory_unreachable" };
-    }
-
-    let frame: Record<string, unknown> | null = null;
-    let timedOut = false;
-    await Promise.race([
-      outcomePromise.then((f) => { frame = f; }),
-      new Promise<void>((resolve) => setTimeout(() => { timedOut = true; resolve(); }, this.#connectionTimeoutMs)),
-    ]);
-
-    this.#pendingDisclosureResolvers.delete(opts.connection_request_id);
-
-    if (timedOut || !frame) {
-      return { result: "timeout" };
-    }
-
-    const type = frame["type"] as string;
-
-    if (type === "connection_established") {
-      const connectionId = frame["connection_id"] as string;
-      const counterpartyPubkey = frame["counterparty_pubkey"] as string;
-      const establishedAt = Date.now();
-      const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
-        connection_id: connectionId,
-        counterparty_pubkey: counterpartyPubkey,
-        counterparty_primary_pubkey: "",
-        counterparty_ml_dsa_pubkey: "",
-        established_at: establishedAt,
-        status: "active",
-      };
-      this.#connections.set(connectionId, record);
-      this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
-      if (this.#persistence) {
-        void this.#persistence.persistConnection({
-          connectionId,
-          counterpartyPubkey,
-          establishedAt,
-        });
-      }
-      return { result: "established", connection_id: connectionId };
-    }
-
-    if (type === "connection_rejected") {
-      return { result: "rejected", reason: (frame["reason"] as string) ?? "rejected" };
-    }
-
-    if (type === "connection_insufficient") {
-      return { result: "insufficient", unmet_requirements: (frame["unmet_requirements"] as unknown[]) ?? [] };
-    }
-
-    return { result: "error", reason: "unknown" };
+    return this.#connectionManager.cello_respond_to_disclosure_request(opts);
   }
 
-  /**
-   * Request more disclosure from the sender (Round 2, target side).
-   * Returns { error: 'max_rounds_reached' } if Round 2 is already in flight.
-   */
   async cello_request_more_disclosure(opts: {
     connection_request_id: string;
     requested_items: unknown[];
   }): Promise<{ error: "max_rounds_reached" } | { ok: true }> {
-    const pending = this.#pendingInboundRequests.get(opts.connection_request_id);
-    if (!pending) {
-      return { error: "max_rounds_reached" }; // no such request or already completed
-    }
-    if (pending.round >= 2) {
-      return { error: "max_rounds_reached" };
-    }
-
-    // Advance to Round 2 state
-    pending.round = 2;
-
-    if (!this.#persistentSignalingStream) {
-      return { error: "max_rounds_reached" }; // stream gone
-    }
-
-    const frameBytes = CBOR_ENC.encode({
-      type: "disclosure_request",
-      connection_request_id: opts.connection_request_id,
-      requested_items: opts.requested_items,
-    }) as Uint8Array;
-
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(frameBytes));
-    } catch {
-      return { error: "max_rounds_reached" };
-    }
-
-    return { ok: true };
+    return this.#connectionManager.cello_request_more_disclosure(opts);
   }
 
   /**
@@ -4831,437 +4056,29 @@ class CelloClientImpl implements CelloClient {
     }
   }
 
-  /**
-   * TEST-ONLY escape hatch: inject a pending inbound connection request into state.
-   * Used by AC-010 to test max_rounds_reached without going through the full flow.
-   */
   _injectPendingConnectionRequest(opts: {
     connection_request_id: string;
     from_pubkey: string;
     package_cbor: Uint8Array;
     round: number;
   }): void {
-    this.#pendingInboundRequests.set(opts.connection_request_id, {
-      connection_request_id: opts.connection_request_id,
-      from_pubkey: opts.from_pubkey,
-      package_cbor: opts.package_cbor,
-      round: opts.round,
-    });
+    this.#connectionManager._injectPendingConnectionRequest(opts);
   }
 
-  /**
-   * CONNREQ-003 TEST-ONLY escape hatch: route a synthetic connection outcome frame
-   * through the same resolver logic as the signaling stream reader.
-   *
-   * Used by SI-001 adversarial test to inject a connection_established frame for
-   * target B while C's resolver is still pending, verifying that B's frame does NOT
-   * resolve C's resolver (Map-keyed routing isolation guarantee).
-   *
-   * Accepts the same frame types that the signaling reader handles for connection
-   * outcomes: connection_established, connection_rejected, connection_insufficient,
-   * connection_request_error, disclosure_request_inbound.
-   *
-   * Does not store a connection record (connection_established frames injected in
-   * tests bypass the full connection lifecycle — they test resolver routing only).
-   */
   _injectConnectionFrame(frame: Record<string, unknown>): void {
-    const type = frame["type"] as string;
-    if (type === "connection_established") {
-      const counterpartyPubkey = frame["counterparty_pubkey"] as string;
-      const resolve = this.#pendingConnectionRequestResolvers.get(counterpartyPubkey);
-      if (resolve) {
-        this.#pendingConnectionRequestResolvers.delete(counterpartyPubkey);
-        resolve(frame);
-      }
-    } else if (type === "disclosure_request_inbound") {
-      const targetPubkeyForDisclosure = frame["from_pubkey"] as string;
-      const resolve = this.#pendingConnectionRequestResolvers.get(targetPubkeyForDisclosure);
-      if (resolve) {
-        this.#pendingConnectionRequestResolvers.delete(targetPubkeyForDisclosure);
-        resolve(frame);
-      }
-    } else {
-      // connection_rejected, connection_insufficient, connection_request_error
-      const targetPubkeyForError = frame["target_pubkey"] as string | undefined;
-      if (targetPubkeyForError && this.#pendingConnectionRequestResolvers.has(targetPubkeyForError)) {
-        const resolve = this.#pendingConnectionRequestResolvers.get(targetPubkeyForError)!;
-        this.#pendingConnectionRequestResolvers.delete(targetPubkeyForError);
-        resolve(frame);
-      } else if (this.#pendingConnectionRequestResolvers.size === 1) {
-        const [singleKey, singleResolve] = this.#pendingConnectionRequestResolvers.entries().next().value as [string, (frame: Record<string, unknown>) => void];
-        this.#pendingConnectionRequestResolvers.delete(singleKey);
-        singleResolve(frame);
-      }
-    }
+    this.#connectionManager._injectConnectionFrame(frame);
   }
 
-  // ─── CONNREQ-002: B-side inbound request handler ─────────────────────────────
+  // ─── CONNREQ-002: B-side inbound request handler (delegated to ConnectionManager) ──
 
-  /**
-   * Handle an inbound connection_request_inbound frame (B's side).
-   * CONNREQ-002 pseudocode (connection-request.ts story):
-   *   1. Check whitelist — if sender whitelisted, accept without policy evaluation
-   *   2. Decode + validate the ConnectionPackage (decodeConnectionPackage + validateConnectionPackage)
-   *   3. Build DirectoryContext from the frame-provided sender_registered_at / sender_is_provisional
-   *   4. Call evaluateConnectionPackage (increment _evaluateCallCount if trackEvaluateCount)
-   *   5a. auto_accept → send connection_response { verdict: 'accept' }
-   *   5b. auto_reject → send connection_response { verdict: 'reject', reason }
-   *   5c. auto_insufficient → send connection_response { verdict: 'insufficient', unmet_requirements }
-   *   5d. pending_agent_review → fire onConnectionPendingReview handler; store in #pendingInboundRequests;
-   *       optionally start round2TimeoutMs timer that auto-rejects on expiry
-   */
   async #handleInboundConnectionRequest(frame: Record<string, unknown>): Promise<void> {
-    if (!this.#persistentSignalingStream) return;
-
-    const connectionRequestId = frame["connection_request_id"] as string;
-    const fromPubkey = frame["from_pubkey"] as string;
-    const packageCborRaw = frame["package_cbor"];
-    const packageCbor = packageCborRaw instanceof Uint8Array ? packageCborRaw
-      : Buffer.isBuffer(packageCborRaw) ? new Uint8Array(packageCborRaw as Buffer) : null;
-
-    if (!connectionRequestId || !fromPubkey || !packageCbor) return;
-
-    const senderRegisteredAt = typeof frame["sender_registered_at"] === "number"
-      ? frame["sender_registered_at"] : 0;
-    const senderIsProvisional = frame["sender_is_provisional"] === true;
-
-    let verdict: "accept" | "reject" | "insufficient" = "reject";
-    let rejectReason: string | undefined;
-    let unmetRequirements: unknown[] | undefined;
-
-    const isWhitelisted = this.#whitelist.includes(fromPubkey);
-
-    if (isWhitelisted) {
-      verdict = "accept";
-    } else if (!this.#connectionPolicy) {
-      // No policy configured — default to accept
-      verdict = "accept";
-    } else {
-      // Decode and validate the package
-      let pkg;
-      try {
-        pkg = decodeConnectionPackage(packageCbor);
-      } catch {
-        verdict = "reject";
-        rejectReason = "package_decode_failed";
-        pkg = null;
-      }
-
-      if (pkg !== null) {
-        const fromPubkeyBytes = Buffer.from(fromPubkey, "hex");
-        const validatedPackage = validateConnectionPackage(
-          pkg,
-          fromPubkeyBytes,
-          Date.now(),
-          mlDsaVerify,
-        );
-
-        if (!validatedPackage.valid) {
-          verdict = "reject";
-          rejectReason = validatedPackage.reason;
-        } else {
-        const context: import("@cello-protocol/protocol-types").DirectoryContext = {
-          registered_at: senderRegisteredAt,
-          is_provisional: senderIsProvisional,
-          conversation_count: 0,
-          clean_close_rate: 0,
-        };
-
-        if (this.#trackEvaluateCount) {
-          this._evaluateCallCount++;
-        }
-
-        const { evaluateConnectionPackage } = await import("./connection-policy.js");
-        const report = evaluateConnectionPackage(
-          validatedPackage,
-          this.#connectionPolicy,
-          context,
-          Date.now(),
-        );
-
-        if (report.verdict === "auto_accept") {
-          verdict = "accept";
-        } else if (report.verdict === "auto_reject") {
-          verdict = "reject";
-          rejectReason = report.reason;
-        } else if (report.verdict === "auto_insufficient") {
-          if (this.#round2TimeoutMs > 0) {
-            // Round 2 enabled: send disclosure_request to ask for more
-            this.#pendingInboundRequests.set(connectionRequestId, {
-              connection_request_id: connectionRequestId,
-              from_pubkey: fromPubkey,
-              package_cbor: packageCbor,
-              round: 1,
-            });
-            const disclosureFrame = CBOR_ENC.encode({
-              type: "disclosure_request",
-              connection_request_id: connectionRequestId,
-              requested_items: report.unmet_requirements.map((u) => ({
-                type: u.signal_type,
-                condition: u.condition,
-              })),
-            }) as Uint8Array;
-            try {
-              this.#persistentSignalingStream!.send(lp.encode.single(disclosureFrame));
-            } catch { /* stream closed */ }
-            setTimeout(() => {
-              const stillPending = this.#pendingInboundRequests.get(connectionRequestId);
-              if (stillPending) {
-                this.#pendingInboundRequests.delete(connectionRequestId);
-                if (this.#persistentSignalingStream) {
-                  const timeoutFrame = CBOR_ENC.encode({
-                    type: "connection_response",
-                    connection_request_id: connectionRequestId,
-                    verdict: "reject",
-                    reason: "disclosure_timeout",
-                  }) as Uint8Array;
-                  try {
-                    this.#persistentSignalingStream.send(lp.encode.single(timeoutFrame));
-                  } catch { /* stream closed */ }
-                }
-              }
-            }, this.#round2TimeoutMs);
-            return;
-          }
-          verdict = "insufficient";
-          unmetRequirements = report.unmet_requirements;
-        } else {
-          // pending_agent_review: store for agent review and fire callback
-          this.#pendingInboundRequests.set(connectionRequestId, {
-            connection_request_id: connectionRequestId,
-            from_pubkey: fromPubkey,
-            package_cbor: packageCbor,
-            round: 1,
-          });
-
-          const reviewItem = {
-            connection_request_id: connectionRequestId,
-            from_pubkey: fromPubkey,
-            report,
-            package_cbor: packageCbor,
-            sender_registered_at: senderRegisteredAt,
-            sender_is_provisional: senderIsProvisional,
-          };
-
-          // CONNREQ-003: Deliver to the first waiting awaitConnectionRequest() caller (FIFO),
-          // or enqueue in #pendingReviewQueue if no callers are waiting.
-          const awaitResolver = this.#pendingAwaitConnectionRequestResolvers.shift();
-          if (awaitResolver) {
-            // Direct delivery to waiting caller — do not add to #pendingReviewQueue
-            awaitResolver({
-              connection_request_id: connectionRequestId,
-              from_pubkey: fromPubkey,
-              report,
-            });
-          } else {
-            // No caller waiting — enqueue for future awaitConnectionRequest() poll
-            this.#pendingReviewQueue.push(reviewItem);
-          }
-
-          // CRIT-2: persist pending connection request
-          if (this.#persistence) {
-            void this.#persistence.persistPendingConnectionRequest({
-              requestId: connectionRequestId,
-              fromPubkey,
-              packageCbor,
-              round: 1,
-            });
-          }
-
-          if (this.#onConnectionPendingReview) {
-            this.#onConnectionPendingReview({
-              type: "connection_request_inbound",
-              from_pubkey: fromPubkey,
-              connection_request_id: connectionRequestId,
-              package_cbor: packageCbor,
-              sender_registered_at: senderRegisteredAt,
-              sender_is_provisional: senderIsProvisional,
-            });
-          }
-
-          // Start round2TimeoutMs auto-reject timer
-          if (this.#round2TimeoutMs > 0) {
-            setTimeout(() => {
-              const stillPending = this.#pendingInboundRequests.get(connectionRequestId);
-              if (stillPending) {
-                this.#pendingInboundRequests.delete(connectionRequestId);
-                if (this.#persistentSignalingStream) {
-                  const responseFrame = CBOR_ENC.encode({
-                    type: "connection_response",
-                    connection_request_id: connectionRequestId,
-                    verdict: "reject",
-                    reason: "disclosure_timeout",
-                  }) as Uint8Array;
-                  try {
-                    this.#persistentSignalingStream.send(lp.encode.single(responseFrame));
-                  } catch { /* stream closed */ }
-                }
-              }
-            }, this.#round2TimeoutMs);
-          }
-          return; // do not send a connection_response yet
-        }
-        } // end of validatedPackage.valid else-branch
-      } else {
-        // pkg was null (decode failed) — verdict/rejectReason already set above
-      }
-    }
-
-    // DB-003: cross-check logic — mark as unchecked when enabled (profile-query not yet implemented)
-    if (verdict === "accept" && this.#crossCheckDirectoryOnInbound) {
-      this.#profileUncheckedPeers.add(fromPubkey);
-    }
-
-    // Send connection_response to directory
-    const responsePayload: Record<string, unknown> = {
-      type: "connection_response",
-      connection_request_id: connectionRequestId,
-      verdict,
-    };
-    if (rejectReason !== undefined) responsePayload["reason"] = rejectReason;
-    if (unmetRequirements !== undefined) responsePayload["unmet_requirements"] = unmetRequirements;
-
-    const responseFrame = CBOR_ENC.encode(responsePayload) as Uint8Array;
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(responseFrame));
-    } catch { /* stream closed — response lost */ }
+    return this.#connectionManager.handleInboundConnectionRequest(frame);
   }
 
-  /**
-   * Handle a disclosure_response_inbound frame (B's side, Round 2).
-   * Re-evaluates the updated package and sends final connection_response.
-   */
   async #handleDisclosureResponse(frame: Record<string, unknown>): Promise<void> {
-    if (!this.#persistentSignalingStream) return;
-
-    const connectionRequestId = frame["connection_request_id"] as string;
-    const packageCborRaw = frame["package_cbor"];
-    const packageCbor = packageCborRaw instanceof Uint8Array ? packageCborRaw
-      : Buffer.isBuffer(packageCborRaw) ? new Uint8Array(packageCborRaw as Buffer) : null;
-
-    if (!connectionRequestId || !packageCbor) return;
-
-    const pending = this.#pendingInboundRequests.get(connectionRequestId);
-    if (!pending) return; // stale — already handled or timed out
-
-    this.#pendingInboundRequests.delete(connectionRequestId);
-
-    const fromPubkey = pending.from_pubkey;
-
-    let verdict: "accept" | "reject" | "insufficient" = "reject";
-    let rejectReason: string | undefined;
-    let unmetRequirements: unknown[] | undefined;
-
-    if (!this.#connectionPolicy) {
-      verdict = "accept";
-    } else {
-      let pkg;
-      try {
-        pkg = decodeConnectionPackage(packageCbor);
-      } catch {
-        verdict = "reject";
-        rejectReason = "package_decode_failed";
-        pkg = null;
-      }
-
-      if (pkg !== null) {
-        const fromPubkeyBytes = Buffer.from(fromPubkey, "hex");
-        const validatedPackage = validateConnectionPackage(
-          pkg,
-          fromPubkeyBytes,
-          Date.now(),
-          mlDsaVerify,
-        );
-
-        if (!validatedPackage.valid) {
-          verdict = "reject";
-          rejectReason = validatedPackage.reason;
-        } else {
-          const context: import("@cello-protocol/protocol-types").DirectoryContext = {
-            registered_at: 0,
-            is_provisional: false,
-            conversation_count: 0,
-            clean_close_rate: 0,
-          };
-
-          if (this.#trackEvaluateCount) {
-            this._evaluateCallCount++;
-          }
-
-          const { evaluateConnectionPackage } = await import("./connection-policy.js");
-          const report = evaluateConnectionPackage(
-            validatedPackage,
-            this.#connectionPolicy,
-            context,
-            Date.now(),
-          );
-
-          if (report.verdict === "auto_accept") {
-            verdict = "accept";
-          } else if (report.verdict === "auto_reject") {
-            verdict = "reject";
-            rejectReason = report.reason;
-          } else if (report.verdict === "auto_insufficient") {
-            verdict = "insufficient";
-            unmetRequirements = report.unmet_requirements;
-          } else {
-            // pending_agent_review in Round 2 (inference mode) — surface for agent review with is_round_2: true.
-            // Build a Round 2 report by cloning the Round 1 report shape with is_round_2: true.
-            const round2Report = { ...report, is_round_2: true };
-            this.#pendingInboundRequests.set(connectionRequestId, {
-              connection_request_id: connectionRequestId,
-              from_pubkey: fromPubkey,
-              package_cbor: packageCbor,
-              round: 2,
-            });
-            if (this.#persistence) {
-              void this.#persistence.persistPendingConnectionRequest({
-                requestId: connectionRequestId,
-                fromPubkey,
-                packageCbor,
-                round: 2,
-              });
-            }
-            const round2ReviewItem = {
-              connection_request_id: connectionRequestId,
-              from_pubkey: fromPubkey,
-              report: round2Report,
-              package_cbor: packageCbor,
-              sender_registered_at: 0,
-              sender_is_provisional: false,
-            };
-            const awaitResolver = this.#pendingAwaitConnectionRequestResolvers.shift();
-            if (awaitResolver) {
-              awaitResolver({
-                connection_request_id: connectionRequestId,
-                from_pubkey: fromPubkey,
-                report: round2Report,
-              });
-            } else {
-              this.#pendingReviewQueue.push(round2ReviewItem);
-            }
-            // No response yet — wait for agent to call accept/reject.
-            return;
-          }
-        }
-      } else {
-        // pkg was null (decode failed) — verdict already set
-      }
-    }
-
-    const responsePayload: Record<string, unknown> = {
-      type: "connection_response",
-      connection_request_id: connectionRequestId,
-      verdict,
-    };
-    if (rejectReason !== undefined) responsePayload["reason"] = rejectReason;
-    if (unmetRequirements !== undefined) responsePayload["unmet_requirements"] = unmetRequirements;
-
-    const responseFrame = CBOR_ENC.encode(responsePayload) as Uint8Array;
-    try {
-      this.#persistentSignalingStream.send(lp.encode.single(responseFrame));
-    } catch { /* stream closed */ }
+    return this.#connectionManager.handleDisclosureResponse(frame);
   }
+
 
   // ─── ADAPTER-003: initiateSession ──────────────────────────────────────────
 
@@ -5533,7 +4350,7 @@ class CelloClientImpl implements CelloClient {
     stream: Stream,
     iter: AsyncIterator<Uint8Array>,
   ): Promise<void> {
-    process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: ENTERED loop\n`);
+    this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: ENTERED loop` });
     try {
       while (true) {
         let result: IteratorResult<Uint8Array>;
@@ -5541,11 +4358,11 @@ class CelloClientImpl implements CelloClient {
           result = await iter.next();
         } catch (iterErr) {
           const msg = iterErr instanceof Error ? iterErr.message : String(iterErr);
-          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: iter.next() THREW — breaking loop. error="${msg}"\n`);
+          this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: iter.next() THREW — breaking loop. error="${msg}"` });
           break;
         }
         if (result.done || result.value === undefined) {
-          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: iter.next() returned done=${result.done} value=${result.value === undefined ? "undefined" : "present"} — breaking loop\n`);
+          this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: iter.next() returned done=${result.done} value=${result.value === undefined ? "undefined" : "present"} — breaking loop` });
           break;
         }
 
@@ -5554,19 +4371,19 @@ class CelloClientImpl implements CelloClient {
           frame = decode(toU8(result.value as unknown)) as Record<string, unknown>;
         } catch (decErr) {
           const msg = decErr instanceof Error ? decErr.message : String(decErr);
-          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: CBOR decode failed — skipping frame. error="${msg}"\n`);
+          this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: CBOR decode failed — skipping frame. error="${msg}"` });
           continue;
         }
 
-        process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: received frame type="${String(frame["type"])}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}\n`);
+        this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: received frame type="${String(frame["type"])}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}` });
 
         if (frame["type"] === "session_assignment" || frame["type"] === "session_request_error") {
           // Route to pending session_request resolver (if one is waiting)
           const resolve = this.#pendingSessionRequestResolve;
-          process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: routing ${String(frame["type"])} — resolve=${resolve ? "SET" : "NULL"}\n`);
+          this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: routing ${String(frame["type"])} — resolve=${resolve ? "SET" : "NULL"}` });
           if (resolve) {
             this.#pendingSessionRequestResolve = null;
-            process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: calling resolve() with frame type="${String(frame["type"])}"\n`);
+            this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: calling resolve() with frame type="${String(frame["type"])}"` });
             resolve(frame);
           } else if (frame["type"] === "session_assignment") {
             // No pending outbound request — this is an inbound assignment (participant B role).
@@ -5699,108 +4516,10 @@ class CelloClientImpl implements CelloClient {
           frame["type"] === "connection_request_error" ||
           frame["type"] === "disclosure_request_inbound"
         ) {
-          // CONNREQ-002/CONNREQ-003: route connection outcome frames.
-          //
-          // CONNREQ-003: The single-slot #pendingConnectionRequestResolve is replaced by
-          // #pendingConnectionRequestResolvers (Map keyed by target pubkey hex).
-          // Routing uses counterparty_pubkey (for established) or target_pubkey (for errors)
-          // to find the exact resolver for this target — ensuring cross-target isolation (SI-001).
-
-          if (frame["type"] === "connection_established") {
-            // Store connection record locally (applies to both sender A and target B)
-            const connectionId = frame["connection_id"] as string;
-            const counterpartyPubkey = frame["counterparty_pubkey"] as string;
-            if (connectionId && counterpartyPubkey) {
-              if (!this.#connections.has(connectionId)) {
-                const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
-                  connection_id: connectionId,
-                  counterparty_pubkey: counterpartyPubkey,
-                  counterparty_primary_pubkey: "",
-                  counterparty_ml_dsa_pubkey: "",
-                  established_at: Date.now(),
-                  status: "active",
-                };
-                if (this.#profileUncheckedPeers.has(counterpartyPubkey)) {
-                  record.profile_unchecked = true;
-                  this.#profileUncheckedPeers.delete(counterpartyPubkey);
-                }
-                this.#connections.set(connectionId, record);
-                this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
-                // PERSIST-024: persist connection to DB
-                if (this.#persistence) {
-                  void this.#persistence.persistConnection({
-                    connectionId,
-                    counterpartyPubkey,
-                    establishedAt: record.established_at,
-                    profileUnchecked: record.profile_unchecked,
-                  });
-                }
-              }
-              // Fire onConnectionEstablished handler (both A and B)
-              const handler = this.#onConnectionEstablishedHandler;
-              if (handler) {
-                handler({ type: "connection_established", counterparty_pubkey: counterpartyPubkey, connection_id: connectionId });
-              }
-            }
-            // CONNREQ-003: Route to the resolver for this specific target (keyed by counterparty pubkey).
-            // SI-001: only the resolver waiting for counterpartyPubkey is unblocked; no cross-target routing.
-            const resolve = this.#pendingConnectionRequestResolvers.get(counterpartyPubkey);
-            if (resolve) {
-              this.#pendingConnectionRequestResolvers.delete(counterpartyPubkey);
-              resolve(frame);
-            } else {
-              // Round 2: route to disclosure resolver if pending (no in-flight connection_request)
-              for (const [id, disclosureResolve] of this.#pendingDisclosureResolvers) {
-                this.#pendingDisclosureResolvers.delete(id);
-                disclosureResolve(frame);
-                break;
-              }
-            }
-          } else if (frame["type"] === "disclosure_request_inbound") {
-            // CONNREQ-002 Round 2: target requests more disclosure → fire onDisclosureRequested
-            const disclosureHandler = this.#onDisclosureRequestedHandler;
-            if (disclosureHandler) {
-              disclosureHandler({
-                type: "disclosure_request_inbound",
-                from_pubkey: frame["from_pubkey"] as string,
-                connection_request_id: frame["connection_request_id"] as string,
-                requested_items: (frame["requested_items"] as import("@cello-protocol/protocol-types").DisclosureRequestItem[]) ?? [],
-              });
-            }
-            // CONNREQ-003: disclosure_request_inbound carries from_pubkey (= target).
-            // Route to the resolver for this target.
-            const targetPubkeyForDisclosure = frame["from_pubkey"] as string;
-            const resolve = this.#pendingConnectionRequestResolvers.get(targetPubkeyForDisclosure);
-            if (resolve) {
-              this.#pendingConnectionRequestResolvers.delete(targetPubkeyForDisclosure);
-              resolve(frame);
-            }
-          } else {
-            // connection_rejected, connection_insufficient, connection_request_error
-            // These frames carry target_pubkey so we can route to the correct resolver.
-            const targetPubkeyForError = frame["target_pubkey"] as string | undefined;
-            if (targetPubkeyForError && this.#pendingConnectionRequestResolvers.has(targetPubkeyForError)) {
-              const resolve = this.#pendingConnectionRequestResolvers.get(targetPubkeyForError)!;
-              this.#pendingConnectionRequestResolvers.delete(targetPubkeyForError);
-              resolve(frame);
-            } else if (this.#pendingConnectionRequestResolvers.size === 1) {
-              // Fallback: if exactly one request is in flight and frame has no target_pubkey,
-              // route to that single resolver (backward-compatible with pre-CONNREQ-003 directory).
-              const [singleKey, singleResolve] = this.#pendingConnectionRequestResolvers.entries().next().value as [string, (frame: Record<string, unknown>) => void];
-              this.#pendingConnectionRequestResolvers.delete(singleKey);
-              singleResolve(frame);
-            } else {
-              // Round 2: route to disclosure resolver if pending
-              for (const [id, disclosureResolve] of this.#pendingDisclosureResolvers) {
-                this.#pendingDisclosureResolvers.delete(id);
-                disclosureResolve(frame);
-                break;
-              }
-            }
-          }
+          // CONNREQ-002/CONNREQ-003: route connection outcome frames via ConnectionManager.
+          this.#connectionManager.routeConnectionFrame(frame);
         } else if (frame["type"] === "connection_request_inbound") {
           // CONNREQ-002: inbound connection request for this client (B's side).
-          // Evaluate the package using connectionPolicy and send connection_response.
           void this.#handleInboundConnectionRequest(frame);
         } else if (frame["type"] === "disclosure_response_inbound") {
           // CONNREQ-002 Round 2: A provided updated package → re-evaluate and send response.
@@ -5809,24 +4528,24 @@ class CelloClientImpl implements CelloClient {
       }
     } catch (outerErr) {
       const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: outer catch fired — stream closed with error. error="${msg}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: outer catch fired — stream closed with error. error="${msg}" pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"}` });
     }
 
-    process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: LOOP EXITED — stream is closing. isSameStream=${this.#persistentSignalingStream === stream} pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"} pendingRegisterResolve=${this.#pendingRegisterResolve ? "SET" : "NULL"} pendingDkgReadyResolve=${this.#pendingDkgReadyResolve ? "SET" : "NULL"} pendingConnectionRequestResolvers.size=${this.#pendingConnectionRequestResolvers.size}\n`);
+    this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: LOOP EXITED — stream is closing. isSameStream=${this.#persistentSignalingStream === stream} pendingSessionRequestResolve=${this.#pendingSessionRequestResolve ? "SET" : "NULL"} pendingRegisterResolve=${this.#pendingRegisterResolve ? "SET" : "NULL"} pendingDkgReadyResolve=${this.#pendingDkgReadyResolve ? "SET" : "NULL"} pendingConnectionRequestResolvers.size=${this.#connectionManager.pendingConnectionRequestResolverCount}` });
 
     // Stream closed — clear persistent stream ref
     if (this.#persistentSignalingStream === stream) {
       this.#persistentSignalingStream = null;
       this.#persistentSignalingIter = null;
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: cleared #persistentSignalingStream ref\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: cleared #persistentSignalingStream ref` });
     } else {
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: #persistentSignalingStream was ALREADY replaced (different stream object) — not clearing\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: #persistentSignalingStream was ALREADY replaced (different stream object) — not clearing` });
     }
 
     // If a register() call is pending (dkg_ready phase), unblock it with a synthetic error
     const dkgReadyResolve = this.#pendingDkgReadyResolve;
     if (dkgReadyResolve) {
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: unblocking pendingDkgReadyResolve with register_error/stream_closed\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: unblocking pendingDkgReadyResolve with register_error/stream_closed` });
       this.#pendingDkgReadyResolve = null;
       dkgReadyResolve({ type: "register_error", reason: "stream_closed" });
     }
@@ -5834,7 +4553,7 @@ class CelloClientImpl implements CelloClient {
     // If a register() call is pending (register_success phase), unblock it with a synthetic error
     const regResolve = this.#pendingRegisterResolve;
     if (regResolve) {
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: unblocking pendingRegisterResolve with register_error/stream_closed\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: unblocking pendingRegisterResolve with register_error/stream_closed` });
       this.#pendingRegisterResolve = null;
       regResolve({ type: "register_error", reason: "stream_closed" });
     }
@@ -5842,20 +4561,17 @@ class CelloClientImpl implements CelloClient {
     // If a session_request is pending, unblock it with a synthetic error
     const resolve = this.#pendingSessionRequestResolve;
     if (resolve) {
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: FIRING synthetic session_request_error/directory_unreachable — THIS IS THE BUG PATH\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: FIRING synthetic session_request_error/directory_unreachable — THIS IS THE BUG PATH` });
       this.#pendingSessionRequestResolve = null;
       resolve({ type: "session_request_error", reason: "directory_unreachable" });
     } else {
-      process.stderr.write(`[SIGREAD-DEBUG] runPersistentSignalingReader: no pending session request resolver — stream closed cleanly or after resolution\n`);
+      this.#logger.debug("signaling.reader.debug", { message: `runPersistentSignalingReader: no pending session request resolver — stream closed cleanly or after resolution` });
     }
 
     // CONNREQ-003: Unblock all pending connection request resolvers (AC-005)
     // When the signaling stream closes, all in-flight cello_request_connection calls
     // receive a synthetic connection_request_error so they can return directory_unreachable.
-    for (const [targetPubkey, pendingResolve] of this.#pendingConnectionRequestResolvers) {
-      this.#pendingConnectionRequestResolvers.delete(targetPubkey);
-      pendingResolve({ type: "connection_request_error", reason: "directory_unreachable", target_pubkey: targetPubkey });
-    }
+    this.#connectionManager.unblockAllOnStreamClose();
 
     // Fix 2: if any session is in sealing or seal_deferred status, the directory may have
     // a queued seal_verified notification that it couldn't deliver (stream was gone).
