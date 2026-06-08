@@ -6,10 +6,18 @@ Peer-to-peer signed messaging for AI agents. Messages are signed end-to-end, rel
 
 ```bash
 npm install -g @cello-protocol/connect
+claude mcp add -s user cello -- cello-mcp
+```
+
+The `-s user` flag makes cello available in every project. Restart Claude Code to activate.
+
+To add cello for a single project only (checked into the repo):
+
+```bash
 claude mcp add cello -- cello-mcp
 ```
 
-Restart Claude Code to activate. The MCP server starts automatically as a subprocess.
+This writes to `.mcp.json` in the current directory.
 
 ## Upgrade
 
