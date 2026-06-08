@@ -1,8 +1,9 @@
 /**
  * ConnectionManager — CONNREQ-002, CONNREQ-003
  *
- * Extracted from CelloClientImpl. Handles connection establishment,
- * inbound connection requests, disclosure rounds, and connection state.
+ * Extracted from CelloClientImpl. Owns all connection domain state:
+ *   connections, connectionsByPeer, profileUncheckedPeers, connectionPolicy,
+ *   pending resolvers, review queue, etc.
  */
 
 import { Encoder } from "cbor-x";
@@ -57,22 +58,24 @@ export interface ConnectionContext {
   readonly trackEvaluateCount: boolean;
   readonly whitelist: string[];
   readonly crossCheckDirectoryOnInbound: boolean;
-  readonly connectionPolicy: SignalRequirementPolicy | undefined;
-  readonly onConnectionPendingReview: ((event: ConnectionRequestInbound) => void) | undefined;
-  readonly onConnectionEstablishedHandler: ((event: ConnectionEstablished) => void) | undefined;
-  readonly onDisclosureRequestedHandler: ((event: DisclosureRequestInbound) => void) | undefined;
   getPersistentSignalingStream(): Stream | null;
   openPersistentSignalingStream(): Promise<boolean>;
-  getConnectionsByPeer(): Map<string, string>;
-  getConnections(): Map<string, ClientConnectionRecord>;
-  getProfileUncheckedPeers(): Set<string>;
   incrementEvaluateCallCount(): void;
 }
 
 export class ConnectionManager {
   readonly #ctx: ConnectionContext;
 
-  // Connection state (owned by this manager)
+  // Connection state owned by this manager
+  readonly #connections = new Map<string, ClientConnectionRecord>();
+  readonly #connectionsByPeer = new Map<string, string>();
+  readonly #profileUncheckedPeers = new Set<string>();
+  #connectionPolicy: SignalRequirementPolicy | undefined;
+  #onConnectionEstablishedHandler: ((event: ConnectionEstablished) => void) | undefined;
+  #onDisclosureRequestedHandler: ((event: DisclosureRequestInbound) => void) | undefined;
+  #onConnectionPendingReview: ((event: ConnectionRequestInbound) => void) | undefined;
+
+  // Request tracking state owned by this manager
   readonly #pendingConnectionRequestResolvers = new Map<string, (frame: Record<string, unknown>) => void>();
   readonly #pendingAwaitConnectionRequestResolvers: Array<(item: AwaitItem) => void> = [];
   readonly #pendingDisclosureResolvers = new Map<string, (result: Record<string, unknown>) => void>();
@@ -80,12 +83,71 @@ export class ConnectionManager {
   readonly #pendingReviewQueue: ReviewQueueItem[] = [];
   readonly #decidedRequests = new Set<string>();
 
-  constructor(ctx: ConnectionContext) {
+  constructor(
+    ctx: ConnectionContext,
+    opts?: {
+      connectionPolicy?: SignalRequirementPolicy;
+      onConnectionPendingReview?: (event: ConnectionRequestInbound) => void;
+    },
+  ) {
     this.#ctx = ctx;
+    this.#connectionPolicy = opts?.connectionPolicy;
+    this.#onConnectionPendingReview = opts?.onConnectionPendingReview;
   }
+
+  // ─── Public state accessors ──────────────────────────────────────────────────
 
   get pendingConnectionRequestResolverCount(): number {
     return this.#pendingConnectionRequestResolvers.size;
+  }
+
+  listConnections(): ClientConnectionRecord[] {
+    return [...this.#connections.values()];
+  }
+
+  hasConnection(counterpartyPubkeyHex: string): string | null {
+    return this.#connectionsByPeer.get(counterpartyPubkeyHex) ?? null;
+  }
+
+  getConnectionIdForPeer(pubkeyHex: string): string | undefined {
+    return this.#connectionsByPeer.get(pubkeyHex);
+  }
+
+  hasConnectionPolicy(): boolean {
+    return this.#connectionPolicy !== undefined;
+  }
+
+  setPolicy(policy: SignalRequirementPolicy): void {
+    this.#connectionPolicy = policy;
+  }
+
+  getPolicy(): SignalRequirementPolicy {
+    return this.#connectionPolicy ?? { mode: "open", review_mode: "deterministic", requirements: [] };
+  }
+
+  onConnectionEstablished(handler: (event: ConnectionEstablished) => void): void {
+    this.#onConnectionEstablishedHandler = handler;
+  }
+
+  onDisclosureRequested(handler: (event: DisclosureRequestInbound) => void): void {
+    this.#onDisclosureRequestedHandler = handler;
+  }
+
+  setOnConnectionPendingReview(handler: (event: ConnectionRequestInbound) => void): void {
+    this.#onConnectionPendingReview = handler;
+  }
+
+  /** Called during loadPersistedState to restore connection records. */
+  addConnection(id: string, record: ClientConnectionRecord): void {
+    this.#connections.set(id, record);
+  }
+
+  addConnectionByPeer(pubkey: string, id: string): void {
+    this.#connectionsByPeer.set(pubkey, id);
+  }
+
+  addProfileUncheckedPeer(pubkey: string): void {
+    this.#profileUncheckedPeers.add(pubkey);
   }
 
   // ─── Public API methods ─────────────────────────────────────────────────────
@@ -134,7 +196,7 @@ export class ConnectionManager {
     // Wait for connection_established to arrive via the signaling reader loop.
     const deadline = Date.now() + this.#ctx.connectionTimeoutMs;
     while (Date.now() < deadline) {
-      const connectionId = this.#ctx.getConnectionsByPeer().get(pending.from_pubkey);
+      const connectionId = this.#connectionsByPeer.get(pending.from_pubkey);
       if (connectionId) {
         return { accepted: true, connection_id: connectionId };
       }
@@ -407,8 +469,8 @@ export class ConnectionManager {
         established_at: Date.now(),
         status: "active",
       };
-      this.#ctx.getConnections().set(connectionId, record);
-      this.#ctx.getConnectionsByPeer().set(counterpartyPubkey, connectionId);
+      this.#connections.set(connectionId, record);
+      this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
       // PERSIST-024: persist connection to DB
       if (this.#ctx.persistence) {
         void this.#ctx.persistence.persistConnection({
@@ -438,7 +500,7 @@ export class ConnectionManager {
       // already_connected: hydrate the existing connection so the caller can proceed.
       if (reason === "already_connected" && frame["connection_id"]) {
         const connectionId = frame["connection_id"] as string;
-        if (!this.#ctx.getConnections().has(connectionId)) {
+        if (!this.#connections.has(connectionId)) {
           const record: ClientConnectionRecord = {
             connection_id: connectionId,
             counterparty_pubkey: targetPubkeyHex,
@@ -447,8 +509,8 @@ export class ConnectionManager {
             established_at: Date.now(),
             status: "active",
           };
-          this.#ctx.getConnections().set(connectionId, record);
-          this.#ctx.getConnectionsByPeer().set(targetPubkeyHex, connectionId);
+          this.#connections.set(connectionId, record);
+          this.#connectionsByPeer.set(targetPubkeyHex, connectionId);
           // PERSIST-024: persist connection to DB
           if (this.#ctx.persistence) {
             void this.#ctx.persistence.persistConnection({
@@ -541,8 +603,8 @@ export class ConnectionManager {
         established_at: establishedAt,
         status: "active",
       };
-      this.#ctx.getConnections().set(connectionId, record);
-      this.#ctx.getConnectionsByPeer().set(counterpartyPubkey, connectionId);
+      this.#connections.set(connectionId, record);
+      this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
       if (this.#ctx.persistence) {
         void this.#ctx.persistence.persistConnection({
           connectionId,
@@ -696,7 +758,7 @@ export class ConnectionManager {
       const connectionId = frame["connection_id"] as string;
       const counterpartyPubkey = frame["counterparty_pubkey"] as string;
       if (connectionId && counterpartyPubkey) {
-        if (!this.#ctx.getConnections().has(connectionId)) {
+        if (!this.#connections.has(connectionId)) {
           const record: ClientConnectionRecord = {
             connection_id: connectionId,
             counterparty_pubkey: counterpartyPubkey,
@@ -705,13 +767,12 @@ export class ConnectionManager {
             established_at: Date.now(),
             status: "active",
           };
-          const profileUncheckedPeers = this.#ctx.getProfileUncheckedPeers();
-          if (profileUncheckedPeers.has(counterpartyPubkey)) {
+          if (this.#profileUncheckedPeers.has(counterpartyPubkey)) {
             record.profile_unchecked = true;
-            profileUncheckedPeers.delete(counterpartyPubkey);
+            this.#profileUncheckedPeers.delete(counterpartyPubkey);
           }
-          this.#ctx.getConnections().set(connectionId, record);
-          this.#ctx.getConnectionsByPeer().set(counterpartyPubkey, connectionId);
+          this.#connections.set(connectionId, record);
+          this.#connectionsByPeer.set(counterpartyPubkey, connectionId);
           // PERSIST-024: persist connection to DB
           if (this.#ctx.persistence) {
             void this.#ctx.persistence.persistConnection({
@@ -723,9 +784,8 @@ export class ConnectionManager {
           }
         }
         // Fire onConnectionEstablished handler (both A and B)
-        const handler = this.#ctx.onConnectionEstablishedHandler;
-        if (handler) {
-          handler({ type: "connection_established", counterparty_pubkey: counterpartyPubkey, connection_id: connectionId });
+        if (this.#onConnectionEstablishedHandler) {
+          this.#onConnectionEstablishedHandler({ type: "connection_established", counterparty_pubkey: counterpartyPubkey, connection_id: connectionId });
         }
       }
       // CONNREQ-003: Route to the resolver for this specific target (keyed by counterparty pubkey).
@@ -743,9 +803,8 @@ export class ConnectionManager {
       }
     } else if (type === "disclosure_request_inbound") {
       // CONNREQ-002 Round 2: target requests more disclosure → fire onDisclosureRequested
-      const disclosureHandler = this.#ctx.onDisclosureRequestedHandler;
-      if (disclosureHandler) {
-        disclosureHandler({
+      if (this.#onDisclosureRequestedHandler) {
+        this.#onDisclosureRequestedHandler({
           type: "disclosure_request_inbound",
           from_pubkey: frame["from_pubkey"] as string,
           connection_request_id: frame["connection_request_id"] as string,
@@ -820,7 +879,7 @@ export class ConnectionManager {
 
     if (isWhitelisted) {
       verdict = "accept";
-    } else if (!this.#ctx.connectionPolicy) {
+    } else if (!this.#connectionPolicy) {
       // No policy configured — default to accept
       verdict = "accept";
     } else {
@@ -861,7 +920,7 @@ export class ConnectionManager {
         const { evaluateConnectionPackage } = await import("./connection-policy.js");
         const report = evaluateConnectionPackage(
           validatedPackage,
-          this.#ctx.connectionPolicy,
+          this.#connectionPolicy,
           context,
           Date.now(),
         );
@@ -954,8 +1013,8 @@ export class ConnectionManager {
             });
           }
 
-          if (this.#ctx.onConnectionPendingReview) {
-            this.#ctx.onConnectionPendingReview({
+          if (this.#onConnectionPendingReview) {
+            this.#onConnectionPendingReview({
               type: "connection_request_inbound",
               from_pubkey: fromPubkey,
               connection_request_id: connectionRequestId,
@@ -996,7 +1055,7 @@ export class ConnectionManager {
 
     // DB-003: cross-check logic — mark as unchecked when enabled
     if (verdict === "accept" && this.#ctx.crossCheckDirectoryOnInbound) {
-      this.#ctx.getProfileUncheckedPeers().add(fromPubkey);
+      this.#profileUncheckedPeers.add(fromPubkey);
     }
 
     // Send connection_response to directory
@@ -1040,7 +1099,7 @@ export class ConnectionManager {
     let rejectReason: string | undefined;
     let unmetRequirements: unknown[] | undefined;
 
-    if (!this.#ctx.connectionPolicy) {
+    if (!this.#connectionPolicy) {
       verdict = "accept";
     } else {
       let pkg;
@@ -1079,7 +1138,7 @@ export class ConnectionManager {
           const { evaluateConnectionPackage } = await import("./connection-policy.js");
           const report = evaluateConnectionPackage(
             validatedPackage,
-            this.#ctx.connectionPolicy,
+            this.#connectionPolicy,
             context,
             Date.now(),
           );

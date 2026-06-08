@@ -1,14 +1,14 @@
 /**
  * RegistrationManager — REG-001, ML-DSA keygen, DKG
  *
- * Extracted from CelloClientImpl. Methods operate on the shared internal state
- * passed via the `ctx` parameter (typed as InternalClientAccess).
+ * Extracted from CelloClientImpl. Owns registration domain state:
+ *   #registrationState, #mlDsaProvider.
  */
 
 import { Encoder } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider } from "@cello-protocol/crypto";
-import type { IThresholdSigner } from "@cello-protocol/crypto";
+import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -34,10 +34,6 @@ export interface RegistrationContext {
   getDirectoryEndpoint(): { peer_id: string; multiaddrs: string[] } | null;
   getThresholdSigner(): IThresholdSigner | undefined;
   setThresholdSigner(signer: IThresholdSigner): void;
-  getRegistrationState(): RegistrationState | null;
-  setRegistrationState(state: RegistrationState | null): void;
-  getMlDsaProvider(): import("@cello-protocol/crypto").MlDsaKeyProvider | null;
-  setMlDsaProvider(provider: import("@cello-protocol/crypto").MlDsaKeyProvider | null): void;
   getMyPrimaryPubkey(): Uint8Array | null;
   setMyPrimaryPubkey(pubkey: Uint8Array): void;
   getPersistentSignalingStream(): Stream | null;
@@ -49,8 +45,30 @@ export interface RegistrationContext {
 export class RegistrationManager {
   readonly #ctx: RegistrationContext;
 
+  // Registration state owned by this manager
+  #registrationState: RegistrationState | null = null;
+  #mlDsaProvider: MlDsaKeyProvider | null = null;
+
   constructor(ctx: RegistrationContext) {
     this.#ctx = ctx;
+  }
+
+  // ─── Public state accessors ──────────────────────────────────────────────────
+
+  getRegistrationState(): RegistrationState | null {
+    return this.#registrationState;
+  }
+
+  setRegistrationState(state: RegistrationState | null): void {
+    this.#registrationState = state;
+  }
+
+  getMlDsaProvider(): MlDsaKeyProvider | null {
+    return this.#mlDsaProvider;
+  }
+
+  setMlDsaProvider(provider: MlDsaKeyProvider | null): void {
+    this.#mlDsaProvider = provider;
   }
 
   /**
@@ -59,12 +77,12 @@ export class RegistrationManager {
    */
   async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
     // Step 1: already registered
-    if (this.#ctx.getRegistrationState()) {
+    if (this.#registrationState) {
       return { error: "already_registered" };
     }
 
     // Step 2: generate or load ML-DSA-44 keypair
-    let mlDsaProvider: import("@cello-protocol/crypto").MlDsaKeyProvider;
+    let mlDsaProvider: MlDsaKeyProvider;
     let mlDsaSecretKeyBlob: Uint8Array | null = null;
     if (this.#ctx.mlDsaKeyFile) {
       mlDsaProvider = await FileMlDsaKeyProvider.load(this.#ctx.mlDsaKeyFile);
@@ -130,8 +148,8 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
-        this.#ctx.setRegistrationState(state);
-        this.#ctx.setMlDsaProvider(mlDsaProvider);
+        this.#registrationState = state;
+        this.#mlDsaProvider = mlDsaProvider;
         if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
           void this.#ctx.persistence.persistMlDsaKeypair({
             mlDsaPubkey: mlDsaPubkeyHex,
@@ -232,8 +250,8 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
-        this.#ctx.setRegistrationState(state);
-        this.#ctx.setMlDsaProvider(mlDsaProvider);
+        this.#registrationState = state;
+        this.#mlDsaProvider = mlDsaProvider;
         if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
           void this.#ctx.persistence.persistMlDsaKeypair({
             mlDsaPubkey: mlDsaPubkeyHex,
@@ -262,8 +280,8 @@ export class RegistrationManager {
       registered_at: Date.now(),
       status: "active",
     };
-    this.#ctx.setRegistrationState(state);
-    this.#ctx.setMlDsaProvider(mlDsaProvider);
+    this.#registrationState = state;
+    this.#mlDsaProvider = mlDsaProvider;
     if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
       void this.#ctx.persistence.persistMlDsaKeypair({
         mlDsaPubkey: mlDsaPubkeyHex,

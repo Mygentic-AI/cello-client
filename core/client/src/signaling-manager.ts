@@ -1,8 +1,9 @@
 /**
  * SignalingManager — persistent signaling stream, frame router, per-session directory streams.
  *
- * Extracted from CelloClientImpl. Methods operate on the shared internal state
- * passed via the `ctx` parameter (typed as SignalingContext).
+ * Extracted from CelloClientImpl. Owns all persistent signaling stream state:
+ *   #persistentSignalingStream, #persistentSignalingIter, #openingSignalingStream,
+ *   #pendingSessionRequestResolve, #pendingRegisterResolve, #pendingDkgReadyResolve.
  */
 
 import { createHash } from "node:crypto";
@@ -52,18 +53,10 @@ export interface SignalingContext {
   getMyPubkeyHex(): string | null;
   setMyPubkeyHex(hex: string): void;
   getDirectoryEndpoint(): { peer_id: string; multiaddrs: string[] } | null;
-  getPersistentSignalingStream(): Stream | null;
-  setPersistentSignalingStream(stream: Stream | null): void;
-  setPersistentSignalingIter(iter: AsyncIterator<Uint8Array> | null): void;
-  getOpeningSignalingStream(): Promise<boolean> | null;
-  setOpeningSignalingStream(p: Promise<boolean> | null): void;
   getDirectoryStream(sessionIdHex: string): Stream | undefined;
   setDirectoryStream(sessionIdHex: string, stream: Stream): void;
   deleteDirectoryStream(sessionIdHex: string): void;
   // Pending-state accessors for AC-007 signaling.stream.closed log
-  hasPendingSessionRequest(): boolean;
-  hasPendingRegister(): boolean;
-  hasPendingDkgReady(): boolean;
   getPendingConnectionResolverCount(): number;
   // Frame dispatch
   dispatchSignalingFrame(stream: Stream, frame: Record<string, unknown>): void;
@@ -71,8 +64,6 @@ export interface SignalingContext {
   // initiateSession dependencies
   getConnectionIdForPeer(pubkeyHex: string): string | undefined;
   hasConnectionPolicy(): boolean;
-  getPendingSessionRequestResolve(): ((frame: Record<string, unknown>) => void) | null;
-  setPendingSessionRequestResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void;
   receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
   getSession(sessionIdHex: string): SessionRecord | undefined;
 }
@@ -80,8 +71,101 @@ export interface SignalingContext {
 export class SignalingManager {
   readonly #ctx: SignalingContext;
 
+  // Signaling state owned by this manager
+  #persistentSignalingStream: Stream | null = null;
+  #persistentSignalingIter: AsyncIterator<Uint8Array> | null = null;
+  #openingSignalingStream: Promise<boolean> | null = null;
+  #pendingSessionRequestResolve: ((frame: Record<string, unknown>) => void) | null = null;
+  #pendingRegisterResolve: ((frame: Record<string, unknown>) => void) | null = null;
+  #pendingDkgReadyResolve: ((frame: Record<string, unknown>) => void) | null = null;
+
   constructor(ctx: SignalingContext) {
     this.#ctx = ctx;
+  }
+
+  // ─── Public state accessors (used by facade to wire other managers) ─────────
+
+  getPersistentSignalingStream(): Stream | null {
+    return this.#persistentSignalingStream;
+  }
+
+  setPersistentSignalingStream(stream: Stream | null): void {
+    this.#persistentSignalingStream = stream;
+  }
+
+  setPersistentSignalingIter(iter: AsyncIterator<Uint8Array> | null): void {
+    this.#persistentSignalingIter = iter;
+  }
+
+  hasPendingSessionRequest(): boolean {
+    return this.#pendingSessionRequestResolve !== null;
+  }
+
+  hasPendingRegister(): boolean {
+    return this.#pendingRegisterResolve !== null;
+  }
+
+  hasPendingDkgReady(): boolean {
+    return this.#pendingDkgReadyResolve !== null;
+  }
+
+  getPendingSessionRequestResolve(): ((frame: Record<string, unknown>) => void) | null {
+    return this.#pendingSessionRequestResolve;
+  }
+
+  setPendingSessionRequestResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void {
+    this.#pendingSessionRequestResolve = resolve;
+  }
+
+  setPendingRegisterResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void {
+    this.#pendingRegisterResolve = resolve;
+  }
+
+  setPendingDkgReadyResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void {
+    this.#pendingDkgReadyResolve = resolve;
+  }
+
+  resolvePendingRegister(frame: Record<string, unknown>): void {
+    const resolve = this.#pendingRegisterResolve;
+    if (resolve) {
+      this.#pendingRegisterResolve = null;
+      resolve(frame);
+    }
+  }
+
+  resolvePendingDkgReady(frame: Record<string, unknown>): void {
+    const resolve = this.#pendingDkgReadyResolve;
+    if (resolve) {
+      this.#pendingDkgReadyResolve = null;
+      resolve(frame);
+    }
+  }
+
+  /**
+   * Called when the signaling stream closes. Unblocks all pending resolvers.
+   */
+  onStreamClosed(stream: Stream): void {
+    if (this.#persistentSignalingStream !== stream) return;
+    this.#persistentSignalingStream = null;
+    this.#persistentSignalingIter = null;
+
+    const dkgReadyResolve = this.#pendingDkgReadyResolve;
+    if (dkgReadyResolve) {
+      this.#pendingDkgReadyResolve = null;
+      dkgReadyResolve({ type: "register_error", reason: "stream_closed" });
+    }
+
+    const regResolve = this.#pendingRegisterResolve;
+    if (regResolve) {
+      this.#pendingRegisterResolve = null;
+      regResolve({ type: "register_error", reason: "stream_closed" });
+    }
+
+    const sessionResolve = this.#pendingSessionRequestResolve;
+    if (sessionResolve) {
+      this.#pendingSessionRequestResolve = null;
+      sessionResolve({ type: "session_request_error", reason: "directory_unreachable" });
+    }
   }
 
   /**
@@ -89,16 +173,16 @@ export class SignalingManager {
    * Serializes concurrent calls.
    */
   openPersistentSignalingStream(directoryPeerId?: string, directoryMultiaddr?: string): Promise<boolean> {
-    if (this.#ctx.getPersistentSignalingStream()) return Promise.resolve(true);
-    const existing = this.#ctx.getOpeningSignalingStream();
+    if (this.#persistentSignalingStream) return Promise.resolve(true);
+    const existing = this.#openingSignalingStream;
     if (existing) return existing;
 
     const p = this.#doOpen(directoryPeerId, directoryMultiaddr).finally(() => {
-      if (this.#ctx.getOpeningSignalingStream() === p) {
-        this.#ctx.setOpeningSignalingStream(null);
+      if (this.#openingSignalingStream === p) {
+        this.#openingSignalingStream = null;
       }
     });
-    this.#ctx.setOpeningSignalingStream(p);
+    this.#openingSignalingStream = p;
     return p;
   }
 
@@ -106,11 +190,11 @@ export class SignalingManager {
    * Reconnect the persistent signaling stream.
    */
   async reconnectDirectory(): Promise<boolean> {
-    const stream = this.#ctx.getPersistentSignalingStream();
+    const stream = this.#persistentSignalingStream;
     if (stream) {
       try { stream.abort(new Error("reconnect")); } catch {}
-      this.#ctx.setPersistentSignalingStream(null);
-      this.#ctx.setPersistentSignalingIter(null);
+      this.#persistentSignalingStream = null;
+      this.#persistentSignalingIter = null;
     }
     return this.openPersistentSignalingStream();
   }
@@ -310,9 +394,9 @@ export class SignalingManager {
         }
         if (result.done || result.value === undefined) {
           this.#ctx.logger.debug("signaling.stream.closed", {
-            pendingSessionRequest: this.#ctx.hasPendingSessionRequest(),
-            pendingRegister: this.#ctx.hasPendingRegister(),
-            pendingDkgReady: this.#ctx.hasPendingDkgReady(),
+            pendingSessionRequest: this.hasPendingSessionRequest(),
+            pendingRegister: this.hasPendingRegister(),
+            pendingDkgReady: this.hasPendingDkgReady(),
             pendingConnectionResolvers: this.#ctx.getPendingConnectionResolverCount(),
           });
           break;
@@ -335,7 +419,9 @@ export class SignalingManager {
       this.#ctx.logger.debug("signaling.stream.iter.error", { error: outerErr instanceof Error ? outerErr.message : String(outerErr) });
     }
 
-    // Notify facade that stream is closed
+    // Notify facade that stream is closed — clears stream refs and unblocks pending resolvers
+    this.onStreamClosed(stream);
+    // Also notify facade for seal reconnect scheduling
     this.#ctx.onSignalingStreamClosed(stream);
   }
 
@@ -377,7 +463,7 @@ export class SignalingManager {
   async #doOpen(directoryPeerId?: string, directoryMultiaddr?: string): Promise<boolean> {
     const directoryEndpoint = this.#ctx.getDirectoryEndpoint();
     if (!directoryEndpoint && !directoryPeerId) return false;
-    if (this.#ctx.getPersistentSignalingStream()) return true;
+    if (this.#persistentSignalingStream) return true;
 
     const dirPeerId = directoryPeerId ?? directoryEndpoint!.peer_id;
     const dirMultiaddr = directoryMultiaddr ?? directoryEndpoint?.multiaddrs[0];
@@ -446,8 +532,8 @@ export class SignalingManager {
       }) as Uint8Array;
       sigStream.send(lp.encode.single(peerInfoFrame));
 
-      this.#ctx.setPersistentSignalingStream(sigStream);
-      this.#ctx.setPersistentSignalingIter(iter);
+      this.#persistentSignalingStream = sigStream;
+      this.#persistentSignalingIter = iter;
 
       this.runPersistentSignalingReader(sigStream, iter);
       return true;
@@ -490,7 +576,7 @@ export class SignalingManager {
     const myPubkey = Buffer.from(this.#ctx.getMyPubkeyHex()!, "hex");
 
     // Open persistent signaling stream if not already open (DB-001)
-    if (!this.#ctx.getPersistentSignalingStream()) {
+    if (!this.#persistentSignalingStream) {
       const opened = await this.openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
       if (!opened) {
         const retried = await this.openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
@@ -515,12 +601,12 @@ export class SignalingManager {
     const responsePromise = new Promise<Record<string, unknown>>((resolve) => {
       responseResolve = resolve;
     });
-    this.#ctx.setPendingSessionRequestResolve(responseResolve);
+    this.#pendingSessionRequestResolve = responseResolve;
 
     try {
-      this.#ctx.getPersistentSignalingStream()!.send(lp.encode.single(sessionRequestFrame));
+      this.#persistentSignalingStream!.send(lp.encode.single(sessionRequestFrame));
     } catch {
-      this.#ctx.setPendingSessionRequestResolve(null);
+      this.#pendingSessionRequestResolve = null;
       return { ok: false, reason: "directory_unreachable" };
     }
 
@@ -535,7 +621,7 @@ export class SignalingManager {
     ]);
 
     if (timedOut) {
-      this.#ctx.setPendingSessionRequestResolve(null);
+      this.#pendingSessionRequestResolve = null;
       return { ok: false, reason: "timeout" };
     }
 
