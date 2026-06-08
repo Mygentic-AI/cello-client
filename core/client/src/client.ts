@@ -577,6 +577,10 @@ class CelloClientImpl implements CelloClient {
     this.#relayStreamManager.injectLeafDeliver(sessionIdHex, frame);
   }
 
+  // Internal test escape: trigger relay disconnect handling for a session.
+  // Used by SESSION-006 tests to simulate relay stream drop without a real network event.
+  injectRelayDisconnect(sessionIdHex: string): void { this.#relayStreamManager.injectRelayDisconnect(sessionIdHex); }
+
   // Internal test escape: inject a minimal session record directly into #sessions.
   // Bypasses receiveSessionAssignment (which requires a real relay) for unit tests
   // that need to test session_sealed, FROST verification, etc. without a relay.
