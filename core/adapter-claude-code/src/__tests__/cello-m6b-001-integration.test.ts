@@ -3,9 +3,10 @@
  *
  * AC-003: When cello-mcp receives SIGTERM, the lock file is removed.
  *   Spawns the real cello-mcp binary, sends SIGTERM, waits for process exit,
- *   then asserts the lock file is absent. This tests the signal handler wiring
- *   in cello-mcp.ts (process.on("SIGTERM", () => process.exit(0))) which triggers
- *   the "exit" event handler that calls releaseLock().
+ *   then asserts the lock file is absent. The SIGTERM handler in cello-mcp.ts
+ *   calls gracefulShutdown() which polls for in-flight FROST ceremonies (up to 4s)
+ *   before calling process.exit(0), which triggers the "exit" handler that calls
+ *   releaseLock(). When no ceremony is in flight, exit is nearly immediate.
  *
  * AC-004: Verify that client.startup.prior.process.killed appears in stderr
  *   BEFORE any DB-open log event. This proves the kill-prior-process step
@@ -142,7 +143,9 @@ describe("AC-004: Kill prior process BEFORE opening DB", () => {
 
       // Spawn processB — the real cello-mcp binary.
       // Use HOME override so getLockFilePath() computes the same lockFilePath as above.
-      // CELLO_ENV=local so path validation allows paths outside ~/.cello/ (testDir != real home).
+      // HOME=testDir causes homedir() to return testDir, so the path guard's computed
+      // celloDir prefix is <testDir>/.cello/ — lockFilePath satisfies the startsWith check.
+      // CELLO_ENV has no effect on the path guard (it only bypasses for NODE_ENV=test).
       processB = spawn(process.execPath, [binPath], {
         stdio: ["ignore", "ignore", "pipe"],
         env: {
@@ -278,15 +281,17 @@ describe("AC-003: Lock file removed when cello-mcp receives SIGTERM (integration
     // Lock file now exists — the process is running and holds it.
     expect(existsSync(lockFilePath), "lock file must exist while cello-mcp is running").toBe(true);
 
-    // Send SIGTERM — the handler calls process.exit(0), which triggers the "exit"
-    // handler that calls releaseLock(), which removes the lock file.
+    // Send SIGTERM — gracefulShutdown() polls for in-flight ceremonies (up to 4s),
+    // then calls process.exit(0), which triggers the "exit" handler that calls
+    // releaseLock(), which removes the lock file. Allow up to 6s: 4s ceremony wait
+    // + 2s margin. No ceremony is in flight in this test so exit is nearly immediate.
     celloMcp.kill("SIGTERM");
 
-    // Wait for the process to exit (up to 5s).
+    // Wait for the process to exit (up to 6s — graceful shutdown allows 4s for ceremonies).
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error("cello-mcp did not exit within 5s after SIGTERM"));
-      }, 5000);
+        reject(new Error("cello-mcp did not exit within 6s after SIGTERM"));
+      }, 6000);
       celloMcp.on("exit", () => {
         clearTimeout(timeout);
         resolve();

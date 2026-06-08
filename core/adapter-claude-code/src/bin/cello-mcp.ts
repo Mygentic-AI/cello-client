@@ -169,11 +169,43 @@ const releaseLock = await acquireLockFile(lockFilePath, {
 // - Sets a shuttingDown flag
 // - Waits up to 5s for in-flight backup() calls to complete
 // - Then allows process.exit(0) to proceed
+
+// Late-bound client reference for graceful shutdown. Populated after createClient() below.
+// SIGTERM handler polls this to defer exit until any in-flight FROST ceremony completes.
+// Without this, a new cello-mcp startup (via lock-file kill) arriving mid-ceremony tears
+// down libp2p before session_assignment arrives, causing directory_unreachable on every
+// cello_initiate_session call. (Root cause identified M6-E2E-001, 2026-06-08.)
+let clientForShutdown: { hasInFlightCryptoOperation(): boolean } | null = null;
+
+// Graceful SIGTERM: wait up to 4 seconds for any in-flight FROST ceremony to complete,
+// then exit. 4 seconds fits within the 5-second SIGTERM poll window in lock-file.ts,
+// leaving 1 second margin before the new process escalates to SIGKILL.
+async function gracefulShutdown(): Promise<void> {
+  // Capture in local const so inner loop accesses are null-safe and consistent with the guard.
+  const client = clientForShutdown;
+  try {
+    if (client?.hasInFlightCryptoOperation()) {
+      process.stderr.write("cello-mcp: [info] client.shutdown.waiting_for_ceremony {}\n");
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline && client.hasInFlightCryptoOperation()) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+      if (client.hasInFlightCryptoOperation()) {
+        process.stderr.write("cello-mcp: [warn] client.shutdown.ceremony_timeout {}\n");
+      } else {
+        process.stderr.write("cello-mcp: [info] client.shutdown.ceremony_complete {}\n");
+      }
+    }
+  } finally {
+    process.exit(0);
+  }
+}
+
 process.on("exit", () => {
   releaseLock();
 });
 process.on("SIGTERM", () => {
-  process.exit(0);
+  void gracefulShutdown();
 });
 process.on("SIGINT", () => {
   process.exit(0);
@@ -387,6 +419,9 @@ const client = createClient(node, kp, {
     if (mcpServer) void pushChannelNotification(mcpServer, senderHex);
   },
 });
+
+// Wire client into graceful shutdown handler so SIGTERM can poll for in-flight ceremonies.
+clientForShutdown = client;
 
 // Create server with single identity.
 // PERSIST-017: checkpointStatusProvider is not available in the cello-mcp binary

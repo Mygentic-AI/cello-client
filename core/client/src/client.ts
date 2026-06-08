@@ -50,6 +50,7 @@ const DEFAULT_SEAL_FROST_TIMEOUT_MS = 15_000;
 
 /** Full public surface exposed by createClient — CelloClient + test/escape-hatch methods. */
 export type ClientExtended = CelloClient & {
+  hasInFlightCryptoOperation(): boolean;
   sendRaw(peerPubkeyHex: string, bytes: Uint8Array): Promise<SendResult>;
   openRawStream(peerPubkeyHex: string): Promise<Stream>;
   openContentStreamByPeerId(peerId: string): Promise<Stream>;
@@ -504,6 +505,17 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
   // ─── Signaling delegates ───────────────────────────────────────────────────
 
   async reconnectDirectory(): Promise<boolean> { return this.signalingManager.reconnectDirectory(); }
+
+  // Returns true when any cryptographic operation is in flight over the signaling stream
+  // (session ceremony, DKG registration, or register request). Used by cello-mcp.ts
+  // graceful-shutdown logic to defer SIGTERM exit until in-flight operations complete.
+  hasInFlightCryptoOperation(): boolean {
+    return (
+      this.signalingManager.hasPendingSessionRequest() ||
+      this.signalingManager.hasPendingRegister() ||
+      this.signalingManager.hasPendingDkgReady()
+    );
+  }
 
   initiateSession(
     targetPubkeyHex: string,
