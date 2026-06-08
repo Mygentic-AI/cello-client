@@ -246,6 +246,7 @@ export class SessionManager {
     // SESSION-004 Step 1: Check signature_type (SI-003, AC-003)
     // M1 'single' frames are hard-refused in M2 — even if the single-key sig verifies.
     if (assignment.signature_type === "single") {
+      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "unsupported_signature_type" });
       return { ok: false, reason: "unsupported_signature_type" };
     }
 
@@ -260,6 +261,7 @@ export class SessionManager {
       // Falling back to assignment.signer_pubkey (frame-provided) would be attacker-controlled.
       const thresholdSigner = this.#ctx.getThresholdSigner();
       if (!thresholdSigner) {
+        this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "frost_signer_not_configured" });
         return { ok: false, reason: "frost_signer_not_configured" };
       }
       verifyKey = thresholdSigner.getPrimaryPubkey();
@@ -277,6 +279,7 @@ export class SessionManager {
 
     // Verify FROST signature with domain separation (context\0tbs framing)
     if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, verifyKey)) {
+      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "frost_signature_invalid" });
       return { ok: false, reason: "frost_signature_invalid" };
     }
 
@@ -314,7 +317,8 @@ export class SessionManager {
     let relayStream: Stream;
     try {
       relayStream = await this.#ctx.node.newStream(relayPeerId, RELAY_PROTOCOL_ID);
-    } catch {
+    } catch (err) {
+      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "relay_auth_error", detail: "newStream failed", error: err instanceof Error ? err.message : String(err) });
       return { ok: false, reason: "relay_auth_error" };
     }
 
@@ -323,10 +327,12 @@ export class SessionManager {
     try {
       const authResult = await this.#ctx.performRelayAuth(relayStream, myPubkey);
       if (!authResult.ok) {
+        this.#ctx.logger.warn("session.assignment.receive_failed", { reason: authResult.reason, detail: "relay auth handshake rejected" });
         return { ok: false, reason: authResult.reason };
       }
       relayIter = authResult.iter;
-    } catch {
+    } catch (err) {
+      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "relay_auth_error", detail: "performRelayAuth threw", error: err instanceof Error ? err.message : String(err) });
       return { ok: false, reason: "relay_auth_error" };
     }
 

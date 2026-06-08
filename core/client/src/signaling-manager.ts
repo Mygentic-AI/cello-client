@@ -163,6 +163,9 @@ export class SignalingManager {
 
     const sessionResolve = this.#pendingSessionRequestResolve;
     if (sessionResolve) {
+      this.#ctx.logger.warn("signaling.stream.closed.with_pending_session_request", {
+        note: "stream closed while session request was in-flight — synthetic directory_unreachable fired",
+      });
       this.#pendingSessionRequestResolve = null;
       sessionResolve({ type: "session_request_error", reason: "directory_unreachable" });
     }
@@ -601,6 +604,11 @@ export class SignalingManager {
     const responsePromise = new Promise<Record<string, unknown>>((resolve) => {
       responseResolve = resolve;
     });
+    if (this.#pendingSessionRequestResolve !== null) {
+      this.#ctx.logger.warn("signaling.session_request.slot_overwrite", {
+        note: "concurrent initiateSession call overwrote in-flight pendingSessionRequestResolve — prior request will never resolve",
+      });
+    }
     this.#pendingSessionRequestResolve = responseResolve;
 
     try {
