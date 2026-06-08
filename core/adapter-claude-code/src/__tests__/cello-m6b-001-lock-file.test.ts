@@ -513,6 +513,10 @@ describe("AC-001: Kill prior running process (integration)", () => {
       expect(killedEvent, "SIGKILL kill event must be logged").toBeDefined();
       expect(killedEvent?.context.priorPid).toBe(priorPid);
       expect(killedEvent?.level, "SIGKILL must be logged at warn level, not info").toBe("warn");
+      expect(
+        typeof killedEvent?.context.reaped,
+        "SIGKILL path must emit reaped boolean field per story YAML taxonomy",
+      ).toBe("boolean");
     } finally {
       // Guaranteed cleanup
       if (processA) {
