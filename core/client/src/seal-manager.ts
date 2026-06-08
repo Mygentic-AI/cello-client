@@ -32,45 +32,98 @@ export interface SealContext {
   readonly keyProvider: KeyProvider;
   getMyPubkeyHex(): string | null;
   getThresholdSigner(): IThresholdSigner | undefined;
-  getMyPrimaryPubkey(): Uint8Array | null;
+  // From SessionManager
   getSession(sessionIdHex: string): SessionRecord | undefined;
   getSessions(): Map<string, SessionRecord>;
-  getRelayStream(sessionIdHex: string): Stream | undefined;
   getOwnPendingContent(sessionIdHex: string): Map<string, { content_bytes: Uint8Array; arrived_at: number }> | undefined;
   getPendingAckResolver(sessionIdHex: string): ((ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void) | undefined;
   setPendingAckResolver(sessionIdHex: string, resolve: (ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void): void;
   deletePendingAckResolver(sessionIdHex: string): void;
-  getSealFrostResolver(sessionIdHex: string): (() => void) | undefined;
-  setSealFrostResolver(sessionIdHex: string, resolve: () => void): void;
-  deleteSealFrostResolver(sessionIdHex: string): void;
-  getSealVerifiedData(sessionIdHex: string): { leafCount: number; timestamp: number } | undefined;
-  setSealVerifiedData(sessionIdHex: string, data: { leafCount: number; timestamp: number }): void;
-  deleteSealVerifiedData(sessionIdHex: string): void;
-  hasFrostCeremonyParticipant(sessionIdHex: string): boolean;
-  addFrostCeremonyParticipant(sessionIdHex: string): void;
-  hasSealInitiatedSession(sessionIdHex: string): boolean;
-  addSealInitiatedSession(sessionIdHex: string): void;
+  // From SignalingManager
   getPersistentSignalingStream(): Stream | null;
   setPersistentSignalingStream(stream: Stream | null): void;
   setPersistentSignalingIter(iter: AsyncIterator<Uint8Array> | null): void;
-  getDirectoryStream(sessionIdHex: string): Stream | undefined;
-  getPendingUnilateralSealResolve(): ((frame: Record<string, unknown>) => void) | null;
-  setPendingUnilateralSealResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void;
   openPersistentSignalingStream(): Promise<boolean>;
-  // Callbacks into the facade for cross-cutting concerns
+  // From RelayStreamManager
+  getRelayStream(sessionIdHex: string): Stream | undefined;
+  getDirectoryStream(sessionIdHex: string): Stream | undefined;
+  // Callbacks into SessionManager
   enqueueSessionSealedEvent(sessionIdHex: string, sealedRoot: Uint8Array, closeTimestamp: number): void;
-  performGapFillReconciliation(sessionIdHex: string, fromSeq: number, toSeq: number, correlationId: string): Promise<void>;
   sendContentFrame(session: SessionRecord, content: Uint8Array, contentHash: Uint8Array): Promise<void>;
   waitForOwnEcho(sessionIdHex: string, seqNum: number): Promise<void>;
+  // Callback into RelayStreamManager
+  performGapFillReconciliation(sessionIdHex: string, fromSeq: number, toSeq: number, correlationId: string): Promise<void>;
 }
 
 export class SealManager {
   readonly #ctx: SealContext;
   readonly #sealFrostTimeoutMs: number;
 
+  // ─── Owned state ─────────────────────────────────────────────────────────────
+
+  // SESSION-005: session_id_hex → resolve fn for seal-frost-timeout Promise
+  readonly #sealFrostResolvers = new Map<string, () => void>();
+
+  // SESSION-005: session_id_hex → { leafCount, timestamp } from seal_verified frame.
+  readonly #sealVerifiedData = new Map<string, { leafCount: number; timestamp: number }>();
+
+  // Session IDs where THIS client is the FROST ceremony participant
+  readonly #frostCeremonyParticipant = new Set<string>();
+
+  // Session IDs where seal was initiated by this client
+  readonly #sealInitiatedSessions = new Set<string>();
+
+  // Pending resolver for seal_unilateral_confirmed / seal_unilateral_too_early (PERSIST-015)
+  #pendingUnilateralSealResolve: ((frame: Record<string, unknown>) => void) | null = null;
+
+  // SESSION-005: track the primary_pubkey for this client (set after bootstrapKeyShares)
+  #myPrimaryPubkey: Uint8Array | null = null;
+
   constructor(ctx: SealContext, sealFrostTimeoutMs: number) {
     this.#ctx = ctx;
     this.#sealFrostTimeoutMs = sealFrostTimeoutMs;
+  }
+
+  // ─── State accessors (called by facade.closeSession, loadPersistedState) ──────
+
+  setMyPrimaryPubkey(pubkey: Uint8Array): void {
+    this.#myPrimaryPubkey = pubkey;
+  }
+
+  getMyPrimaryPubkey(): Uint8Array | null {
+    return this.#myPrimaryPubkey;
+  }
+
+  /** Mark a session as seal-initiated by this client (called from injectTestSession). */
+  markSealInitiated(sessionIdHex: string): void {
+    this.#sealInitiatedSessions.add(sessionIdHex);
+  }
+
+  /** Mark a session as having a FROST ceremony participant (called from injectTestSession). */
+  markFrostCeremonyParticipant(sessionIdHex: string): void {
+    this.#frostCeremonyParticipant.add(sessionIdHex);
+  }
+
+  /**
+   * Resolve the pending unilateral seal waiter (if any) with the given frame.
+   * Called from facade.#dispatchSignalingFrame for seal_unilateral_confirmed and
+   * seal_unilateral_too_early frames. Clears the resolver after calling it.
+   */
+  resolvePendingUnilateralSeal(frame: Record<string, unknown>): void {
+    if (this.#pendingUnilateralSealResolve) {
+      const resolve = this.#pendingUnilateralSealResolve;
+      this.#pendingUnilateralSealResolve = null;
+      resolve(frame);
+    }
+  }
+
+  closeSession(sessionIdHex: string): void {
+    // Resolve seal-frost-timeout waiter so initiateSessionSeal doesn't hang
+    this.#sealFrostResolvers.get(sessionIdHex)?.();
+    this.#sealFrostResolvers.delete(sessionIdHex);
+    this.#sealVerifiedData.delete(sessionIdHex);
+    this.#sealInitiatedSessions.delete(sessionIdHex);
+    this.#frostCeremonyParticipant.delete(sessionIdHex);
   }
 
   async initiateSessionSeal(sessionIdHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -109,7 +162,7 @@ export class SealManager {
     }
 
     session.status = "sealing";
-    this.#ctx.addSealInitiatedSession(sessionIdHex);
+    this.#sealInitiatedSessions.add(sessionIdHex);
     // CRIT-1: persist sealing status
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
 
@@ -123,7 +176,7 @@ export class SealManager {
     // the M1 single-key seal notification will arrive asynchronously.
     if (this.#ctx.getThresholdSigner()) {
       const sealReceived = new Promise<void>((resolve) => {
-        this.#ctx.setSealFrostResolver(sessionIdHex, resolve);
+        this.#sealFrostResolvers.set(sessionIdHex, resolve);
       });
 
       const timeout = new Promise<void>((resolve) =>
@@ -133,7 +186,7 @@ export class SealManager {
       await Promise.race([sealReceived, timeout]);
 
       // Clean up resolver
-      this.#ctx.deleteSealFrostResolver(sessionIdHex);
+      this.#sealFrostResolvers.delete(sessionIdHex);
 
       // Check if session_sealed arrived (status would be 'sealed' by now)
       const sess = this.#ctx.getSession(sessionIdHex);
@@ -143,7 +196,7 @@ export class SealManager {
         sess.seal_type = "bilateral";
         // M-003: store the verified timestamp so handleSessionFrostSealed can reconstruct
         // the exact TBS if the directory later completes the deferred FROST ceremony.
-        const sealVerifiedEntry = this.#ctx.getSealVerifiedData(sessionIdHex);
+        const sealVerifiedEntry = this.#sealVerifiedData.get(sessionIdHex);
         if (sealVerifiedEntry) {
           sess.close_timestamp = sealVerifiedEntry.timestamp;
         }
@@ -195,11 +248,11 @@ export class SealManager {
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const responseFrame = await Promise.race<Record<string, unknown>>([
       new Promise<Record<string, unknown>>((resolve) => {
-        this.#ctx.setPendingUnilateralSealResolve(resolve);
+        this.#pendingUnilateralSealResolve = resolve;
       }),
       new Promise<Record<string, unknown>>((resolve) => {
         timeoutHandle = setTimeout(() => {
-          this.#ctx.setPendingUnilateralSealResolve(null);
+          this.#pendingUnilateralSealResolve = null;
           resolve({ type: "seal_unilateral_error", reason: "timeout" });
         }, UNILATERAL_TIMEOUT_MS);
       }),
@@ -387,7 +440,7 @@ export class SealManager {
 
       // Use sealVerifiedData if available (responder also gets seal_verified when M2 initiator),
       // else fall back to local_tree_leaves.length.
-      const sealVerifiedEntry = this.#ctx.getSealVerifiedData(sessionIdHex);
+      const sealVerifiedEntry = this.#sealVerifiedData.get(sessionIdHex);
       const leafCount = sealVerifiedEntry?.leafCount ?? session.local_tree_leaves.length;
       const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp);
 
@@ -402,7 +455,7 @@ export class SealManager {
       session.signer_pubkey = signerPubkey;
       session.seal_type = "frost";
       session.close_timestamp = closeTimestamp;
-      this.#ctx.deleteSealVerifiedData(sessionIdHex);
+      this.#sealVerifiedData.delete(sessionIdHex);
       // CRIT-1: persist sealed state
       void this.#ctx.persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
@@ -437,7 +490,7 @@ export class SealManager {
     }
 
     // Resolve the seal-frost-timeout waiter
-    this.#ctx.getSealFrostResolver(sessionIdHex)?.();
+    this.#sealFrostResolvers.get(sessionIdHex)?.();
   }
 
   /** M2 FROST seal verification. */
@@ -463,7 +516,7 @@ export class SealManager {
     const leafCountRaw = frame["leaf_count"];
     // Prefer stored sealVerifiedData so we use the same leafCount that was used during
     // the FROST ceremony, even if local_tree_leaves is incomplete due to a desync race.
-    const sealVerifiedEntry = this.#ctx.getSealVerifiedData(sessionIdHex);
+    const sealVerifiedEntry = this.#sealVerifiedData.get(sessionIdHex);
     const leafCount = typeof leafCountRaw === "number" ? leafCountRaw
       : (sealVerifiedEntry?.leafCount ?? session.local_tree_leaves.length);
     const resolvedCloseTimestamp = closeTimestamp ?? sealVerifiedEntry?.timestamp ?? null;
@@ -481,10 +534,10 @@ export class SealManager {
     // #frostCeremonyParticipant is set by handleSealVerified before the ceremony runs —
     // a concurrent-close counterparty (in sealInitiatedSessions but NOT frostCeremonyParticipant)
     // must use signerPubkey from the frame (the actual initiator's key).
-    const isFrostInitiator = this.#ctx.hasFrostCeremonyParticipant(sessionIdHex);
+    const isFrostInitiator = this.#frostCeremonyParticipant.has(sessionIdHex);
     let verifyKey: Uint8Array;
     if (isFrostInitiator) {
-      const myPrimaryPubkey = this.#ctx.getMyPrimaryPubkey();
+      const myPrimaryPubkey = this.#myPrimaryPubkey;
       if (!myPrimaryPubkey) {
         console.warn(`[cello-client] no primary_pubkey set on initiator for session ${sessionIdHex}`);
         return;
@@ -506,14 +559,14 @@ export class SealManager {
     session.signer_pubkey = signerPubkey;
     session.seal_type = "frost";
     session.close_timestamp = resolvedCloseTimestamp;
-    this.#ctx.deleteSealVerifiedData(sessionIdHex);
+    this.#sealVerifiedData.delete(sessionIdHex);
     // CRIT-1: persist sealed state
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
     // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
     this.#ctx.enqueueSessionSealedEvent(sessionIdHex, sealedRoot, resolvedCloseTimestamp);
 
     // Resolve the seal-frost-timeout waiter so initiateSessionSeal returns promptly
-    this.#ctx.getSealFrostResolver(sessionIdHex)?.();
+    this.#sealFrostResolvers.get(sessionIdHex)?.();
   }
 
   handleDirectorySessionSealRejected(sessionIdHex: string, _frame: Record<string, unknown>): void {
@@ -522,7 +575,7 @@ export class SealManager {
     session.status = "seal_rejected";
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
     // Also resolve the seal-frost-timeout waiter so initiateSessionSeal doesn't wait for the timeout
-    this.#ctx.getSealFrostResolver(sessionIdHex)?.();
+    this.#sealFrostResolvers.get(sessionIdHex)?.();
   }
 
   /**
@@ -598,8 +651,8 @@ export class SealManager {
     // absent FROST waiter is harmless (map miss returns undefined), but resolving a present one
     // spuriously would confuse the bilateral seal flow. Guard on whether the session was actually
     // in sealing state via the FROST path before the unilateral confirmation arrived.
-    if (this.#ctx.hasSealInitiatedSession(sessionIdHex)) {
-      this.#ctx.getSealFrostResolver(sessionIdHex)?.();
+    if (this.#sealInitiatedSessions.has(sessionIdHex)) {
+      this.#sealFrostResolvers.get(sessionIdHex)?.();
     }
   }
 
@@ -729,10 +782,10 @@ export class SealManager {
 
     // Store for handleSessionFrostSealed so it can use the authoritative leafCount/timestamp
     // even if local_tree_leaves is incomplete due to a desync race.
-    this.#ctx.setSealVerifiedData(sessionIdHex, { leafCount, timestamp });
+    this.#sealVerifiedData.set(sessionIdHex, { leafCount, timestamp });
     // Mark this client as the FROST ceremony participant so handleFrostSealed uses
     // myPrimaryPubkey for verification (anti-substitution guard).
-    this.#ctx.addFrostCeremonyParticipant(sessionIdHex);
+    this.#frostCeremonyParticipant.add(sessionIdHex);
 
     const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, timestamp);
 
@@ -866,7 +919,7 @@ export class SealManager {
 
     // Prefer stored sealVerifiedData leafCount (same as handleFrostSealed) so verification
     // uses the count from the FROST ceremony even if local_tree_leaves is incomplete.
-    const sealVerifiedEntry = this.#ctx.getSealVerifiedData(sessionIdHex);
+    const sealVerifiedEntry = this.#sealVerifiedData.get(sessionIdHex);
     const leafCount = sealVerifiedEntry?.leafCount ?? session.local_tree_leaves.length;
     // M-003: close_timestamp must be set (stored during bilateral fallback from seal_verified).
     // Without it we cannot reconstruct the exact TBS and verification would be unsound.
@@ -877,10 +930,10 @@ export class SealManager {
     }
     const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp);
 
-    const isFrostInitiator = this.#ctx.hasFrostCeremonyParticipant(sessionIdHex);
+    const isFrostInitiator = this.#frostCeremonyParticipant.has(sessionIdHex);
     let verifyKey: Uint8Array;
     if (isFrostInitiator) {
-      const myPrimaryPubkey = this.#ctx.getMyPrimaryPubkey();
+      const myPrimaryPubkey = this.#myPrimaryPubkey;
       if (!myPrimaryPubkey) return;
       verifyKey = myPrimaryPubkey;
     } else {

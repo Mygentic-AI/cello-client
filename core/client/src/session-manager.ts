@@ -5,10 +5,20 @@
  *   - Session assignment acceptance (receiveSessionAssignment)
  *   - Outbound message sending (sendMessage, #sendMessageLocked)
  *   - Content delivery (sendContentFrame, waitForOwnEcho)
- *   - Inbound message queuing (receiveMessage, receiveAnyMessage)
+ *   - Inbound message queuing (enqueueReceivedMessage, enqueueSessionSealedEvent)
  *   - Async blocking receive (receiveSessionMessageAsync, receiveMessageAsync)
- *   - Session sealed event routing (#enqueueSessionSealedEvent)
  *   - Session listing (listSessions)
+ *
+ * State owned here (not in facade):
+ *   - #sessions: SessionRecord map
+ *   - #sessionMessageQueues + #anyMessageQueue: inbound message queues
+ *   - #receiveWaiters + #receiveAnyWaiters: async-receive wake resolvers
+ *   - #outboundQueues: per-session send serialization chains
+ *   - #pendingAckResolvers: in-flight ack resolvers
+ *   - #ownEchoResolvers: echo wait resolvers (set by relay reader, resolved here)
+ *   - #ownPendingContent: pre-buffered own sends (keyed by content_hash_hex)
+ *   - #contentHandlerRegistered: content stream protocol guard
+ *   - #onSessionAssignmentHandler: inbound session callback
  */
 
 import { createHash } from "node:crypto";
@@ -34,7 +44,8 @@ const CBOR_ENC = new Encoder({ tagUint8Array: false });
 const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 
 /**
- * Narrow interface exposing only what SessionManager needs from CelloClientImpl.
+ * Narrow interface exposing only what SessionManager needs from the facade
+ * and from other managers.
  */
 export interface SessionContext {
   readonly logger: Logger;
@@ -44,49 +55,174 @@ export interface SessionContext {
   getMyPubkeyHex(): string | null;
   setMyPubkeyHex(hex: string): void;
   getThresholdSigner(): IThresholdSigner | undefined;
-  getSession(sessionIdHex: string): SessionRecord | undefined;
-  getSessions(): Map<string, SessionRecord>;
-  setSession(sessionIdHex: string, record: SessionRecord): void;
-  getRelayStream(sessionIdHex: string): Stream | undefined;
-  setRelayStream(sessionIdHex: string, stream: Stream): void;
-  getRelayRecvSeq(sessionIdHex: string): number | undefined;
-  setRelayRecvSeq(sessionIdHex: string, seq: number): void;
-  setReadyQueue(sessionIdHex: string, queue: Map<number, unknown>): void;
-  setPendingS2(sessionIdHex: string, map: Map<string, unknown>): void;
-  setPendingContent(sessionIdHex: string, map: Map<string, unknown>): void;
-  setOwnPendingContent(sessionIdHex: string, map: Map<string, { content_bytes: Uint8Array; arrived_at: number }>): void;
-  getOwnPendingContent(sessionIdHex: string): Map<string, { content_bytes: Uint8Array; arrived_at: number }> | undefined;
-  setTamperedContentClaims(sessionIdHex: string, set: Set<string>): void;
-  setOwnEchoResolvers(sessionIdHex: string, map: Map<number, () => void>): void;
-  getOwnEchoResolvers(sessionIdHex: string): Map<number, () => void> | undefined;
-  setSessionMessageQueue(sessionIdHex: string, queue: ReceivedMessage[]): void;
-  getSessionMessageQueue(sessionIdHex: string): ReceivedMessage[] | undefined;
-  deleteSessionMessageQueue(sessionIdHex: string): void;
-  getAnyMessageQueue(): Array<{ sessionIdHex: string; message: ReceivedMessage }>;
-  getReceiveWaiters(sessionIdHex: string): Set<() => void> | undefined;
-  setReceiveWaiters(sessionIdHex: string, set: Set<() => void>): void;
-  getReceiveAnyWaiters(): Set<() => void>;
-  getOutboundQueue(sessionIdHex: string): Promise<void> | undefined;
-  setOutboundQueue(sessionIdHex: string, queue: Promise<void>): void;
-  getPendingAckResolver(sessionIdHex: string): ((ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void) | undefined;
-  setPendingAckResolver(sessionIdHex: string, resolve: (ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void): void;
-  deletePendingAckResolver(sessionIdHex: string): void;
   getPersistentSignalingStream(): Stream | null;
-  getContentHandlerRegistered(): boolean;
-  setContentHandlerRegistered(value: boolean): void;
-  getOnSessionAssignmentHandler(): ((event: SessionAssignmentEvent) => void) | undefined;
-  // Callbacks into other managers
+  // RelayStreamManager callbacks (lazy — safe since managers are wired before any method is called)
+  initRelaySession(sessionIdHex: string): void;
   runRelayStreamReader(sessionIdHex: string, stream: Stream, myPubkeyHex: string, iter: AsyncIterator<Uint8Array>): void;
   performRelayAuth(stream: Stream, myPubkey: Uint8Array): Promise<{ ok: true; iter: AsyncIterator<Uint8Array> } | { ok: false; reason: "relay_auth_failed" | "relay_auth_error" }>;
   handleContentStream(stream: Stream): void;
   connectDirectorySignalingStream(sessionIdHex: string, assignment: SessionAssignment, myPubkey: Uint8Array): Promise<void>;
+  // RelayStreamManager state accessor (needed by #sendMessageLocked)
+  getRelayStream(sessionIdHex: string): Stream | undefined;
 }
 
 export class SessionManager {
   readonly #ctx: SessionContext;
 
+  // ─── Owned state ─────────────────────────────────────────────────────────────
+
+  // session_id_hex → SessionRecord (SESSION-002)
+  readonly #sessions = new Map<string, SessionRecord>();
+
+  // track whether content handler has been registered on this node
+  #contentHandlerRegistered = false;
+
+  // Callback for inbound session assignments (participant B role). MCP-002.
+  #onSessionAssignmentHandler: ((event: SessionAssignmentEvent) => void) | undefined;
+
+  // session_id_hex → Promise<void> chain for outbound serialization
+  readonly #outboundQueues = new Map<string, Promise<void>>();
+
+  // session_id_hex → pending ack resolver (sequence_number → ack data)
+  readonly #pendingAckResolvers = new Map<string, (ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void>();
+
+  // session_id_hex → own_echo_resolvers (sequence_number → resolve fn)
+  // Populated from relay stream reader via notifyOwnEcho(); resolved when echo arrives.
+  readonly #ownEchoResolvers = new Map<string, Map<number, () => void>>();
+
+  // session_id_hex → own-send pre-buffered content keyed by content_hash_hex
+  readonly #ownPendingContent = new Map<string, Map<string, { content_bytes: Uint8Array; arrived_at: number }>>();
+
+  // session_id_hex → FIFO queue of ReceivedMessage (for receiveMessage)
+  readonly #sessionMessageQueues = new Map<string, ReceivedMessage[]>();
+
+  // FIFO arrival order across all sessions: { sessionIdHex, message }
+  readonly #anyMessageQueue: Array<{ sessionIdHex: string; message: ReceivedMessage }> = [];
+
+  // SESSION-007: wake resolvers for receiveSessionMessageAsync (per-session) and receiveMessageAsync (any-session)
+  readonly #receiveWaiters = new Map<string, Set<() => void>>();
+  readonly #receiveAnyWaiters = new Set<() => void>();
+
   constructor(ctx: SessionContext) {
     this.#ctx = ctx;
+  }
+
+  // ─── State accessors (called by RelayStreamManager, SealManager, facade) ─────
+
+  getSession(sessionIdHex: string): SessionRecord | undefined {
+    return this.#sessions.get(sessionIdHex);
+  }
+
+  getSessions(): Map<string, SessionRecord> {
+    return this.#sessions;
+  }
+
+  setSession(sessionIdHex: string, record: SessionRecord): void {
+    this.#sessions.set(sessionIdHex, record);
+  }
+
+  deleteSession(sessionIdHex: string): void {
+    this.#sessions.delete(sessionIdHex);
+  }
+
+  getOutboundQueue(sessionIdHex: string): Promise<void> | undefined {
+    return this.#outboundQueues.get(sessionIdHex);
+  }
+
+  setOutboundQueue(sessionIdHex: string, queue: Promise<void>): void {
+    this.#outboundQueues.set(sessionIdHex, queue);
+  }
+
+  deleteOutboundQueue(sessionIdHex: string): void {
+    this.#outboundQueues.delete(sessionIdHex);
+  }
+
+  getPendingAckResolver(sessionIdHex: string): ((ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void) | undefined {
+    return this.#pendingAckResolvers.get(sessionIdHex);
+  }
+
+  setPendingAckResolver(sessionIdHex: string, resolve: (ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void): void {
+    this.#pendingAckResolvers.set(sessionIdHex, resolve);
+  }
+
+  deletePendingAckResolver(sessionIdHex: string): void {
+    this.#pendingAckResolvers.delete(sessionIdHex);
+  }
+
+  getOwnEchoResolvers(sessionIdHex: string): Map<number, () => void> | undefined {
+    return this.#ownEchoResolvers.get(sessionIdHex);
+  }
+
+  initOwnEchoResolvers(sessionIdHex: string): void {
+    this.#ownEchoResolvers.set(sessionIdHex, new Map());
+  }
+
+  deleteOwnEchoResolvers(sessionIdHex: string): void {
+    this.#ownEchoResolvers.delete(sessionIdHex);
+  }
+
+  getOwnPendingContent(sessionIdHex: string): Map<string, { content_bytes: Uint8Array; arrived_at: number }> | undefined {
+    return this.#ownPendingContent.get(sessionIdHex);
+  }
+
+  initOwnPendingContent(sessionIdHex: string): void {
+    this.#ownPendingContent.set(sessionIdHex, new Map());
+  }
+
+  deleteOwnPendingContent(sessionIdHex: string): void {
+    this.#ownPendingContent.delete(sessionIdHex);
+  }
+
+  getSessionMessageQueue(sessionIdHex: string): ReceivedMessage[] | undefined {
+    return this.#sessionMessageQueues.get(sessionIdHex);
+  }
+
+  deleteSessionMessageQueue(sessionIdHex: string): void {
+    this.#sessionMessageQueues.delete(sessionIdHex);
+  }
+
+  /** Initialize the message queue for a session (called from loadPersistedState). */
+  initSessionMessageQueue(sessionIdHex: string): void {
+    if (!this.#sessionMessageQueues.has(sessionIdHex)) {
+      this.#sessionMessageQueues.set(sessionIdHex, []);
+    }
+  }
+
+  getAnyMessageQueue(): Array<{ sessionIdHex: string; message: ReceivedMessage }> {
+    return this.#anyMessageQueue;
+  }
+
+  setOnSessionAssignmentHandler(handler: (event: SessionAssignmentEvent) => void): void {
+    this.#onSessionAssignmentHandler = handler;
+  }
+
+  /**
+   * Clean up all per-session state owned by SessionManager.
+   * Called by facade.closeSession — companion to RelayStreamManager.closeSession and SealManager.closeSession.
+   */
+  closeSession(sessionIdHex: string): void {
+    this.#sessions.delete(sessionIdHex);
+    this.#outboundQueues.delete(sessionIdHex);
+    this.#ownEchoResolvers.delete(sessionIdHex);
+    this.#ownPendingContent.delete(sessionIdHex);
+    this.#sessionMessageQueues.delete(sessionIdHex);
+    // Clear pending ack resolver (already unblocked by facade before calling closeSession)
+    this.#pendingAckResolvers.delete(sessionIdHex);
+    // Clear receive waiters for this session
+    this.#receiveWaiters.delete(sessionIdHex);
+  }
+
+  // ─── Called by RelayStreamManager after relay receives a message ─────────────
+
+  enqueueReceivedMessage(sessionIdHex: string, message: ReceivedMessage): void {
+    let queue = this.#sessionMessageQueues.get(sessionIdHex);
+    if (!queue) {
+      queue = [];
+      this.#sessionMessageQueues.set(sessionIdHex, queue);
+    }
+    queue.push(message);
+    this.#anyMessageQueue.push({ sessionIdHex, message });
+    this.wakeReceiveWaiters(sessionIdHex);
   }
 
   // ─── SESSION-002 ─────────────────────────────────────────────────────────────
@@ -152,8 +288,8 @@ export class SessionManager {
 
     // Step 4: Register content protocol handler on this node (if not already registered).
     // Set the flag before awaiting handle() to prevent concurrent calls from both registering.
-    if (!this.#ctx.getContentHandlerRegistered()) {
-      this.#ctx.setContentHandlerRegistered(true);
+    if (!this.#contentHandlerRegistered) {
+      this.#contentHandlerRegistered = true;
       try {
         await this.#ctx.node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
           this.#ctx.handleContentStream(stream);
@@ -235,22 +371,18 @@ export class SessionManager {
       next_expected_seq: 1,
       desynchronized: false,
     };
-    this.#ctx.setSession(sessionIdHex, record);
+    this.#sessions.set(sessionIdHex, record);
     // PERSIST-024: persist session to DB
     if (this.#ctx.persistence) {
       void this.#ctx.persistence.persistSession(sessionIdHex, record);
     }
 
-    // Store the relay stream and start the persistent reader loop (MSG-004)
-    this.#ctx.setRelayStream(sessionIdHex, relayStream);
-    this.#ctx.setRelayRecvSeq(sessionIdHex, 0);
-    this.#ctx.setReadyQueue(sessionIdHex, new Map());
-    this.#ctx.setPendingS2(sessionIdHex, new Map());
-    this.#ctx.setPendingContent(sessionIdHex, new Map());
-    this.#ctx.setOwnPendingContent(sessionIdHex, new Map());
-    this.#ctx.setTamperedContentClaims(sessionIdHex, new Set());
-    this.#ctx.setOwnEchoResolvers(sessionIdHex, new Map());
-    this.#ctx.setSessionMessageQueue(sessionIdHex, []);
+    // Initialize per-session state in this manager and RelayStreamManager
+    this.#outboundQueues.set(sessionIdHex, Promise.resolve());
+    this.#ownEchoResolvers.set(sessionIdHex, new Map());
+    this.#ownPendingContent.set(sessionIdHex, new Map());
+    this.#sessionMessageQueues.set(sessionIdHex, []);
+    this.#ctx.initRelaySession(sessionIdHex);
 
     // Cache myPubkeyHex for the stream reader (same key across all sessions on this client)
     if (!this.#ctx.getMyPubkeyHex()) this.#ctx.setMyPubkeyHex(myPubkeyHex);
@@ -259,7 +391,7 @@ export class SessionManager {
 
     // Fire inbound session handler if this client is participant B.
     if (myPubkeyHex !== pubAHex) {
-      const handler = this.#ctx.getOnSessionAssignmentHandler();
+      const handler = this.#onSessionAssignmentHandler;
       if (handler) {
         handler({
           sessionIdHex,
@@ -280,17 +412,17 @@ export class SessionManager {
   }
 
   listSessions(): SessionRecord[] {
-    return Array.from(this.#ctx.getSessions().values());
+    return Array.from(this.#sessions.values());
   }
 
   // ─── MSG-004 implementation ──────────────────────────────────────────────────
 
   async sendMessage(sessionIdHex: string, content: Uint8Array): Promise<SendMessageResult> {
     // Per-session outbound serialization queue: next send not started until echo received
-    const prev = this.#ctx.getOutboundQueue(sessionIdHex) ?? Promise.resolve();
+    const prev = this.#outboundQueues.get(sessionIdHex) ?? Promise.resolve();
     let release!: () => void;
     const next = new Promise<void>((r) => { release = r; });
-    this.#ctx.setOutboundQueue(sessionIdHex, prev.then(() => next));
+    this.#outboundQueues.set(sessionIdHex, prev.then(() => next));
     await prev;
     try {
       return await this.#sendMessageLocked(sessionIdHex, content);
@@ -300,7 +432,7 @@ export class SessionManager {
   }
 
   async #sendMessageLocked(sessionIdHex: string, content: Uint8Array): Promise<SendMessageResult> {
-    const session = this.#ctx.getSession(sessionIdHex);
+    const session = this.#sessions.get(sessionIdHex);
     if (!session) return { ok: false, reason: "session_not_found" };
     if (session.desynchronized) return { ok: false, reason: "session_desynchronized" };
     if (session.status === "sealing" || session.status === "sealed" || session.status === "seal_deferred" || session.status === "seal_rejected") return { ok: false, reason: "session_sealed" };
@@ -340,7 +472,7 @@ export class SessionManager {
     }) as Uint8Array;
 
     const contentHashHex = Buffer.from(contentHash).toString("hex");
-    this.#ctx.getOwnPendingContent(sessionIdHex)?.set(contentHashHex, {
+    this.#ownPendingContent.get(sessionIdHex)?.set(contentHashHex, {
       content_bytes: content,
       arrived_at: Date.now(),
     });
@@ -352,20 +484,20 @@ export class SessionManager {
     }
 
     // Set up ack resolver before sending to avoid race with fast relay.
-    if (this.#ctx.getPendingAckResolver(sessionIdHex)) {
+    if (this.#pendingAckResolvers.has(sessionIdHex)) {
       throw new Error(`[cello-client] ack resolver already set for session ${sessionIdHex}; outbound queue invariant violated`);
     }
     let ackResolve!: (v: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void;
     const ackPromise = new Promise<{ ok: true; sequence_number: number } | { ok: false; reason: string }>(
       (r) => { ackResolve = r; }
     );
-    this.#ctx.setPendingAckResolver(sessionIdHex, ackResolve);
+    this.#pendingAckResolvers.set(sessionIdHex, ackResolve);
 
     try {
       relayStream.send(lp.encode.single(hashSubmitFrame));
     } catch {
-      this.#ctx.deletePendingAckResolver(sessionIdHex);
-      this.#ctx.getOwnPendingContent(sessionIdHex)?.delete(contentHashHex);
+      this.#pendingAckResolvers.delete(sessionIdHex);
+      this.#ownPendingContent.get(sessionIdHex)?.delete(contentHashHex);
       if (this.#ctx.persistence) {
         void this.#ctx.persistence.removePendingHash(sessionIdHex, contentHashHex);
       }
@@ -387,7 +519,7 @@ export class SessionManager {
     }
 
     // Send content to counterparty on /cello/content/1.0.0
-    const sess2 = this.#ctx.getSession(sessionIdHex);
+    const sess2 = this.#sessions.get(sessionIdHex);
     if (sess2 && !sess2.desynchronized) {
       void this.sendContentFrame(sess2, content, contentHash);
     }
@@ -395,7 +527,7 @@ export class SessionManager {
     // Wait for our own echoed leaf_deliver
     await this.waitForOwnEcho(sessionIdHex, mySeq);
 
-    const sess3 = this.#ctx.getSession(sessionIdHex);
+    const sess3 = this.#sessions.get(sessionIdHex);
     if (!sess3 || sess3.desynchronized) return { ok: false, reason: "session_desynchronized" };
 
     return { ok: true };
@@ -425,7 +557,7 @@ export class SessionManager {
 
   async waitForOwnEcho(sessionIdHex: string, seqNum: number): Promise<void> {
     return new Promise<void>((resolve) => {
-      const resolvers = this.#ctx.getOwnEchoResolvers(sessionIdHex);
+      const resolvers = this.#ownEchoResolvers.get(sessionIdHex);
       if (resolvers) {
         resolvers.set(seqNum, resolve);
       } else {
@@ -435,23 +567,21 @@ export class SessionManager {
   }
 
   receiveMessage(sessionIdHex: string): ReceivedMessage | null {
-    const queue = this.#ctx.getSessionMessageQueue(sessionIdHex);
+    const queue = this.#sessionMessageQueues.get(sessionIdHex);
     if (!queue || queue.length === 0) return null;
     return queue.shift()!;
   }
 
   receiveAnyMessage(): { sessionIdHex: string; message: ReceivedMessage } | null {
-    return this.#ctx.getAnyMessageQueue().shift() ?? null;
+    return this.#anyMessageQueue.shift() ?? null;
   }
 
   // ─── SESSION-007: async blocking receive ─────────────────────────────────────
 
   #computeOtherSessionsPending(excludeSessionIdHex: string): string[] {
     const pending: string[] = [];
-    for (const [sid, queue] of this.#ctx.getSessions().entries()) {
-      void queue;
-      const msgQueue = this.#ctx.getSessionMessageQueue(sid);
-      if (sid !== excludeSessionIdHex && msgQueue && msgQueue.length > 0) {
+    for (const [sid, queue] of this.#sessionMessageQueues.entries()) {
+      if (sid !== excludeSessionIdHex && queue.length > 0) {
         pending.push(sid);
       }
     }
@@ -460,14 +590,14 @@ export class SessionManager {
 
   wakeReceiveWaiters(sessionIdHex: string): void {
     // Wake per-session waiters
-    const sessionWaiters = this.#ctx.getReceiveWaiters(sessionIdHex);
+    const sessionWaiters = this.#receiveWaiters.get(sessionIdHex);
     if (sessionWaiters) {
       for (const resolve of sessionWaiters) resolve();
       sessionWaiters.clear();
     }
     // Wake any-session waiters
-    for (const resolve of this.#ctx.getReceiveAnyWaiters()) resolve();
-    this.#ctx.getReceiveAnyWaiters().clear();
+    for (const resolve of this.#receiveAnyWaiters) resolve();
+    this.#receiveAnyWaiters.clear();
   }
 
   async receiveSessionMessageAsync(sessionIdHex: string, timeoutMs: number): Promise<ReceivedMessage | null> {
@@ -475,15 +605,14 @@ export class SessionManager {
 
     while (true) {
       // Check queue first (fast path: already has messages)
-      const queue = this.#ctx.getSessionMessageQueue(sessionIdHex);
+      const queue = this.#sessionMessageQueues.get(sessionIdHex);
       if (queue && queue.length > 0) {
         const item = queue.shift()!;
-        // Remove from anyMessageQueue as well to keep in sync
-        const anyQueue = this.#ctx.getAnyMessageQueue();
-        const idx = anyQueue.findIndex(
+        // Remove from #anyMessageQueue as well to keep in sync
+        const idx = this.#anyMessageQueue.findIndex(
           (e) => e.sessionIdHex === sessionIdHex && e.message === item
         );
-        if (idx !== -1) anyQueue.splice(idx, 1);
+        if (idx !== -1) this.#anyMessageQueue.splice(idx, 1);
         // Attach otherSessionsPending
         const pending = this.#computeOtherSessionsPending(sessionIdHex);
         const result = pending.length > 0 ? { ...item, otherSessionsPending: pending } : item;
@@ -502,14 +631,15 @@ export class SessionManager {
 
       // Register wake resolver and race against timeout
       await new Promise<void>((resolve) => {
-        let set = this.#ctx.getReceiveWaiters(sessionIdHex);
+        let set = this.#receiveWaiters.get(sessionIdHex);
         if (!set) {
           set = new Set();
-          this.#ctx.setReceiveWaiters(sessionIdHex, set);
+          this.#receiveWaiters.set(sessionIdHex, set);
         }
         set.add(resolve);
         setTimeout(() => {
-          this.#ctx.getReceiveWaiters(sessionIdHex)?.delete(resolve);
+          // Remove resolver if timeout fires before wake
+          this.#receiveWaiters.get(sessionIdHex)?.delete(resolve);
           resolve();
         }, remaining);
       });
@@ -524,11 +654,10 @@ export class SessionManager {
 
     while (true) {
       // Check any-session queue first (fast path)
-      const anyQueue = this.#ctx.getAnyMessageQueue();
-      if (anyQueue.length > 0) {
-        const entry = anyQueue.shift()!;
+      if (this.#anyMessageQueue.length > 0) {
+        const entry = this.#anyMessageQueue.shift()!;
         // Remove from per-session queue as well
-        const perSession = this.#ctx.getSessionMessageQueue(entry.sessionIdHex);
+        const perSession = this.#sessionMessageQueues.get(entry.sessionIdHex);
         if (perSession) {
           const idx = perSession.indexOf(entry.message);
           if (idx !== -1) perSession.splice(idx, 1);
@@ -553,9 +682,9 @@ export class SessionManager {
 
       // Register wake resolver and race against timeout
       await new Promise<void>((resolve) => {
-        this.#ctx.getReceiveAnyWaiters().add(resolve);
+        this.#receiveAnyWaiters.add(resolve);
         setTimeout(() => {
-          this.#ctx.getReceiveAnyWaiters().delete(resolve);
+          this.#receiveAnyWaiters.delete(resolve);
           resolve();
         }, remaining);
       });
@@ -567,6 +696,7 @@ export class SessionManager {
     sealedRoot: Uint8Array,
     closeTimestamp: number,
   ): void {
+    // Use sessionIdHex as correlationId — minted at session initiation, unique per session flow.
     const correlationId = sessionIdHex;
     this.#ctx.logger.info("session.sealed.received", {
       sessionId: sessionIdHex,
@@ -582,13 +712,13 @@ export class SessionManager {
       closeTimestamp,
       checkpointStatus: "pending",
     };
-    let queue = this.#ctx.getSessionMessageQueue(sessionIdHex);
+    let queue = this.#sessionMessageQueues.get(sessionIdHex);
     if (!queue) {
       queue = [];
-      this.#ctx.setSessionMessageQueue(sessionIdHex, queue);
+      this.#sessionMessageQueues.set(sessionIdHex, queue);
     }
     queue.push(lifecycleEvent);
-    this.#ctx.getAnyMessageQueue().push({ sessionIdHex, message: lifecycleEvent });
+    this.#anyMessageQueue.push({ sessionIdHex, message: lifecycleEvent });
     this.wakeReceiveWaiters(sessionIdHex);
   }
 }

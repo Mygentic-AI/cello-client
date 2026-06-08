@@ -1,123 +1,19 @@
 /**
- * CELLO Client — client.ts (MSG-002, SESSION-002)
+ * CELLO Client — CelloClientImpl facade.
  *
- * CelloClientImpl: peer registry, send path, inbound stream handler,
- * and receive queue for the M0 one-shot message exchange protocol.
- * SESSION-002 additions: receiveSessionAssignment, listSessions.
- *
- * PSEUDOCODE (Phase P):
- *
- * send(peerPubkeyHex, content):
- *   1. Look up peerPubkeyHex → peer_not_connected if absent
- *   2. buildEnvelope(content, keyProvider, Date.now()) → content_too_large if rejected
- *   3. serializeEnvelope → bytes
- *   4. node.newStream(peerId, CELLO_PROTOCOL_ID):
- *      - structured error → peer_unreachable or connection_lost
- *   5. stream.send(lp.encode.single(bytes))
- *   6. stream.close() — half-close write side
- *   7. Drain read side (for await lp.decode(stream)):
- *      - clean EOF → delivered:true
- *      - stream.status === 'reset' → remote_rejected
- *      - transport error → connection_lost
- *
- * inbound handler (stream):
- *   1. AbortController with 5s timeout
- *   2. Read one LP frame via lp.decode(stream) — abort if timeout fires
- *   3. deserializeEnvelope(payload) → malformed_envelope + stream.abort on error
- *   4. validateEnvelope(envelope) → stream.abort on error
- *   5. enqueue to receiveQueue keyed by sender_pubkey hex
- *   6. stream.close() — clean close signals delivered:true to sender
- *
- * sendRaw(peerPubkeyHex, bytes) [internal, exposed for tests]:
- *   Open stream, write raw bytes as single LP frame, await close type.
- *   Used by tests to inject tampered envelopes.
- *
- * receiveSessionAssignment(assignment, myPubkey):
- *   SESSION-002 AC-002, AC-003, AC-004, AC-005, SI-003
- *   SESSION-004 changes: replace M1 Ed25519 verify with FROST verify path.
- *
- *   SESSION-004 pseudocode (Phase P rev2):
- *   RFC 9591 (FROST), RFC 8032 (Ed25519), FIPS 180-4 (SHA-256)
- *
- *   1. Check signature_type (SESSION-004 SI-003, AC-003):
- *      if assignment.signature_type === 'single':
- *        return { ok:false, reason:"unsupported_signature_type" }
- *        // Hard cut — even if the single-key sig itself verifies (SI-003 is absolute)
- *        // No session record is created (SI-003). No I/O is attempted.
- *
- *   2. Determine role and verification key (SESSION-004 AC-007):
- *      isInitiator = (Buffer.from(myPubkey).equals(Buffer.from(pubA)))
- *      if isInitiator:
- *        // CRITICAL-1 FIX: initiator MUST have a thresholdSigner injected.
- *        // There is NO fallback to assignment.signer_pubkey — that is frame-provided
- *        // and attacker-controlled. Absence of a signer is a hard error.
- *        if this.#thresholdSigner is null:
- *          return { ok:false, reason:"frost_signer_not_configured" }
- *        verifyKey = this.#thresholdSigner.getPrimaryPubkey()  // HIGH-4: on IThresholdSigner
- *      else:
- *        // Counterparty: use signer_pubkey embedded in the frame (A's primary_pubkey)
- *        // TypeScript discriminated union guarantees signer_pubkey is present for 'frost' frames
- *        verifyKey = assignment.signer_pubkey  // guaranteed non-undefined by type system
- *
- *   3. Compute genesis_prev_root (same as M1):
- *      genesis_prev_root = computeGenesisPrevRoot(pubA, pubB, session_id, session_timestamp)
- *
- *   4. Build session establishment TBS (HIGH-5: uses buildSessionEstablishmentTbs from protocol-types):
- *      tbs = buildSessionEstablishmentTbs(session_id, pubA, pubB, genesis_prev_root, session_timestamp)
- *
- *   5. Verify FROST signature (SESSION-004 AC-002, SI-001):
- *      //  Use FrostThresholdSigner.verifySignature() which handles framing internally:
- *      //    framedMsg = <context>\0<tbs>  (domain separation per CONTEXT.md)
- *      //  OR use ed25519_FROST.verify(sig, frameMessage(context, tbs), verifyKey) directly
- *      //  The client imports ed25519_FROST from @noble/curves/ed25519 (not from @cello-protocol/crypto)
- *      //  to keep the verify path independent from any signer state.
- *      framedMsg = frameMessage(CONTEXT_SESSION_ESTABLISHMENT, tbs)  // context\0tbs
- *      isValid = ed25519_FROST.verify(assignment.directory_signature, framedMsg, verifyKey)
- *      if !isValid:
- *        return { ok:false, reason:"frost_signature_invalid" }
- *        // Never accept a tampered signature (SI-001 absolute)
- *
- *   6-9. (same as M1: content handler, relay auth, counterparty dial, store session)
- *
- * IMPORTANT NOTE on CelloClientImpl constructor and createClient factory changes:
- *   - Add optional #thresholdSigner: IThresholdSigner | null field
- *   - createClient accepts optional thresholdSigner in opts
- *   - No @cello-protocol/directory import — IThresholdSigner comes from @cello-protocol/crypto
- *
- * IMPORTANT NOTE on ReceiveAssignmentResult (IMPORTANT-9):
- *   Add 'frost_signature_invalid' | 'unsupported_signature_type' | 'frost_signer_not_configured'
- *   to the reason union in types.ts
- *
- *   1. Build TBS = CBOR([session_id, participant_a.pubkey, participant_b.pubkey, session_timestamp])
- *   2. Verify Ed25519(TBS, assignment.directory_pubkey, assignment.directory_signature) [M1, REMOVED in M2]
- *      → { ok:false, reason:"directory_signature_invalid" } if fails
- *   3. Determine counterparty: if myPubkey == participant_a.pubkey then counterparty = B, else A
- *   4. Compute genesis_prev_root = computeGenesisPrevRoot(pubA, pubB, session_id, session_timestamp)
- *      per FIPS 180-4 / SESSION-002
- *   5. Register /cello/content/1.0.0 handler on node (if not yet registered)
- *   6. Dial relay on /cello/relay/1.0.0, complete challenge-response auth:
- *      a. Read relay_auth_challenge frame
- *      b. Compute authMsg = SHA-256("CELLO-RELAY-AUTH-v1" || nonce || myPubkey)  [RFC 8032, FIPS 180-4]
- *      c. Sign authMsg with keyProvider → signature
- *      d. Send relay_auth_response{pubkey, signature}
- *      → { ok:false, reason:"relay_auth_failed" } or "relay_auth_error" on failure
- *   7. Dial counterparty on /cello/content/1.0.0
- *      → { ok:false, reason:"dial_counterparty_failed" } if unreachable
- *   8. Store SessionRecord with status:"active", last_seen_seq:0
- *   9. Return { ok:true, sessionId }
+ * Domain logic is delegated to manager classes:
+ *   RegistrationManager, ConnectionManager, SignalingManager,
+ *   RelayStreamManager, SealManager, SessionManager.
+ * Parse helpers live in session-assignment-parser.ts.
+ * Startup restore logic lives in client-startup.ts.
  */
 
-import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import {
   buildEnvelope, serializeEnvelope, deserializeEnvelope, validateEnvelope,
 } from "@cello-protocol/protocol-types";
-import type { Structure2 } from "@cello-protocol/protocol-types";
-import { InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
-import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { IThresholdSigner } from "@cello-protocol/crypto";
 import { CELLO_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
-import { NetworkDirectoryNode } from "./network-directory-node.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -130,7 +26,6 @@ import type {
 import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
 import type { AgentHashQueue } from "./agent-hash-queue.js";
-import { FrostThresholdSigner } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import { RegistrationManager } from "./registration-manager.js";
 import type { RegistrationContext } from "./registration-manager.js";
 import { ConnectionManager } from "./connection-manager.js";
@@ -143,50 +38,9 @@ import { SealManager } from "./seal-manager.js";
 import type { SealContext } from "./seal-manager.js";
 import { SessionManager } from "./session-manager.js";
 import type { SessionContext } from "./session-manager.js";
-
-const DEFAULT_INITIATE_TIMEOUT_MS = 30_000;
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
-
-function toU8Safe(v: unknown): Uint8Array | null {
-  if (v instanceof Uint8Array) return v;
-  if (Buffer.isBuffer(v)) return new Uint8Array(v as Buffer);
-  return null;
-}
-
-// ─── MSG-004 pending cross-check state ───────────────────────────────────────
-
-interface Structure1Fields {
-  last_seen_seq: number;
-  timestamp: number | bigint;
-}
-
-interface PendingS2Entry {
-  s2: Structure2;
-  s2_cbor: Uint8Array;
-  s1_fields: Structure1Fields;
-  leaf_kind: number;
-  sequence_number: number;
-  content_hash: Uint8Array;
-  is_own_send: boolean;
-  arrived_at: number;
-  timer_handle: ReturnType<typeof setTimeout>;
-  echo_resolve?: () => void;
-}
-
-interface PendingContentEntry {
-  content_bytes: Uint8Array;
-  arrived_at: number;
-}
-
-interface ReadyEntry {
-  s2: Structure2;
-  s2_cbor: Uint8Array;
-  s1_fields: Structure1Fields;
-  leaf_kind: number;
-  content_bytes: Uint8Array;
-  is_own_send: boolean;
-  echo_resolve?: () => void;
-}
+import { loadClientStartupState } from "./client-startup.js";
+import type { StartupContext } from "./client-startup.js";
+import { parseSessionAssignment, mapSessionRequestErrorFrame } from "./session-assignment-parser.js";
 
 // ─── SESSION-006 reconnect constants ─────────────────────────────────────────
 
@@ -226,65 +80,7 @@ class CelloClientImpl implements CelloClient {
   // Optional callback invoked after each successful inbound enqueue
   readonly #onMessageQueued: ((senderPubkeyHex: string) => void) | undefined;
 
-  // Callback for inbound session assignments (participant B role). MCP-002.
-  #onSessionAssignmentHandler: ((event: SessionAssignmentEvent) => void) | undefined;
-
-  // session_id_hex → SessionRecord (SESSION-002)
-  readonly #sessions = new Map<string, SessionRecord>();
-
-  // track whether content handler has been registered on this node
-  #contentHandlerRegistered = false;
-
-  // ─── MSG-004 per-session state ──────────────────────────────────────────────
-
-  // session_id_hex → persistent relay stream
-  readonly #relayStreams = new Map<string, Stream>();
-
-  // session_id_hex → Promise<void> chain for outbound serialization
-  readonly #outboundQueues = new Map<string, Promise<void>>();
-
-  // session_id_hex → pending ack resolver (sequence_number → ack data)
-  readonly #pendingAckResolvers = new Map<string, (ack: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void>();
-
-  // session_id_hex → highest seq# received from relay (tracks relay delivery order independently
-  // of cross-check completion; used for sequence gap/replay detection)
-  readonly #relayRecvSeq = new Map<string, number>();
-
-  // session_id_hex → fully-ready cross-checks keyed by seqNum, awaiting in-order processing
-  readonly #readyQueue = new Map<string, Map<number, ReadyEntry>>();
-
-  // session_id_hex → pending S2 entries keyed by content_hash_hex
-  readonly #pendingS2 = new Map<string, Map<string, PendingS2Entry>>();
-
-  // session_id_hex → pending content entries keyed by content_hash_hex (counterparty-sent content)
-  readonly #pendingContent = new Map<string, Map<string, PendingContentEntry>>();
-
-  // session_id_hex → own-send pre-buffered content keyed by content_hash_hex
-  // Kept separate from #pendingContent to avoid collision when both sides send identical bytes.
-  readonly #ownPendingContent = new Map<string, Map<string, PendingContentEntry>>();
-
-  // session_id_hex → set of content_hash_hex values from tampered frames (declared hash ≠ computed)
-  // If a subsequent S2 arrives claiming the same hash, it immediately desync's (content_hash_mismatch).
-  readonly #tamperedContentClaims = new Map<string, Set<string>>();
-
-  // session_id_hex → own_echo_resolvers (sequence_number → resolve fn)
-  readonly #ownEchoResolvers = new Map<string, Map<number, () => void>>();
-
-  // session_id_hex → FIFO queue of ReceivedMessage (for receiveMessage)
-  readonly #sessionMessageQueues = new Map<string, ReceivedMessage[]>();
-
-  // FIFO arrival order across all sessions: { sessionIdHex, message }
-  readonly #anyMessageQueue: Array<{ sessionIdHex: string; message: ReceivedMessage }> = [];
-
-  // SESSION-007: wake resolvers for receiveSessionMessageAsync (per-session) and receiveMessageAsync (any-session)
-  readonly #receiveWaiters = new Map<string, Set<() => void>>();
-  readonly #receiveAnyWaiters = new Set<() => void>();
-
-  // session_id_hex → directory signaling stream (SESSION-003)
-  readonly #directoryStreams = new Map<string, Stream>();
-
-  // SESSION-006: track whether a reconnect loop is already running per session
-  readonly #reconnectInProgress = new Set<string>();
+  // Note: session, relay-stream, and seal state are owned by their respective managers.
 
   // ─── ADAPTER-003: persistent directory signaling stream ────────────────────
 
@@ -304,30 +100,8 @@ class CelloClientImpl implements CelloClient {
   /** In-flight promise for #openPersistentSignalingStream — prevents concurrent open attempts. */
   #openingSignalingStream: Promise<boolean> | null = null;
 
-  // session_id_hex → Promise: set when the initiator SEAL echo is expected (SESSION-003)
-  // Allows non-initiator auto-response to know when its own SEAL echo confirms the seal
-  readonly #sealInitiatedSessions = new Set<string>();
-
-  // session_id_hex: set when THIS client received seal_verified and ran the FROST ceremony.
-  // Guards #handleFrostSealed to use #myPrimaryPubkey for verification (anti-substitution).
-  // Distinct from #sealInitiatedSessions: a concurrent-close counterparty can call
-  // initiateSessionSeal but is NOT the FROST ceremony participant.
-  readonly #frostCeremonyParticipant = new Set<string>();
-
-  // SESSION-005: session_id_hex → resolve fn for seal-frost-timeout Promise
-  // The Promise resolves when session_sealed arrives; if it times out first, seal_type = 'bilateral'.
-  readonly #sealFrostResolvers = new Map<string, () => void>();
-
-  // PERSIST-014: session_id_hex → resolve callback for pending gap-fill requests
-  readonly #pendingGapFillResolvers = new Map<string, (result: { ok: true; leaves: unknown[] } | { ok: false; reason: string }) => void>();
-
-  // SESSION-005: session_id_hex → { leafCount, timestamp } from seal_verified frame.
-  // Stored so #handleFrostSealed can use the authoritative values even if local_tree_leaves
-  // is incomplete due to a sequence_causal_inconsistency desync race.
-  readonly #sealVerifiedData = new Map<string, { leafCount: number; timestamp: number }>();
-
-  // SESSION-005: track the primary_pubkey for this client (set after bootstrapKeyShares)
-  #myPrimaryPubkey: Uint8Array | null = null;
+  // Note: seal state (sealFrostResolvers, sealVerifiedData, frostCeremonyParticipant,
+  // sealInitiatedSessions, pendingUnilateralSealResolve, myPrimaryPubkey) is owned by SealManager.
 
   // ─── REG-001: Registration state ────────────────────────────────────────────
 
@@ -338,8 +112,7 @@ class CelloClientImpl implements CelloClient {
   #pendingRegisterResolve: ((frame: Record<string, unknown>) => void) | null = null;
   /** Pending resolver for dkg_ready from directory (part of register flow). */
   #pendingDkgReadyResolve: ((frame: Record<string, unknown>) => void) | null = null;
-  /** Pending resolver for seal_unilateral_confirmed / seal_unilateral_too_early (PERSIST-015). */
-  #pendingUnilateralSealResolve: ((frame: Record<string, unknown>) => void) | null = null;
+  // Note: #pendingUnilateralSealResolve moved to SealManager.
 
   /** Optional path for persisting the ML-DSA keypair (FileMlDsaKeyProvider). REG-001 AC-010. */
   readonly #mlDsaKeyFile: string | undefined;
@@ -478,8 +251,8 @@ class CelloClientImpl implements CelloClient {
       setRegistrationState: (state: RegistrationState | null) => { self.#registrationState = state; },
       getMlDsaProvider: () => self.#mlDsaProvider,
       setMlDsaProvider: (provider: import("@cello-protocol/crypto").MlDsaKeyProvider | null) => { self.#mlDsaProvider = provider; },
-      getMyPrimaryPubkey: () => self.#myPrimaryPubkey,
-      setMyPrimaryPubkey: (pubkey: Uint8Array) => { self.#myPrimaryPubkey = new Uint8Array(pubkey); },
+      getMyPrimaryPubkey: () => self.#sealManager.getMyPrimaryPubkey(),
+      setMyPrimaryPubkey: (pubkey: Uint8Array) => { self.#sealManager.setMyPrimaryPubkey(new Uint8Array(pubkey)); },
       getPersistentSignalingStream: () => self.#persistentSignalingStream,
       openPersistentSignalingStream: () => self.#openPersistentSignalingStream(),
       setPendingDkgReadyResolve: (resolve) => { self.#pendingDkgReadyResolve = resolve; },
@@ -522,17 +295,27 @@ class CelloClientImpl implements CelloClient {
       setPersistentSignalingIter: (iter) => { self.#persistentSignalingIter = iter; },
       getOpeningSignalingStream: () => self.#openingSignalingStream,
       setOpeningSignalingStream: (p) => { self.#openingSignalingStream = p; },
-      getDirectoryStreams: () => self.#directoryStreams,
+      getDirectoryStream: (sessionIdHex) => self.#relayStreamManager.getDirectoryStream(sessionIdHex),
+      setDirectoryStream: (sessionIdHex, stream) => { self.#relayStreamManager.setDirectoryStream(sessionIdHex, stream); },
+      deleteDirectoryStream: (sessionIdHex) => { self.#relayStreamManager.deleteDirectoryStream(sessionIdHex); },
       hasPendingSessionRequest: () => self.#pendingSessionRequestResolve !== null,
       hasPendingRegister: () => self.#pendingRegisterResolve !== null,
       hasPendingDkgReady: () => self.#pendingDkgReadyResolve !== null,
       getPendingConnectionResolverCount: () => self.#connectionManager.pendingConnectionRequestResolverCount,
       dispatchSignalingFrame: (stream, frame) => { self.#dispatchSignalingFrame(stream, frame); },
       onSignalingStreamClosed: (stream) => { self.#onSignalingStreamClosed(stream); },
+      // initiateSession dependencies
+      getConnectionIdForPeer: (hex) => self.#connectionsByPeer.get(hex),
+      hasConnectionPolicy: () => self.#connectionPolicy !== undefined,
+      getPendingSessionRequestResolve: () => self.#pendingSessionRequestResolve,
+      setPendingSessionRequestResolve: (r) => { self.#pendingSessionRequestResolve = r; },
+      receiveSessionAssignment: (assignment, myPubkey) => self.receiveSessionAssignment(assignment, myPubkey),
+      getSession: (sessionIdHex) => self.#sessionManager.getSession(sessionIdHex),
     };
     this.#signalingManager = new SignalingManager(sigCtx);
 
-    // Wire up SessionManager with narrow context interface
+    // Wire up SessionManager with thin context interface
+    // (managers are wired before any method is called — lazy callbacks are safe)
     const sessionCtx: SessionContext = {
       get logger() { return self.#logger; },
       get persistence() { return self.#persistence; },
@@ -541,38 +324,8 @@ class CelloClientImpl implements CelloClient {
       getMyPubkeyHex: () => self.#myPubkeyHex,
       setMyPubkeyHex: (hex) => { self.#myPubkeyHex = hex; },
       getThresholdSigner: () => self.#thresholdSigner,
-      getSession: (sessionIdHex) => self.#sessions.get(sessionIdHex),
-      getSessions: () => self.#sessions,
-      setSession: (sessionIdHex, record) => { self.#sessions.set(sessionIdHex, record); },
-      getRelayStream: (sessionIdHex) => self.#relayStreams.get(sessionIdHex),
-      setRelayStream: (sessionIdHex, stream) => { self.#relayStreams.set(sessionIdHex, stream); },
-      getRelayRecvSeq: (sessionIdHex) => self.#relayRecvSeq.get(sessionIdHex),
-      setRelayRecvSeq: (sessionIdHex, seq) => { self.#relayRecvSeq.set(sessionIdHex, seq); },
-      setReadyQueue: (sessionIdHex, queue) => { self.#readyQueue.set(sessionIdHex, queue as Map<number, ReadyEntry>); },
-      setPendingS2: (sessionIdHex, map) => { self.#pendingS2.set(sessionIdHex, map as Map<string, PendingS2Entry>); },
-      setPendingContent: (sessionIdHex, map) => { self.#pendingContent.set(sessionIdHex, map as Map<string, PendingContentEntry>); },
-      setOwnPendingContent: (sessionIdHex, map) => { self.#ownPendingContent.set(sessionIdHex, map); },
-      getOwnPendingContent: (sessionIdHex) => self.#ownPendingContent.get(sessionIdHex),
-      setTamperedContentClaims: (sessionIdHex, set) => { self.#tamperedContentClaims.set(sessionIdHex, set); },
-      setOwnEchoResolvers: (sessionIdHex, map) => { self.#ownEchoResolvers.set(sessionIdHex, map); },
-      getOwnEchoResolvers: (sessionIdHex) => self.#ownEchoResolvers.get(sessionIdHex),
-      setSessionMessageQueue: (sessionIdHex, queue) => { self.#sessionMessageQueues.set(sessionIdHex, queue); },
-      getSessionMessageQueue: (sessionIdHex) => self.#sessionMessageQueues.get(sessionIdHex),
-      deleteSessionMessageQueue: (sessionIdHex) => { self.#sessionMessageQueues.delete(sessionIdHex); },
-      getAnyMessageQueue: () => self.#anyMessageQueue,
-      getReceiveWaiters: (sessionIdHex) => self.#receiveWaiters.get(sessionIdHex),
-      setReceiveWaiters: (sessionIdHex, set) => { self.#receiveWaiters.set(sessionIdHex, set); },
-      getReceiveAnyWaiters: () => self.#receiveAnyWaiters,
-      getOutboundQueue: (sessionIdHex) => self.#outboundQueues.get(sessionIdHex),
-      setOutboundQueue: (sessionIdHex, queue) => { self.#outboundQueues.set(sessionIdHex, queue); },
-      getPendingAckResolver: (sessionIdHex) => self.#pendingAckResolvers.get(sessionIdHex),
-      setPendingAckResolver: (sessionIdHex, resolve) => { self.#pendingAckResolvers.set(sessionIdHex, resolve); },
-      deletePendingAckResolver: (sessionIdHex) => { self.#pendingAckResolvers.delete(sessionIdHex); },
       getPersistentSignalingStream: () => self.#persistentSignalingStream,
-      getContentHandlerRegistered: () => self.#contentHandlerRegistered,
-      setContentHandlerRegistered: (value) => { self.#contentHandlerRegistered = value; },
-      getOnSessionAssignmentHandler: () => self.#onSessionAssignmentHandler,
-      // Callbacks into other managers (lazy — safe since managers are created before any method is called)
+      initRelaySession: (sessionIdHex) => { self.#relayStreamManager.initSession(sessionIdHex); },
       runRelayStreamReader: (sessionIdHex, stream, myPubkeyHex, iter) => {
         self.#relayStreamManager.runRelayStreamReader(sessionIdHex, stream, myPubkeyHex, iter);
       },
@@ -580,52 +333,45 @@ class CelloClientImpl implements CelloClient {
       handleContentStream: (stream) => { void self.#relayStreamManager.handleContentStream(stream); },
       connectDirectorySignalingStream: (sessionIdHex, assignment, myPubkey) =>
         self.#signalingManager.connectDirectorySignalingStream(sessionIdHex, assignment, myPubkey),
+      getRelayStream: (sessionIdHex) => self.#relayStreamManager.getRelayStream(sessionIdHex),
     };
     this.#sessionManager = new SessionManager(sessionCtx);
 
-    // Wire up SealManager with narrow context interface
+    // Wire up SealManager with thin context interface
     const sealCtx: SealContext = {
       get logger() { return self.#logger; },
       get persistence() { return self.#persistence; },
       get keyProvider() { return self.#keyProvider; },
       getMyPubkeyHex: () => self.#myPubkeyHex,
       getThresholdSigner: () => self.#thresholdSigner,
-      getMyPrimaryPubkey: () => self.#myPrimaryPubkey,
-      getSession: (sessionIdHex) => self.#sessions.get(sessionIdHex),
-      getSessions: () => self.#sessions,
-      getRelayStream: (sessionIdHex) => self.#relayStreams.get(sessionIdHex),
-      getOwnPendingContent: (sessionIdHex) => self.#ownPendingContent.get(sessionIdHex),
-      getPendingAckResolver: (sessionIdHex) => self.#pendingAckResolvers.get(sessionIdHex),
-      setPendingAckResolver: (sessionIdHex, resolve) => { self.#pendingAckResolvers.set(sessionIdHex, resolve); },
-      deletePendingAckResolver: (sessionIdHex) => { self.#pendingAckResolvers.delete(sessionIdHex); },
-      getSealFrostResolver: (sessionIdHex) => self.#sealFrostResolvers.get(sessionIdHex),
-      setSealFrostResolver: (sessionIdHex, resolve) => { self.#sealFrostResolvers.set(sessionIdHex, resolve); },
-      deleteSealFrostResolver: (sessionIdHex) => { self.#sealFrostResolvers.delete(sessionIdHex); },
-      getSealVerifiedData: (sessionIdHex) => self.#sealVerifiedData.get(sessionIdHex),
-      setSealVerifiedData: (sessionIdHex, data) => { self.#sealVerifiedData.set(sessionIdHex, data); },
-      deleteSealVerifiedData: (sessionIdHex) => { self.#sealVerifiedData.delete(sessionIdHex); },
-      hasFrostCeremonyParticipant: (sessionIdHex) => self.#frostCeremonyParticipant.has(sessionIdHex),
-      addFrostCeremonyParticipant: (sessionIdHex) => { self.#frostCeremonyParticipant.add(sessionIdHex); },
-      hasSealInitiatedSession: (sessionIdHex) => self.#sealInitiatedSessions.has(sessionIdHex),
-      addSealInitiatedSession: (sessionIdHex) => { self.#sealInitiatedSessions.add(sessionIdHex); },
+      // From SessionManager (lazy — safe since managers are wired before any method is called)
+      getSession: (sessionIdHex) => self.#sessionManager.getSession(sessionIdHex),
+      getSessions: () => self.#sessionManager.getSessions(),
+      getOwnPendingContent: (sessionIdHex) => self.#sessionManager.getOwnPendingContent(sessionIdHex),
+      getPendingAckResolver: (sessionIdHex) => self.#sessionManager.getPendingAckResolver(sessionIdHex),
+      setPendingAckResolver: (sessionIdHex, resolve) => { self.#sessionManager.setPendingAckResolver(sessionIdHex, resolve); },
+      deletePendingAckResolver: (sessionIdHex) => { self.#sessionManager.deletePendingAckResolver(sessionIdHex); },
+      // From SignalingManager
       getPersistentSignalingStream: () => self.#persistentSignalingStream,
       setPersistentSignalingStream: (stream) => { self.#persistentSignalingStream = stream; },
       setPersistentSignalingIter: (iter) => { self.#persistentSignalingIter = iter; },
-      getDirectoryStream: (sessionIdHex) => self.#directoryStreams.get(sessionIdHex),
-      getPendingUnilateralSealResolve: () => self.#pendingUnilateralSealResolve,
-      setPendingUnilateralSealResolve: (resolve) => { self.#pendingUnilateralSealResolve = resolve; },
       openPersistentSignalingStream: () => self.#openPersistentSignalingStream(),
+      // From RelayStreamManager
+      getRelayStream: (sessionIdHex) => self.#relayStreamManager.getRelayStream(sessionIdHex),
+      getDirectoryStream: (sessionIdHex) => self.#relayStreamManager.getDirectoryStream(sessionIdHex),
+      // Callbacks into SessionManager
       enqueueSessionSealedEvent: (sessionIdHex, sealedRoot, closeTimestamp) => {
         self.#sessionManager.enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
       },
-      performGapFillReconciliation: (sessionIdHex, fromSeq, toSeq, correlationId) =>
-        self.#relayStreamManager.performGapFillReconciliation(sessionIdHex, fromSeq, toSeq, correlationId),
       sendContentFrame: (session, content, contentHash) => self.#sessionManager.sendContentFrame(session, content, contentHash),
       waitForOwnEcho: (sessionIdHex, seqNum) => self.#sessionManager.waitForOwnEcho(sessionIdHex, seqNum),
+      // Callback into RelayStreamManager
+      performGapFillReconciliation: (sessionIdHex, fromSeq, toSeq, correlationId) =>
+        self.#relayStreamManager.performGapFillReconciliation(sessionIdHex, fromSeq, toSeq, correlationId),
     };
     this.#sealManager = new SealManager(sealCtx, this.#sealFrostTimeoutMs);
 
-    // Wire up RelayStreamManager with narrow context interface
+    // Wire up RelayStreamManager with thin context interface
     const relayCtx: RelayStreamContext = {
       get node() { return self.#node; },
       get keyProvider() { return self.#keyProvider; },
@@ -635,66 +381,22 @@ class CelloClientImpl implements CelloClient {
       get reconnectTimeoutMs() { return self.#reconnectTimeoutMs; },
       get hashQueue() { return self.#hashQueue; },
       getMyPubkeyHex: () => self.#myPubkeyHex,
-      getSession: (sessionIdHex) => self.#sessions.get(sessionIdHex),
-      getSessions: () => self.#sessions,
-      getRelayStream: (sessionIdHex) => self.#relayStreams.get(sessionIdHex),
-      setRelayStream: (sessionIdHex, stream) => { self.#relayStreams.set(sessionIdHex, stream); },
-      deleteRelayStream: (sessionIdHex) => { self.#relayStreams.delete(sessionIdHex); },
-      getRelayRecvSeq: (sessionIdHex) => self.#relayRecvSeq.get(sessionIdHex),
-      setRelayRecvSeq: (sessionIdHex, seq) => { self.#relayRecvSeq.set(sessionIdHex, seq); },
-      deleteRelayRecvSeq: (sessionIdHex) => { self.#relayRecvSeq.delete(sessionIdHex); },
-      getPendingAckResolver: (sessionIdHex) => self.#pendingAckResolvers.get(sessionIdHex),
-      setPendingAckResolver: (sessionIdHex, resolve) => { self.#pendingAckResolvers.set(sessionIdHex, resolve); },
-      deletePendingAckResolver: (sessionIdHex) => { self.#pendingAckResolvers.delete(sessionIdHex); },
-      getReadyQueue: (sessionIdHex) => self.#readyQueue.get(sessionIdHex),
-      setReadyQueue: (sessionIdHex, queue) => { self.#readyQueue.set(sessionIdHex, queue); },
-      deleteReadyQueue: (sessionIdHex) => { self.#readyQueue.delete(sessionIdHex); },
-      getPendingS2: (sessionIdHex) => self.#pendingS2.get(sessionIdHex),
-      setPendingS2: (sessionIdHex, map) => { self.#pendingS2.set(sessionIdHex, map); },
-      deletePendingS2: (sessionIdHex) => { self.#pendingS2.delete(sessionIdHex); },
-      getPendingContent: (sessionIdHex) => self.#pendingContent.get(sessionIdHex),
-      setPendingContent: (sessionIdHex, map) => { self.#pendingContent.set(sessionIdHex, map); },
-      deletePendingContent: (sessionIdHex) => { self.#pendingContent.delete(sessionIdHex); },
-      getOwnPendingContent: (sessionIdHex) => self.#ownPendingContent.get(sessionIdHex),
-      setOwnPendingContent: (sessionIdHex, map) => { self.#ownPendingContent.set(sessionIdHex, map); },
-      deleteOwnPendingContent: (sessionIdHex) => { self.#ownPendingContent.delete(sessionIdHex); },
-      getTamperedContentClaims: (sessionIdHex) => self.#tamperedContentClaims.get(sessionIdHex),
-      setTamperedContentClaims: (sessionIdHex, set) => { self.#tamperedContentClaims.set(sessionIdHex, set); },
-      deleteTamperedContentClaims: (sessionIdHex) => { self.#tamperedContentClaims.delete(sessionIdHex); },
-      getOwnEchoResolvers: (sessionIdHex) => self.#ownEchoResolvers.get(sessionIdHex),
-      setOwnEchoResolvers: (sessionIdHex, map) => { self.#ownEchoResolvers.set(sessionIdHex, map); },
-      deleteOwnEchoResolvers: (sessionIdHex) => { self.#ownEchoResolvers.delete(sessionIdHex); },
-      getSessionMessageQueue: (sessionIdHex) => self.#sessionMessageQueues.get(sessionIdHex),
-      setSessionMessageQueue: (sessionIdHex, queue) => { self.#sessionMessageQueues.set(sessionIdHex, queue); },
-      deleteSessionMessageQueue: (sessionIdHex) => { self.#sessionMessageQueues.delete(sessionIdHex); },
-      getAnyMessageQueue: () => self.#anyMessageQueue,
-      getReconnectInProgress: () => self.#reconnectInProgress,
-      getPendingGapFillResolver: (sessionIdHex) => self.#pendingGapFillResolvers.get(sessionIdHex),
-      setPendingGapFillResolver: (sessionIdHex, resolve) => { self.#pendingGapFillResolvers.set(sessionIdHex, resolve); },
-      deletePendingGapFillResolver: (sessionIdHex) => { self.#pendingGapFillResolvers.delete(sessionIdHex); },
-      getDirectoryStream: (sessionIdHex) => self.#directoryStreams.get(sessionIdHex),
-      getOutboundQueue: (sessionIdHex) => self.#outboundQueues.get(sessionIdHex),
-      // Callbacks
-      onRelayDisconnected: (sessionIdHex, myPubkeyHex) => {
-        const session = self.#sessions.get(sessionIdHex);
-        if (!session) return;
-        if (session.desynchronized) return;
-        if (session.status === "transport_lost") return;
-        // Sealing/sealed/seal_rejected/seal_deferred: relay close expected; do not clobber status.
-        if (session.status === "sealing" || session.status === "sealed" || session.status === "seal_rejected" || session.status === "seal_deferred") return;
-        session.status = "transport_lost";
-        void self.#persistence?.persistSession(sessionIdHex, session);
-        const ackResolve = self.#pendingAckResolvers.get(sessionIdHex);
-        if (ackResolve) {
-          self.#pendingAckResolvers.delete(sessionIdHex);
-          ackResolve({ ok: false, reason: "transport_unavailable" });
-        }
-        void self.#relayStreamManager.reconnectRelayStream(sessionIdHex, myPubkeyHex);
-      },
+      // From SessionManager (lazy — safe since managers are wired before any method is called)
+      getSession: (sessionIdHex) => self.#sessionManager.getSession(sessionIdHex),
+      getSessions: () => self.#sessionManager.getSessions(),
+      getPendingAckResolver: (sessionIdHex) => self.#sessionManager.getPendingAckResolver(sessionIdHex),
+      setPendingAckResolver: (sessionIdHex, resolve) => { self.#sessionManager.setPendingAckResolver(sessionIdHex, resolve); },
+      deletePendingAckResolver: (sessionIdHex) => { self.#sessionManager.deletePendingAckResolver(sessionIdHex); },
+      getOwnPendingContent: (sessionIdHex) => self.#sessionManager.getOwnPendingContent(sessionIdHex),
+      getOwnEchoResolvers: (sessionIdHex) => self.#sessionManager.getOwnEchoResolvers(sessionIdHex),
+      getOutboundQueue: (sessionIdHex) => self.#sessionManager.getOutboundQueue(sessionIdHex),
+      // Delivery callbacks into SessionManager
+      enqueueReceivedMessage: (sessionIdHex, message) => { self.#sessionManager.enqueueReceivedMessage(sessionIdHex, message); },
       wakeReceiveWaiters: (sessionIdHex) => { self.#sessionManager.wakeReceiveWaiters(sessionIdHex); },
       enqueueSessionSealedEvent: (sessionIdHex, sealedRoot, closeTimestamp) => {
         self.#sessionManager.enqueueSessionSealedEvent(sessionIdHex, sealedRoot, closeTimestamp);
       },
+      // Seal callbacks (lazy)
       handleSealVerified: (sessionIdHex, frame) => { void self.#sealManager.handleSealVerified(sessionIdHex, frame); },
       handleSessionFrostSealed: (sessionIdHex, frame) => { self.#sealManager.handleSessionFrostSealed(sessionIdHex, frame); },
       handleSealRejectedTreeMismatch: (sessionIdHex, frame) => { self.#sealManager.handleSealRejectedTreeMismatch(sessionIdHex, frame); },
@@ -705,6 +407,23 @@ class CelloClientImpl implements CelloClient {
       },
       handleDirectorySessionSealRejected: (sessionIdHex, frame) => {
         self.#sealManager.handleDirectorySessionSealRejected(sessionIdHex, frame);
+      },
+      // Reconnect callback
+      onRelayDisconnected: (sessionIdHex, myPubkeyHex) => {
+        const session = self.#sessionManager.getSession(sessionIdHex);
+        if (!session) return;
+        if (session.desynchronized) return;
+        if (session.status === "transport_lost") return;
+        // Sealing/sealed/seal_rejected/seal_deferred: relay close expected; do not clobber status.
+        if (session.status === "sealing" || session.status === "sealed" || session.status === "seal_rejected" || session.status === "seal_deferred") return;
+        session.status = "transport_lost";
+        void self.#persistence?.persistSession(sessionIdHex, session);
+        const ackResolve = self.#sessionManager.getPendingAckResolver(sessionIdHex);
+        if (ackResolve) {
+          self.#sessionManager.deletePendingAckResolver(sessionIdHex);
+          ackResolve({ ok: false, reason: "transport_unavailable" });
+        }
+        void self.#relayStreamManager.reconnectRelayStream(sessionIdHex, myPubkeyHex);
       },
     };
     this.#relayStreamManager = new RelayStreamManager(relayCtx);
@@ -717,388 +436,44 @@ class CelloClientImpl implements CelloClient {
    * is the seal initiator.
    */
   setPrimaryPubkey(primaryPubkey: Uint8Array): void {
-    this.#myPrimaryPubkey = new Uint8Array(primaryPubkey);
+    this.#sealManager.setMyPrimaryPubkey(new Uint8Array(primaryPubkey));
   }
 
-  /**
-   * PERSIST-024: Load all durable state from the SQLCipher DB and populate in-memory state.
-   *
-   * Pseudocode:
-   *   1. Call persistence.loadStartupState() — emits client.startup.state.loaded
-   *   2. Restore FROST key share → call storeDkgResult to populate module-level key store;
-   *      reconstruct FrostThresholdSigner with same config used at registration
-   *   3. Restore ML-DSA keypair → reconstruct InMemoryMlDsaKeyProvider
-   *   4. Restore registration state → populate #registrationState
-   *   5. Restore connections → populate #connections and #connectionsByPeer
-   *   6. Restore connection policy → populate #connectionPolicy
-   *   7. Restore sessions → populate #sessions; load leaves per session
-   *   8. Restore peers → populate #peers
-   *   9. Restore decided requests → populate #decidedRequests
-   *
-   * Security invariants:
-   *   SI-001: signing_share bytes never appear in any log event.
-   *   SI-002: secret_key_blob bytes never appear in any log event.
-   *
-   * Crypto refs: RFC 9591 (FROST), NIST FIPS 204 (ML-DSA-44)
-   */
+  /** PERSIST-024: Restore all durable state from SQLCipher. Implementation in client-startup.ts. */
   async loadPersistedState(): Promise<void> {
-    const p = this.#persistence;
-    if (!p) return;
-
-    const state = await p.loadStartupState();
-
-    // ── 1. FROST key share ────────────────────────────────────────────────────
-    if (state.frostShare) {
-      const row = state.frostShare;
-      // Reconstruct FrostSecret: { identifier, signingShare }
-      const signingShareBytes = row.signing_share instanceof Buffer
-        ? new Uint8Array(row.signing_share)
-        : new Uint8Array(row.signing_share as Uint8Array);
-      const frostSecret = { identifier: row.identifier, signingShare: signingShareBytes };
-
-      // Reconstruct FrostPublic: { signers, commitments, verifyingShares }
-      // commitments_cbor is CBOR-encoded Uint8Array[]; verifying_shares_cbor is CBOR-encoded Record<string, Uint8Array>
-      let commitments: Uint8Array[] = [];
-      let verifyingShares: Record<string, Uint8Array> = {};
-      try {
-        const commitmentsCborBytes = row.commitments_cbor instanceof Buffer
-          ? row.commitments_cbor
-          : Buffer.from(row.commitments_cbor as Uint8Array);
-        const decodedCommitments = decode(commitmentsCborBytes) as unknown;
-        if (Array.isArray(decodedCommitments)) {
-          commitments = decodedCommitments.map((c: unknown) =>
-            c instanceof Uint8Array ? c : Buffer.isBuffer(c) ? new Uint8Array(c as Buffer) : new Uint8Array(0)
-          );
-        }
-        const verifyingSharesCborBytes = row.verifying_shares_cbor instanceof Buffer
-          ? row.verifying_shares_cbor
-          : Buffer.from(row.verifying_shares_cbor as Uint8Array);
-        const decodedVerifyingShares = decode(verifyingSharesCborBytes) as unknown;
-        if (decodedVerifyingShares && typeof decodedVerifyingShares === "object" && !Array.isArray(decodedVerifyingShares)) {
-          for (const [k, v] of Object.entries(decodedVerifyingShares as Record<string, unknown>)) {
-            verifyingShares[k] = v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : new Uint8Array(0);
-          }
-        }
-      } catch {
-        // HIGH-2: emit correct error event and return early — do not call storeDkgResult
-        // with broken/empty data, which would corrupt the module-level key store.
-        this.#logger.error("client.frost.share.load.failed", {
-          agentPubkey: row.agent_pubkey,
-          reason: "cbor_deserialize_failed",
-        });
-        return;
-      }
-
-      const frostPublic = {
-        signers: { min: row.threshold, max: row.participants + 1 },
-        commitments,
-        verifyingShares,
-      };
-
-      const myPubkeyHex = row.agent_pubkey;
-      try {
-        // SI-001: storeDkgResult does not log the secret
-        storeDkgResult(myPubkeyHex, frostSecret as import("@noble/curves/abstract/frost.js").FrostSecret, frostPublic as import("@noble/curves/abstract/frost.js").FrostPublic);
-      } catch {
-        this.#logger.error("client.frost.share.load.failed", {
-          agentPubkey: myPubkeyHex,
-          reason: "storeDkgResult_failed",
-        });
-        return;
-      }
-
-      // Reconstruct FrostThresholdSigner (config only — secret is in module-level store).
-      // AC-003 (DX-001): directoryNodeStubs MUST be populated from the current directoryEndpoint
-      // so that the signer can participate in FROST signing ceremonies (round-trip frames
-      // to directory via libp2p). Without directoryNodeStubs, the signer can verify but cannot
-      // participate in ceremonies — causing directory_below_threshold on session initiation.
-      if (!this.#thresholdSigner) {
-        let directoryNodeStubsForSigner: NetworkDirectoryNode[] | undefined;
-        if (this.#directoryEndpoint) {
-          const stub = new NetworkDirectoryNode({
-            id: this.#directoryEndpoint.peer_id,
-            node: this.#node,
-            directoryPeerId: this.#directoryEndpoint.peer_id,
-            directoryMultiaddrs: this.#directoryEndpoint.multiaddrs,
-          });
-          stub.setBootstrapContext(myPubkeyHex, `${myPubkeyHex}:epoch:1`);
-          directoryNodeStubsForSigner = [stub];
-        }
-        this.#thresholdSigner = new FrostThresholdSigner(
-          {
-            threshold: row.threshold,
-            participants: row.participants,
-            directoryNodeStubs: directoryNodeStubsForSigner,
-          },
-          Buffer.from(myPubkeyHex, "hex"),
-        );
-      }
-
-      // Set primary_pubkey from stored commitments[0]
-      if (commitments.length > 0 && !this.#myPrimaryPubkey) {
-        this.#myPrimaryPubkey = new Uint8Array(commitments[0]!);
-      }
-
-      // HIGH-1: emit success event after FROST share loaded
-      this.#logger.info("client.frost.share.loaded", {
-        agentPubkey: myPubkeyHex,
-        epochId: row.epoch_id,
-        threshold: row.threshold,
-        participants: row.participants,
-      });
-    }
-
-    // HIGH-3: emit alarm when registration exists but no FROST share found
-    if (!state.frostShare && state.registrationState) {
-      this.#logger.error("client.frost.share.missing", {
-        agentPubkey: state.registrationState.agent_pubkey,
-        reason: "no_active_share_in_db",
-      });
-    }
-
-    // ── 2. ML-DSA keypair ─────────────────────────────────────────────────────
-    if (state.mlDsaKeypair) {
-      const row = state.mlDsaKeypair;
-      try {
-        const secretKeyBlob = row.secret_key_blob instanceof Buffer
-          ? new Uint8Array(row.secret_key_blob)
-          : new Uint8Array(row.secret_key_blob as Uint8Array);
-        const mlDsaPubkeyBytes = Buffer.from(row.ml_dsa_pubkey, "hex");
-        // SI-002: InMemoryMlDsaKeyProvider does not log secret key
-        this.#mlDsaProvider = new InMemoryMlDsaKeyProvider(mlDsaPubkeyBytes, secretKeyBlob);
-        // HIGH-1: emit success event after ML-DSA keypair loaded
-        this.#logger.info("client.mldsa.keypair.loaded", {
-          agentPubkey: row.agent_pubkey,
-          mlDsaPubkey: row.ml_dsa_pubkey,
-        });
-      } catch (err: unknown) {
-        // Story specifies level: error for this event
-        this.#logger.error("client.mldsa.load.failed", {
-          agentPubkey: row.agent_pubkey,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    // ── 3. Registration state ─────────────────────────────────────────────────
-    if (state.registrationState) {
-      const row = state.registrationState;
-      this.#registrationState = {
-        agent_id: row.agent_id,
-        primary_pubkey: row.primary_pubkey,
-        ml_dsa_pubkey: row.ml_dsa_pubkey,
-        registered_at: row.registered_at,
-        status: "active",
-      };
-      // HIGH-1: emit success event after registration state loaded
-      this.#logger.info("client.registration.loaded", {
-        agentPubkey: row.agent_pubkey,
-        agentId: row.agent_id,
-        status: row.status,
-      });
-    }
-
-    // ── 4. Connections ────────────────────────────────────────────────────────
-    for (const row of state.connections) {
-      if (!this.#connections.has(row.connection_id)) {
-        const record: import("@cello-protocol/protocol-types").ClientConnectionRecord = {
-          connection_id: row.connection_id,
-          counterparty_primary_pubkey: row.counterparty_primary_pubkey ?? "",
-          counterparty_ml_dsa_pubkey: row.counterparty_ml_dsa_pubkey ?? "",
-          counterparty_pubkey: row.counterparty_pubkey,
-          established_at: row.established_at,
-          status: row.status as "active",
-        };
-        this.#connections.set(row.connection_id, record);
-        this.#connectionsByPeer.set(row.counterparty_pubkey, row.connection_id);
-        if (row.profile_unchecked) {
-          this.#profileUncheckedPeers.add(row.counterparty_pubkey);
-        }
-      }
-    }
-
-    // ── 5. Connection policy ──────────────────────────────────────────────────
-    if (state.connectionPolicy) {
-      this.#connectionPolicy = state.connectionPolicy;
-    }
-
-    // ── 6. Sessions + leaves ──────────────────────────────────────────────────
-    for (const row of state.sessions) {
-      const sessionIdHex = row.session_id;
-      if (this.#sessions.has(sessionIdHex)) continue;
-
-      const leaves = await p.loadSessionTreeLeaves(sessionIdHex);
-      const localTreeLeaves: SessionRecord["local_tree_leaves"] = leaves.map((l) => ({
-        kind: l.leaf_kind as "msg" | "ctrl",
-        s2_cbor: l.s2_cbor instanceof Buffer
-          ? new Uint8Array(l.s2_cbor)
-          : new Uint8Array(l.s2_cbor as Uint8Array),
-      }));
-
-      const counterpartyPubkey = row.counterparty_pubkey instanceof Buffer
-        ? new Uint8Array(row.counterparty_pubkey)
-        : new Uint8Array(row.counterparty_pubkey as Uint8Array);
-      const directoryPubkey = row.directory_pubkey instanceof Buffer
-        ? new Uint8Array(row.directory_pubkey)
-        : new Uint8Array(row.directory_pubkey as Uint8Array);
-      const genesisPrevRoot = row.genesis_prev_root instanceof Buffer
-        ? new Uint8Array(row.genesis_prev_root)
-        : new Uint8Array(row.genesis_prev_root as Uint8Array);
-
-      let counterpartyMultiaddrs: string[] = [];
-      let relayMultiaddrs: string[] = [];
-      let directoryMultiaddrs: string[] = [];
-      try { counterpartyMultiaddrs = JSON.parse(row.counterparty_multiaddrs) as string[]; } catch { /* ignore */ }
-      try { relayMultiaddrs = JSON.parse(row.relay_multiaddrs) as string[]; } catch { /* ignore */ }
-      try { directoryMultiaddrs = JSON.parse(row.directory_multiaddrs) as string[]; } catch { /* ignore */ }
-
-      const record: SessionRecord = {
-        session_id: Buffer.from(sessionIdHex, "hex"),
-        counterparty_pubkey: counterpartyPubkey,
-        counterparty_peer_id: row.counterparty_peer_id,
-        counterparty_multiaddrs: counterpartyMultiaddrs,
-        relay_endpoint: { peer_id: row.relay_peer_id, multiaddrs: relayMultiaddrs },
-        directory_endpoint: { peer_id: row.directory_peer_id, multiaddrs: directoryMultiaddrs },
-        directory_pubkey: directoryPubkey,
-        genesis_prev_root: genesisPrevRoot,
-        last_seen_seq: row.last_seen_seq,
-        last_sent_seq: row.last_sent_seq,
-        next_expected_seq: row.next_expected_seq,
-        status: row.status as SessionRecord["status"],
-        desynchronized: row.desynchronized !== 0,
-        local_tree_leaves: localTreeLeaves,
-        sealed_root: row.sealed_root
-          ? (row.sealed_root instanceof Buffer ? new Uint8Array(row.sealed_root) : new Uint8Array(row.sealed_root as Uint8Array))
-          : undefined,
-        seal_type: row.seal_type as SessionRecord["seal_type"] ?? undefined,
-        close_timestamp: row.close_timestamp ?? undefined,
-        frost_signature: row.frost_signature
-          ? (row.frost_signature instanceof Buffer ? new Uint8Array(row.frost_signature) : new Uint8Array(row.frost_signature as Uint8Array))
-          : undefined,
-        signer_pubkey: row.signer_pubkey
-          ? (row.signer_pubkey instanceof Buffer ? new Uint8Array(row.signer_pubkey) : new Uint8Array(row.signer_pubkey as Uint8Array))
-          : undefined,
-        directory_signature: row.directory_signature
-          ? (row.directory_signature instanceof Buffer ? new Uint8Array(row.directory_signature) : new Uint8Array(row.directory_signature as Uint8Array))
-          : undefined,
-      };
-
-      this.#sessions.set(sessionIdHex, record);
-      this.#sessionMessageQueues.set(sessionIdHex, []);
-
-      // HIGH-4: emit alarm when loaded leaf count doesn't match sessions.leaf_count
-      if (leaves.length !== row.leaf_count) {
-        this.#logger.error("client.session.leaves.mismatch", {
-          agentPubkey: row.agent_pubkey,
-          sessionId: sessionIdHex,
-          expectedLeafCount: row.leaf_count,
-          actualLeafCount: leaves.length,
-        });
-      }
-    }
-
-    // ── 7. Peers ──────────────────────────────────────────────────────────────
-    for (const row of state.peers) {
-      if (!this.#peers.has(row.peer_pubkey_hex)) {
-        let multiaddrs: string[] = [];
-        try { multiaddrs = JSON.parse(row.multiaddrs) as string[]; } catch { /* ignore */ }
-        this.#peers.set(row.peer_pubkey_hex, { peerId: row.peer_id, multiaddrs, connected: false });
-      }
-    }
-
-    // ── 8. Decided requests ───────────────────────────────────────────────────
-    for (const row of state.decidedRequests) {
-      this.#connectionManager.restoreDecidedRequest(row.request_id);
-    }
-
-    // ── 9. Pending connection requests ────────────────────────────────────────
-    for (const row of state.pendingConnectionRequests) {
-      const packageCbor = row.package_cbor instanceof Buffer
-        ? new Uint8Array(row.package_cbor)
-        : new Uint8Array(row.package_cbor as Uint8Array);
-      // Populate ConnectionManager#pendingInboundRequests so acceptConnection/rejectConnection work
-      this.#connectionManager.restorePendingInboundRequest({
-        connection_request_id: row.request_id,
-        from_pubkey: row.from_pubkey,
-        package_cbor: packageCbor,
-        round: row.round,
-      });
-      // Populate ConnectionManager#pendingReviewQueue so awaitConnectionRequest() returns it.
-      // Reconstruct a minimal pending_agent_review report — the full policy evaluation
-      // result is not persisted, only the package_cbor. The agent review UI only needs
-      // the connection_request_id, from_pubkey, and package_cbor to make a decision.
-      const restoredReport: Extract<import("./connection-policy.js").ConnectionReport, { verdict: "pending_agent_review" }> = {
-        verdict: "pending_agent_review",
-        policy_summary: {
-          mode: "unknown",
-          review_mode: "inference",
-          requirements_met: [],
-          requirements_unmet: [],
-        },
-        package_summary: {
-          pseudonym_label: "",
-          endorsement_count: 0,
-          attestation_types: [],
-          pseudonym_age_days: 0,
-          registration_age_days: 0,
-          is_provisional: false,
-        },
-        is_round_2: row.round > 1,
-      };
-      this.#connectionManager.restoreReviewQueueItem({
-        connection_request_id: row.request_id,
-        from_pubkey: row.from_pubkey,
-        report: restoredReport,
-        package_cbor: packageCbor,
-        sender_registered_at: 0,
-        sender_is_provisional: false,
-      });
-    }
-
-    // ── 10. Endorsements and attestations (MED-4) ────────────────────────────────
-    if (state.endorsements.length > 0) {
-      this.#endorsements = state.endorsements;
-    }
-    if (state.attestations.length > 0) {
-      this.#attestations = state.attestations;
-    }
-
-    // ── HIGH-3: set #myPubkeyHex from registration state if sessions were loaded ──
-    // #myPubkeyHex is used in #sendMessageLocked with a non-null assertion.
-    // It is set during receiveSessionAssignment but never set during startup load.
-    // If the agent restarts with active sessions and calls sendMessage before any
-    // new session assignment, it would crash on the non-null assertion.
-    if (!this.#myPubkeyHex && state.registrationState) {
-      this.#myPubkeyHex = state.registrationState.agent_pubkey;
-    }
-
-    // ── PERSIST-024 FINDING-4: store loaded pending hashes for caller consumption ──
-    // The caller (composition root) must pass these to AgentHashQueue so they are
-    // resubmitted to the relay on reconnect (AC-008). CelloClientImpl does not hold
-    // an AgentHashQueue directly — that is a composition-root concern.
-    this.#loadedPendingHashes = state.pendingHashes.map((row) => ({
-      sessionId: row.session_id,
-      hashHex: row.hash_hex,
-      enqueuedAt: row.enqueued_at,
-    }));
-
-    // M-5: upsertAgent at the END of startup so last_seen_at only reflects a fully successful boot.
-    await p.upsertAgent();
-
-    // PERSIST-024 FINDING-3: emit client.startup.state.loaded AFTER all in-memory structures
-    // are populated. AC-013 requires this event to fire only after the full startup sequence.
-    // The event is not emitted by loadStartupState() (which only loads DB rows).
-    this.#logger.info("client.startup.state.loaded", {
-      agentPubkey: this.#myPubkeyHex ?? state.registrationState?.agent_pubkey ?? "unknown",
-      connectionCount: state.connectionCount,
-      sessionCount: state.sessionCount,
-      leafCount: state.leafCount,
-      pendingHashCount: state.pendingHashCount,
-      hasFrostShare: state.hasFrostShare,
-      hasMlDsaKeypair: state.hasMlDsaKeypair,
-      hasRegistration: state.hasRegistration,
-      hasPolicy: state.hasPolicy,
-    });
+    if (!this.#persistence) return;
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    const startupCtx: StartupContext = {
+      get node() { return self.#node; },
+      get logger() { return self.#logger; },
+      get persistence() { return self.#persistence!; },
+      getDirectoryEndpoint: () => self.#directoryEndpoint,
+      getThresholdSigner: () => self.#thresholdSigner,
+      setThresholdSigner: (signer) => { self.#thresholdSigner = signer; },
+      getMyPubkeyHex: () => self.#myPubkeyHex,
+      setMyPubkeyHex: (hex) => { self.#myPubkeyHex = hex; },
+      setRegistrationState: (state) => { self.#registrationState = state; },
+      setMlDsaProvider: (provider) => { self.#mlDsaProvider = provider; },
+      addConnection: (id, record) => { self.#connections.set(id, record); },
+      addConnectionByPeer: (pubkey, id) => { self.#connectionsByPeer.set(pubkey, id); },
+      addProfileUncheckedPeer: (pubkey) => { self.#profileUncheckedPeers.add(pubkey); },
+      setConnectionPolicy: (policy) => { self.#connectionPolicy = policy; },
+      addPeer: (hex, entry) => { self.#peers.set(hex, entry); },
+      hasPeer: (hex) => self.#peers.has(hex),
+      setEndorsements: (e) => { self.#endorsements = e; },
+      setAttestations: (a) => { self.#attestations = a; },
+      setLoadedPendingHashes: (hashes) => { self.#loadedPendingHashes = hashes; },
+      getSessionById: (id) => self.#sessionManager.getSession(id),
+      setSession: (id, record) => { self.#sessionManager.setSession(id, record); },
+      initSessionMessageQueue: (id) => { self.#sessionManager.initSessionMessageQueue(id); },
+      getMyPrimaryPubkey: () => self.#sealManager.getMyPrimaryPubkey(),
+      setMyPrimaryPubkey: (pubkey) => { self.#sealManager.setMyPrimaryPubkey(pubkey); },
+      restoreDecidedRequest: (id) => { self.#connectionManager.restoreDecidedRequest(id); },
+      restorePendingInboundRequest: (opts) => { self.#connectionManager.restorePendingInboundRequest(opts); },
+      restoreReviewQueueItem: (opts) => { self.#connectionManager.restoreReviewQueueItem(opts); },
+    };
+    await loadClientStartupState(startupCtx);
   }
 
   /**
@@ -1232,15 +607,15 @@ class CelloClientImpl implements CelloClient {
       next_expected_seq: 1,
       desynchronized: false,
     };
-    this.#sessions.set(sessionIdHex, record);
+    this.#sessionManager.setSession(sessionIdHex, record);
     if (!this.#myPubkeyHex) {
       this.#myPubkeyHex = myPubkeyHex;
     }
     // M-001: mark as seal-initiated and FROST ceremony participant so #handleFrostSealed
     // uses own primary_pubkey for verification.
     if (opts?.isInitiator) {
-      this.#sealInitiatedSessions.add(sessionIdHex);
-      this.#frostCeremonyParticipant.add(sessionIdHex);
+      this.#sealManager.markSealInitiated(sessionIdHex);
+      this.#sealManager.markFrostCeremonyParticipant(sessionIdHex);
     }
   }
 
@@ -1248,7 +623,7 @@ class CelloClientImpl implements CelloClient {
   // seal_verified, or session_frost_sealed frame into the directory stream handler —
   // bypasses the real directory signaling stream so tests can inject adversarial frames.
   injectDirectoryFrame(sessionIdHex: string, frame: Record<string, unknown>): void {
-    const session = this.#sessions.get(sessionIdHex);
+    const session = this.#sessionManager.getSession(sessionIdHex);
     if (!session) throw new Error(`injectDirectoryFrame: session not found: ${sessionIdHex}`);
     if (frame["type"] === "session_sealed") {
       this.#sealManager.handleDirectorySessionSealed(sessionIdHex, frame, session.directory_pubkey);
@@ -1392,37 +767,16 @@ class CelloClientImpl implements CelloClient {
 
 
   closeSession(sessionIdHex: string): void {
-    this.#sessions.delete(sessionIdHex);
-    const ackResolve = this.#pendingAckResolvers.get(sessionIdHex);
+    // Unblock any pending ack resolver before deleting from SessionManager
+    const ackResolve = this.#sessionManager.getPendingAckResolver(sessionIdHex);
     if (ackResolve) {
-      this.#pendingAckResolvers.delete(sessionIdHex);
+      this.#sessionManager.deletePendingAckResolver(sessionIdHex);
       ackResolve({ ok: false, reason: "session_closed" });
     }
-    this.#relayRecvSeq.delete(sessionIdHex);
-    this.#readyQueue.delete(sessionIdHex);
-    this.#pendingS2.delete(sessionIdHex);
-    this.#pendingContent.delete(sessionIdHex);
-    this.#ownPendingContent.delete(sessionIdHex);
-    this.#tamperedContentClaims.delete(sessionIdHex);
-    this.#ownEchoResolvers.delete(sessionIdHex);
-    this.#sessionMessageQueues.delete(sessionIdHex);
-    this.#outboundQueues.delete(sessionIdHex);
-    this.#sealInitiatedSessions.delete(sessionIdHex);
-    this.#frostCeremonyParticipant.delete(sessionIdHex);
-    // Resolve seal-frost-timeout waiter so initiateSessionSeal doesn't hang
-    this.#sealFrostResolvers.get(sessionIdHex)?.();
-    this.#sealFrostResolvers.delete(sessionIdHex);
-    this.#sealVerifiedData.delete(sessionIdHex);
-    const stream = this.#relayStreams.get(sessionIdHex);
-    if (stream) {
-      this.#relayStreams.delete(sessionIdHex);
-      stream.abort(new Error("session_closed"));
-    }
-    const dirStream = this.#directoryStreams.get(sessionIdHex);
-    if (dirStream) {
-      this.#directoryStreams.delete(sessionIdHex);
-      dirStream.abort(new Error("session_closed"));
-    }
+    // Delegate cleanup to each owning manager
+    this.#sessionManager.closeSession(sessionIdHex);
+    this.#relayStreamManager.closeSession(sessionIdHex);
+    this.#sealManager.closeSession(sessionIdHex);
   }
 
   // ─── MSG-002 handlers ─────────────────────────────────────────────────────────
@@ -1460,30 +814,7 @@ class CelloClientImpl implements CelloClient {
 
   // ─── REG-001: Agent registration ─────────────────────────────────────────────
 
-  /**
-   * Register this agent with the directory.
-   *
-   * REG-001 Phase P pseudocode:
-   *   1. If already registered, return { error: 'already_registered' }
-   *   2. Generate (or load) ML-DSA-44 keypair (NIST FIPS 204)
-   *      - If #mlDsaKeyFile is set: FileMlDsaKeyProvider.load(path) — persists with 0o600
-   *      - Otherwise: mlDsaKeygen() → InMemoryMlDsaKeyProvider
-   *   3. Open (or reuse) persistent signaling stream (auth handled inside)
-   *   4. Get myPubkeyHex (Ed25519 K_local)
-   *   5. Send register_request { phone_stub, k_local_pubkey, ml_dsa_pubkey } on signaling stream
-   *   5a. Await dkg_ready { epochId, participants, threshold } (routed by signaling reader)
-   *   5b. Run real FROST DKG ceremony over /cello/frost/1.0.0 streams (RFC 9591)
-   *       - Create NetworkDirectoryNode for each directory peer
-   *       - runNetworkDkg(agentPubkey, { threshold, participants, directoryNodes })
-   *       - Stores client share via storeDkgResult in frost-threshold-signer
-   *   5c. Send dkg_complete { primary_pubkey } on signaling stream
-   *   6. Await register_success or register_error (routed by #runPersistentSignalingReader)
-   *      - register_error → return { error: reason }
-   *      - register_success → build RegistrationState and cache it
-   *   7. Return RegistrationState
-   *
-   * Crypto refs: NIST FIPS 204 (ML-DSA-44), RFC 9591 (FROST), FIPS 180-4 (SHA-256)
-   */
+  /** REG-001: Register this agent with the directory. Delegates to RegistrationManager. */
   async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
     return this.#registrationManager.register(phoneStub, preAuthToken);
   }
@@ -1569,7 +900,7 @@ class CelloClientImpl implements CelloClient {
   }
 
   onSessionAssignment(handler: (event: SessionAssignmentEvent) => void): void {
-    this.#onSessionAssignmentHandler = handler;
+    this.#sessionManager.setOnSessionAssignmentHandler(handler);
   }
 
   // ─── CONNREQ-002: Connection methods ──────────────────────────────────────────
@@ -1734,28 +1065,7 @@ class CelloClientImpl implements CelloClient {
     return this.#signalingManager.reconnectDirectory();
   }
 
-  /**
-   * FEDERATION-003 AC-004: Look up a relay's registered public key from the directory.
-   *
-   * Opens a one-shot signaling stream, authenticates, sends relay_pubkey_request,
-   * and returns the public_key_hex for the given relayId.
-   *
-   * DB-002: If the directory is unreachable, returns undefined. The caller is responsible
-   * for retry logic (the hash submission stays in the pending queue).
-   *
-   * Pseudocode (Phase P):
-   *   1. Require directoryEndpoint — return undefined if not configured.
-   *   2. Dial directory and open signaling stream.
-   *   3. Authenticate: read signaling_auth_challenge, sign SHA-256("CELLO-DIR-AUTH-v1" || nonce || pubkey),
-   *      send signaling_auth_response. Read signaling_auth_ok.  RFC 8032, FIPS 180-4.
-   *   4. Send relay_pubkey_request { type, relay_id }.
-   *   5. Read relay_pubkey_response { type, public_key_hex } or relay_pubkey_error { type, reason }.
-   *   6. On relay_pubkey_response: return public_key_hex.
-   *   7. On relay_pubkey_error or any failure: return undefined.
-   *
-   * @param relayId - hex encoding of the relay's Ed25519 public key
-   * @returns the relay's registered public_key_hex, or undefined if not found / unreachable
-   */
+  /** FEDERATION-003 AC-004: Look up a relay's registered public key from the directory. */
   async getRelayPublicKey(relayId: string): Promise<string | undefined> {
     const pubkeyHex = await this.#signalingManager.getRelayPublicKey(relayId);
     // PERSIST-024: cache in known_relays so lookupRelayPubkey can serve from DB
@@ -1791,153 +1101,12 @@ class CelloClientImpl implements CelloClient {
 
   // ─── ADAPTER-003: initiateSession ──────────────────────────────────────────
 
-  /**
-   * Send a `session_request` over the persistent directory signaling stream and await
-   * the `session_assignment` or error response.
-   *
-   * PSEUDOCODE (Phase P — ADAPTER-003):
-   *
-   * initiateSession(targetPubkeyHex, opts):
-   *   1. If no #directoryEndpoint configured → return { ok: false, reason: 'directory_unreachable' }
-   *   2. Ensure #myPubkeyHex is set (read from keyProvider if not yet set)
-   *   3. Open persistent signaling stream if not already open (DB-001: single retry on failure)
-   *      If stream still cannot be opened → return { ok: false, reason: 'directory_unreachable' }
-   *   4. Encode session_request frame inline using CBOR (no @cello-protocol/directory import):
-   *        CBOR({ type: "session_request", target_pubkey: Buffer.from(targetPubkeyHex, 'hex') })
-   *      SI-001: only target_pubkey, no extra fields, no key material
-   *   5. Create response Promise:
-   *        Create resolve fn, store in #pendingSessionRequestResolve
-   *   6. Send frame on #persistentSignalingStream
-   *   7. Race: response Promise vs timeout (opts.timeoutMs ?? DEFAULT_INITIATE_TIMEOUT_MS)
-   *   8. On timeout:
-   *        Clear #pendingSessionRequestResolve
-   *        Return { ok: false, reason: 'timeout' }
-   *   9. On session_request_error frame:
-   *        reason = frame['reason'] ('target_offline' | 'relay_unavailable')
-   *        Return { ok: false, reason }
-   *  10. On session_assignment frame:
-   *        Decode assignment fields from frame['assignment']
-   *        Call receiveSessionAssignment(assignment, myPubkey)
-   *        If ok:true → return { ok: true, sessionId, genesisPrevRoot }
-   *        If ok:false → return { ok: false, reason: 'directory_unreachable' }
-   *
-   * SI-002: K_local private key never appears in frame, response, or log output.
-   *         keyProvider.getPublicKey() returns only the public key.
-   */
-  async initiateSession(
+  /** ADAPTER-003: Delegate to SignalingManager. SI-002: K_local never in frames or logs. */
+  initiateSession(
     targetPubkeyHex: string,
-    opts?: {
-      /** Directory peer ID to connect to (overrides configured directoryEndpoint). */
-      directoryPeerId?: string;
-      /** Directory multiaddr for initial dial (overrides configured directoryEndpoint). */
-      directoryMultiaddr?: string;
-      /** Timeout in ms. Default: 30_000. */
-      timeoutMs?: number;
-    },
+    opts?: { directoryPeerId?: string; directoryMultiaddr?: string; timeoutMs?: number },
   ): Promise<InitiateSessionResult> {
-    const timeoutMs = opts?.timeoutMs ?? DEFAULT_INITIATE_TIMEOUT_MS;
-
-    // SESSION-006: check local connections map before touching the signaling stream.
-    // If we have a connection policy configured (M3 mode), require a connection.
-    // If no connection policy (M2 mode), skip the gate.
-    const connectionId = this.#connectionsByPeer.get(targetPubkeyHex);
-    if (this.#connectionPolicy !== undefined && !connectionId) {
-      return { ok: false, reason: "no_connection" } as InitiateSessionResult;
-    }
-
-    if (!this.#directoryEndpoint && !opts?.directoryPeerId) {
-      return { ok: false, reason: "directory_unreachable" };
-    }
-
-    // Ensure myPubkeyHex is set (needed for receiveSessionAssignment)
-    if (!this.#myPubkeyHex) {
-      const pubkey = await this.#keyProvider.getPublicKey();
-      this.#myPubkeyHex = Buffer.from(pubkey).toString("hex");
-    }
-    const myPubkey = Buffer.from(this.#myPubkeyHex, "hex");
-
-    // Open persistent signaling stream if not already open (DB-001)
-    if (!this.#persistentSignalingStream) {
-      const opened = await this.#openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
-      if (!opened) {
-        const retried = await this.#openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
-        if (!retried) {
-          return { ok: false, reason: "directory_unreachable" };
-        }
-      }
-    }
-
-    // SESSION-006: session_request frame includes connection_id if we have one
-    // Encoded inline with raw CBOR — no import from @cello-protocol/directory
-    const targetPubkeyBytes = Buffer.from(targetPubkeyHex, "hex");
-    const sessionRequestPayload: Record<string, unknown> = {
-      type: "session_request",
-      target_pubkey: new Uint8Array(targetPubkeyBytes),
-    };
-    if (connectionId) {
-      sessionRequestPayload["connection_id"] = connectionId;
-    }
-    const sessionRequestFrame = CBOR_ENC.encode(sessionRequestPayload) as Uint8Array;
-
-    // Set up Promise that resolves when the directory responds
-    let responseResolve!: (frame: Record<string, unknown>) => void;
-    const responsePromise = new Promise<Record<string, unknown>>((resolve) => {
-      responseResolve = resolve;
-    });
-    this.#pendingSessionRequestResolve = responseResolve;
-
-    try {
-      this.#persistentSignalingStream!.send(lp.encode.single(sessionRequestFrame));
-    } catch {
-      this.#pendingSessionRequestResolve = null;
-      return { ok: false, reason: "directory_unreachable" };
-    }
-
-    // Race: directory response vs timeout
-    let responseFrame: Record<string, unknown> | null = null;
-    let timedOut = false;
-    await Promise.race([
-      responsePromise.then((f) => { responseFrame = f; }),
-      new Promise<void>((resolve) =>
-        setTimeout(() => { timedOut = true; resolve(); }, timeoutMs)
-      ),
-    ]);
-
-    if (timedOut) {
-      this.#pendingSessionRequestResolve = null;
-      return { ok: false, reason: "timeout" };
-    }
-
-    const frame = responseFrame!;
-
-    if (frame["type"] === "session_request_error") {
-      return mapSessionRequestErrorFrame(frame);
-    }
-
-    if (frame["type"] === "session_assignment") {
-      const rawAssignment = frame["assignment"] as Record<string, unknown> | undefined;
-      if (!rawAssignment) return { ok: false, reason: "directory_unreachable" };
-
-      const assignment = parseSessionAssignment(rawAssignment);
-      if (!assignment) return { ok: false, reason: "directory_unreachable" };
-
-      const result = await this.receiveSessionAssignment(assignment, myPubkey);
-      if (!result.ok) {
-        return { ok: false, reason: "directory_unreachable" };
-      }
-
-      const sessionIdHex = Buffer.from(result.sessionId).toString("hex");
-      const record = this.#sessions.get(sessionIdHex);
-      if (!record) return { ok: false, reason: "directory_unreachable" };
-
-      return {
-        ok: true,
-        sessionId: result.sessionId,
-        genesisPrevRoot: record.genesis_prev_root,
-      };
-    }
-
-    return { ok: false, reason: "directory_unreachable" };
+    return this.#signalingManager.initiateSession(targetPubkeyHex, opts);
   }
 
   /** Delegate to SignalingManager — opens and authenticates the persistent directory signaling stream. */
@@ -1984,7 +1153,7 @@ class CelloClientImpl implements CelloClient {
         return sid ? Buffer.from(sid).toString("hex") : null;
       })();
       if (sessionIdHex) {
-        const session = this.#sessions.get(sessionIdHex);
+        const session = this.#sessionManager.getSession(sessionIdHex);
         if (session) {
           const dirPubkey = injectedDirectoryPubkey ?? session.directory_pubkey;
           this.#sealManager.handleDirectorySessionSealed(sessionIdHex, frame, dirPubkey);
@@ -2011,11 +1180,7 @@ class CelloClientImpl implements CelloClient {
         return sid ? Buffer.from(sid).toString("hex") : null;
       })();
       if (sessionIdHex) this.#sealManager.handleSealUnilateralConfirmed(sessionIdHex, frame);
-      const unilateralResolve = this.#pendingUnilateralSealResolve;
-      if (unilateralResolve) {
-        this.#pendingUnilateralSealResolve = null;
-        unilateralResolve(frame);
-      }
+      this.#sealManager.resolvePendingUnilateralSeal(frame);
     } else if (frame["type"] === "seal_unilateral_notification") {
       const sessionIdHex = injectedSessionIdHex ?? (() => {
         const raw = frame["session_id"];
@@ -2033,11 +1198,7 @@ class CelloClientImpl implements CelloClient {
         const remainingSeconds = typeof frame["remaining_seconds"] === "number" ? frame["remaining_seconds"] : 0;
         this.#logger.warn("session.unilateral.too.early", { sessionId: sessionIdHex, remainingSeconds });
       }
-      const unilateralResolve = this.#pendingUnilateralSealResolve;
-      if (unilateralResolve) {
-        this.#pendingUnilateralSealResolve = null;
-        unilateralResolve(frame);
-      }
+      this.#sealManager.resolvePendingUnilateralSeal(frame);
     } else if (frame["type"] === "seal_verified") {
       const sessionIdHex = injectedSessionIdHex ?? (() => {
         const raw = frame["session_id"];
@@ -2123,7 +1284,7 @@ class CelloClientImpl implements CelloClient {
 
     // If any session is sealing or seal_deferred, schedule reconnect so directory can
     // drain its seal_verified notification queue and the FROST ceremony can complete.
-    const pendingSealSessions = Array.from(this.#sessions.entries())
+    const pendingSealSessions = Array.from(this.#sessionManager.getSessions().entries())
       .filter(([, s]) => s.status === "sealing" || s.status === "seal_deferred")
       .map(([id]) => id);
     if (pendingSealSessions.length > 0 && this.#directoryEndpoint) {
@@ -2136,138 +1297,8 @@ class CelloClientImpl implements CelloClient {
   }
 }
 
-// ─── Stream iterator helpers ──────────────────────────────────────────────────
-
-// ─── ADAPTER-003: parseSessionAssignment ─────────────────────────────────────
-
-/**
- * Decode a raw CBOR-decoded object (from frame["assignment"]) into a typed SessionAssignment.
- * Returns null if any required field is missing or malformed.
- *
- * The object is already decoded by cbor-x from the outer frame — this function just
- * validates and casts the fields. No @cello-protocol/directory import needed.
- *
- * Wire shape (from encodeSessionAssignment in directory-frames.ts):
- *   {
- *     session_id: Uint8Array (16),
- *     participant_a: { pubkey: Uint8Array (32), peer_id: string, multiaddrs: string[] },
- *     participant_b: { pubkey: Uint8Array (32), peer_id: string, multiaddrs: string[] },
- *     relay_endpoint: { peer_id: string, multiaddrs: string[] },
- *     directory_endpoint: { peer_id: string, multiaddrs: string[] },
- *     session_timestamp: number,
- *     directory_pubkey: Uint8Array (32),
- *     directory_signature: Uint8Array (64),
- *   }
- */
-function parseSessionAssignment(raw: Record<string, unknown>): SessionAssignment | null {
-  const sessionId = toU8Safe(raw["session_id"]);
-  if (!sessionId || sessionId.length !== 16) return null;
-
-  const dirPubkey = toU8Safe(raw["directory_pubkey"]);
-  if (!dirPubkey || dirPubkey.length !== 32) return null;
-
-  const dirSig = toU8Safe(raw["directory_signature"]);
-  if (!dirSig || dirSig.length !== 64) return null;
-
-  const tsRaw = raw["session_timestamp"];
-  const sessionTimestamp = typeof tsRaw === "number" ? tsRaw
-    : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
-  if (sessionTimestamp === null) return null;
-
-  const participantA = parseParticipantInfo(raw["participant_a"]);
-  if (!participantA) return null;
-
-  const participantB = parseParticipantInfo(raw["participant_b"]);
-  if (!participantB) return null;
-
-  const relayEndpoint = parseEndpointInfo(raw["relay_endpoint"]);
-  if (!relayEndpoint) return null;
-
-  const directoryEndpoint = parseEndpointInfo(raw["directory_endpoint"]);
-  if (!directoryEndpoint) return null;
-
-  const sigType = typeof raw["signature_type"] === "string" ? raw["signature_type"] : "single";
-
-  if (sigType === "frost") {
-    const signerPubkey = toU8Safe(raw["signer_pubkey"]);
-    if (!signerPubkey || signerPubkey.length !== 32) return null;
-    return {
-      session_id: sessionId,
-      participant_a: participantA,
-      participant_b: participantB,
-      relay_endpoint: relayEndpoint,
-      directory_endpoint: directoryEndpoint,
-      session_timestamp: sessionTimestamp,
-      directory_pubkey: dirPubkey,
-      directory_signature: dirSig,
-      signature_type: "frost" as const,
-      signer_pubkey: signerPubkey,
-    };
-  }
-
-  return {
-    session_id: sessionId,
-    participant_a: participantA,
-    participant_b: participantB,
-    relay_endpoint: relayEndpoint,
-    directory_endpoint: directoryEndpoint,
-    session_timestamp: sessionTimestamp,
-    directory_pubkey: dirPubkey,
-    directory_signature: dirSig,
-    signature_type: "single" as const,
-  };
-}
-
-function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-types").ParticipantInfo | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const pubkey = toU8Safe(r["pubkey"]);
-  if (!pubkey || pubkey.length !== 32) return null;
-  const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : null;
-  if (!peerId) return null;
-  const multiaddrs = parseStringArray(r["multiaddrs"]);
-  if (!multiaddrs) return null;
-  return { pubkey, peer_id: peerId, multiaddrs };
-}
-
-function parseEndpointInfo(raw: unknown): import("@cello-protocol/protocol-types").RelayEndpointInfo | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : null;
-  if (!peerId) return null;
-  const multiaddrs = parseStringArray(r["multiaddrs"]);
-  if (!multiaddrs) return null;
-  return { peer_id: peerId, multiaddrs };
-}
-
-function parseStringArray(v: unknown): string[] | null {
-  if (!Array.isArray(v)) return null;
-  if (!v.every((x) => typeof x === "string")) return null;
-  return v as string[];
-}
-
-// ─── Session request error mapping ───────────────────────────────────────────
-
-/**
- * Map a raw decoded session_request_error frame to an InitiateSessionResult.
- * Exported for direct unit testing (AC-005, AC-006).
- * The frame must have type === "session_request_error".
- */
-export function mapSessionRequestErrorFrame(
-  frame: Record<string, unknown>,
-): import("./types.js").InitiateSessionResult {
-  const reason = frame["reason"];
-  if (reason === "target_offline") return { ok: false, reason: "target_offline" };
-  if (reason === "relay_unavailable") return { ok: false, reason: "relay_unavailable" };
-  if (reason === "frost_signer_not_configured") return { ok: false, reason: "frost_signer_not_configured" };
-  if (reason === "directory_below_threshold") return { ok: false, reason: "directory_below_threshold" };
-  if (reason === "ceremony_timeout") return { ok: false, reason: "ceremony_timeout" };
-  if (reason === "ceremony_exhausted") return { ok: false, reason: "ceremony_exhausted" };
-  if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
-  if (reason === "no_connection") return { ok: false, reason: "no_connection" };
-  if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
-  return { ok: false, reason: "directory_unreachable" };
-}
+// ─── Re-export parse helpers (implementations moved to session-assignment-parser.ts) ──
+export { mapSessionRequestErrorFrame };
 
 // ─── Factory ─────────────────────────────────────────────────────────────────
 

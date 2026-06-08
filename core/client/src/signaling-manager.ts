@@ -13,6 +13,8 @@ import type { Logger } from "@cello-protocol/interfaces";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import type { InitiateSessionResult, ReceiveAssignmentResult, SessionRecord } from "./types.js";
+import { parseSessionAssignment, mapSessionRequestErrorFrame } from "./session-assignment-parser.js";
 
 const SIGNALING_PROTOCOL_ID = "/cello/signaling/1.0.0";
 const AUTH_DOMAIN_DIR = "CELLO-DIR-AUTH-v1";
@@ -55,7 +57,9 @@ export interface SignalingContext {
   setPersistentSignalingIter(iter: AsyncIterator<Uint8Array> | null): void;
   getOpeningSignalingStream(): Promise<boolean> | null;
   setOpeningSignalingStream(p: Promise<boolean> | null): void;
-  getDirectoryStreams(): Map<string, Stream>;
+  getDirectoryStream(sessionIdHex: string): Stream | undefined;
+  setDirectoryStream(sessionIdHex: string, stream: Stream): void;
+  deleteDirectoryStream(sessionIdHex: string): void;
   // Pending-state accessors for AC-007 signaling.stream.closed log
   hasPendingSessionRequest(): boolean;
   hasPendingRegister(): boolean;
@@ -64,6 +68,13 @@ export interface SignalingContext {
   // Frame dispatch
   dispatchSignalingFrame(stream: Stream, frame: Record<string, unknown>): void;
   onSignalingStreamClosed(stream: Stream): void;
+  // initiateSession dependencies
+  getConnectionIdForPeer(pubkeyHex: string): string | undefined;
+  hasConnectionPolicy(): boolean;
+  getPendingSessionRequestResolve(): ((frame: Record<string, unknown>) => void) | null;
+  setPendingSessionRequestResolve(resolve: ((frame: Record<string, unknown>) => void) | null): void;
+  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
+  getSession(sessionIdHex: string): SessionRecord | undefined;
 }
 
 export class SignalingManager {
@@ -128,7 +139,7 @@ export class SignalingManager {
         return;
       }
 
-      this.#ctx.getDirectoryStreams().set(sessionIdHex, dirStream);
+      this.#ctx.setDirectoryStream(sessionIdHex, dirStream);
 
       const iter = (lp.decode(dirStream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
       const { value: challengeRaw, done } = await iter.next();
@@ -356,9 +367,8 @@ export class SignalingManager {
       }
     } catch { /* stream closed */ }
 
-    const directoryStreams = this.#ctx.getDirectoryStreams();
-    if (directoryStreams.get(sessionIdHex) === stream) {
-      directoryStreams.delete(sessionIdHex);
+    if (this.#ctx.getDirectoryStream(sessionIdHex) === stream) {
+      this.#ctx.deleteDirectoryStream(sessionIdHex);
     }
   }
 
@@ -444,5 +454,120 @@ export class SignalingManager {
     } catch {
       return false;
     }
+  }
+
+  // ─── ADAPTER-003: initiateSession ────────────────────────────────────────────
+
+  /**
+   * ADAPTER-003: Send session_request on the persistent signaling stream and await
+   * session_assignment or error. SI-002: K_local never appears in any frame or log.
+   */
+  async initiateSession(
+    targetPubkeyHex: string,
+    opts?: {
+      directoryPeerId?: string;
+      directoryMultiaddr?: string;
+      timeoutMs?: number;
+    },
+  ): Promise<InitiateSessionResult> {
+    const timeoutMs = opts?.timeoutMs ?? 30_000;
+
+    // SESSION-006: check local connections map before touching the signaling stream.
+    const connectionId = this.#ctx.getConnectionIdForPeer(targetPubkeyHex);
+    if (this.#ctx.hasConnectionPolicy() && !connectionId) {
+      return { ok: false, reason: "no_connection" } as InitiateSessionResult;
+    }
+
+    if (!this.#ctx.getDirectoryEndpoint() && !opts?.directoryPeerId) {
+      return { ok: false, reason: "directory_unreachable" };
+    }
+
+    // Ensure myPubkeyHex is set
+    if (!this.#ctx.getMyPubkeyHex()) {
+      const pubkey = await this.#ctx.keyProvider.getPublicKey();
+      this.#ctx.setMyPubkeyHex(Buffer.from(pubkey).toString("hex"));
+    }
+    const myPubkey = Buffer.from(this.#ctx.getMyPubkeyHex()!, "hex");
+
+    // Open persistent signaling stream if not already open (DB-001)
+    if (!this.#ctx.getPersistentSignalingStream()) {
+      const opened = await this.openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
+      if (!opened) {
+        const retried = await this.openPersistentSignalingStream(opts?.directoryPeerId, opts?.directoryMultiaddr);
+        if (!retried) {
+          return { ok: false, reason: "directory_unreachable" };
+        }
+      }
+    }
+
+    // SESSION-006: include connection_id in session_request if available
+    const sessionRequestPayload: Record<string, unknown> = {
+      type: "session_request",
+      target_pubkey: new Uint8Array(Buffer.from(targetPubkeyHex, "hex")),
+    };
+    if (connectionId) {
+      sessionRequestPayload["connection_id"] = connectionId;
+    }
+    const sessionRequestFrame = CBOR_ENC.encode(sessionRequestPayload) as Uint8Array;
+
+    // Set up Promise that resolves when the directory responds
+    let responseResolve!: (frame: Record<string, unknown>) => void;
+    const responsePromise = new Promise<Record<string, unknown>>((resolve) => {
+      responseResolve = resolve;
+    });
+    this.#ctx.setPendingSessionRequestResolve(responseResolve);
+
+    try {
+      this.#ctx.getPersistentSignalingStream()!.send(lp.encode.single(sessionRequestFrame));
+    } catch {
+      this.#ctx.setPendingSessionRequestResolve(null);
+      return { ok: false, reason: "directory_unreachable" };
+    }
+
+    // Race: directory response vs timeout
+    let responseFrame: Record<string, unknown> | null = null;
+    let timedOut = false;
+    await Promise.race([
+      responsePromise.then((f) => { responseFrame = f; }),
+      new Promise<void>((resolve) =>
+        setTimeout(() => { timedOut = true; resolve(); }, timeoutMs)
+      ),
+    ]);
+
+    if (timedOut) {
+      this.#ctx.setPendingSessionRequestResolve(null);
+      return { ok: false, reason: "timeout" };
+    }
+
+    const frame = responseFrame!;
+
+    if (frame["type"] === "session_request_error") {
+      return mapSessionRequestErrorFrame(frame);
+    }
+
+    if (frame["type"] === "session_assignment") {
+      const rawAssignment = frame["assignment"] as Record<string, unknown> | undefined;
+      if (!rawAssignment) return { ok: false, reason: "directory_unreachable" };
+
+      const assignment = parseSessionAssignment(rawAssignment);
+      if (!assignment) return { ok: false, reason: "directory_unreachable" };
+
+      const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey);
+      if (!result.ok) {
+        return { ok: false, reason: "directory_unreachable" };
+      }
+
+      const sessionIdHex = Buffer.from(result.sessionId).toString("hex");
+      const record = this.#ctx.getSession(sessionIdHex);
+      if (!record) return { ok: false, reason: "directory_unreachable" };
+
+      return {
+        ok: true,
+        sessionId: result.sessionId,
+        genesisPrevRoot: record.genesis_prev_root,
+      };
+    }
+
+    return { ok: false, reason: "directory_unreachable" };
   }
 }

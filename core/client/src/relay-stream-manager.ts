@@ -11,6 +11,12 @@
  * - #performRelayAuth: challenge-response auth
  * - #performGapFillReconciliation: PERSIST-014 gap fill
  * - #handleGapFillResponse
+ *
+ * State owned here (not in facade):
+ *   - #relayStreams, #relayRecvSeq, #reconnectInProgress
+ *   - #readyQueue, #pendingS2, #pendingContent
+ *   - #tamperedContentClaims, #pendingGapFillResolvers
+ *   - #directoryStreams
  */
 
 import { createHash } from "node:crypto";
@@ -97,7 +103,8 @@ interface ReadyEntry {
 }
 
 /**
- * Narrow interface exposing only what RelayStreamManager needs from CelloClientImpl.
+ * Narrow interface exposing only what RelayStreamManager needs from external managers.
+ * State owned by RelayStreamManager is no longer in this interface.
  */
 export interface RelayStreamContext {
   readonly node: CelloNode;
@@ -108,49 +115,20 @@ export interface RelayStreamContext {
   readonly reconnectTimeoutMs: number;
   readonly hashQueue: AgentHashQueue | null;
   getMyPubkeyHex(): string | null;
+  // From SessionManager (session records and send-side state)
   getSession(sessionIdHex: string): SessionRecord | undefined;
   getSessions(): Map<string, SessionRecord>;
-  getRelayStream(sessionIdHex: string): Stream | undefined;
-  setRelayStream(sessionIdHex: string, stream: Stream): void;
-  deleteRelayStream(sessionIdHex: string): void;
-  getRelayRecvSeq(sessionIdHex: string): number | undefined;
-  setRelayRecvSeq(sessionIdHex: string, seq: number): void;
-  deleteRelayRecvSeq(sessionIdHex: string): void;
   getPendingAckResolver(sessionIdHex: string): ((v: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void) | undefined;
   setPendingAckResolver(sessionIdHex: string, resolve: (v: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void): void;
   deletePendingAckResolver(sessionIdHex: string): void;
-  getReadyQueue(sessionIdHex: string): Map<number, ReadyEntry> | undefined;
-  setReadyQueue(sessionIdHex: string, queue: Map<number, ReadyEntry>): void;
-  deleteReadyQueue(sessionIdHex: string): void;
-  getPendingS2(sessionIdHex: string): Map<string, PendingS2Entry> | undefined;
-  setPendingS2(sessionIdHex: string, map: Map<string, PendingS2Entry>): void;
-  deletePendingS2(sessionIdHex: string): void;
-  getPendingContent(sessionIdHex: string): Map<string, PendingContentEntry> | undefined;
-  setPendingContent(sessionIdHex: string, map: Map<string, PendingContentEntry>): void;
-  deletePendingContent(sessionIdHex: string): void;
-  getOwnPendingContent(sessionIdHex: string): Map<string, PendingContentEntry> | undefined;
-  setOwnPendingContent(sessionIdHex: string, map: Map<string, PendingContentEntry>): void;
-  deleteOwnPendingContent(sessionIdHex: string): void;
-  getTamperedContentClaims(sessionIdHex: string): Set<string> | undefined;
-  setTamperedContentClaims(sessionIdHex: string, set: Set<string>): void;
-  deleteTamperedContentClaims(sessionIdHex: string): void;
+  getOwnPendingContent(sessionIdHex: string): Map<string, { content_bytes: Uint8Array; arrived_at: number }> | undefined;
   getOwnEchoResolvers(sessionIdHex: string): Map<number, () => void> | undefined;
-  setOwnEchoResolvers(sessionIdHex: string, map: Map<number, () => void>): void;
-  deleteOwnEchoResolvers(sessionIdHex: string): void;
-  getSessionMessageQueue(sessionIdHex: string): ReceivedMessage[] | undefined;
-  setSessionMessageQueue(sessionIdHex: string, queue: ReceivedMessage[]): void;
-  deleteSessionMessageQueue(sessionIdHex: string): void;
-  getAnyMessageQueue(): Array<{ sessionIdHex: string; message: ReceivedMessage }>;
-  getReconnectInProgress(): Set<string>;
-  getPendingGapFillResolver(sessionIdHex: string): ((result: { ok: true; leaves: unknown[] } | { ok: false; reason: string }) => void) | undefined;
-  setPendingGapFillResolver(sessionIdHex: string, resolve: (result: { ok: true; leaves: unknown[] } | { ok: false; reason: string }) => void): void;
-  deletePendingGapFillResolver(sessionIdHex: string): void;
-  getDirectoryStream(sessionIdHex: string): Stream | undefined;
   getOutboundQueue(sessionIdHex: string): Promise<void> | undefined;
-  // callbacks
-  onRelayDisconnected(sessionIdHex: string, myPubkeyHex: string): void;
+  // Delivery callbacks into SessionManager
+  enqueueReceivedMessage(sessionIdHex: string, message: ReceivedMessage): void;
   wakeReceiveWaiters(sessionIdHex: string): void;
   enqueueSessionSealedEvent(sessionIdHex: string, sealedRoot: Uint8Array, closeTimestamp: number): void;
+  // Seal callbacks
   handleSealVerified(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleSessionFrostSealed(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleSealRejectedTreeMismatch(sessionIdHex: string, frame: Record<string, unknown>): void;
@@ -158,6 +136,8 @@ export interface RelayStreamContext {
   handleSealUnilateralNotification(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleDirectorySessionSealed(sessionIdHex: string, frame: Record<string, unknown>, directoryPubkey: Uint8Array): void;
   handleDirectorySessionSealRejected(sessionIdHex: string, frame: Record<string, unknown>): void;
+  // Reconnect callback
+  onRelayDisconnected(sessionIdHex: string, myPubkeyHex: string): void;
 }
 
 export type { ReadyEntry, PendingS2Entry, PendingContentEntry, Structure1Fields };
@@ -165,8 +145,98 @@ export type { ReadyEntry, PendingS2Entry, PendingContentEntry, Structure1Fields 
 export class RelayStreamManager {
   readonly #ctx: RelayStreamContext;
 
+  // ─── Owned state ──────────────────────────────────────────────────────────────
+
+  // session_id_hex → persistent relay stream
+  readonly #relayStreams = new Map<string, Stream>();
+
+  // session_id_hex → directory signaling stream (SESSION-003)
+  readonly #directoryStreams = new Map<string, Stream>();
+
+  // session_id_hex → highest seq# received from relay
+  readonly #relayRecvSeq = new Map<string, number>();
+
+  // SESSION-006: track whether a reconnect loop is already running per session
+  readonly #reconnectInProgress = new Set<string>();
+
+  // session_id_hex → fully-ready cross-checks keyed by seqNum, awaiting in-order processing
+  readonly #readyQueue = new Map<string, Map<number, ReadyEntry>>();
+
+  // session_id_hex → pending S2 entries keyed by content_hash_hex
+  readonly #pendingS2 = new Map<string, Map<string, PendingS2Entry>>();
+
+  // session_id_hex → pending content entries keyed by content_hash_hex
+  readonly #pendingContent = new Map<string, Map<string, PendingContentEntry>>();
+
+  // session_id_hex → set of content_hash_hex values from tampered frames
+  readonly #tamperedContentClaims = new Map<string, Set<string>>();
+
+  // session_id_hex → pending gap fill resolver
+  readonly #pendingGapFillResolvers = new Map<string, (result: { ok: true; leaves: unknown[] } | { ok: false; reason: string }) => void>();
+
   constructor(ctx: RelayStreamContext) {
     this.#ctx = ctx;
+  }
+
+  // ─── State accessors (called by SessionManager, SealManager, facade) ──────────
+
+  getRelayStream(sessionIdHex: string): Stream | undefined {
+    return this.#relayStreams.get(sessionIdHex);
+  }
+
+  setRelayStream(sessionIdHex: string, stream: Stream): void {
+    this.#relayStreams.set(sessionIdHex, stream);
+  }
+
+  deleteRelayStream(sessionIdHex: string): void {
+    this.#relayStreams.delete(sessionIdHex);
+  }
+
+  getDirectoryStream(sessionIdHex: string): Stream | undefined {
+    return this.#directoryStreams.get(sessionIdHex);
+  }
+
+  setDirectoryStream(sessionIdHex: string, stream: Stream): void {
+    this.#directoryStreams.set(sessionIdHex, stream);
+  }
+
+  deleteDirectoryStream(sessionIdHex: string): void {
+    this.#directoryStreams.delete(sessionIdHex);
+  }
+
+  /** Called by SessionManager.receiveSessionAssignment to initialize per-session relay state. */
+  initSession(sessionIdHex: string): void {
+    this.#relayRecvSeq.set(sessionIdHex, 0);
+    this.#readyQueue.set(sessionIdHex, new Map());
+    this.#pendingS2.set(sessionIdHex, new Map());
+    this.#pendingContent.set(sessionIdHex, new Map());
+    this.#tamperedContentClaims.set(sessionIdHex, new Set());
+  }
+
+  /** Called by facade.closeSession to tear down per-session relay state. */
+  closeSession(sessionIdHex: string): void {
+    // Clear pending S2 timers to avoid memory leaks
+    const ps2 = this.#pendingS2.get(sessionIdHex);
+    if (ps2) {
+      for (const entry of ps2.values()) clearTimeout(entry.timer_handle);
+    }
+    this.#relayRecvSeq.delete(sessionIdHex);
+    this.#readyQueue.delete(sessionIdHex);
+    this.#pendingS2.delete(sessionIdHex);
+    this.#pendingContent.delete(sessionIdHex);
+    this.#tamperedContentClaims.delete(sessionIdHex);
+    this.#pendingGapFillResolvers.delete(sessionIdHex);
+    const stream = this.#relayStreams.get(sessionIdHex);
+    if (stream) {
+      this.#relayStreams.delete(sessionIdHex);
+      stream.abort(new Error("session_closed"));
+    }
+    const dirStream = this.#directoryStreams.get(sessionIdHex);
+    if (dirStream) {
+      this.#directoryStreams.delete(sessionIdHex);
+      dirStream.abort(new Error("session_closed"));
+    }
+    this.#reconnectInProgress.delete(sessionIdHex);
   }
 
   // ─── Public API: TEST-ONLY escape hatches ────────────────────────────────────
@@ -178,11 +248,11 @@ export class RelayStreamManager {
   }
 
   injectRelayDisconnect(sessionIdHex: string): void {
-    const stream = this.#ctx.getRelayStream(sessionIdHex);
+    const stream = this.#relayStreams.get(sessionIdHex);
     const myPubkeyHex = this.#ctx.getMyPubkeyHex();
     if (!myPubkeyHex) return;
     if (stream) {
-      this.#ctx.deleteRelayStream(sessionIdHex);
+      this.#relayStreams.delete(sessionIdHex);
       try { stream.abort(new Error("test_inject_disconnect")); } catch { /* ignore */ }
     }
     this.#ctx.onRelayDisconnected(sessionIdHex, myPubkeyHex);
@@ -247,17 +317,17 @@ export class RelayStreamManager {
           this.#handleGapFillResponse(sessionIdHex, frame);
         } else if (frame["type"] === "gap_fill_error") {
           const reason = typeof frame["reason"] === "string" ? frame["reason"] : "unknown";
-          const pendingReconciliation = this.#ctx.getPendingGapFillResolver(sessionIdHex);
+          const pendingReconciliation = this.#pendingGapFillResolvers.get(sessionIdHex);
           if (pendingReconciliation) {
-            this.#ctx.deletePendingGapFillResolver(sessionIdHex);
+            this.#pendingGapFillResolvers.delete(sessionIdHex);
             pendingReconciliation({ ok: false, reason });
           }
         }
       }
     } catch { /* stream closed */ }
 
-    if (this.#ctx.getRelayStream(sessionIdHex) === stream) {
-      this.#ctx.deleteRelayStream(sessionIdHex);
+    if (this.#relayStreams.get(sessionIdHex) === stream) {
+      this.#relayStreams.delete(sessionIdHex);
     }
     this.#ctx.onRelayDisconnected(sessionIdHex, myPubkeyHex);
   }
@@ -265,9 +335,8 @@ export class RelayStreamManager {
   // ─── SESSION-006 reconnect ──────────────────────────────────────────────────
 
   async reconnectRelayStream(sessionIdHex: string, myPubkeyHex: string): Promise<void> {
-    const reconnectInProgress = this.#ctx.getReconnectInProgress();
-    if (reconnectInProgress.has(sessionIdHex)) return;
-    reconnectInProgress.add(sessionIdHex);
+    if (this.#reconnectInProgress.has(sessionIdHex)) return;
+    this.#reconnectInProgress.add(sessionIdHex);
 
     const reconnectTimeoutMs = this.#ctx.reconnectTimeoutMs;
     const deadline = Date.now() + reconnectTimeoutMs;
@@ -307,7 +376,7 @@ export class RelayStreamManager {
             return;
           }
 
-          this.#ctx.setRelayStream(sessionIdHex, newStream);
+          this.#relayStreams.set(sessionIdHex, newStream);
           sessionAfterAuth.status = "active";
           void this.#ctx.persistence?.persistSession(sessionIdHex, sessionAfterAuth);
 
@@ -333,7 +402,7 @@ export class RelayStreamManager {
         }
       }
     } finally {
-      reconnectInProgress.delete(sessionIdHex);
+      this.#reconnectInProgress.delete(sessionIdHex);
     }
   }
 
@@ -384,7 +453,7 @@ export class RelayStreamManager {
 
     const declaredHashHex = Buffer.from(declaredHash).toString("hex");
 
-    const ps2MapEarly = this.#ctx.getPendingS2(sessionIdHex);
+    const ps2MapEarly = this.#pendingS2.get(sessionIdHex);
     const s2EntryEarly = ps2MapEarly?.get(declaredHashHex);
 
     if (s2EntryEarly) {
@@ -408,14 +477,14 @@ export class RelayStreamManager {
       const matchesMsg = Buffer.compare(Buffer.from(msgHash), Buffer.from(declaredHash)) === 0;
       const matchesCtrl = Buffer.compare(Buffer.from(ctrlHash), Buffer.from(declaredHash)) === 0;
       if (!matchesMsg && !matchesCtrl) {
-        this.#ctx.getTamperedContentClaims(sessionIdHex)?.add(declaredHashHex);
+        this.#tamperedContentClaims.get(sessionIdHex)?.add(declaredHashHex);
         stream.close().catch(() => {});
         return;
       }
     }
 
     const contentHashHex = declaredHashHex;
-    const ps2Map = this.#ctx.getPendingS2(sessionIdHex);
+    const ps2Map = this.#pendingS2.get(sessionIdHex);
     const s2Entry = ps2Map?.get(contentHashHex);
 
     if (s2Entry) {
@@ -432,7 +501,7 @@ export class RelayStreamManager {
         s2Entry.echo_resolve,
       );
     } else {
-      const pending = this.#ctx.getPendingContent(sessionIdHex);
+      const pending = this.#pendingContent.get(sessionIdHex);
       if (pending) {
         if (pending.size >= PENDING_CONTENT_BOUND) {
           const firstKey = pending.keys().next().value;
@@ -553,10 +622,10 @@ export class RelayStreamManager {
       prev_root: prevRoot,
     };
 
-    const relayRecvSeq = this.#ctx.getRelayRecvSeq(sessionIdHex) ?? 0;
+    const relayRecvSeq = this.#relayRecvSeq.get(sessionIdHex) ?? 0;
     if (seqNum <= relayRecvSeq) { this.#desync(sessionIdHex, "sequence_replay"); return; }
     if (seqNum > relayRecvSeq + 1) { this.#desync(sessionIdHex, "sequence_gap"); return; }
-    this.#ctx.setRelayRecvSeq(sessionIdHex, seqNum);
+    this.#relayRecvSeq.set(sessionIdHex, seqNum);
 
     const s1CborRaw = frame["structure1_cbor"];
     const s1Cbor = s1CborRaw instanceof Uint8Array ? s1CborRaw
@@ -587,14 +656,14 @@ export class RelayStreamManager {
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const leafKind = typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : 0x00;
 
-    const tamperedClaims = this.#ctx.getTamperedContentClaims(sessionIdHex);
+    const tamperedClaims = this.#tamperedContentClaims.get(sessionIdHex);
     if (tamperedClaims?.has(contentHashHex)) {
       tamperedClaims.delete(contentHashHex);
       this.#desync(sessionIdHex, "content_hash_mismatch"); return;
     }
 
     const ownPendingContent = isOwnSend ? this.#ctx.getOwnPendingContent(sessionIdHex) : undefined;
-    const pendingContent = this.#ctx.getPendingContent(sessionIdHex);
+    const pendingContent = this.#pendingContent.get(sessionIdHex);
     const contentEntry = isOwnSend
       ? ownPendingContent?.get(contentHashHex)
       : pendingContent?.get(contentHashHex);
@@ -612,7 +681,7 @@ export class RelayStreamManager {
       this.#crossCheckDelivery(sessionIdHex, s2, s2Cbor, s1Fields, leafKind, contentEntry.content_bytes, isOwnSend, echoResolve);
     } else {
       const timerHandle = setTimeout(() => {
-        const ps2Map = this.#ctx.getPendingS2(sessionIdHex);
+        const ps2Map = this.#pendingS2.get(sessionIdHex);
         if (ps2Map?.has(contentHashHex)) {
           ps2Map.delete(contentHashHex);
           this.#desync(sessionIdHex, "content_missing");
@@ -631,7 +700,7 @@ export class RelayStreamManager {
         timer_handle: timerHandle,
         echo_resolve: echoResolve,
       };
-      this.#ctx.getPendingS2(sessionIdHex)?.set(contentHashHex, entry);
+      this.#pendingS2.get(sessionIdHex)?.set(contentHashHex, entry);
     }
   }
 
@@ -648,7 +717,7 @@ export class RelayStreamManager {
     const session = this.#ctx.getSession(sessionIdHex);
     if (!session || session.desynchronized) return;
 
-    const readyQ = this.#ctx.getReadyQueue(sessionIdHex);
+    const readyQ = this.#readyQueue.get(sessionIdHex);
     if (!readyQ) return;
 
     readyQ.set(s2.sequence_number, { s2, s2_cbor: s2Cbor, s1_fields: s1Fields, leaf_kind: leafKind, content_bytes: contentBytes, is_own_send: isOwnSend, echo_resolve: echoResolve });
@@ -657,7 +726,7 @@ export class RelayStreamManager {
 
   #drainReadyQueue(sessionIdHex: string): void {
     const session = this.#ctx.getSession(sessionIdHex);
-    const readyQ = this.#ctx.getReadyQueue(sessionIdHex);
+    const readyQ = this.#readyQueue.get(sessionIdHex);
     if (!session || !readyQ || session.desynchronized) return;
 
     while (true) {
@@ -716,7 +785,6 @@ export class RelayStreamManager {
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);
           void (async () => {
             // Notify the seal manager that responder received SEAL leaf
-            // This is done via a callback to avoid circular dependencies
             this.#ctx.handleSealVerified(sessionIdHex, {
               type: "_responder_seal_trigger",
               sessionIdHex,
@@ -731,9 +799,7 @@ export class RelayStreamManager {
             sequenceNumber: s2.sequence_number,
             leafHash,
           };
-          this.#ctx.getSessionMessageQueue(sessionIdHex)?.push(msg);
-          this.#ctx.getAnyMessageQueue().push({ sessionIdHex, message: msg });
-          this.#ctx.wakeReceiveWaiters(sessionIdHex);
+          this.#ctx.enqueueReceivedMessage(sessionIdHex, msg);
         }
       }
     }
@@ -746,7 +812,7 @@ export class RelayStreamManager {
     session.desynchronized = true;
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
 
-    const ps2 = this.#ctx.getPendingS2(sessionIdHex);
+    const ps2 = this.#pendingS2.get(sessionIdHex);
     if (ps2) {
       for (const entry of ps2.values()) {
         clearTimeout(entry.timer_handle);
@@ -761,10 +827,10 @@ export class RelayStreamManager {
       resolvers.clear();
     }
 
-    this.#ctx.getPendingContent(sessionIdHex)?.clear();
+    this.#pendingContent.get(sessionIdHex)?.clear();
     this.#ctx.getOwnPendingContent(sessionIdHex)?.clear();
-    this.#ctx.deleteRelayRecvSeq(sessionIdHex);
-    this.#ctx.getReadyQueue(sessionIdHex)?.clear();
+    this.#relayRecvSeq.delete(sessionIdHex);
+    this.#readyQueue.get(sessionIdHex)?.clear();
 
     const ackResolve = this.#ctx.getPendingAckResolver(sessionIdHex);
     if (ackResolve) {
@@ -789,7 +855,7 @@ export class RelayStreamManager {
     const startMs = Date.now();
     const gapSize = toSeq - fromSeq;
 
-    const relayStream = this.#ctx.getRelayStream(sessionIdHex);
+    const relayStream = this.#relayStreams.get(sessionIdHex);
     if (!relayStream || relayStream.status !== "open") {
       this.#ctx.logger.error("session.gap.fill.failed", {
         sessionId: sessionIdHex,
@@ -807,13 +873,13 @@ export class RelayStreamManager {
     }) as Uint8Array;
 
     const responsePromise = new Promise<{ ok: true; leaves: unknown[] } | { ok: false; reason: string }>((resolve) => {
-      this.#ctx.setPendingGapFillResolver(sessionIdHex, resolve);
+      this.#pendingGapFillResolvers.set(sessionIdHex, resolve);
     });
 
     try {
       relayStream.send(lp.encode.single(gapFillRequestFrame));
     } catch {
-      this.#ctx.deletePendingGapFillResolver(sessionIdHex);
+      this.#pendingGapFillResolvers.delete(sessionIdHex);
       this.#ctx.logger.error("session.gap.fill.failed", {
         sessionId: sessionIdHex,
         reason: "relay_send_failed",
@@ -878,7 +944,7 @@ export class RelayStreamManager {
     });
 
     const localRoot = this.#computeLocalRoot(session);
-    const dirStream = this.#ctx.getDirectoryStream(sessionIdHex);
+    const dirStream = this.#directoryStreams.get(sessionIdHex);
     if (localRoot && dirStream && dirStream.status === "open") {
       const sealAttemptFrame = CBOR_ENC.encode({
         type: "seal_attempt",
@@ -899,9 +965,9 @@ export class RelayStreamManager {
   }
 
   #handleGapFillResponse(sessionIdHex: string, frame: Record<string, unknown>): void {
-    const resolver = this.#ctx.getPendingGapFillResolver(sessionIdHex);
+    const resolver = this.#pendingGapFillResolvers.get(sessionIdHex);
     if (!resolver) return;
-    this.#ctx.deletePendingGapFillResolver(sessionIdHex);
+    this.#pendingGapFillResolvers.delete(sessionIdHex);
     const leavesRaw = Array.isArray(frame["leaves"]) ? frame["leaves"] as unknown[] : [];
     resolver({ ok: true, leaves: leavesRaw });
   }
