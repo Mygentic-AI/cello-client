@@ -643,19 +643,21 @@ export class SignalingManager {
 
     if (frame["type"] === "session_assignment") {
       const rawAssignment = frame["assignment"] as Record<string, unknown> | undefined;
-      if (!rawAssignment) return { ok: false, reason: "directory_unreachable" };
+      if (!rawAssignment) { process.stderr.write("[DIAG-C1] rawAssignment is null/undefined\n"); return { ok: false, reason: "directory_unreachable" }; }
 
       const assignment = parseSessionAssignment(rawAssignment);
-      if (!assignment) return { ok: false, reason: "directory_unreachable" };
+      if (!assignment) { process.stderr.write("[DIAG-C2] parseSessionAssignment returned null\n"); return { ok: false, reason: "directory_unreachable" }; }
 
+      process.stderr.write("[DIAG-C3] calling receiveSessionAssignment\n");
       const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey);
       if (!result.ok) {
+        process.stderr.write(`[DIAG-C4] receiveSessionAssignment failed: ${JSON.stringify(result)}\n`);
         return { ok: false, reason: "directory_unreachable" };
       }
 
       const sessionIdHex = Buffer.from(result.sessionId).toString("hex");
       const record = this.#ctx.getSession(sessionIdHex);
-      if (!record) return { ok: false, reason: "directory_unreachable" };
+      if (!record) { process.stderr.write(`[DIAG-C5] getSession returned null for ${sessionIdHex}\n`); return { ok: false, reason: "directory_unreachable" }; }
 
       return {
         ok: true,
@@ -664,6 +666,7 @@ export class SignalingManager {
       };
     }
 
+    process.stderr.write(`[DIAG-C6] unhandled frame type="${String(frame["type"])}"\n`);
     return { ok: false, reason: "directory_unreachable" };
   }
 }
