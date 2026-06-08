@@ -180,6 +180,7 @@ export class RegistrationManager {
       node: this.#ctx.node,
       directoryPeerId: directoryEndpoint.peer_id,
       directoryMultiaddrs: directoryEndpoint.multiaddrs,
+      logger: this.#ctx.logger,
     });
     void epochId;
     const kLocalPubkeyBytes = Buffer.from(kLocalPubkeyHex, "hex");

@@ -139,6 +139,7 @@ export async function loadClientStartupState(ctx: StartupContext): Promise<void>
           node: ctx.node,
           directoryPeerId: directoryEndpoint.peer_id,
           directoryMultiaddrs: directoryEndpoint.multiaddrs,
+          logger: ctx.logger,
         });
         stub.setBootstrapContext(myPubkeyHex, `${myPubkeyHex}:epoch:1`);
         directoryNodeStubsForSigner = [stub];
