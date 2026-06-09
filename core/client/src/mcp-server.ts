@@ -477,7 +477,27 @@ export function createMcpSessionServer(
         });
       }
 
-      // M6B-002: Add descriptive message fields for new ceremony failure reasons
+      if (result.reason === "relay_auth_error") {
+        return jsonText({
+          ok: false,
+          reason: result.reason,
+          message: "Could not open a stream to the relay assigned by the directory. The relay may be temporarily unreachable — retry in a few seconds.",
+        });
+      }
+      if (result.reason === "relay_auth_failed") {
+        return jsonText({
+          ok: false,
+          reason: result.reason,
+          message: "Relay rejected the session auth response. This may indicate a relay key rotation or a protocol mismatch — retry or contact support.",
+        });
+      }
+      if (result.reason === "frost_signer_not_configured") {
+        return jsonText({
+          ok: false,
+          reason: result.reason,
+          message: "FROST signer not configured — this client cannot participate in threshold ceremonies. Run: pkill -f cello-mcp && rm ~/.cello/client.db, get a fresh token from the Telegram bot, then call cello_register again.",
+        });
+      }
       if (result.reason === "ceremony_timeout") {
         return jsonText({
           ok: false,

@@ -198,7 +198,7 @@ export interface ReceivedEnvelope {
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 

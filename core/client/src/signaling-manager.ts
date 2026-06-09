@@ -166,7 +166,6 @@ export class SignalingManager {
       this.#ctx.logger.warn("signaling.stream.closed.with_pending_session_request", {
         note: "stream closed while session request was in-flight — synthetic directory_unreachable fired",
       });
-      process.stderr.write("[DIAG-A] onStreamClosed fired synthetic directory_unreachable — stream died before session_assignment arrived\n");
       this.#pendingSessionRequestResolve = null;
       sessionResolve({ type: "session_request_error", reason: "directory_unreachable" });
     }
@@ -635,29 +634,25 @@ export class SignalingManager {
     }
 
     const frame = responseFrame!;
-    process.stderr.write(`[DIAG-B] responseFrame received type="${String(frame["type"])}"\n`);
-
     if (frame["type"] === "session_request_error") {
       return mapSessionRequestErrorFrame(frame);
     }
 
     if (frame["type"] === "session_assignment") {
       const rawAssignment = frame["assignment"] as Record<string, unknown> | undefined;
-      if (!rawAssignment) { process.stderr.write("[DIAG-C1] rawAssignment is null/undefined\n"); return { ok: false, reason: "directory_unreachable" }; }
+      if (!rawAssignment) { return { ok: false, reason: "directory_unreachable" }; }
 
       const assignment = parseSessionAssignment(rawAssignment);
-      if (!assignment) { process.stderr.write("[DIAG-C2] parseSessionAssignment returned null\n"); return { ok: false, reason: "directory_unreachable" }; }
+      if (!assignment) { return { ok: false, reason: "directory_unreachable" }; }
 
-      process.stderr.write("[DIAG-C3] calling receiveSessionAssignment\n");
       const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey);
       if (!result.ok) {
-        process.stderr.write(`[DIAG-C4] receiveSessionAssignment failed: ${JSON.stringify(result)}\n`);
-        return { ok: false, reason: "directory_unreachable" };
+        return { ok: false, reason: result.reason };
       }
 
       const sessionIdHex = Buffer.from(result.sessionId).toString("hex");
       const record = this.#ctx.getSession(sessionIdHex);
-      if (!record) { process.stderr.write(`[DIAG-C5] getSession returned null for ${sessionIdHex}\n`); return { ok: false, reason: "directory_unreachable" }; }
+      if (!record) { return { ok: false, reason: "directory_unreachable" }; }
 
       return {
         ok: true,
@@ -666,7 +661,6 @@ export class SignalingManager {
       };
     }
 
-    process.stderr.write(`[DIAG-C6] unhandled frame type="${String(frame["type"])}"\n`);
     return { ok: false, reason: "directory_unreachable" };
   }
 }
