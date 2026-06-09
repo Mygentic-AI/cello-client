@@ -133,17 +133,65 @@ export class SealManager {
       return { ok: false, reason: "session_not_active" };
     }
 
-    // If the counterparty already initiated a seal (status === "sealing"), skip the
-    // signaling reconnect and status mutation — go straight to submitting our SEAL leaf.
+    // If the counterparty already initiated a seal (status === "sealing"), act as responder.
     // The relay needs both parties' ctrl leaves; blocking the responder here was the deadlock.
-    // Guard: if this client already initiated (in #sealInitiatedSessions), don't double-submit.
+    // Guard: if this client already initiated (#sealInitiatedSessions set), don't double-submit.
     if (session.status === "sealing") {
       if (this.#sealInitiatedSessions.has(sessionIdHex)) {
         return { ok: true };
       }
+
+      // Ensure the signaling stream is alive — the directory's seal_verified response (which
+      // triggers the FROST ceremony) arrives on this stream. A dead stream means the ceremony
+      // never starts and the session stays "sealing" forever.
+      const sigStreamR = this.#ctx.getPersistentSignalingStream();
+      if (!sigStreamR || sigStreamR.status !== "open") {
+        const correlationId = Buffer.from(session.session_id).toString("hex");
+        this.#ctx.logger.info("seal.reconnect.attempted", { sessionId: sessionIdHex, correlationId });
+        this.#ctx.setPersistentSignalingStream(null);
+        this.#ctx.setPersistentSignalingIter(null);
+        const opened = await this.#ctx.openPersistentSignalingStream();
+        if (!opened || !this.#ctx.getPersistentSignalingStream()) {
+          return { ok: false, reason: "directory_unreachable" };
+        }
+        // Re-check after async gap: a concurrent call may have already set #sealInitiatedSessions.
+        if (this.#sealInitiatedSessions.has(sessionIdHex)) {
+          return { ok: true };
+        }
+      }
+
       this.#sealInitiatedSessions.add(sessionIdHex);
       const result = await this.#submitSealLeaf(sessionIdHex, session, "responder");
-      if (!result.ok) return result;
+      if (!result.ok) {
+        // Clear the guard so a retry is possible when the transport comes back.
+        this.#sealInitiatedSessions.delete(sessionIdHex);
+        return result;
+      }
+
+      // If a threshold signer is configured, wait for the FROST ceremony to complete
+      // (same fallback logic as the initiator path — timeout → seal_deferred).
+      if (this.#ctx.getThresholdSigner()) {
+        const sealReceived = new Promise<void>((resolve) => {
+          this.#sealFrostResolvers.set(sessionIdHex, resolve);
+        });
+        const timeout = new Promise<void>((resolve) =>
+          setTimeout(resolve, this.#sealFrostTimeoutMs)
+        );
+        await Promise.race([sealReceived, timeout]);
+        this.#sealFrostResolvers.delete(sessionIdHex);
+
+        const sessAfter = this.#ctx.getSession(sessionIdHex);
+        if (sessAfter && sessAfter.status === "sealing") {
+          sessAfter.status = "seal_deferred";
+          sessAfter.seal_type = "bilateral";
+          const sealVerifiedEntry = this.#sealVerifiedData.get(sessionIdHex);
+          if (sealVerifiedEntry) {
+            sessAfter.close_timestamp = sealVerifiedEntry.timestamp;
+          }
+          void this.#ctx.persistence?.persistSession(sessionIdHex, sessAfter);
+        }
+      }
+
       return { ok: true };
     }
 

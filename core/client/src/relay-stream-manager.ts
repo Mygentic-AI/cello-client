@@ -507,7 +507,7 @@ export class RelayStreamManager {
           if (firstKey !== undefined) pending.delete(firstKey);
         }
         pending.set(contentHashHex, { content_bytes: contentBytes, arrived_at: Date.now() });
-        console.debug(`[cello-client] content_without_hash: session=${sessionIdHex} hash=${contentHashHex}`);
+        this.#ctx.logger.debug("relay.content.without_hash", { sessionId: sessionIdHex, contentHash: contentHashHex });
       }
     }
 
