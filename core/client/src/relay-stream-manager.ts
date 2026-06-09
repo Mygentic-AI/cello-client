@@ -129,7 +129,6 @@ export interface RelayStreamContext {
   wakeReceiveWaiters(sessionIdHex: string): void;
   enqueueSessionSealedEvent(sessionIdHex: string, sealedRoot: Uint8Array, closeTimestamp: number): void;
   // Seal callbacks
-  handleSealVerified(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleSessionFrostSealed(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleSealRejectedTreeMismatch(sessionIdHex: string, frame: Record<string, unknown>): void;
   handleSealUnilateralConfirmed(sessionIdHex: string, frame: Record<string, unknown>): void;
@@ -783,13 +782,6 @@ export class RelayStreamManager {
         if (kind === "ctrl" && session.status === "active") {
           session.status = "sealing";
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);
-          void (async () => {
-            // Notify the seal manager that responder received SEAL leaf
-            this.#ctx.handleSealVerified(sessionIdHex, {
-              type: "_responder_seal_trigger",
-              sessionIdHex,
-            });
-          })();
         } else {
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);
           const msg: ReceivedMessage = {

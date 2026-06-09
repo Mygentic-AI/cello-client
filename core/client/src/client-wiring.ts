@@ -229,7 +229,6 @@ export function buildRelayStreamContext(f: ClientWiringSurface): RelayStreamCont
     enqueueSessionSealedEvent: (id, root, ts) => {
       f.sessionManager.enqueueSessionSealedEvent(id, root, ts);
     },
-    handleSealVerified: (id, frame) => { void f.sealManager.handleSealVerified(id, frame); },
     handleSessionFrostSealed: (id, frame) => { f.sealManager.handleSessionFrostSealed(id, frame); },
     handleSealRejectedTreeMismatch: (id, frame) => { f.sealManager.handleSealRejectedTreeMismatch(id, frame); },
     handleSealUnilateralConfirmed: (id, frame) => { f.sealManager.handleSealUnilateralConfirmed(id, frame); },

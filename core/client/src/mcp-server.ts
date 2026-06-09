@@ -585,7 +585,17 @@ export function createMcpSessionServer(
       const result = await client.sendMessage(session_id, contentBytes);
 
       if (!result.ok) {
-        return jsonText({ delivered: false, reason: result.reason });
+        let guidance: string | undefined;
+        if (result.reason === "session_sealed") {
+          guidance = "The session is being sealed or already sealed. No more messages can be sent. Call cello_close_session to complete the bilateral seal ceremony if you haven't already.";
+        } else if (result.reason === "transport_unavailable") {
+          guidance = "The relay connection is down. Wait briefly and retry, or check session status with cello_list_sessions.";
+        } else if (result.reason === "session_not_found") {
+          guidance = "No session with this ID exists. Use cello_list_sessions to find valid session IDs.";
+        } else if (result.reason === "session_desynchronized") {
+          guidance = "The session Merkle tree is out of sync. Call cello_close_session to seal this session and start a new one if needed.";
+        }
+        return jsonText({ delivered: false, reason: result.reason, ...(guidance && { guidance }) });
       }
 
       // Retrieve leaf_hash from the most recent leaf in the local tree.
@@ -750,12 +760,23 @@ export function createMcpSessionServer(
 
       const result = await client.initiateSessionSeal(session_id);
       if (!result.ok) {
+        let guidance: string | undefined;
+        if (result.reason === "session_not_active") {
+          guidance = "The session is not in an active or sealing state. It may already be sealed or rejected. Use cello_list_sessions to check current status.";
+        } else if (result.reason === "session_not_found") {
+          guidance = "No session with this ID exists. Use cello_list_sessions to find valid session IDs.";
+        } else if (result.reason === "transport_unavailable") {
+          guidance = "The relay connection is down. The seal leaf could not be submitted. Wait briefly and retry.";
+        } else if (result.reason === "directory_unreachable") {
+          guidance = "The directory signaling stream could not be established. The seal ceremony requires directory coordination. Retry shortly.";
+        }
         return jsonText({
           status: "seal_rejected",
           sealed_root: null,
           close_timestamp: Date.now(),
           reason: result.reason,
           mmr_peak: null,
+          ...(guidance && { guidance }),
         });
       }
 

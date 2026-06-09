@@ -129,7 +129,19 @@ export class SealManager {
   async initiateSessionSeal(sessionIdHex: string): Promise<{ ok: true } | { ok: false; reason: string }> {
     const session = this.#ctx.getSession(sessionIdHex);
     if (!session) return { ok: false, reason: "session_not_found" };
-    if (session.status !== "active") return { ok: false, reason: "session_not_active" };
+    if (session.status !== "active" && session.status !== "sealing") {
+      return { ok: false, reason: "session_not_active" };
+    }
+
+    // If the counterparty already initiated a seal (status === "sealing"), skip the
+    // signaling reconnect and status mutation — go straight to submitting our SEAL leaf.
+    // The relay needs both parties' ctrl leaves; blocking the responder here was the deadlock.
+    if (session.status === "sealing") {
+      this.#sealInitiatedSessions.add(sessionIdHex);
+      const result = await this.#submitSealLeaf(sessionIdHex, session, "responder");
+      if (!result.ok) return result;
+      return { ok: true };
+    }
 
     // Fix 1: ensure the signaling stream is alive before mutating session state.
     // The directory replies (seal_verified / session_frost_sealed) on this stream.
