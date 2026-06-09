@@ -325,10 +325,11 @@ export class RelayStreamManager {
       }
     } catch { /* stream closed */ }
 
-    if (this.#relayStreams.get(sessionIdHex) === stream) {
+    const wasActive = this.#relayStreams.get(sessionIdHex) === stream;
+    if (wasActive) {
       this.#relayStreams.delete(sessionIdHex);
+      this.#ctx.onRelayDisconnected(sessionIdHex, myPubkeyHex);
     }
-    this.#ctx.onRelayDisconnected(sessionIdHex, myPubkeyHex);
   }
 
   // ─── SESSION-006 reconnect ──────────────────────────────────────────────────

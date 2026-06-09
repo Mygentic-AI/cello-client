@@ -765,46 +765,47 @@ export class SealManager {
     const sealedRootRaw = frame["sealed_root"];
     const sealedRoot = sealedRootRaw instanceof Uint8Array ? sealedRootRaw
       : Buffer.isBuffer(sealedRootRaw) ? new Uint8Array(sealedRootRaw as Buffer) : null;
+    const closeTimestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
 
-    session.status = "sealed";
-    if (sealedRoot) session.sealed_root = sealedRoot;
-    session.seal_type = "unilateral";
-    session.close_timestamp = typeof frame["sealed_at"] === "number" ? frame["sealed_at"] : Date.now();
-    // CRIT-1: persist sealed state
-    void this.#ctx.persistence?.persistSession(sessionIdHex, session);
-
-    // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
-    if (sealedRoot) {
-      this.#ctx.enqueueSessionSealedEvent(sessionIdHex, sealedRoot, session.close_timestamp!);
-    }
-
-    // AC-004: Verify sealed root against local Merkle state
+    // AC-004: Verify sealed root against local Merkle state BEFORE committing sealed status.
+    // If local state exists and the roots differ, reject the notification — a tampered or
+    // mismatched root must not be committed as a valid sealed record.
     const localRoot = this.#computeLocalRoot(session);
 
-    if (localRoot == null) {
-      // Cannot verify — no local leaves received yet; log distinctly rather than as mismatch
-      this.#ctx.logger.info("session.unilateral.no.local.state", {
-        sessionId: sessionIdHex,
-        correlationId: sessionIdHex,
-      });
-      return;
-    }
-
-    const match = sealedRoot != null && Buffer.from(localRoot).equals(Buffer.from(sealedRoot));
-
-    if (match) {
+    if (localRoot != null) {
+      const match = sealedRoot != null && Buffer.from(localRoot).equals(Buffer.from(sealedRoot));
+      if (!match) {
+        this.#ctx.logger.warn("session.unilateral.mismatch", {
+          sessionId: sessionIdHex,
+          localRoot: Buffer.from(localRoot).toString("hex"),
+          sealedRoot: sealedRoot ? Buffer.from(sealedRoot).toString("hex") : "null",
+          correlationId: sessionIdHex,
+        });
+        return;
+      }
       this.#ctx.logger.info("session.unilateral.verified", {
         sessionId: sessionIdHex,
         match: true,
         correlationId: sessionIdHex,
       });
     } else {
-      this.#ctx.logger.warn("session.unilateral.mismatch", {
+      // Cannot verify — no local leaves received yet; proceed but log distinctly.
+      this.#ctx.logger.info("session.unilateral.no.local.state", {
         sessionId: sessionIdHex,
-        localRoot: Buffer.from(localRoot).toString("hex"),
-        sealedRoot: sealedRoot ? Buffer.from(sealedRoot).toString("hex") : "null",
         correlationId: sessionIdHex,
       });
+    }
+
+    session.status = "sealed";
+    if (sealedRoot) session.sealed_root = sealedRoot;
+    session.seal_type = "unilateral";
+    session.close_timestamp = closeTimestamp;
+    // CRIT-1: persist sealed state
+    void this.#ctx.persistence?.persistSession(sessionIdHex, session);
+
+    // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
+    if (sealedRoot) {
+      this.#ctx.enqueueSessionSealedEvent(sessionIdHex, sealedRoot, session.close_timestamp!);
     }
   }
 

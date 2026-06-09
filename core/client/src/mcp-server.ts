@@ -427,7 +427,7 @@ export function createMcpSessionServer(
     async ({ target_pubkey, target_agent_id, timeout_ms }) => {
       if (!isRegistered()) return NOT_REGISTERED_ERROR;
       // AC-009 (DX-001): await background init (directory connection, loadPersistedState)
-      try { await awaitReady(); } catch { /* proceed — may return directory_unreachable if needed */ }
+      try { await awaitReady(); } catch { logger?.warn("client.background_init.timeout", { timeoutMs: 10_000 }); }
       if (!transportStarted()) return TRANSPORT_NOT_STARTED;
 
       // AC-007b (DX-001): resolve target_agent_id to target_pubkey via /agent-lookup
@@ -1281,7 +1281,7 @@ export function createMcpSessionServer(
     async ({ target_pubkey, target_agent_id }) => {
       if (!isRegistered()) return NOT_REGISTERED_ERROR;
       // AC-009 (DX-001): await background init before attempting connection
-      try { await awaitReady(); } catch { /* proceed — per-stage timeouts handle directory_unreachable */ }
+      try { await awaitReady(); } catch { logger?.warn("client.background_init.timeout", { timeoutMs: 10_000 }); }
 
       const extendedClient = client as unknown as {
         cello_request_connection: (opts: { target_pubkey: string; package_cbor: Uint8Array; dialTimeoutMs?: number; sendTimeoutMs?: number; waitTimeoutMs?: number }) => Promise<

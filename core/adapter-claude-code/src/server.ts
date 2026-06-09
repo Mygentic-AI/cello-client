@@ -394,6 +394,14 @@ export function createMcpServer(
       let sealResult: { ok: boolean; reason?: string } | undefined;
       if (!alreadySealing && session?.status === "active") {
         sealResult = await client.initiateSessionSeal(session_id);
+        // Poll until sealed/rejected/deferred before tearing down — closing immediately
+        // aborts the in-flight FROST ceremony and always produces seal_deferred.
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+          const s = client.listSessions().find((r) => Buffer.from(r.session_id).toString("hex") === session_id);
+          if (!s || s.status === "sealed" || s.status === "seal_rejected" || s.status === "seal_deferred") break;
+          await sleep(100);
+        }
       }
 
       client.closeSession(session_id);
