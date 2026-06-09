@@ -633,7 +633,7 @@ export function createMcpSessionServer(
   server.registerTool(
     "cello_receive_session",
     {
-      description: "Wait for a message or lifecycle event on a specific session (session-locked), or timeout. Returns session_sealed inline when the session is sealed by the counterparty.",
+      description: "Wait for a message or lifecycle event on a specific session (session-locked), or timeout. Returns counterparty_closing when the counterparty initiates session closure (you must then call cello_close_session). Returns session_sealed when the full bilateral seal is confirmed.",
       inputSchema: {
         session_id: z.string().describe("Session ID as lowercase hex"),
         timeout_ms: z.number().int().min(0).describe("Maximum wait time in milliseconds"),
@@ -703,7 +703,7 @@ export function createMcpSessionServer(
   server.registerTool(
     "cello_receive",
     {
-      description: "Wait for a message or lifecycle event from any active session, or timeout. Returns session_id so caller knows which session the message came from. This is the default receive tool.",
+      description: "Wait for a message or lifecycle event from any active session, or timeout. Returns session_id so caller knows which session the message came from. Returns counterparty_closing when the counterparty initiates session closure (you must then call cello_close_session). This is the default receive tool.",
       inputSchema: {
         timeout_ms: z.number().int().min(0).describe("Maximum wait time in milliseconds"),
       },
