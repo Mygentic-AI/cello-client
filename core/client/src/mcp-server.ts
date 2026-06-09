@@ -655,6 +655,7 @@ export function createMcpSessionServer(
           sealed_root: toHex(msg.sealedRoot),
           close_timestamp: msg.closeTimestamp,
           checkpoint_status: msg.checkpointStatus,
+          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
           ...(msg.otherSessionsPending && msg.otherSessionsPending.length > 0
             ? { other_sessions_pending: msg.otherSessionsPending }
             : {}),
@@ -712,6 +713,7 @@ export function createMcpSessionServer(
           sealed_root: toHex(result.sealedRoot),
           close_timestamp: result.closeTimestamp,
           checkpoint_status: result.checkpointStatus,
+          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
           ...(result.otherSessionsPending && result.otherSessionsPending.length > 0
             ? { other_sessions_pending: result.otherSessionsPending }
             : {}),
