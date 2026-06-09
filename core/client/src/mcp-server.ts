@@ -762,7 +762,7 @@ export function createMcpSessionServer(
       if (!result.ok) {
         let guidance: string | undefined;
         if (result.reason === "session_not_active") {
-          guidance = "The session is not in an active or sealing state. It may already be sealed or rejected. Use cello_list_sessions to check current status.";
+          guidance = "The session cannot be sealed from its current state. It may already be sealed, rejected, or deferred. Use cello_list_sessions to check the exact status.";
         } else if (result.reason === "session_not_found") {
           guidance = "No session with this ID exists. Use cello_list_sessions to find valid session IDs.";
         } else if (result.reason === "transport_unavailable") {

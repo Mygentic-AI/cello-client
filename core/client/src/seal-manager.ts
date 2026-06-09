@@ -136,7 +136,11 @@ export class SealManager {
     // If the counterparty already initiated a seal (status === "sealing"), skip the
     // signaling reconnect and status mutation — go straight to submitting our SEAL leaf.
     // The relay needs both parties' ctrl leaves; blocking the responder here was the deadlock.
+    // Guard: if this client already initiated (in #sealInitiatedSessions), don't double-submit.
     if (session.status === "sealing") {
+      if (this.#sealInitiatedSessions.has(sessionIdHex)) {
+        return { ok: true };
+      }
       this.#sealInitiatedSessions.add(sessionIdHex);
       const result = await this.#submitSealLeaf(sessionIdHex, session, "responder");
       if (!result.ok) return result;
