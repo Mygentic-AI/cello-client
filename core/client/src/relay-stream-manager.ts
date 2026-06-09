@@ -782,6 +782,10 @@ export class RelayStreamManager {
         if (kind === "ctrl" && session.status === "active") {
           session.status = "sealing";
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);
+          this.#ctx.enqueueReceivedMessage(sessionIdHex, {
+            type: "counterparty_closing",
+            sessionIdHex,
+          });
         } else {
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);
           const msg: ReceivedMessage = {

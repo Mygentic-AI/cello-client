@@ -158,6 +158,14 @@ export type ReceivedMessage =
       checkpointStatus: "pending" | "confirmed";
       /** SESSION-007: other active sessions that have queued messages. */
       otherSessionsPending?: string[];
+    }
+  | {
+      /** Fired when the counterparty's SEAL ctrl leaf arrives. The session is partially
+       *  sealed — the local agent must call cello_close_session to complete the ceremony. */
+      type: "counterparty_closing";
+      sessionIdHex: string;
+      /** SESSION-007: other active sessions that have queued messages. */
+      otherSessionsPending?: string[];
     };
 
 export type SendMessageFailureReason =

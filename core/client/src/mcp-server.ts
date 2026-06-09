@@ -648,6 +648,17 @@ export function createMcpSessionServer(
         return jsonText({ type: "timeout" });
       }
 
+      if (msg.type === "counterparty_closing") {
+        return jsonText({
+          type: "counterparty_closing",
+          session_id: msg.sessionIdHex,
+          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+          ...(msg.otherSessionsPending && msg.otherSessionsPending.length > 0
+            ? { other_sessions_pending: msg.otherSessionsPending }
+            : {}),
+        });
+      }
+
       if (msg.type === "session_sealed") {
         return jsonText({
           type: "session_sealed",
@@ -655,7 +666,7 @@ export function createMcpSessionServer(
           sealed_root: toHex(msg.sealedRoot),
           close_timestamp: msg.closeTimestamp,
           checkpoint_status: msg.checkpointStatus,
-          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+          guidance: "The session has been fully sealed by both parties. No further actions are required for this session.",
           ...(msg.otherSessionsPending && msg.otherSessionsPending.length > 0
             ? { other_sessions_pending: msg.otherSessionsPending }
             : {}),
@@ -706,6 +717,17 @@ export function createMcpSessionServer(
         return jsonText({ type: "timeout" });
       }
 
+      if (result.type === "counterparty_closing") {
+        return jsonText({
+          type: "counterparty_closing",
+          session_id: result.sessionIdHex,
+          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+          ...(result.otherSessionsPending && result.otherSessionsPending.length > 0
+            ? { other_sessions_pending: result.otherSessionsPending }
+            : {}),
+        });
+      }
+
       if (result.type === "session_sealed") {
         return jsonText({
           type: "session_sealed",
@@ -713,7 +735,7 @@ export function createMcpSessionServer(
           sealed_root: toHex(result.sealedRoot),
           close_timestamp: result.closeTimestamp,
           checkpoint_status: result.checkpointStatus,
-          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+          guidance: "The session has been fully sealed by both parties. No further actions are required for this session.",
           ...(result.otherSessionsPending && result.otherSessionsPending.length > 0
             ? { other_sessions_pending: result.otherSessionsPending }
             : {}),

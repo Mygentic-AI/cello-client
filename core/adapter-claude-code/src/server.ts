@@ -272,6 +272,13 @@ export function createMcpServer(
       while (Date.now() < deadline) {
         const msg = client.receiveMessage(session_id);
         if (msg) {
+          if (msg.type === "counterparty_closing") {
+            return jsonText({
+              type: "counterparty_closing",
+              session_id: msg.sessionIdHex,
+              guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+            });
+          }
           if (msg.type === "session_sealed") {
             return jsonText({
               type: "session_sealed",
@@ -279,6 +286,7 @@ export function createMcpServer(
               sealed_root: Buffer.from(msg.sealedRoot).toString("hex"),
               close_timestamp: msg.closeTimestamp,
               checkpoint_status: msg.checkpointStatus,
+              guidance: "The session has been fully sealed by both parties. No further actions are required for this session.",
             });
           }
           return jsonText(formatSessionMessage(msg, session_id));
@@ -313,6 +321,17 @@ export function createMcpServer(
         return jsonText({ type: "timeout" });
       }
 
+      if (result.type === "counterparty_closing") {
+        return jsonText({
+          type: "counterparty_closing",
+          session_id: result.sessionIdHex,
+          guidance: "The other party has initiated session closure. Call cello_close_session with this session_id to complete the bilateral seal ceremony. You cannot send further messages on this session.",
+          ...(result.otherSessionsPending && result.otherSessionsPending.length > 0
+            ? { other_sessions_pending: result.otherSessionsPending }
+            : {}),
+        });
+      }
+
       if (result.type === "session_sealed") {
         return jsonText({
           type: "session_sealed",
@@ -320,6 +339,7 @@ export function createMcpServer(
           sealed_root: Buffer.from(result.sealedRoot).toString("hex"),
           close_timestamp: result.closeTimestamp,
           checkpoint_status: result.checkpointStatus,
+          guidance: "The session has been fully sealed by both parties. No further actions are required for this session.",
           ...(result.otherSessionsPending && result.otherSessionsPending.length > 0
             ? { other_sessions_pending: result.otherSessionsPending }
             : {}),
