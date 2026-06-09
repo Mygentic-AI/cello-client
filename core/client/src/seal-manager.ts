@@ -171,14 +171,18 @@ export class SealManager {
       // If a threshold signer is configured, wait for the FROST ceremony to complete
       // (same fallback logic as the initiator path — timeout → seal_deferred).
       if (this.#ctx.getThresholdSigner()) {
-        const sealReceived = new Promise<void>((resolve) => {
-          this.#sealFrostResolvers.set(sessionIdHex, resolve);
-        });
-        const timeout = new Promise<void>((resolve) =>
-          setTimeout(resolve, this.#sealFrostTimeoutMs)
-        );
-        await Promise.race([sealReceived, timeout]);
-        this.#sealFrostResolvers.delete(sessionIdHex);
+        // Only register a resolver if one isn't already set — prevents overwriting the
+        // initiator's waiter if both parties call initiateSessionSeal concurrently.
+        if (!this.#sealFrostResolvers.has(sessionIdHex)) {
+          const sealReceived = new Promise<void>((resolve) => {
+            this.#sealFrostResolvers.set(sessionIdHex, resolve);
+          });
+          const timeout = new Promise<void>((resolve) =>
+            setTimeout(resolve, this.#sealFrostTimeoutMs)
+          );
+          await Promise.race([sealReceived, timeout]);
+          this.#sealFrostResolvers.delete(sessionIdHex);
+        }
 
         const sessAfter = this.#ctx.getSession(sessionIdHex);
         if (sessAfter && sessAfter.status === "sealing") {
@@ -403,6 +407,7 @@ export class SealManager {
     });
 
     if (this.#ctx.getPendingAckResolver(sessionIdHex)) {
+      this.#ctx.getOwnPendingContent(sessionIdHex)?.delete(contentHashHex);
       return { ok: false, reason: "ack_resolver_conflict" };
     }
     let ackResolve!: (v: { ok: true; sequence_number: number } | { ok: false; reason: string }) => void;

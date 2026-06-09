@@ -244,6 +244,13 @@ export function buildRelayStreamContext(f: ClientWiringSurface): RelayStreamCont
       if (!session) return;
       if (session.desynchronized) return;
       if (session.status === "transport_lost") return;
+      // Always resolve a pending ack resolver when the relay disconnects — the ack will
+      // never arrive on a dead stream, and #submitSealLeaf awaits it indefinitely.
+      const ackResolve = f.sessionManager.getPendingAckResolver(sessionIdHex);
+      if (ackResolve) {
+        f.sessionManager.deletePendingAckResolver(sessionIdHex);
+        ackResolve({ ok: false, reason: "transport_unavailable" });
+      }
       if (
         session.status === "sealing" ||
         session.status === "sealed" ||
@@ -252,11 +259,6 @@ export function buildRelayStreamContext(f: ClientWiringSurface): RelayStreamCont
       ) return;
       session.status = "transport_lost";
       void f.persistence?.persistSession(sessionIdHex, session);
-      const ackResolve = f.sessionManager.getPendingAckResolver(sessionIdHex);
-      if (ackResolve) {
-        f.sessionManager.deletePendingAckResolver(sessionIdHex);
-        ackResolve({ ok: false, reason: "transport_unavailable" });
-      }
       void f.relayStreamManager.reconnectRelayStream(sessionIdHex, myPubkeyHex);
     },
   };
