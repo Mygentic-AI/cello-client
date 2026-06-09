@@ -62,8 +62,9 @@ export interface SessionContext {
   performRelayAuth(stream: Stream, myPubkey: Uint8Array): Promise<{ ok: true; iter: AsyncIterator<Uint8Array> } | { ok: false; reason: "relay_auth_failed" | "relay_auth_error" }>;
   handleContentStream(stream: Stream): void;
   connectDirectorySignalingStream(sessionIdHex: string, assignment: SessionAssignment, myPubkey: Uint8Array): Promise<void>;
-  // RelayStreamManager state accessor (needed by #sendMessageLocked)
+  // RelayStreamManager state accessors
   getRelayStream(sessionIdHex: string): Stream | undefined;
+  setRelayStream(sessionIdHex: string, stream: Stream): void;
 }
 
 export class SessionManager {
@@ -389,6 +390,7 @@ export class SessionManager {
     this.#ownPendingContent.set(sessionIdHex, new Map());
     this.#sessionMessageQueues.set(sessionIdHex, []);
     this.#ctx.initRelaySession(sessionIdHex);
+    this.#ctx.setRelayStream(sessionIdHex, relayStream);
 
     // Cache myPubkeyHex for the stream reader (same key across all sessions on this client)
     if (!this.#ctx.getMyPubkeyHex()) this.#ctx.setMyPubkeyHex(myPubkeyHex);

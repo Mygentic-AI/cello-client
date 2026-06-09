@@ -170,6 +170,7 @@ export function buildSessionContext(f: ClientWiringSurface): SessionContext {
     connectDirectorySignalingStream: (id, assignment, myPubkey) =>
       f.signalingManager.connectDirectorySignalingStream(id, assignment, myPubkey),
     getRelayStream: (id) => f.relayStreamManager.getRelayStream(id),
+    setRelayStream: (id, stream) => f.relayStreamManager.setRelayStream(id, stream),
   };
 }
 
