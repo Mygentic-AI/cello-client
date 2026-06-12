@@ -40,6 +40,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
+import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
@@ -273,6 +274,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("ipc.connect", async (params, connectionId) => {
     const clientType = (params?.clientType as string) ?? "cli";
     perConnectionState.set(connectionId, { currentAgent: null, clientType });
+    // MCP-002: Register connection with notification dispatcher
+    notificationDispatcher.registerConnection(connectionId);
     // Re-log with correct clientType (overrides the default "cli" from handleConnection)
     logger.info("daemon.ipc.connected", { connectionId, clientType });
     return { connectionId };
@@ -294,6 +297,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     onlineAgents.add(name);
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
+    // MCP-002: Broadcast agent_state_changed to ALL connections
+    notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
     return { ok: true };
   });
 
@@ -312,12 +317,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.delete(name);
-    logger.info("agent.offline", { agentName: name, reason: "cello_stop_agent" });
+    logger.info("agent.offline", { agentName: name, reason: "stopped" });
+    // MCP-002: Broadcast agent_state_changed to ALL connections
+    notificationDispatcher.dispatchAgentStateChanged(name, "offline", "stopped");
 
     // Clear current agent for all connections that had this agent as current
     for (const [connId, state] of perConnectionState) {
       if (state.currentAgent === name) {
         state.currentAgent = null;
+        notificationDispatcher.setCurrentAgent(connId, null);
         logger.info("agent.current.switched", { connectionId: connId, fromAgent: name, toAgent: null });
       }
     }
@@ -346,6 +354,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const fromAgent = connState.currentAgent;
     connState.currentAgent = name;
+    // MCP-002: Update dispatcher's routing table and send notification to this connection only
+    notificationDispatcher.setCurrentAgent(connectionId, name);
+    notificationDispatcher.dispatchAgentCurrentChanged(connectionId, fromAgent, name);
     logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name });
     return { ok: true };
   });
@@ -441,6 +452,34 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { pendingCount: depth, nonces: entries.map(e => e.nonceHex) };
   });
 
+  // MCP-002: Test-only handler to emit session lifecycle events.
+  // Allows integration tests to trigger session_state_changed notifications
+  // without requiring a full libp2p session handshake.
+  handlers.set("__test_emit_session_event", async (params, _connectionId) => {
+    const type = params?.type as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    const agentName = params?.agentName as string | undefined;
+    const counterpartyPubkey = (params?.counterpartyPubkey as string) ?? null;
+
+    if (!type || !sessionId || !agentName) {
+      return { error: "missing_params", guidance: "Provide type, sessionId, and agentName." };
+    }
+
+    if (type === "created") {
+      const sessionPeerId = (params?.sessionPeerId as string) ?? "";
+      const correlationId = (params?.correlationId as string) ?? "";
+      logger.info("session.node.created", { sessionId, agentName, sessionPeerId, correlationId });
+      notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, "created", counterpartyPubkey);
+    } else if (type === "destroyed") {
+      const state = (params?.state as string) ?? "interrupted";
+      const reason = (params?.reason as string) ?? state;
+      logger.info("session.node.destroyed", { sessionId, agentName, reason });
+      notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey);
+    }
+
+    return { ok: true };
+  });
+
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {
     if (!shutdownPromise) {
@@ -467,9 +506,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     throw err;
   }
 
+  // MCP-002: Instantiate NotificationDispatcher (wired to IPC server)
+  const notificationDispatcher = new NotificationDispatcher({
+    logger,
+    sendNotification: (connectionId, notification) => ipcServer.sendNotification(connectionId, notification),
+    getConnectionIds: () => ipcServer.getConnectionIds(),
+  });
+
   // MCP-001: Clean up per-connection state when a connection disconnects
+  // MCP-002: Also unregister from notification dispatcher
   ipcServer.onDisconnect((connectionId) => {
     perConnectionState.delete(connectionId);
+    notificationDispatcher.unregisterConnection(connectionId);
   });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
