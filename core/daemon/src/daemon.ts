@@ -3,21 +3,27 @@
  *
  * Pseudocode:
  * 1. startDaemon(config):
- *    a. Load agents from ~/.cello/agents/ (or legacy ~/.cello/key)
- *    b. Acquire lock file atomically
- *    c. Initialize SessionNodeManager (creates standing receiver, detects interrupted sessions)
- *    d. Start IPC server on Unix domain socket
- *    e. Register method handlers (status, shutdown)
- *    f. Log daemon.started event
- *    g. Set up SIGTERM/SIGINT handlers for graceful shutdown
- *    h. Stub directory connection validation (mark all connections as 'unverified')
+ *    a. M7-MANIFEST-002: Load and verify consortium manifest (BEFORE any directory connection)
+ *       - On signature failure: log error, skip connection
+ *       - On expiry: log directory.auth.manifest.expired at ERROR, skip connection
+ *       - On version rollback: log directory.auth.manifest.version.rollback at ERROR
+ *       - On success: log directory.auth.manifest.verified at INFO
+ *    b. Load agents from ~/.cello/agents/ (or legacy ~/.cello/key)
+ *    c. Acquire lock file atomically
+ *    d. Initialize SessionNodeManager (creates standing receiver, detects interrupted sessions)
+ *    e. Start IPC server on Unix domain socket
+ *    f. Register method handlers (status, shutdown)
+ *    g. Log daemon.started event (with manifestVerified field)
+ *    h. Set up SIGTERM/SIGINT handlers for graceful shutdown
+ *    i. Start background manifest polling (if pollScheduler provided and manifest verified)
  *
  * 2. shutdown(reason):
- *    a. Log daemon.stopped event
- *    b. Call SessionNodeManager.gracefulShutdown() (marks sessions interrupted)
- *    c. Stop IPC server (finishes in-flight, sends shutdown frame)
- *    d. Remove lock file
- *    e. Exit 0
+ *    a. Cancel manifest poll scheduler
+ *    b. Log daemon.stopped event
+ *    c. Call SessionNodeManager.gracefulShutdown() (marks sessions interrupted)
+ *    d. Stop IPC server (finishes in-flight, sends shutdown frame)
+ *    e. Remove lock file
+ *    f. Exit 0
  */
 
 import { mkdir } from "node:fs/promises";
@@ -34,7 +40,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
-import { createNode } from "@cello-protocol/transport";
+import { createNode, SignalingManager, InMemorySignalingOutboundQueue } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 export interface DaemonHandle {
@@ -63,7 +69,74 @@ class ProductionSessionNodeFactory implements ISessionNodeFactory {
 }
 
 export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
-  const { celloDir, socketPath, lockFilePath, maxConnections, version, logger } = config;
+  const {
+    celloDir, socketPath, lockFilePath, maxConnections, version, logger,
+    manifestProvider, manifestRootKeys, manifestThreshold,
+    manifestVersionStore, manifestPollScheduler,
+  } = config;
+
+  // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
+  //
+  // Pseudocode for manifest loading:
+  //   1. If manifestProvider is configured:
+  //      a. Call manifestProvider.loadAndVerify(rootKeys, threshold).
+  //      b. Check validity window: not_before <= now < expires.
+  //      c. Check version monotonicity (if manifestVersionStore is provided).
+  //      d. On success: log directory.auth.manifest.verified.
+  //      e. On failure: log error event, set directory_signaling to 'reconnecting'.
+  //   2. If manifestProvider is absent: skip (backward compat for DAEMON-001 tests).
+  let manifestVerified = false;
+
+  if (manifestProvider && manifestRootKeys && manifestThreshold !== undefined) {
+    try {
+      const manifest = await manifestProvider.loadAndVerify(manifestRootKeys, manifestThreshold);
+
+      // Check validity window: not_before <= now < expires
+      const now = new Date();
+      const notBefore = new Date(manifest.not_before);
+      const expiresAt = new Date(manifest.expires);
+
+      if (now < notBefore) {
+        logger.error("directory.auth.manifest.not.yet.valid", {
+          manifestVersion: manifest.version,
+          notBefore: manifest.not_before,
+        });
+      } else if (expiresAt <= now) {
+        logger.error("directory.auth.manifest.expired", {
+          manifestVersion: manifest.version,
+          expiresAt: manifest.expires,
+        });
+      } else {
+        // Check version monotonicity if version store is provided
+        if (manifestVersionStore) {
+          const lastSeen = await manifestVersionStore.getLastSeenVersion();
+          if (lastSeen !== null && manifest.version < lastSeen) {
+            logger.error("directory.auth.manifest.version.rollback", {
+              manifestVersion: manifest.version,
+              lastSeenVersion: lastSeen,
+            });
+          } else {
+            await manifestVersionStore.persistVersion(manifest.version);
+            manifestVerified = true;
+            logger.info("directory.auth.manifest.verified", {
+              manifestVersion: manifest.version,
+              signerCount: manifest.signatures.length,
+            });
+          }
+        } else {
+          manifestVerified = true;
+          logger.info("directory.auth.manifest.verified", {
+            manifestVersion: manifest.version,
+            signerCount: manifest.signatures.length,
+          });
+        }
+      }
+    } catch (err: unknown) {
+      logger.error("directory.auth.manifest.load.failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // Ensure the cello directory exists
   await mkdir(celloDir, { recursive: true });
@@ -218,10 +291,39 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     pid: process.pid,
     ipcSocketPath: socketPath,
     agentCount: loadedAgents.length,
+    manifestVerified,
   });
+
+  // M7-MANIFEST-002: Start background manifest polling if scheduler is provided and manifest verified.
+  if (manifestPollScheduler && manifestVerified) {
+    if (manifestProvider && manifestVersionStore && config.challengeVerifier) {
+      const outboundQueue = new InMemorySignalingOutboundQueue();
+      const signalingManager = new SignalingManager({
+        challengeVerifier: config.challengeVerifier,
+        pollScheduler: manifestPollScheduler,
+        manifestVersionStore,
+        manifestProvider,
+        outboundQueue,
+        logger,
+        correlationId: `daemon-startup-${version}`,
+        rootKeys: manifestRootKeys!,
+        threshold: manifestThreshold!,
+      });
+      signalingManager.startPolling();
+    } else {
+      // Minimal path: scheduler present but full deps not yet wired.
+      manifestPollScheduler.scheduleNext(async () => {
+        logger.info("directory.auth.manifest.poll.scheduled", {});
+      });
+    }
+  }
 
   // Graceful shutdown
   async function stop(reason: string): Promise<void> {
+    // Cancel any pending manifest poll timer
+    if (manifestPollScheduler) {
+      manifestPollScheduler.cancel();
+    }
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
     await sessionNodeManager.gracefulShutdown();

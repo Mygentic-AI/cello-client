@@ -6,6 +6,21 @@
  * Responses: {id, result} or {id, error: {code, message, guidance}}
  */
 
+import type {
+  IManifestProvider,
+  IManifestVersionStore,
+  IManifestPollScheduler,
+  IDirectoryChallengeVerifier,
+} from "@cello-protocol/transport";
+
+// Re-export manifest interfaces for consumers of the daemon package
+export type {
+  IManifestProvider,
+  IManifestVersionStore,
+  IManifestPollScheduler,
+  IDirectoryChallengeVerifier,
+};
+
 // --- Logger interface (injected, never imported directly) ---
 
 export interface Logger {
@@ -116,6 +131,37 @@ export interface DaemonConfig {
   maxConnections: number;
   version: string;
   logger: Logger;
+  /**
+   * M7-MANIFEST-002: manifest loading and verification.
+   * When provided, startDaemon() calls manifestProvider.loadAndVerify() at startup.
+   * When absent, manifest loading is skipped (backward compat for DAEMON-001 tests).
+   */
+  manifestProvider?: IManifestProvider;
+  /**
+   * M7-MANIFEST-002: officer root keys for manifest signature verification.
+   * Required when manifestProvider is provided.
+   */
+  manifestRootKeys?: readonly string[];
+  /**
+   * M7-MANIFEST-002: officer threshold for manifest signature verification.
+   * Required when manifestProvider is provided.
+   */
+  manifestThreshold?: number;
+  /**
+   * M7-MANIFEST-002: version store for monotonicity enforcement.
+   * When absent, monotonicity check is skipped.
+   */
+  manifestVersionStore?: IManifestVersionStore;
+  /**
+   * M7-MANIFEST-002: poll scheduler for background manifest refresh.
+   * When absent, polling is disabled.
+   */
+  manifestPollScheduler?: IManifestPollScheduler;
+  /**
+   * M7-MANIFEST-002: challenge verifier for directory step-5 identity proof.
+   * When absent, directory challenge verification is skipped.
+   */
+  challengeVerifier?: IDirectoryChallengeVerifier;
 }
 
 // --- Session node types ---
