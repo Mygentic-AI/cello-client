@@ -14,6 +14,10 @@ export type {
   DirectorySignalingState,
   DaemonStatusResponse,
   DaemonConfig,
+  IManifestProvider,
+  IManifestVersionStore,
+  IManifestPollScheduler,
+  IDirectoryChallengeVerifier,
 } from "./types.js";
 export { ErrorCodes } from "./types.js";
 
@@ -25,3 +29,10 @@ export { connectToDaemon, type IpcClient, IpcError } from "./ipc-client.js";
 export { connectOrStart, type ConnectResult } from "./connect-or-start.js";
 export { RetryQueue, type RetryQueueEntry, type ResendFn, type ResendResult, RETRY_QUEUE_CAP } from "./retry-queue.js";
 export { NonceDedupStore, NONCE_DEDUP_CAP } from "./nonce-dedup.js";
+
+// M7-MANIFEST-002: manifest loading, verification, and polling
+export { FileManifestProvider } from "./manifest-loader.js";
+export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll-scheduler.js";
+export { InMemoryManifestVersionStore } from "./manifest-version-store.js";
+export { FileManifestVersionStore } from "./manifest-version-store-file.js";
+export { ManifestDirectoryChallengeVerifier, TestDirectoryChallengeVerifier } from "./challenge-verifier.js";
