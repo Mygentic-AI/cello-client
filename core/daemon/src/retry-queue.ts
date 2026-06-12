@@ -312,8 +312,9 @@ export class RetryQueue {
     return this.#queues.get(sessionId)?.length ?? 0;
   }
 
-  /** Get all entries for a session (FIFO ordered). Used by drain_session IPC. */
-  getSessionEntries(sessionId: string): readonly RetryQueueEntry[] {
-    return this.#queues.get(sessionId) ?? [];
+  /** Get all entries for a session (FIFO ordered, defensive copy). Used by drain_session IPC. */
+  getSessionEntries(sessionId: string): RetryQueueEntry[] {
+    const queue = this.#queues.get(sessionId);
+    return queue ? [...queue] : [];
   }
 }

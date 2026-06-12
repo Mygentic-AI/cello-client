@@ -36,7 +36,11 @@ export class IpcError extends Error {
   }
 }
 
-export function connectToDaemon(socketPath: string): Promise<IpcClient> {
+export interface IpcClientOptions {
+  onFrameError?: (error: string) => void;
+}
+
+export function connectToDaemon(socketPath: string, opts?: IpcClientOptions): Promise<IpcClient> {
   return new Promise<IpcClient>((resolve, reject) => {
     const socket: Socket = createConnection(socketPath);
     const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -110,8 +114,11 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
               p.resolve(response.result);
             }
           }
-        } catch {
-          // Malformed frame — ignore
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (opts?.onFrameError) {
+            opts.onFrameError(msg);
+          }
         }
       }
     });
