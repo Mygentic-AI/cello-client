@@ -67,6 +67,16 @@ importers:
         specifier: ^10.0.1
         version: 10.0.2
 
+  core/cli:
+    dependencies:
+      '@cello-protocol/daemon':
+        specifier: workspace:*
+        version: link:../daemon
+    devDependencies:
+      '@types/node':
+        specifier: ^25.6.2
+        version: 25.9.1
+
   core/client:
     dependencies:
       '@aws-sdk/client-s3':
@@ -137,6 +147,16 @@ importers:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
         version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1))
+      '@types/node':
+        specifier: ^25.6.2
+        version: 25.9.1
+
+  core/daemon:
+    dependencies:
+      '@cello-protocol/crypto':
+        specifier: workspace:*
+        version: link:../crypto
+    devDependencies:
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
