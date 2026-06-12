@@ -51,11 +51,7 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
           const id = randomUUID();
           pending.set(id, { resolve: res, reject: rej });
           const request: IpcRequest = { id, method, params };
-          const ok = socket.write(JSON.stringify(request) + "\n");
-          if (!ok) {
-            pending.delete(id);
-            rej(new Error("Socket write buffer full"));
-          }
+          socket.write(JSON.stringify(request) + "\n");
         });
       },
 

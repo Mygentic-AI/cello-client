@@ -94,10 +94,24 @@ export function createIpcServer(
 
     logger.info("daemon.ipc.connected", { connectionId, clientType: "cli" });
 
+    const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per connection
     let buffer = "";
 
     socket.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf-8");
+      if (buffer.length > MAX_BUFFER_SIZE) {
+        const errorResp: IpcResponse = {
+          id: "system",
+          error: {
+            code: "message_too_large",
+            message: "IPC message exceeds 1MB limit",
+            guidance: "IPC messages must be under 1MB. Check for malformed input.",
+          },
+        };
+        try { conn.socket.write(JSON.stringify(errorResp) + "\n"); } catch { /* socket may be dead */ }
+        conn.socket.end();
+        return;
+      }
       let newlineIdx: number;
       while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newlineIdx);
@@ -164,7 +178,7 @@ export function createIpcServer(
     }
 
     conn.inFlightCount++;
-    handler(request.params)
+    Promise.resolve(handler(request.params))
       .then((result) => {
         try {
           const resp: IpcResponse = { id: request.id, result };

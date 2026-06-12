@@ -19,6 +19,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 import type {
   DaemonConfig,
   DaemonStatusResponse,
@@ -41,10 +42,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   await mkdir(celloDir, { recursive: true });
 
   // Ensure the socket parent directory exists
-  const socketDir = socketPath.substring(0, socketPath.lastIndexOf("/"));
-  if (socketDir) {
-    await mkdir(socketDir, { recursive: true });
-  }
+  await mkdir(dirname(socketPath), { recursive: true });
 
   // Load agent identities
   const { loaded: loadedAgents, failed: failedAgents } = await loadAgents(celloDir, logger);
@@ -95,9 +93,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async () => {
-    // Trigger graceful shutdown but respond first
     if (!shutdownPromise) {
-      shutdownPromise = stop("logout_requested");
+      shutdownPromise = stop("logout_requested").catch((err: unknown) => {
+        logger.error("daemon.shutdown.failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }
     return { acknowledged: true };
   });
@@ -108,7 +109,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     handlers,
   );
 
-  await ipcServer.start();
+  try {
+    await ipcServer.start();
+  } catch (err: unknown) {
+    await removeLock(lockFilePath, logger);
+    throw err;
+  }
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
   logger.info("daemon.login.validation.complete", {

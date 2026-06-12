@@ -53,7 +53,12 @@ export async function acquireLock(lockPath: string, content: LockFileContent): P
   const tmpPath = lockPath + ".tmp";
   const json = JSON.stringify(content, null, 2) + "\n";
   await writeFile(tmpPath, json, { mode: 0o600 });
-  await rename(tmpPath, lockPath);
+  try {
+    await rename(tmpPath, lockPath);
+  } catch (err: unknown) {
+    try { await unlink(tmpPath); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
 }
 
 export async function removeLock(lockPath: string, logger: Logger): Promise<void> {
