@@ -1,5 +1,8 @@
 /**
- * CELLO-M6B-001 — Integration tests for cello-mcp PID lock file
+ * CELLO-M6B-001 — Integration tests for cello-mcp PID lock file [M6 — superseded by M7 daemon proxy]
+ *
+ * M7: The adapter no longer manages lock files — the daemon handles process exclusivity.
+ * These tests are preserved for reference but skipped.
  *
  * AC-003: When cello-mcp receives SIGTERM, the lock file is removed.
  *   Spawns the real cello-mcp binary, sends SIGTERM, waits for process exit,
@@ -90,7 +93,7 @@ function buildKeyFile(keyPath: string): void {
 
 // ─── AC-004: Kill-before-DB ordering ────────────────────────────────────────────
 
-describe("AC-004: Kill prior process BEFORE opening DB", () => {
+describe.skip("AC-004: Kill prior process BEFORE opening DB [M6 — superseded by M7 daemon]", () => {
   it.skipIf(!binaryExists)("client.startup.prior.process.killed appears before DB-open log in processB stderr", async () => {
     // Set up a .cello directory in the test dir (used as HOME override for processB)
     const celloDir = join(testDir, ".cello");
@@ -222,7 +225,7 @@ describe("AC-004: Kill prior process BEFORE opening DB", () => {
 
 // ─── AC-003: Lock file cleanup on SIGTERM (integration) ────────────────────────
 
-describe("AC-003: Lock file removed when cello-mcp receives SIGTERM (integration)", () => {
+describe.skip("AC-003: Lock file removed when cello-mcp receives SIGTERM [M6 — superseded by M7 daemon]", () => {
   it.skipIf(!binaryExists)("lock file does not exist after cello-mcp is sent SIGTERM and exits", async () => {
     // Set up HOME override so getLockFilePath() writes to our test dir.
     // CELLO_LOCK_FILE_PATH is set explicitly so we know exactly where the lock file is.
@@ -305,7 +308,7 @@ describe("AC-003: Lock file removed when cello-mcp receives SIGTERM (integration
 
 // ─── AC-003: Lock file cleanup on SIGINT (integration) ─────────────────────────
 
-describe("AC-003: Lock file removed when cello-mcp receives SIGINT (integration)", () => {
+describe.skip("AC-003: Lock file removed when cello-mcp receives SIGINT [M6 — superseded by M7 daemon]", () => {
   it.skipIf(!binaryExists)("lock file does not exist after cello-mcp is sent SIGINT and exits", async () => {
     // Each integration test gets its own isolated subdir to avoid lock file collisions
     const subDir = join(testDir, "sigint-test");

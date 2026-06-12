@@ -33,7 +33,7 @@ import { chmod, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 
-export type IpcHandler = (params: Record<string, unknown> | undefined) => Promise<unknown>;
+export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
 export interface IpcServerConfig {
   socketPath: string;
@@ -41,10 +41,13 @@ export interface IpcServerConfig {
   logger: Logger;
 }
 
+export type IpcDisconnectHandler = (connectionId: string) => void;
+
 export interface IpcServer {
   start(): Promise<void>;
   stop(): Promise<void>;
   getConnectionCount(): number;
+  onDisconnect(handler: IpcDisconnectHandler): void;
 }
 
 interface ActiveConnection {
@@ -62,6 +65,7 @@ export function createIpcServer(
   let server: Server | null = null;
   const connections = new Map<string, ActiveConnection>();
   let stopping = false;
+  let disconnectHandler: IpcDisconnectHandler | null = null;
 
   function handleConnection(socket: Socket): void {
     if (stopping) {
@@ -85,6 +89,7 @@ export function createIpcServer(
     const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0, shutdownReason: null };
     connections.set(connectionId, conn);
 
+    // clientType is logged as "cli" by default; ipc.connect handler can update it
     logger.info("daemon.ipc.connected", { connectionId, clientType: "cli" });
 
     const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per connection
@@ -112,11 +117,13 @@ export function createIpcServer(
       connections.delete(connectionId);
       const reason = conn.shutdownReason || "client_closed";
       logger.info("daemon.ipc.disconnected", { connectionId, reason });
+      if (disconnectHandler) disconnectHandler(connectionId);
     });
 
     socket.on("error", (err: Error) => {
       connections.delete(connectionId);
       logger.info("daemon.ipc.disconnected", { connectionId, reason: err.message });
+      if (disconnectHandler) disconnectHandler(connectionId);
     });
   }
 
@@ -156,7 +163,7 @@ export function createIpcServer(
     }
 
     conn.inFlightCount++;
-    Promise.resolve(handler(request.params))
+    Promise.resolve(handler(request.params, conn.id))
       .then((result) => {
         try {
           const resp: IpcResponse = { id: request.id, result };
@@ -267,6 +274,10 @@ export function createIpcServer(
 
     getConnectionCount(): number {
       return connections.size;
+    },
+
+    onDisconnect(handler: IpcDisconnectHandler): void {
+      disconnectHandler = handler;
     },
   };
 }
