@@ -43,12 +43,11 @@ export async function connectOrStart(
       try {
         const client = await connectToDaemon(lock.socketPath);
         return { client, alreadyRunning: true };
-      } catch {
-        // Socket exists but connection failed — daemon is in a bad state
-        // Remove stale lock and start fresh
+      } catch (err: unknown) {
         logger.info("daemon.lock.stale", {
           pid: lock.pid,
           reason: "socket_unreachable",
+          error: err instanceof Error ? err.message : String(err),
         });
         await removeLock(lockFilePath, logger);
       }

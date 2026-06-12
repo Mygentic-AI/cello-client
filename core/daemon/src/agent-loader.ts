@@ -27,9 +27,20 @@ export interface LoadedAgent {
   pubkey: string;
 }
 
-export async function loadAgents(celloDir: string, logger: Logger): Promise<LoadedAgent[]> {
+export interface FailedAgent {
+  name: string;
+  error: string;
+}
+
+export interface AgentLoadResult {
+  loaded: LoadedAgent[];
+  failed: FailedAgent[];
+}
+
+export async function loadAgents(celloDir: string, logger: Logger): Promise<AgentLoadResult> {
   const agentsDir = join(celloDir, "agents");
-  const agents: LoadedAgent[] = [];
+  const loaded: LoadedAgent[] = [];
+  const failed: FailedAgent[] = [];
 
   const agentsDirExists = await directoryExists(agentsDir);
 
@@ -37,12 +48,14 @@ export async function loadAgents(celloDir: string, logger: Logger): Promise<Load
     // Legacy backwards compat: if ~/.cello/key exists and ~/.cello/agents/ doesn't
     const legacyKeyPath = join(celloDir, "key");
     if (await fileExists(legacyKeyPath)) {
-      const agent = await loadSingleAgent("default", legacyKeyPath, logger);
-      if (agent) {
-        agents.push(agent);
+      const result = await loadSingleAgent("default", legacyKeyPath, logger);
+      if (result.ok) {
+        loaded.push(result.agent);
+      } else {
+        failed.push({ name: "default", error: result.error });
       }
     }
-    return agents;
+    return { loaded, failed };
   }
 
   // Enumerate subdirectories of agents/
@@ -52,35 +65,41 @@ export async function loadAgents(celloDir: string, logger: Logger): Promise<Load
 
     const keyPath = join(agentsDir, entry.name, "key");
     if (!(await fileExists(keyPath))) {
-      // Silently skip directories without a key file
       continue;
     }
 
-    const agent = await loadSingleAgent(entry.name, keyPath, logger);
-    if (agent) {
-      agents.push(agent);
+    const result = await loadSingleAgent(entry.name, keyPath, logger);
+    if (result.ok) {
+      loaded.push(result.agent);
+    } else {
+      failed.push({ name: entry.name, error: result.error });
     }
   }
 
-  return agents;
+  return { loaded, failed };
 }
+
+type LoadResult =
+  | { ok: true; agent: LoadedAgent }
+  | { ok: false; error: string };
 
 async function loadSingleAgent(
   name: string,
   keyPath: string,
   logger: Logger,
-): Promise<LoadedAgent | null> {
+): Promise<LoadResult> {
   try {
     const keyProvider = await FileKeyProvider.load(keyPath);
     const pubkeyBytes = await keyProvider.getPublicKey();
     const pubkey = Buffer.from(pubkeyBytes).toString("hex");
-    return { name, pubkey };
+    return { ok: true, agent: { name, pubkey } };
   } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("agent.load.failed", {
       agentName: name,
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMsg,
     });
-    return null;
+    return { ok: false, error: errorMsg };
   }
 }
 

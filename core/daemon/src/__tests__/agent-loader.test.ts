@@ -35,21 +35,22 @@ describe("agent-loader", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("returns empty array when no agents/ dir and no legacy key", async () => {
+  it("returns empty result when no agents/ dir and no legacy key", async () => {
     const result = await loadAgents(tempDir, logger);
-    expect(result).toEqual([]);
+    expect(result.loaded).toEqual([]);
+    expect(result.failed).toEqual([]);
   });
 
   it("loads legacy ~/.cello/key as agent 'default' when agents/ does not exist", async () => {
-    // Create a valid key file using FileKeyProvider (which auto-generates)
     const keyPath = join(tempDir, "key");
     const keyProvider = await FileKeyProvider.load(keyPath);
     const pubkey = await keyProvider.getPublicKey();
 
     const result = await loadAgents(tempDir, logger);
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe("default");
-    expect(result[0].pubkey).toBe(Buffer.from(pubkey).toString("hex"));
+    expect(result.loaded).toHaveLength(1);
+    expect(result.loaded[0].name).toBe("default");
+    expect(result.loaded[0].pubkey).toBe(Buffer.from(pubkey).toString("hex"));
+    expect(result.failed).toHaveLength(0);
   });
 
   it("loads agents from agents/<name>/key subdirectories", async () => {
@@ -57,17 +58,16 @@ describe("agent-loader", () => {
     await mkdir(join(agentsDir, "alice"), { recursive: true });
     await mkdir(join(agentsDir, "bob"), { recursive: true });
 
-    // Create valid keys
     const aliceKey = await FileKeyProvider.load(join(agentsDir, "alice", "key"));
     await FileKeyProvider.load(join(agentsDir, "bob", "key"));
 
     const result = await loadAgents(tempDir, logger);
-    expect(result).toHaveLength(2);
+    expect(result.loaded).toHaveLength(2);
 
-    const names = result.map((a) => a.name).sort();
+    const names = result.loaded.map((a) => a.name).sort();
     expect(names).toEqual(["alice", "bob"]);
 
-    const alice = result.find((a) => a.name === "alice")!;
+    const alice = result.loaded.find((a) => a.name === "alice")!;
     const alicePubkey = await aliceKey.getPublicKey();
     expect(alice.pubkey).toBe(Buffer.from(alicePubkey).toString("hex"));
   });
@@ -79,20 +79,22 @@ describe("agent-loader", () => {
     await FileKeyProvider.load(join(agentsDir, "valid-agent", "key"));
 
     const result = await loadAgents(tempDir, logger);
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe("valid-agent");
-    // No error logged for the skipped directory
+    expect(result.loaded).toHaveLength(1);
+    expect(result.loaded[0].name).toBe("valid-agent");
+    expect(result.failed).toHaveLength(0);
     expect(logEvents.filter((e) => e.event === "agent.load.failed")).toHaveLength(0);
   });
 
-  it("logs agent.load.failed for malformed key files", async () => {
+  it("returns failed agents with error message for malformed key files", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "bad-agent"), { recursive: true });
-    // Write garbage data as the key file
     await writeFile(join(agentsDir, "bad-agent", "key"), "not a valid key");
 
     const result = await loadAgents(tempDir, logger);
-    expect(result).toHaveLength(0);
+    expect(result.loaded).toHaveLength(0);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].name).toBe("bad-agent");
+    expect(typeof result.failed[0].error).toBe("string");
 
     const errorEvents = logEvents.filter((e) => e.event === "agent.load.failed");
     expect(errorEvents).toHaveLength(1);
@@ -101,28 +103,25 @@ describe("agent-loader", () => {
   });
 
   it("prefers agents/ directory over legacy key when both exist", async () => {
-    // Create both legacy key and agents directory
     await FileKeyProvider.load(join(tempDir, "key"));
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "my-agent"), { recursive: true });
     await FileKeyProvider.load(join(agentsDir, "my-agent", "key"));
 
     const result = await loadAgents(tempDir, logger);
-    // Should load from agents/, not the legacy key
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe("my-agent");
+    expect(result.loaded).toHaveLength(1);
+    expect(result.loaded[0].name).toBe("my-agent");
   });
 
   it("skips non-directory entries in agents/", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(agentsDir, { recursive: true });
-    // Create a regular file (not a directory) in agents/
     await writeFile(join(agentsDir, "not-a-dir"), "some content");
     await mkdir(join(agentsDir, "real-agent"), { recursive: true });
     await FileKeyProvider.load(join(agentsDir, "real-agent", "key"));
 
     const result = await loadAgents(tempDir, logger);
-    expect(result).toHaveLength(1);
-    expect(result[0].name).toBe("real-agent");
+    expect(result.loaded).toHaveLength(1);
+    expect(result.loaded[0].name).toBe("real-agent");
   });
 });

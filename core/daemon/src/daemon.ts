@@ -25,7 +25,7 @@ import type {
   AgentInfo,
   ConnectionInfo,
 } from "./types.js";
-import { loadAgents, type LoadedAgent } from "./agent-loader.js";
+import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 
@@ -47,7 +47,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   }
 
   // Load agent identities
-  const loadedAgents = await loadAgents(celloDir, logger);
+  const { loaded: loadedAgents, failed: failedAgents } = await loadAgents(celloDir, logger);
 
   // Acquire lock file
   await acquireLock(lockFilePath, {
@@ -57,11 +57,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   // Build agent state (all start in 'registered' state — no auto-start)
-  const agents: AgentInfo[] = loadedAgents.map((a: LoadedAgent) => ({
-    name: a.name,
-    state: "registered" as const,
-    pubkey: a.pubkey,
-  }));
+  const agents: AgentInfo[] = [
+    ...loadedAgents.map((a) => ({
+      name: a.name,
+      state: "registered" as const,
+      pubkey: a.pubkey,
+    })),
+    ...failedAgents.map((a) => ({
+      name: a.name,
+      state: "load_failed" as const,
+      error: a.error,
+    })),
+  ];
 
   // Stub: all connections marked as 'unverified' until SIGNAL-001 implements
   // the directory signaling stream
@@ -71,8 +78,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   function getStatus(): DaemonStatusResponse {
     return {
       daemon: "running",
-      // Stub: no directory signaling stream yet (SIGNAL-001 scope)
-      directory_signaling: "lost",
+      // Per CONTEXT.md: from the moment the daemon first attempts a directory
+      // connection (at startup), any non-connected state is 'reconnecting'
+      directory_signaling: "reconnecting",
       agents,
       connections,
     };
@@ -102,11 +110,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   await ipcServer.start();
 
+  // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
+  logger.info("daemon.login.validation.complete", {
+    verifiedCount: 0,
+    staleCount: 0,
+    goneCount: 0,
+  });
+
   // Log daemon.started
   logger.info("daemon.started", {
     pid: process.pid,
     ipcSocketPath: socketPath,
-    agentCount: agents.length,
+    agentCount: loadedAgents.length,
   });
 
   // Graceful shutdown

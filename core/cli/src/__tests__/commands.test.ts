@@ -90,7 +90,7 @@ describe("cli commands", () => {
       expect(result.exitCode).toBe(0);
       const parsed = JSON.parse(result.output);
       expect(parsed.daemon).toBe("running");
-      expect(parsed.directory_signaling).toBe("lost");
+      expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
       expect(Array.isArray(parsed.connections)).toBe(true);
     });

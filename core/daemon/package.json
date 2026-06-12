@@ -20,7 +20,10 @@
   "bin": {
     "cello-daemon": "./dist/bin/cello-daemon.js"
   },
-  "files": ["dist/", "package.json"],
+  "files": [
+    "dist/",
+    "package.json"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
@@ -29,6 +32,7 @@
     "@cello-protocol/crypto": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "^25.6.2"
+    "@types/node": "^25.6.2",
+    "tsx": "^4.22.4"
   }
 }

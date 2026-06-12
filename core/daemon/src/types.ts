@@ -48,12 +48,13 @@ export type IpcResponse = IpcResponseOk | IpcResponseError;
 
 // --- Agent state ---
 
-export type AgentState = "registered" | "online" | "current";
+export type AgentState = "registered" | "online" | "current" | "load_failed";
 
 export interface AgentInfo {
   name: string;
   state: AgentState;
   pubkey?: string;
+  error?: string;
 }
 
 // --- Connection state ---

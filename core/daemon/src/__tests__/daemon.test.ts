@@ -8,7 +8,7 @@
  * - Agents loaded in 'registered' state (not auto-started)
  * - Shutdown handler: acknowledges and triggers graceful stop
  * - daemon.login.validation.complete stub (connections all 'unverified')
- * - directory_signaling starts as 'lost' (no signaling stream yet)
+ * - directory_signaling starts as 'reconnecting' (per CONTEXT.md AC-009)
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -137,7 +137,7 @@ describe("daemon", () => {
     const status = handle.getStatus();
 
     expect(status.daemon).toBe("running");
-    expect(status.directory_signaling).toBe("lost");
+    expect(status.directory_signaling).toBe("reconnecting");
     expect(Array.isArray(status.agents)).toBe(true);
     expect(Array.isArray(status.connections)).toBe(true);
   });
@@ -185,5 +185,75 @@ describe("daemon", () => {
     handle = await startDaemon(makeConfig());
     const status = handle.getStatus();
     expect(status.connections).toEqual([]);
+  });
+
+  it("emits daemon.login.validation.complete with zeroed counts (stub)", async () => {
+    handle = await startDaemon(makeConfig());
+
+    const validationEvent = logEvents.find((e) => e.event === "daemon.login.validation.complete");
+    expect(validationEvent).toBeDefined();
+    expect(validationEvent!.context.verifiedCount).toBe(0);
+    expect(validationEvent!.context.staleCount).toBe(0);
+    expect(validationEvent!.context.goneCount).toBe(0);
+  });
+
+  it("includes failed agents in status with state 'load_failed' and error (DB-002)", async () => {
+    const agentsDir = join(tempDir, "agents");
+    await mkdir(join(agentsDir, "bad-agent"), { recursive: true });
+    // Write invalid key data
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(agentsDir, "bad-agent", "key"), "invalid-key-data");
+
+    handle = await startDaemon(makeConfig());
+    const status = handle.getStatus();
+
+    const failedAgent = status.agents.find((a) => a.name === "bad-agent");
+    expect(failedAgent).toBeDefined();
+    expect(failedAgent!.state).toBe("load_failed");
+    expect(failedAgent!.error).toBeDefined();
+    expect(typeof failedAgent!.error).toBe("string");
+  });
+
+  it("logs daemon.ipc.disconnected with reason 'daemon_shutdown' during stop (AC-006)", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+
+    // Connect a client
+    const client = await connectToDaemon(config.socketPath);
+
+    // Stop the daemon while client is connected
+    await handle.stop("graceful");
+    handle = null;
+
+    // Wait for disconnect events to propagate
+    await new Promise((r) => setTimeout(r, 100));
+    client.close();
+
+    const disconnectEvents = logEvents.filter((e) => e.event === "daemon.ipc.disconnected");
+    expect(disconnectEvents.length).toBeGreaterThanOrEqual(1);
+    const shutdownDisconnect = disconnectEvents.find((e) => e.context.reason === "daemon_shutdown");
+    expect(shutdownDisconnect).toBeDefined();
+  });
+
+  it("logs daemon.ipc.disconnected with actual error.message on socket error (AC-010)", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+
+    // Connect via raw socket and destroy it abruptly
+    const { createConnection } = await import("node:net");
+    const socket = createConnection(config.socketPath);
+    await new Promise<void>((resolve) => socket.on("connect", resolve));
+
+    // Wait for the IPC server to register the connection
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Destroy the socket (simulates TCP RST)
+    socket.destroy();
+
+    // Wait for disconnect event
+    await new Promise((r) => setTimeout(r, 100));
+
+    const disconnectEvents = logEvents.filter((e) => e.event === "daemon.ipc.disconnected");
+    expect(disconnectEvents.length).toBeGreaterThanOrEqual(1);
   });
 });

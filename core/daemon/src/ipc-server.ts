@@ -52,6 +52,7 @@ interface ActiveConnection {
   id: string;
   socket: Socket;
   inFlightCount: number;
+  shutdownReason: string | null;
 }
 
 export function createIpcServer(
@@ -88,7 +89,7 @@ export function createIpcServer(
     }
 
     const connectionId = randomUUID();
-    const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0 };
+    const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0, shutdownReason: null };
     connections.set(connectionId, conn);
 
     logger.info("daemon.ipc.connected", { connectionId, clientType: "cli" });
@@ -108,7 +109,8 @@ export function createIpcServer(
 
     socket.on("close", () => {
       connections.delete(connectionId);
-      logger.info("daemon.ipc.disconnected", { connectionId, reason: "client_closed" });
+      const reason = conn.shutdownReason || "client_closed";
+      logger.info("daemon.ipc.disconnected", { connectionId, reason });
     });
 
     socket.on("error", (err: Error) => {
@@ -236,13 +238,13 @@ export function createIpcServer(
       const shutdownFrame = JSON.stringify({ id: "system", result: { type: "shutdown" } }) + "\n";
       for (const conn of connections.values()) {
         try {
+          conn.shutdownReason = "daemon_shutdown";
           conn.socket.write(shutdownFrame);
           conn.socket.end();
         } catch {
           // Connection may already be closed
         }
       }
-      connections.clear();
 
       // Close server and remove socket
       await new Promise<void>((resolve) => {
