@@ -14,7 +14,7 @@
  */
 
 import type { KeyProvider } from "@cello-protocol/crypto";
-import type { Stream } from "@libp2p/interface";
+import type { ConnectionGater, Stream } from "@libp2p/interface";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -44,6 +44,12 @@ export interface CreateNodeOptions {
    * a stable Peer ID across restarts.
    */
   transportPrivateKey?: Uint8Array;
+  /**
+   * Optional libp2p ConnectionGater. When provided, the gater is installed on
+   * the node to filter incoming and outgoing connections. Used by DAEMON-002
+   * to enforce per-session peer allowlists on ephemeral session nodes.
+   */
+  connectionGater?: ConnectionGater;
 }
 
 // ─── StreamHandler ──────────────────────────────────────────────────────────

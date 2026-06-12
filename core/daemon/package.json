@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/daemon",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": false,
   "type": "module",
   "engines": {
@@ -29,7 +29,9 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/crypto": "workspace:*"
+    "@cello-protocol/crypto": "workspace:*",
+    "@cello-protocol/transport": "workspace:*",
+    "@libp2p/interface": "^3.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",

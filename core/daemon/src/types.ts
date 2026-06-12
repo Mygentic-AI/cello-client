@@ -55,6 +55,15 @@ export interface IpcNotification {
 
 export type IpcFrame = IpcResponse | IpcNotification;
 
+// --- Session node sentinel ---
+
+/**
+ * Sentinel agentName used for the standing receiver node before any agent
+ * transitions to Online. The IPC socket opens after initialize() completes,
+ * so no agent can call cello_start_agent before the standing receiver exists.
+ */
+export const STANDING_RECEIVER_AGENT_NAME = "__standing_receiver__" as const;
+
 // --- Agent state ---
 
 export type AgentState = "registered" | "online" | "current" | "load_failed";
@@ -84,6 +93,12 @@ export interface DaemonStatusResponse {
   directory_signaling: DirectorySignalingState;
   agents: AgentInfo[];
   connections: ConnectionInfo[];
+  /**
+   * True when the standing receiver node is listening and ready to accept the
+   * next inbound session. Set to true by SessionNodeManager.initialize() during
+   * daemon startup (before the IPC socket opens). DAEMON-002 AC-002.
+   */
+  standing_receiver_ready: boolean;
 }
 
 // --- Daemon configuration ---
@@ -97,6 +112,26 @@ export interface DaemonConfig {
   logger: Logger;
 }
 
+// --- Session node types ---
+
+/**
+ * Maximum number of concurrent session nodes per daemon.
+ * Outline.md §Resource Caps, DAEMON-002 AC-006.
+ */
+export const MAX_SESSION_NODES = 32;
+
+/** Status of a session persisted in SQLite. */
+export type SessionStatus = "active" | "sealed" | "interrupted";
+
+export interface SessionRecord {
+  session_id: string;
+  agent_name: string;
+  counterparty_pubkey: string;
+  status: SessionStatus;
+  created_at: number;
+  updated_at: number;
+}
+
 // --- Error codes ---
 
 export const ErrorCodes = {
@@ -106,4 +141,7 @@ export const ErrorCodes = {
   IPC_CONNECTION_LIMIT: "ipc_connection_limit",
   CONNECTION_VALIDATION_TIMEOUT: "connection_validation_timeout",
   DIRECTORY_UNREACHABLE_AT_LOGIN: "directory_unreachable_at_login",
+  MAX_SESSIONS_REACHED: "max_sessions_reached",
+  SESSION_NODE_CREATION_FAILED: "session_node_creation_failed",
+  STANDING_RECEIVER_UNAVAILABLE: "standing_receiver_unavailable",
 } as const;
