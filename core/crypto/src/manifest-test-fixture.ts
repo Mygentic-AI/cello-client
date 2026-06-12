@@ -1,5 +1,5 @@
 /**
- * M7-MANIFEST-001 — Test fixture for consortium manifest creation.
+ * M7-MANIFEST-001 / M7-MANIFEST-002 — Test fixture for consortium manifest creation.
  *
  * Provides makeTestManifest() which creates a fully-signed ConsortiumManifest
  * using deterministic test officer keys. The manifest is signed with officer
@@ -78,3 +78,20 @@ export function makeTestManifest(
   manifest.signatures = signatures;
   return manifest;
 }
+
+// ─── M7-MANIFEST-002: Test directory node keypair ────────────────────────────
+
+/**
+ * Deterministic test directory node keypair for step-5 challenge signing tests.
+ *
+ * Derived from SHA-256("cello-test-directory-node-key-0") as a 32-byte seed.
+ * This seed is DISTINCT from TEST_OFFICER_SEEDS (0x01..0x05) — it is NOT an
+ * officer key. It represents a directory node's per-node Ed25519 signing key.
+ *
+ * Crypto reference: RFC 8032 (Ed25519).
+ * Seed derivation: SHA-256("cello-test-directory-node-key-0") — deterministic.
+ */
+export const TEST_DIRECTORY_NODE_KEYPAIR = {
+  privateKeyHex: "707a125efaed6d467e8cac1758b3a87af260a5b9c7a6f0d6a74d364c1d5dacd9",
+  publicKeyHex: "b93092dd6bf675c00a895abc05503dfd1214a170a2d945d97bab81fd5cfe6a1b",
+} as const;

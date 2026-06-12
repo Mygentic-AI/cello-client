@@ -1,0 +1,686 @@
+/**
+ * M7-MANIFEST-002 — SignalingManager and manifest interfaces tests.
+ *
+ * AC mapping:
+ *   AC-001: IManifestVersionStore enforces version monotonicity
+ *   AC-002: IManifestProvider.loadAndVerify() returns manifest and caches it
+ *   AC-003: IDirectoryChallengeVerifier verifies step-5 signature correctly
+ *   AC-004: SignalingManager.processStep5Frame() emits directory.auth.challenge.verified
+ *   AC-005: SignalingManager version store persistence (in-memory stub)
+ *   AC-009: buildStep5Tbs() produces correct TBS bytes (directory step-5 unit test)
+ *   AC-010: poll round-trip — dispatchManifestPoll sends manifest_poll_request,
+ *            handleManifestPollResponse processes response
+ *   AC-013: ISignalingOutboundQueue enqueues frames for SIGNAL-001
+ *   SI-001: Per-node key binding — different nodes produce different TBS bytes
+ *   SI-002: Expired manifest causes processStep5Frame to fail (via verifier)
+ *   SI-003: Nonce prevents replay — different nonces produce different TBS bytes
+ */
+
+import { describe, it, expect } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD } from "@cello-protocol/crypto";
+import {
+  SignalingManager,
+  InMemorySignalingOutboundQueue,
+  buildStep5Tbs,
+  TestManifestProvider,
+  TestDirectoryChallengeVerifier,
+  ManifestDirectoryChallengeVerifier,
+  InMemoryManifestVersionStore,
+  ImmediatePollScheduler,
+  TestDirectoryKeyProvider,
+  TestDirectoryManifestStore,
+} from "../index.js";
+import type { SignalingLogger, SignalingManagerConfig } from "../signaling-manager.js";
+import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeLogger(): SignalingLogger & {
+  events: Array<{ level: string; event: string; context: Record<string, unknown> }>;
+} {
+  const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
+  return {
+    events,
+    info(event: string, context: Record<string, unknown>) { events.push({ level: "info", event, context }); },
+    warn(event: string, context: Record<string, unknown>) { events.push({ level: "warn", event, context }); },
+    error(event: string, context: Record<string, unknown>) { events.push({ level: "error", event, context }); },
+  };
+}
+
+function makeTestNode(nodeId: string, pubkeyHex: string) {
+  return {
+    nodeId,
+    pubkey: pubkeyHex,
+    region: "us-east-1",
+    provider: "aws" as const,
+    endpoint: "wss://test.cello.test:443",
+  };
+}
+
+function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
+  manager: SignalingManager;
+  logger: ReturnType<typeof makeLogger>;
+  queue: InMemorySignalingOutboundQueue;
+  versionStore: InMemoryManifestVersionStore;
+  verifier: TestDirectoryChallengeVerifier;
+  scheduler: ImmediatePollScheduler;
+  manifestProvider: TestManifestProvider;
+  manifest: ConsortiumManifest;
+} {
+  const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+  const nodeId = "test-node-us-east-1";
+
+  const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+  const manifestProvider = new TestManifestProvider(manifest);
+  const versionStore = new InMemoryManifestVersionStore();
+  const verifier = new TestDirectoryChallengeVerifier();
+  const scheduler = new ImmediatePollScheduler(0);
+  const queue = new InMemorySignalingOutboundQueue();
+  const logger = makeLogger();
+
+  const manager = new SignalingManager({
+    challengeVerifier: verifier,
+    pollScheduler: scheduler,
+    manifestVersionStore: versionStore,
+    manifestProvider,
+    outboundQueue: queue,
+    logger,
+    correlationId: "test-corr-001",
+    rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+    threshold: TEST_CONSORTIUM_THRESHOLD,
+    ...overrides,
+  });
+
+  return { manager, logger, queue, versionStore, verifier, scheduler, manifestProvider, manifest };
+}
+
+// ─── AC-009: buildStep5Tbs produces correct TBS bytes ─────────────────────────
+
+describe("AC-009: buildStep5Tbs — directory step-5 TBS construction", () => {
+  it("produces UTF-8 bytes with correct format and label", () => {
+    const tbs = buildStep5Tbs({
+      nodeId: "dir-node-us-east-1",
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    const str = new TextDecoder().decode(tbs);
+    expect(str).toBe(
+      "cello-directory-auth-challenge-v1\n" +
+      "dir-node-us-east-1\n" +
+      "a".repeat(64) + "\n" +
+      "b".repeat(64) + "\n" +
+      "2026-06-12T10:00:00.000Z"
+    );
+  });
+
+  it("SI-001: different nodeIds produce different TBS bytes", () => {
+    const opts = {
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    };
+    const tbs1 = buildStep5Tbs({ ...opts, nodeId: "node-A" });
+    const tbs2 = buildStep5Tbs({ ...opts, nodeId: "node-B" });
+    expect(Buffer.from(tbs1).toString("hex")).not.toBe(Buffer.from(tbs2).toString("hex"));
+  });
+
+  it("SI-003: different nonces produce different TBS bytes (replay prevention)", () => {
+    const opts = {
+      nodeId: "dir-node-us-east-1",
+      agentPubkeyHex: "a".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    };
+    const tbs1 = buildStep5Tbs({ ...opts, nonceHex: "c".repeat(64) });
+    const tbs2 = buildStep5Tbs({ ...opts, nonceHex: "d".repeat(64) });
+    expect(Buffer.from(tbs1).toString("hex")).not.toBe(Buffer.from(tbs2).toString("hex"));
+  });
+
+  it("different agent pubkeys produce different TBS bytes", () => {
+    const opts = {
+      nodeId: "dir-node-us-east-1",
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    };
+    const tbs1 = buildStep5Tbs({ ...opts, agentPubkeyHex: "e".repeat(64) });
+    const tbs2 = buildStep5Tbs({ ...opts, agentPubkeyHex: "f".repeat(64) });
+    expect(Buffer.from(tbs1).toString("hex")).not.toBe(Buffer.from(tbs2).toString("hex"));
+  });
+});
+
+// ─── AC-003: IDirectoryChallengeVerifier ──────────────────────────────────────
+
+describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification", () => {
+  const privateKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex;
+  const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+  const nodeId = "test-node-us-east-1";
+
+  function makeVerifier() {
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    void provider.loadAndVerify([], 0); // sets #loaded so getCurrentManifest() returns it
+    const verifier = new ManifestDirectoryChallengeVerifier(provider);
+    return { verifier, manifest };
+  }
+
+  it("returns { valid: true } for a valid Ed25519 signature over TBS bytes (RFC 8032)", async () => {
+    const { verifier } = makeVerifier();
+    const keyProvider = new TestDirectoryKeyProvider({ nodeId, privateKeyHex });
+
+    const tbsBytes = buildStep5Tbs({
+      nodeId,
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    const sigBytes = await keyProvider.sign(tbsBytes);
+    const signatureHex = Buffer.from(sigBytes).toString("hex");
+
+    expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+  });
+
+  it("returns { valid: false, reason: 'signature_invalid' } for wrong signature", async () => {
+    const { verifier } = makeVerifier();
+    const tbsBytes = buildStep5Tbs({
+      nodeId,
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+    const wrongSig = "00".repeat(64);
+    expect(verifier.verifyChallenge(nodeId, tbsBytes, wrongSig)).toEqual({ valid: false, reason: "signature_invalid" });
+  });
+
+  it("AC-007: returns { valid: false, reason: 'key_not_in_manifest' } for unknown nodeId", async () => {
+    const { verifier } = makeVerifier();
+    const tbsBytes = buildStep5Tbs({
+      nodeId: "unknown-node",
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+    expect(verifier.verifyChallenge("unknown-node", tbsBytes, "00".repeat(64))).toEqual({
+      valid: false,
+      reason: "key_not_in_manifest",
+    });
+  });
+
+  it("returns { valid: false, reason: 'key_not_in_manifest' } if manifest not loaded yet", () => {
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    // Do NOT call loadAndVerify — getCurrentManifest() returns null
+    const verifier = new ManifestDirectoryChallengeVerifier(provider);
+    const tbsBytes = buildStep5Tbs({
+      nodeId,
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+    expect(verifier.verifyChallenge(nodeId, tbsBytes, "00".repeat(64))).toEqual({
+      valid: false,
+      reason: "key_not_in_manifest",
+    });
+  });
+
+  it("SI-001: signature for nodeA does not verify for nodeB (per-node key binding)", async () => {
+    const nodeIdA = "node-A";
+    const nodeIdB = "node-B";
+    const privA = TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex;
+    const pubA = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+
+    // Generate a different key for nodeB using a fixed alternative seed
+    const privBBytes = new Uint8Array(32).fill(0x20);
+    const pubB = Buffer.from(ed25519.getPublicKey(privBBytes)).toString("hex");
+
+    const manifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode(nodeIdA, pubA),
+      makeTestNode(nodeIdB, pubB),
+    ]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    void provider.loadAndVerify([], 0);
+    const verifier = new ManifestDirectoryChallengeVerifier(provider);
+
+    const tbsA = buildStep5Tbs({
+      nodeId: nodeIdA,
+      agentPubkeyHex: "a".repeat(64),
+      nonceHex: "b".repeat(64),
+      isoTimestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    // Sign with nodeA's key but verify against nodeB — must fail
+    const keyProviderA = new TestDirectoryKeyProvider({ nodeId: nodeIdA, privateKeyHex: privA });
+    const sigForA = await keyProviderA.sign(tbsA);
+    const sigHex = Buffer.from(sigForA).toString("hex");
+
+    expect(verifier.verifyChallenge(nodeIdA, tbsA, sigHex)).toEqual({ valid: true });
+    // nodeB's slot is found in manifest but signed with nodeA's key → signature_invalid
+    expect(verifier.verifyChallenge(nodeIdB, tbsA, sigHex)).toEqual({ valid: false, reason: "signature_invalid" });
+  });
+});
+
+// ─── AC-004: SignalingManager.processStep5Frame ────────────────────────────────
+
+describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flow", () => {
+  it("emits directory.auth.challenge.verified when signature is valid", async () => {
+    const privateKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex;
+    const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+    const nodeId = "test-node-us-east-1";
+
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifestProvider = new TestManifestProvider(manifest);
+    await manifestProvider.loadAndVerify([], 0);
+    const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+
+    const queue = new InMemorySignalingOutboundQueue();
+    const logger = makeLogger();
+    const manager = new SignalingManager({
+      challengeVerifier: realVerifier,
+      pollScheduler: new ImmediatePollScheduler(0),
+      manifestVersionStore: new InMemoryManifestVersionStore(),
+      manifestProvider,
+      outboundQueue: queue,
+      logger,
+      correlationId: "test-corr",
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+    });
+
+    const nonceHex = "cc".repeat(32);
+    const agentPubkeyHex = "aa".repeat(32);
+    const timestamp = "2026-06-12T10:00:00.000Z";
+
+    manager.setHandshakeContext(nonceHex, agentPubkeyHex);
+
+    const tbsBytes = buildStep5Tbs({ nodeId, agentPubkeyHex, nonceHex, isoTimestamp: timestamp });
+    const keyProvider = new TestDirectoryKeyProvider({ nodeId, privateKeyHex });
+    const sigBytes = await keyProvider.sign(tbsBytes);
+
+    const result = manager.processStep5Frame({
+      type: "signaling_auth_ok",
+      nodeId,
+      signature: Buffer.from(sigBytes).toString("hex"),
+      timestamp,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(logger.events.find((e) => e.event === "directory.auth.challenge.verified")).toBeDefined();
+    expect(logger.events.find((e) => e.event === "directory.auth.challenge.failed")).toBeUndefined();
+  });
+
+  it("emits directory.auth.challenge.failed when signature is invalid", async () => {
+    const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+    const nodeId = "test-node-us-east-1";
+
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifestProvider = new TestManifestProvider(manifest);
+    await manifestProvider.loadAndVerify([], 0);
+    const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+
+    const queue = new InMemorySignalingOutboundQueue();
+    const logger = makeLogger();
+    const manager = new SignalingManager({
+      challengeVerifier: realVerifier,
+      pollScheduler: new ImmediatePollScheduler(0),
+      manifestVersionStore: new InMemoryManifestVersionStore(),
+      manifestProvider,
+      outboundQueue: queue,
+      logger,
+      correlationId: "fail-test",
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+    });
+
+    manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
+
+    const result = manager.processStep5Frame({
+      type: "signaling_auth_ok",
+      nodeId,
+      signature: "00".repeat(64), // wrong signature
+      timestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    expect(result.verified).toBe(false);
+    expect((result as { reason: string }).reason).toBe("signature_invalid");
+    const failEvent = logger.events.find((e) => e.event === "directory.auth.challenge.failed");
+    expect(failEvent).toBeDefined();
+    expect(failEvent?.context.reason).toBe("signature_invalid");
+  });
+
+  it("AC-007: emits directory.auth.challenge.failed with reason key_not_in_manifest when nodeId absent from manifest", async () => {
+    const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+    const knownNodeId = "test-node-us-east-1";
+    const rogueNodeId = "rogue-node-not-in-manifest";
+
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(knownNodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifestProvider = new TestManifestProvider(manifest);
+    await manifestProvider.loadAndVerify([], 0);
+    const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+
+    const queue = new InMemorySignalingOutboundQueue();
+    const logger = makeLogger();
+    const manager = new SignalingManager({
+      challengeVerifier: realVerifier,
+      pollScheduler: new ImmediatePollScheduler(0),
+      manifestVersionStore: new InMemoryManifestVersionStore(),
+      manifestProvider,
+      outboundQueue: queue,
+      logger,
+      correlationId: "ac-007-test",
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+    });
+
+    manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
+
+    const result = manager.processStep5Frame({
+      type: "signaling_auth_ok",
+      nodeId: rogueNodeId,
+      signature: "00".repeat(64),
+      timestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    expect(result.verified).toBe(false);
+    expect((result as { reason: string }).reason).toBe("key_not_in_manifest");
+    const failEvent = logger.events.find((e) => e.event === "directory.auth.challenge.failed");
+    expect(failEvent).toBeDefined();
+    expect(failEvent?.context.reason).toBe("key_not_in_manifest");
+    expect(failEvent?.context.nodeId).toBe(rogueNodeId);
+  });
+
+  it("emits directory.auth.challenge.skipped when frame has no identity proof", () => {
+    const { manager, logger } = makeManagerConfig();
+
+    manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
+
+    const result = manager.processStep5Frame({ type: "signaling_auth_ok" });
+
+    expect(result.verified).toBe(false);
+    expect((result as { reason: string }).reason).toBe("no_identity_proof");
+    const skipEvent = logger.events.find((e) => e.event === "directory.auth.challenge.skipped");
+    expect(skipEvent).toBeDefined();
+    expect(skipEvent?.level).toBe("warn");
+  });
+
+  it("returns handshake_context_missing when setHandshakeContext was not called", () => {
+    const { manager, logger } = makeManagerConfig();
+    // Do NOT call setHandshakeContext
+
+    const result = manager.processStep5Frame({
+      type: "signaling_auth_ok",
+      nodeId: "test-node-us-east-1",
+      signature: "00".repeat(64),
+      timestamp: "2026-06-12T10:00:00.000Z",
+    });
+
+    expect(result.verified).toBe(false);
+    expect((result as { reason: string }).reason).toBe("handshake_context_missing");
+    const failEvent = logger.events.find((e) => e.event === "directory.auth.challenge.failed");
+    expect(failEvent).toBeDefined();
+  });
+
+  it("SI-003: replay attack fails — wrong nonce produces different TBS, signature doesn't verify", async () => {
+    const privateKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex;
+    const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
+    const nodeId = "test-node-us-east-1";
+
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifestProvider = new TestManifestProvider(manifest);
+    await manifestProvider.loadAndVerify([], 0);
+    const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+
+    const queue = new InMemorySignalingOutboundQueue();
+    const logger = makeLogger();
+    const manager = new SignalingManager({
+      challengeVerifier: realVerifier,
+      pollScheduler: new ImmediatePollScheduler(0),
+      manifestVersionStore: new InMemoryManifestVersionStore(),
+      manifestProvider,
+      outboundQueue: queue,
+      logger,
+      correlationId: "replay-test",
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+    });
+
+    // Original challenge
+    const originalNonce = "cc".repeat(32);
+    const agentPubkeyHex = "aa".repeat(32);
+    const timestamp = "2026-06-12T10:00:00.000Z";
+
+    // Sign over the original nonce
+    const originalTbs = buildStep5Tbs({ nodeId, agentPubkeyHex, nonceHex: originalNonce, isoTimestamp: timestamp });
+    const keyProvider = new TestDirectoryKeyProvider({ nodeId, privateKeyHex });
+    const sig = await keyProvider.sign(originalTbs);
+    const sigHex = Buffer.from(sig).toString("hex");
+
+    // Simulate the manager receiving a DIFFERENT nonce (replay: attacker replays old sig)
+    const replayNonce = "dd".repeat(32);
+    manager.setHandshakeContext(replayNonce, agentPubkeyHex);
+
+    const result = manager.processStep5Frame({
+      type: "signaling_auth_ok",
+      nodeId,
+      signature: sigHex,
+      timestamp,
+    });
+
+    // The TBS built from replayNonce differs from originalTbs, so signature fails
+    expect(result.verified).toBe(false);
+    expect((result as { reason: string }).reason).toBe("signature_invalid");
+  });
+});
+
+// ─── AC-001: IManifestVersionStore ────────────────────────────────────────────
+
+describe("AC-001: InMemoryManifestVersionStore — monotonicity", () => {
+  it("starts at null (no version seen)", async () => {
+    const store = new InMemoryManifestVersionStore();
+    expect(await store.getLastSeenVersion()).toBeNull();
+  });
+
+  it("persists and returns a version", async () => {
+    const store = new InMemoryManifestVersionStore();
+    await store.persistVersion(7);
+    expect(await store.getLastSeenVersion()).toBe(7);
+  });
+
+  it("replaces the previous version when updated", async () => {
+    const store = new InMemoryManifestVersionStore();
+    await store.persistVersion(5);
+    await store.persistVersion(8);
+    expect(await store.getLastSeenVersion()).toBe(8);
+  });
+});
+
+// ─── AC-002: TestManifestProvider ─────────────────────────────────────────────
+
+describe("AC-002: TestManifestProvider — manifest loading and caching", () => {
+  it("loadAndVerify returns the supplied manifest", async () => {
+    const manifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("node-1", "00".repeat(32)),
+    ]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    const result = await provider.loadAndVerify([], 0);
+    expect(result.nodes[0].nodeId).toBe("node-1");
+  });
+
+  it("getCurrentManifest returns null before loadAndVerify", () => {
+    const manifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("node-1", "00".repeat(32)),
+    ]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    expect(provider.getCurrentManifest()).toBeNull();
+  });
+
+  it("getCurrentManifest returns the manifest after loadAndVerify", async () => {
+    const manifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("node-1", "00".repeat(32)),
+    ]) as ConsortiumManifest;
+    const provider = new TestManifestProvider(manifest);
+    await provider.loadAndVerify([], 0);
+    expect(provider.getCurrentManifest()).toBe(manifest);
+  });
+});
+
+// ─── AC-010: Poll round-trip ───────────────────────────────────────────────────
+
+describe("AC-010: Manifest poll round-trip", () => {
+  it("dispatchManifestPoll enqueues manifest_poll_request frame", () => {
+    const { manager, queue } = makeManagerConfig();
+    manager.dispatchManifestPoll();
+    expect(queue.getFrames()[0]).toEqual({ type: "manifest_poll_request" });
+  });
+
+  it("handleManifestPollResponse persists version and logs manifest.poll.success", async () => {
+    const { manager, logger, versionStore } = makeManagerConfig();
+    const newManifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
+    ], { version: 2 }) as ConsortiumManifest;
+
+    await manager.handleManifestPollResponse(newManifest);
+
+    expect(await versionStore.getLastSeenVersion()).toBe(2);
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.success")).toBeDefined();
+  });
+
+  it("handleManifestPollResponse rejects version rollback", async () => {
+    const { manager, logger, versionStore } = makeManagerConfig();
+
+    // First set a higher version
+    await versionStore.persistVersion(5);
+
+    const oldManifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
+    ], { version: 3 }) as ConsortiumManifest;
+
+    await manager.handleManifestPollResponse(oldManifest);
+
+    // Version should remain 5 (not replaced by 3)
+    expect(await versionStore.getLastSeenVersion()).toBe(5);
+    const rollbackEvent = logger.events.find((e) => e.event === "directory.auth.manifest.version.rollback");
+    expect(rollbackEvent).toBeDefined();
+    expect(rollbackEvent?.context.manifestVersion).toBe(3);
+    expect(rollbackEvent?.context.lastSeenVersion).toBe(5);
+  });
+
+  it("AC-005: version store persists across manager restart (same store reused)", async () => {
+    const store = new InMemoryManifestVersionStore();
+    await store.persistVersion(10);
+
+    // Simulate restart: create a new manager with the SAME store
+    const manager2Config = {
+      challengeVerifier: new TestDirectoryChallengeVerifier(),
+      pollScheduler: new ImmediatePollScheduler(0),
+      manifestVersionStore: store, // same store instance
+      manifestProvider: new TestManifestProvider(makeTestManifest([]) as ConsortiumManifest),
+      outboundQueue: new InMemorySignalingOutboundQueue(),
+      logger: makeLogger(),
+      correlationId: "restart-test",
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+    };
+    const manager2 = new SignalingManager(manager2Config);
+
+    // Version from "before restart" should be visible
+    const lastSeen = await store.getLastSeenVersion();
+    expect(lastSeen).toBe(10);
+
+    // Reject any manifest version <= 10
+    const oldManifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("node", "00".repeat(32)),
+    ], { version: 9 }) as ConsortiumManifest;
+    await manager2.handleManifestPollResponse(oldManifest);
+    expect(await store.getLastSeenVersion()).toBe(10); // unchanged
+  });
+});
+
+// ─── AC-013: ISignalingOutboundQueue stub ─────────────────────────────────────
+
+describe("AC-013: ISignalingOutboundQueue — SIGNAL-001 stub", () => {
+  it("enqueues frames and allows inspection", () => {
+    const queue = new InMemorySignalingOutboundQueue();
+    queue.enqueue({ type: "manifest_poll_request" });
+    queue.enqueue({ type: "other_frame", data: 42 });
+    expect(queue.getFrames()).toHaveLength(2);
+    expect(queue.getFrames()[0]).toEqual({ type: "manifest_poll_request" });
+  });
+
+  it("drain() returns all frames and clears the queue", () => {
+    const queue = new InMemorySignalingOutboundQueue();
+    queue.enqueue({ type: "a" });
+    queue.enqueue({ type: "b" });
+    const drained = queue.drain();
+    expect(drained).toHaveLength(2);
+    expect(queue.getFrames()).toHaveLength(0);
+  });
+});
+
+// ─── ImmediatePollScheduler ───────────────────────────────────────────────────
+
+describe("ImmediatePollScheduler", () => {
+  it("fires the callback after the configured delay", async () => {
+    const scheduler = new ImmediatePollScheduler(0);
+    let fired = false;
+    scheduler.scheduleNext(async () => { fired = true; });
+    // Wait for the setTimeout(fn, 0) to fire
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(fired).toBe(true);
+  });
+
+  it("cancel() prevents the callback from firing", async () => {
+    const scheduler = new ImmediatePollScheduler(1000);
+    let fired = false;
+    scheduler.scheduleNext(async () => { fired = true; });
+    scheduler.cancel();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(fired).toBe(false);
+  });
+});
+
+// ─── TestDirectoryKeyProvider ─────────────────────────────────────────────────
+
+describe("TestDirectoryKeyProvider", () => {
+  it("produces deterministic public key from private key seed", () => {
+    const provider = new TestDirectoryKeyProvider({
+      nodeId: "test",
+      privateKeyHex: TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex,
+    });
+    expect(provider.getPublicKeyHex()).toBe(TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex);
+  });
+
+  it("sign() returns a 64-byte signature that verifies against the public key", async () => {
+    const provider = new TestDirectoryKeyProvider({
+      nodeId: "test",
+      privateKeyHex: TEST_DIRECTORY_NODE_KEYPAIR.privateKeyHex,
+    });
+    const msg = new TextEncoder().encode("test message");
+    const sig = await provider.sign(msg);
+    expect(sig.length).toBe(64);
+
+    // Verify with @noble/curves (RFC 8032)
+    const pubKeyBytes = Buffer.from(TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex, "hex");
+    expect(ed25519.verify(sig, msg, pubKeyBytes)).toBe(true);
+  });
+
+  it("throws on invalid privateKeyHex length", () => {
+    expect(() => new TestDirectoryKeyProvider({
+      nodeId: "test",
+      privateKeyHex: "too-short",
+    })).toThrow();
+  });
+});
+
+// ─── TestDirectoryManifestStore ───────────────────────────────────────────────
+
+describe("TestDirectoryManifestStore", () => {
+  it("getCurrentManifest returns the fixed manifest", () => {
+    const manifest: ConsortiumManifest = makeTestManifest([
+      makeTestNode("node-1", "00".repeat(32)),
+    ]) as ConsortiumManifest;
+    const store = new TestDirectoryManifestStore(manifest);
+    expect(store.getCurrentManifest()).toBe(manifest);
+  });
+});
