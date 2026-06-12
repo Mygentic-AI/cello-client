@@ -22,7 +22,7 @@ describe("ipc-client", () => {
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-client-test-"));
-    logger = { info: () => {}, warn: () => {}, error: () => {} };
+    logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
   });
 
   afterEach(async () => {

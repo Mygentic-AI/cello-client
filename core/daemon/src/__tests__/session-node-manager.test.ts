@@ -76,6 +76,7 @@ import type { PeerId, MultiaddrConnection, ConnectionGater } from "@libp2p/inter
 function makeLogger(): { logger: Logger; events: Array<{ level: string; event: string; context: Record<string, unknown> }> } {
   const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
   const logger: Logger = {
+    debug(event, context) { events.push({ level: "debug", event, context }); },
     info(event, context) { events.push({ level: "info", event, context }); },
     warn(event, context) { events.push({ level: "warn", event, context }); },
     error(event, context) { events.push({ level: "error", event, context }); },

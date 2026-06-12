@@ -9,6 +9,7 @@
 // --- Logger interface (injected, never imported directly) ---
 
 export interface Logger {
+  debug(event: string, context: Record<string, unknown>): void;
   info(event: string, context: Record<string, unknown>): void;
   warn(event: string, context: Record<string, unknown>): void;
   error(event: string, context: Record<string, unknown>): void;
@@ -99,6 +100,11 @@ export interface DaemonStatusResponse {
    * daemon startup (before the IPC socket opens). DAEMON-002 AC-002.
    */
   standing_receiver_ready: boolean;
+  /**
+   * Total count of retry_queue entries across all sessions.
+   * Always present as integer >= 0. DAEMON-003 AC-009.
+   */
+  retryQueueDepth: number;
 }
 
 // --- Daemon configuration ---

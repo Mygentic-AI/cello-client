@@ -32,6 +32,8 @@ import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
+import { RetryQueue } from "./retry-queue.js";
+import { NonceDedupStore } from "./nonce-dedup.js";
 import { createNode } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
@@ -108,6 +110,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
   await sessionNodeManager.initialize();
 
+  // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
+  // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
+  // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
+  const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
+  retryQueue.loadFromDb();
+
+  const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
+  nonceDedupStore.loadFromDb();
+
   // Build status response factory
   function getStatus(): DaemonStatusResponse {
     return {
@@ -118,6 +129,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agents,
       connections,
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
+      retryQueueDepth: retryQueue.getTotalDepth(),
     };
   }
 
@@ -126,6 +138,46 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   handlers.set("status", async () => {
     return getStatus();
+  });
+
+  // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
+  handlers.set("queue_failed_send", async (params) => {
+    const sessionId = params?.sessionId as string | undefined;
+    const nonceHex = params?.nonce as string | undefined;
+    const contentHex = params?.content as string | undefined;
+    if (!sessionId || !nonceHex || !contentHex) {
+      return { error: "missing_params", guidance: "Provide sessionId, nonce (hex), and content (hex)." };
+    }
+    const nonce = Buffer.from(nonceHex, "hex");
+    const content = Buffer.from(contentHex, "hex");
+    retryQueue.enqueue(sessionId, nonce, content);
+    return { queued: true, queueDepth: retryQueue.getSessionDepth(sessionId) };
+  });
+
+  handlers.set("check_nonce", async (params) => {
+    const sessionId = params?.sessionId as string | undefined;
+    const nonceHex = params?.nonce as string | undefined;
+    const senderPubkeyHex = params?.senderPubkey as string | undefined;
+    if (!sessionId || !nonceHex || !senderPubkeyHex) {
+      return { error: "missing_params", guidance: "Provide sessionId, nonce (hex), and senderPubkey (hex)." };
+    }
+    const nonce = Buffer.from(nonceHex, "hex");
+    const senderPubkey = Buffer.from(senderPubkeyHex, "hex");
+    const duplicate = nonceDedupStore.checkAndAdd(sessionId, nonce, senderPubkey);
+    return { duplicate };
+  });
+
+  // DAEMON-003: drain_session IPC handler — triggered on peer reconnect.
+  // Returns pending entry metadata (nonces only — SI-002 forbids content in IPC frames).
+  // The actual drain+delivery is triggered separately when a real sendFn is available.
+  handlers.set("drain_session", async (params) => {
+    const sessionId = params?.sessionId as string | undefined;
+    if (!sessionId) {
+      return { error: "missing_params", guidance: "Provide sessionId." };
+    }
+    const depth = retryQueue.getSessionDepth(sessionId);
+    const entries = retryQueue.getSessionEntries(sessionId);
+    return { pendingCount: depth, nonces: entries.map(e => e.nonceHex) };
   });
 
   let shutdownPromise: Promise<void> | null = null;
