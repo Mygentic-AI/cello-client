@@ -119,10 +119,10 @@ export function createIpcServer(
       if (disconnectHandler) disconnectHandler(connectionId);
     });
 
+    // Set shutdownReason so the 'close' handler (which always fires after 'error') logs it.
+    // Do NOT call disconnectHandler or log here — 'close' fires immediately after 'error'.
     socket.on("error", (err: Error) => {
-      connections.delete(connectionId);
-      logger.info("daemon.ipc.disconnected", { connectionId, reason: err.message });
-      if (disconnectHandler) disconnectHandler(connectionId);
+      conn.shutdownReason = err.message;
     });
   }
 
@@ -154,7 +154,7 @@ export function createIpcServer(
         error: {
           code: "method_not_found",
           message: `Unknown method: ${request.method}`,
-          guidance: "Available methods: status, shutdown",
+          guidance: `Unknown IPC method '${request.method}'. Check that cello-mcp and the daemon are the same version. Run 'cello status' to verify the daemon is running.`,
         },
       };
       conn.socket.write(JSON.stringify(errorResp) + "\n");

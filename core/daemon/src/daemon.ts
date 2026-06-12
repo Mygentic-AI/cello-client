@@ -365,6 +365,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
   }
 
+  // ─── MCP-001: stubs for tools registered in cello-mcp.ts but not yet implemented ───
+  // These return not_implemented (same as session tools) so LLMs get consistent guidance.
+  for (const tool of ["cello_backup", "cello_restore", "cello_get_sealed_receipt", "cello_get_inclusion_proof"]) {
+    handlers.set(tool, async (_params, _connectionId) => {
+      return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
+    });
+  }
+
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
