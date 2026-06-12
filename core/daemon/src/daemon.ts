@@ -133,6 +133,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!shutdownPromise) {
       shutdownPromise = stop("logout_requested").catch((err: unknown) => {
         logger.error("daemon.shutdown.failed", {
+          signal: "logout",
           error: err instanceof Error ? err.message : String(err),
         });
       });

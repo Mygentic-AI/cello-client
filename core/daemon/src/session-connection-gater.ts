@@ -136,6 +136,14 @@ export class DirectoryConnectionGater implements ConnectionGater {
   }
 
   denyInboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
+    return this.#denyIfNotDirectory(peerId);
+  }
+
+  denyOutboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
+    return this.#denyIfNotDirectory(peerId);
+  }
+
+  #denyIfNotDirectory(peerId: PeerId): boolean {
     const peerIdStr = peerId.toString();
     if (this.#provider.isDirectoryPeer(peerIdStr)) {
       return false; // allow

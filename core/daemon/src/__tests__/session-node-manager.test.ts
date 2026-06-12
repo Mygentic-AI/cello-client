@@ -415,12 +415,21 @@ describe("SessionNodeManager — unit tests", () => {
   // None of these swallow exceptions silently — they are all at network write sites
   // where the connection state is unknown. All upstream error handling extracts
   // error.message explicitly (see line ~174: err instanceof Error ? err.message : String(err)).
-  it("AC-013: ipc-server.ts intentional bare catch blocks are all at best-effort write sites", () => {
-    // This test documents the audit finding. The actual ipc-server.ts code is verified
-    // by the ipc-server.test.ts suite. The bare catches are all after socket.write()
-    // calls — where the connection may be closed before the write completes.
-    // Each is preceded by comment documenting why it is intentional.
-    expect(true).toBe(true); // presence of this test documents the audit
+  it("AC-013: ipc-server.ts bare catch blocks are preceded by documenting comments", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const src = await readFile(join(__dirname, "..", "ipc-server.ts"), "utf-8");
+    const lines = src.split("\n");
+    const bareCatchIndices = lines
+      .map((line, i) => ({ line: line.trim(), i }))
+      .filter(({ line }) => line === "} catch {")
+      .map(({ i }) => i);
+    // Every bare catch must have a comment on the line immediately after (inside the block)
+    expect(bareCatchIndices.length).toBeGreaterThan(0);
+    for (const idx of bareCatchIndices) {
+      const nextLine = lines[idx + 1]?.trim() ?? "";
+      expect(nextLine.startsWith("//")).toBe(true);
+    }
   });
 
   // ── AC-015: gater.setAllowedPeer called before acceptSession() returns ────
@@ -1262,8 +1271,8 @@ describe("SessionNodeManager — integration tests", () => {
       counterparty_pubkey TEXT NOT NULL, status TEXT NOT NULL,
       created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
     )`);
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s1","alice","pk-alice","active",now,now);
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s2","bob","pk-bob","active",now,now);
+    db.prepare("INSERT INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s1","alice","pk-alice","active",now,now);
+    db.prepare("INSERT INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s2","bob","pk-bob","active",now,now);
     db.close();
 
     // Step (c): send SIGTERM and wait for clean exit
@@ -1308,55 +1317,39 @@ describe("SessionNodeManager — integration tests", () => {
     await clientNode.start();
     cleanupNodes.push(serverNode, clientNode);
 
-    // Register a handler on the server
-    let serverStream: import("@libp2p/interface").Stream | null = null;
-    await serverNode.handle(PROTOCOL, (stream) => {
-      serverStream = stream;
+    await serverNode.handle(PROTOCOL, async (stream) => {
+      await stream.close();
     });
 
-    // Client dials server
     const serverAddrs = serverNode.listenAddresses();
     await clientNode.dial(serverAddrs[0]);
 
-    // Client opens a stream
     const serverPeerId = serverNode.getPeerId();
     const clientStream = await clientNode.newStream(serverPeerId, PROTOCOL);
 
-    // Wait for server to receive the stream
-    await new Promise((r) => setTimeout(r, 100));
+    // Stop the server node entirely — tears down the TCP connection.
+    // This guarantees the client-side stream is broken unambiguously.
+    await serverNode.stop();
+    await new Promise((r) => setTimeout(r, 300));
 
-    // Close the stream on the server side (simulates remote close)
-    if (serverStream) {
-      await (serverStream as import("@libp2p/interface").Stream).close();
-    }
-
-    // Wait a moment for the close to propagate
-    await new Promise((r) => setTimeout(r, 200));
-
-    // Now try to write to the dead stream — must produce an error with a message
+    // Attempt to write on the now-dead stream. The v3 API is stream.send() +
+    // stream.close(). send() may buffer but close() must flush — one of them
+    // will throw or the stream's close event will carry an error.
     let caughtError: unknown = null;
     try {
-      // Drain the sink with an error-producing source
-      const source = async function* () {
-        yield new Uint8Array([1, 2, 3]);
-      };
-      // Consuming clientStream.sink should throw after the remote has closed
-      await clientStream.sink(source());
+      clientStream.send(new Uint8Array([1, 2, 3]));
+      await clientStream.close();
     } catch (err: unknown) {
       caughtError = err;
     }
 
-    // We must have caught something, and it must have a message property
-    // (not be '[object Object]')
-    if (caughtError !== null) {
-      const msg = caughtError instanceof Error
-        ? caughtError.message
-        : String(caughtError);
-      expect(msg).not.toBe("[object Object]");
-      expect(msg.length).toBeGreaterThan(0);
-    }
-    // If no error was caught, the stream silently accepted — that's also valid
-    // as long as the daemon doesn't crash. AC-012 primarily verifies the
-    // error extraction pattern; the stream behavior is transport-dependent.
+    // Unconditional assertion: the error MUST surface (server is gone)
+    expect(caughtError).not.toBeNull();
+    const msg = caughtError instanceof Error
+      ? caughtError.message
+      : String(caughtError);
+    // AC-012 core assertion: error.message is extractable and not '[object Object]'
+    expect(msg).not.toBe("[object Object]");
+    expect(msg.length).toBeGreaterThan(0);
   }, 20_000);
 });

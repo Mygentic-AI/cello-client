@@ -343,14 +343,7 @@ export class SessionNodeManager {
     });
 
     // Immediately spin up a replacement (async — do NOT await, AC-003)
-    this.#createStandingReceiver().catch((err: unknown) => {
-      this.#logger.error("session.node.create.failed", {
-        sessionId: "standing_receiver_replacement",
-        agentName: STANDING_RECEIVER_AGENT_NAME,
-        error: err instanceof Error ? err.message : String(err),
-        correlationId,
-      });
-    });
+    this.#createStandingReceiverWithRetry(correlationId);
 
     return { ok: true, peerId, addrs };
   }
@@ -423,23 +416,23 @@ export class SessionNodeManager {
       }
     }
 
-    // Stop all session nodes, then emit session.node.destroyed after each stop
+    // Stop all session nodes, then emit session.node.destroyed only on success
     // (mirrors destroySessionNode ordering: stop first, log destroyed after)
     const stopPromises: Promise<void>[] = [];
     for (const [sessionId, entry] of this.#activeNodes) {
       stopPromises.push(
-        entry.node.stop().catch((err: unknown) => {
+        entry.node.stop().then(() => {
+          this.#logger.info("session.node.destroyed", {
+            sessionId,
+            agentName: entry.agentName,
+            reason: "interrupted",
+          });
+        }).catch((err: unknown) => {
           this.#logger.error("session.node.stop.failed", {
             sessionId,
             agentName: entry.agentName,
             error: err instanceof Error ? err.message : String(err),
             correlationId: entry.correlationId,
-          });
-        }).then(() => {
-          this.#logger.info("session.node.destroyed", {
-            sessionId,
-            agentName: entry.agentName,
-            reason: "interrupted",
           });
         }),
       );
@@ -524,7 +517,7 @@ export class SessionNodeManager {
     try {
       this.#db
         .prepare(
-          `INSERT OR REPLACE INTO sessions
+          `INSERT INTO sessions
            (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
@@ -537,6 +530,30 @@ export class SessionNodeManager {
       });
       return false;
     }
+  }
+
+  async #createStandingReceiverWithRetry(correlationId: string): Promise<void> {
+    const MAX_RETRIES = 3;
+    const BACKOFF_MS = [100, 500, 2000];
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        await this.#createStandingReceiver();
+        return;
+      } catch (err: unknown) {
+        this.#logger.error("session.node.create.failed", {
+          sessionId: "standing_receiver_replacement",
+          agentName: STANDING_RECEIVER_AGENT_NAME,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+        if (attempt < MAX_RETRIES - 1) {
+          await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+        }
+      }
+    }
+    this.#logger.error("session.standing_receiver.permanently_unavailable", {
+      correlationId,
+    });
   }
 
   #updateSessionStatus(
