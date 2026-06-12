@@ -24,6 +24,8 @@
   },
   "dependencies": {
     "@cello-protocol/crypto": "workspace:*",
+    "@cello-protocol/protocol-types": "workspace:*",
+    "@noble/curves": "2.2.0",
     "@libp2p/crypto": "^5.0.0",
     "@libp2p/interface": "^3.0.0",
     "@libp2p/peer-id": "^6.0.0",

@@ -51,4 +51,4 @@ export {
   TEST_CONSORTIUM_THRESHOLD,
 } from "./consortium-keys.js";
 export type { TestConsortiumNode, MakeTestManifestOpts } from "./manifest-test-fixture.js";
-export { makeTestManifest } from "./manifest-test-fixture.js";
+export { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR } from "./manifest-test-fixture.js";
