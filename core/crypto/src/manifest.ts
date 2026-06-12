@@ -125,6 +125,17 @@ export function verifyManifest(
   rootKeys: readonly string[],
   threshold: number,
 ): ManifestVerifyResult {
+  // A manifest with no nodes is structurally invalid — the consumer has no nodes
+  // to connect to and cannot distinguish "empty by design" from "tampered" (AC-003(d)).
+  if (manifest.nodes.length === 0) {
+    return {
+      ok: false,
+      reason: "manifest_signature_invalid",
+      detail: "manifest contains no nodes",
+      diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+    };
+  }
+
   const body = canonicalManifestBody(manifest);
   const verifiedIndices = new Set<number>();
   const skippedEntries: ManifestVerifySkippedEntry[] = [];

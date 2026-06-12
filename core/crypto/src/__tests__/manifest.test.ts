@@ -17,6 +17,7 @@
  * AC-014: Error distinctness — every failure path is unique and diagnosable.
  * AC-017: Empty signatures array → { ok: false, detail: '0 valid of 3 required' }.
  * AC-018: All malformed entries → processes all (no early exit), returns { ok: false }.
+ * Empty nodes guard: manifest.nodes === [] → { ok: false, detail: 'manifest contains no nodes' }.
  *
  * SI-001: Duplicate officer index → only 1 unique counts.
  * SI-002: Canonical serialization is insertion-order independent.
@@ -560,6 +561,43 @@ describe("AC-017: empty signatures array", () => {
       expect(result.reason).toBe("manifest_signature_invalid");
       expect(result.detail).toContain("0 valid");
       expect(result.detail).toContain("3 required");
+    }
+  });
+});
+
+// ─── Empty nodes guard ───────────────────────────────────────────────────────
+
+describe("verifyManifest: empty nodes array", () => {
+  it("manifest with nodes: [] → { ok: false, detail: 'manifest contains no nodes' }", () => {
+    const manifest: ConsortiumManifestInput = {
+      version: 1,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2027-01-01T00:00:00Z",
+      nodes: [],
+      signatures: [],
+    };
+
+    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("manifest_signature_invalid");
+      expect(result.detail).toBe("manifest contains no nodes");
+    }
+  });
+
+  it("empty nodes → { ok: false } even when threshold signatures are present", () => {
+    const manifest: ConsortiumManifestInput = {
+      version: 1,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2027-01-01T00:00:00Z",
+      nodes: [],
+      signatures: signManifest({ version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes: [], signatures: [] }, [0, 1, 2]),
+    };
+
+    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.detail).toBe("manifest contains no nodes");
     }
   });
 });
