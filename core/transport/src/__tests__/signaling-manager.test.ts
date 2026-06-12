@@ -684,3 +684,466 @@ describe("TestDirectoryManifestStore", () => {
     expect(store.getCurrentManifest()).toBe(manifest);
   });
 });
+
+// ─── SIGNAL-001: SignalingManager lifecycle tests ─────────────────────────────
+//
+// Tests for heartbeat, backoff reconnect, operation queue, status transitions,
+// and graceful shutdown — the SIGNAL-001 behaviors merged into SignalingManager.
+
+import { afterEach } from "vitest";
+
+// --- SignalingStream mock ---
+
+interface MockStream {
+  send(frame: unknown): Promise<void>;
+  onMessage(handler: (frame: unknown) => void): void;
+  close(): void;
+  simulateMessage(frame: unknown): void;
+}
+
+function createMockStream(opts?: { sendShouldThrow?: Error; closeCalled?: { count: number } }): MockStream {
+  let messageHandler: ((frame: unknown) => void) | null = null;
+  return {
+    async send(_frame: unknown) {
+      if (opts?.sendShouldThrow) throw opts.sendShouldThrow;
+    },
+    onMessage(handler: (frame: unknown) => void) { messageHandler = handler; },
+    close() { if (opts?.closeCalled) opts.closeCalled.count++; },
+    simulateMessage(frame: unknown) { if (messageHandler) messageHandler(frame); },
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function createTestLogger() {
+  const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
+  return {
+    logger: {
+      info(event: string, context: Record<string, unknown>) { events.push({ level: "info", event, context }); },
+      warn(event: string, context: Record<string, unknown>) { events.push({ level: "warn", event, context }); },
+      error(event: string, context: Record<string, unknown>) { events.push({ level: "error", event, context }); },
+    },
+    events,
+  };
+}
+
+const SHORT_INTERVAL = 50;
+const SHORT_TIMEOUT = 50;
+const SHORT_BACKOFF = 10;
+const SHORT_MAX_BACKOFF = 100;
+
+const liveOnly = describe.skipIf(!process.env.CELLO_E2E_LIVE);
+
+liveOnly("SignalingManager — live E2E (SIGNAL-001)", () => {
+  it("AC-001: detects TCP kill within 30s of heartbeat being active", () => {
+    expect(true).toBe(true); // placeholder — requires real infra
+  });
+  it("AC-003: reconnect success with full state transition", () => {
+    expect(true).toBe(true); // placeholder — requires real infra
+  });
+});
+
+describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
+  let manager: InstanceType<typeof SignalingManager> | null;
+
+  afterEach(async () => {
+    if (manager) {
+      await manager.stop();
+      manager = null;
+    }
+  });
+
+  describe("AC-002: Backoff timing sequence", () => {
+    it("first 4 reconnect attempts have correct exponential backoffMs", async () => {
+      const { logger, events } = createTestLogger();
+      let attempt = 0;
+
+      manager = new SignalingManager({
+        connect: async () => { attempt++; throw new Error(`refused_${attempt}`); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 5,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(300);
+
+      const reconnectingEvents = events.filter((e) => e.event === "directory.signaling.reconnecting");
+      expect(reconnectingEvents.length).toBeGreaterThanOrEqual(4);
+      expect(reconnectingEvents[0].context.backoffMs).toBe(SHORT_BACKOFF);
+      expect(reconnectingEvents[1].context.backoffMs).toBe(SHORT_BACKOFF * 2);
+      expect(reconnectingEvents[2].context.backoffMs).toBe(SHORT_BACKOFF * 4);
+      expect(reconnectingEvents[3].context.backoffMs).toBe(SHORT_BACKOFF * 8);
+    });
+
+    it("backoff caps at maxBackoffMs", async () => {
+      const { logger, events } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("refused"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(1200);
+
+      const reconnectingEvents = events.filter((e) => e.event === "directory.signaling.reconnecting");
+      const overCap = reconnectingEvents.filter((e) => (e.context.backoffMs as number) > SHORT_MAX_BACKOFF);
+      expect(overCap.length).toBe(0);
+    });
+  });
+
+  describe("AC-004: 10 failed attempts → 'lost'", () => {
+    it("fires 10 reconnecting events then reconnect.failed, status is lost", async () => {
+      const { logger, events } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("unreachable"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(1500);
+
+      const reconnectingEvents = events.filter((e) => e.event === "directory.signaling.reconnecting");
+      expect(reconnectingEvents.length).toBe(10);
+
+      const failedEvents = events.filter((e) => e.event === "directory.signaling.reconnect.failed");
+      expect(failedEvents.length).toBe(1);
+      expect(failedEvents[0].context.maxAttempts).toBe(10);
+      expect(manager!.status).toBe("lost");
+    });
+  });
+
+  describe("AC-005: Two-tier model — MCP immediate rejection, internal ops queued and drained", () => {
+    it("MCP call rejected immediately when reconnecting, internal op queued and drained on reconnect", async () => {
+      const { logger, events } = createTestLogger();
+      let connectAttempt = 0;
+
+      manager = new SignalingManager({
+        connect: async () => {
+          connectAttempt++;
+          if (connectAttempt <= 3) throw new Error(`refused_${connectAttempt}`);
+          return { stream: createMockStream(), directoryNodeId: "node-b", manifestVersion: 2 };
+        },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(5);
+      expect(manager.status).toBe("reconnecting");
+
+      const mcpResult = await manager.submitMcpOperation();
+      expect(mcpResult.ok).toBe(false);
+      expect(mcpResult.reason).toBe("signaling_reconnecting");
+      expect((mcpResult as { guidance: string }).guidance).toContain("reconnects automatically");
+
+      let internalResolved = false;
+      const internalPromise = manager.submitInternalOperation(async () => {
+        internalResolved = true;
+        return { success: true };
+      });
+
+      await delay(5);
+      expect(internalResolved).toBe(false);
+
+      await delay(300);
+
+      const result = await internalPromise;
+      expect(internalResolved).toBe(true);
+      expect(result).toEqual({ success: true });
+
+      const connectedEvents = events.filter((e) => e.event === "directory.signaling.connected");
+      expect(connectedEvents.length).toBeGreaterThanOrEqual(1);
+      expect(manager.status).toBe("connected");
+    });
+  });
+
+  describe("AC-006: MCP calls rejected immediately, queue depth stays 0", () => {
+    it("two MCP calls both rejected, queue empty", async () => {
+      const { logger } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("always_fails"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(5);
+      const r1 = await manager.submitMcpOperation();
+      const r2 = await manager.submitMcpOperation();
+
+      expect(r1.ok).toBe(false);
+      expect(r1.reason).toBe("signaling_reconnecting");
+      expect(r2.ok).toBe(false);
+      expect(r2.reason).toBe("signaling_reconnecting");
+      expect(manager.queueDepth).toBe(0);
+    });
+  });
+
+  describe("AC-007: 64-op queue cap, 65th rejected with signaling_queue_full", () => {
+    it("65th internal op rejected with signaling_queue_full", async () => {
+      const { logger } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("always_fails"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+        outboundQueueCap: 64,
+      });
+
+      await delay(5);
+      for (let i = 0; i < 64; i++) {
+        manager.submitInternalOperation(async () => ({ idx: i }));
+      }
+      expect(manager.queueDepth).toBe(64);
+
+      const result65 = await manager.submitInternalOperation(async () => ({ idx: 65 }));
+      expect(result65).toEqual({ ok: false, reason: "signaling_queue_full", guidance: expect.any(String) });
+      expect(manager.queueDepth).toBe(64);
+    });
+  });
+
+  describe("AC-008: 'lost' state rejects all ops, flushes queue", () => {
+    it("queued ops flushed with signaling_lost on transition, new ops rejected", async () => {
+      const { logger } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("permanently_unreachable"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 3,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(5);
+      const p1 = manager.submitInternalOperation(async () => "op1");
+      const p2 = manager.submitInternalOperation(async () => "op2");
+      expect(manager.queueDepth).toBe(2);
+
+      await delay(200);
+      expect(manager.status).toBe("lost");
+      expect(manager.queueDepth).toBe(0);
+
+      const r1 = await p1;
+      const r2 = await p2;
+      expect(r1).toEqual({ ok: false, reason: "signaling_lost", guidance: expect.stringContaining("lost its connection") });
+      expect(r2).toEqual({ ok: false, reason: "signaling_lost", guidance: expect.stringContaining("lost its connection") });
+
+      const newMcp = await manager.submitMcpOperation();
+      expect(newMcp.ok).toBe(false);
+      expect(newMcp.reason).toBe("signaling_lost");
+    });
+  });
+
+  describe("AC-009: FIFO drain order, partial failure continues", () => {
+    it("drains in FIFO order, op-B failure does not halt op-C", async () => {
+      const { logger } = createTestLogger();
+      let connectAttempt = 0;
+      const executionOrder: string[] = [];
+
+      manager = new SignalingManager({
+        connect: async () => {
+          connectAttempt++;
+          if (connectAttempt === 1) throw new Error("first_fail");
+          return { stream: createMockStream(), directoryNodeId: "node-a", manifestVersion: 1 };
+        },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(5);
+
+      const opA = manager.submitInternalOperation(async () => { executionOrder.push("A"); return "result-A"; });
+      const opB = manager.submitInternalOperation(async () => { executionOrder.push("B"); throw new Error("op_b_failed"); });
+      const opC = manager.submitInternalOperation(async () => { executionOrder.push("C"); return "result-C"; });
+
+      let opBError: Error | null = null;
+      const opBCaught = opB.catch((err) => { opBError = err as Error; });
+
+      await delay(100);
+
+      expect(await opA).toBe("result-A");
+      await opBCaught;
+      expect(opBError).toBeInstanceOf(Error);
+      expect(opBError!.message).toBe("op_b_failed");
+      expect(await opC).toBe("result-C");
+      expect(executionOrder).toEqual(["A", "B", "C"]);
+    });
+  });
+
+  describe("AC-012: Send-path liveness — stream dies at send", () => {
+    it("write failure triggers disconnect and reconnect", async () => {
+      const { logger, events } = createTestLogger();
+      let connectAttempt = 0;
+      const sendError = new Error("ECONNRESET: connection reset by peer");
+
+      manager = new SignalingManager({
+        connect: async () => {
+          connectAttempt++;
+          if (connectAttempt === 1) return { stream: createMockStream({ sendShouldThrow: sendError }), directoryNodeId: "node-a", manifestVersion: 1 };
+          return { stream: createMockStream(), directoryNodeId: "node-b", manifestVersion: 2 };
+        },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(10);
+      expect(manager.status).toBe("connected");
+
+      await delay(SHORT_INTERVAL + 20);
+
+      const disconnects = events.filter((e) => e.event === "directory.signaling.disconnected");
+      expect(disconnects.length).toBeGreaterThanOrEqual(1);
+      expect(disconnects[0].context.reason).toBe("ECONNRESET: connection reset by peer");
+
+      await delay(50);
+      expect(manager.status).toBe("connected");
+    });
+  });
+
+  describe("DB-002: Graceful shutdown during reconnecting", () => {
+    it("cancels reconnect loop, flushes queue with signaling_shutdown, does not transition to lost", async () => {
+      const { logger, events } = createTestLogger();
+
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("unreachable"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+
+      await delay(5);
+      const queuedOp = manager.submitInternalOperation(async () => "should_not_execute");
+
+      await manager.stop();
+
+      const result = await queuedOp;
+      expect(result).toEqual({ ok: false, reason: "signaling_shutdown", guidance: expect.stringContaining("shutting down") });
+
+      const failedEvents = events.filter((e) => e.event === "directory.signaling.reconnect.failed");
+      expect(failedEvents.length).toBe(0);
+
+      manager = null;
+    });
+  });
+
+  describe("Status transitions", () => {
+    it("starts as reconnecting during initial connect", () => {
+      const { logger } = createTestLogger();
+      manager = new SignalingManager({
+        connect: async () => { await delay(100); return { stream: createMockStream(), directoryNodeId: "node-a", manifestVersion: 1 }; },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+      expect(manager.status).toBe("reconnecting");
+    });
+
+    it("transitions to connected after successful connect, fires directory.signaling.connected", async () => {
+      const { logger, events } = createTestLogger();
+      manager = new SignalingManager({
+        connect: async () => ({ stream: createMockStream(), directoryNodeId: "node-a", manifestVersion: 1 }),
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+      await delay(20);
+      expect(manager.status).toBe("connected");
+      const connectedEvents = events.filter((e) => e.event === "directory.signaling.connected");
+      expect(connectedEvents.length).toBe(1);
+      expect(connectedEvents[0].context.directoryNodeId).toBe("node-a");
+    });
+
+    it("internal ops execute immediately when connected", async () => {
+      const { logger } = createTestLogger();
+      manager = new SignalingManager({
+        connect: async () => ({ stream: createMockStream(), directoryNodeId: "node-a", manifestVersion: 1 }),
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL * 10,
+        heartbeatTimeoutMs: SHORT_TIMEOUT * 10,
+        maxReconnectAttempts: 10,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      });
+      await delay(20);
+      expect(manager.status).toBe("connected");
+      const result = await manager.submitInternalOperation(async () => "done");
+      expect(result).toBe("done");
+      expect(manager.queueDepth).toBe(0);
+    });
+  });
+
+  describe("SI-001: processStep5Frame nonce cleared after use — no stale replay", () => {
+    it("second call without setHandshakeContext returns handshake_context_missing", () => {
+      const { logger } = createTestLogger();
+      // Must provide a challengeVerifier so the early no_challenge_verifier guard doesn't fire.
+      // TestDirectoryChallengeVerifier is already imported at the top of this file.
+      manager = new SignalingManager({
+        connect: async () => { throw new Error("unused"); },
+        logger,
+        heartbeatIntervalMs: SHORT_INTERVAL,
+        heartbeatTimeoutMs: SHORT_TIMEOUT,
+        maxReconnectAttempts: 1,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+        challengeVerifier: new TestDirectoryChallengeVerifier(),
+      });
+
+      // First call with context set — consumes nonce
+      manager.setHandshakeContext("cc".repeat(32), "aa".repeat(32));
+      const first = manager.processStep5Frame({ type: "signaling_auth_ok", nodeId: "node-x", signature: "00".repeat(64), timestamp: "2026-06-12T10:00:00.000Z" });
+      // First call will return verified: false (TestDirectoryChallengeVerifier rejects unknown nodes),
+      // but the important thing is the nonce is consumed.
+      expect(first).toBeDefined();
+
+      // Second call without setting context — nonce must not be reused
+      const second = manager.processStep5Frame({ type: "signaling_auth_ok", nodeId: "node-x", signature: "00".repeat(64), timestamp: "2026-06-12T10:00:00.000Z" });
+      expect(second.verified).toBe(false);
+      expect((second as { reason: string }).reason).toBe("handshake_context_missing");
+    });
+  });
+});

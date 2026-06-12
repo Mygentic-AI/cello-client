@@ -76,8 +76,9 @@ export type { ChallengeVerifyResult } from "./manifest-interfaces.js";
 
 // ─── Logger interface ─────────────────────────────────────────────────────────
 
-// Structurally identical to daemon's Logger. Defined locally because transport
-// must not depend on daemon. TypeScript structural typing ensures compatibility.
+// Subset of daemon's Logger (daemon also has debug). Defined locally because transport
+// must not depend on daemon. TypeScript structural typing ensures compatibility —
+// a daemon Logger satisfies this interface.
 export interface Logger {
   info(event: string, context: Record<string, unknown>): void;
   warn(event: string, context: Record<string, unknown>): void;
@@ -279,7 +280,7 @@ export class SignalingManager {
     this._threshold = opts.threshold ?? 0;
 
     // Begin connection immediately — status starts as 'reconnecting'
-    this.reconnectLoop();
+    void this.reconnectLoop();
   }
 
   // ─── Public API — connection status ─────────────────────────────────────────
@@ -407,7 +408,14 @@ export class SignalingManager {
       return { verified: false, reason: "no_identity_proof" };
     }
 
-    if (this._pendingNonce === null || this._agentPubkeyHex === null) {
+    // Consume nonce and pubkey immediately — nonces are single-use.
+    // Clearing before verification prevents stale-nonce reuse across reconnects (SI-003).
+    const pendingNonce = this._pendingNonce;
+    const agentPubkeyHex = this._agentPubkeyHex;
+    this._pendingNonce = null;
+    this._agentPubkeyHex = null;
+
+    if (pendingNonce === null || agentPubkeyHex === null) {
       this._logger.error("directory.auth.challenge.failed", {
         correlationId: this._correlationId,
         nodeId,
@@ -418,8 +426,8 @@ export class SignalingManager {
 
     const tbsBytes = buildStep5Tbs({
       nodeId,
-      agentPubkeyHex: this._agentPubkeyHex,
-      nonceHex: this._pendingNonce,
+      agentPubkeyHex,
+      nonceHex: pendingNonce,
       isoTimestamp: timestamp,
     });
 
