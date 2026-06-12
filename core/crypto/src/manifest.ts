@@ -41,10 +41,16 @@ export interface ConsortiumManifestInput {
 
 export type ManifestVerifySkipReason = "out_of_bounds" | "duplicate" | "malformed_signature" | "malformed_key" | "verification_failed";
 
+export interface ManifestVerifySkippedEntry {
+  index: number;
+  reason: ManifestVerifySkipReason;
+  error?: string;
+}
+
 export interface ManifestVerifyDiagnostics {
   threshold: number;
   validOfficers: number[];
-  skippedEntries: Array<{ index: number; reason: ManifestVerifySkipReason }>;
+  skippedEntries: ManifestVerifySkippedEntry[];
 }
 
 export type ManifestVerifyResult =
@@ -122,7 +128,7 @@ export function verifyManifest(
   const body = canonicalManifestBody(manifest);
   const verifiedIndices = new Set<number>();
   const seenIndices = new Set<number>();
-  const skippedEntries: Array<{ index: number; reason: ManifestVerifySkipReason }> = [];
+  const skippedEntries: ManifestVerifySkippedEntry[] = [];
 
   for (const entry of manifest.signatures) {
     const { officerIndex, signature } = entry;
@@ -161,8 +167,8 @@ export function verifyManifest(
       } else {
         skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
       }
-    } catch {
-      skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
+    } catch (err: unknown) {
+      skippedEntries.push({ index: officerIndex, reason: "verification_failed", error: err instanceof Error ? err.message : String(err) });
       continue;
     }
   }

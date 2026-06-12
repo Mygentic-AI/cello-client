@@ -42,7 +42,7 @@ export { buildCheckpointTbs, computeCheckpointHash } from "./checkpoint.js";
 export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./relay-registration.js";
 
 // M7-MANIFEST-001: consortium manifest verification and root key constants
-export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ConsortiumManifestInput } from "./manifest.js";
+export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
 export { canonicalManifestBody, verifyManifest } from "./manifest.js";
 export {
   CONSORTIUM_ROOT_KEYS,
