@@ -185,37 +185,35 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     expect(verifiedEvent?.context.manifestVersion).toBe(1);
   });
 
-  it("AC-007 / SI-002: logs manifest.expired when manifest is expired, does not block startup", async () => {
+  it("AC-007 / SI-002 / ADV-002: expired manifest causes fatal startup error when manifestProvider configured", async () => {
     const logger = makeLogger();
     const expiredManifest = makeExpiredManifest();
     const manifestProvider = new TestManifestProvider(expiredManifest);
 
-    handle = await startDaemon(makeBaseConfig(logger, {
+    await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
       manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
       manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
-    }));
+    }))).rejects.toThrow(/Manifest verification failed/);
 
     const expiredEvent = logger.events.find((e) => e.event === "directory.auth.manifest.expired");
     expect(expiredEvent).toBeDefined();
     expect(expiredEvent?.context.manifestVersion).toBe(1);
-    // Daemon still starts (daemon.started must be present)
-    expect(logger.events.find((e) => e.event === "daemon.started")).toBeDefined();
   });
 
-  it("AC-008: logs manifest.version.rollback when manifest version is older than last seen", async () => {
+  it("AC-008 / ADV-002: version rollback causes fatal startup error when manifestProvider configured", async () => {
     const logger = makeLogger();
     const manifest = makeValidManifest(5);
     const manifestProvider = new TestManifestProvider(manifest);
     const versionStore = new InMemoryManifestVersionStore();
     await versionStore.persistVersion(10);
 
-    handle = await startDaemon(makeBaseConfig(logger, {
+    await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
       manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
       manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
       manifestVersionStore: versionStore,
-    }));
+    }))).rejects.toThrow(/Manifest verification failed/);
 
     const rollbackEvent = logger.events.find((e) => e.event === "directory.auth.manifest.version.rollback");
     expect(rollbackEvent).toBeDefined();
@@ -223,14 +221,13 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     expect(rollbackEvent?.context.lastSeenVersion).toBe(10);
   });
 
-  it("AC-012: poll scheduler is started after successful manifest load", async () => {
+  it("ADV-007: poll deferred log emitted when manifest verified (polling not yet wired)", async () => {
     const logger = makeLogger();
     const manifest = makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
-    let schedulerFired = false;
 
     const scheduler: IManifestPollScheduler = {
-      scheduleNext(_cb) { schedulerFired = true; },
+      scheduleNext(_cb) { /* no-op */ },
       cancel() { /* no-op */ },
     };
 
@@ -241,7 +238,8 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
       manifestPollScheduler: scheduler,
     }));
 
-    expect(schedulerFired).toBe(true);
+    const deferredEvent = logger.events.find((e) => e.event === "directory.auth.manifest.poll.deferred");
+    expect(deferredEvent).toBeDefined();
   });
 
   it("equal version passes (same version as last-seen is not a rollback)", async () => {
@@ -286,18 +284,42 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     expect(startedEvent?.context.manifestVerified).toBe(true);
   });
 
-  it("manifestVerified is false when manifest fails verification", async () => {
+  it("ADV-002: manifestVerified=false with manifestProvider configured throws (fatal)", async () => {
     const logger = makeLogger();
     const expiredManifest = makeExpiredManifest();
     const manifestProvider = new TestManifestProvider(expiredManifest);
 
-    handle = await startDaemon(makeBaseConfig(logger, {
+    await expect(startDaemon(makeBaseConfig(logger, {
       manifestProvider,
       manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
       manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
-    }));
+    }))).rejects.toThrow(/Manifest verification failed/);
 
-    const startedEvent = logger.events.find((e) => e.event === "daemon.started");
-    expect(startedEvent?.context.manifestVerified).toBe(false);
+    // daemon.started is never emitted when startup throws
+    expect(logger.events.find((e) => e.event === "daemon.started")).toBeUndefined();
+  });
+
+  it("ADV-006: manifestProvider without manifestRootKeys throws config error", async () => {
+    const logger = makeLogger();
+    const manifest = makeValidManifest();
+    const manifestProvider = new TestManifestProvider(manifest);
+
+    await expect(startDaemon(makeBaseConfig(logger, {
+      manifestProvider,
+      // manifestRootKeys intentionally omitted
+      manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+    }))).rejects.toThrow(/manifestProvider requires manifestRootKeys/);
+  });
+
+  it("ADV-008: manifestThreshold=0 throws config error", async () => {
+    const logger = makeLogger();
+    const manifest = makeValidManifest();
+    const manifestProvider = new TestManifestProvider(manifest);
+
+    await expect(startDaemon(makeBaseConfig(logger, {
+      manifestProvider,
+      manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      manifestThreshold: 0,
+    }))).rejects.toThrow(/manifestProvider requires manifestRootKeys.*manifestThreshold/);
   });
 });

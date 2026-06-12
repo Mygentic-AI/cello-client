@@ -22,7 +22,6 @@
   },
   "files": [
     "dist/",
-    "src/consortium-manifest.json",
     "package.json"
   ],
   "scripts": {

@@ -12,6 +12,8 @@ import * as lp from "it-length-prefixed";
 import type { Stream } from "@libp2p/interface";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { CelloNode } from "@cello-protocol/transport";
+import { buildStep5Tbs } from "@cello-protocol/transport";
+import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { InitiateSessionResult, ReceiveAssignmentResult, SessionRecord } from "./types.js";
@@ -66,6 +68,13 @@ export interface SignalingContext {
   hasConnectionPolicy(): boolean;
   receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
   getSession(sessionIdHex: string): SessionRecord | undefined;
+  /**
+   * ADV-001: Optional directory challenge verifier (MANIFEST-002 step-6).
+   * When provided, the handshake verifies the directory's Ed25519 signature
+   * against the manifest before proceeding. When absent, verification is skipped
+   * (backward compat for pre-MANIFEST-002 directories).
+   */
+  getChallengeVerifier(): IDirectoryChallengeVerifier | null;
 }
 
 export class SignalingManager {
@@ -262,6 +271,32 @@ export class SignalingManager {
         dirStream.abort(new Error("dir_auth_error")); return;
       }
 
+      // ADV-001: Step-6 verification on per-session directory stream.
+      const verifier2 = this.#ctx.getChallengeVerifier();
+      if (verifier2) {
+        const nodeId = ackFrame2["nodeId"] as string | undefined;
+        const signature = ackFrame2["signature"] as string | undefined;
+        const timestamp = ackFrame2["timestamp"] as string | undefined;
+
+        if (!nodeId || !signature || !timestamp) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", { reason: "no_identity_proof" });
+          dirStream.abort(new Error("directory_challenge_failed"));
+          return;
+        }
+
+        const nonceHex = Buffer.from(nonce).toString("hex");
+        const agentPubkeyHex = Buffer.from(myPubkey).toString("hex");
+        const tbsBytes = buildStep5Tbs({ nodeId, agentPubkeyHex, nonceHex, isoTimestamp: timestamp });
+        const result = verifier2.verifyChallenge(nodeId, tbsBytes, signature);
+
+        if (!result.valid) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", { directoryNodeId: nodeId, reason: result.reason });
+          dirStream.abort(new Error("directory_challenge_failed"));
+          return;
+        }
+        this.#ctx.logger.info("directory.auth.challenge.verified", { directoryNodeId: nodeId });
+      }
+
       void this.#runDirectoryStreamReader(sessionIdHex, dirStream, assignment.directory_pubkey, iter);
     } catch {
       // Directory connection failure — session still active
@@ -332,6 +367,32 @@ export class SignalingManager {
       } catch { sigStream.abort(new Error("dir_auth_error")); this.#ctx.logger.warn("relay.pubkey.lookup.failed", { relayId, reason: "decode_failed" }); return undefined; }
       if (ackFrame["type"] !== "signaling_auth_ok") {
         sigStream.abort(new Error("dir_auth_error")); this.#ctx.logger.warn("relay.pubkey.lookup.failed", { relayId, reason: "auth_failed" }); return undefined;
+      }
+
+      // ADV-001: Step-6 verification on relay pubkey lookup stream.
+      const verifier3 = this.#ctx.getChallengeVerifier();
+      if (verifier3) {
+        const nodeId = ackFrame["nodeId"] as string | undefined;
+        const signature = ackFrame["signature"] as string | undefined;
+        const timestamp = ackFrame["timestamp"] as string | undefined;
+
+        if (!nodeId || !signature || !timestamp) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", { reason: "no_identity_proof" });
+          sigStream.abort(new Error("directory_challenge_failed"));
+          return undefined;
+        }
+
+        const nonceHex = Buffer.from(nonce).toString("hex");
+        const agentPubkeyHex = this.#ctx.getMyPubkeyHex()!;
+        const tbsBytes = buildStep5Tbs({ nodeId, agentPubkeyHex, nonceHex, isoTimestamp: timestamp });
+        const result = verifier3.verifyChallenge(nodeId, tbsBytes, signature);
+
+        if (!result.valid) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", { directoryNodeId: nodeId, reason: result.reason });
+          sigStream.abort(new Error("directory_challenge_failed"));
+          return undefined;
+        }
+        this.#ctx.logger.info("directory.auth.challenge.verified", { directoryNodeId: nodeId });
       }
 
       sigStream.send(lp.encode.single(CBOR_ENC.encode({
@@ -526,6 +587,42 @@ export class SignalingManager {
       } catch { sigStream.abort(new Error("dir_auth_error")); return false; }
       if (ackFrame["type"] !== "signaling_auth_ok") {
         sigStream.abort(new Error("dir_auth_error")); return false;
+      }
+
+      // ADV-001: Step-6 directory challenge verification (MANIFEST-002).
+      // Verify the directory's Ed25519 signature over the challenge TBS before
+      // trusting the connection.
+      const verifier = this.#ctx.getChallengeVerifier();
+      if (verifier) {
+        const nodeId = ackFrame["nodeId"] as string | undefined;
+        const signature = ackFrame["signature"] as string | undefined;
+        const timestamp = ackFrame["timestamp"] as string | undefined;
+
+        if (!nodeId || !signature || !timestamp) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", {
+            reason: "no_identity_proof",
+          });
+          sigStream.abort(new Error("directory_challenge_failed"));
+          return false;
+        }
+
+        const nonceHex = Buffer.from(nonce).toString("hex");
+        const agentPubkeyHex = this.#ctx.getMyPubkeyHex()!;
+        const tbsBytes = buildStep5Tbs({ nodeId, agentPubkeyHex, nonceHex, isoTimestamp: timestamp });
+        const result = verifier.verifyChallenge(nodeId, tbsBytes, signature);
+
+        if (!result.valid) {
+          this.#ctx.logger.error("directory.auth.challenge.failed", {
+            directoryNodeId: nodeId,
+            reason: result.reason,
+          });
+          sigStream.abort(new Error("directory_challenge_failed"));
+          return false;
+        }
+
+        this.#ctx.logger.info("directory.auth.challenge.verified", {
+          directoryNodeId: nodeId,
+        });
       }
 
       const peerInfoFrame = CBOR_ENC.encode({

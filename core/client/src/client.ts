@@ -11,7 +11,7 @@ import {
 import type { IThresholdSigner } from "@cello-protocol/crypto";
 import { CELLO_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import type { CelloNode } from "@cello-protocol/transport";
+import type { CelloNode, IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import type { SessionAssignment, RegistrationState } from "@cello-protocol/protocol-types";
 import type {
@@ -133,6 +133,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
   persistence: ClientStatePersistence | null = null;
   hashQueue: AgentHashQueue | null = null;
   evaluateCallCount = 0;
+  challengeVerifier: IDirectoryChallengeVerifier | null = null;
 
   registrationManager!: RegistrationManager;
   connectionManager!: ConnectionManager;
@@ -177,6 +178,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
     crossCheckDirectoryOnInbound = false,
     logger?: Logger,
     persistence?: ClientStatePersistence,
+    challengeVerifier?: IDirectoryChallengeVerifier,
   ) {
     this.node = node;
     this.keyProvider = keyProvider;
@@ -188,6 +190,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
     this.directoryEndpoint = directoryEndpoint;
     this.logger = logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
     this.persistence = persistence ?? null;
+    this.challengeVerifier = challengeVerifier ?? null;
     buildManagers(this, {
       mlDsaKeyFile,
       connectionPolicy,
@@ -592,6 +595,8 @@ export function createClient(
     crossCheckDirectoryOnInbound?: boolean;
     logger?: Logger;
     persistence?: ClientStatePersistence;
+    /** ADV-001: Optional directory challenge verifier (MANIFEST-002 step-6). */
+    challengeVerifier?: IDirectoryChallengeVerifier;
   }
 ): ClientExtended {
   return new CelloClientImpl(
@@ -601,6 +606,6 @@ export function createClient(
     opts?.mlDsaKeyFile, opts?.connectionPolicy, opts?.connectionTimeoutMs,
     opts?.round2TimeoutMs, opts?.trackEvaluateCount, opts?.whitelist,
     opts?.onConnectionPendingReview, opts?.crossCheckDirectoryOnInbound,
-    opts?.logger, opts?.persistence,
+    opts?.logger, opts?.persistence, opts?.challengeVerifier,
   ) as unknown as ClientExtended;
 }

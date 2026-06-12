@@ -30,6 +30,7 @@ const POLL_MAX_MS = 12 * 60 * 60 * 1000; // 12 hours
  */
 export class RandomizedPollScheduler implements IManifestPollScheduler {
   #timer: ReturnType<typeof setTimeout> | null = null;
+  #cancelled = false;
   readonly #minMs: number;
   readonly #maxMs: number;
 
@@ -40,9 +41,16 @@ export class RandomizedPollScheduler implements IManifestPollScheduler {
 
   scheduleNext(callbackFn: () => Promise<void>): void {
     this.cancel();
+    // ADV-003: Reset cancelled flag when scheduling a new callback (cancel() sets it).
+    // If cancel() was called to clear a previous timer before scheduling the next one,
+    // the flag must be reset so the new callback can fire.
+    this.#cancelled = false;
     const delay = this.#minMs + Math.random() * (this.#maxMs - this.#minMs);
     this.#timer = setTimeout(() => {
       this.#timer = null;
+      // ADV-003: Check cancelled flag at callback entry point. If cancel() was called
+      // between timer fire and callback execution, do not run the callback.
+      if (this.#cancelled) return;
       callbackFn().catch(() => {
         // Poll errors are logged by the caller; scheduling errors don't crash the daemon
       });
@@ -50,6 +58,7 @@ export class RandomizedPollScheduler implements IManifestPollScheduler {
   }
 
   cancel(): void {
+    this.#cancelled = true;
     if (this.#timer !== null) {
       clearTimeout(this.#timer);
       this.#timer = null;
