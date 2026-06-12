@@ -40,7 +40,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
-import { createNode } from "@cello-protocol/transport";
+import { createNode, SignalingManager, type ConnectResult } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 export interface DaemonHandle {
@@ -73,6 +73,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore, manifestPollScheduler,
+    signalingConnect, challengeVerifier,
   } = config;
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
@@ -187,9 +188,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     })),
   ];
 
-  // Stub: all connections marked as 'unverified' until SIGNAL-001 implements
-  // the directory signaling stream
+  // Stub: all connections marked as 'unverified' until connection validation is wired
   const connections: ConnectionInfo[] = [];
+
+  // M7-SIGNAL-001: Instantiate SignalingManager — owns directory signaling stream lifecycle.
+  const defaultConnect = async (): Promise<ConnectResult> => {
+    throw new Error("directory_signaling_not_configured");
+  };
+
+  const signalingManager = new SignalingManager({
+    connect: (signalingConnect ?? defaultConnect) as () => Promise<ConnectResult>,
+    logger,
+    challengeVerifier,
+  });
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
@@ -242,9 +253,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   function getStatus(): DaemonStatusResponse {
     return {
       daemon: "running",
-      // Per CONTEXT.md: from the moment the daemon first attempts a directory
-      // connection (at startup), any non-connected state is 'reconnecting'
-      directory_signaling: "reconnecting",
+      directory_signaling: signalingManager.status,
       agents,
       connections,
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
@@ -350,7 +359,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_status", async (_params, connectionId) => {
     return {
       daemon: "running",
-      directory_signaling: "reconnecting",
+      directory_signaling: signalingManager.status,
       agents: getAgentsForConnection(connectionId),
       connections,
     };
@@ -495,6 +504,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       manifestPollScheduler.cancel();
     }
     logger.info("daemon.stopped", { pid: process.pid, reason });
+    // Stop SignalingManager (flushes pending ops with shutdown error, cancels reconnect loop)
+    await signalingManager.stop();
     // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
     await sessionNodeManager.gracefulShutdown();
     await ipcServer.stop();

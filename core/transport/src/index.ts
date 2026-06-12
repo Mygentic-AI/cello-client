@@ -39,7 +39,7 @@ export {
   TestDirectoryManifestStore,
 } from "./manifest-stubs.js";
 
-// M7-MANIFEST-002: SignalingManager and outbound queue
+// M7-SIGNAL-001 + M7-MANIFEST-002: SignalingManager, frame types, and helpers
 export {
   SignalingManager,
   InMemorySignalingOutboundQueue,
@@ -50,6 +50,14 @@ export type {
   ManifestPollResponseFrame,
   ISignalingOutboundQueue,
   SignalingManagerConfig,
+  SignalingManagerOptions,
   SignalingLogger,
+  Logger as SignalingConnectionLogger,
   ProcessStep5Result,
+  SignalingStream,
+  ConnectResult,
+  OperationResult,
+  OperationSuccess,
+  OperationFailure,
+  SignalingFailureReason,
 } from "./signaling-manager.js";
