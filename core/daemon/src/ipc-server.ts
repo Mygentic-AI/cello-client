@@ -33,7 +33,7 @@ import { chmod, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 
-export type IpcHandler = (params: Record<string, unknown> | undefined) => Promise<unknown>;
+export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
 export interface IpcServerConfig {
   socketPath: string;
@@ -41,10 +41,13 @@ export interface IpcServerConfig {
   logger: Logger;
 }
 
+export type IpcDisconnectHandler = (connectionId: string) => void;
+
 export interface IpcServer {
   start(): Promise<void>;
   stop(): Promise<void>;
   getConnectionCount(): number;
+  onDisconnect(handler: IpcDisconnectHandler): void;
 }
 
 interface ActiveConnection {
@@ -62,6 +65,7 @@ export function createIpcServer(
   let server: Server | null = null;
   const connections = new Map<string, ActiveConnection>();
   let stopping = false;
+  let disconnectHandler: IpcDisconnectHandler | null = null;
 
   function handleConnection(socket: Socket): void {
     if (stopping) {
@@ -85,7 +89,7 @@ export function createIpcServer(
     const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0, shutdownReason: null };
     connections.set(connectionId, conn);
 
-    logger.info("daemon.ipc.connected", { connectionId, clientType: "cli" });
+    logger.info("daemon.ipc.accepted", { connectionId });
 
     const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per connection
     let buffer = "";
@@ -112,11 +116,13 @@ export function createIpcServer(
       connections.delete(connectionId);
       const reason = conn.shutdownReason || "client_closed";
       logger.info("daemon.ipc.disconnected", { connectionId, reason });
+      if (disconnectHandler) disconnectHandler(connectionId);
     });
 
+    // Set shutdownReason so the 'close' handler (which always fires after 'error') logs it.
+    // Do NOT call disconnectHandler or log here — 'close' fires immediately after 'error'.
     socket.on("error", (err: Error) => {
-      connections.delete(connectionId);
-      logger.info("daemon.ipc.disconnected", { connectionId, reason: err.message });
+      conn.shutdownReason = err.message;
     });
   }
 
@@ -148,7 +154,7 @@ export function createIpcServer(
         error: {
           code: "method_not_found",
           message: `Unknown method: ${request.method}`,
-          guidance: "Available methods: status, shutdown",
+          guidance: `Unknown IPC method '${request.method}'. Check that cello-mcp and the daemon are the same version. Run 'cello status' to verify the daemon is running.`,
         },
       };
       conn.socket.write(JSON.stringify(errorResp) + "\n");
@@ -156,7 +162,7 @@ export function createIpcServer(
     }
 
     conn.inFlightCount++;
-    Promise.resolve(handler(request.params))
+    Promise.resolve(handler(request.params, conn.id))
       .then((result) => {
         try {
           const resp: IpcResponse = { id: request.id, result };
@@ -267,6 +273,10 @@ export function createIpcServer(
 
     getConnectionCount(): number {
       return connections.size;
+    },
+
+    onDisconnect(handler: IpcDisconnectHandler): void {
+      disconnectHandler = handler;
     },
   };
 }

@@ -18,6 +18,9 @@
  * MANDATORY: --pool-options.threads.maxThreads=1
  */
 
+// M7: These tests verify M6 binary behavior (direct CelloClient instantiation, lazy startup).
+// The M7 adapter is a thin IPC proxy — it requires a running daemon and has no background init.
+// These tests are preserved for reference but skipped.
 import { describe, it, expect } from "vitest";
 import { spawn } from "node:child_process";
 import { resolve, dirname } from "node:path";
@@ -162,7 +165,7 @@ async function runSubprocessHarness(timeoutMs: number): Promise<SubprocessResult
 
 // ─── AC-009: subprocess tools/list within 3 seconds ──────────────────────────
 
-describe("AC-009: cello-mcp responds to tools/list before background init completes", () => {
+describe.skip("AC-009: cello-mcp responds to tools/list before background init completes [M6 — superseded by M7 daemon proxy]", () => {
   it("tools/list returns a non-empty tools array within 3 seconds of spawning", async () => {
     // AC-009 requires tools to be registered and callable BEFORE background I/O completes.
     // We verify this by completing the full MCP handshake and asserting tools/list

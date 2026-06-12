@@ -172,6 +172,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the directory signaling stream
   const connections: ConnectionInfo[] = [];
 
+  // Per-connection state: tracks which agent is "current" for each IPC connection.
+  // Key = connectionId (assigned by IPC server), Value = current agent name or null.
+  const perConnectionState = new Map<string, { currentAgent: string | null; clientType: string }>();
+
+  // Set of agents currently in "online" state (transitioned via cello_start_agent)
+  const onlineAgents = new Set<string>();
+
   // Initialize SessionNodeManager (DAEMON-002: composition root — AC-011).
   // This runs before the IPC socket opens so:
   //   1. The standing receiver is ready before any cello_await_session call.
@@ -192,6 +199,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
   nonceDedupStore.loadFromDb();
 
+  // Build agent list from this connection's perspective
+  function getAgentsForConnection(connectionId: string): AgentInfo[] {
+    const connState = perConnectionState.get(connectionId);
+    const currentAgent = connState?.currentAgent ?? null;
+
+    return agents
+      .filter((a) => a.state !== "load_failed")
+      .map((a) => {
+        let state: AgentInfo["state"];
+        if (a.name === currentAgent && onlineAgents.has(a.name)) {
+          state = "current";
+        } else if (onlineAgents.has(a.name)) {
+          state = "online";
+        } else {
+          state = "registered";
+        }
+        return { name: a.name, state, pubkey: a.pubkey };
+      });
+  }
+
   // Build status response factory
   function getStatus(): DaemonStatusResponse {
     return {
@@ -209,12 +236,145 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Register IPC handlers
   const handlers = new Map<string, IpcHandler>();
 
-  handlers.set("status", async () => {
+  handlers.set("status", async (_params, _connectionId) => {
     return getStatus();
   });
 
+  // ─── MCP-001: ipc.connect handler ───
+  // Registers the connection's clientType and returns the connectionId.
+  handlers.set("ipc.connect", async (params, connectionId) => {
+    const clientType = (params?.clientType as string) ?? "cli";
+    perConnectionState.set(connectionId, { currentAgent: null, clientType });
+    // Re-log with correct clientType (overrides the default "cli" from handleConnection)
+    logger.info("daemon.ipc.connected", { connectionId, clientType });
+    return { connectionId };
+  });
+
+  // ─── MCP-001: cello_start_agent handler ───
+  handlers.set("cello_start_agent", async (params, _connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to start." };
+    }
+    const agent = agents.find((a) => a.name === name);
+    if (!agent || agent.state === "load_failed") {
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Run 'cello login' to register agents, or check agent names with cello_list_agents.` };
+    }
+    if (onlineAgents.has(name)) {
+      // Idempotent — already online, no event
+      return { ok: true };
+    }
+    onlineAgents.add(name);
+    logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
+    return { ok: true };
+  });
+
+  // ─── MCP-001: cello_stop_agent handler ───
+  handlers.set("cello_stop_agent", async (params, _connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to stop." };
+    }
+    const agent = agents.find((a) => a.name === name);
+    if (!agent || agent.state === "load_failed") {
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_list_agents.` };
+    }
+    if (!onlineAgents.has(name)) {
+      // Idempotent — already registered/offline, no event
+      return { ok: true };
+    }
+    onlineAgents.delete(name);
+    logger.info("agent.offline", { agentName: name, reason: "cello_stop_agent" });
+
+    // Clear current agent for all connections that had this agent as current
+    for (const [connId, state] of perConnectionState) {
+      if (state.currentAgent === name) {
+        state.currentAgent = null;
+        logger.info("agent.current.switched", { connectionId: connId, fromAgent: name, toAgent: null });
+      }
+    }
+    return { ok: true };
+  });
+
+  // ─── MCP-001: cello_use_agent handler ───
+  handlers.set("cello_use_agent", async (params, connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to use." };
+    }
+    const agent = agents.find((a) => a.name === name);
+    if (!agent || agent.state === "load_failed") {
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_list_agents.` };
+    }
+    if (!onlineAgents.has(name)) {
+      return { ok: false, reason: "agent_not_online", guidance: `Agent '${name}' exists but is not online. Call cello_start_agent('${name}') first to bring it online, then retry cello_use_agent.` };
+    }
+    const connState = perConnectionState.get(connectionId);
+    if (!connState) {
+      return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
+    }
+    if (connState.currentAgent === name) {
+      return { ok: false, reason: "agent_already_current", guidance: `Agent '${name}' is already the current agent for this connection. No action needed — you can proceed with session operations.` };
+    }
+    const fromAgent = connState.currentAgent;
+    connState.currentAgent = name;
+    logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name });
+    return { ok: true };
+  });
+
+  // ─── MCP-001: cello_list_agents handler ───
+  handlers.set("cello_list_agents", async (_params, connectionId) => {
+    return { agents: getAgentsForConnection(connectionId) };
+  });
+
+  // ─── MCP-001: cello_status (per-connection perspective) ───
+  handlers.set("cello_status", async (_params, connectionId) => {
+    return {
+      daemon: "running",
+      directory_signaling: "reconnecting",
+      agents: getAgentsForConnection(connectionId),
+      connections,
+    };
+  });
+
+  // ─── MCP-001: no_current_agent guard for session tools ───
+  const SESSION_TOOLS_REQUIRING_AGENT = [
+    "cello_send",
+    "cello_receive",
+    "cello_receive_session",
+    "cello_initiate_session",
+    "cello_await_session",
+    "cello_close_session",
+    "cello_list_sessions",
+  ];
+
+  const NO_CURRENT_AGENT_RESPONSE = {
+    ok: false,
+    reason: "no_current_agent",
+    guidance: "No current agent is set for this connection. Call cello_start_agent to bring an agent online, then call cello_use_agent to set it as the current agent for this connection.",
+  };
+
+  for (const tool of SESSION_TOOLS_REQUIRING_AGENT) {
+    handlers.set(tool, async (_params, connectionId) => {
+      const connState = perConnectionState.get(connectionId);
+      if (!connState || !connState.currentAgent) {
+        return NO_CURRENT_AGENT_RESPONSE;
+      }
+      // Stub: actual session tool routing will be implemented in DAEMON-002/SIGNAL-001
+      return { ok: false, reason: "not_implemented", guidance: `Session tool '${tool}' routing is not yet implemented in the daemon. This will be available after the session node manager is wired to the IPC layer.` };
+    });
+  }
+
+  // ─── MCP-001: stubs for tools registered in cello-mcp.ts but not yet implemented ───
+  // These return not_implemented (same as session tools) so LLMs get consistent guidance.
+  for (const tool of ["cello_backup", "cello_restore", "cello_get_sealed_receipt", "cello_get_inclusion_proof"]) {
+    handlers.set(tool, async (_params, _connectionId) => {
+      return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
+    });
+  }
+
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
-  handlers.set("queue_failed_send", async (params) => {
+  handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const nonceHex = params?.nonce as string | undefined;
     const contentHex = params?.content as string | undefined;
@@ -227,7 +387,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { queued: true, queueDepth: retryQueue.getSessionDepth(sessionId) };
   });
 
-  handlers.set("check_nonce", async (params) => {
+  handlers.set("check_nonce", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const nonceHex = params?.nonce as string | undefined;
     const senderPubkeyHex = params?.senderPubkey as string | undefined;
@@ -243,7 +403,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // DAEMON-003: drain_session IPC handler — triggered on peer reconnect.
   // Returns pending entry metadata (nonces only — SI-002 forbids content in IPC frames).
   // The actual drain+delivery is triggered separately when a real sendFn is available.
-  handlers.set("drain_session", async (params) => {
+  handlers.set("drain_session", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     if (!sessionId) {
       return { error: "missing_params", guidance: "Provide sessionId." };
@@ -254,7 +414,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   let shutdownPromise: Promise<void> | null = null;
-  handlers.set("shutdown", async () => {
+  handlers.set("shutdown", async (_params, _connectionId) => {
     if (!shutdownPromise) {
       shutdownPromise = stop("logout_requested").catch((err: unknown) => {
         logger.error("daemon.shutdown.failed", {
@@ -278,6 +438,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     await removeLock(lockFilePath, logger);
     throw err;
   }
+
+  // MCP-001: Clean up per-connection state when a connection disconnects
+  ipcServer.onDisconnect((connectionId) => {
+    perConnectionState.delete(connectionId);
+  });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
   logger.info("daemon.login.validation.complete", {
