@@ -38,20 +38,12 @@ import {
   makeTestManifest,
 } from "../index.js";
 import type { ConsortiumManifestInput } from "../manifest.js";
+import { TEST_OFFICER_SEEDS } from "../manifest-test-fixture.js";
 import type { TestConsortiumNode } from "../manifest-test-fixture.js";
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
 const toHex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
-
-/** Deterministic test officer seeds — same as in manifest-test-fixture.ts */
-const TEST_OFFICER_SEEDS = [
-  new Uint8Array(32).fill(0x01),
-  new Uint8Array(32).fill(0x02),
-  new Uint8Array(32).fill(0x03),
-  new Uint8Array(32).fill(0x04),
-  new Uint8Array(32).fill(0x05),
-] as const;
 
 const TEST_OFFICER_PUBKEYS = TEST_OFFICER_SEEDS.map((seed) =>
   toHex(ed25519.getPublicKey(seed)),
@@ -382,6 +374,24 @@ describe("AC-009: malformed hex signature is silently handled", () => {
 
     const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
     expect(result.ok).toBe(false);
+  });
+
+  it("partially-invalid hex ('0g'.repeat) → classified as malformed_signature, not verification_failed", () => {
+    // parseInt("0g", 16) === 0 (not NaN) — naive NaN check would accept this as valid hex.
+    // The strict /^[0-9a-fA-F]+$/ regex guard must reject it as malformed_signature.
+    const nodes = makeNodes();
+    const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
+    manifest.signatures = [
+      { officerIndex: 0, signature: "0g".repeat(64) }, // 128 chars, correct length, invalid hex
+      ...signManifest(manifest, [1, 2]),
+    ];
+
+    const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const entry = result.diagnostics.skippedEntries.find((e) => e.index === 0);
+      expect(entry?.reason).toBe("malformed_signature");
+    }
   });
 });
 

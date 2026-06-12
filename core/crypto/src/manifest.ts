@@ -215,17 +215,14 @@ function hexToBytes(hex: string, expectedBytes: number): Uint8Array | null {
   if (hex.length !== expectedBytes * 2) {
     return null;
   }
-  try {
-    const bytes = new Uint8Array(expectedBytes);
-    for (let i = 0; i < bytes.length; i++) {
-      const byte = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-      if (Number.isNaN(byte)) {
-        return null;
-      }
-      bytes[i] = byte;
-    }
-    return bytes;
-  } catch {
+  // Strict hex validation before parsing — parseInt("0g", 16) returns 0 (not NaN),
+  // so the NaN check alone does not catch strings with invalid non-leading characters.
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
     return null;
   }
+  const bytes = new Uint8Array(expectedBytes);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
 }
