@@ -141,6 +141,57 @@ describe("MCP-001 AC-010: ipc_deserialization_error recovery", () => {
   });
 });
 
+// ─── AC-020: --version, TTY detection, stderr tee ───
+describe("MCP-001 AC-020: binary behaviors", () => {
+  // Resolve tsx binary from pnpm store (not hoisted to root node_modules/.bin/)
+  function findTsx(): string {
+    const candidates = [
+      join(import.meta.dirname, "../../../../node_modules/.bin/tsx"),
+      join(import.meta.dirname, "../../../../node_modules/.pnpm/node_modules/.bin/tsx"),
+      join(import.meta.dirname, "../../../daemon/node_modules/.bin/tsx"),
+    ];
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+    throw new Error(`tsx not found in any candidate path: ${candidates.join(", ")}`);
+  }
+
+  it("--version flag prints version matching package.json and exits 0", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const pkg = JSON.parse(readFileSync(join(import.meta.dirname, "../../package.json"), "utf8"));
+    const tsxPath = findTsx();
+    const binPath = join(import.meta.dirname, "../bin/cello-mcp.ts");
+
+    const output = execFileSync(tsxPath, [binPath, "--version"], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: { ...process.env, NODE_ENV: "test" },
+    });
+    expect(output.trim()).toBe(pkg.version);
+  });
+
+  it("exits 1 with daemon_not_running when no daemon socket exists", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const tsxPath = findTsx();
+    const binPath = join(import.meta.dirname, "../bin/cello-mcp.ts");
+
+    try {
+      execFileSync(tsxPath, [binPath], {
+        encoding: "utf8",
+        timeout: 10000,
+        // stdin must not be a TTY (it won't be in execFileSync)
+        // HOME points to nonexistent dir → no daemon.sock → exit 1
+        env: { ...process.env, NODE_ENV: "test", HOME: "/tmp/cello-mcp001-noexist" },
+      });
+      expect.fail("should have exited with non-zero");
+    } catch (err: unknown) {
+      const e = err as { status: number; stderr: string };
+      expect(e.status).toBe(1);
+      expect(e.stderr).toContain("cello login");
+    }
+  });
+});
+
 // ─── AC-014: Distinct reason codes ───
 describe("MCP-001 AC-014: distinct reason codes", () => {
   it("ipc_proxy returns ipc_connection_lost when socket is closed", async () => {

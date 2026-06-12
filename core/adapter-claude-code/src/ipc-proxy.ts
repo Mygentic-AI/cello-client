@@ -40,6 +40,8 @@ const IPC_DESERIALIZATION_ERROR = {
     "The daemon sent a malformed response — this may be transient. Retry your operation. If the error persists, run `cello-mcp --version` and `cello status` to check for a version mismatch between cello-mcp and the running daemon.",
 };
 
+const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB — matches IPC server limit
+
 export class IpcProxy {
   readonly #socketPath: string;
   #socket: Socket | null = null;
@@ -77,6 +79,15 @@ export class IpcProxy {
 
       socket.on("data", (chunk: Buffer) => {
         this.#buffer += chunk.toString("utf-8");
+        if (this.#buffer.length > MAX_BUFFER_SIZE) {
+          this.#dead = true;
+          socket.destroy();
+          for (const [, p] of this.#pending) {
+            p.resolve(IPC_CONNECTION_LOST);
+          }
+          this.#pending.clear();
+          return;
+        }
         this.#processBuffer();
       });
 
@@ -96,6 +107,9 @@ export class IpcProxy {
    * Returns the result directly if successful, or an error object with reason/guidance.
    */
   async call(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    if (!method || typeof method !== "string") {
+      return { ok: false, reason: "invalid_method", guidance: "IPC method name must be a non-empty string." };
+    }
     if (this.#dead) {
       return IPC_CONNECTION_LOST;
     }
@@ -114,7 +128,10 @@ export class IpcProxy {
       const frame = JSON.stringify({ id, method, params }) + "\n";
       try {
         this.#socket!.write(frame);
-      } catch {
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`cello-mcp: IPC write failed: ${msg}\n`);
+        this.#dead = true;
         this.#pending.delete(id);
         resolve(IPC_CONNECTION_LOST);
       }
@@ -144,8 +161,11 @@ export class IpcProxy {
       try {
         frame = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        // Malformed JSON — resolve the oldest pending request with deserialization error
-        // This handles the case where a response is corrupted
+        // Malformed JSON — resolve the oldest pending request with deserialization error.
+        // In production the daemon never sends malformed frames; this handles transient
+        // corruption or version mismatch. We resolve the oldest pending because responses
+        // arrive in order for the single-socket serial protocol.
+        process.stderr.write(`cello-mcp: received malformed IPC frame (${line.length} bytes)\n`);
         const oldestEntry = this.#pending.entries().next();
         if (!oldestEntry.done) {
           const [oldestId, resolver] = oldestEntry.value;
@@ -177,6 +197,8 @@ export class IpcProxy {
         } else {
           pending.resolve(frame.result);
         }
+      } else if (responseId) {
+        process.stderr.write(`cello-mcp: orphaned IPC response for id=${responseId} (no pending request)\n`);
       }
     }
   }

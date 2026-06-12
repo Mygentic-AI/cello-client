@@ -99,13 +99,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+// Read version from package.json (same source as --version flag)
+const { createRequire: cr2 } = await import("node:module");
+const req2 = cr2(import.meta.url);
+const pkgForServer = req2("../../package.json") as { version: string };
+
 function jsonText(value: unknown): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
 const server = new McpServer({
   name: "cello",
-  version: "0.0.43",
+  version: pkgForServer.version,
 });
 
 // ─── Agent management tools ─────────────────────────────────────────────────

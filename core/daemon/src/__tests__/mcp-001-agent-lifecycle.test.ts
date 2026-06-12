@@ -511,6 +511,30 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(result.guidance).toBeDefined();
   });
 
+  // ─── AC-018: signaling_reconnecting passthrough ───
+  it("AC-018: session tools return not_implemented (signaling stub) while list_agents succeeds", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    // Session tool returns not_implemented (actual signaling_reconnecting passthrough
+    // will be testable once SIGNAL-001 wires the directory connection; for now the
+    // daemon stubs session tools after the no_current_agent guard passes)
+    const sessionResult = await client.send("cello_initiate_session", { target_pubkey: "abc123" }) as { ok: boolean; reason: string };
+    expect(sessionResult.ok).toBe(false);
+    // The daemon currently returns not_implemented for session tools; once SIGNAL-001
+    // lands, this will return signaling_reconnecting when directory is in that state.
+    expect(sessionResult.reason).toBeDefined();
+
+    // Non-directory-requiring tool succeeds (proves partitioning)
+    const listResult = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    expect(listResult.agents).toBeDefined();
+    expect(listResult.agents.find((a) => a.name === "alice")?.state).toBe("current");
+  });
+
   // ─── Connection disconnect cleans up per-connection state ───
   it("connection disconnect cleans up per-connection state silently", async () => {
     const config = await setupWithAgents("alice");
