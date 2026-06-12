@@ -9,7 +9,7 @@
  * but its correct persistence is load-bearing for anti-rollback security).
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 
@@ -37,6 +37,12 @@ export class FileManifestVersionStore implements IManifestVersionStore {
   async persistVersion(version: number): Promise<void> {
     await mkdir(dirname(this.#filePath), { recursive: true });
     const content: VersionStoreFile = { lastSeenVersion: version };
-    await writeFile(this.#filePath, JSON.stringify(content), "utf-8");
+    // ADV-005: Atomic write using write-to-temp-then-rename pattern.
+    // rename() is atomic on POSIX (same filesystem). This prevents a crash
+    // during write from corrupting the version file and resetting the
+    // monotonicity check (which would enable a rollback attack on next start).
+    const tmpPath = this.#filePath + ".tmp";
+    await writeFile(tmpPath, JSON.stringify(content), "utf-8");
+    await rename(tmpPath, this.#filePath);
   }
 }

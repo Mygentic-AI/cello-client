@@ -40,7 +40,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
-import { createNode, SignalingManager, InMemorySignalingOutboundQueue } from "@cello-protocol/transport";
+import { createNode } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 export interface DaemonHandle {
@@ -86,6 +86,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //      e. On failure: log error event, set directory_signaling to 'reconnecting'.
   //   2. If manifestProvider is absent: skip (backward compat for DAEMON-001 tests).
   let manifestVerified = false;
+
+  // ADV-006 + ADV-008: If manifestProvider is set, manifestRootKeys and a positive
+  // manifestThreshold are required. Fail loudly on misconfiguration rather than
+  // silently proceeding unverified.
+  if (manifestProvider && (!manifestRootKeys || !manifestThreshold || manifestThreshold <= 0)) {
+    throw new Error(
+      "DaemonConfig: manifestProvider requires manifestRootKeys (non-empty) and manifestThreshold (positive integer >= 1)",
+    );
+  }
 
   if (manifestProvider && manifestRootKeys && manifestThreshold !== undefined) {
     try {
@@ -136,6 +145,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  // ADV-002: When manifestProvider is configured (opt-in mode) and verification
+  // failed, the daemon must refuse to proceed. Operators who configure
+  // manifestProvider have opted into manifest enforcement.
+  if (manifestProvider && !manifestVerified) {
+    throw new Error(
+      "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
+      "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",
+    );
   }
 
   // Ensure the cello directory exists
@@ -459,28 +478,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     manifestVerified,
   });
 
-  // M7-MANIFEST-002: Start background manifest polling if scheduler is provided and manifest verified.
+  // M7-MANIFEST-002: Background manifest polling.
+  // TODO(SIGNAL-001): Wire real SignalingManager here when SIGNAL-001 integrates the
+  // signaling stream. The poll scheduler + outbound queue need a live signaling stream
+  // to deliver manifest_poll_request frames. Until then, polling is deferred.
   if (manifestPollScheduler && manifestVerified) {
-    if (manifestProvider && manifestVersionStore && config.challengeVerifier) {
-      const outboundQueue = new InMemorySignalingOutboundQueue();
-      const signalingManager = new SignalingManager({
-        challengeVerifier: config.challengeVerifier,
-        pollScheduler: manifestPollScheduler,
-        manifestVersionStore,
-        manifestProvider,
-        outboundQueue,
-        logger,
-        correlationId: `daemon-startup-${version}`,
-        rootKeys: manifestRootKeys!,
-        threshold: manifestThreshold!,
-      });
-      signalingManager.startPolling();
-    } else {
-      // Minimal path: scheduler present but full deps not yet wired.
-      manifestPollScheduler.scheduleNext(async () => {
-        logger.info("directory.auth.manifest.poll.scheduled", {});
-      });
-    }
+    logger.debug("directory.auth.manifest.poll.deferred", {
+      reason: "signaling_stream_not_yet_wired",
+    });
   }
 
   // Graceful shutdown

@@ -135,6 +135,10 @@ export interface DaemonConfig {
    * M7-MANIFEST-002: manifest loading and verification.
    * When provided, startDaemon() calls manifestProvider.loadAndVerify() at startup.
    * When absent, manifest loading is skipped (backward compat for DAEMON-001 tests).
+   *
+   * Production: requires manifestRootKeys (non-empty array) and manifestThreshold (>= 1).
+   * The bundled consortium-manifest.json is NOT shipped in the npm package — operators
+   * must supply their own manifest path via FileManifestProvider(path).
    */
   manifestProvider?: IManifestProvider;
   /**

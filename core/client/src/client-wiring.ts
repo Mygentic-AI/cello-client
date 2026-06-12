@@ -12,7 +12,7 @@
 
 import type { IThresholdSigner } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import type { CelloNode } from "@cello-protocol/transport";
+import type { CelloNode, IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
@@ -56,6 +56,8 @@ export interface ClientWiringSurface {
   myPubkeyHex: string | null;
   directoryEndpoint: { peer_id: string; multiaddrs: string[] } | null;
   evaluateCallCount: number;
+  /** ADV-001: Optional directory challenge verifier (MANIFEST-002 step-6). */
+  challengeVerifier: IDirectoryChallengeVerifier | null;
 
   // Managers (assigned during construction — accessed lazily via closures)
   registrationManager: RegistrationManager;
@@ -147,6 +149,7 @@ export function buildSignalingContext(f: ClientWiringSurface): SignalingContext 
     hasConnectionPolicy: () => f.connectionManager.hasConnectionPolicy(),
     receiveSessionAssignment: (a, p) => f.receiveSessionAssignment(a, p),
     getSession: (id) => f.sessionManager.getSession(id),
+    getChallengeVerifier: () => f.challengeVerifier,
   };
 }
 
