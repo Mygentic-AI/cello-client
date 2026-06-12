@@ -160,7 +160,7 @@ describe("ipc-server", () => {
     }
   });
 
-  it("logs daemon.ipc.connected and daemon.ipc.disconnected", async () => {
+  it("logs daemon.ipc.accepted and daemon.ipc.disconnected", async () => {
     const socketPath = join(tempDir, "test.sock");
     const handlers = new Map<string, IpcHandler>();
     const server = createIpcServer({ socketPath, maxConnections: 16, logger }, handlers);
@@ -170,7 +170,7 @@ describe("ipc-server", () => {
       const socket = await connectToSocket(socketPath);
       // Wait for connection event to be logged
       await new Promise((r) => setTimeout(r, 50));
-      expect(logEvents.find((e) => e.event === "daemon.ipc.connected")).toBeDefined();
+      expect(logEvents.find((e) => e.event === "daemon.ipc.accepted")).toBeDefined();
 
       socket.end();
       await new Promise((r) => setTimeout(r, 100));

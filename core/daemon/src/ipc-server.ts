@@ -89,8 +89,7 @@ export function createIpcServer(
     const conn: ActiveConnection = { id: connectionId, socket, inFlightCount: 0, shutdownReason: null };
     connections.set(connectionId, conn);
 
-    // clientType is logged as "cli" by default; ipc.connect handler can update it
-    logger.info("daemon.ipc.connected", { connectionId, clientType: "cli" });
+    logger.info("daemon.ipc.accepted", { connectionId });
 
     const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per connection
     let buffer = "";

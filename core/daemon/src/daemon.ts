@@ -341,6 +341,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const SESSION_TOOLS_REQUIRING_AGENT = [
     "cello_send",
     "cello_receive",
+    "cello_receive_session",
     "cello_initiate_session",
     "cello_await_session",
     "cello_close_session",

@@ -265,9 +265,11 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const sessionTools = [
       "cello_send",
       "cello_receive",
+      "cello_receive_session",
       "cello_initiate_session",
       "cello_await_session",
       "cello_close_session",
+      "cello_list_sessions",
     ];
 
     for (const tool of sessionTools) {
