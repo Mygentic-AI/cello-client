@@ -5,8 +5,9 @@
  * using deterministic test officer keys. The manifest is signed with officer
  * indices 0, 1, 2 (meeting the threshold of 3).
  *
- * The private keys used for signing are NOT exported from the package index —
- * they stay internal to this file and consortium-keys.ts (AC-011).
+ * The private keys (TEST_OFFICER_SEEDS) are defined here and NOT exported from
+ * the package index (AC-011). They are only available via direct import of this
+ * file for internal test use.
  *
  * Crypto reference: RFC 8032 (Ed25519).
  */
@@ -14,7 +15,20 @@
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { canonicalManifestBody } from "./manifest.js";
 import type { ConsortiumManifestInput } from "./manifest.js";
-import { TEST_OFFICER_SEEDS } from "./consortium-keys.js";
+
+/**
+ * Deterministic test officer seeds (private keys). Used to derive
+ * TEST_CONSORTIUM_ROOT_KEYS and to sign test manifests.
+ *
+ * NOT exported from the package index — only from this file for internal use.
+ */
+export const TEST_OFFICER_SEEDS: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array, Uint8Array] = [
+  new Uint8Array(32).fill(0x01),
+  new Uint8Array(32).fill(0x02),
+  new Uint8Array(32).fill(0x03),
+  new Uint8Array(32).fill(0x04),
+  new Uint8Array(32).fill(0x05),
+] as const;
 
 /** Node entry for makeTestManifest input. Structurally matches ConsortiumNode from protocol-types. */
 export type TestConsortiumNode = {

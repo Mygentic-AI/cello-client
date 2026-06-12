@@ -6,13 +6,14 @@
  * unique officer keys have signed it.
  *
  * Production keys are placeholder zeros until the initial key ceremony is
- * conducted. Test keys are derived from deterministic seeds for reproducible
- * test fixtures.
+ * conducted. Test keys are derived from deterministic seeds defined in
+ * manifest-test-fixture.ts (AC-011).
  *
  * Crypto reference: RFC 8032 (Ed25519).
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { TEST_OFFICER_SEEDS } from "./manifest-test-fixture.js";
 
 // ─── Production constants ────────────────────────────────────────────────────
 
@@ -37,23 +38,9 @@ export const CONSORTIUM_THRESHOLD = 3;
 // ─── Test constants ──────────────────────────────────────────────────────────
 
 /**
- * Deterministic test officer seeds. Used to derive TEST_CONSORTIUM_ROOT_KEYS
- * and to sign test manifests in the test fixture.
- *
- * These are NOT exported from the package index — only from this file for
- * internal test fixture use.
- */
-export const TEST_OFFICER_SEEDS: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array, Uint8Array] = [
-  new Uint8Array(32).fill(0x01),
-  new Uint8Array(32).fill(0x02),
-  new Uint8Array(32).fill(0x03),
-  new Uint8Array(32).fill(0x04),
-  new Uint8Array(32).fill(0x05),
-] as const;
-
-/**
  * Test consortium officer root keys — real Ed25519 public keys derived from
- * deterministic fixed seeds. Completely disjoint from production keys (SI-003).
+ * deterministic fixed seeds in manifest-test-fixture.ts. Completely disjoint
+ * from production keys (SI-003).
  */
 export const TEST_CONSORTIUM_ROOT_KEYS: readonly [string, string, string, string, string] = [
   Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[0])).toString("hex"),

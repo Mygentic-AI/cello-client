@@ -110,11 +110,11 @@ function sortedReplacer(_key: string, value: unknown): unknown {
  *   1. Compute canonical body bytes via canonicalManifestBody.
  *   2. For each signature entry in manifest.signatures:
  *      a. If officerIndex is out of bounds (< 0 or >= rootKeys.length), skip.
- *      b. If officerIndex has already been seen, skip (duplicate — SI-001).
- *      c. Decode the hex signature to bytes. If malformed, skip.
- *      d. Decode the root key at officerIndex to bytes. If malformed, skip.
- *      e. Verify: ed25519.verify(signature, body, publicKey).
- *      f. If valid, add officerIndex to the set of verified signers.
+ *      b. Decode the hex signature to bytes. If malformed, skip.
+ *      c. Decode the root key at officerIndex to bytes. If malformed, skip.
+ *      d. Verify: ed25519.verify(signature, body, publicKey).
+ *      e. If valid AND officerIndex not already in verified set, add it (SI-001).
+ *      f. If valid BUT officerIndex already verified, mark as duplicate.
  *   3. If |verified signers| >= threshold → { ok: true, signerCount }.
  *   4. Otherwise → { ok: false, reason, detail }.
  *
@@ -127,7 +127,6 @@ export function verifyManifest(
 ): ManifestVerifyResult {
   const body = canonicalManifestBody(manifest);
   const verifiedIndices = new Set<number>();
-  const seenIndices = new Set<number>();
   const skippedEntries: ManifestVerifySkippedEntry[] = [];
 
   for (const entry of manifest.signatures) {
@@ -138,13 +137,6 @@ export function verifyManifest(
       skippedEntries.push({ index: officerIndex, reason: "out_of_bounds" });
       continue;
     }
-
-    // Skip duplicate indices — only first occurrence counts (SI-001)
-    if (seenIndices.has(officerIndex)) {
-      skippedEntries.push({ index: officerIndex, reason: "duplicate" });
-      continue;
-    }
-    seenIndices.add(officerIndex);
 
     // Decode signature hex to bytes (Ed25519 signature = 64 bytes)
     const sigBytes = hexToBytes(signature, 64);
@@ -161,16 +153,26 @@ export function verifyManifest(
     }
 
     // Verify Ed25519 signature (RFC 8032)
+    let isValid = false;
     try {
-      if (ed25519.verify(sigBytes, body, pubkeyBytes)) {
-        verifiedIndices.add(officerIndex);
-      } else {
-        skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
-      }
+      isValid = ed25519.verify(sigBytes, body, pubkeyBytes);
     } catch (err: unknown) {
       skippedEntries.push({ index: officerIndex, reason: "verification_failed", error: err instanceof Error ? err.message : String(err) });
       continue;
     }
+
+    if (!isValid) {
+      skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
+      continue;
+    }
+
+    // Check uniqueness AFTER verification — only first valid sig per officer counts (SI-001)
+    if (verifiedIndices.has(officerIndex)) {
+      skippedEntries.push({ index: officerIndex, reason: "duplicate" });
+      continue;
+    }
+
+    verifiedIndices.add(officerIndex);
   }
 
   const signerCount = verifiedIndices.size;

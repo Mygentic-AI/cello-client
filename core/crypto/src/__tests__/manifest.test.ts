@@ -164,6 +164,33 @@ describe("AC-003: canonicalManifestBody determinism", () => {
   });
 });
 
+// ─── AC-003 (continued): deeply nested object key sorting ───────────────────
+
+describe("AC-003: deeply nested object key sorting", () => {
+  it("sorts object keys at three levels of nesting", () => {
+    const nodeWithMeta = {
+      nodeId: "n1",
+      pubkey: "a".repeat(64),
+      region: "us-east-1",
+      provider: "aws" as const,
+      endpoint: "https://a.com",
+      metadata: { zulu: "last", alpha: "first", bravo: { zebra: 2, apple: 1 } },
+    };
+
+    const manifest: ConsortiumManifestInput = {
+      version: 1,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2027-01-01T00:00:00Z",
+      nodes: [nodeWithMeta],
+      signatures: [],
+    };
+
+    const json = new TextDecoder().decode(canonicalManifestBody(manifest));
+    // All three levels are sorted: top-level, node fields, and nested metadata
+    expect(json).toContain('"metadata":{"alpha":"first","bravo":{"apple":1,"zebra":2},"zulu":"last"}');
+  });
+});
+
 // ─── SI-002: Canonical serialization is insertion-order independent ──────────
 
 describe("SI-002: canonical serialization is insertion-order independent", () => {
