@@ -180,7 +180,7 @@ interface PendingOperation {
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 export interface SignalingManagerOptions {
-  connect: () => Promise<ConnectResult>;
+  connect?: () => Promise<ConnectResult>;
   logger: Logger;
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
@@ -259,7 +259,7 @@ export class SignalingManager {
   private readonly _threshold: number;
 
   constructor(opts: SignalingManagerOptions) {
-    this._connect = opts.connect;
+    this._connect = opts.connect ?? (() => Promise.reject(new Error("no_connect_configured")));
     this._logger = opts.logger;
     this._heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 15_000;
     this._heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 15_000;
@@ -350,14 +350,14 @@ export class SignalingManager {
     this.cancelHeartbeat();
     this.cancelBackoffWait();
 
-    if (this._streamDeathResolve) {
-      this._streamDeathResolve();
-      this._streamDeathResolve = null;
-    }
-
     if (this._currentStream) {
       this._currentStream.close();
       this._currentStream = null;
+    }
+
+    if (this._streamDeathResolve) {
+      this._streamDeathResolve();
+      this._streamDeathResolve = null;
     }
 
     if (this._pollScheduler) {
@@ -555,7 +555,7 @@ export class SignalingManager {
       if (this._stopped) return;
     }
 
-    await this.runReconnectCycle(initialResult.success ? "" : initialResult.error!);
+    await this.runReconnectCycle(initialResult.success ? this._lastDisconnectReason : initialResult.error!);
   }
 
   private async runReconnectCycle(initialError?: string): Promise<void> {
@@ -711,6 +711,7 @@ export class SignalingManager {
   // ─── Private: Stream death ────────────────────────────────────────────────────
 
   private _streamDeathResolve: (() => void) | null = null;
+  private _lastDisconnectReason = "";
 
   private waitForStreamDeath(): Promise<void> {
     return new Promise((resolve) => {
@@ -721,6 +722,7 @@ export class SignalingManager {
   private declareStreamDead(reason: string): void {
     if (this._status !== "connected") return;
 
+    this._lastDisconnectReason = reason;
     this.cancelHeartbeat();
 
     this._logger.warn("directory.signaling.disconnected", {

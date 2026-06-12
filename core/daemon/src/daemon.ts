@@ -73,7 +73,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore, manifestPollScheduler,
-    signalingConnect,
+    signalingConnect, challengeVerifier,
   } = config;
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
@@ -199,6 +199,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const signalingManager = new SignalingManager({
     connect: (signalingConnect ?? defaultConnect) as () => Promise<ConnectResult>,
     logger,
+    challengeVerifier,
   });
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
