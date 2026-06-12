@@ -5,6 +5,8 @@ export type {
   IpcResponse,
   IpcResponseOk,
   IpcResponseError,
+  IpcNotification,
+  IpcFrame,
   AgentState,
   AgentInfo,
   ConnectionStatus,

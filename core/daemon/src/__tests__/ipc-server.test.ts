@@ -116,7 +116,7 @@ describe("ipc-server", () => {
     }
   });
 
-  it("returns error for malformed JSON", async () => {
+  it("destroys connection on malformed JSON", async () => {
     const socketPath = join(tempDir, "test.sock");
     const handlers = new Map<string, IpcHandler>();
     const server = createIpcServer({ socketPath, maxConnections: 16, logger }, handlers);
@@ -124,17 +124,21 @@ describe("ipc-server", () => {
 
     try {
       const socket = await connectToSocket(socketPath);
-      const response = await sendAndReceive(socket, "not valid json");
-      const parsed = JSON.parse(response);
-      expect(parsed.error.code).toBe("parse_error");
-      expect(typeof parsed.error.guidance).toBe("string");
-      socket.end();
+      // Send malformed JSON — server should destroy the connection
+      socket.write("not valid json\n");
+      await new Promise<void>((resolve) => {
+        socket.on("close", () => resolve());
+      });
+      // Connection was destroyed by server
+      expect(socket.destroyed).toBe(true);
+      const parseEvent = logEvents.find((e) => e.event === "daemon.ipc.parse.error");
+      expect(parseEvent).toBeDefined();
     } finally {
       await server.stop();
     }
   });
 
-  it("returns error for requests missing id or method", async () => {
+  it("destroys connection for requests missing id or method", async () => {
     const socketPath = join(tempDir, "test.sock");
     const handlers = new Map<string, IpcHandler>();
     const server = createIpcServer({ socketPath, maxConnections: 16, logger }, handlers);
@@ -142,10 +146,14 @@ describe("ipc-server", () => {
 
     try {
       const socket = await connectToSocket(socketPath);
-      const response = await sendAndReceive(socket, JSON.stringify({ id: "x" }));
-      const parsed = JSON.parse(response);
-      expect(parsed.error.code).toBe("invalid_request");
-      socket.end();
+      // Send request without method field — server should destroy
+      socket.write(JSON.stringify({ id: "x" }) + "\n");
+      await new Promise<void>((resolve) => {
+        socket.on("close", () => resolve());
+      });
+      expect(socket.destroyed).toBe(true);
+      const invalidEvent = logEvents.find((e) => e.event === "daemon.ipc.invalid.request");
+      expect(invalidEvent).toBeDefined();
     } finally {
       await server.stop();
     }
@@ -171,7 +179,7 @@ describe("ipc-server", () => {
     }
   });
 
-  it("rejects connections beyond maxConnections with connection.limit.reached", async () => {
+  it("destroys connections beyond maxConnections with connection.limit.reached", async () => {
     const socketPath = join(tempDir, "test.sock");
     const handlers = new Map<string, IpcHandler>();
     const maxConnections = 2;
@@ -186,27 +194,17 @@ describe("ipc-server", () => {
       }
       await new Promise((r) => setTimeout(r, 50));
 
-      // Third connection should get rejected
+      // Third connection should be destroyed immediately
       const rejected = await connectToSocket(socketPath);
-      const data = await new Promise<string>((resolve) => {
-        let buf = "";
-        rejected.on("data", (chunk: Buffer) => {
-          buf += chunk.toString("utf-8");
-          const idx = buf.indexOf("\n");
-          if (idx !== -1) resolve(buf.slice(0, idx));
-        });
+      await new Promise<void>((resolve) => {
+        rejected.on("close", () => resolve());
       });
-
-      const parsed = JSON.parse(data);
-      expect(parsed.error.code).toBe("ipc_connection_limit");
-      expect(typeof parsed.error.guidance).toBe("string");
+      expect(rejected.destroyed).toBe(true);
 
       const warnEvents = logEvents.filter((e) => e.event === "daemon.ipc.connection.limit.reached");
       expect(warnEvents.length).toBeGreaterThanOrEqual(1);
       expect(warnEvents[0].context.currentCount).toBe(maxConnections);
       expect(warnEvents[0].context.maxCount).toBe(maxConnections);
-
-      rejected.end();
     } finally {
       for (const s of sockets) s.end();
       await server.stop();

@@ -16,11 +16,12 @@
 
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
-import type { IpcRequest, IpcResponse, IpcResponseError } from "./types.js";
+import type { IpcRequest, IpcResponse, IpcResponseError, IpcNotification } from "./types.js";
 
 export interface IpcClient {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
   close(): void;
+  onNotification(handler: (notification: IpcNotification) => void): void;
 }
 
 export class IpcError extends Error {
@@ -40,6 +41,7 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
     const socket: Socket = createConnection(socketPath);
     const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
     let buffer = "";
+    let notificationHandler: ((notification: IpcNotification) => void) | null = null;
 
     const client: IpcClient = {
       send(method: string, params?: Record<string, unknown>): Promise<unknown> {
@@ -57,6 +59,10 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
 
       close(): void {
         socket.end();
+      },
+
+      onNotification(handler: (notification: IpcNotification) => void): void {
+        notificationHandler = handler;
       },
     };
 
@@ -81,7 +87,19 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
         if (line.trim().length === 0) continue;
 
         try {
-          const response = JSON.parse(line) as IpcResponse;
+          const frame = JSON.parse(line) as Record<string, unknown>;
+
+          // Notifications have a "notification" field — they are server-initiated
+          // and never correlate to a request.
+          if ("notification" in frame) {
+            if (notificationHandler) {
+              notificationHandler(frame as unknown as IpcNotification);
+            }
+            continue;
+          }
+
+          // Regular response — correlate by id
+          const response = frame as unknown as IpcResponse;
           const p = pending.get(response.id);
           if (p) {
             pending.delete(response.id);
@@ -93,7 +111,7 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
             }
           }
         } catch {
-          // Malformed response — ignore
+          // Malformed frame — ignore
         }
       }
     });

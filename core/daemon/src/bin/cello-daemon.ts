@@ -54,22 +54,38 @@ async function main(): Promise<void> {
   };
 
   process.on("SIGTERM", () => {
-    shutdown("SIGTERM").catch((err: unknown) => {
+    try {
+      shutdown("SIGTERM").catch((err: unknown) => {
+        logger.error("daemon.shutdown.failed", {
+          signal: "SIGTERM",
+          error: err instanceof Error ? err.message : String(err),
+        });
+        process.exit(1);
+      });
+    } catch (err: unknown) {
       logger.error("daemon.shutdown.failed", {
         signal: "SIGTERM",
         error: err instanceof Error ? err.message : String(err),
       });
       process.exit(1);
-    });
+    }
   });
   process.on("SIGINT", () => {
-    shutdown("SIGINT").catch((err: unknown) => {
+    try {
+      shutdown("SIGINT").catch((err: unknown) => {
+        logger.error("daemon.shutdown.failed", {
+          signal: "SIGINT",
+          error: err instanceof Error ? err.message : String(err),
+        });
+        process.exit(1);
+      });
+    } catch (err: unknown) {
       logger.error("daemon.shutdown.failed", {
         signal: "SIGINT",
         error: err instanceof Error ? err.message : String(err),
       });
       process.exit(1);
-    });
+    }
   });
 }
 

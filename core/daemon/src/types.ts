@@ -46,6 +46,15 @@ export interface IpcResponseError {
 
 export type IpcResponse = IpcResponseOk | IpcResponseError;
 
+// Notifications are server-initiated frames that don't correlate to a request.
+// They use a distinct shape so clients never confuse them with responses.
+export interface IpcNotification {
+  notification: string;
+  data?: Record<string, unknown>;
+}
+
+export type IpcFrame = IpcResponse | IpcNotification;
+
 // --- Agent state ---
 
 export type AgentState = "registered" | "online" | "current" | "load_failed";

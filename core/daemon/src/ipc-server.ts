@@ -31,8 +31,7 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { chmod, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import type { Logger, IpcRequest, IpcResponse } from "./types.js";
-import { ErrorCodes } from "./types.js";
+import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 
 export type IpcHandler = (params: Record<string, unknown> | undefined) => Promise<unknown>;
 
@@ -75,16 +74,10 @@ export function createIpcServer(
         currentCount: connections.size,
         maxCount: maxConnections,
       });
-      const errorFrame: IpcResponse = {
-        id: "system",
-        error: {
-          code: ErrorCodes.IPC_CONNECTION_LIMIT,
-          message: `Maximum ${maxConnections} concurrent IPC connections reached`,
-          guidance: "Wait for an existing connection to close before opening a new one.",
-        },
-      };
-      socket.write(JSON.stringify(errorFrame) + "\n");
-      socket.end();
+      // Destroy immediately — the client has no pending requests to correlate
+      // an error response against. Client's connectToDaemon() will reject with
+      // a socket error, which is the correct signal.
+      socket.destroy();
       return;
     }
 
@@ -100,16 +93,10 @@ export function createIpcServer(
     socket.on("data", (chunk: Buffer) => {
       buffer += chunk.toString("utf-8");
       if (buffer.length > MAX_BUFFER_SIZE) {
-        const errorResp: IpcResponse = {
-          id: "system",
-          error: {
-            code: "message_too_large",
-            message: "IPC message exceeds 1MB limit",
-            guidance: "IPC messages must be under 1MB. Check for malformed input.",
-          },
-        };
-        try { conn.socket.write(JSON.stringify(errorResp) + "\n"); } catch { /* socket may be dead */ }
-        conn.socket.end();
+        logger.warn("daemon.ipc.buffer.overflow", { connectionId, bufferSize: buffer.length });
+        buffer = "";
+        socket.removeAllListeners("data");
+        socket.destroy();
         return;
       }
       let newlineIdx: number;
@@ -138,28 +125,19 @@ export function createIpcServer(
     try {
       request = JSON.parse(line) as IpcRequest;
     } catch {
-      const errorResp: IpcResponse = {
-        id: "unknown",
-        error: {
-          code: "parse_error",
-          message: "Failed to parse IPC request as JSON",
-          guidance: "Send a valid JSON object followed by a newline character.",
-        },
-      };
-      conn.socket.write(JSON.stringify(errorResp) + "\n");
+      // Cannot recover the request ID from unparseable input.
+      // Close the connection — client's pending promises will all reject
+      // with "Connection closed", which correctly propagates the failure.
+      logger.warn("daemon.ipc.parse.error", { connectionId: conn.id });
+      conn.socket.destroy();
       return;
     }
 
     if (!request.id || !request.method) {
-      const errorResp: IpcResponse = {
-        id: request.id || "unknown",
-        error: {
-          code: "invalid_request",
-          message: "Request must include 'id' and 'method' fields",
-          guidance: "Format: {\"id\": \"<uuid>\", \"method\": \"<method_name>\", \"params\": {}}",
-        },
-      };
-      conn.socket.write(JSON.stringify(errorResp) + "\n");
+      // If id is missing/falsy, we can't correlate an error response.
+      // Close the connection rather than sending an unmatchable frame.
+      logger.warn("daemon.ipc.invalid.request", { connectionId: conn.id, hasId: !!request.id, hasMethod: !!request.method });
+      conn.socket.destroy();
       return;
     }
 
@@ -239,8 +217,9 @@ export function createIpcServer(
 
       // Wait for in-flight requests to complete (max 5 seconds)
       const deadline = Date.now() + 5000;
+      let totalInFlight = 0;
       while (Date.now() < deadline) {
-        let totalInFlight = 0;
+        totalInFlight = 0;
         for (const conn of connections.values()) {
           totalInFlight += conn.inFlightCount;
         }
@@ -248,8 +227,15 @@ export function createIpcServer(
         await new Promise((r) => setTimeout(r, 50));
       }
 
-      // Send shutdown frame to all connected clients
-      const shutdownFrame = JSON.stringify({ id: "system", result: { type: "shutdown" } }) + "\n";
+      if (totalInFlight > 0) {
+        logger.warn("daemon.ipc.shutdown.timeout", { abandonedRequests: totalInFlight });
+      }
+
+      // Send shutdown notification to all connected clients.
+      // Uses IpcNotification shape — distinct from IpcResponse so clients
+      // never confuse it with a response to their request.
+      const shutdownNotification: IpcNotification = { notification: "shutdown" };
+      const shutdownFrame = JSON.stringify(shutdownNotification) + "\n";
       for (const conn of connections.values()) {
         try {
           conn.shutdownReason = "daemon_shutdown";
