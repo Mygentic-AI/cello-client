@@ -179,6 +179,18 @@ export class SessionNodeManager {
 
   // ─── Public API ──────────────────────────────────────────────────────────
 
+  /**
+   * Get the underlying DatabaseSync handle.
+   * Used by the composition root (daemon.ts) to pass to RetryQueue and
+   * NonceDedupStore — they share the same SQLCipher DB file (DAEMON-003 AC-008).
+   */
+  getDb(): DatabaseSync {
+    if (!this.#db) {
+      throw new Error("SessionNodeManager not initialized — call initialize() first");
+    }
+    return this.#db;
+  }
+
   /** Whether the standing receiver node is ready for the next inbound session. */
   getStandingReceiverReady(): boolean {
     return this.#standingReceiverReady;
