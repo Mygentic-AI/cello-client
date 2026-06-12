@@ -142,7 +142,7 @@ export class NonceDedupStore {
 
     // Check for duplicate
     if (sessionMap.has(nonceHex)) {
-      this.#logger.info("message.nonce.duplicate", {
+      this.#logger.debug("message.nonce.duplicate", {
         sessionId,
         nonce: nonceHex,
         senderPubkey: senderPubkeyHex,
@@ -181,32 +181,53 @@ export class NonceDedupStore {
 
   /**
    * Evict the oldest entry (lowest seen_at) for a session.
+   * Uses the SQLite index on (session_id, seen_at ASC) for O(log n) lookup
+   * instead of O(n) in-memory scan.
    */
   #evictOldest(sessionId: string, sessionMap: Map<string, NonceEntry>): void {
-    // Find entry with lowest seen_at
-    let oldest: NonceEntry | null = null;
-    for (const entry of sessionMap.values()) {
-      if (!oldest || entry.seenAt < oldest.seenAt) {
-        oldest = entry;
+    // Use indexed query to find the oldest — O(log n) via the seen_at index
+    let oldestHex: string | null = null;
+    try {
+      const row = this.#db
+        .prepare("SELECT nonce_hex FROM session_seen_nonces WHERE session_id = ? ORDER BY seen_at ASC LIMIT 1")
+        .get(sessionId) as { nonce_hex: string } | undefined;
+      if (row) {
+        oldestHex = row.nonce_hex;
       }
+    } catch (err: unknown) {
+      this.#logger.error("message.nonce.persist.failed", {
+        sessionId,
+        nonce: "eviction_query",
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
-    if (!oldest) return;
+    // Fallback: if DB query failed, scan in-memory
+    if (!oldestHex) {
+      let oldest: NonceEntry | null = null;
+      for (const entry of sessionMap.values()) {
+        if (!oldest || entry.seenAt < oldest.seenAt) {
+          oldest = entry;
+        }
+      }
+      if (!oldest) return;
+      oldestHex = oldest.nonceHex;
+    }
 
     // Delete from DB
     try {
       this.#db
         .prepare("DELETE FROM session_seen_nonces WHERE session_id = ? AND nonce_hex = ?")
-        .run(sessionId, oldest.nonceHex);
+        .run(sessionId, oldestHex);
     } catch (err: unknown) {
       this.#logger.error("message.nonce.persist.failed", {
         sessionId,
-        nonce: oldest.nonceHex,
+        nonce: oldestHex,
         error: err instanceof Error ? err.message : String(err),
       });
     }
 
     // Remove from memory
-    sessionMap.delete(oldest.nonceHex);
+    sessionMap.delete(oldestHex);
   }
 }

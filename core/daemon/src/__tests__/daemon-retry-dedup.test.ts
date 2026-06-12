@@ -36,6 +36,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-daemon-rq-test-"));
     logEvents = [];
     logger = {
+      debug(event, context) { logEvents.push({ level: "debug", event, context }); },
       info(event, context) { logEvents.push({ level: "info", event, context }); },
       warn(event, context) { logEvents.push({ level: "warn", event, context }); },
       error(event, context) { logEvents.push({ level: "error", event, context }); },

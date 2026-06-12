@@ -245,6 +245,19 @@ export class RetryQueue {
       const result = await sendFn(entry.contentBlob);
 
       if (!result.delivered) {
+        // Increment attempts on failure so attemptsTotal reflects actual tries
+        entry.attempts++;
+        try {
+          this.#db
+            .prepare("UPDATE retry_queue SET attempts = ? WHERE session_id = ? AND nonce_hex = ?")
+            .run(entry.attempts, sessionId, entry.nonceHex);
+        } catch (err: unknown) {
+          this.#logger.error("message.retry.persist.failed", {
+            sessionId,
+            nonce: entry.nonceHex,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
         // Halt immediately — FIFO invariant (AC-015)
         break;
       }
@@ -297,5 +310,10 @@ export class RetryQueue {
   /** Retry queue depth for a specific session. */
   getSessionDepth(sessionId: string): number {
     return this.#queues.get(sessionId)?.length ?? 0;
+  }
+
+  /** Get all entries for a session (FIFO ordered). Used by drain_session IPC. */
+  getSessionEntries(sessionId: string): readonly RetryQueueEntry[] {
+    return this.#queues.get(sessionId) ?? [];
   }
 }

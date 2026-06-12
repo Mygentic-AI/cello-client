@@ -167,6 +167,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { duplicate };
   });
 
+  // DAEMON-003: drain_session IPC handler — triggered on peer reconnect.
+  // The client calls this when a session stream is re-established. The sendFn
+  // is provided as a callback mechanism: the daemon serializes each message
+  // back to the client via a per-entry IPC response, and the client resends
+  // over the live stream. For the daemon-internal case (peer reconnect detected
+  // by SessionNodeManager), the drain is triggered directly.
+  handlers.set("drain_session", async (params) => {
+    const sessionId = params?.sessionId as string | undefined;
+    if (!sessionId) {
+      return { error: "missing_params", guidance: "Provide sessionId." };
+    }
+    const entries = retryQueue.getSessionEntries(sessionId);
+    return { pendingCount: entries.length, entries: entries.map(e => ({ nonce: e.nonceHex, content: Buffer.from(e.contentBlob).toString("hex") })) };
+  });
+
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async () => {
     if (!shutdownPromise) {

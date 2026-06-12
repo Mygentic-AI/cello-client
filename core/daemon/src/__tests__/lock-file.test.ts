@@ -18,6 +18,7 @@ import type { Logger } from "../types.js";
 describe("lock-file", () => {
   let tempDir: string;
   const mockLogger: Logger = {
+    debug: () => {},
     info: () => {},
     warn: () => {},
     error: () => {},

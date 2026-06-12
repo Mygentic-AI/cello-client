@@ -8,15 +8,6 @@
  * - AC-006: typed serializer (nonce Uint8Array survives hex round-trip)
  *
  * AC interpretations:
- * - AC-004: "logged at DEBUG" — per the Logger interface we have info/warn/error.
- *   The story says DEBUG level, but our Logger interface only has info/warn/error.
- *   We'll use logger.info for message.nonce.duplicate (it's a known-nonce event,
- *   not an error). The story's DEBUG intent is that it should NOT pollute important
- *   log streams. In production the Logger implementation can filter by event name.
- *   UPDATE: Re-reading the story, it says "logged at DEBUG with sessionId, nonce (hex),
- *   and senderPubkey (hex)". Since our Logger has no .debug method, we use .info
- *   and note this is a deliberate interpretation. The production Logger adapter will
- *   route message.nonce.duplicate to DEBUG level based on the event name.
  * - AC-011: We pre-seed exactly 10,000 entries and verify the oldest is evicted
  *   when entry 10,001 is added.
  */
@@ -37,6 +28,7 @@ describe("NonceDedupStore", () => {
     db = new DatabaseSync(":memory:");
     logEvents = [];
     logger = {
+      debug(event, context) { logEvents.push({ level: "debug", event, context }); },
       info(event, context) { logEvents.push({ level: "info", event, context }); },
       warn(event, context) { logEvents.push({ level: "warn", event, context }); },
       error(event, context) { logEvents.push({ level: "error", event, context }); },

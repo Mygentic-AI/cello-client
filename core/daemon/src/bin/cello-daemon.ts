@@ -19,6 +19,10 @@ const MAX_CONNECTIONS = 16;
 
 // Composition root: stdout JSON logger
 const logger: Logger = {
+  debug(event: string, context: Record<string, unknown>): void {
+    const line = JSON.stringify({ level: "debug", event, ...context, ts: new Date().toISOString() });
+    process.stdout.write(line + "\n");
+  },
   info(event: string, context: Record<string, unknown>): void {
     const line = JSON.stringify({ level: "info", event, ...context, ts: new Date().toISOString() });
     process.stdout.write(line + "\n");
