@@ -127,19 +127,40 @@ describe("AC-003: canonicalManifestBody determinism", () => {
     expect(body.length).toBeGreaterThan(0);
   });
 
-  it("output is valid JSON with sorted keys", () => {
+  it("output is valid JSON with sorted keys and exactly the expected fields", () => {
     const manifest: ConsortiumManifestInput = { version: 2, not_before: "2026-06-01T00:00:00Z", expires: "2027-06-01T00:00:00Z", nodes: makeNodes(), signatures: [] };
     const body = canonicalManifestBody(manifest);
     const json = new TextDecoder().decode(body);
     const parsed = JSON.parse(json);
 
-    // Top-level keys should be sorted
+    // Top-level keys should be sorted and exactly the expected set
     const keys = Object.keys(parsed);
-    const sortedKeys = [...keys].sort();
-    expect(keys).toEqual(sortedKeys);
+    expect(keys).toEqual(["expires", "nodes", "not_before", "version"]);
 
     // signatures should NOT be present
     expect(parsed).not.toHaveProperty("signatures");
+  });
+
+  it("extra fields on manifest input are included in canonical body", () => {
+    const manifest: ConsortiumManifestInput = {
+      version: 1,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2027-01-01T00:00:00Z",
+      nodes: [],
+      signatures: [],
+      _extra_field: "unexpected",
+    };
+
+    const body = canonicalManifestBody(manifest);
+    const json = new TextDecoder().decode(body);
+    const parsed = JSON.parse(json);
+
+    // Extra fields ARE included — the canonical body captures all non-signature fields.
+    // This is correct: officers sign what they see. If a field is present, it's signed.
+    expect(parsed).toHaveProperty("_extra_field", "unexpected");
+    // Keys remain sorted even with the extra field
+    const keys = Object.keys(parsed);
+    expect(keys).toEqual([...keys].sort());
   });
 });
 

@@ -39,9 +39,17 @@ export interface ConsortiumManifestInput {
 
 // ─── Result type ─────────────────────────────────────────────────────────────
 
+export type ManifestVerifySkipReason = "out_of_bounds" | "duplicate" | "malformed_signature" | "malformed_key" | "verification_failed";
+
+export interface ManifestVerifyDiagnostics {
+  threshold: number;
+  validOfficers: number[];
+  skippedEntries: Array<{ index: number; reason: ManifestVerifySkipReason }>;
+}
+
 export type ManifestVerifyResult =
   | { ok: true; signerCount: number }
-  | { ok: false; reason: "manifest_signature_invalid"; detail: string };
+  | { ok: false; reason: "manifest_signature_invalid"; detail: string; diagnostics: ManifestVerifyDiagnostics };
 
 // ─── Canonical serialization ─────────────────────────────────────────────────
 
@@ -113,29 +121,36 @@ export function verifyManifest(
 ): ManifestVerifyResult {
   const body = canonicalManifestBody(manifest);
   const verifiedIndices = new Set<number>();
+  const seenIndices = new Set<number>();
+  const skippedEntries: Array<{ index: number; reason: ManifestVerifySkipReason }> = [];
 
   for (const entry of manifest.signatures) {
     const { officerIndex, signature } = entry;
 
     // Skip out-of-bounds indices (AC-008)
     if (officerIndex < 0 || officerIndex >= rootKeys.length) {
+      skippedEntries.push({ index: officerIndex, reason: "out_of_bounds" });
       continue;
     }
 
-    // Skip duplicate indices — only first valid occurrence counts (SI-001)
-    if (verifiedIndices.has(officerIndex)) {
+    // Skip duplicate indices — only first occurrence counts (SI-001)
+    if (seenIndices.has(officerIndex)) {
+      skippedEntries.push({ index: officerIndex, reason: "duplicate" });
       continue;
     }
+    seenIndices.add(officerIndex);
 
-    // Decode signature hex to bytes
-    const sigBytes = hexToBytes(signature);
+    // Decode signature hex to bytes (Ed25519 signature = 64 bytes)
+    const sigBytes = hexToBytes(signature, 64);
     if (sigBytes === null) {
+      skippedEntries.push({ index: officerIndex, reason: "malformed_signature" });
       continue;
     }
 
-    // Decode public key hex to bytes
-    const pubkeyBytes = hexToBytes(rootKeys[officerIndex]);
+    // Decode public key hex to bytes (Ed25519 public key = 32 bytes)
+    const pubkeyBytes = hexToBytes(rootKeys[officerIndex], 32);
     if (pubkeyBytes === null) {
+      skippedEntries.push({ index: officerIndex, reason: "malformed_key" });
       continue;
     }
 
@@ -143,9 +158,11 @@ export function verifyManifest(
     try {
       if (ed25519.verify(sigBytes, body, pubkeyBytes)) {
         verifiedIndices.add(officerIndex);
+      } else {
+        skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
       }
     } catch {
-      // Malformed key/signature that ed25519 cannot process — skip
+      skippedEntries.push({ index: officerIndex, reason: "verification_failed" });
       continue;
     }
   }
@@ -160,21 +177,27 @@ export function verifyManifest(
     ok: false,
     reason: "manifest_signature_invalid",
     detail: `${signerCount} valid of ${threshold} required`,
+    diagnostics: {
+      threshold,
+      validOfficers: Array.from(verifiedIndices).sort((a, b) => a - b),
+      skippedEntries,
+    },
   };
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 /**
- * Decode a hex string to Uint8Array. Returns null if the input is not valid hex.
+ * Decode a hex string to Uint8Array with expected byte length validation.
+ * Returns null if the input is not valid hex or doesn't match expectedBytes.
  * Never throws.
  */
-function hexToBytes(hex: string): Uint8Array | null {
-  if (hex.length === 0 || hex.length % 2 !== 0) {
+function hexToBytes(hex: string, expectedBytes: number): Uint8Array | null {
+  if (hex.length !== expectedBytes * 2) {
     return null;
   }
   try {
-    const bytes = new Uint8Array(hex.length / 2);
+    const bytes = new Uint8Array(expectedBytes);
     for (let i = 0; i < bytes.length; i++) {
       const byte = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
       if (Number.isNaN(byte)) {

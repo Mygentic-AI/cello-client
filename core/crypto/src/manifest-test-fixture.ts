@@ -16,14 +16,14 @@ import { canonicalManifestBody } from "./manifest.js";
 import type { ConsortiumManifestInput } from "./manifest.js";
 import { TEST_OFFICER_SEEDS } from "./consortium-keys.js";
 
-/** Node entry for makeTestManifest input. */
-export interface TestConsortiumNode {
+/** Node entry for makeTestManifest input. Structurally matches ConsortiumNode from protocol-types. */
+export type TestConsortiumNode = {
   nodeId: string;
   pubkey: string;
   region: string;
   provider: "aws" | "gcp" | "azure";
   endpoint: string;
-}
+};
 
 export interface MakeTestManifestOpts {
   version?: number;
@@ -48,7 +48,7 @@ export function makeTestManifest(
     version: opts?.version ?? 1,
     not_before: opts?.notBefore ?? "2026-01-01T00:00:00Z",
     expires: opts?.expires ?? "2027-01-01T00:00:00Z",
-    nodes: nodes as unknown as readonly Record<string, unknown>[],
+    nodes: nodes as readonly Record<string, unknown>[],
     signatures: [],
   };
 

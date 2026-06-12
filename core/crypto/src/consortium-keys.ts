@@ -55,9 +55,13 @@ export const TEST_OFFICER_SEEDS: readonly [Uint8Array, Uint8Array, Uint8Array, U
  * Test consortium officer root keys — real Ed25519 public keys derived from
  * deterministic fixed seeds. Completely disjoint from production keys (SI-003).
  */
-export const TEST_CONSORTIUM_ROOT_KEYS: readonly [string, string, string, string, string] = TEST_OFFICER_SEEDS.map(
-  (seed) => Buffer.from(ed25519.getPublicKey(seed)).toString("hex"),
-) as unknown as readonly [string, string, string, string, string];
+export const TEST_CONSORTIUM_ROOT_KEYS: readonly [string, string, string, string, string] = [
+  Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[0])).toString("hex"),
+  Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[1])).toString("hex"),
+  Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[2])).toString("hex"),
+  Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[3])).toString("hex"),
+  Buffer.from(ed25519.getPublicKey(TEST_OFFICER_SEEDS[4])).toString("hex"),
+] as const;
 
 /** Test threshold — same as production for realistic test coverage. */
 export const TEST_CONSORTIUM_THRESHOLD = 3;
