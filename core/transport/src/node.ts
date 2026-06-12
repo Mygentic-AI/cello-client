@@ -299,6 +299,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       relay: circuitRelayServer(),
       dcutr: dcutr(),
     },
+    ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
   });
 
   // Return node in STOPPED state — caller must call start()
