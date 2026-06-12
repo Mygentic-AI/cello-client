@@ -40,3 +40,15 @@ export { buildCheckpointTbs, computeCheckpointHash } from "./checkpoint.js";
 
 // FEDERATION-003: relay registration TBS and signature verification
 export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./relay-registration.js";
+
+// M7-MANIFEST-001: consortium manifest verification and root key constants
+export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
+export { canonicalManifestBody, verifyManifest } from "./manifest.js";
+export {
+  CONSORTIUM_ROOT_KEYS,
+  CONSORTIUM_THRESHOLD,
+  TEST_CONSORTIUM_ROOT_KEYS,
+  TEST_CONSORTIUM_THRESHOLD,
+} from "./consortium-keys.js";
+export type { TestConsortiumNode, MakeTestManifestOpts } from "./manifest-test-fixture.js";
+export { makeTestManifest } from "./manifest-test-fixture.js";

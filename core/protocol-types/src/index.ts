@@ -116,3 +116,17 @@ export type {
   FrostDkgRequest,
   FrostDkgResponse,
 } from "./frost-dkg.js";
+
+// M7-MANIFEST-001: Consortium manifest types
+export type {
+  ConsortiumManifest,
+  ConsortiumNode,
+  OfficerSignature,
+  ManifestError,
+} from "./manifest.js";
+
+export {
+  MANIFEST_SIGNATURE_INVALID,
+  MANIFEST_VERSION_ROLLBACK,
+  MANIFEST_EXPIRED,
+} from "./manifest.js";
