@@ -141,7 +141,7 @@ export class DirectoryConnectionGater implements ConnectionGater {
       return false; // allow
     }
     this.#logger.warn("session.node.connection.rejected", {
-      sessionId: "directory",
+      sessionId: "__directory_facing__",
       attemptedPeerId: peerIdStr,
       expectedPeerId: "known_directory_peer",
     });

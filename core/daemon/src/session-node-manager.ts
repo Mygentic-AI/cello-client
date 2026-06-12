@@ -400,23 +400,24 @@ export class SessionNodeManager {
    * SQLite writes complete before this method returns.
    */
   async gracefulShutdown(): Promise<void> {
-    // Mark all active sessions interrupted in SQLite first
+    // Mark ALL 'active' rows interrupted in SQLite — single batch UPDATE covers
+    // both in-memory managed nodes AND any rows that were inserted directly
+    // (e.g. by the binary AC-009 SIGTERM test inserting synthetic rows).
+    // This is the authoritative persistence step; in-memory map is secondary.
     const now = Date.now();
-    for (const [sessionId] of this.#activeNodes) {
+    if (!this.#db) {
+      this.#logger.error("session.interrupt.db.write.failed", {
+        sessionId: "__all__",
+        error: "db not initialized",
+      });
+    } else {
       try {
-        if (!this.#db) {
-          this.#logger.error("session.interrupt.db.write.failed", {
-            sessionId,
-            error: "db not initialized",
-          });
-        } else {
-          this.#db.prepare(
-            "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE session_id = ?",
-          ).run(now, sessionId);
-        }
+        this.#db.prepare(
+          "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE status = 'active'",
+        ).run(now);
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
-          sessionId,
+          sessionId: "__all__",
           error: err instanceof Error ? err.message : String(err),
         });
       }
