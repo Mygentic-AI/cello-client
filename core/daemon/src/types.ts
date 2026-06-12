@@ -11,6 +11,7 @@ import type {
   IManifestVersionStore,
   IManifestPollScheduler,
   IDirectoryChallengeVerifier,
+  ConnectResult,
 } from "@cello-protocol/transport";
 
 // Re-export manifest interfaces for consumers of the daemon package
@@ -166,6 +167,12 @@ export interface DaemonConfig {
    * When absent, directory challenge verification is skipped.
    */
   challengeVerifier?: IDirectoryChallengeVerifier;
+  /**
+   * M7-SIGNAL-001: injectable connect function for directory signaling stream.
+   * When absent, a stub that always rejects (directory_signaling_not_configured) is used.
+   * Production: performs the full 7-step directory handshake.
+   */
+  signalingConnect?: () => Promise<ConnectResult>;
 }
 
 // --- Session node types ---
