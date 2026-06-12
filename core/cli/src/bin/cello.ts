@@ -9,8 +9,8 @@
  */
 
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, dirname } from "node:path";
+import { createRequire } from "node:module";
 import { login, logout, status } from "../commands.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -32,9 +32,10 @@ const logger: Logger = {
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
 const command = process.argv[2];
 
-// Resolve the daemon binary relative to this file
-const thisDir = fileURLToPath(new URL(".", import.meta.url));
-const daemonBin = resolve(thisDir, "../../daemon/dist/bin/cello-daemon.js");
+// Resolve daemon binary via package resolution (works after npm publish)
+const require = createRequire(import.meta.url);
+const daemonPkgPath = require.resolve("@cello-protocol/daemon/package.json");
+const daemonBin = join(dirname(daemonPkgPath), "dist/bin/cello-daemon.js");
 
 async function main(): Promise<void> {
   let result: { exitCode: number; output: string };

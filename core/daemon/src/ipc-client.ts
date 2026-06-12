@@ -41,13 +41,35 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
     const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
     let buffer = "";
 
+    const client: IpcClient = {
+      send(method: string, params?: Record<string, unknown>): Promise<unknown> {
+        return new Promise<unknown>((res, rej) => {
+          if (socket.destroyed) {
+            rej(new Error("Socket closed"));
+            return;
+          }
+          const id = randomUUID();
+          pending.set(id, { resolve: res, reject: rej });
+          const request: IpcRequest = { id, method, params };
+          const ok = socket.write(JSON.stringify(request) + "\n");
+          if (!ok) {
+            pending.delete(id);
+            rej(new Error("Socket write buffer full"));
+          }
+        });
+      },
+
+      close(): void {
+        socket.end();
+      },
+    };
+
     socket.on("connect", () => {
       resolve(client);
     });
 
     socket.on("error", (err: Error) => {
       reject(err);
-      // Reject all pending requests
       for (const [, p] of pending) {
         p.reject(err);
       }
@@ -86,20 +108,5 @@ export function connectToDaemon(socketPath: string): Promise<IpcClient> {
       }
       pending.clear();
     });
-
-    const client: IpcClient = {
-      send(method: string, params?: Record<string, unknown>): Promise<unknown> {
-        return new Promise<unknown>((res, rej) => {
-          const id = randomUUID();
-          pending.set(id, { resolve: res, reject: rej });
-          const request: IpcRequest = { id, method, params };
-          socket.write(JSON.stringify(request) + "\n");
-        });
-      },
-
-      close(): void {
-        socket.end();
-      },
-    };
   });
 }

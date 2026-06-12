@@ -164,19 +164,27 @@ export function createIpcServer(
     conn.inFlightCount++;
     handler(request.params)
       .then((result) => {
-        const resp: IpcResponse = { id: request.id, result };
-        conn.socket.write(JSON.stringify(resp) + "\n");
+        try {
+          const resp: IpcResponse = { id: request.id, result };
+          conn.socket.write(JSON.stringify(resp) + "\n");
+        } catch {
+          // Socket closed before response could be written
+        }
       })
       .catch((err: unknown) => {
-        const resp: IpcResponse = {
-          id: request.id,
-          error: {
-            code: "internal_error",
-            message: err instanceof Error ? err.message : String(err),
-            guidance: "An unexpected error occurred. Check daemon logs for details.",
-          },
-        };
-        conn.socket.write(JSON.stringify(resp) + "\n");
+        try {
+          const resp: IpcResponse = {
+            id: request.id,
+            error: {
+              code: "internal_error",
+              message: err instanceof Error ? err.message : String(err),
+              guidance: "An unexpected error occurred. Check daemon logs for details.",
+            },
+          };
+          conn.socket.write(JSON.stringify(resp) + "\n");
+        } catch {
+          // Socket closed before error could be written
+        }
       })
       .finally(() => {
         conn.inFlightCount--;
@@ -245,7 +253,10 @@ export function createIpcServer(
         await unlink(socketPath);
       } catch (err: unknown) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          // Non-critical, log but continue
+          logger.warn("daemon.ipc.socket.unlink.failed", {
+            socketPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
 

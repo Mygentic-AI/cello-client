@@ -48,14 +48,29 @@ async function main(): Promise<void> {
     logger,
   });
 
-  // SIGTERM/SIGINT → graceful shutdown
   const shutdown = async (signal: string): Promise<void> => {
     await handle.stop(signal);
     process.exit(0);
   };
 
-  process.on("SIGTERM", () => { shutdown("SIGTERM"); });
-  process.on("SIGINT", () => { shutdown("SIGINT"); });
+  process.on("SIGTERM", () => {
+    shutdown("SIGTERM").catch((err: unknown) => {
+      logger.error("daemon.shutdown.failed", {
+        signal: "SIGTERM",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      process.exit(1);
+    });
+  });
+  process.on("SIGINT", () => {
+    shutdown("SIGINT").catch((err: unknown) => {
+      logger.error("daemon.shutdown.failed", {
+        signal: "SIGINT",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      process.exit(1);
+    });
+  });
 }
 
 main().catch((err: unknown) => {

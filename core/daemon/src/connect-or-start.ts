@@ -109,7 +109,12 @@ async function spawnDaemon(
           if (event.event === "daemon.startup.failed") {
             clearTimeout(timeout);
             child.stdout!.removeAllListeners();
-            reject(new Error(event.error as string || "Daemon startup failed"));
+            const errorMsg = typeof event.error === "string"
+              ? event.error
+              : event.error instanceof Error
+                ? event.error.message
+                : String(event.error || "Daemon startup failed");
+            reject(new Error(errorMsg));
             return;
           }
         } catch {
