@@ -63,6 +63,9 @@
  * getStatus(): { standingReceiverReady: boolean }
  */
 
+// node:sqlite (DatabaseSync) requires Node.js >= 24 (stable in 24 LTS).
+// The engines field in package.json is set to ">=24" specifically because of this
+// dependency — do not lower the engine floor without replacing this import.
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { Logger, SessionRecord } from "./types.js";
@@ -293,6 +296,22 @@ export class SessionNodeManager {
       };
     }
 
+    // Cap enforcement — inbound sessions count against the same limit (AC-006)
+    if (this.#activeNodes.size >= MAX_SESSION_NODES) {
+      this.#logger.warn("session.node.cap.reached", {
+        agentName,
+        currentCount: this.#activeNodes.size,
+        maxCount: MAX_SESSION_NODES,
+      });
+      return {
+        ok: false,
+        reason: "max_sessions_reached",
+        guidance:
+          "The daemon has reached its maximum of 32 concurrent session nodes. " +
+          "Close an existing session before starting a new one.",
+      };
+    }
+
     const { node, gater } = this.#standingReceiver;
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
@@ -329,7 +348,7 @@ export class SessionNodeManager {
         sessionId: "standing_receiver_replacement",
         agentName: STANDING_RECEIVER_AGENT_NAME,
         error: err instanceof Error ? err.message : String(err),
-        correlationId: "n/a",
+        correlationId,
       });
     });
 
@@ -350,7 +369,7 @@ export class SessionNodeManager {
     try {
       await entry.node.stop();
     } catch (err: unknown) {
-      this.#logger.error("session.node.create.failed", {
+      this.#logger.error("session.node.stop.failed", {
         sessionId,
         agentName: entry.agentName,
         error: err instanceof Error ? err.message : String(err),
@@ -359,7 +378,10 @@ export class SessionNodeManager {
       // Fall through — still remove from active map and update DB
     }
 
-    // Update SQLite — 'sealed' → 'sealed', everything else → 'interrupted'
+    // Update SQLite — 'sealed' → 'sealed', 'interrupted'/'error' → 'interrupted'.
+    // 'error' is not a valid SessionStatus in SQLite; error-torn-down sessions
+    // surface as interrupted so AC-010 recovery handles them at next login.
+    // The session.node.destroyed log preserves the original reason for observability.
     const dbStatus = reason === "sealed" ? "sealed" : "interrupted";
     this.#updateSessionStatus(sessionId, dbStatus);
 
@@ -380,34 +402,43 @@ export class SessionNodeManager {
   async gracefulShutdown(): Promise<void> {
     // Mark all active sessions interrupted in SQLite first
     const now = Date.now();
-    for (const [sessionId, entry] of this.#activeNodes) {
+    for (const [sessionId] of this.#activeNodes) {
       try {
-        this.#db!.prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE session_id = ?",
-        ).run(now, sessionId);
+        if (!this.#db) {
+          this.#logger.error("session.interrupt.db.write.failed", {
+            sessionId,
+            error: "db not initialized",
+          });
+        } else {
+          this.#db.prepare(
+            "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE session_id = ?",
+          ).run(now, sessionId);
+        }
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
           sessionId,
           error: err instanceof Error ? err.message : String(err),
         });
       }
-      this.#logger.info("session.node.destroyed", {
-        sessionId,
-        agentName: entry.agentName,
-        reason: "interrupted",
-      });
     }
 
-    // Stop all session nodes
+    // Stop all session nodes, then emit session.node.destroyed after each stop
+    // (mirrors destroySessionNode ordering: stop first, log destroyed after)
     const stopPromises: Promise<void>[] = [];
-    for (const [, entry] of this.#activeNodes) {
+    for (const [sessionId, entry] of this.#activeNodes) {
       stopPromises.push(
         entry.node.stop().catch((err: unknown) => {
-          this.#logger.error("session.node.create.failed", {
-            sessionId: "shutdown",
+          this.#logger.error("session.node.stop.failed", {
+            sessionId,
             agentName: entry.agentName,
             error: err instanceof Error ? err.message : String(err),
             correlationId: entry.correlationId,
+          });
+        }).then(() => {
+          this.#logger.info("session.node.destroyed", {
+            sessionId,
+            agentName: entry.agentName,
+            reason: "interrupted",
           });
         }),
       );
@@ -420,7 +451,7 @@ export class SessionNodeManager {
       try {
         await this.#standingReceiver.node.stop();
       } catch (err: unknown) {
-        this.#logger.error("session.node.create.failed", {
+        this.#logger.error("session.node.stop.failed", {
           sessionId: "standing_receiver_shutdown",
           agentName: STANDING_RECEIVER_AGENT_NAME,
           error: err instanceof Error ? err.message : String(err),
@@ -447,6 +478,8 @@ export class SessionNodeManager {
 
   async #createStandingReceiver(): Promise<void> {
     const sessionId = `standing_receiver_${randomUUID()}`;
+    // Mint a correlationId per creation attempt so log events are trackable
+    const correlationId = randomUUID();
     const gater = new SessionConnectionGater({
       sessionId,
       allowedPeerId: null, // open — counterparty unknown at creation time
@@ -463,7 +496,7 @@ export class SessionNodeManager {
         sessionId,
         agentName: STANDING_RECEIVER_AGENT_NAME,
         error: errorMessage,
-        correlationId: "n/a",
+        correlationId,
       });
       return; // standing receiver not ready — callers check #standingReceiverReady
     }
@@ -475,7 +508,7 @@ export class SessionNodeManager {
       sessionId,
       agentName: STANDING_RECEIVER_AGENT_NAME,
       sessionPeerId: node.getPeerId(),
-      correlationId: "n/a",
+      correlationId,
     });
   }
 
@@ -484,8 +517,8 @@ export class SessionNodeManager {
     agentName: string,
     counterpartyPubkey: string,
     status: "active" | "sealed" | "interrupted",
-  ): void {
-    if (!this.#db) return;
+  ): boolean {
+    if (!this.#db) return false;
     const now = Date.now();
     try {
       this.#db
@@ -495,11 +528,13 @@ export class SessionNodeManager {
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
         .run(sessionId, agentName, counterpartyPubkey, status, now, now);
+      return true;
     } catch (err: unknown) {
       this.#logger.error("session.interrupt.db.write.failed", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 

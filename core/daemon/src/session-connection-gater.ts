@@ -85,10 +85,23 @@ export class SessionConnectionGater implements ConnectionGater {
 
   /**
    * denyInboundEncryptedConnection — called after Noise handshake, before muxer.
-   * This is the enforcement point: PeerId is known here.
+   * This is the enforcement point for inbound connections: PeerId is known here.
    * Return true to DENY the connection.
    */
   denyInboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
+    return this.#denyIfNotAllowed(peerId);
+  }
+
+  /**
+   * denyOutboundEncryptedConnection — symmetric gate for outbound connections.
+   * Session nodes should only connect to the designated counterparty.
+   * Return true to DENY the connection.
+   */
+  denyOutboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
+    return this.#denyIfNotAllowed(peerId);
+  }
+
+  #denyIfNotAllowed(peerId: PeerId): boolean {
     // If no allowed peer set (fully open gater), allow all.
     if (this.#allowedPeerId === null) {
       return false;

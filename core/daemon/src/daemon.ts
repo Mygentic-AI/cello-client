@@ -33,7 +33,6 @@ import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { createNode } from "@cello-protocol/transport";
-import { generateKeypair } from "@cello-protocol/crypto";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 export interface DaemonHandle {
@@ -41,15 +40,20 @@ export interface DaemonHandle {
   getStatus(): DaemonStatusResponse;
 }
 
+// Minimal no-op KeyProvider stub for session nodes.
+// Session nodes don't need signing keys — libp2p generates its own fresh
+// transport keypair internally. The KeyProvider interface is required by
+// createNode but is never called on session nodes.
+const SESSION_NODE_KEY_STUB = {
+  getPublicKey: () => Promise.resolve(new Uint8Array(32)),
+  sign: (_data: Uint8Array) => Promise.resolve(new Uint8Array(64)),
+};
+
 // Production session node factory — wraps createNode from @cello-protocol/transport
 class ProductionSessionNodeFactory implements ISessionNodeFactory {
   async createNode(config: SessionNodeConfig) {
-    // Use a throwaway in-memory keypair — session nodes don't need signing keys.
-    // Per ADR-0001: libp2p generates its own fresh transport keypair internally.
-    // We need a KeyProvider only to satisfy the CelloNode interface; it is never called.
-    const keyProvider = generateKeypair();
     return createNode({
-      keyProvider,
+      keyProvider: SESSION_NODE_KEY_STUB,
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
       connectionGater: config.connectionGater,
     });
