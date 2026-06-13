@@ -7,9 +7,15 @@ on:
   pull_request:
     branches: ['main']
 
+# M7-CICD-001: OIDC permissions for the cross-repo e2e gate.
+# id-token: write is required for GitHub OIDC → AWS role assumption.
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build:
-    name: Build, Test, and Publish
+    name: Build and Test
     runs-on: ubuntu-latest
 
     steps:
@@ -70,48 +76,176 @@ jobs:
             exit 1
           fi
 
-      # Publish step — only runs on version tags, requires NPM_TOKEN secret.
-      # Checks out trustless-cello to publish @cello-protocol/interfaces via pnpm
-      # (so workspace:* specifiers are rewritten to real version numbers).
-      # All commands use || true for idempotency (E409 if version already exists).
+  # ── M7-CICD-001: Cross-repo e2e gate ─────────────────────────────────────
+  # Runs only on main branch pushes (not PRs, not tags).
+  # Uploads the candidate connect tarball to S3, triggers the trustless-cello
+  # e2e pipeline, and blocks publish if it fails.
+  e2e-gate:
+    name: Cross-repo E2E Gate
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout cello-client
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      # AC-013 step 1: Pack the connect tarball
+      - name: Pack @cello-protocol/connect tarball
+        run: |
+          cd core/adapter-claude-code
+          pnpm pack
+          mv cello-protocol-connect-*.tgz connect.tgz
+          echo "TARBALL_PATH=$(pwd)/connect.tgz" >> $GITHUB_ENV
+          echo "TARBALL_SIZE=$(stat -c%s connect.tgz)" >> $GITHUB_ENV
+
+      # AC-013 step 2: Configure AWS credentials via OIDC
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # AC-013 step 2: Upload candidate tarball to S3
+      - name: Upload candidate tarball to S3
+        run: |
+          S3_KEY="candidates/${{ github.sha }}/connect.tgz"
+          aws s3 cp "$TARBALL_PATH" "s3://cello-codepipeline-artifacts-us-east-1/${S3_KEY}"
+          echo '{"event":"cicd.candidate.uploaded","level":"info","candidateSha":"${{ github.sha }}","s3Key":"'"${S3_KEY}"'","sizeBytes":'"${TARBALL_SIZE}"',"repo":"Mygentic-AI/cello-client"}'
+
+      # AC-013 step 3: Start e2e pipeline with CELLO_CANDIDATE_SHA
+      - name: Start e2e pipeline
+        id: start_pipeline
+        run: |
+          RESULT=$(aws codepipeline start-pipeline-execution \
+            --name cello-e2e-tests-pipeline \
+            --variables "name=CELLO_CANDIDATE_SHA,value=${{ github.sha }}" \
+            --output json)
+          EXECUTION_ID=$(echo "$RESULT" | jq -r '.pipelineExecutionId')
+          echo "EXECUTION_ID=$EXECUTION_ID" >> $GITHUB_ENV
+          echo '{"event":"cicd.e2e_gate.started","level":"info","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","repo":"Mygentic-AI/cello-client"}'
+
+      # AC-013 step 4: Poll pipeline execution every 30s for up to 15 minutes
+      - name: Poll e2e pipeline execution
+        run: |
+          START_TIME=$(date +%s)
+          TIMEOUT=900  # 15 minutes
+          POLL_INTERVAL=30
+
+          while true; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo '{"event":"cicd.e2e_gate.timeout","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","elapsedMs":'$(( ELAPSED * 1000 ))'}'
+              echo "ERROR: Pipeline execution timed out after ${TIMEOUT}s"
+              exit 1
+            fi
+
+            STATUS=$(aws codepipeline get-pipeline-execution \
+              --pipeline-name cello-e2e-tests-pipeline \
+              --pipeline-execution-id "$EXECUTION_ID" \
+              --query 'pipelineExecution.status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+
+            echo "Pipeline status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            case "$STATUS" in
+              Succeeded)
+                DURATION_MS=$(( ELAPSED * 1000 ))
+                echo '{"event":"cicd.e2e_gate.passed","level":"info","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","durationMs":'"$DURATION_MS"'}'
+                exit 0
+                ;;
+              Failed|Superseded|Stopped|Stopping|Cancelled)
+                FAILED_STAGE=$(aws codepipeline list-action-executions \
+                  --pipeline-name cello-e2e-tests-pipeline \
+                  --filter "pipelineExecutionId=$EXECUTION_ID" \
+                  --query 'actionExecutionDetails[?status==`Failed`].stageName | [0]' \
+                  --output text 2>/dev/null || echo "unknown")
+                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","failedStageName":"'"$FAILED_STAGE"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client"}'
+                echo "ERROR: Pipeline execution $STATUS (failed stage: $FAILED_STAGE)"
+                exit 1
+                ;;
+              *)
+                # InProgress or other transitional status — keep polling
+                sleep $POLL_INTERVAL
+                ;;
+            esac
+          done
+
+    outputs:
+      e2e_passed: ${{ job.status == 'success' }}
+
+  # ── Publish job — only runs after e2e gate passes ──────────────────────────
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: e2e-gate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout cello-client
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      # Checkout trustless-cello for interfaces publish
       - name: Checkout trustless-cello (for interfaces publish)
-        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/checkout@v4
         with:
           repository: Mygentic-AI/CELLO
           path: trustless-cello
 
       - name: Install trustless-cello interfaces dependencies (for publish)
-        if: startsWith(github.ref, 'refs/tags/')
         working-directory: trustless-cello/packages/interfaces
         run: pnpm install --ignore-workspace
 
       - name: Build @cello-protocol/interfaces (for publish)
-        if: startsWith(github.ref, 'refs/tags/')
         working-directory: trustless-cello/packages/interfaces
         run: |
           pnpm run typecheck
           test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
 
-      - name: Publish to npm (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish to npm (beta)
         run: |
-          # DEFAULT IS BETA. Every publish goes to 'beta' unless the tag contains
-          # '-latest' (e.g. v1.0.0-latest). Promotion to 'latest' is a manual gate
-          # done AFTER verification: `npm dist-tag add @cello-protocol/connect@X.Y.Z latest`
           TAG="beta"
-          if [[ "${{ github.ref_name }}" == *-latest ]]; then
-            TAG="latest"
-          fi
           echo "Publishing with tag: $TAG"
 
-          # Publish @cello-protocol/interfaces in isolation to avoid workspace
-          # dependency resolution failures (other packages may reference client
-          # versions not yet published at this point in the pipeline).
+          # Publish @cello-protocol/interfaces in isolation
           (cd "$GITHUB_WORKSPACE/trustless-cello/packages/interfaces" && pnpm publish --ignore-workspace --access public --no-git-checks --tag "$TAG") || true
 
           # Publish cello-client packages in dependency order.
-          # || true makes each command idempotent (E409 if version already exists).
           pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
@@ -121,7 +255,198 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify all published versions match local
-        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          FAILED=0
+          for pkg in protocol-types crypto transport client; do
+            local_ver=$(node -p "require('./core/$pkg/package.json').version")
+            npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
+            if [ "$local_ver" != "$npm_ver" ]; then
+              echo "FAIL: @cello-protocol/$pkg local=$local_ver beta=$npm_ver — bump the version before tagging"
+              FAILED=1
+            else
+              echo "OK: @cello-protocol/$pkg@$local_ver"
+            fi
+          done
+          local_ver=$(node -p "require('./core/adapter-claude-code/package.json').version")
+          npm_ver=$(npm view @cello-protocol/connect@beta version 2>/dev/null || echo "missing")
+          if [ "$local_ver" != "$npm_ver" ]; then
+            echo "FAIL: @cello-protocol/connect local=$local_ver beta=$npm_ver — bump the version before tagging"
+            FAILED=1
+          else
+            echo "OK: @cello-protocol/connect@$local_ver"
+          fi
+          exit $FAILED
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Tag-triggered e2e gate ───────────────────────────────────────────────────
+  # Tags are the actual release path — they must also pass the e2e gate.
+  e2e-gate-tag:
+    name: Cross-repo E2E Gate (tag)
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout cello-client
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Pack @cello-protocol/connect tarball
+        run: |
+          cd core/adapter-claude-code
+          pnpm pack
+          mv cello-protocol-connect-*.tgz connect.tgz
+          echo "TARBALL_PATH=$(pwd)/connect.tgz" >> $GITHUB_ENV
+          echo "TARBALL_SIZE=$(stat -c%s connect.tgz)" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Upload candidate tarball to S3
+        run: |
+          S3_KEY="candidates/${{ github.sha }}/connect.tgz"
+          aws s3 cp "$TARBALL_PATH" "s3://cello-codepipeline-artifacts-us-east-1/${S3_KEY}"
+          echo '{"event":"cicd.candidate.uploaded","level":"info","candidateSha":"${{ github.sha }}","s3Key":"'"${S3_KEY}"'","sizeBytes":'"${TARBALL_SIZE}"',"repo":"Mygentic-AI/cello-client","trigger":"tag"}'
+
+      - name: Start e2e pipeline
+        id: start_pipeline
+        run: |
+          RESULT=$(aws codepipeline start-pipeline-execution \
+            --name cello-e2e-tests-pipeline \
+            --variables "name=CELLO_CANDIDATE_SHA,value=${{ github.sha }}" \
+            --output json)
+          EXECUTION_ID=$(echo "$RESULT" | jq -r '.pipelineExecutionId')
+          echo "EXECUTION_ID=$EXECUTION_ID" >> $GITHUB_ENV
+          echo '{"event":"cicd.e2e_gate.started","level":"info","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","repo":"Mygentic-AI/cello-client","trigger":"tag"}'
+
+      - name: Poll e2e pipeline execution
+        run: |
+          START_TIME=$(date +%s)
+          TIMEOUT=900
+          POLL_INTERVAL=30
+
+          while true; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo '{"event":"cicd.e2e_gate.timeout","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","elapsedMs":'$(( ELAPSED * 1000 ))'}'
+              echo "ERROR: Pipeline execution timed out after ${TIMEOUT}s"
+              exit 1
+            fi
+
+            STATUS=$(aws codepipeline get-pipeline-execution \
+              --pipeline-name cello-e2e-tests-pipeline \
+              --pipeline-execution-id "$EXECUTION_ID" \
+              --query 'pipelineExecution.status' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+
+            echo "Pipeline status: $STATUS (elapsed: ${ELAPSED}s)"
+
+            case "$STATUS" in
+              Succeeded)
+                DURATION_MS=$(( ELAPSED * 1000 ))
+                echo '{"event":"cicd.e2e_gate.passed","level":"info","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","durationMs":'"$DURATION_MS"',"trigger":"tag"}'
+                exit 0
+                ;;
+              Failed|Superseded|Stopped|Stopping|Cancelled)
+                FAILED_STAGE=$(aws codepipeline list-action-executions \
+                  --pipeline-name cello-e2e-tests-pipeline \
+                  --filter "pipelineExecutionId=$EXECUTION_ID" \
+                  --query 'actionExecutionDetails[?status==`Failed`].stageName | [0]' \
+                  --output text 2>/dev/null || echo "unknown")
+                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","failedStageName":"'"$FAILED_STAGE"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client","trigger":"tag"}'
+                echo "ERROR: Pipeline execution $STATUS (failed stage: $FAILED_STAGE)"
+                exit 1
+                ;;
+              *)
+                sleep $POLL_INTERVAL
+                ;;
+            esac
+          done
+
+  # ── Tag-triggered publish ──────────────────────────────────────────────────
+  publish-tag:
+    name: Publish (tag release)
+    runs-on: ubuntu-latest
+    needs: [build, e2e-gate-tag]
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout cello-client
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup pnpm 10.33.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Checkout trustless-cello (for interfaces publish)
+        uses: actions/checkout@v4
+        with:
+          repository: Mygentic-AI/CELLO
+          path: trustless-cello
+
+      - name: Install trustless-cello interfaces dependencies (for publish)
+        working-directory: trustless-cello/packages/interfaces
+        run: pnpm install --ignore-workspace
+
+      - name: Build @cello-protocol/interfaces (for publish)
+        working-directory: trustless-cello/packages/interfaces
+        run: |
+          pnpm run typecheck
+          test -d dist && test "$(ls -A dist)" || (echo "ERROR: dist/ is empty after build" && exit 1)
+
+      - name: Publish to npm (tags only)
+        run: |
+          TAG="beta"
+          if [[ "${{ github.ref_name }}" == *-latest ]]; then
+            TAG="latest"
+          fi
+          echo "Publishing with tag: $TAG"
+
+          (cd "$GITHUB_WORKSPACE/trustless-cello/packages/interfaces" && pnpm publish --ignore-workspace --access public --no-git-checks --tag "$TAG") || true
+
+          pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify all published versions match local
         run: |
           FAILED=0
           for pkg in protocol-types crypto transport client; do
