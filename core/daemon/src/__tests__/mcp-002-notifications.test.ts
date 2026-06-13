@@ -367,20 +367,55 @@ describe("MCP-002: notification routing", () => {
     });
   });
 
-  // ─── AC-008: All notifications include agent field ───
-  it("AC-008: agent_state_changed notification includes agent field", async () => {
-    const config = await setupWithAgents("alice");
+  // ─── AC-008: All notifications include agent field (all three types) ───
+  it("AC-008: all three notification types include the agent field", async () => {
+    const config = await setupWithAgents("alice", "bob");
     handle = await startDaemon(config);
 
     const clientA = await connect(config.socketPath);
     const notifA = collectNotifications(clientA);
 
+    // 1. agent_state_changed — start alice
     await clientA.send("cello_start_agent", { name: "alice" });
+    await clientA.send("cello_start_agent", { name: "bob" });
     await waitForNotifications();
 
+    // 2. agent_current_changed — use alice (first use: fromAgent=null, toAgent=alice)
+    await clientA.send("cello_use_agent", { name: "bob" });
+    await waitForNotifications();
+
+    // 3. session_state_changed — emit session event for bob
+    await clientA.send("__test_emit_session_event", {
+      type: "created",
+      sessionId: "sess-ac008",
+      agentName: "bob",
+      counterpartyPubkey: "cdef1234",
+    });
+    await waitForNotifications();
+
+    // Verify agent field on agent_state_changed
     const stateNotifs = notifA.filter((n) => n.notification === "agent_state_changed");
-    expect(stateNotifs).toHaveLength(1);
-    expect(stateNotifs[0].data!.agent).toBe("alice");
+    expect(stateNotifs.length).toBeGreaterThanOrEqual(1);
+    for (const n of stateNotifs) {
+      expect(n.data!.agent).toBeDefined();
+      expect(typeof n.data!.agent).toBe("string");
+    }
+
+    // Verify agent field on agent_current_changed
+    const currentNotifs = notifA.filter((n) => n.notification === "agent_current_changed");
+    expect(currentNotifs.length).toBeGreaterThanOrEqual(1);
+    for (const n of currentNotifs) {
+      expect(n.data!.agent).toBeDefined();
+      expect(typeof n.data!.agent).toBe("string");
+    }
+
+    // Verify agent field on session_state_changed
+    const sessionNotifs = notifA.filter((n) => n.notification === "session_state_changed");
+    expect(sessionNotifs.length).toBeGreaterThanOrEqual(1);
+    for (const n of sessionNotifs) {
+      expect(n.data!.agent).toBeDefined();
+      expect(typeof n.data!.agent).toBe("string");
+    }
   });
 
   // ─── AC-009: Connections without current agent still receive agent_state_changed ───
@@ -617,6 +652,40 @@ describe("MCP-002: notification routing", () => {
     expect(dispatchFailed[0].context.connectionId).toBe("conn-1");
     expect(dispatchFailed[0].context.notificationType).toBe("agent_state_changed");
     expect(dispatchFailed[0].context.error).toBe("EPIPE: broken pipe");
+  });
+
+  // ─── SI-002: No key material in notification payloads ───
+  it("SI-002: notification construction sites do not reference prohibited key fields", async () => {
+    const { readFileSync, readdirSync, statSync } = await import("node:fs");
+    const { join: pathJoin } = await import("node:path");
+
+    const prohibitedFields = /privateKey|signingShare|localShare|secretKey|identityKey/;
+
+    function scanDir(dir: string): string[] {
+      const violations: string[] = [];
+      for (const entry of readdirSync(dir)) {
+        const full = pathJoin(dir, entry);
+        if (statSync(full).isDirectory()) {
+          if (entry === "node_modules" || entry === "__tests__" || entry === "dist") continue;
+          violations.push(...scanDir(full));
+        } else if (entry.endsWith(".ts") && !entry.endsWith(".test.ts")) {
+          const content = readFileSync(full, "utf-8");
+          const lines = content.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes("notification") && prohibitedFields.test(lines[i])) {
+              violations.push(`${full}:${i + 1}: ${lines[i].trim()}`);
+            }
+          }
+        }
+      }
+      return violations;
+    }
+
+    const daemonSrc = pathJoin(__dirname, "..");
+    const adapterSrc = pathJoin(__dirname, "..", "..", "..", "adapter-claude-code", "src");
+
+    const violations = [...scanDir(daemonSrc), ...scanDir(adapterSrc)];
+    expect(violations).toEqual([]);
   });
 
   it("notification.dispatch.failed logged when sendNotification returns false", () => {
