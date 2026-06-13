@@ -50,8 +50,6 @@ export interface IpcServer {
   onDisconnect(handler: IpcDisconnectHandler): void;
   /** Write a notification to a specific connection. Returns false on write failure. */
   sendNotification(connectionId: string, notification: IpcNotification): boolean;
-  /** Write a notification to ALL active connections. */
-  broadcastNotification(notification: IpcNotification): void;
   /** Return all active connection IDs. */
   getConnectionIds(): string[];
 }
@@ -291,20 +289,12 @@ export function createIpcServer(
       try {
         const frame = JSON.stringify(notification) + "\n";
         return conn.socket.write(frame);
-      } catch {
-        // Socket closed or destroyed before notification could be written
+      } catch (err: unknown) {
+        logger.debug("daemon.ipc.notification.write.failed", {
+          connectionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
         return false;
-      }
-    },
-
-    broadcastNotification(notification: IpcNotification): void {
-      const frame = JSON.stringify(notification) + "\n";
-      for (const conn of connections.values()) {
-        try {
-          conn.socket.write(frame);
-        } catch {
-          // Connection may already be closed — silently skip
-        }
       }
     },
 

@@ -97,7 +97,7 @@ export class NotificationDispatcher {
    * Send agent_current_changed to the triggering connection ONLY.
    * Routing rule: only the connection that called cello_use_agent receives this.
    */
-  dispatchAgentCurrentChanged(connectionId: string, fromAgent: string | null, toAgent: string): void {
+  dispatchAgentCurrentChanged(connectionId: string, fromAgent: string | null, toAgent: string | null): void {
     const notification: IpcNotification = {
       notification: "agent_current_changed",
       data: {
@@ -148,7 +148,7 @@ export class NotificationDispatcher {
         this.#logger.debug("notification.dispatch.failed", {
           connectionId,
           notificationType,
-          error: "write returned false",
+          error: "sendNotification returned false",
         });
       }
     } catch (err: unknown) {

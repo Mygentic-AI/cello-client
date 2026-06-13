@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { NotificationDispatcher } from "../notification-dispatcher.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 
@@ -35,6 +36,7 @@ describe("MCP-002: notification routing", () => {
   let clients: IpcClient[];
 
   beforeEach(async () => {
+    process.env["CELLO_ENV"] = "test";
     tempDir = await mkdtemp(join(tmpdir(), "cello-mcp002-test-"));
     logEvents = [];
     logger = {
@@ -55,6 +57,7 @@ describe("MCP-002: notification routing", () => {
       try { await handle.stop("test_cleanup"); } catch { /* already stopped */ }
     }
     await rm(tempDir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
   });
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
@@ -582,37 +585,64 @@ describe("MCP-002: notification routing", () => {
     expect(leakedSessionNotifs).toHaveLength(0);
   });
 
-  // ─── notification.dispatch.failed logged at DEBUG when socket write fails ───
-  it("notification.dispatch.failed logged when writing to dead socket", async () => {
-    const config = await setupWithAgents("alice");
-    handle = await startDaemon(config);
+  // ─── notification.dispatch.failed logged at DEBUG when sendNotification fails ───
+  it("notification.dispatch.failed logged when sendNotification throws", () => {
+    // Unit test of NotificationDispatcher directly — no daemon, no real socket.
+    // This guarantees the catch path is exercised unconditionally.
 
-    const clientA = await connect(config.socketPath);
-    const clientB = await connect(config.socketPath);
+    const unitLogEvents: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
+    const unitLogger: Logger = {
+      debug(event, context) { unitLogEvents.push({ level: "debug", event, context }); },
+      info(event, context) { unitLogEvents.push({ level: "info", event, context }); },
+      warn(event, context) { unitLogEvents.push({ level: "warn", event, context }); },
+      error(event, context) { unitLogEvents.push({ level: "error", event, context }); },
+    };
 
-    collectNotifications(clientA);
-    collectNotifications(clientB);
+    const throwingSender = (_connId: string, _notif: IpcNotification): boolean => {
+      throw new Error("EPIPE: broken pipe");
+    };
 
-    // Destroy clientB's socket forcefully (simulate half-closed)
-    // We'll close clientB, wait a tiny bit (not enough for disconnect handler),
-    // then trigger an event. The daemon's write attempt to B's socket should
-    // log notification.dispatch.failed at DEBUG.
-    clientB.close();
-    // Give it just enough time for the socket to close but test the error path
-    await waitForNotifications(50);
+    const dispatcher = new NotificationDispatcher({
+      logger: unitLogger,
+      sendNotification: throwingSender,
+      getConnectionIds: () => ["conn-1"],
+    });
 
-    await clientA.send("cello_start_agent", { name: "alice" });
-    await waitForNotifications();
+    dispatcher.registerConnection("conn-1");
+    dispatcher.dispatchAgentStateChanged("alice", "online", "started");
 
-    // The daemon logged the failed dispatch at DEBUG
-    const dispatchFailed = logEvents.filter((e) => e.event === "notification.dispatch.failed");
-    // May or may not fire depending on timing — if the disconnect handler removed
-    // the connection before the notification, it won't fire. If it fires, it should
-    // have the right shape.
-    if (dispatchFailed.length > 0) {
-      expect(dispatchFailed[0].level).toBe("debug");
-      expect(dispatchFailed[0].context.notificationType).toBe("agent_state_changed");
-      expect(dispatchFailed[0].context.connectionId).toBeDefined();
-    }
+    const dispatchFailed = unitLogEvents.filter((e) => e.event === "notification.dispatch.failed");
+    expect(dispatchFailed).toHaveLength(1);
+    expect(dispatchFailed[0].level).toBe("debug");
+    expect(dispatchFailed[0].context.connectionId).toBe("conn-1");
+    expect(dispatchFailed[0].context.notificationType).toBe("agent_state_changed");
+    expect(dispatchFailed[0].context.error).toBe("EPIPE: broken pipe");
+  });
+
+  it("notification.dispatch.failed logged when sendNotification returns false", () => {
+
+    const unitLogEvents: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
+    const unitLogger: Logger = {
+      debug(event, context) { unitLogEvents.push({ level: "debug", event, context }); },
+      info(event, context) { unitLogEvents.push({ level: "info", event, context }); },
+      warn(event, context) { unitLogEvents.push({ level: "warn", event, context }); },
+      error(event, context) { unitLogEvents.push({ level: "error", event, context }); },
+    };
+
+    const falseSender = (_connId: string, _notif: IpcNotification): boolean => false;
+
+    const dispatcher = new NotificationDispatcher({
+      logger: unitLogger,
+      sendNotification: falseSender,
+      getConnectionIds: () => ["conn-1"],
+    });
+
+    dispatcher.registerConnection("conn-1");
+    dispatcher.dispatchAgentStateChanged("alice", "online", "started");
+
+    const dispatchFailed = unitLogEvents.filter((e) => e.event === "notification.dispatch.failed");
+    expect(dispatchFailed).toHaveLength(1);
+    expect(dispatchFailed[0].level).toBe("debug");
+    expect(dispatchFailed[0].context.error).toBe("sendNotification returned false");
   });
 });

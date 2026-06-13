@@ -326,6 +326,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       if (state.currentAgent === name) {
         state.currentAgent = null;
         notificationDispatcher.setCurrentAgent(connId, null);
+        notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
         logger.info("agent.current.switched", { connectionId: connId, fromAgent: name, toAgent: null });
       }
     }
@@ -453,8 +454,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   // MCP-002: Test-only handler to emit session lifecycle events.
-  // Allows integration tests to trigger session_state_changed notifications
-  // without requiring a full libp2p session handshake.
+  // Guarded by CELLO_ENV=test — never available in production.
+  if (process.env["CELLO_ENV"] === "test") {
   handlers.set("__test_emit_session_event", async (params, _connectionId) => {
     const type = params?.type as string | undefined;
     const sessionId = params?.sessionId as string | undefined;
@@ -479,6 +480,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     return { ok: true };
   });
+  } // end CELLO_ENV=test guard
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {
