@@ -172,8 +172,13 @@ jobs:
                 exit 0
                 ;;
               Failed|Superseded|Stopped|Stopping|Cancelled)
-                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client"}'
-                echo "ERROR: Pipeline execution $STATUS"
+                FAILED_STAGE=$(aws codepipeline list-action-executions \
+                  --pipeline-name cello-e2e-tests-pipeline \
+                  --filter "pipelineExecutionId=$EXECUTION_ID" \
+                  --query 'actionExecutionDetails[?status==`Failed`].stageName | [0]' \
+                  --output text 2>/dev/null || echo "unknown")
+                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","failedStageName":"'"$FAILED_STAGE"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client"}'
+                echo "ERROR: Pipeline execution $STATUS (failed stage: $FAILED_STAGE)"
                 exit 1
                 ;;
               *)
@@ -363,8 +368,13 @@ jobs:
                 exit 0
                 ;;
               Failed|Superseded|Stopped|Stopping|Cancelled)
-                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client","trigger":"tag"}'
-                echo "ERROR: Pipeline execution $STATUS"
+                FAILED_STAGE=$(aws codepipeline list-action-executions \
+                  --pipeline-name cello-e2e-tests-pipeline \
+                  --filter "pipelineExecutionId=$EXECUTION_ID" \
+                  --query 'actionExecutionDetails[?status==`Failed`].stageName | [0]' \
+                  --output text 2>/dev/null || echo "unknown")
+                echo '{"event":"cicd.e2e_gate.failed","level":"error","candidateSha":"${{ github.sha }}","pipelineExecutionId":"'"$EXECUTION_ID"'","failedStageName":"'"$FAILED_STAGE"'","status":"'"$STATUS"'","repo":"Mygentic-AI/cello-client","trigger":"tag"}'
+                echo "ERROR: Pipeline execution $STATUS (failed stage: $FAILED_STAGE)"
                 exit 1
                 ;;
               *)
