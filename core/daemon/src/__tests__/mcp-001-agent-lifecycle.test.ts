@@ -178,7 +178,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const offlineEvent = logEvents.find((e) => e.event === "agent.offline");
     expect(offlineEvent).toBeDefined();
     expect(offlineEvent!.context.agentName).toBe("alice");
-    expect(offlineEvent!.context.reason).toBe("cello_stop_agent");
+    expect(offlineEvent!.context.reason).toBe("stopped");
 
     // Second call: idempotent — no second event
     const result2 = await client.send("cello_stop_agent", { name: "alice" });

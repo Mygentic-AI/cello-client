@@ -48,6 +48,10 @@ export interface IpcServer {
   stop(): Promise<void>;
   getConnectionCount(): number;
   onDisconnect(handler: IpcDisconnectHandler): void;
+  /** Write a notification to a specific connection. Returns false on write failure. */
+  sendNotification(connectionId: string, notification: IpcNotification): boolean;
+  /** Return all active connection IDs. */
+  getConnectionIds(): string[];
 }
 
 interface ActiveConnection {
@@ -277,6 +281,25 @@ export function createIpcServer(
 
     onDisconnect(handler: IpcDisconnectHandler): void {
       disconnectHandler = handler;
+    },
+
+    sendNotification(connectionId: string, notification: IpcNotification): boolean {
+      const conn = connections.get(connectionId);
+      if (!conn) return false;
+      try {
+        const frame = JSON.stringify(notification) + "\n";
+        return conn.socket.write(frame);
+      } catch (err: unknown) {
+        logger.debug("daemon.ipc.notification.write.failed", {
+          connectionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return false;
+      }
+    },
+
+    getConnectionIds(): string[] {
+      return Array.from(connections.keys());
     },
   };
 }
