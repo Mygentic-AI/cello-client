@@ -63,6 +63,20 @@ export interface SessionRecord {
    */
   signer_pubkey?: Uint8Array;
 
+  // ─── M7 WIRE-001 additions ──────────────────────────────────────────────────
+
+  /** M7: session node Peer ID of the initiator (for transport binding verification). */
+  initiator_session_peer_id?: string;
+
+  /** M7: session node Peer ID of the counterparty (for transport binding verification). */
+  counterparty_session_peer_id?: string;
+
+  /** M7: multiaddrs of the counterparty's session node. */
+  counterparty_session_addrs?: string[];
+
+  /** M7: transport mode — 'direct' (P2P) or 'relay' (relay-mediated). */
+  transport_mode?: 'direct' | 'relay';
+
   // ─── MSG-004 additions ────────────────────────────────────────────────────
 
   /** Ordered list of accepted leaves; used to recompute prev_root locally. MSG-004. */
@@ -79,13 +93,17 @@ export interface SessionRecord {
  * Result of receiveSessionAssignment().
  *
  * Failure reasons:
- *   relay_auth_failed            — relay explicitly rejected the auth response.
- *   relay_auth_error             — could not open a stream to the relay or read the challenge.
- *   dial_counterparty_failed     — reserved for future use.
- *   unsupported_signature_type   — SESSION-004: M1 'single' signature type refused by M2+ clients.
- *   frost_signature_invalid      — SESSION-004: FROST threshold signature verification failed.
- *   frost_signer_not_configured  — SESSION-004: initiator has no IThresholdSigner injected;
- *                                  cannot derive verification key for own primary_pubkey.
+ *   relay_auth_failed                  — relay explicitly rejected the auth response.
+ *   relay_auth_error                   — could not open a stream to the relay or read the challenge.
+ *   dial_counterparty_failed           — reserved for future use.
+ *   unsupported_signature_type         — SESSION-004: M1 'single' signature type refused by M2+ clients.
+ *   frost_signature_invalid            — SESSION-004: FROST threshold signature verification failed.
+ *   frost_signer_not_configured        — SESSION-004: initiator has no IThresholdSigner injected;
+ *                                        cannot derive verification key for own primary_pubkey.
+ *   assignment_missing_session_peer_id — M7 WIRE-001: session Peer ID fields absent.
+ *   assignment_peer_id_mismatch        — M7 WIRE-001: initiator's session Peer ID does not match local node.
+ *   assignment_tbs_verification_failed — M7 WIRE-001: TBS FROST signature verification failed
+ *                                        (distinct from seal verification).
  *
  * NOTE (SESSION-004 L-5): `directory_signature_invalid` has been removed.
  * It was the M1 Ed25519 single-key failure reason. In M2, `signature_type: 'single'` frames
@@ -103,7 +121,11 @@ export type ReceiveAssignmentResult =
         | "dial_counterparty_failed"
         | "unsupported_signature_type"
         | "frost_signature_invalid"
-        | "frost_signer_not_configured";
+        | "frost_signer_not_configured"
+        | "assignment_missing_session_peer_id"
+        | "assignment_peer_id_mismatch"
+        | "assignment_tbs_verification_failed";
+      guidance?: string;
     };
 
 // ─── Peer registry ───────────────────────────────────────────────────────────
@@ -206,7 +228,7 @@ export interface ReceivedEnvelope {
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 
@@ -356,6 +378,7 @@ export interface CelloClient {
   receiveSessionAssignment(
     assignment: import("@cello-protocol/protocol-types").SessionAssignment,
     myPubkey: Uint8Array,
+    opts?: { mySessionPeerId?: string; correlationId?: string },
   ): Promise<ReceiveAssignmentResult>;
 
   /**

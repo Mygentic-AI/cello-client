@@ -345,8 +345,8 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
 
   // ─── Session delegates ────────────────────────────────────────────────────
 
-  async receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult> {
-    return this.sessionManager.receiveSessionAssignment(assignment, myPubkey);
+  async receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<ReceiveAssignmentResult> {
+    return this.sessionManager.receiveSessionAssignment(assignment, myPubkey, opts);
   }
 
   listSessions(): SessionRecord[] { return this.sessionManager.listSessions(); }

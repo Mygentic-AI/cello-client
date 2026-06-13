@@ -66,7 +66,7 @@ export interface SignalingContext {
   // initiateSession dependencies
   getConnectionIdForPeer(pubkeyHex: string): string | undefined;
   hasConnectionPolicy(): boolean;
-  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
+  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<ReceiveAssignmentResult>;
   getSession(sessionIdHex: string): SessionRecord | undefined;
   /**
    * ADV-001: Optional directory challenge verifier (MANIFEST-002 step-6).

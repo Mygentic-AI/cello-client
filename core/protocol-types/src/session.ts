@@ -105,6 +105,12 @@ interface SessionAssignmentCommon {
   session_timestamp: number;        // Unix ms
   directory_pubkey: Uint8Array;     // 32-byte directory identity pubkey
   directory_signature: Uint8Array;  // 64-byte threshold/single signature over TBS
+  // M7 WIRE-001: session-layer transport peer IDs and mode
+  initiator_session_peer_id: string;       // libp2p session node Peer ID of initiator
+  initiator_session_addrs: string[];       // multiaddrs of initiator's session node
+  counterparty_session_peer_id: string;    // libp2p session node Peer ID of counterparty
+  counterparty_session_addrs: string[];    // multiaddrs of counterparty's session node
+  transport_mode: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
 }
 
 /**
@@ -143,15 +149,25 @@ export type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle
  * (verifier) use identical canonical CBOR encoding. Any drift would silently
  * break verification.
  *
- * TBS = canonical CBOR([session_id, agent_A_pubkey, agent_B_pubkey, genesis_prev_root, timestamp])
+ * Legacy (M1–M6) TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, timestamp])
+ * M7+ TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, timestamp,
+ *   initiatorSessionPeerId, JSON.stringify(initiatorSessionAddrs.slice().sort()),
+ *   counterpartySessionPeerId, JSON.stringify(counterpartySessionAddrs.slice().sort()),
+ *   transportMode])
  *
  * Per CONTEXT.md: tagUint8Array: false. Timestamp encoded as BigInt when > 0xffffffff.
+ * Address arrays are sorted and JSON-stringified for canonical ordering.
  *
  * @param sessionId - 16-byte session identifier
  * @param pubA - 32-byte K_local pubkey of participant A
  * @param pubB - 32-byte K_local pubkey of participant B
  * @param genesisPrevRoot - 32-byte genesis prev_root (output of computeGenesisPrevRoot)
  * @param timestamp - session_timestamp in Unix milliseconds
+ * @param initiatorSessionPeerId - M7: session node Peer ID of initiator (optional for backward compat)
+ * @param initiatorSessionAddrs - M7: multiaddrs of initiator session node (optional for backward compat)
+ * @param counterpartySessionPeerId - M7: session node Peer ID of counterparty (optional for backward compat)
+ * @param counterpartySessionAddrs - M7: multiaddrs of counterparty session node (optional for backward compat)
+ * @param transportMode - M7: 'direct' or 'relay' (optional for backward compat)
  * @returns canonical CBOR bytes of the TBS array
  */
 export function buildSessionEstablishmentTbs(
@@ -160,13 +176,43 @@ export function buildSessionEstablishmentTbs(
   pubB: Uint8Array,
   genesisPrevRoot: Uint8Array,
   timestamp: number | bigint,
+  initiatorSessionPeerId?: string,
+  initiatorSessionAddrs?: string[],
+  counterpartySessionPeerId?: string,
+  counterpartySessionAddrs?: string[],
+  transportMode?: 'direct' | 'relay',
 ): Uint8Array {
+  const tsEncoded = typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
+
+  // M7+: when all new fields are provided, encode all 10 fields
+  if (
+    initiatorSessionPeerId !== undefined &&
+    initiatorSessionAddrs !== undefined &&
+    counterpartySessionPeerId !== undefined &&
+    counterpartySessionAddrs !== undefined &&
+    transportMode !== undefined
+  ) {
+    return CBOR_ENC.encode([
+      sessionId,
+      pubA,
+      pubB,
+      genesisPrevRoot,
+      tsEncoded,
+      initiatorSessionPeerId,
+      JSON.stringify(initiatorSessionAddrs.slice().sort()),
+      counterpartySessionPeerId,
+      JSON.stringify(counterpartySessionAddrs.slice().sort()),
+      transportMode,
+    ]) as Uint8Array;
+  }
+
+  // Legacy (M1–M6): encode only the original 5 fields
   return CBOR_ENC.encode([
     sessionId,
     pubA,
     pubB,
     genesisPrevRoot,
-    typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp,
+    tsEncoded,
   ]) as Uint8Array;
 }
 
