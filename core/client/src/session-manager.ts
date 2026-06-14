@@ -310,7 +310,7 @@ export class SessionManager {
 
     // Verify FROST signature with domain separation (context\0tbs framing)
     if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, verifyKey)) {
-      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "assignment_tbs_verification_failed", sessionId: sessionIdHex, correlationId });
+      this.#ctx.logger.error("session.assignment.verification.failed", { reason: "assignment_tbs_verification_failed", sessionId: sessionIdHex, correlationId });
       return { ok: false, reason: "assignment_tbs_verification_failed", guidance: "The FROST threshold signature over the session establishment TBS failed verification. This may indicate a tampered assignment or a directory key mismatch. Do not proceed with dialing." };
     }
 
