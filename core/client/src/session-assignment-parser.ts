@@ -154,5 +154,6 @@ export function mapSessionRequestErrorFrame(
   if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
   if (reason === "no_connection") return { ok: false, reason: "no_connection" };
   if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
+  if (reason === "session_request_missing_peer_id") return { ok: false, reason: "session_request_missing_peer_id" };
   return { ok: false, reason: "directory_unreachable" };
 }

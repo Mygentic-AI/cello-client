@@ -228,7 +228,7 @@ export interface ReceivedEnvelope {
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" | "session_request_missing_peer_id" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 
@@ -477,6 +477,10 @@ export interface CelloClient {
       directoryMultiaddr?: string;
       /** Timeout in ms. Default: 30_000. */
       timeoutMs?: number;
+      /** WIRE-001: This agent's session-layer libp2p Peer ID (multibase). Required by M7+ directories. */
+      sessionPeerId?: string;
+      /** WIRE-001: This agent's session-layer multiaddrs. Required by M7+ directories. */
+      sessionAddrs?: string[];
     },
   ): Promise<InitiateSessionResult>;
 }

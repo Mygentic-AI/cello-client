@@ -522,7 +522,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
 
   initiateSession(
     targetPubkeyHex: string,
-    opts?: { directoryPeerId?: string; directoryMultiaddr?: string; timeoutMs?: number },
+    opts?: { directoryPeerId?: string; directoryMultiaddr?: string; timeoutMs?: number; sessionPeerId?: string; sessionAddrs?: string[] },
   ): Promise<InitiateSessionResult> {
     return this.signalingManager.initiateSession(targetPubkeyHex, opts);
   }

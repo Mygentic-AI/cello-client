@@ -654,6 +654,10 @@ export class SignalingManager {
       directoryPeerId?: string;
       directoryMultiaddr?: string;
       timeoutMs?: number;
+      /** WIRE-001: This agent's session-layer libp2p Peer ID (multibase). Required by M7+ directories. */
+      sessionPeerId?: string;
+      /** WIRE-001: This agent's session-layer multiaddrs. Required by M7+ directories. */
+      sessionAddrs?: string[];
     },
   ): Promise<InitiateSessionResult> {
     const timeoutMs = opts?.timeoutMs ?? 30_000;
@@ -693,6 +697,13 @@ export class SignalingManager {
     };
     if (connectionId) {
       sessionRequestPayload["connection_id"] = connectionId;
+    }
+    // WIRE-001: include session Peer ID and multiaddrs when provided (required by M7+ directories)
+    if (opts?.sessionPeerId) {
+      sessionRequestPayload["initiator_session_peer_id"] = opts.sessionPeerId;
+    }
+    if (opts?.sessionAddrs) {
+      sessionRequestPayload["initiator_session_addrs"] = opts.sessionAddrs;
     }
     const sessionRequestFrame = CBOR_ENC.encode(sessionRequestPayload) as Uint8Array;
 
