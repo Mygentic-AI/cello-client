@@ -273,25 +273,27 @@ export class SessionManager {
       verifyKey = assignment.signer_pubkey;
     }
 
-    // M7 WIRE-001: Check session peer ID fields are present before TBS reconstruction
+    // M7 WIRE-001: Check session peer ID fields consistency
     const sessionIdHex = Buffer.from(session_id).toString("hex");
     const correlationId = opts?.correlationId ?? sessionIdHex;
 
-    if (
-      !assignment.initiator_session_peer_id ||
-      !assignment.counterparty_session_peer_id
-    ) {
+    // Reject only when M7 fields are partially present (one peer ID set, the other missing).
+    // Both undefined = pre-M7 directory → fall through to 5-field TBS verification.
+    // Both present = M7 directory → proceed to 10-field TBS verification.
+    const hasInitiator = !!assignment.initiator_session_peer_id;
+    const hasCounterparty = !!assignment.counterparty_session_peer_id;
+    if (hasInitiator !== hasCounterparty) {
       this.#ctx.logger.error("session.assignment.verification.failed", {
         reason: "assignment_missing_session_peer_id",
         sessionId: sessionIdHex,
-        hasInitiatorPeerId: !!assignment.initiator_session_peer_id,
-        hasCounterpartyPeerId: !!assignment.counterparty_session_peer_id,
+        hasInitiatorPeerId: hasInitiator,
+        hasCounterpartyPeerId: hasCounterparty,
         correlationId,
       });
       return {
         ok: false,
         reason: "assignment_missing_session_peer_id",
-        guidance: "The SessionAssignment received from the directory is missing one or both session Peer ID fields. This may indicate a directory version mismatch. Ensure both directory and client are running M7 or later. Do not attempt to dial — the session cannot be established without verified session Peer IDs.",
+        guidance: "The SessionAssignment has one session Peer ID but not the other — this indicates a malformed assignment. Both must be present (M7+) or both absent (pre-M7).",
       };
     }
 

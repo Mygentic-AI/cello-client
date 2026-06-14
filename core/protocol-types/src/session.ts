@@ -105,12 +105,12 @@ interface SessionAssignmentCommon {
   session_timestamp: number;        // Unix ms
   directory_pubkey: Uint8Array;     // 32-byte directory identity pubkey
   directory_signature: Uint8Array;  // 64-byte threshold/single signature over TBS
-  // M7 WIRE-001: session-layer transport peer IDs and mode
-  initiator_session_peer_id: string;       // libp2p session node Peer ID of initiator
-  initiator_session_addrs: string[];       // multiaddrs of initiator's session node
-  counterparty_session_peer_id: string;    // libp2p session node Peer ID of counterparty
-  counterparty_session_addrs: string[];    // multiaddrs of counterparty's session node
-  transport_mode: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
+  // M7 WIRE-001: session-layer transport peer IDs and mode (optional for pre-M7 backward compat)
+  initiator_session_peer_id?: string;       // libp2p session node Peer ID of initiator
+  initiator_session_addrs?: string[];       // multiaddrs of initiator's session node
+  counterparty_session_peer_id?: string;    // libp2p session node Peer ID of counterparty
+  counterparty_session_addrs?: string[];    // multiaddrs of counterparty's session node
+  transport_mode?: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
 }
 
 /**

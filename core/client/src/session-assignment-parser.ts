@@ -60,13 +60,13 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
 
   const sigType = typeof raw["signature_type"] === "string" ? raw["signature_type"] : "single";
 
-  // M7 WIRE-001: parse session peer ID and transport mode fields
-  const initiatorSessionPeerId = typeof raw["initiator_session_peer_id"] === "string" ? raw["initiator_session_peer_id"] : "";
-  const initiatorSessionAddrs = parseStringArray(raw["initiator_session_addrs"]) ?? [];
-  const counterpartySessionPeerId = typeof raw["counterparty_session_peer_id"] === "string" ? raw["counterparty_session_peer_id"] : "";
-  const counterpartySessionAddrs = parseStringArray(raw["counterparty_session_addrs"]) ?? [];
+  // M7 WIRE-001: parse session peer ID and transport mode fields (undefined when absent for pre-M7 compat)
+  const initiatorSessionPeerId = typeof raw["initiator_session_peer_id"] === "string" && raw["initiator_session_peer_id"] !== "" ? raw["initiator_session_peer_id"] : undefined;
+  const initiatorSessionAddrs = parseStringArray(raw["initiator_session_addrs"]) ?? undefined;
+  const counterpartySessionPeerId = typeof raw["counterparty_session_peer_id"] === "string" && raw["counterparty_session_peer_id"] !== "" ? raw["counterparty_session_peer_id"] : undefined;
+  const counterpartySessionAddrs = parseStringArray(raw["counterparty_session_addrs"]) ?? undefined;
   const transportModeRaw = raw["transport_mode"];
-  const transportMode: "direct" | "relay" = transportModeRaw === "direct" ? "direct" : "relay";
+  const transportMode: "direct" | "relay" | undefined = transportModeRaw === "direct" ? "direct" : transportModeRaw === "relay" ? "relay" : undefined;
 
   if (sigType === "frost") {
     const signerPubkey = toU8Safe(raw["signer_pubkey"]);
