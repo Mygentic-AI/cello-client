@@ -21,7 +21,7 @@ export interface FrameDispatchDeps {
   sessionManager: SessionManager;
   logger: Logger;
   getMyPubkeyHex(): string | null;
-  receiveSessionAssignment(assignment: import("@cello-protocol/protocol-types").SessionAssignment, myPubkey: Uint8Array): Promise<unknown>;
+  receiveSessionAssignment(assignment: import("@cello-protocol/protocol-types").SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<unknown>;
 }
 
 /** Extract session_id bytes → hex from a frame. Returns null if not found. */

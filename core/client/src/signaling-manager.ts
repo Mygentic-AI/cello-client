@@ -753,7 +753,7 @@ export class SignalingManager {
       const assignment = parseSessionAssignment(rawAssignment);
       if (!assignment) { return { ok: false, reason: "directory_unreachable" }; }
 
-      const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey);
+      const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey, { mySessionPeerId: opts?.sessionPeerId });
       if (!result.ok) {
         return { ok: false, reason: result.reason };
       }

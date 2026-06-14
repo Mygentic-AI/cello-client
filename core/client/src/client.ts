@@ -217,7 +217,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
       sessionManager: this.sessionManager,
       logger: this.logger,
       getMyPubkeyHex: () => this.myPubkeyHex,
-      receiveSessionAssignment: (a, p) => this.receiveSessionAssignment(a, p),
+      receiveSessionAssignment: (a, p, o) => this.receiveSessionAssignment(a, p, o),
     });
   }
 
