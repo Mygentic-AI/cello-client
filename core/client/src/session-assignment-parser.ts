@@ -60,6 +60,14 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
 
   const sigType = typeof raw["signature_type"] === "string" ? raw["signature_type"] : "single";
 
+  // M7 WIRE-001: parse session peer ID and transport mode fields (undefined when absent for pre-M7 compat)
+  const initiatorSessionPeerId = typeof raw["initiator_session_peer_id"] === "string" && raw["initiator_session_peer_id"] !== "" ? raw["initiator_session_peer_id"] : undefined;
+  const initiatorSessionAddrs = parseStringArray(raw["initiator_session_addrs"]) ?? undefined;
+  const counterpartySessionPeerId = typeof raw["counterparty_session_peer_id"] === "string" && raw["counterparty_session_peer_id"] !== "" ? raw["counterparty_session_peer_id"] : undefined;
+  const counterpartySessionAddrs = parseStringArray(raw["counterparty_session_addrs"]) ?? undefined;
+  const transportModeRaw = raw["transport_mode"];
+  const transportMode: "direct" | "relay" | undefined = transportModeRaw === "direct" ? "direct" : transportModeRaw === "relay" ? "relay" : undefined;
+
   if (sigType === "frost") {
     const signerPubkey = toU8Safe(raw["signer_pubkey"]);
     if (!signerPubkey || signerPubkey.length !== 32) return null;
@@ -74,6 +82,11 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
       directory_signature: dirSig,
       signature_type: "frost" as const,
       signer_pubkey: signerPubkey,
+      initiator_session_peer_id: initiatorSessionPeerId,
+      initiator_session_addrs: initiatorSessionAddrs,
+      counterparty_session_peer_id: counterpartySessionPeerId,
+      counterparty_session_addrs: counterpartySessionAddrs,
+      transport_mode: transportMode,
     };
   }
 
@@ -87,6 +100,11 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
     directory_pubkey: dirPubkey,
     directory_signature: dirSig,
     signature_type: "single" as const,
+    initiator_session_peer_id: initiatorSessionPeerId,
+    initiator_session_addrs: initiatorSessionAddrs,
+    counterparty_session_peer_id: counterpartySessionPeerId,
+    counterparty_session_addrs: counterpartySessionAddrs,
+    transport_mode: transportMode,
   };
 }
 
@@ -136,5 +154,6 @@ export function mapSessionRequestErrorFrame(
   if (reason === "ceremony_conflict") return { ok: false, reason: "ceremony_conflict" };
   if (reason === "no_connection") return { ok: false, reason: "no_connection" };
   if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
+  if (reason === "session_request_missing_peer_id") return { ok: false, reason: "session_request_missing_peer_id" };
   return { ok: false, reason: "directory_unreachable" };
 }

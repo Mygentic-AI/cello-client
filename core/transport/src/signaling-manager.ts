@@ -202,7 +202,7 @@ export interface SignalingManagerOptions {
 }
 
 // Keep the named config type used by MANIFEST-002 tests
-export interface SignalingManagerConfig extends SignalingManagerOptions {}
+export type SignalingManagerConfig = SignalingManagerOptions;
 
 // ─── Guidance strings ─────────────────────────────────────────────────────────
 

@@ -66,7 +66,7 @@ export interface SignalingContext {
   // initiateSession dependencies
   getConnectionIdForPeer(pubkeyHex: string): string | undefined;
   hasConnectionPolicy(): boolean;
-  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
+  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<ReceiveAssignmentResult>;
   getSession(sessionIdHex: string): SessionRecord | undefined;
   /**
    * ADV-001: Optional directory challenge verifier (MANIFEST-002 step-6).
@@ -654,6 +654,10 @@ export class SignalingManager {
       directoryPeerId?: string;
       directoryMultiaddr?: string;
       timeoutMs?: number;
+      /** WIRE-001: This agent's session-layer libp2p Peer ID (multibase). Required by M7+ directories. */
+      sessionPeerId?: string;
+      /** WIRE-001: This agent's session-layer multiaddrs. Required by M7+ directories. */
+      sessionAddrs?: string[];
     },
   ): Promise<InitiateSessionResult> {
     const timeoutMs = opts?.timeoutMs ?? 30_000;
@@ -693,6 +697,13 @@ export class SignalingManager {
     };
     if (connectionId) {
       sessionRequestPayload["connection_id"] = connectionId;
+    }
+    // WIRE-001: include session Peer ID and multiaddrs when provided (required by M7+ directories)
+    if (opts?.sessionPeerId) {
+      sessionRequestPayload["initiator_session_peer_id"] = opts.sessionPeerId;
+    }
+    if (opts?.sessionAddrs) {
+      sessionRequestPayload["initiator_session_addrs"] = opts.sessionAddrs;
     }
     const sessionRequestFrame = CBOR_ENC.encode(sessionRequestPayload) as Uint8Array;
 
@@ -742,7 +753,7 @@ export class SignalingManager {
       const assignment = parseSessionAssignment(rawAssignment);
       if (!assignment) { return { ok: false, reason: "directory_unreachable" }; }
 
-      const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey);
+      const result = await this.#ctx.receiveSessionAssignment(assignment, myPubkey, { mySessionPeerId: opts?.sessionPeerId });
       if (!result.ok) {
         return { ok: false, reason: result.reason };
       }

@@ -217,7 +217,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
       sessionManager: this.sessionManager,
       logger: this.logger,
       getMyPubkeyHex: () => this.myPubkeyHex,
-      receiveSessionAssignment: (a, p) => this.receiveSessionAssignment(a, p),
+      receiveSessionAssignment: (a, p, o) => this.receiveSessionAssignment(a, p, o),
     });
   }
 
@@ -345,8 +345,8 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
 
   // ─── Session delegates ────────────────────────────────────────────────────
 
-  async receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult> {
-    return this.sessionManager.receiveSessionAssignment(assignment, myPubkey);
+  async receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<ReceiveAssignmentResult> {
+    return this.sessionManager.receiveSessionAssignment(assignment, myPubkey, opts);
   }
 
   listSessions(): SessionRecord[] { return this.sessionManager.listSessions(); }
@@ -522,7 +522,7 @@ class CelloClientImpl implements CelloClient, ClientWiringSurface {
 
   initiateSession(
     targetPubkeyHex: string,
-    opts?: { directoryPeerId?: string; directoryMultiaddr?: string; timeoutMs?: number },
+    opts?: { directoryPeerId?: string; directoryMultiaddr?: string; timeoutMs?: number; sessionPeerId?: string; sessionAddrs?: string[] },
   ): Promise<InitiateSessionResult> {
     return this.signalingManager.initiateSession(targetPubkeyHex, opts);
   }

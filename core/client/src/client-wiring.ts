@@ -77,7 +77,7 @@ export interface ClientWiringSurface {
   openPersistentSignalingStream(directoryPeerId?: string, directoryMultiaddr?: string): Promise<boolean>;
   dispatchSignalingFrame(stream: Stream, frame: Record<string, unknown>): void;
   onSignalingStreamClosed(stream: Stream): void;
-  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array): Promise<ReceiveAssignmentResult>;
+  receiveSessionAssignment(assignment: SessionAssignment, myPubkey: Uint8Array, opts?: { mySessionPeerId?: string; correlationId?: string }): Promise<ReceiveAssignmentResult>;
 }
 
 // ─── Per-manager context builders ────────────────────────────────────────────
@@ -147,7 +147,7 @@ export function buildSignalingContext(f: ClientWiringSurface): SignalingContext 
     onSignalingStreamClosed: (stream) => { f.onSignalingStreamClosed(stream); },
     getConnectionIdForPeer: (hex) => f.connectionManager.getConnectionIdForPeer(hex),
     hasConnectionPolicy: () => f.connectionManager.hasConnectionPolicy(),
-    receiveSessionAssignment: (a, p) => f.receiveSessionAssignment(a, p),
+    receiveSessionAssignment: (a, p, o) => f.receiveSessionAssignment(a, p, o),
     getSession: (id) => f.sessionManager.getSession(id),
     getChallengeVerifier: () => f.challengeVerifier,
   };

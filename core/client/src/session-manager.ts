@@ -239,6 +239,7 @@ export class SessionManager {
   async receiveSessionAssignment(
     assignment: SessionAssignment,
     myPubkey: Uint8Array,
+    opts?: { mySessionPeerId?: string; correlationId?: string },
   ): Promise<ReceiveAssignmentResult> {
     const { session_id, session_timestamp } = assignment;
     const pubA = assignment.participant_a.pubkey;
@@ -272,17 +273,72 @@ export class SessionManager {
       verifyKey = assignment.signer_pubkey;
     }
 
+    // M7 WIRE-001: Check session peer ID fields consistency
+    const sessionIdHex = Buffer.from(session_id).toString("hex");
+    const correlationId = opts?.correlationId ?? sessionIdHex;
+
+    // Reject when counterparty peer ID is present but initiator is missing — always malformed.
+    // Valid states: both present (full M7), both absent (pre-M7), or initiator-only (WIRE-001
+    // without session_offer_accept — counterparty hasn't responded yet).
+    const hasInitiator = !!assignment.initiator_session_peer_id;
+    const hasCounterparty = !!assignment.counterparty_session_peer_id;
+    if (hasCounterparty && !hasInitiator) {
+      this.#ctx.logger.error("session.assignment.verification.failed", {
+        reason: "assignment_missing_session_peer_id",
+        sessionId: sessionIdHex,
+        hasInitiatorPeerId: hasInitiator,
+        hasCounterpartyPeerId: hasCounterparty,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "assignment_missing_session_peer_id",
+        guidance: "The SessionAssignment has counterparty session Peer ID but no initiator — this indicates a malformed assignment.",
+      };
+    }
+
     // SESSION-004 Step 3: Build TBS and verify FROST signature (AC-002, SI-001)
-    // TBS = canonical CBOR([session_id, pubA, pubB, genesis_prev_root, session_timestamp])
+    // M7 WIRE-001: TBS now includes session peer IDs, addrs, and transport mode
     // buildSessionEstablishmentTbs imported from protocol-types (HIGH-5: single source of truth)
     const genesis_prev_root_for_tbs = computeGenesisPrevRoot(pubA, pubB, session_id, session_timestamp);
-    const tbs = buildSessionEstablishmentTbs(session_id, pubA, pubB, genesis_prev_root_for_tbs, session_timestamp);
+    const tbs = buildSessionEstablishmentTbs(
+      session_id, pubA, pubB, genesis_prev_root_for_tbs, session_timestamp,
+      assignment.initiator_session_peer_id,
+      assignment.initiator_session_addrs,
+      assignment.counterparty_session_peer_id,
+      assignment.counterparty_session_addrs,
+      assignment.transport_mode,
+    );
 
     // Verify FROST signature with domain separation (context\0tbs framing)
     if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, verifyKey)) {
-      this.#ctx.logger.warn("session.assignment.receive_failed", { reason: "frost_signature_invalid" });
-      return { ok: false, reason: "frost_signature_invalid" };
+      this.#ctx.logger.error("session.assignment.verification.failed", { reason: "assignment_tbs_verification_failed", sessionId: sessionIdHex, correlationId });
+      return { ok: false, reason: "assignment_tbs_verification_failed", guidance: "The FROST threshold signature over the session establishment TBS failed verification. This may indicate a tampered assignment or a directory key mismatch. Do not proceed with dialing." };
     }
+
+    // M7 WIRE-001: Initiator self-check — verify that our session Peer ID matches what the directory signed
+    if (isInitiator && opts?.mySessionPeerId && assignment.initiator_session_peer_id !== opts.mySessionPeerId) {
+      this.#ctx.logger.error("session.assignment.verification.failed", {
+        reason: "assignment_peer_id_mismatch",
+        sessionId: sessionIdHex,
+        expectedPeerId: opts.mySessionPeerId,
+        actualPeerId: assignment.initiator_session_peer_id,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "assignment_peer_id_mismatch",
+        guidance: "The initiator session Peer ID in the directory-signed assignment does not match this node's session Peer ID. This may indicate a MITM attack or a directory bug. Do not proceed.",
+      };
+    }
+
+    // M7 WIRE-001: Log successful assignment receipt
+    this.#ctx.logger.info("session.assignment.received", {
+      sessionId: sessionIdHex,
+      counterpartyPubkey: Buffer.from(isInitiator ? pubB : pubA).toString("hex"),
+      transportMode: assignment.transport_mode,
+      correlationId,
+    });
 
     // Step 4: Determine counterparty
     const counterparty = isInitiator ? assignment.participant_b : assignment.participant_a;
@@ -355,7 +411,6 @@ export class SessionManager {
     }
 
     // Step 7: Store session record (AC-004)
-    const sessionIdHex = Buffer.from(session_id).toString("hex");
     const record: SessionRecord = {
       session_id,
       counterparty_pubkey: counterparty.pubkey,
@@ -377,6 +432,11 @@ export class SessionManager {
       local_tree_leaves: [],
       next_expected_seq: 1,
       desynchronized: false,
+      // M7 WIRE-001: store session peer IDs and transport mode
+      initiator_session_peer_id: assignment.initiator_session_peer_id,
+      counterparty_session_peer_id: assignment.counterparty_session_peer_id,
+      counterparty_session_addrs: assignment.counterparty_session_addrs,
+      transport_mode: assignment.transport_mode,
     };
     this.#sessions.set(sessionIdHex, record);
     // PERSIST-024: persist session to DB
