@@ -277,12 +277,12 @@ export class SessionManager {
     const sessionIdHex = Buffer.from(session_id).toString("hex");
     const correlationId = opts?.correlationId ?? sessionIdHex;
 
-    // Reject only when M7 fields are partially present (one peer ID set, the other missing).
-    // Both undefined = pre-M7 directory → fall through to 5-field TBS verification.
-    // Both present = M7 directory → proceed to 10-field TBS verification.
+    // Reject when counterparty peer ID is present but initiator is missing — always malformed.
+    // Valid states: both present (full M7), both absent (pre-M7), or initiator-only (WIRE-001
+    // without session_offer_accept — counterparty hasn't responded yet).
     const hasInitiator = !!assignment.initiator_session_peer_id;
     const hasCounterparty = !!assignment.counterparty_session_peer_id;
-    if (hasInitiator !== hasCounterparty) {
+    if (hasCounterparty && !hasInitiator) {
       this.#ctx.logger.error("session.assignment.verification.failed", {
         reason: "assignment_missing_session_peer_id",
         sessionId: sessionIdHex,
@@ -293,7 +293,7 @@ export class SessionManager {
       return {
         ok: false,
         reason: "assignment_missing_session_peer_id",
-        guidance: "The SessionAssignment has one session Peer ID but not the other — this indicates a malformed assignment. Both must be present (M7+) or both absent (pre-M7).",
+        guidance: "The SessionAssignment has counterparty session Peer ID but no initiator — this indicates a malformed assignment.",
       };
     }
 

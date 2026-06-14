@@ -165,7 +165,7 @@ describe("WIRE-001 AC-011: missing session peer ID returns assignment_missing_se
     }
   });
 
-  it("AC-011: empty counterparty_session_peer_id returns assignment_missing_session_peer_id", async () => {
+  it("AC-011: counterparty present without initiator returns assignment_missing_session_peer_id", async () => {
     const { pubkeyA, pubkeyB, primaryPubkey, clientA } = await setupWithFrost();
 
     const assignment: SessionAssignmentFrost = {
@@ -179,9 +179,9 @@ describe("WIRE-001 AC-011: missing session peer ID returns assignment_missing_se
       directory_signature: new Uint8Array(64),
       signature_type: "frost" as const,
       signer_pubkey: primaryPubkey,
-      initiator_session_peer_id: INITIATOR_SESSION_PEER_ID,
-      initiator_session_addrs: INITIATOR_SESSION_ADDRS,
-      counterparty_session_peer_id: "", // empty — triggers rejection
+      initiator_session_peer_id: undefined, // absent initiator
+      initiator_session_addrs: undefined,
+      counterparty_session_peer_id: "12D3KooWCounterparty", // present counterparty — malformed
       counterparty_session_addrs: COUNTERPARTY_SESSION_ADDRS,
       transport_mode: TRANSPORT_MODE,
     };
