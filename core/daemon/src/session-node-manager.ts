@@ -168,8 +168,13 @@ export class SessionNodeManager {
     ]) {
       try {
         this.#db.exec(ddl);
-      } catch {
-        // Column already exists — ignore (SQLite error code: SQLITE_ERROR 'duplicate column name')
+      } catch (err: unknown) {
+        // Only swallow the idempotent "duplicate column name" case (the column
+        // already exists from a prior init). Any other failure — disk full,
+        // SQLITE_LOCKED, corruption — must propagate, otherwise the daemon would
+        // run without these columns and later silently read undefined.
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes("duplicate column name")) throw err;
       }
     }
 

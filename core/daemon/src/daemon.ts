@@ -721,6 +721,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!kp) { await reject("signing_key_unavailable"); return; }
 
     // Co-sign our SEAL-INTERRUPTED leaf over the same Merkle root the initiator sent.
+    // C-1: the daemon holds no session Merkle tree, so the responder cannot compute
+    // its own root — it echoes the initiator-supplied merkleRootReq back unchanged.
+    // The meaningful bilateral check at this layer is the leaf-count comparison above
+    // (against our OWN message_count); true Merkle-root agreement is a deferred
+    // FROST-seal concern (see the H-1 SCOPE note).
     const ownLeaf = await buildSignedSealInterruptedLeaf(kp, {
       sessionId,
       leafCount: localRecord.message_count ?? 0,
@@ -802,7 +807,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //     - the daemon holds NO session Merkle tree (it tracks only message_count),
   //       so it cannot itself compute or independently verify the Merkle root — the
   //       root must be supplied by the client. The responder in particular has no
-  //       synchronous client interaction to obtain its own root.
+  //       synchronous client interaction to obtain its own root; it echoes the
+  //       initiator-supplied root back in its leaf rather than computing one.
+  //   Consequence for cross-checking (C-1): Merkle-root agreement is NOT verified
+  //   at this daemon leaf-exchange layer. The leafCount agreement (responder vs its
+  //   own SQLite message_count, and initiator vs its own ownLeafCount) is the
+  //   bilateral check available here. True Merkle-root agreement is verified at the
+  //   FROST seal step against the directory-held tree, which is deferred. We still
+  //   persist the initiator-supplied merkleRootAtInterruption in the artifacts table
+  //   because it is the value the eventual FROST seal will use — but the daemon does
+  //   not, and cannot, independently verify it.
   //   Per the audit instruction, we therefore STOP at the persisted bilateral
   //   commitment under 'seal_interrupted_pending' rather than fake a completed seal.
   //   Wiring the real FROST seal requires injecting a SealManager adapter from a
@@ -981,10 +995,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         };
       }
 
-      // SI-002/AC-008: cross-check that the counterparty's leaf AGREES with our own
-      // state BEFORE accepting it. The leafCount and the Merkle root must match the
-      // values we signed into our own leaf. Disagreement means the two sides have
-      // divergent histories — abort with a distinct reason.
+      // C-1 / SI-002 / AC-008: leafCount agreement is the ONE bilateral check
+      // available at this layer. We compare the counterparty's returned leafCount
+      // against our OWN message_count — a genuinely independent value — so a real
+      // divergence in session length is caught here.
+      //
+      // Merkle-root agreement is NOT verified at the daemon leaf-exchange layer
+      // because the daemon holds no session Merkle tree. The responder does not
+      // independently compute a root; it echoes the initiator-supplied
+      // merkleRootAtInterruption back in its leaf, so comparing the returned root
+      // against our own would always be true for an honest network and could only
+      // ever fire on wire corruption — never on real divergence. We therefore do
+      // NOT perform that comparison rather than claim a guarantee we cannot provide.
+      // True Merkle-root agreement is verified at the FROST seal step against the
+      // directory-held tree, which is deferred (see the H-1 SCOPE note above).
       const cpLeafCount = typeof leaf.leafCount === "number" ? leaf.leafCount : null;
       if (cpLeafCount !== ownLeafCount) {
         logger.error("session.interrupted.seal.failed", {
@@ -998,21 +1022,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           ok: false,
           reason: "seal_interrupted_leaf_count_mismatch",
           guidance: "The counterparty's recorded message count at interruption does not match ours. The two sides have divergent session histories and cannot form a bilateral commitment. Compare cello status on both ends before retrying.",
-        };
-      }
-      const cpMerkleRoot = typeof leaf.merkleRootAtInterruption === "string" ? leaf.merkleRootAtInterruption : null;
-      if (cpMerkleRoot !== merkleRootAtInterruption) {
-        logger.error("session.interrupted.seal.failed", {
-          sessionId,
-          agentName: record.agent_name,
-          reason: "seal_interrupted_merkle_root_mismatch",
-          error: "counterparty merkleRootAtInterruption did not match own",
-          correlationId,
-        });
-        return {
-          ok: false,
-          reason: "seal_interrupted_merkle_root_mismatch",
-          guidance: "The counterparty's Merkle root at interruption does not match ours. The two sides have divergent session histories and cannot form a bilateral commitment. Compare cello status on both ends before retrying.",
         };
       }
 
