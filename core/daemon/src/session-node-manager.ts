@@ -68,6 +68,9 @@
 // dependency — do not lower the engine floor without replacing this import.
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
+import * as lp from "it-length-prefixed";
+import { decode } from "cbor-x";
+import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
@@ -142,6 +145,20 @@ export class SessionNodeManager {
       )
     `);
 
+    // M7-SESSION-001: idempotent schema extension — add message_count and interrupted_at
+    // columns if they do not exist. ALTER TABLE IF NOT EXISTS COLUMN is not supported by
+    // older SQLite; we use a try/catch per column as the idempotent approach.
+    for (const ddl of [
+      "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
+    ]) {
+      try {
+        this.#db.exec(ddl);
+      } catch {
+        // Column already exists — ignore (SQLite error code: SQLITE_ERROR 'duplicate column name')
+      }
+    }
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -151,13 +168,14 @@ export class SessionNodeManager {
 
     if (activeRows.length > 0) {
       const now = Date.now();
+      const interruptedAt = new Date(now).toISOString();
       for (const row of activeRows) {
         try {
           this.#db
             .prepare(
-              "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE session_id = ?",
+              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE session_id = ?",
             )
-            .run(now, row.session_id);
+            .run(now, interruptedAt, row.session_id);
           this.#logger.warn("session.interrupted.detected", {
             sessionId: row.session_id,
             agentName: row.agent_name,
@@ -416,10 +434,11 @@ export class SessionNodeManager {
         error: "db not initialized",
       });
     } else {
+      const interruptedAt = new Date(now).toISOString();
       try {
         this.#db.prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ? WHERE status = 'active'",
-        ).run(now);
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE status = 'active'",
+        ).run(now, interruptedAt);
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
           sessionId: "__all__",
@@ -478,6 +497,166 @@ export class SessionNodeManager {
     return this.#db
       .prepare("SELECT * FROM sessions WHERE status = ?")
       .all(status) as unknown as SessionRecord[];
+  }
+
+  /**
+   * M7-SESSION-001: Mark a session as interrupted with message count and timestamp.
+   * Called when a relay session_interrupted frame arrives or a relay stream closes.
+   * Also tears down the in-memory session node if one exists for this sessionId.
+   *
+   * @param sessionId The hex session ID from the relay frame
+   * @param messageCount Number of message leaves at interruption
+   * @param source 'relay_frame' | 'stream_close'
+   */
+  async markInterruptedWithDetails(
+    sessionId: string,
+    messageCount: number,
+    source: "relay_frame" | "stream_close",
+  ): Promise<void> {
+    if (!this.#db) return;
+    const now = Date.now();
+    const interruptedAt = new Date(now).toISOString();
+
+    try {
+      this.#db
+        .prepare(
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE session_id = ?",
+        )
+        .run(now, messageCount, interruptedAt, sessionId);
+    } catch (err: unknown) {
+      this.#logger.error("session.interrupt.db.write.failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Look up the entry to get agentName for the log event.
+    // Fall back to the DB row when the session isn't in the in-memory map
+    // (e.g. the session was already torn down before the stream watcher fired).
+    const entry = this.#activeNodes.get(sessionId);
+    const agentName: string = entry?.agentName
+      ?? (this.#db?.prepare("SELECT agent_name FROM sessions WHERE session_id = ?").get(sessionId) as { agent_name?: string } | undefined)?.agent_name
+      ?? "unknown";
+
+    // Tear down the in-memory session node if it exists
+    if (entry) {
+      try {
+        await entry.node.stop();
+      } catch (err: unknown) {
+        this.#logger.error("session.node.stop.failed", {
+          sessionId,
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId: entry.correlationId,
+        });
+        // Fall through — still remove from active map
+      }
+      this.#activeNodes.delete(sessionId);
+      this.#logger.info("session.node.destroyed", {
+        sessionId,
+        agentName,
+        reason: "interrupted",
+      });
+    }
+
+    this.#logger.warn("session.interrupted.detected", {
+      sessionId,
+      agentName,
+      source,
+    });
+  }
+
+  /**
+   * Return the session record for a specific sessionId, regardless of status.
+   * Used by cello_close_session to inspect session state.
+   */
+  getSessionRecord(sessionId: string): SessionRecord | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT * FROM sessions WHERE session_id = ?")
+      .get(sessionId) as unknown as SessionRecord | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * M7-SESSION-001 AC-004/AC-005: Register a relay stream for an active session.
+   * Starts a background reader that watches for session_interrupted frames and
+   * stream close events. Both detection paths call markInterruptedWithDetails().
+   *
+   * The reader runs for the lifetime of the relay stream. If the stream closes
+   * without delivering a session_interrupted frame (AC-005 / 'stream_close' path),
+   * the session is still marked interrupted.
+   *
+   * @param sessionId The hex session ID
+   * @param stream The relay stream to monitor
+   * @param messageCount Number of message leaves at the time of registration
+   *   (used as the count at interruption — best effort since exact count at frame
+   *   receipt may differ, but this is the value available at stream setup time)
+   */
+  registerRelayStream(sessionId: string, stream: Stream, messageCount: number = 0): void {
+    void this.#watchRelayStream(sessionId, stream, messageCount);
+  }
+
+  /**
+   * Background relay stream watcher.
+   * Pseudocode:
+   *   1. Create LP-framed iterator over the stream
+   *   2. For each frame:
+   *      a. If type === 'session_interrupted':
+   *         - Record receivedInterruptFrame = true
+   *         - Call markInterruptedWithDetails(sessionId, messageCount, 'relay_frame')
+   *         - Break (no more frames expected)
+   *   3. On stream close (loop ends normally or with error):
+   *      a. If !receivedInterruptFrame:
+   *         - Call markInterruptedWithDetails(sessionId, messageCount, 'stream_close')
+   */
+  async #watchRelayStream(sessionId: string, stream: Stream, messageCount: number): Promise<void> {
+    let receivedInterruptFrame = false;
+    const source = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+    try {
+      while (true) {
+        let result: IteratorResult<Uint8Array>;
+        try {
+          result = await source.next();
+        } catch {
+          // Stream error (e.g. stream aborted) — treat as stream close
+          break;
+        }
+        if (result.done || result.value === undefined) break;
+
+        let frame: Record<string, unknown>;
+        try {
+          const bytes = result.value instanceof Uint8Array ? result.value
+            : Buffer.isBuffer(result.value) ? new Uint8Array(result.value as Buffer)
+            : (result.value as { slice(): Uint8Array }).slice();
+          frame = decode(bytes) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+
+        if (frame["type"] === "session_interrupted") {
+          receivedInterruptFrame = true;
+          const sessionIdFromFrame = typeof frame["session_id"] === "string"
+            ? frame["session_id"]
+            : (frame["session_id"] instanceof Uint8Array
+              ? Buffer.from(frame["session_id"]).toString("hex")
+              : sessionId);
+          await this.markInterruptedWithDetails(sessionIdFromFrame, messageCount, "relay_frame");
+          break; // No more relay frames expected after session_interrupted
+        }
+      }
+    } catch {
+      // Stream read loop ended — fall through to stream_close check
+    }
+
+    // AC-005: stream closed without a session_interrupted frame
+    if (!receivedInterruptFrame) {
+      // Only mark interrupted if this session is still active in SQLite
+      const record = this.getSessionRecord(sessionId);
+      if (record && record.status === "active") {
+        await this.markInterruptedWithDetails(sessionId, messageCount, "stream_close");
+      }
+    }
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────

@@ -121,6 +121,11 @@ export interface DaemonStatusResponse {
    * Always present as integer >= 0. DAEMON-003 AC-009.
    */
   retryQueueDepth: number;
+  /**
+   * M7-SESSION-001 AC-007: interrupted sessions from SQLite.
+   * Always present (empty array if none). Never undefined or omitted.
+   */
+  interrupted_sessions: InterruptedSessionInfo[];
 }
 
 // --- Daemon configuration ---
@@ -193,6 +198,19 @@ export interface SessionRecord {
   status: SessionStatus;
   created_at: number;
   updated_at: number;
+  /** M7-SESSION-001: leaf count at interruption. 0 if not yet set. */
+  message_count: number;
+  /** M7-SESSION-001: ISO 8601 timestamp of interruption. Null if not yet set. */
+  interrupted_at: string | null;
+}
+
+/** M7-SESSION-001: An interrupted session entry in the cello status response. */
+export interface InterruptedSessionInfo {
+  sessionId: string;
+  agentName: string;
+  counterpartyPubkey: string;
+  messageCount: number;
+  interruptedAt: string;
 }
 
 // --- Error codes ---

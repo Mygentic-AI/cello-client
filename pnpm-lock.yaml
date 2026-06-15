@@ -156,12 +156,21 @@ importers:
       '@cello-protocol/crypto':
         specifier: workspace:*
         version: link:../crypto
+      '@cello-protocol/protocol-types':
+        specifier: workspace:*
+        version: link:../protocol-types
       '@cello-protocol/transport':
         specifier: workspace:*
         version: link:../transport
       '@libp2p/interface':
         specifier: ^3.0.0
         version: 3.2.2
+      cbor-x:
+        specifier: ^1.6.0
+        version: 1.6.4
+      it-length-prefixed:
+        specifier: ^10.0.1
+        version: 10.0.2
     devDependencies:
       '@types/node':
         specifier: ^25.6.2
