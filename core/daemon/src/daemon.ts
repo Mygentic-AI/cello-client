@@ -44,6 +44,7 @@ import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult } from "@cello-protocol/transport";
+import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 export interface DaemonHandle {
@@ -706,9 +707,59 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     if (ackResult.type === "seal_interrupted_ack") {
-      // SI-002: verify counterparty's leaf signature — full FROST ceremony integration deferred.
-      // The leaf arrived via authenticated directory signaling (counterparty is authenticated).
-      // FROST ceremony integration is a future story.
+      // SI-002: verify counterparty's K_local Ed25519 signature on the SEAL-INTERRUPTED leaf.
+      // The leaf.signerPubkey must match the expected counterparty pubkey (record.counterparty_pubkey).
+      // Canonical leaf content to verify: JSON.stringify({type, sessionId, leafCount,
+      //   merkleRootAtInterruption, timestamp, signerPubkey}) — deterministic field ordering.
+      const leaf = ackResult.sealInterruptedLeaf;
+      let sigVerified = false;
+      try {
+        const signerPubkeyHex = typeof leaf.signerPubkey === "string" ? leaf.signerPubkey : null;
+        const signatureHex = typeof leaf.signature === "string" ? leaf.signature : null;
+        if (!signerPubkeyHex || !signatureHex) {
+          throw new Error("leaf missing signerPubkey or signature");
+        }
+        // SI-002: signerPubkey must match the expected counterparty
+        if (signerPubkeyHex !== record.counterparty_pubkey) {
+          throw new Error(`leaf signerPubkey ${signerPubkeyHex.slice(0, 16)} does not match counterparty ${record.counterparty_pubkey.slice(0, 16)}`);
+        }
+        const canonicalLeaf = {
+          type: leaf.type,
+          sessionId: leaf.sessionId,
+          leafCount: leaf.leafCount,
+          merkleRootAtInterruption: leaf.merkleRootAtInterruption,
+          timestamp: leaf.timestamp,
+          signerPubkey: leaf.signerPubkey,
+        };
+        const leafBytes = new TextEncoder().encode(JSON.stringify(canonicalLeaf));
+        const pubkeyBytes = new Uint8Array(Buffer.from(signerPubkeyHex, "hex"));
+        const sigBytes = new Uint8Array(Buffer.from(signatureHex, "hex"));
+        sigVerified = ed25519Verify(pubkeyBytes, leafBytes, sigBytes);
+      } catch (verifyErr: unknown) {
+        logger.error("session.interrupted.seal.failed", {
+          sessionId,
+          agentName: record.agent_name,
+          reason: "seal_interrupted_leaf_signature_invalid",
+          error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+          correlationId,
+        });
+        return;
+      }
+
+      if (!sigVerified) {
+        logger.error("session.interrupted.seal.failed", {
+          sessionId,
+          agentName: record.agent_name,
+          reason: "seal_interrupted_leaf_signature_invalid",
+          error: "Ed25519 signature verification failed on SEAL-INTERRUPTED leaf",
+          correlationId,
+        });
+        return;
+      }
+
+      // Signature verified — mark session sealed and log completion.
+      // NOTE: Full FROST seal ceremony (involving the directory) is deferred —
+      // the seal-interrupted bilateral agreement is the cryptographic commitment here.
       logger.info("session.interrupted.sealed", {
         sessionId,
         agentName: record.agent_name,

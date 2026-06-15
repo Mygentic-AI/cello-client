@@ -71,16 +71,21 @@ function makeLogger(): { logger: Logger; events: Array<{ level: string; event: s
 }
 
 /** Minimal fake CelloNode for tests that don't need real libp2p. */
-class FakeCelloNode implements CelloNode {
+class FakeCelloNode {
   private _started = false;
   readonly #peerId = `fake-peer-${Math.random().toString(36).slice(2)}`;
   readonly #addrs = ["/ip4/127.0.0.1/tcp/0"];
   async start() { this._started = true; }
   async stop() { this._started = false; }
   getPeerId() { return this.#peerId; }
-  getMultiaddrs() { return this.#addrs; }
-  newStream(_peer: unknown, _proto: unknown): Promise<Stream> { return Promise.reject(new Error("stub")); }
-  dial(_addr: unknown): Promise<unknown> { return Promise.reject(new Error("stub")); }
+  listenAddresses() { return this.#addrs; }
+  newStream(_peer: string, _proto: string): Promise<Stream> { return Promise.reject(new Error("stub")); }
+  dial(_addr: string): Promise<{ peerId: string }> { return Promise.reject(new Error("stub")); }
+  async handle(_protocolId: string, _handler: unknown, _opts?: unknown): Promise<void> {}
+  getProtocols(): string[] { return []; }
+  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
+  onPeerConnect(_handler: (peerId: string) => void): void {}
+  onPeerDisconnect(_handler: (peerId: string) => void): void {}
 }
 
 class StubNodeFactory implements ISessionNodeFactory {
