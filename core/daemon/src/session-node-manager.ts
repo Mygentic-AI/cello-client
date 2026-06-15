@@ -118,6 +118,20 @@ export class SessionNodeManager {
   #activeNodes = new Map<string, ActiveSessionEntry>();
   #standingReceiver: { node: CelloNode; gater: SessionConnectionGater } | null = null;
   #standingReceiverReady = false;
+  // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
+  // state, so the composition root can dispatch a session_state_changed
+  // notification to live MCP clients. Injected via a setter AFTER construction
+  // because the NotificationDispatcher is built later than this manager in
+  // daemon.ts (it depends on the IPC server). Never required — when unset,
+  // state changes are persisted and logged but no push notification is emitted.
+  #onSessionStateChanged:
+    | ((
+        agentName: string,
+        sessionId: string,
+        state: string,
+        counterpartyPubkey: string | null,
+      ) => void)
+    | null = null;
 
   constructor(opts: {
     factory: ISessionNodeFactory;
@@ -158,6 +172,23 @@ export class SessionNodeManager {
         // Column already exists — ignore (SQLite error code: SQLITE_ERROR 'duplicate column name')
       }
     }
+
+    // M7-SESSION-001 (H-1): side table holding the verified bilateral
+    // SEAL-INTERRUPTED commitment artifacts. A side table (CREATE TABLE IF NOT
+    // EXISTS) is inherently idempotent — no ALTER TABLE / duplicate-column
+    // handling required. We keep BOTH parties' signed leaves and the agreed
+    // Merkle root so the achieved commitment is never discarded.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS seal_interrupted_artifacts (
+        session_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        own_leaf TEXT NOT NULL,
+        counterparty_leaf TEXT NOT NULL,
+        merkle_root TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )
+    `);
 
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
@@ -212,6 +243,22 @@ export class SessionNodeManager {
   /** Whether the standing receiver node is ready for the next inbound session. */
   getStandingReceiverReady(): boolean {
     return this.#standingReceiverReady;
+  }
+
+  /**
+   * M7-SESSION-001 (M-1 PUSH): register the session-state-change callback.
+   * Called by the composition root (daemon.ts) after the NotificationDispatcher
+   * exists. Setter injection avoids a construction-order/circular dependency.
+   */
+  setOnSessionStateChanged(
+    cb: (
+      agentName: string,
+      sessionId: string,
+      state: string,
+      counterpartyPubkey: string | null,
+    ) => void,
+  ): void {
+    this.#onSessionStateChanged = cb;
   }
 
   /**
@@ -514,13 +561,32 @@ export class SessionNodeManager {
     source: "relay_frame" | "stream_close",
   ): Promise<void> {
     if (!this.#db) return;
+
+    // H-3 SECURITY: only an 'active' session may transition to 'interrupted'.
+    // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
+    // or already-'interrupted' session back to 'interrupted'. This mirrors the
+    // stream-close guard in #watchRelayStream below — the two paths must agree.
+    const existing = this.getSessionRecord(sessionId);
+    if (!existing || existing.status !== "active") {
+      this.#logger.warn("session.interrupt.ignored", {
+        sessionId,
+        source,
+        currentStatus: existing?.status ?? "absent",
+        reason: "session_not_active",
+      });
+      return;
+    }
+
     const now = Date.now();
     const interruptedAt = new Date(now).toISOString();
 
     try {
+      // The `AND status = 'active'` predicate is the authoritative guard: even if
+      // the pre-check above raced (it cannot — DatabaseSync is synchronous), the
+      // UPDATE only mutates a row that is still active.
       this.#db
         .prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE session_id = ?",
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE session_id = ? AND status = 'active'",
         )
         .run(now, messageCount, interruptedAt, sessionId);
     } catch (err: unknown) {
@@ -535,7 +601,7 @@ export class SessionNodeManager {
     // (e.g. the session was already torn down before the stream watcher fired).
     const entry = this.#activeNodes.get(sessionId);
     const agentName: string = entry?.agentName
-      ?? (this.#db?.prepare("SELECT agent_name FROM sessions WHERE session_id = ?").get(sessionId) as { agent_name?: string } | undefined)?.agent_name
+      ?? existing.agent_name
       ?? "unknown";
 
     // Tear down the in-memory session node if it exists
@@ -564,6 +630,113 @@ export class SessionNodeManager {
       agentName,
       source,
     });
+
+    // M7-SESSION-001 (M-1 PUSH): notify live MCP clients that this session is now
+    // interrupted. Only fires on a real active→interrupted transition (the guard
+    // above already returned for any non-active session).
+    try {
+      this.#onSessionStateChanged?.(
+        agentName,
+        sessionId,
+        "interrupted",
+        existing.counterparty_pubkey,
+      );
+    } catch (err: unknown) {
+      this.#logger.debug("session.state.notify.failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * M7-SESSION-001 (H-1): persist a verified bilateral SEAL-INTERRUPTED
+   * commitment and transition the session to 'seal_interrupted_pending'.
+   *
+   * This is NOT a seal. It records that both parties produced and exchanged
+   * K_local-signed SEAL-INTERRUPTED leaves over the same {leafCount, merkleRoot}.
+   * The FROST threshold notarization is a separate, currently-unwired step (see
+   * daemon.ts handleSealInterruptedFlow H-1 note), which is precisely why the
+   * status is 'seal_interrupted_pending' and never 'sealed'.
+   *
+   * The status update is guarded so it only advances a session out of the
+   * 'interrupted' state — it will not overwrite a 'sealed' row.
+   *
+   * @returns true if the session row was advanced to seal_interrupted_pending.
+   */
+  persistSealInterruptedCommitment(opts: {
+    sessionId: string;
+    role: "initiator" | "responder";
+    ownLeaf: unknown;
+    counterpartyLeaf: unknown;
+    merkleRoot: string;
+    nonce: string;
+  }): boolean {
+    if (!this.#db) return false;
+    const now = Date.now();
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR REPLACE INTO seal_interrupted_artifacts
+           (session_id, role, own_leaf, counterparty_leaf, merkle_root, nonce, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          opts.sessionId,
+          opts.role,
+          JSON.stringify(opts.ownLeaf),
+          JSON.stringify(opts.counterpartyLeaf),
+          opts.merkleRoot,
+          opts.nonce,
+          now,
+        );
+    } catch (err: unknown) {
+      this.#logger.error("session.interrupted.db.write.failed", {
+        sessionId: opts.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+
+    const result = this.#db
+      .prepare(
+        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE session_id = ? AND status = 'interrupted'",
+      )
+      .run(now, opts.sessionId);
+    return Number(result.changes) > 0;
+  }
+
+  /**
+   * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
+   * for a session. Returns null when none exist.
+   */
+  getSealInterruptedArtifacts(sessionId: string): {
+    role: string;
+    ownLeaf: unknown;
+    counterpartyLeaf: unknown;
+    merkleRoot: string;
+    nonce: string;
+  } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE session_id = ?")
+      .get(sessionId) as
+      | {
+          role: string;
+          own_leaf: string;
+          counterparty_leaf: string;
+          merkle_root: string;
+          nonce: string;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      role: row.role,
+      ownLeaf: JSON.parse(row.own_leaf),
+      counterpartyLeaf: JSON.parse(row.counterparty_leaf),
+      merkleRoot: row.merkle_root,
+      nonce: row.nonce,
+    };
   }
 
   /**
@@ -635,13 +808,27 @@ export class SessionNodeManager {
         }
 
         if (frame["type"] === "session_interrupted") {
-          receivedInterruptFrame = true;
-          const sessionIdFromFrame = typeof frame["session_id"] === "string"
+          // H-3 SECURITY: this stream is registered (bound) to a specific
+          // sessionId. A malicious or buggy relay could put a DIFFERENT session_id
+          // in the frame body to target a session this stream is not authorized
+          // for (cross-session targeting). Never trust the frame's id: if the frame
+          // names a different session, reject it and keep watching the bound one.
+          const frameSessionId = typeof frame["session_id"] === "string"
             ? frame["session_id"]
             : (frame["session_id"] instanceof Uint8Array
               ? Buffer.from(frame["session_id"]).toString("hex")
-              : sessionId);
-          await this.markInterruptedWithDetails(sessionIdFromFrame, messageCount, "relay_frame");
+              : null);
+          if (frameSessionId !== null && frameSessionId !== sessionId) {
+            this.#logger.warn("session.interrupt.frame.session_mismatch", {
+              boundSessionId: sessionId,
+              frameSessionId,
+              reason: "cross_session_frame_rejected",
+            });
+            continue; // ignore the hostile/mismatched frame; keep reading
+          }
+          receivedInterruptFrame = true;
+          // Always mark the BOUND sessionId — never the id carried in the frame.
+          await this.markInterruptedWithDetails(sessionId, messageCount, "relay_frame");
           break; // No more relay frames expected after session_interrupted
         }
       }

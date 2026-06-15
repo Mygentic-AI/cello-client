@@ -56,6 +56,18 @@ export interface SealInterruptedRequest {
   initiatorPubkey: string;
   counterpartyPubkey: string;
   leafCountAtInterruption: number;
+  /**
+   * Hex-encoded Merkle root the initiator computed at interruption. The
+   * initiator's client (the holder of the session Merkle tree) supplies this;
+   * the daemon itself does not compute Merkle roots. Carried so the counterparty
+   * co-signs over the same root. Empty string when the initiator's client did not
+   * supply one (the bilateral commitment then binds leafCount only).
+   */
+  merkleRootAtInterruption: string;
+  /**
+   * Liveness nonce. The counterparty MUST echo this back in its ack so the
+   * initiator can reject a stale or replayed response (L-2).
+   */
   nonce: string;
 }
 
@@ -66,6 +78,17 @@ export interface SealInterruptedRequest {
 export interface SealInterruptedAck {
   type: "seal_interrupted_ack";
   sessionId: string;
+  /**
+   * Hex-encoded K_local public key of the original initiator. The directory's
+   * signaling decoder routes the reply back by looking up this pubkey, so it is
+   * REQUIRED on the wire (the directory does not infer it from session state).
+   */
+  initiatorPubkey: string;
+  /**
+   * The nonce from the originating SealInterruptedRequest, echoed verbatim. The
+   * initiator rejects the ack if this does not match the nonce it sent (L-2).
+   */
+  nonce: string;
   sealInterruptedLeaf: SealInterruptedLeaf;
 }
 
@@ -76,6 +99,12 @@ export interface SealInterruptedAck {
 export interface SealInterruptedRejection {
   type: "seal_interrupted_rejection";
   sessionId: string;
+  /**
+   * Hex-encoded K_local public key of the original initiator. The directory's
+   * signaling decoder routes the reply back by looking up this pubkey, so it is
+   * REQUIRED on the wire (the directory does not infer it from session state).
+   */
+  initiatorPubkey: string;
   reason: string;
 }
 

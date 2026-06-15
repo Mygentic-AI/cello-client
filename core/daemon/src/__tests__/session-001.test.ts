@@ -46,7 +46,8 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { Encoder } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -808,12 +809,15 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
       send: async (frame: unknown) => {
         const f = frame as Record<string, unknown>;
         if (typeof f === "object" && f !== null && f.type === "seal_interrupted_request") {
-          // Deliver a tampered ack: correct signerPubkey, zeroed signature (64 zero bytes)
+          // Deliver a tampered ack: correct signerPubkey, zeroed signature (64 zero bytes).
+          // leafCount (2) and merkleRootAtInterruption ("") match the initiator's own
+          // state, and the nonce is echoed, so the cross-checks and nonce check pass and
+          // the ONLY thing wrong is the Ed25519 signature — which must be rejected.
           const tamperedLeaf = {
             type: "SEAL_INTERRUPTED",
             sessionId: f.sessionId,
-            leafCount: 3,
-            merkleRootAtInterruption: "aabbcc",
+            leafCount: 2,
+            merkleRootAtInterruption: "",
             timestamp: Date.now(),
             signerPubkey: counterpartyPubkeyHex,
             signature: "00".repeat(64), // zeroed — invalid Ed25519 signature
@@ -825,6 +829,8 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
               inboundHandler({
                 type: "seal_interrupted_ack",
                 sessionId: f.sessionId,
+                initiatorPubkey: f.initiatorPubkey,
+                nonce: f.nonce,
                 sealInterruptedLeaf: tamperedLeaf,
               });
             }
@@ -1089,5 +1095,442 @@ describe("SESSION-001: markInterruptedWithDetails", () => {
     expect(detectedEvent!.level).toBe("warn");
     expect(detectedEvent!.context.source).toBe("relay_frame");
     expect(detectedEvent!.context.sessionId).toBe(sessionId);
+  });
+});
+
+// ─── Shared helpers for H-1/H-3/M-1/L-2 ──────────────────────────────────────
+
+/** Canonical SEAL-INTERRUPTED leaf bytes — MUST match daemon.ts exactly. */
+function canonicalLeafBytes(leaf: {
+  type: string;
+  sessionId: string;
+  leafCount: number;
+  merkleRootAtInterruption: string;
+  timestamp: number;
+  signerPubkey: string;
+}): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({
+      type: leaf.type,
+      sessionId: leaf.sessionId,
+      leafCount: leaf.leafCount,
+      merkleRootAtInterruption: leaf.merkleRootAtInterruption,
+      timestamp: leaf.timestamp,
+      signerPubkey: leaf.signerPubkey,
+    }),
+  );
+}
+
+/** Build a real K_local-signed SEAL-INTERRUPTED leaf using a real keypair. */
+async function signLeaf(
+  kp: KeyProvider,
+  opts: { sessionId: string; leafCount: number; merkleRootAtInterruption: string; signerPubkeyHex: string },
+): Promise<Record<string, unknown>> {
+  const partial = {
+    type: "SEAL_INTERRUPTED",
+    sessionId: opts.sessionId,
+    leafCount: opts.leafCount,
+    merkleRootAtInterruption: opts.merkleRootAtInterruption,
+    timestamp: Date.now(),
+    signerPubkey: opts.signerPubkeyHex,
+  };
+  const sig = await kp.sign(canonicalLeafBytes(partial));
+  return { ...partial, signature: Buffer.from(sig).toString("hex") };
+}
+
+// ─── H-3 SECURITY: relay-frame interrupt path is guarded ─────────────────────
+
+describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
+  let tempDir: string;
+  let mgr: SessionNodeManager;
+  let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-h3-"));
+    const l = makeLogger();
+    logEvents = l.events;
+    mgr = await makeSessionNodeManager(l.logger, join(tempDir, "sessions.db"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("H-3: a 'sealed' session is NOT reverted to interrupted by a relay frame", async () => {
+    const sessionId = "5ea1ed00112233445566778899aabbccddeeff00112233445566778899aabbcc";
+    const db = mgr.getDb();
+    insertSession(db, { sessionId, agentName: "alice", counterpartyPubkey: "cp1", status: "sealed", messageCount: 4 });
+
+    // Deliver a session_interrupted frame naming the sealed (bound) session.
+    const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: sessionId, reason: "peer_disconnected" });
+    mgr.registerRelayStream(sessionId, makeFakeRelayStream([frame]), 4);
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    const row = db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
+    expect(row.status).toBe("sealed"); // NOT reverted
+
+    // The guard logged the ignore, and no interrupted.detected fired for it.
+    const ignored = logEvents.find((e) => e.event === "session.interrupt.ignored" && e.context.sessionId === sessionId);
+    expect(ignored).toBeDefined();
+    expect(ignored!.context.currentStatus).toBe("sealed");
+    const detected = logEvents.filter((e) => e.event === "session.interrupted.detected");
+    expect(detected).toHaveLength(0);
+  });
+
+  it("H-3: a frame naming a DIFFERENT session does not affect that other session", async () => {
+    const boundId = "b0undaa00112233445566778899aabbccddeeff00112233445566778899aabbcc";
+    const otherId = "07he4baa00112233445566778899aabbccddeeff00112233445566778899aabbcc";
+    const db = mgr.getDb();
+    insertSession(db, { sessionId: boundId, agentName: "alice", counterpartyPubkey: "cp1", status: "active", messageCount: 2 });
+    insertSession(db, { sessionId: otherId, agentName: "bob", counterpartyPubkey: "cp2", status: "active", messageCount: 9 });
+
+    // Stream is bound to boundId but the frame names otherId (cross-session attempt).
+    const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: otherId, reason: "peer_disconnected" });
+    mgr.registerRelayStream(boundId, makeFakeRelayStream([frame]), 2);
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    // The OTHER session is untouched — the forged frame did not target it.
+    const other = db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(otherId) as { status: string };
+    expect(other.status).toBe("active");
+
+    // The mismatch was logged.
+    const mismatch = logEvents.find((e) => e.event === "session.interrupt.frame.session_mismatch");
+    expect(mismatch).toBeDefined();
+    expect(mismatch!.context.boundSessionId).toBe(boundId);
+    expect(mismatch!.context.frameSessionId).toBe(otherId);
+  });
+});
+
+// ─── M-1 PUSH: markInterruptedWithDetails emits session_state_changed ─────────
+
+describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
+  let tempDir: string;
+  let mgr: SessionNodeManager;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-m1push-"));
+    const { logger } = makeLogger();
+    mgr = await makeSessionNodeManager(logger, join(tempDir, "sessions.db"));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("fires on active→interrupted with state 'interrupted' and counterparty pubkey", async () => {
+    const calls: Array<{ agentName: string; sessionId: string; state: string; cp: string | null }> = [];
+    mgr.setOnSessionStateChanged((agentName, sessionId, state, cp) => calls.push({ agentName, sessionId, state, cp }));
+
+    const sessionId = "m1push0011223344556677889900aabbccddeeff00112233445566778899aabb";
+    insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "active", messageCount: 3 });
+
+    await mgr.markInterruptedWithDetails(sessionId, 3, "relay_frame");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ agentName: "alice", sessionId, state: "interrupted", cp: "cphex" });
+  });
+
+  it("does NOT fire for a non-active (sealed) session", async () => {
+    const calls: unknown[] = [];
+    mgr.setOnSessionStateChanged(() => calls.push(1));
+
+    const sessionId = "m1push5ea1ed11223344556677889900aabbccddeeff00112233445566778899";
+    insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "sealed", messageCount: 3 });
+
+    await mgr.markInterruptedWithDetails(sessionId, 3, "relay_frame");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+// ─── H-1: seal-interrupted pending status, responder, and persisted artifacts ─
+
+describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
+  let tempDir: string;
+  let handle: Awaited<ReturnType<typeof startDaemon>> | null;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-h1-"));
+    handle = null;
+  });
+
+  afterEach(async () => {
+    if (handle) {
+      try { await handle.stop("test_cleanup"); } catch { /* ignore */ }
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function makeAgent(name: string): Promise<string> {
+    const agentDir = join(tempDir, "agents", name);
+    await mkdir(agentDir, { recursive: true });
+    const kp = await FileKeyProvider.load(join(agentDir, "key"));
+    return Buffer.from(await kp.getPublicKey()).toString("hex");
+  }
+
+  it("H-1 INITIATOR: valid bilateral ack → seal_interrupted_pending (NOT sealed) + persisted artifacts", async () => {
+    await makeAgent("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+    const MROOT = "deadbeefdeadbeefdeadbeefdeadbeef";
+
+    let inboundHandler: ((frame: unknown) => void) | null = null;
+    const sendStream: SignalingStream = {
+      send: async (frame: unknown) => {
+        const f = frame as Record<string, unknown>;
+        if (f && f.type === "seal_interrupted_request") {
+          const leaf = await signLeaf(cpKp, {
+            sessionId: f.sessionId as string,
+            leafCount: f.leafCountAtInterruption as number,
+            merkleRootAtInterruption: f.merkleRootAtInterruption as string,
+            signerPubkeyHex: cpPubkeyHex,
+          });
+          setImmediate(() => inboundHandler?.({
+            type: "seal_interrupted_ack",
+            sessionId: f.sessionId,
+            initiatorPubkey: f.initiatorPubkey,
+            nonce: f.nonce,
+            sealInterruptedLeaf: leaf,
+          }));
+        }
+      },
+      onMessage: (h: (frame: unknown) => void) => { inboundHandler = h; },
+      close: () => {},
+    };
+    const signalingConnect = async (): Promise<ConnectResult> => ({ stream: sendStream, directoryNodeId: "dir-h1", manifestVersion: 1 });
+
+    const { logger } = makeLogger();
+    const h = await startDaemon({
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
+    });
+    handle = h;
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    const sessionId = "h1in00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
+    const dbPath = join(tempDir, "sessions.db");
+    const db = new DatabaseSync(dbPath);
+    const now = Date.now();
+    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
+    db.close();
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const result = await client.send("cello_close_session", { sessionId, merkleRootAtInterruption: MROOT }) as Record<string, unknown>;
+
+      expect(result.ok).toBe(true);
+      expect(result.status).toBe("seal_interrupted_pending");
+
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
+      expect(row.status).toBe("seal_interrupted_pending");
+      const art = db2.prepare("SELECT * FROM seal_interrupted_artifacts WHERE session_id = ?").get(sessionId) as {
+        role: string; own_leaf: string; counterparty_leaf: string; merkle_root: string;
+      };
+      db2.close();
+      expect(art).toBeTruthy();
+      expect(art.role).toBe("initiator");
+      expect(art.merkle_root).toBe(MROOT);
+      // Both leaves persisted, and the counterparty leaf is the real signed one.
+      const cpLeaf = JSON.parse(art.counterparty_leaf) as { signerPubkey: string };
+      expect(cpLeaf.signerPubkey).toBe(cpPubkeyHex);
+      const ownLeaf = JSON.parse(art.own_leaf) as { signerPubkey: string };
+      expect(typeof ownLeaf.signerPubkey).toBe("string");
+    } finally {
+      client.close();
+    }
+  });
+
+  it("L-2 INITIATOR: ack echoing a WRONG nonce is rejected; session stays interrupted", async () => {
+    await makeAgent("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+
+    let inboundHandler: ((frame: unknown) => void) | null = null;
+    const sendStream: SignalingStream = {
+      send: async (frame: unknown) => {
+        const f = frame as Record<string, unknown>;
+        if (f && f.type === "seal_interrupted_request") {
+          const leaf = await signLeaf(cpKp, {
+            sessionId: f.sessionId as string,
+            leafCount: f.leafCountAtInterruption as number,
+            merkleRootAtInterruption: f.merkleRootAtInterruption as string,
+            signerPubkeyHex: cpPubkeyHex,
+          });
+          setImmediate(() => inboundHandler?.({
+            type: "seal_interrupted_ack",
+            sessionId: f.sessionId,
+            initiatorPubkey: f.initiatorPubkey,
+            nonce: "this-is-not-the-nonce", // WRONG
+            sealInterruptedLeaf: leaf,
+          }));
+        }
+      },
+      onMessage: (h: (frame: unknown) => void) => { inboundHandler = h; },
+      close: () => {},
+    };
+    const signalingConnect = async (): Promise<ConnectResult> => ({ stream: sendStream, directoryNodeId: "dir-l2", manifestVersion: 1 });
+
+    const { logger } = makeLogger();
+    const h = await startDaemon({
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
+    });
+    handle = h;
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    const sessionId = "l2nonce00112233445566778899aabbccddeeff00112233445566778899aabb";
+    const dbPath = join(tempDir, "sessions.db");
+    const db = new DatabaseSync(dbPath);
+    const now = Date.now();
+    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
+    db.close();
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const result = await client.send("cello_close_session", { sessionId, merkleRootAtInterruption: "ab" }) as Record<string, unknown>;
+
+      expect(result.ok).not.toBe(true);
+      expect(result.reason).toBe("seal_interrupted_nonce_mismatch");
+
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
+      db2.close();
+      expect(row.status).toBe("interrupted");
+    } finally {
+      client.close();
+    }
+  });
+
+  it("H-1 RESPONDER: inbound seal_interrupted_request produces a valid signed ack and pending status", async () => {
+    const bobPubkeyHex = await makeAgent("bob");
+    const initiatorKp = generateKeypair();
+    const initiatorPubkeyHex = Buffer.from(await initiatorKp.getPublicKey()).toString("hex");
+    const MROOT = "cafebabecafebabecafebabe";
+
+    const sent: Array<Record<string, unknown>> = [];
+    let inboundHandler: ((frame: unknown) => void) | null = null;
+    const sendStream: SignalingStream = {
+      send: async (frame: unknown) => { sent.push(frame as Record<string, unknown>); },
+      onMessage: (h: (frame: unknown) => void) => { inboundHandler = h; },
+      close: () => {},
+    };
+    const signalingConnect = async (): Promise<ConnectResult> => ({ stream: sendStream, directoryNodeId: "dir-resp", manifestVersion: 1 });
+
+    const { logger } = makeLogger();
+    const h = await startDaemon({
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
+    });
+    handle = h;
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    // bob's local view: session interrupted, counterparty is the initiator, 5 message leaves.
+    const sessionId = "resp00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
+    const dbPath = join(tempDir, "sessions.db");
+    const db = new DatabaseSync(dbPath);
+    const now = Date.now();
+    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
+    db.close();
+
+    // Deliver the inbound request (as if from the directory signaling stream).
+    expect(inboundHandler).not.toBeNull();
+    inboundHandler!({
+      type: "seal_interrupted_request",
+      sessionId,
+      initiatorPubkey: initiatorPubkeyHex,
+      counterpartyPubkey: bobPubkeyHex,
+      leafCountAtInterruption: 5,
+      merkleRootAtInterruption: MROOT,
+      nonce: "nonce-xyz",
+    });
+
+    await new Promise<void>((r) => setTimeout(r, 80));
+
+    const ack = sent.find((f) => f.type === "seal_interrupted_ack");
+    expect(ack).toBeDefined();
+    expect(ack!.initiatorPubkey).toBe(initiatorPubkeyHex);
+    expect(ack!.nonce).toBe("nonce-xyz");
+    const leaf = ack!.sealInterruptedLeaf as Record<string, unknown>;
+    expect(leaf.signerPubkey).toBe(bobPubkeyHex);
+    expect(leaf.leafCount).toBe(5);
+    expect(leaf.merkleRootAtInterruption).toBe(MROOT);
+
+    // The ack leaf carries a REAL Ed25519 signature over the canonical bytes.
+    const sigOk = ed25519Verify(
+      new Uint8Array(Buffer.from(bobPubkeyHex, "hex")),
+      canonicalLeafBytes(leaf as { type: string; sessionId: string; leafCount: number; merkleRootAtInterruption: string; timestamp: number; signerPubkey: string }),
+      new Uint8Array(Buffer.from(leaf.signature as string, "hex")),
+    );
+    expect(sigOk).toBe(true);
+
+    // Responder advanced the session to seal_interrupted_pending and persisted its artifacts.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
+    const art = db2.prepare("SELECT role FROM seal_interrupted_artifacts WHERE session_id = ?").get(sessionId) as { role: string } | undefined;
+    db2.close();
+    expect(row.status).toBe("seal_interrupted_pending");
+    expect(art?.role).toBe("responder");
+  });
+
+  it("H-1 RESPONDER: leaf-count mismatch yields a rejection (no ack)", async () => {
+    const bobPubkeyHex = await makeAgent("bob");
+    const initiatorKp = generateKeypair();
+    const initiatorPubkeyHex = Buffer.from(await initiatorKp.getPublicKey()).toString("hex");
+
+    const sent: Array<Record<string, unknown>> = [];
+    let inboundHandler: ((frame: unknown) => void) | null = null;
+    const sendStream: SignalingStream = {
+      send: async (frame: unknown) => { sent.push(frame as Record<string, unknown>); },
+      onMessage: (hh: (frame: unknown) => void) => { inboundHandler = hh; },
+      close: () => {},
+    };
+    const signalingConnect = async (): Promise<ConnectResult> => ({ stream: sendStream, directoryNodeId: "dir-resp2", manifestVersion: 1 });
+
+    const { logger } = makeLogger();
+    const h = await startDaemon({
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
+    });
+    handle = h;
+    await new Promise<void>((r) => setTimeout(r, 50));
+
+    const sessionId = "resp2011223344556677889900aabbccddeeff00112233445566778899aabbc";
+    const dbPath = join(tempDir, "sessions.db");
+    const db = new DatabaseSync(dbPath);
+    const now = Date.now();
+    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
+    db.close();
+
+    inboundHandler!({
+      type: "seal_interrupted_request",
+      sessionId,
+      initiatorPubkey: initiatorPubkeyHex,
+      counterpartyPubkey: bobPubkeyHex,
+      leafCountAtInterruption: 99, // disagrees with bob's message_count of 5
+      merkleRootAtInterruption: "aa",
+      nonce: "nonce-2",
+    });
+    await new Promise<void>((r) => setTimeout(r, 80));
+
+    const rej = sent.find((f) => f.type === "seal_interrupted_rejection");
+    expect(rej).toBeDefined();
+    expect(rej!.reason).toBe("leaf_count_mismatch");
+    expect(rej!.initiatorPubkey).toBe(initiatorPubkeyHex);
+    expect(sent.find((f) => f.type === "seal_interrupted_ack")).toBeUndefined();
+
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
+    db2.close();
+    expect(row.status).toBe("interrupted"); // unchanged
   });
 });

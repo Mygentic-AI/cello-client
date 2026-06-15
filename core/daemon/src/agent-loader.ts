@@ -20,11 +20,19 @@
 import { readdir, stat, access } from "node:fs/promises";
 import { join } from "node:path";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 
 export interface LoadedAgent {
   name: string;
   pubkey: string;
+  /**
+   * The agent's K_local signing key, retained so the daemon can produce
+   * K_local-signed control leaves (e.g. the SEAL-INTERRUPTED leaf in the
+   * seal-interrupted bilateral flow). The private scalar never leaves this
+   * provider — only signatures are emitted.
+   */
+  keyProvider: KeyProvider;
 }
 
 export interface FailedAgent {
@@ -92,7 +100,7 @@ async function loadSingleAgent(
     const keyProvider = await FileKeyProvider.load(keyPath);
     const pubkeyBytes = await keyProvider.getPublicKey();
     const pubkey = Buffer.from(pubkeyBytes).toString("hex");
-    return { ok: true, agent: { name, pubkey } };
+    return { ok: true, agent: { name, pubkey, keyProvider } };
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("agent.load.failed", {
