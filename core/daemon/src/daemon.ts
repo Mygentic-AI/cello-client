@@ -50,6 +50,12 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-mana
 export interface DaemonHandle {
   stop(reason: string): Promise<void>;
   getStatus(): DaemonStatusResponse;
+  /**
+   * AC-016 test hook: exposes the session node manager so integration tests can
+   * call registerRelayStream directly and verify the composition root is wired.
+   * Not part of the production API surface.
+   */
+  getSessionNodeManager(): SessionNodeManager;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -481,25 +487,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    // AC-012 / AC-013: seal-interrupted bilateral flow for interrupted sessions
+    // AC-012 / AC-013: seal-interrupted bilateral flow for interrupted sessions.
+    // BLOCKING-1 fix: await the flow synchronously so the caller receives the real result
+    // (counterparty_unavailable, rejected_by_counterparty, or sealed).
+    // The sealInterruptedInProgress Set still guards concurrent calls (AC-011).
     if (record.status === "interrupted") {
       sealInterruptedInProgress.add(sessionId);
       const correlationId = randomUUID();
-      void (async () => {
-        try {
-          await handleSealInterruptedFlow(sessionId, record, correlationId);
-        } finally {
-          sealInterruptedInProgress.delete(sessionId);
-        }
-      })();
-      // The flow runs asynchronously — return accepted to the caller.
-      // The caller observes completion via session.interrupted.sealed log or status change.
-      return {
-        ok: true,
-        status: "seal_interrupted_initiated",
-        sessionId,
-        guidance: "Seal-interrupted flow initiated. Watch for session.interrupted.sealed in the daemon logs to confirm completion.",
-      };
+      try {
+        return await handleSealInterruptedFlow(sessionId, record, correlationId);
+      } finally {
+        sealInterruptedInProgress.delete(sessionId);
+      }
     }
 
     // Active session — normal (non-interrupted) close not yet implemented
@@ -601,11 +600,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // NOTE: Full FROST seal ceremony integration is deferred until FROST ceremony
   // adapter is available. This implementation handles the signaling frame exchange
   // and error codes (AC-010 through AC-013, DB-001).
+  // Result type for handleSealInterruptedFlow — maps to the MCP tool response shape.
+  type SealFlowResult =
+    | { ok: true; sessionId: string; status: "sealed" }
+    | { ok: false; reason: string; guidance: string };
+
   async function handleSealInterruptedFlow(
     sessionId: string,
     record: import("./types.js").SessionRecord,
     correlationId: string,
-  ): Promise<void> {
+  ): Promise<SealFlowResult> {
     const nonce = randomUUID();
 
     // Retrieve the agent's own pubkey from the agent list
@@ -623,7 +627,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         error: "directory_signaling_reconnecting",
         correlationId,
       });
-      return;
+      return {
+        ok: false,
+        reason: "signaling_reconnecting",
+        guidance: "The directory signaling stream is reconnecting. Wait for directory_signaling to show connected in cello status before initiating seal-interrupted. The daemon reconnects automatically — no manual intervention required.",
+      };
     }
 
     // Send SealInterruptedRequest via directory signaling
@@ -645,7 +653,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         error: sendResult.reason,
         correlationId,
       });
-      return;
+      return {
+        ok: false,
+        reason: "seal_interrupted_counterparty_unavailable",
+        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_list_connections.",
+      };
     }
 
     // Wait for counterparty ack/rejection via registered inbound handler
@@ -692,7 +704,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         error: "seal_interrupted_response_timeout",
         correlationId,
       });
-      return;
+      return {
+        ok: false,
+        reason: "seal_interrupted_counterparty_unavailable",
+        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_list_connections.",
+      };
     }
 
     if (ackResult.type === "seal_interrupted_rejection") {
@@ -703,10 +719,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         error: ackResult.reason,
         correlationId,
       });
-      return;
+      return {
+        ok: false,
+        reason: "seal_interrupted_rejected_by_counterparty",
+        guidance: "The counterparty rejected the seal-interrupted request. This may indicate their session state is inconsistent. Ask the counterparty to check their interrupted sessions via cello status on their end.",
+      };
     }
 
-    if (ackResult.type === "seal_interrupted_ack") {
+    // ackResult.type === "seal_interrupted_ack"
+    {
       // SI-002: verify counterparty's K_local Ed25519 signature on the SEAL-INTERRUPTED leaf.
       // The leaf.signerPubkey must match the expected counterparty pubkey (record.counterparty_pubkey).
       // Canonical leaf content to verify: JSON.stringify({type, sessionId, leafCount,
@@ -743,7 +764,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
           correlationId,
         });
-        return;
+        return {
+          ok: false,
+          reason: "seal_interrupted_leaf_signature_invalid",
+          guidance: "The counterparty's SEAL-INTERRUPTED leaf signature could not be verified. The seal flow has been aborted. The session remains interrupted — retry cello_close_session after confirming the counterparty is using a compatible version.",
+        };
       }
 
       if (!sigVerified) {
@@ -754,7 +779,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           error: "Ed25519 signature verification failed on SEAL-INTERRUPTED leaf",
           correlationId,
         });
-        return;
+        return {
+          ok: false,
+          reason: "seal_interrupted_leaf_signature_invalid",
+          guidance: "The counterparty's SEAL-INTERRUPTED leaf signature did not verify. The seal flow has been aborted. The session remains interrupted — retry cello_close_session after confirming the counterparty is using a compatible version.",
+        };
       }
 
       // Signature verified — mark session sealed and log completion.
@@ -772,11 +801,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           "UPDATE sessions SET status = 'sealed', updated_at = ? WHERE session_id = ?",
         ).run(Date.now(), sessionId);
       } catch (dbErr: unknown) {
-        logger.error("session.interrupt.db.write.failed", {
+        // Medium finding fix: correct event name from session.interrupt.db.write.failed
+        // to session.interrupted.db.write.failed (add -ed).
+        logger.error("session.interrupted.db.write.failed", {
           sessionId,
           error: dbErr instanceof Error ? dbErr.message : String(dbErr),
         });
       }
+      return { ok: true, sessionId, status: "sealed" };
     }
   }
 
@@ -860,5 +892,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     await removeLock(lockFilePath, logger);
   }
 
-  return { stop, getStatus };
+  function getSessionNodeManager(): SessionNodeManager {
+    return sessionNodeManager;
+  }
+
+  return { stop, getStatus, getSessionNodeManager };
 }
