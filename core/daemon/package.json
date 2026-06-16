@@ -30,8 +30,11 @@
   },
   "dependencies": {
     "@cello-protocol/crypto": "workspace:*",
+    "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
-    "@libp2p/interface": "^3.0.0"
+    "@libp2p/interface": "^3.0.0",
+    "cbor-x": "^1.6.0",
+    "it-length-prefixed": "^10.0.1"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",

@@ -250,6 +250,10 @@ export class SignalingManager {
   private _pendingNonce: string | null = null;
   private _agentPubkeyHex: string | null = null;
 
+  // M7-SESSION-001: registered inbound message handlers.
+  // Handlers are called for every inbound frame not consumed by built-in logic.
+  private _inboundHandlers: Array<(frame: Record<string, unknown>) => void> = [];
+
   // Manifest polling state (MANIFEST-002)
   private readonly _pollScheduler: IManifestPollScheduler | undefined;
   private readonly _manifestVersionStore: IManifestVersionStore | undefined;
@@ -291,6 +295,40 @@ export class SignalingManager {
 
   get queueDepth(): number {
     return this._queue.length;
+  }
+
+  /**
+   * M7-SESSION-001: Send a frame directly on the active signaling stream.
+   * Returns ok:true when connected and send succeeded.
+   * Returns ok:false with reason when not connected or send failed.
+   */
+  async sendRaw(frame: unknown): Promise<OperationResult> {
+    if (this._status !== "connected" || !this._currentStream) {
+      if (this._status === "reconnecting") {
+        return { ok: false, reason: "signaling_reconnecting", guidance: GUIDANCE_RECONNECTING };
+      }
+      return { ok: false, reason: "signaling_lost", guidance: GUIDANCE_LOST };
+    }
+    try {
+      await this._currentStream.send(frame);
+      return { ok: true };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: "signaling_lost", guidance: `Send failed: ${msg}` };
+    }
+  }
+
+  /**
+   * M7-SESSION-001: Register a handler for inbound signaling frames.
+   * Called for every frame not consumed by the built-in heartbeat/manifest logic.
+   * Returns an unregister function.
+   */
+  registerInboundHandler(handler: (frame: Record<string, unknown>) => void): () => void {
+    this._inboundHandlers.push(handler);
+    return () => {
+      const idx = this._inboundHandlers.indexOf(handler);
+      if (idx !== -1) this._inboundHandlers.splice(idx, 1);
+    };
   }
 
   /**
@@ -702,6 +740,21 @@ export class SignalingManager {
 
     if (f.type === "manifest_poll_response" && f.manifest) {
       void this.handleManifestPollResponse(f.manifest as ConsortiumManifest);
+      return;
+    }
+
+    // M7-SESSION-001: dispatch to registered inbound handlers (e.g. seal_interrupted_ack/rejection)
+    if (this._inboundHandlers.length > 0) {
+      for (const handler of this._inboundHandlers) {
+        try {
+          handler(f);
+        } catch (err: unknown) {
+          this._logger.error("signaling.inbound.handler.error", {
+            frameType: typeof f.type === "string" ? f.type : "unknown",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
   }
 

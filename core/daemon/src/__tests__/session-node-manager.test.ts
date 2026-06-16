@@ -1267,13 +1267,14 @@ describe("SessionNodeManager — integration tests", () => {
     const { DatabaseSync: DbSync } = await import("node:sqlite");
     const db = new DbSync(dbPath);
     const now = Date.now();
-    db.exec(`CREATE TABLE IF NOT EXISTS sessions (
-      session_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL,
-      counterparty_pubkey TEXT NOT NULL, status TEXT NOT NULL,
-      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    )`);
-    db.prepare("INSERT INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s1","alice","pk-alice","active",now,now);
-    db.prepare("INSERT INTO sessions VALUES (?,?,?,?,?,?)").run("sigterm-s2","bob","pk-bob","active",now,now);
+    // Use named columns to be schema-agnostic (works with both 6-col legacy schema
+    // and the M7-SESSION-001 8-col schema that added message_count + interrupted_at).
+    db.prepare(
+      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    ).run("sigterm-s1", "alice", "pk-alice", "active", now, now);
+    db.prepare(
+      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    ).run("sigterm-s2", "bob", "pk-bob", "active", now, now);
     db.close();
 
     // Step (c): send SIGTERM and wait for clean exit

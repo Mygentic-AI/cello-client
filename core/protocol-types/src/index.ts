@@ -130,3 +130,13 @@ export {
   MANIFEST_VERSION_ROLLBACK,
   MANIFEST_EXPIRED,
 } from "./manifest.js";
+
+// M7-SESSION-001: Seal-interrupted protocol types
+export type {
+  SealInterruptedLeaf,
+  SealInterruptedRequest,
+  SealInterruptedAck,
+  SealInterruptedRejection,
+  SessionInterruptedFrame,
+  SealInterruptedSignalingMessage,
+} from "./seal-interrupted.js";
