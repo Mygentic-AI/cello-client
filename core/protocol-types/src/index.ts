@@ -32,10 +32,11 @@ export {
   verifyStructure2Signature,
 } from "./structure2.js";
 
-export { computeGenesisPrevRoot, encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs } from "./session.js";
+export { computeGenesisPrevRoot, encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs, SEAL_RECEIPT_DISCLAIMER } from "./session.js";
 export type {
   SessionAssignment, SessionAssignmentFrost, SessionAssignmentSingle, ParticipantInfo, RelayEndpointInfo, SealPayload,
   SessionAbandoned, SessionSealedSingle, SessionSealedFrost, SessionSealed, SealRejectionReason, SessionSealRejected, SealVerified,
+  AttestationMode, SealLegibility, SealLegibilityParticipant, SealLegibilityFinalMessage,
 } from "./session.js";
 
 export type {
