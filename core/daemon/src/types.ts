@@ -22,6 +22,9 @@ export type {
   IDirectoryChallengeVerifier,
 };
 
+// Type-only import (erased at runtime — no circular dependency at load time).
+import type { DirectoryEndpoint } from "./signaling-connect.js";
+
 // --- Logger interface (injected, never imported directly) ---
 
 export interface Logger {
@@ -176,8 +179,19 @@ export interface DaemonConfig {
    * M7-SIGNAL-001: injectable connect function for directory signaling stream.
    * When absent, a stub that always rejects (directory_signaling_not_configured) is used.
    * Production: performs the full 7-step directory handshake.
+   *
+   * Tests inject a fake signalingConnect directly. Production leaves this undefined
+   * and supplies directoryEndpointResolver instead (see below), so startDaemon can
+   * build the real connect wired to its own loaded-agent identity.
    */
   signalingConnect?: () => Promise<ConnectResult>;
+  /**
+   * M7 Keystone (Part 1): resolves the directory endpoint to dial (GET /bootstrap).
+   * When signalingConnect is absent and this is present, startDaemon builds the
+   * production signalingConnect from this resolver + the daemon's primary agent
+   * identity. Ignored when signalingConnect is provided directly.
+   */
+  directoryEndpointResolver?: () => Promise<DirectoryEndpoint | null>;
 }
 
 // --- Session node types ---

@@ -92,8 +92,12 @@ export interface SignalingAuthIdentity {
 }
 
 export interface SignalingConnectDeps {
-  /** Resolve the directory node to dial. Returns null when no endpoint is known yet. */
-  getDirectoryEndpoint: () => DirectoryEndpoint | null;
+  /**
+   * Resolve the directory node to dial. Returns null when no endpoint is known yet.
+   * May be async — production re-resolves the bootstrap (GET /bootstrap) per connect
+   * so a directory address change is picked up on the next reconnect.
+   */
+  getDirectoryEndpoint: () => DirectoryEndpoint | null | Promise<DirectoryEndpoint | null>;
   /** Resolve the agent identity to authenticate as. Returns null when no agent exists yet. */
   getAuthIdentity: () => SignalingAuthIdentity | null;
   logger: Logger;
@@ -120,7 +124,7 @@ export interface SignalingConnectDeps {
  */
 export function createSignalingConnect(deps: SignalingConnectDeps): () => Promise<ConnectResult> {
   return async function connect(): Promise<ConnectResult> {
-    const endpoint = deps.getDirectoryEndpoint();
+    const endpoint = await deps.getDirectoryEndpoint();
     if (!endpoint) {
       throw new Error("directory_endpoint_unknown");
     }

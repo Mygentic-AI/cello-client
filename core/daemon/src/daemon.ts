@@ -44,6 +44,7 @@ import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult } from "@cello-protocol/transport";
+import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
@@ -136,7 +137,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore, manifestPollScheduler,
-    signalingConnect, challengeVerifier,
+    signalingConnect, challengeVerifier, directoryEndpointResolver,
   } = config;
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
@@ -150,6 +151,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //      e. On failure: log error event, set directory_signaling to 'reconnecting'.
   //   2. If manifestProvider is absent: skip (backward compat for DAEMON-001 tests).
   let manifestVerified = false;
+  // M7 Keystone: the version of the verified manifest, surfaced in ConnectResult.
+  // Stays 0 when no manifestProvider is configured (the M6 backward-compat path).
+  let verifiedManifestVersion = 0;
 
   // ADV-006 + ADV-008: If manifestProvider is set, manifestRootKeys and a positive
   // manifestThreshold are required. Fail loudly on misconfiguration rather than
@@ -191,6 +195,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           } else {
             await manifestVersionStore.persistVersion(manifest.version);
             manifestVerified = true;
+            verifiedManifestVersion = manifest.version;
             logger.info("directory.auth.manifest.verified", {
               manifestVersion: manifest.version,
               signerCount: manifest.signatures.length,
@@ -198,6 +203,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           }
         } else {
           manifestVerified = true;
+          verifiedManifestVersion = manifest.version;
           logger.info("directory.auth.manifest.verified", {
             manifestVersion: manifest.version,
             signerCount: manifest.signatures.length,
@@ -268,8 +274,40 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     throw new Error("directory_signaling_not_configured");
   };
 
+  // M7 Keystone (Part 1): resolve the agent identity that authenticates the
+  // directory signaling stream. The daemon's directory-facing node is one per
+  // daemon, so the keystone authenticates as the PRIMARY agent (first successfully
+  // loaded). Returns null when no agent is registered yet → connect() throws
+  // no_agent_identity and the SignalingManager stays reconnecting until one exists
+  // (registration, Action 2, brings the first identity).
+  //
+  // NOTE (multi-agent, Action 2+): per-agent directory operations under distinct
+  // identities are out of keystone scope. This establishes the directory door.
+  const getAuthIdentity = (): SignalingAuthIdentity | null => {
+    const primary = loadedAgents[0];
+    if (!primary) return null;
+    return { keyProvider: primary.keyProvider, pubkeyHex: primary.pubkey };
+  };
+
+  // Production builds signalingConnect from the bootstrap resolver + agent identity.
+  // Tests inject signalingConnect directly (takes precedence). Neither → defaultConnect
+  // (DAEMON-001 backward-compat). challengeVerifier is left to the caller: when absent,
+  // step-6 directory verification is skipped — the M6 path that connected and ran the
+  // full DKG/seal pipeline.
+  const resolvedConnect: () => Promise<ConnectResult> =
+    signalingConnect ??
+    (directoryEndpointResolver
+      ? createSignalingConnect({
+          getDirectoryEndpoint: directoryEndpointResolver,
+          getAuthIdentity,
+          logger,
+          challengeVerifier,
+          getManifestVersion: () => verifiedManifestVersion,
+        })
+      : defaultConnect);
+
   const signalingManager = new SignalingManager({
-    connect: (signalingConnect ?? defaultConnect) as () => Promise<ConnectResult>,
+    connect: resolvedConnect,
     logger,
     challengeVerifier,
   });

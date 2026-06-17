@@ -13,6 +13,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { startDaemon } from "../daemon.js";
+import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import type { Logger } from "../types.js";
 
 const MAX_CONNECTIONS = 16;
@@ -43,6 +44,14 @@ const lockFilePath = join(celloDir, "daemon.lock");
 const version = process.env.CELLO_VERSION || "0.0.1";
 
 async function main(): Promise<void> {
+  // M7 Keystone (Part 1): give the daemon its door to the directory. The resolver
+  // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
+  // proven M6 path); startDaemon builds the real signalingConnect from it + the
+  // primary agent identity. challengeVerifier is intentionally NOT supplied here, so
+  // step-6 directory verification is skipped — the M6 backward-compat path. The
+  // consortium-manifest hardening layers on later (opt-in).
+  const directoryEndpointResolver = createDirectoryEndpointResolver({ logger });
+
   const handle = await startDaemon({
     celloDir,
     socketPath,
@@ -50,6 +59,7 @@ async function main(): Promise<void> {
     maxConnections: MAX_CONNECTIONS,
     version,
     logger,
+    directoryEndpointResolver,
   });
 
   const shutdown = async (signal: string): Promise<void> => {
