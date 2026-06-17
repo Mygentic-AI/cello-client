@@ -1077,6 +1077,11 @@ export class SealManager {
     session.frost_signature = frostSig;
     session.signer_pubkey = signerPubkey;
     session.seal_type = "frost";
+    // M7-SESSION-004 (review finding #3): a deferred seal that completes via
+    // session_frost_sealed must end with the SAME receipt-not-assent legibility as a
+    // live push. Apply it here (no-op if the frame carries no legibility) so the
+    // bilateral-fallback → directory-completes path does not strand the certificate.
+    this.#applyLegibility(sessionIdHex, frame, session);
     // CRIT-1: persist sealed state
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
   }
