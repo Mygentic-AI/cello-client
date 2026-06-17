@@ -67,14 +67,17 @@
 // The engines field in package.json is set to ">=24" specifically because of this
 // dependency — do not lower the engine floor without replacing this import.
 import { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { decode } from "cbor-x";
+import { decode, Encoder } from "cbor-x";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
-import type { CelloNode } from "@cello-protocol/transport";
+import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
+import { CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
+
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -100,6 +103,19 @@ interface ActiveSessionEntry {
   counterpartyPubkey: string;
   gater: SessionConnectionGater;
   correlationId: string;
+  /**
+   * DAEMON-004: the counterparty's SESSION-layer Peer ID — the dial target for
+   * the direct content stream (/cello/content/1.0.0). Set when the node is
+   * created (outbound: the gater-allowed peer) or accepted (inbound: initiator).
+   */
+  counterpartySessionPeerId: string;
+}
+
+/** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
+interface ReceivedContentEntry {
+  contentHex: string;
+  senderPubkey: string;
+  sequenceNumber: number;
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -118,6 +134,13 @@ export class SessionNodeManager {
   #activeNodes = new Map<string, ActiveSessionEntry>();
   #standingReceiver: { node: CelloNode; gater: SessionConnectionGater } | null = null;
   #standingReceiverReady = false;
+  // DAEMON-004: lazily-loaded in-memory cache of each session's daemon-owned
+  // Merkle tree. The authoritative store is the session_tree_leaves table —
+  // the cache is rebuilt from it on first access (so it survives a restart).
+  #trees = new Map<string, SessionTree>();
+  // DAEMON-004: per-session FIFO buffer of verified received content awaiting
+  // cello_receive. Populated by ingestReceivedContent / the content stream handler.
+  #receivedContent = new Map<string, ReceivedContentEntry[]>();
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -192,6 +215,22 @@ export class SessionNodeManager {
         merkle_root TEXT NOT NULL,
         nonce TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      )
+    `);
+
+    // DAEMON-004 (AC-007 / SI-001): the daemon-owned per-session Merkle tree,
+    // persisted as an ordered list of leaf hashes. The (session_id, leaf_index)
+    // primary key enforces append-order uniqueness; a fresh daemon reconstructs
+    // each tree from these rows so the transcript survives a restart. Querying
+    // by session_id ORDER BY leaf_index is the only read pattern.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS session_tree_leaves (
+        session_id TEXT NOT NULL,
+        leaf_index INTEGER NOT NULL,
+        leaf_kind TEXT NOT NULL,
+        leaf_hash_hex TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_id, leaf_index)
       )
     `);
 
@@ -348,7 +387,12 @@ export class SessionNodeManager {
       counterpartyPubkey,
       gater,
       correlationId,
+      counterpartySessionPeerId: counterpartyPeerId,
     });
+
+    // DAEMON-004: register the content stream handler so inbound content_frames
+    // are cross-checked, appended to the daemon-owned tree, and buffered.
+    this.#registerContentHandler(sessionId, node, counterpartyPubkey);
 
     return { ok: true, peerId, addrs };
   }
@@ -422,7 +466,11 @@ export class SessionNodeManager {
       counterpartyPubkey,
       gater,
       correlationId,
+      counterpartySessionPeerId: initiatorPeerId,
     });
+
+    // DAEMON-004: register the content stream handler for the inbound session.
+    this.#registerContentHandler(sessionId, node, counterpartyPubkey);
 
     // Immediately spin up a replacement (async — do NOT await, AC-003)
     this.#createStandingReceiverWithRetry(correlationId);
@@ -754,6 +802,213 @@ export class SessionNodeManager {
       .prepare("SELECT * FROM sessions WHERE session_id = ?")
       .get(sessionId) as unknown as SessionRecord | undefined;
     return row ?? null;
+  }
+
+  // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
+
+  /**
+   * Return the daemon-owned Merkle tree for a session, loading it from SQLite
+   * on first access (so it survives a restart — AC-007). Never returns null;
+   * an unknown session yields an empty tree.
+   */
+  getSessionTree(sessionId: string): SessionTree {
+    const cached = this.#trees.get(sessionId);
+    if (cached) return cached;
+    const tree = this.#loadTreeFromDb(sessionId);
+    this.#trees.set(sessionId, tree);
+    return tree;
+  }
+
+  /** Current daemon-owned tree root for a session, as hex. */
+  getSessionTreeRootHex(sessionId: string): string {
+    return this.getSessionTree(sessionId).rootHex();
+  }
+
+  /**
+   * Append a leaf (by its 32-byte leaf-hash hex) to the daemon-owned tree,
+   * persist it, advance the root, and fire session.tree.appended.
+   *
+   * @returns the new leaf index and the recomputed root hex.
+   */
+  appendSessionLeaf(
+    sessionId: string,
+    kind: SessionTreeLeafKind,
+    leafHashHex: string,
+    correlationId?: string,
+  ): { leafIndex: number; newRootHex: string } {
+    const tree = this.getSessionTree(sessionId);
+    const { leafIndex, newRootHex } = tree.appendLeafHash(kind, leafHashHex);
+
+    if (this.#db) {
+      try {
+        this.#db
+          .prepare(
+            `INSERT INTO session_tree_leaves
+             (session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(sessionId, leafIndex, kind, leafHashHex, Date.now());
+      } catch (err: unknown) {
+        // A persist failure must be visible, not swallowed: the in-memory tree
+        // has advanced but the durable transcript has not, which would diverge
+        // on restart. Surface it loudly.
+        this.#logger.error("session.tree.persist.failed", {
+          sessionId,
+          leafIndex,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      }
+    }
+
+    this.#logger.info("session.tree.appended", {
+      sessionId,
+      leafIndex,
+      newRootHex,
+      correlationId,
+    });
+    return { leafIndex, newRootHex };
+  }
+
+  /**
+   * DAEMON-004: send content over the session node's direct P2P content stream.
+   * On a dead/missing stream this returns a NAMED, diagnosable failure — never a
+   * silent success and never a desync (closing the old silent
+   * `void sendContentFrame(...)` catch at session-manager.ts:621-623).
+   *
+   * The relay hash-submit round-trip that assigns the global sequence number is
+   * the live-session path (AC-001 under CELLO_E2E_LIVE) and is layered by MSG-001.
+   */
+  async sendContent(
+    sessionId: string,
+    content: Uint8Array,
+    contentHash: Uint8Array,
+  ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) {
+      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
+    }
+    try {
+      const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      const frame = CBOR_ENC.encode({
+        type: "content_frame",
+        session_id: sessionId,
+        content_hash: contentHash,
+        content_bytes: content,
+      }) as Uint8Array;
+      stream.send(lp.encode.single(frame));
+      try { await stream.close(); } catch { /* best-effort close */ }
+      return { ok: true };
+    } catch (err: unknown) {
+      // error.message extracted — never [object Object].
+      return {
+        ok: false,
+        reason: "session_stream_unavailable",
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  /**
+   * DAEMON-004: cross-check received content against its hash, append the
+   * verified leaf to the daemon-owned tree, and buffer it for cello_receive.
+   * A hash MISMATCH is genuine tamper — rejected without append or buffer.
+   *
+   * @returns the appended leaf index (as sequenceNumber) on success.
+   */
+  ingestReceivedContent(
+    sessionId: string,
+    content: Uint8Array,
+    contentHash: Uint8Array,
+    correlationId?: string,
+  ): { ok: true; leafIndex: number; sequenceNumber: number } | { ok: false; reason: string } {
+    const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    if (Buffer.from(computed).toString("hex") !== contentHashHex) {
+      this.#logger.warn("session.content.cross_check.failed", {
+        sessionId,
+        reason: "content_hash_mismatch",
+        correlationId,
+      });
+      return { ok: false, reason: "content_hash_mismatch" };
+    }
+
+    const entry = this.#activeNodes.get(sessionId);
+    const senderPubkey = entry?.counterpartyPubkey
+      ?? this.getSessionRecord(sessionId)?.counterparty_pubkey
+      ?? "unknown";
+
+    const { leafIndex, newRootHex } = this.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
+
+    let buf = this.#receivedContent.get(sessionId);
+    if (!buf) { buf = []; this.#receivedContent.set(sessionId, buf); }
+    buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
+
+    this.#logger.info("session.content.received", {
+      sessionId,
+      senderPubkey,
+      contentHashHex,
+      sequenceNumber: leafIndex,
+      correlationId,
+    });
+    void newRootHex;
+    return { ok: true, leafIndex, sequenceNumber: leafIndex };
+  }
+
+  /** DAEMON-004: pop the oldest verified received content for cello_receive. */
+  takeReceivedContent(sessionId: string): ReceivedContentEntry | null {
+    const buf = this.#receivedContent.get(sessionId);
+    if (!buf || buf.length === 0) return null;
+    return buf.shift() ?? null;
+  }
+
+  #loadTreeFromDb(sessionId: string): SessionTree {
+    if (!this.#db) return SessionTree.empty();
+    const rows = this.#db
+      .prepare(
+        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE session_id = ? ORDER BY leaf_index ASC",
+      )
+      .all(sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
+    return SessionTree.fromLeaves(
+      rows.map((r) => ({ kind: r.leaf_kind === "ctrl" ? "ctrl" : "msg", hashHex: r.leaf_hash_hex })),
+    );
+  }
+
+  /**
+   * DAEMON-004: register the /cello/content/1.0.0 handler on a session node so
+   * inbound content_frames are decoded, cross-checked, and ingested.
+   */
+  #registerContentHandler(sessionId: string, node: CelloNode, _counterpartyPubkey: string): void {
+    void node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
+      void this.#handleContentStream(sessionId, stream);
+    }).catch((err: unknown) => {
+      this.#logger.error("session.content.handler.register.failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  async #handleContentStream(sessionId: string, stream: Stream): Promise<void> {
+    const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+    try {
+      const result = await iter.next();
+      if (result.done || result.value === undefined) return;
+      const bytes = result.value instanceof Uint8Array ? result.value
+        : Buffer.isBuffer(result.value) ? new Uint8Array(result.value as Buffer)
+        : (result.value as { slice(): Uint8Array }).slice();
+      const frame = decode(bytes) as Record<string, unknown>;
+      if (frame["type"] !== "content_frame") return;
+      const contentBytes = frame["content_bytes"];
+      const contentHash = frame["content_hash"];
+      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
+      this.ingestReceivedContent(sessionId, contentBytes, contentHash);
+    } catch (err: unknown) {
+      this.#logger.warn("session.content.stream.read.failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
