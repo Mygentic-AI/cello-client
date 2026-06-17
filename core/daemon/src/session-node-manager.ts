@@ -90,6 +90,12 @@ export interface ISessionNodeFactory {
 export interface SessionNodeConfig {
   sessionId: string;
   connectionGater?: SessionConnectionGater;
+  /**
+   * CELLO-M7-TRANSPORT-001: role of the node, forwarded to createNode to tune the
+   * libp2p service set (dcutr is included for 'session' dialers, omitted for the
+   * 'standing_receiver'). AutoNAT is present for both.
+   */
+  nodeType?: "session" | "standing_receiver";
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -308,7 +314,7 @@ export class SessionNodeManager {
 
     let node: CelloNode;
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater });
+      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
       await node.start();
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -865,7 +871,7 @@ export class SessionNodeManager {
 
     let node: CelloNode;
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater });
+      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
       await node.start();
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : String(err);

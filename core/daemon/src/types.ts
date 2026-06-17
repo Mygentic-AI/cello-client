@@ -12,7 +12,9 @@ import type {
   IManifestPollScheduler,
   IDirectoryChallengeVerifier,
   ConnectResult,
+  IAutoNatService,
 } from "@cello-protocol/transport";
+import type { TransportDialer } from "./transport-selector.js";
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
@@ -178,6 +180,19 @@ export interface DaemonConfig {
    * Production: performs the full 7-step directory handshake.
    */
   signalingConnect?: () => Promise<ConnectResult>;
+  /**
+   * CELLO-M7-TRANSPORT-001: low-level dialer backing the transport selector in
+   * production environments (dev/staging/production). Wraps a CelloNode (direct +
+   * relay circuit dial) and the daemon relay registry. Required for production
+   * CELLO_ENV; for 'local'/'test' the composition root uses an in-process stub.
+   */
+  transportDialer?: TransportDialer;
+  /**
+   * CELLO-M7-TRANSPORT-001: AutoNAT service adapter backing dialability detection
+   * in production environments. Wraps the standing-receiver node's libp2p AutoNAT
+   * observable. For 'local'/'test' the composition root uses a stub (dialable=false).
+   */
+  autoNatService?: IAutoNatService;
 }
 
 // --- Session node types ---

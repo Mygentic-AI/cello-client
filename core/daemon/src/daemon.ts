@@ -48,6 +48,14 @@ import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
+import {
+  resolveCelloEnv,
+  createTransportSelector,
+  createAutoNatService,
+  isProductionVariant,
+} from "./transport-composition.js";
+import type { ITransportSelector } from "./transport-selector.js";
+import type { IAutoNatService } from "@cello-protocol/transport";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -109,6 +117,17 @@ export interface DaemonHandle {
    * Not part of the production API surface.
    */
   getSessionNodeManager(): SessionNodeManager;
+  /**
+   * CELLO-M7-TRANSPORT-001 (AC-010): exposes the composition-root transport
+   * selector so integration tests can confirm the adapter is wired (not dead
+   * code) and exercise the selection path without "adapter not wired".
+   */
+  getTransportSelector(): ITransportSelector;
+  /**
+   * CELLO-M7-TRANSPORT-001 (AC-010): exposes the composition-root AutoNAT service
+   * adapter (stub default dialable=false in local/test).
+   */
+  getAutoNatService(): IAutoNatService;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -127,6 +146,9 @@ class ProductionSessionNodeFactory implements ISessionNodeFactory {
       keyProvider: SESSION_NODE_KEY_STUB,
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
       connectionGater: config.connectionGater,
+      // CELLO-M7-TRANSPORT-001: forward the role so AutoNAT/dcutr are configured
+      // correctly (session nodes get dcutr; standing receivers do not).
+      nodeType: config.nodeType,
     });
   }
 }
@@ -138,6 +160,25 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     manifestVersionStore, manifestPollScheduler,
     signalingConnect, challengeVerifier,
   } = config;
+
+  // CELLO-M7-TRANSPORT-001: composition-root selection of the transport adapters.
+  // Driven by CELLO_ENV; fails fast at startup (here, not at first session) when a
+  // production environment is missing required config (AC-010).
+  const celloEnv = resolveCelloEnv(process.env["CELLO_ENV"]);
+  const transportSelector = createTransportSelector({
+    env: celloEnv,
+    logger,
+    transportDialer: config.transportDialer,
+  });
+  const autoNatService = createAutoNatService({
+    env: celloEnv,
+    autoNatService: config.autoNatService,
+  });
+  logger.info("transport.adapters.wired", {
+    env: celloEnv,
+    selector: isProductionVariant(celloEnv) ? "real" : "stub",
+    autonat: isProductionVariant(celloEnv) ? "real" : "stub",
+  });
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
   //
@@ -1213,5 +1254,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return sessionNodeManager;
   }
 
-  return { stop, getStatus, getSessionNodeManager };
+  function getTransportSelector(): ITransportSelector {
+    return transportSelector;
+  }
+
+  function getAutoNatService(): IAutoNatService {
+    return autoNatService;
+  }
+
+  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService };
 }
