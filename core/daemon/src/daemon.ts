@@ -539,6 +539,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // with the directory: ML-DSA keygen → register_request → FROST DKG → register_success,
   // persisting the ML-DSA keypair, FROST share, registration state, and agent→user link.
   // Always invoked with a pre-authorization ticket from the CELLO Operations Agent.
+  // Single-flight guard (M1): the directory's registration reply frames
+  // (dkg_ready / register_success / register_error) carry NO agent identifier, so
+  // two concurrent registrations over the one shared directory signaling stream
+  // would each arm a resolver and both receive the same reply — cross-wiring the
+  // ceremonies. Serialize registration daemon-wide (it is a rare, once-per-agent,
+  // human-initiated operation). This is the registration analogue of the
+  // sealInterruptedInProgress guard, but global rather than per-key because the
+  // frames are not agent-tagged.
+  let registrationInProgress = false;
+
   const registrationGuidance = (reason: string): string => {
     switch (reason) {
       case "already_registered":
@@ -571,41 +581,69 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!directoryEndpointResolver) {
       return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };
     }
-
-    // Resolve the directory endpoint once for this registration (the context's
-    // getDirectoryEndpoint is synchronous; the daemon's resolver is async with a
-    // last-known-good fallback). The endpoint is stable for the duration of one
-    // registration — if it changed mid-flow the DKG streams would break anyway.
-    const ep = await directoryEndpointResolver();
-    if (!ep || !ep.multiaddr) {
-      // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
-      // multiaddr is required (DirectoryEndpoint.multiaddr is optional for the
-      // already-connected signaling case, but registration needs to open streams).
-      return { ok: false, reason: "directory_unreachable", guidance: "Could not resolve a dialable directory bootstrap endpoint (GET /bootstrap). Check CELLO_DIRECTORY_URL and network connectivity, then retry." };
+    // M1: claim the single-flight slot synchronously (no await between the check
+    // and the set) so two concurrent calls cannot both proceed.
+    if (registrationInProgress) {
+      return { ok: false, reason: "registration_already_in_progress", guidance: "Another agent registration is already in progress on this daemon. Registration runs one at a time because the directory's reply frames are not agent-tagged. Wait for it to finish (check the daemon logs for registration.succeeded/failed), then retry." };
     }
-    const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
-
-    const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
-    const ctx = new DaemonRegistrationContext({
-      signaling: signalingManager,
-      getDirectoryNode,
-      getDirectoryEndpoint: () => directoryEndpoint,
-      keyProvider,
-      persistence,
-      logger,
-    });
+    registrationInProgress = true;
     try {
-      const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
-      if ("error" in result) {
-        logger.warn("registration.failed", { agentName: name, reason: result.error });
-        return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
+      // Resolve the directory endpoint once for this registration (the context's
+      // getDirectoryEndpoint is synchronous; the daemon's resolver is async with a
+      // last-known-good fallback). The endpoint is stable for the duration of one
+      // registration — if it changed mid-flow the DKG streams would break anyway.
+      const ep = await directoryEndpointResolver();
+      if (!ep || !ep.multiaddr) {
+        // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
+        // multiaddr is required (DirectoryEndpoint.multiaddr is optional for the
+        // already-connected signaling case, but registration needs to open streams).
+        return { ok: false, reason: "directory_unreachable", guidance: "Could not resolve a dialable directory bootstrap endpoint (GET /bootstrap). Check CELLO_DIRECTORY_URL and network connectivity, then retry." };
       }
-      // Capture-now-or-lose-it: persist the agent→user link (using it is future trust-layer work).
-      await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
-      logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
-      return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
+      const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
+
+      const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
+      const ctx = new DaemonRegistrationContext({
+        signaling: signalingManager,
+        getDirectoryNode,
+        getDirectoryEndpoint: () => directoryEndpoint,
+        keyProvider,
+        persistence,
+        logger,
+      });
+      try {
+        const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
+        if ("error" in result) {
+          logger.warn("registration.failed", { agentName: name, reason: result.error });
+          return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
+        }
+        // Capture-now-or-lose-it: persist the agent→user link (using it is future
+        // trust-layer work). L1: the agent is already registered at this point —
+        // a link-write failure must NOT be reported as a registration failure.
+        // Surface it as a non-fatal warning so the operator knows the link wasn't
+        // captured (re-registering with the same token re-attempts it).
+        try {
+          await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
+          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+          return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
+        } catch (linkErr: unknown) {
+          logger.warn("registration.user_link.capture_failed", {
+            agentName: name,
+            agentId: result.agent_id,
+            error: linkErr instanceof Error ? linkErr.message : String(linkErr),
+          });
+          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+          return {
+            ok: true,
+            agent_id: result.agent_id,
+            primary_pubkey: result.primary_pubkey,
+            warning: "agent_user_link_not_captured",
+          };
+        }
+      } finally {
+        ctx.dispose();
+      }
     } finally {
-      ctx.dispose();
+      registrationInProgress = false;
     }
   });
 

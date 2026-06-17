@@ -28,6 +28,7 @@ describe("cli commands", () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-cli-test-"));
     logEvents = [];
     logger = {
+      debug(event, context) { logEvents.push({ level: "debug", event, context }); },
       info(event, context) { logEvents.push({ level: "info", event, context }); },
       warn(event, context) { logEvents.push({ level: "warn", event, context }); },
       error(event, context) { logEvents.push({ level: "error", event, context }); },

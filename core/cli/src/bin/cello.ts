@@ -59,8 +59,16 @@ async function main(): Promise<void> {
       // cello register <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN
       // so it need not appear in shell history). Optional phone stub follows.
       const agent = process.argv[3] ?? "";
-      const preAuthToken = process.argv[4] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
+      const tokenArg = process.argv[4];
+      const preAuthToken = tokenArg ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = process.argv[5] ?? "";
+      // L3: a token passed as an argv positional is visible in the process list
+      // (ps / /proc). Warn and steer to the env var, which is the safe path.
+      if (tokenArg) {
+        process.stderr.write(
+          "Warning: passing the pre-auth token as a command-line argument exposes it in the process list. Prefer the CELLO_PREAUTH_TOKEN environment variable.\n",
+        );
+      }
       result = await register(celloDir, agent, preAuthToken, phoneStub);
       break;
     }
