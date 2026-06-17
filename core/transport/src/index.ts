@@ -18,6 +18,14 @@ export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROT
 // CELLO-M7-TRANSPORT-001: AutoNAT dialability adapter + stub
 export type { IAutoNatService, Dialability, Unsubscribe } from "./autonat.js";
 export { LocalAutoNatStub, DEFAULT_DIALABILITY } from "./autonat.js";
+// CELLO-M7-TRANSPORT-001: real IAutoNatService over a live CelloNode (emits the
+// transport.autonat.result / transport.autonat.unavailable observability events).
+export { NodeAutoNatService } from "./autonat-service.js";
+export type {
+  AutoNatLogger,
+  AutoNatNodeType,
+  NodeAutoNatServiceOptions,
+} from "./autonat-service.js";
 
 // M7-MANIFEST-002: manifest interfaces
 export type {

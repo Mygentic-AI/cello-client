@@ -167,6 +167,28 @@ describe("dialability observable: loopback node defaults to not-dialable", () =>
     expect(node.getDialability()).toEqual(DEFAULT_DIALABILITY);
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
   });
+
+  // ─── I5: a CONFIGURED public address is NOT proof of dialability ────────────
+  // A node that is bound to / announces a public IP but is actually behind a
+  // firewall must NOT report dialable:true. Dialability comes from AutoNAT
+  // dial-back confirmation (an observed address), never from configuration.
+  it("a node announcing a configured public IP still reports NOT dialable (no AutoNAT confirmation)", async () => {
+    const node = await createNode({
+      keyProvider: keyProvider(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      // Configured public announce address — but nothing confirmed it via dial-back.
+      announceAddresses: ["/ip4/203.0.113.250/tcp/4001"],
+      nodeType: "standing_receiver",
+    });
+    await node.start();
+    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
+
+    const d = node.getDialability();
+    // The configured public host is excluded from the dialability derivation, so a
+    // firewalled-but-public-announced node correctly reports not dialable.
+    expect(d.dialable).toBe(false);
+    expect(d.publicAddr).toBeNull();
+  });
 });
 
 // ─── LocalAutoNatStub: configurable values + observe ─────────────────────────
@@ -222,10 +244,35 @@ describe("SI-002: AutoNAT probers are exclusively the directory nodes (no rogue 
 const liveOnly = describe.skipIf(!process.env["CELLO_E2E_LIVE"]);
 
 liveOnly("AC-003: real AutoNAT probe confirms dialability (live)", () => {
+  let scope = createTestScope();
+  beforeEach(() => { scope = createTestScope(); });
+  afterEach(() => scope.run(async () => {}));
+
   it("a publicly-reachable standing receiver reports dialable:true with a non-null publicAddr", async () => {
-    // Requires a real daemon with a real directory connection performing
-    // dial-back. In-process stubs cannot satisfy this AC.
-    // (Body intentionally exercised only under CELLO_E2E_LIVE.)
-    expect(process.env["CELLO_E2E_LIVE"]).toBeTruthy();
+    // CELLO_E2E_LIVE: the host must be publicly reachable (e.g. a LAN/public IP
+    // where AutoNAT dial-back from directory-node probers succeeds). We bind a
+    // real (non-loopback) interface so libp2p can observe and confirm an external
+    // address. In-process stubs cannot satisfy this AC.
+    const node = await createNode({
+      keyProvider: keyProvider(),
+      // Bind all interfaces so a real external address can be observed/confirmed.
+      listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
+      nodeType: "standing_receiver",
+    });
+    await node.start();
+    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
+
+    // Wait for the AutoNAT probe cycle to confirm an external address.
+    const dialable = await new Promise<Dialability>((resolve) => {
+      const unsub = node.onDialabilityChange((d) => {
+        if (d.dialable) { unsub(); resolve(d); }
+      });
+      // Fallback: resolve with the current value after the probe window.
+      setTimeout(() => { unsub(); resolve(node.getDialability()); }, 30_000);
+    });
+
+    expect(dialable.dialable).toBe(true);
+    expect(dialable.publicAddr).not.toBeNull();
+    expect(typeof dialable.publicAddr).toBe("string");
   });
 });

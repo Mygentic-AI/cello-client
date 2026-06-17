@@ -130,12 +130,41 @@ function isPubliclyDialable(addr: string): boolean {
   return false; // no IP transport component — not directly dialable
 }
 
+/** Extract the IPv4/IPv6 host component of a multiaddr string, or null. */
+function extractHost(addr: string): string | null {
+  const ip4 = addr.match(/\/ip4\/([0-9.]+)/);
+  if (ip4) return ip4[1]!;
+  const ip6 = addr.match(/\/ip6\/([0-9a-fA-F:]+)/);
+  if (ip6) return ip6[1]!.toLowerCase();
+  return null;
+}
+
 /**
- * Derive dialability from the node's current self-reported multiaddrs. Returns
- * the first publicly-dialable multiaddr (if any) as publicAddr.
+ * Derive dialability from the node's current self-reported multiaddrs.
+ *
+ * CELLO-M7-TRANSPORT-001 (review I5): dialability MUST reflect AutoNAT dial-back
+ * confirmation, not mere configuration. A node configured to listen on / announce
+ * a public IP that is actually behind a firewall is NOT dialable — advertising
+ * that unreachable direct address would deny service. We therefore exclude any
+ * address whose host matches the node's own configured listen/announce hosts:
+ * those are configured, not dial-back-confirmed. Only an address that appeared
+ * dynamically (an AutoNAT-confirmed `observed` address — its host is not one we
+ * configured) counts toward dialable:true.
+ *
+ * CELLO session and standing-receiver nodes listen on loopback
+ * (/ip4/127.0.0.1/tcp/0), so in practice the only public address that can appear
+ * in getMultiaddrs() is one AutoNAT confirmed — this exclusion simply makes the
+ * invariant explicit and robust for any future public-bound node.
  */
-function deriveDialability(addrs: string[]): Dialability {
-  const publicAddr = addrs.find((a) => isPubliclyDialable(a)) ?? null;
+function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>): Dialability {
+  const publicAddr =
+    addrs.find((a) => {
+      if (!isPubliclyDialable(a)) return false;
+      const host = extractHost(a);
+      // A public address on a host we explicitly configured is not proof of
+      // external reachability — exclude it (AutoNAT must confirm an observed addr).
+      return host !== null && !configuredHosts.has(host);
+    }) ?? null;
   return { dialable: publicAddr !== null, publicAddr };
 }
 
@@ -148,10 +177,15 @@ class CelloNodeImpl implements CelloNode {
   // probe cycle (surfaced by libp2p as a 'self:peer:update' event).
   #dialability: Dialability = { ...DEFAULT_DIALABILITY };
   readonly #dialabilityListeners = new Set<(d: Dialability) => void>();
+  // CELLO-M7-TRANSPORT-001 (I5): hosts this node was explicitly configured to
+  // listen on / announce. These are NOT dial-back-confirmed, so they are excluded
+  // from dialability — only AutoNAT-confirmed observed addresses count.
+  readonly #configuredHosts: ReadonlySet<string>;
 
-  constructor(libp2p: Libp2p, keyProvider: KeyProvider) {
+  constructor(libp2p: Libp2p, keyProvider: KeyProvider, configuredHosts: ReadonlySet<string>) {
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
+    this.#configuredHosts = configuredHosts;
     // Recompute dialability whenever libp2p updates its self-reported addresses.
     // AutoNAT verification of an external address triggers a 'self:peer:update'.
     this.#libp2p.addEventListener("self:peer:update", () => {
@@ -160,7 +194,7 @@ class CelloNodeImpl implements CelloNode {
   }
 
   #recomputeDialability(): void {
-    const next = deriveDialability(this.listenAddresses());
+    const next = deriveDialability(this.listenAddresses(), this.#configuredHosts);
     if (
       next.dialable === this.#dialability.dialable &&
       next.publicAddr === this.#dialability.publicAddr
@@ -423,6 +457,15 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
   });
 
+  // CELLO-M7-TRANSPORT-001 (I5): record the hosts this node was configured to
+  // listen on / announce. deriveDialability excludes these so dialability reflects
+  // AutoNAT dial-back confirmation, not configuration.
+  const configuredHosts = new Set<string>();
+  for (const a of [...opts.listenAddresses, ...(opts.announceAddresses ?? [])]) {
+    const host = extractHost(a);
+    if (host !== null) configuredHosts.add(host);
+  }
+
   // Return node in STOPPED state — caller must call start()
-  return new CelloNodeImpl(libp2p, opts.keyProvider);
+  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts);
 }
