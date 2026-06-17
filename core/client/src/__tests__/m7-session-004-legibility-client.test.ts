@@ -35,6 +35,8 @@ import {
   CERTIFICATE_FRONTIER_UNVERIFIABLE,
 } from "../seal-legibility-client.js";
 import { deriveDbKey } from "../db-key-derivation.js";
+import { loadClientStartupState, type StartupContext } from "../client-startup.js";
+import type { SessionRecord } from "../types.js";
 
 const ENC = new Encoder({ tagUint8Array: false });
 
@@ -87,6 +89,50 @@ function makeLegibility(aPubkey: Uint8Array, bPubkey: Uint8Array): SealLegibilit
     ],
     final_message: { sender_pubkey: aPubkey, seq: 7, answered: false },
   };
+}
+
+/**
+ * Build a minimal StartupContext that drives the REAL `loadClientStartupState`
+ * reconstruction path and captures the SessionRecords it rebuilds via `setSession`.
+ * Every method the session-loading section (§6) does not touch is a no-op; this test
+ * persists only a session + agent row, so the FROST/ML-DSA/registration branches are skipped.
+ */
+function makeCapturingStartupContext(opts: {
+  persistence: InstanceType<typeof ClientStatePersistence>;
+  logger: ReturnType<typeof makeSpyLogger>;
+}): { ctx: StartupContext; sessions: Map<string, SessionRecord> } {
+  const sessions = new Map<string, SessionRecord>();
+  const noop = () => {};
+  const ctx: StartupContext = {
+    node: {} as StartupContext["node"],
+    logger: opts.logger,
+    persistence: opts.persistence,
+    getDirectoryEndpoint: () => null,
+    getThresholdSigner: () => undefined,
+    setThresholdSigner: noop,
+    getMyPubkeyHex: () => null,
+    setMyPubkeyHex: noop,
+    setRegistrationState: noop,
+    setMlDsaProvider: noop,
+    addConnection: noop,
+    addConnectionByPeer: noop,
+    addProfileUncheckedPeer: noop,
+    setConnectionPolicy: noop,
+    addPeer: noop,
+    hasPeer: () => false,
+    setEndorsements: noop,
+    setAttestations: noop,
+    setLoadedPendingHashes: noop,
+    getSessionById: (id) => sessions.get(id),
+    setSession: (id, record) => { sessions.set(id, record); },
+    initSessionMessageQueue: noop,
+    getMyPrimaryPubkey: () => null,
+    setMyPrimaryPubkey: noop,
+    restoreDecidedRequest: noop,
+    restorePendingInboundRequest: noop,
+    restoreReviewQueueItem: noop,
+  };
+  return { ctx, sessions };
 }
 
 // ─── parseLegibility (pure) ────────────────────────────────────────────────────
@@ -290,6 +336,25 @@ describeWithSQLCipher("M7-SESSION-004 (client): AC-005 legibility persists and r
     )!;
     expect(aEntry.content_frontier_seq).toBe(6);
     expect(aEntry.content_frontier_seq).toBe(row.last_seen_seq);
+
+    // Drive the REAL production reconstruction path (loadClientStartupState §6) rather than
+    // re-deriving CBOR decode → parseLegibility by hand: the in-memory SessionRecord the
+    // facade actually uses after restart must carry the legibility object intact.
+    const { ctx, sessions } = makeCapturingStartupContext({ persistence: persistence2, logger });
+    await loadClientStartupState(ctx);
+    const restored = sessions.get(sessionIdHex);
+    expect(restored).toBeDefined();
+    expect(restored!.counterparty_ack_frontier).toBe(4);
+    expect(restored!.legibility).toBeDefined();
+    expect(restored!.legibility!.attests).toBe("receipt");
+    expect(restored!.legibility!.implies_assent).toBe(false);
+    expect(restored!.legibility!.disclaimer).toBe(SEAL_RECEIPT_DISCLAIMER);
+    expect(restored!.legibility!.final_message.answered).toBe(false);
+    // The reconstructed in-use record passes the SI-002 self-verification too.
+    expect(findUnverifiableFrontier(restored!.legibility!, new Map<string, number>([
+      [agentPubkey, restored!.last_seen_seq],
+      [Buffer.from(bPubkey).toString("hex"), restored!.counterparty_ack_frontier],
+    ]))).toBeNull();
 
     await store2.close();
   });
