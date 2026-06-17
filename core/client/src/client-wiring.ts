@@ -205,6 +205,21 @@ export function buildSealContext(f: ClientWiringSurface): SealContext {
     waitForOwnEcho: (id, seq) => f.sessionManager.waitForOwnEcho(id, seq),
     performGapFillReconciliation: (id, from, to, corrId) =>
       f.relayStreamManager.performGapFillReconciliation(id, from, to, corrId),
+    // M7-SESSION-003: the session-path liveness authority for the unilateral-seal
+    // gate. transport_mode (WIRE-001) is the sole disambiguator — never inferred
+    // from address format. 'relay' → query the relay; 'direct' (or undefined) →
+    // the local per-session session-node flag. The directory connection is NEVER
+    // consulted (SI-002).
+    getCounterpartyLivenessVerdict: async (session, _correlationId) => {
+      if (session.transport_mode === "relay") {
+        return f.relayStreamManager.queryRelayLiveness(
+          Buffer.from(session.session_id).toString("hex"),
+          session.session_id,
+          session.counterparty_pubkey,
+        );
+      }
+      return { liveness: session.counterparty_liveness ?? "unknown", authority: "session_node" };
+    },
   };
 }
 

@@ -27,10 +27,12 @@ import type { LeafInput } from "@cello-protocol/crypto";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import type { Structure2 } from "@cello-protocol/protocol-types";
+import { encodeSessionLivenessQuery, decodeSessionLivenessResponse } from "@cello-protocol/protocol-types";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
 import type { SessionRecord, ReceivedMessage } from "./types.js";
+import type { LivenessVerdict } from "./session-liveness.js";
 import type { AgentHashQueue } from "./agent-hash-queue.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -173,6 +175,9 @@ export class RelayStreamManager {
   // session_id_hex → pending gap fill resolver
   readonly #pendingGapFillResolvers = new Map<string, (result: { ok: true; leaves: unknown[] } | { ok: false; reason: string }) => void>();
 
+  // M7-SESSION-003: session_id_hex → pending session_liveness_response resolver.
+  readonly #pendingLivenessResolvers = new Map<string, (liveness: "alive" | "gone" | "unknown") => void>();
+
   constructor(ctx: RelayStreamContext) {
     this.#ctx = ctx;
   }
@@ -185,6 +190,63 @@ export class RelayStreamManager {
 
   setRelayStream(sessionIdHex: string, stream: Stream): void {
     this.#relayStreams.set(sessionIdHex, stream);
+  }
+
+  /**
+   * M7-SESSION-003 AC-008/AC-013/SI-004: query the relay — the session-path
+   * liveness authority for a relay-mode session — for the counterparty's liveness.
+   * The ABSENT verdict for a relay-path session can ONLY originate from the
+   * relay's response; the initiator never manufactures it locally (SI-004). A
+   * dead/absent relay stream, a timeout, or an 'unknown' response all yield a
+   * failureReason so the gate fails SAFE to DELIVERED — never ABSENT (SI-003).
+   */
+  async queryRelayLiveness(
+    sessionIdHex: string,
+    sessionId: Uint8Array,
+    counterpartyPubkey: Uint8Array,
+  ): Promise<LivenessVerdict> {
+    const stream = this.#relayStreams.get(sessionIdHex);
+    if (!stream || stream.status !== "open") {
+      return { liveness: "unknown", authority: "relay", failureReason: "liveness_query_unreachable" };
+    }
+    const query = encodeSessionLivenessQuery({
+      type: "session_liveness_query",
+      session_id: sessionId,
+      counterparty_pubkey: counterpartyPubkey,
+    });
+    try {
+      stream.send(lp.encode.single(query));
+    } catch (err: unknown) {
+      this.#ctx.logger.debug("relay.liveness.query.send.failed", {
+        sessionId: sessionIdHex,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return { liveness: "unknown", authority: "relay", failureReason: "liveness_query_unreachable" };
+    }
+
+    const LIVENESS_QUERY_TIMEOUT_MS = 5_000;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const liveness = await Promise.race<"alive" | "gone" | "unknown" | null>([
+      new Promise<"alive" | "gone" | "unknown">((resolve) => {
+        this.#pendingLivenessResolvers.set(sessionIdHex, resolve);
+      }),
+      new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          this.#pendingLivenessResolvers.delete(sessionIdHex);
+          resolve(null);
+        }, LIVENESS_QUERY_TIMEOUT_MS);
+      }),
+    ]);
+    clearTimeout(timeoutHandle);
+
+    if (liveness === null) {
+      return { liveness: "unknown", authority: "relay", failureReason: "liveness_query_timeout" };
+    }
+    if (liveness === "unknown") {
+      // No positive observation — non-determinative for ABSENT purposes.
+      return { liveness: "unknown", authority: "relay", failureReason: "liveness_unknown" };
+    }
+    return { liveness, authority: "relay" };
   }
 
   deleteRelayStream(sessionIdHex: string): void {
@@ -321,9 +383,25 @@ export class RelayStreamManager {
             this.#pendingGapFillResolvers.delete(sessionIdHex);
             pendingReconciliation({ ok: false, reason });
           }
+        } else if (frame["type"] === "session_liveness_response") {
+          // M7-SESSION-003 AC-008: the relay's session-path liveness verdict for
+          // the unilateral-seal gate. Resolve the pending query waiter.
+          const resp = decodeSessionLivenessResponse(bytes);
+          const resolve = this.#pendingLivenessResolvers.get(sessionIdHex);
+          if (resp && resolve) {
+            this.#pendingLivenessResolvers.delete(sessionIdHex);
+            resolve(resp.liveness);
+          }
         }
       }
-    } catch { /* stream closed */ }
+    } catch (err: unknown) {
+      // Stream closed/reset — normal relay disconnect. Surface the cause at DEBUG
+      // rather than swallowing it (lateral catch audit, AC-014).
+      this.#ctx.logger.debug("relay.stream.reader.closed", {
+        sessionId: sessionIdHex,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     const wasActive = this.#relayStreams.get(sessionIdHex) === stream;
     if (wasActive) {

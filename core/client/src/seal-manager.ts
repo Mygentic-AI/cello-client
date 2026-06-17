@@ -20,6 +20,8 @@ import type { Stream } from "@libp2p/interface";
 import type { SessionRecord } from "./types.js";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
+import { livenessToAttestation } from "./session-liveness.js";
+import type { LivenessVerdict } from "./session-liveness.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -53,6 +55,20 @@ export interface SealContext {
   waitForOwnEcho(sessionIdHex: string, seqNum: number): Promise<void>;
   // Callback into RelayStreamManager
   performGapFillReconciliation(sessionIdHex: string, fromSeq: number, toSeq: number, correlationId: string): Promise<void>;
+
+  /**
+   * M7-SESSION-003: obtain the counterparty's session-path liveness verdict from
+   * the authority for this session's transport_mode (WIRE-001 — the sole
+   * disambiguator, never inferred from address format):
+   *   - 'direct' → the local per-session counterparty_liveness flag (session_node)
+   *   - 'relay'  → a session_liveness_query to the relay
+   * NEVER reads the directory connection state (SI-002). When the relay query
+   * cannot be answered the verdict carries a failureReason and liveness is forced
+   * to 'unknown' (fail-safe → DELIVERED, never ABSENT — SI-003). Optional so
+   * pre-M7 SealContext callers keep working: when absent the gate defaults to the
+   * fail-safe 'unknown' → DELIVERED.
+   */
+  getCounterpartyLivenessVerdict?(session: SessionRecord, correlationId: string): Promise<LivenessVerdict>;
 }
 
 export class SealManager {
@@ -300,6 +316,22 @@ export class SealManager {
       }
     }
 
+    // M7-SESSION-003 — THE GATE: after the directory-enforced delivery-grace floor
+    // (the directory still owns the 'too_early' timer), determine the counterparty
+    // attestation from session-path liveness. correlationId is minted here and
+    // threaded through the liveness query and the determination (AC-016).
+    const correlationId = Buffer.from(session.session_id).toString("hex") + "-" + Date.now().toString(36);
+    const verdict = await this.#determineCounterpartyVerdict(session, sessionIdHex, correlationId);
+    const counterpartyAttestation = livenessToAttestation(verdict.liveness);
+    this.#ctx.logger.info("session.seal.attestation.determined", {
+      sessionId: sessionIdHex,
+      counterpartyPubkey: Buffer.from(session.counterparty_pubkey).toString("hex"),
+      attestation: counterpartyAttestation,
+      liveness: verdict.liveness,
+      authority: verdict.authority,
+      correlationId,
+    });
+
     const localRoot = this.#computeLocalRoot(session) ?? session.genesis_prev_root;
     const reportedSeq = session.next_expected_seq - 1;
 
@@ -308,6 +340,11 @@ export class SealManager {
       session_id: session.session_id,
       reported_root: localRoot,
       reported_seq: reportedSeq,
+      // SESSION-003: the liveness verdict and its mapped attestation travel on the
+      // frame. The directory (SESSION-002 notarization workstream) sets the
+      // counterparty attestation FROM these fields — it never self-derives liveness.
+      counterparty_liveness: verdict.liveness,
+      counterparty_attestation: counterpartyAttestation,
     }) as Uint8Array;
 
     this.#ctx.getPersistentSignalingStream()!.send(lp.encode.single(frame));
@@ -343,6 +380,53 @@ export class SealManager {
     }
 
     return { ok: false, reason: (responseFrame["reason"] as string | undefined) ?? "unknown" };
+  }
+
+  /**
+   * M7-SESSION-003: resolve the counterparty session-path liveness verdict for
+   * the unilateral-seal gate. Delegates authority selection to the injected
+   * context (transport_mode → relay query | local session-node flag). When the
+   * context provides no authority (pre-M7 callers), fail SAFE to 'unknown'
+   * (→ DELIVERED). A relay query failure emits session.liveness.query.failed at
+   * WARN with the extracted error.message — never the raw error object (AC-014).
+   * ABSENT is NEVER produced here without a positive 'gone' from the authority.
+   */
+  async #determineCounterpartyVerdict(
+    session: SessionRecord,
+    sessionIdHex: string,
+    correlationId: string,
+  ): Promise<LivenessVerdict> {
+    const authorityFn = this.#ctx.getCounterpartyLivenessVerdict;
+    if (!authorityFn) {
+      // No authority wired — fail safe to the non-determinative verdict.
+      return { liveness: "unknown", authority: session.transport_mode === "relay" ? "relay" : "session_node" };
+    }
+    let verdict: LivenessVerdict;
+    try {
+      verdict = await authorityFn.call(this.#ctx, session, correlationId);
+    } catch (error: unknown) {
+      // The authority itself threw — treat as an unreachable query, fail safe.
+      this.#ctx.logger.warn("session.liveness.query.failed", {
+        sessionId: sessionIdHex,
+        counterpartyPubkey: Buffer.from(session.counterparty_pubkey).toString("hex"),
+        reason: "liveness_query_unreachable",
+        error: error instanceof Error ? error.message : String(error),
+        correlationId,
+      });
+      return { liveness: "unknown", authority: session.transport_mode === "relay" ? "relay" : "session_node" };
+    }
+    if (verdict.failureReason) {
+      // DB-001 / AC-013 / SI-003: a non-determinative relay result (unreachable,
+      // timeout, or 'unknown') never records ABSENT — fail safe to DELIVERED.
+      this.#ctx.logger.warn("session.liveness.query.failed", {
+        sessionId: sessionIdHex,
+        counterpartyPubkey: Buffer.from(session.counterparty_pubkey).toString("hex"),
+        reason: verdict.failureReason,
+        error: verdict.failureReason,
+        correlationId,
+      });
+    }
+    return verdict;
   }
 
   async #submitSealLeaf(

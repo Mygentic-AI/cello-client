@@ -77,6 +77,15 @@ export interface SessionRecord {
   /** M7: transport mode — 'direct' (P2P) or 'relay' (relay-mediated). */
   transport_mode?: 'direct' | 'relay';
 
+  /**
+   * M7-SESSION-003: per-session counterparty session-path liveness for a DIRECT
+   * session, set from the session node's onPeerConnect ('alive') /
+   * onPeerDisconnect ('gone'). This is the local authority for direct sessions —
+   * the unilateral-seal gate reads it (relay sessions query the relay instead).
+   * Undefined = no observation yet ('unknown' → DELIVERED fail-safe).
+   */
+  counterparty_liveness?: 'alive' | 'gone' | 'unknown';
+
   // ─── MSG-004 additions ────────────────────────────────────────────────────
 
   /** Ordered list of accepted leaves; used to recompute prev_root locally. MSG-004. */
