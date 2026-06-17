@@ -87,6 +87,24 @@ export interface SessionRecord {
 
   /** Fail-closed flag. Once true all send/receive return session_desynchronized. MSG-004. */
   desynchronized: boolean;
+
+  // ─── M7-SESSION-004 additions ───────────────────────────────────────────────
+
+  /**
+   * M7-SESSION-004: the counterparty's acknowledgement frontier — the highest
+   * last_seen_seq this client has observed across the counterparty's signed leaves.
+   * Equals the counterparty's content_frontier_seq. Used to independently re-derive
+   * and verify the certificate's published frontier for the counterparty (SI-002).
+   * Starts at 0. (This client's own frontier is `last_seen_seq`.)
+   */
+  counterparty_ack_frontier?: number;
+
+  /**
+   * M7-SESSION-004: the seal certificate's receipt-not-assent legibility object,
+   * persisted alongside the sealed record and exposed intact on read. Populated
+   * when a SessionSealed frame carrying legibility is accepted.
+   */
+  legibility?: import("@cello-protocol/protocol-types").SealLegibility;
 }
 
 /**

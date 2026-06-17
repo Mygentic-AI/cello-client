@@ -12,10 +12,15 @@
  *   SI-004: relay_ack_receipts is append-only (INSERT OR IGNORE).
  */
 
+import { Encoder } from "cbor-x";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { SQLCipherClientStore } from "./sqlcipher-client-store.js";
 import type { SignalRequirementPolicy, SignalRequirement } from "./connection-policy.js";
 import type { SessionRecord } from "./types.js";
+
+// M7-SESSION-004: canonical CBOR for the persisted legibility blob (RFC 8949 §4.2.1),
+// consistent with the wire frame encoding (tagUint8Array: false).
+const LEGIBILITY_ENC = new Encoder({ tagUint8Array: false });
 
 // ─── Types for DB rows ──────────────────────────────────────────────────────
 
@@ -97,6 +102,9 @@ export interface SessionRow {
   frost_signature: Buffer | Uint8Array | null;
   signer_pubkey: Buffer | Uint8Array | null;
   directory_signature: Buffer | Uint8Array | null;
+  // M7-SESSION-004 (inline-migrated columns)
+  legibility_cbor: Buffer | Uint8Array | null;
+  counterparty_ack_frontier: number;
 }
 
 export interface SessionTreeLeafRow {
@@ -394,8 +402,8 @@ export class ClientStatePersistence {
         directory_multiaddrs, directory_pubkey, genesis_prev_root,
         last_seen_seq, last_sent_seq, next_expected_seq, status, desynchronized,
         leaf_count, sealed_root, seal_type, close_timestamp, frost_signature,
-        signer_pubkey, directory_signature, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+        signer_pubkey, directory_signature, legibility_cbor, counterparty_ack_frontier, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
       [
         sessionIdHex, this.#agentPubkey,
         Buffer.from(record.counterparty_pubkey),
@@ -416,6 +424,8 @@ export class ClientStatePersistence {
         record.frost_signature ? Buffer.from(record.frost_signature) : null,
         record.signer_pubkey ? Buffer.from(record.signer_pubkey) : null,
         record.directory_signature ? Buffer.from(record.directory_signature) : null,
+        record.legibility ? Buffer.from(LEGIBILITY_ENC.encode(record.legibility) as Uint8Array) : null,
+        record.counterparty_ack_frontier ?? 0,
       ],
     );
     this.#logger.info("client.session.persisted", {

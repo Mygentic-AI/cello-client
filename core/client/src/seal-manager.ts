@@ -20,6 +20,11 @@ import type { Stream } from "@libp2p/interface";
 import type { SessionRecord } from "./types.js";
 import type { Logger } from "@cello-protocol/interfaces";
 import type { ClientStatePersistence } from "./client-state-persistence.js";
+import {
+  parseLegibility,
+  findUnverifiableFrontier,
+  CERTIFICATE_FRONTIER_UNVERIFIABLE,
+} from "./seal-legibility-client.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -524,6 +529,8 @@ export class SealManager {
       session.signer_pubkey = signerPubkey;
       session.seal_type = "frost";
       session.close_timestamp = closeTimestamp;
+      // M7-SESSION-004: attach the receipt-not-assent legibility certificate (SI-002 guard).
+      this.#applyLegibility(sessionIdHex, frame, session);
       this.#sealVerifiedData.delete(sessionIdHex);
       // CRIT-1: persist sealed state
       void this.#ctx.persistence?.persistSession(sessionIdHex, session);
@@ -552,6 +559,8 @@ export class SealManager {
       session.sealed_root = sealedRoot;
       session.directory_signature = dirSig;
       session.close_timestamp = closeTimestamp;
+      // M7-SESSION-004: attach the receipt-not-assent legibility certificate (SI-002 guard).
+      this.#applyLegibility(sessionIdHex, frame, session);
       // CRIT-1: persist sealed state
       void this.#ctx.persistence?.persistSession(sessionIdHex, session);
       // SESSION-007: enqueue lifecycle event for blocked cello_receive callers.
@@ -628,6 +637,8 @@ export class SealManager {
     session.signer_pubkey = signerPubkey;
     session.seal_type = "frost";
     session.close_timestamp = resolvedCloseTimestamp;
+    // M7-SESSION-004: attach the receipt-not-assent legibility certificate (SI-002 guard).
+    this.#applyLegibility(sessionIdHex, frame, session);
     this.#sealVerifiedData.delete(sessionIdHex);
     // CRIT-1: persist sealed state
     void this.#ctx.persistence?.persistSession(sessionIdHex, session);
@@ -636,6 +647,51 @@ export class SealManager {
 
     // Resolve the seal-frost-timeout waiter so initiateSessionSeal returns promptly
     this.#sealFrostResolvers.get(sessionIdHex)?.();
+  }
+
+  /**
+   * M7-SESSION-004: parse and attach the seal certificate's legibility object to the
+   * session, after independently re-deriving the content frontiers (SI-002 client
+   * guard). Mutates `session.legibility` on success; on a malformed certificate or a
+   * published frontier that EXCEEDS the client's re-derived signed maximum, logs and
+   * leaves legibility unset (the certificate is rejected rather than rendered — the
+   * cryptographic seal itself is unaffected). Does NOT persist — the caller's
+   * persistSession captures the mutation.
+   */
+  #applyLegibility(sessionIdHex: string, frame: Record<string, unknown>, session: SessionRecord): void {
+    const rawLeg = frame["legibility"];
+    if (rawLeg === undefined) return;
+    const parsed = parseLegibility(rawLeg);
+    if (!parsed) {
+      this.#ctx.logger.warn("seal.certificate.legibility.malformed", { sessionId: sessionIdHex, correlationId: sessionIdHex });
+      return;
+    }
+
+    const myHex = this.#ctx.getMyPubkeyHex();
+    const derivedByHex = new Map<string, number>();
+    if (myHex) derivedByHex.set(myHex, session.last_seen_seq);
+    // The counterparty frontier is only authoritatively re-derivable when the client
+    // holds complete synchronized state; otherwise being legitimately behind would
+    // false-positive against a higher (valid) published value.
+    if (!session.desynchronized) {
+      const cpHex = Buffer.from(session.counterparty_pubkey).toString("hex");
+      derivedByHex.set(cpHex, session.counterparty_ack_frontier ?? 0);
+    }
+
+    const bad = findUnverifiableFrontier(parsed, derivedByHex);
+    if (bad) {
+      this.#ctx.logger.error("seal.certificate.frontier.unverifiable", {
+        sessionId: sessionIdHex,
+        party: bad.party,
+        publishedFrontier: bad.publishedFrontier,
+        derivedFrontier: bad.derivedFrontier,
+        reason: CERTIFICATE_FRONTIER_UNVERIFIABLE,
+        correlationId: sessionIdHex,
+      });
+      return;
+    }
+
+    session.legibility = parsed;
   }
 
   handleDirectorySessionSealRejected(sessionIdHex: string, _frame: Record<string, unknown>): void {

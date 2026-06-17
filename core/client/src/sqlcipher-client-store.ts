@@ -192,6 +192,11 @@ export class SQLCipherClientStore implements ClientStore {
       // Run migration runner — applies pending V{n}__*.sql files
       this.#runMigrations(db);
 
+      // M7-SESSION-004: idempotent inline column additions (guarded ALTER TABLE) —
+      // NOT a Flyway migration. Adds the seal-certificate legibility blob and the
+      // counterparty acknowledgement frontier to the sessions table.
+      this.#applyInlineColumns(db);
+
       this.#logger.info("client.store.opened", {
         env: this.#env,
         dbPath: this.#dbPath,
@@ -305,6 +310,37 @@ export class SQLCipherClientStore implements ClientStore {
    *   5. Record the version in schema_migrations.
    *   6. Log client.store.migration.applied for each applied migration.
    */
+  /**
+   * M7-SESSION-004: idempotent inline schema extension. Adds the seal-certificate
+   * legibility blob and the counterparty acknowledgement frontier columns to the
+   * sessions table if they do not already exist. SQLite does not support
+   * `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so each ALTER is guarded by a
+   * try/catch that swallows ONLY the idempotent "duplicate column name" case — any
+   * other failure (disk full, locked, corruption) propagates so the client never
+   * runs against a half-migrated schema. This is the same client-side inline
+   * migration pattern SESSION-001 uses; it is NOT a Flyway migration.
+   */
+  #applyInlineColumns(db: SignalDatabase): void {
+    const ddl = [
+      "ALTER TABLE sessions ADD COLUMN legibility_cbor BLOB",
+      "ALTER TABLE sessions ADD COLUMN counterparty_ack_frontier INTEGER NOT NULL DEFAULT 0",
+    ];
+    for (const stmt of ddl) {
+      try {
+        db.exec(stmt);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes("duplicate column name")) {
+          this.#logger.error("client.store.inline.migration.failed", {
+            agentPubkey: this.#agentId,
+            reason: msg,
+          });
+          throw err;
+        }
+      }
+    }
+  }
+
   #runMigrations(db: SignalDatabase): void {
     // Bootstrap the migrations table before any migration runs — this is not a migration
     // itself and must not be inside a migration transaction.

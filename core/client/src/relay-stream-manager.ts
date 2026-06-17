@@ -780,6 +780,12 @@ export class RelayStreamManager {
         echo_resolve?.();
       } else {
         session.last_seen_seq = s2.sequence_number;
+        // M7-SESSION-004: track the counterparty's acknowledgement frontier (their
+        // highest signed last_seen_seq) so the client can independently re-derive and
+        // verify the certificate's published counterparty frontier (SI-002).
+        if (s1_fields.last_seen_seq > (session.counterparty_ack_frontier ?? 0)) {
+          session.counterparty_ack_frontier = s1_fields.last_seen_seq;
+        }
         if (kind === "ctrl" && session.status === "active") {
           session.status = "sealing";
           void this.#ctx.persistence?.persistSession(sessionIdHex, session);

@@ -25,6 +25,7 @@ import type { SessionRecord, PeerEntry } from "./types.js";
 import type { SignalRequirementPolicy } from "./connection-policy.js";
 import type { ReviewQueueItem } from "./connection-manager.js";
 import { NetworkDirectoryNode } from "./network-directory-node.js";
+import { parseLegibility } from "./seal-legibility-client.js";
 
 /**
  * Narrow interface providing access to the facade's mutable state and manager callbacks
@@ -293,6 +294,13 @@ export async function loadClientStartupState(ctx: StartupContext): Promise<void>
         : undefined,
       directory_signature: row.directory_signature
         ? (row.directory_signature instanceof Buffer ? new Uint8Array(row.directory_signature) : new Uint8Array(row.directory_signature as Uint8Array))
+        : undefined,
+      // M7-SESSION-004: reconstruct the inline-migrated legibility blob + frontier.
+      counterparty_ack_frontier: row.counterparty_ack_frontier ?? 0,
+      legibility: row.legibility_cbor
+        ? (parseLegibility(decode(
+            row.legibility_cbor instanceof Buffer ? new Uint8Array(row.legibility_cbor) : new Uint8Array(row.legibility_cbor as Uint8Array),
+          )) ?? undefined)
         : undefined,
     };
 
