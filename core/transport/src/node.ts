@@ -70,6 +70,7 @@ import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { circuitRelayServer, circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { dcutr } from "@libp2p/dcutr";
+import { autoNAT } from "@libp2p/autonat";
 import { identify } from "@libp2p/identify";
 import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
 import { multiaddr } from "@multiformats/multiaddr";
@@ -81,16 +82,104 @@ import type {
   CelloStreamHandler,
   CreateNodeOptions,
 } from "./types.js";
+import {
+  type Dialability,
+  type Unsubscribe,
+  DEFAULT_DIALABILITY,
+} from "./autonat.js";
+
+// ─── Dialability helpers (CELLO-M7-TRANSPORT-001) ─────────────────────────────
+
+/**
+ * Decide whether a multiaddr string represents a publicly-dialable address.
+ *
+ * AutoNAT confirms externally-reachable addresses. We treat an address as
+ * publicly dialable when it is an IP transport address that is NOT loopback,
+ * NOT in a private/link-local range, and NOT a circuit-relay address. This is
+ * the same classification libp2p applies to surface externally-reachable
+ * addresses via getMultiaddrs() after AutoNAT verification.
+ */
+function isPubliclyDialable(addr: string): boolean {
+  if (addr.includes("/p2p-circuit")) return false; // relay address, not direct
+  // Extract the IPv4/IPv6 host component.
+  const ip4 = addr.match(/\/ip4\/([0-9.]+)/);
+  const ip6 = addr.match(/\/ip6\/([0-9a-fA-F:]+)/);
+  if (ip4) {
+    const host = ip4[1]!;
+    if (host === "127.0.0.1" || host.startsWith("127.")) return false; // loopback
+    if (host.startsWith("10.")) return false; // private
+    if (host.startsWith("192.168.")) return false; // private
+    if (host.startsWith("169.254.")) return false; // link-local
+    // 172.16.0.0 – 172.31.255.255 private range
+    const m = host.match(/^172\.(\d+)\./);
+    if (m) {
+      const second = Number(m[1]);
+      if (second >= 16 && second <= 31) return false;
+    }
+    if (host === "0.0.0.0") return false; // unspecified
+    return true;
+  }
+  if (ip6) {
+    const host = ip6[1]!.toLowerCase();
+    if (host === "::1") return false; // loopback
+    if (host.startsWith("fe80")) return false; // link-local
+    if (host.startsWith("fc") || host.startsWith("fd")) return false; // unique-local
+    if (host === "::") return false; // unspecified
+    return true;
+  }
+  return false; // no IP transport component — not directly dialable
+}
+
+/**
+ * Derive dialability from the node's current self-reported multiaddrs. Returns
+ * the first publicly-dialable multiaddr (if any) as publicAddr.
+ */
+function deriveDialability(addrs: string[]): Dialability {
+  const publicAddr = addrs.find((a) => isPubliclyDialable(a)) ?? null;
+  return { dialable: publicAddr !== null, publicAddr };
+}
 
 // ─── CelloNodeImpl ───────────────────────────────────────────────────────────
 
 class CelloNodeImpl implements CelloNode {
   readonly #libp2p: Libp2p;
   readonly keyProvider: KeyProvider;
+  // CELLO-M7-TRANSPORT-001: dialability observable, updated on each AutoNAT
+  // probe cycle (surfaced by libp2p as a 'self:peer:update' event).
+  #dialability: Dialability = { ...DEFAULT_DIALABILITY };
+  readonly #dialabilityListeners = new Set<(d: Dialability) => void>();
 
   constructor(libp2p: Libp2p, keyProvider: KeyProvider) {
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
+    // Recompute dialability whenever libp2p updates its self-reported addresses.
+    // AutoNAT verification of an external address triggers a 'self:peer:update'.
+    this.#libp2p.addEventListener("self:peer:update", () => {
+      this.#recomputeDialability();
+    });
+  }
+
+  #recomputeDialability(): void {
+    const next = deriveDialability(this.listenAddresses());
+    if (
+      next.dialable === this.#dialability.dialable &&
+      next.publicAddr === this.#dialability.publicAddr
+    ) {
+      return; // no change — do not notify
+    }
+    this.#dialability = next;
+    for (const l of this.#dialabilityListeners) l({ ...next });
+  }
+
+  getDialability(): Dialability {
+    return { ...this.#dialability };
+  }
+
+  onDialabilityChange(listener: (d: Dialability) => void): Unsubscribe {
+    this.#dialabilityListeners.add(listener);
+    return () => {
+      this.#dialabilityListeners.delete(listener);
+    };
   }
 
   async start(): Promise<void> {
@@ -265,9 +354,23 @@ function mapStreamError(
  *   - Transports: TCP + WebSockets
  *   - Security: Noise ONLY (XX pattern, RFC: https://noiseprotocol.org/noise.html)
  *   - Muxer: Yamux
- *   - Services: identify, circuitRelayServer (advertises HOP), DCuTR
+ *   - Services: identify, circuitRelayServer (advertises HOP), AutoNAT, DCuTR
+ *
+ * CELLO-M7-TRANSPORT-001:
+ *   - autoNAT() is added to ALL nodes. On client nodes (session / standing
+ *     receiver) it probes connected directory nodes for dial-back to determine
+ *     dialability; on directory nodes it serves the responder role, answering
+ *     dial-back requests (AC-011). Protocol: /libp2p/autonat/1.0.0.
+ *   - dcutr() is included for session nodes (and the default/service nodes) so a
+ *     relay-fallback connection can be hole-punch upgraded to direct, but is
+ *     OMITTED for standing-receiver nodes (nodeType==='standing_receiver') — a
+ *     standing receiver only needs to know its own dialability, not upgrade
+ *     existing connections (AC-002).
  */
 export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
+  // dcutr is for dialers upgrading relay-fallback connections. A standing
+  // receiver is a receiver, not a dialer — omit dcutr there (AC-002).
+  const includeDcutr = opts.nodeType !== "standing_receiver";
   // ADR-0001: generate a fresh keypair for libp2p transport identity.
   // keyProvider is intentionally NOT touched here — see SI-002.
   const transportKey = opts.transportPrivateKey
@@ -292,12 +395,30 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       // Noise XX pattern per https://noiseprotocol.org/noise.html
       noise(),
     ],
-    streamMuxers: [yamux()],
+    // Cast: see the AutoNAT note below. yamux links uint8arraylist v2 while
+    // libp2p core links v3; adding the AutoNAT service to the service map shifts
+    // the inferred Components type so the muxer's Stream type no longer unifies.
+    // Runtime interop is unaffected (all libp2p v3.x). Build-time-only.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    streamMuxers: [yamux() as any],
     services: {
       identify: identify(),
       // circuitRelayServer advertises CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID
       relay: circuitRelayServer(),
-      dcutr: dcutr(),
+      // AutoNAT (RFC: https://libp2p.io/docs/concepts/nat/autonat/). Client role
+      // probes connected directory nodes for dial-back; server role answers
+      // probes (directory nodes). Protocol /libp2p/autonat/1.0.0.
+      //
+      // Cast: @libp2p/autonat@3.0.x links @libp2p/interface@3.2.2 (uint8arraylist
+      // v2) while libp2p core links @libp2p/interface@3.2.4 (uint8arraylist v3).
+      // The two copies are structurally identical at runtime (same libp2p v3.x
+      // wire protocols) but TypeScript treats their Stream/Components types as
+      // distinct. The cast erases the version-specific AutoNATComponents param so
+      // the service-map inference does not surface this benign duplication. This
+      // is a build-time-only concern; runtime interop is unaffected.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      autonat: autoNAT() as any,
+      ...(includeDcutr ? { dcutr: dcutr() } : {}),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
   });

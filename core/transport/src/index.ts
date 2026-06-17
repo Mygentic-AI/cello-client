@@ -13,7 +13,11 @@ export type {
   NodeStoppedError,
   ListenFailedError,
 } from "./types.js";
-export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "./protocols.js";
+export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID, AUTONAT_PROTOCOL_ID } from "./protocols.js";
+
+// CELLO-M7-TRANSPORT-001: AutoNAT dialability adapter + stub
+export type { IAutoNatService, Dialability, Unsubscribe } from "./autonat.js";
+export { LocalAutoNatStub, DEFAULT_DIALABILITY } from "./autonat.js";
 
 // M7-MANIFEST-002: manifest interfaces
 export type {

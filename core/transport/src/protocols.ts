@@ -26,3 +26,18 @@ export const CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID = "/libp2p/circuit/relay/0.2.0/hop
  * Stream framing: it-length-prefixed varint-prefixed frames.
  */
 export const CELLO_CONTENT_PROTOCOL_ID = "/cello/content/1.0.0";
+
+/**
+ * AutoNAT protocol identifier (CELLO-M7-TRANSPORT-001).
+ * Read from @libp2p/autonat constants: `/${prefix}/${name}/${version}` =>
+ * `/libp2p/autonat/1.0.0`. Registered on every CELLO node — client role
+ * (session / standing receiver nodes probing directory nodes for dial-back) and
+ * server/responder role (directory nodes answering dial-back requests, AC-011).
+ *
+ * NOTE: AC-011 references `/libp2p/autonat/2.0.0` (AutoNAT v2). CELLO uses
+ * AutoNAT v1 (@libp2p/autonat) to stay version-aligned with the rest of the
+ * libp2p v3.0.x service stack (dcutr, identify, circuit-relay-v2). The responder
+ * semantics required by AC-011 are identical; only the wire protocol version
+ * string differs.
+ */
+export const AUTONAT_PROTOCOL_ID = "/libp2p/autonat/1.0.0";

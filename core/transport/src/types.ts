@@ -15,6 +15,7 @@
 
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ConnectionGater, Stream } from "@libp2p/interface";
+import type { Dialability, Unsubscribe } from "./autonat.js";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,19 @@ export interface CreateNodeOptions {
    * to enforce per-session peer allowlists on ephemeral session nodes.
    */
   connectionGater?: ConnectionGater;
+  /**
+   * CELLO-M7-TRANSPORT-001: the role of this node, which tunes the libp2p service
+   * set:
+   *   - 'session'           — ephemeral per-session dialer; includes dcutr so a
+   *                           relay-fallback connection can be hole-punch upgraded.
+   *   - 'standing_receiver' — pre-warmed inbound receiver; OMITS dcutr (it only
+   *                           needs to know its own dialability, not upgrade
+   *                           existing connections).
+   *   - undefined           — service/default node (directory, relay, client):
+   *                           dcutr included for backward compatibility.
+   * AutoNAT is included for every nodeType.
+   */
+  nodeType?: "session" | "standing_receiver";
 }
 
 // ─── StreamHandler ──────────────────────────────────────────────────────────
@@ -139,6 +153,19 @@ export interface CelloNode {
    * The transport layer itself never calls any methods on this object.
    */
   readonly keyProvider: KeyProvider;
+
+  /**
+   * CELLO-M7-TRANSPORT-001: current AutoNAT-derived dialability.
+   * Returns { dialable: false, publicAddr: null } before the first probe cycle
+   * completes (the conservative default that drives the relay fallback).
+   */
+  getDialability(): Dialability;
+
+  /**
+   * Observe dialability changes. The listener fires on each AutoNAT probe cycle
+   * that changes the result. Returns an unsubscribe handle.
+   */
+  onDialabilityChange(listener: (d: Dialability) => void): Unsubscribe;
 }
 
 // ─── Structured error types ──────────────────────────────────────────────────
