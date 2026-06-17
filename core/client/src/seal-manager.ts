@@ -423,7 +423,12 @@ export class SealManager {
 
     try {
       relayStream.send(lp.encode.single(hashSubmitFrame));
-    } catch {
+    } catch (error) {
+      // Surface the underlying send failure so transport_unavailable is never an opaque label.
+      this.#ctx.logger.warn("seal.hash.submit.send.failed", {
+        sessionId: sessionIdHex,
+        error: error instanceof Error ? error.message : String(error),
+      });
       this.#ctx.deletePendingAckResolver(sessionIdHex);
       this.#ctx.getOwnPendingContent(sessionIdHex)?.delete(contentHashHex);
       return { ok: false, reason: "transport_unavailable" };
@@ -924,8 +929,15 @@ export class SealManager {
         tbs,
         "cello-frost-seal-v1",
       );
-    } catch {
-      // Ceremony failed — bilateral fallback; do not send seal_frost_signature
+    } catch (error) {
+      // Ceremony failed — bilateral fallback; do not send seal_frost_signature.
+      // Surface the underlying error so a FROST seal-ceremony failure is never silent
+      // (M6B-002 silent-FROST-failure pattern).
+      this.#ctx.logger.warn("seal.frost.ceremony.failed", {
+        sessionId: sessionIdHex,
+        ceremonyId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return;
     }
 
@@ -949,8 +961,12 @@ export class SealManager {
 
     try {
       sendStream.send(lp.encode.single(sealFrostSigFrame));
-    } catch {
-      // Stream closed — bilateral fallback
+    } catch (error) {
+      // Stream closed — bilateral fallback. Surface the send failure so it is not silent.
+      this.#ctx.logger.warn("seal.frost.signature.send.failed", {
+        sessionId: sessionIdHex,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
