@@ -113,6 +113,14 @@ export interface SignalingConnectDeps {
    * directory-facing node per connect.
    */
   createDirectoryNode?: (keyProvider: KeyProvider) => Promise<CelloNode>;
+  /**
+   * M7 Action 2: publish the live directory-facing node to the daemon so subsystems
+   * that must reach the directory on the SAME node — registration's FROST DKG
+   * (NetworkDirectoryNode), ceremonies, seal — can use it. Called with the node on a
+   * successful connect, and with `null` when the stream closes. The daemon keeps the
+   * latest reference and gates use on the signaling status being `connected`.
+   */
+  publishNode?: (node: CelloNode | null) => void;
 }
 
 /**
@@ -237,7 +245,11 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
         verified: !!verifier,
       });
 
-      const stream = wrapSignalingStream(sigStream, iter, node, deps.logger);
+      // Publish the live, directory-connected node so registration/FROST/seal can
+      // open further streams to the directory on the same node.
+      deps.publishNode?.(node);
+
+      const stream = wrapSignalingStream(sigStream, iter, node, deps.logger, deps.publishNode);
       return {
         stream,
         directoryNodeId,
@@ -268,6 +280,7 @@ function wrapSignalingStream(
   iter: AsyncIterator<Uint8Array>,
   node: CelloNode,
   logger: Logger,
+  publishNode?: (node: CelloNode | null) => void,
 ): SignalingStream {
   let closed = false;
   return {
@@ -299,6 +312,9 @@ function wrapSignalingStream(
     close(): void {
       if (closed) return;
       closed = true;
+      // Clear the daemon's reference before tearing the node down — registration/
+      // FROST/seal must not use a node that is being stopped.
+      publishNode?.(null);
       try {
         sigStream.abort(new Error("signaling_closed"));
       } catch {

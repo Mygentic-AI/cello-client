@@ -43,7 +43,7 @@ import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
-import { createNode, SignalingManager, type ConnectResult } from "@cello-protocol/transport";
+import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -110,6 +110,12 @@ export interface DaemonHandle {
    * Not part of the production API surface.
    */
   getSessionNodeManager(): SessionNodeManager;
+  /**
+   * M7 Action 2: the live directory-facing libp2p node (or null when signaling is not
+   * connected). Registration's FROST DKG and future ceremonies open streams to the
+   * directory on this node. Consumers must gate use on signaling being connected.
+   */
+  getDirectoryNode(): CelloNode | null;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -297,6 +303,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // (DAEMON-001 backward-compat). challengeVerifier is left to the caller: when absent,
   // step-6 directory verification is skipped — the M6 path that connected and ran the
   // full DKG/seal pipeline.
+  // M7 Action 2: the daemon holds a reference to the live directory-facing node so
+  // registration's FROST DKG (NetworkDirectoryNode) — and future ceremonies/seal — can
+  // open streams to the directory on the SAME node. createSignalingConnect sets it via
+  // publishNode on a successful connect and clears it (null) when the stream closes.
+  // Consumers MUST gate use on signalingManager.status === "connected".
+  let directoryNode: CelloNode | null = null;
+  const getDirectoryNode = (): CelloNode | null => directoryNode;
+
   const resolvedConnect: () => Promise<ConnectResult> =
     signalingConnect ??
     (directoryEndpointResolver
@@ -306,6 +320,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           logger,
           challengeVerifier,
           getManifestVersion: () => verifiedManifestVersion,
+          publishNode: (n) => {
+            directoryNode = n;
+          },
         })
       : defaultConnect);
 
@@ -1266,5 +1283,5 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return sessionNodeManager;
   }
 
-  return { stop, getStatus, getSessionNodeManager };
+  return { stop, getStatus, getSessionNodeManager, getDirectoryNode };
 }
