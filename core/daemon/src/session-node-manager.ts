@@ -509,12 +509,23 @@ export class SessionNodeManager {
     this.#updateSessionStatus(sessionId, dbStatus);
 
     this.#activeNodes.delete(sessionId);
+    // Evict the in-memory per-session caches on teardown. The tree is durable in
+    // SQLite (getSessionTree reloads it on demand), and the received-content buffer
+    // holds plaintext that must not linger after a session ends. Without this, both
+    // maps grow unbounded by total sessions seen over a long-lived daemon.
+    this.#evictSessionCaches(sessionId);
 
     this.#logger.info("session.node.destroyed", {
       sessionId,
       agentName: entry.agentName,
       reason,
     });
+  }
+
+  /** Drop the in-memory tree + received-content caches for a torn-down session. */
+  #evictSessionCaches(sessionId: string): void {
+    this.#trees.delete(sessionId);
+    this.#receivedContent.delete(sessionId);
   }
 
   /**
@@ -570,6 +581,10 @@ export class SessionNodeManager {
     }
     await Promise.all(stopPromises);
     this.#activeNodes.clear();
+    // Evict in-memory per-session caches (trees reload from SQLite; received-content
+    // plaintext must not survive shutdown in memory).
+    this.#trees.clear();
+    this.#receivedContent.clear();
 
     // Stop standing receiver
     if (this.#standingReceiver) {
@@ -906,6 +921,7 @@ export class SessionNodeManager {
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
+    correlationId?: string,
   ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) {
@@ -913,11 +929,15 @@ export class SessionNodeManager {
     }
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      // AC-001: the sender's correlationId rides in the frame so the receiver's
+      // session.content.received shares ONE correlationId with the sender's
+      // session.content.sent — a single async flow traceable across the two daemons.
       const frame = CBOR_ENC.encode({
         type: "content_frame",
         session_id: sessionId,
         content_hash: contentHash,
         content_bytes: content,
+        correlation_id: correlationId,
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
@@ -1035,7 +1055,10 @@ export class SessionNodeManager {
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
       if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
-      this.ingestReceivedContent(sessionId, contentBytes, contentHash);
+      // AC-001: carry the sender's correlationId from the frame into the receive
+      // path so both sides log the same flow id (never re-minted on receipt).
+      const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
+      this.ingestReceivedContent(sessionId, contentBytes, contentHash, correlationId);
     } catch (err: unknown) {
       this.#logger.warn("session.content.stream.read.failed", {
         sessionId,

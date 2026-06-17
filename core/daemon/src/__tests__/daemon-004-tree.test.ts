@@ -29,6 +29,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import * as lp from "it-length-prefixed";
+import { decode as cborDecode } from "cbor-x";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
@@ -83,6 +85,54 @@ class ConfigurableFakeNode implements Partial<CelloNode> {
 class ControlledFactory implements ISessionNodeFactory {
   constructor(private node: CelloNode) {}
   async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }
+}
+
+/**
+ * A loopback node: the content-stream handler registered via handle() is invoked
+ * with whatever newStream().send() delivers, so a sendContent on this node is
+ * cross-checked + ingested by the SAME manager's content handler. This exercises
+ * the real lp-framed CBOR content_frame encode → decode path (including the
+ * correlationId field), without a second OS process — used only to verify the
+ * in-process mechanism (the cross-PROCESS gate is E2E-001 under CELLO_E2E_LIVE).
+ */
+class LoopbackFakeNode implements Partial<CelloNode> {
+  #handler: ((stream: Stream) => void) | null = null;
+  readonly #peerId = `lb-${Math.random().toString(36).slice(2)}`;
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getPeerId(): string { return this.#peerId; }
+  listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
+  async dial(_addr: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
+  async handle(_p: string, h: (stream: Stream) => void): Promise<void> { this.#handler = h; }
+  getProtocols(): string[] { return []; }
+  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
+  onPeerConnect(_h: (p: string) => void): void {}
+  onPeerDisconnect(_h: (p: string) => void): void {}
+  async newStream(_peer: string, _proto: string): Promise<Stream> {
+    const handler = this.#handler;
+    const stream = {
+      send(data: unknown) {
+        const chunks = [data];
+        const inbound = {
+          [Symbol.asyncIterator]() {
+            let i = 0;
+            return {
+              next(): Promise<IteratorResult<unknown>> {
+                return i < chunks.length
+                  ? Promise.resolve({ value: chunks[i++], done: false })
+                  : Promise.resolve({ value: undefined, done: true });
+              },
+            };
+          },
+        } as unknown as Stream;
+        if (handler) handler(inbound);
+      },
+      async close() {},
+      abort() {},
+      status: "open",
+    } as unknown as Stream;
+    return stream;
+  }
 }
 
 async function makeManager(logger: Logger, dbPath: string, node: CelloNode): Promise<SessionNodeManager> {
@@ -254,5 +304,84 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const failEvent = events.find((e) => e.event === "session.content.cross_check.failed");
     expect(failEvent).toBeDefined();
     expect(failEvent!.level).toBe("warn");
+  });
+
+  // ── AC-001 finding: correlationId must be SHARED across the send/receive boundary ──
+  it("AC-001 correlationId: sendContent stamps correlation_id into the content_frame", async () => {
+    const node = new ConfigurableFakeNode();
+    const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    const content = new TextEncoder().encode("hello");
+    const correlationId = "flow-abc-123";
+    const res = await mgr.sendContent(sid, content, msgLeafHash(content), correlationId);
+    expect(res.ok).toBe(true);
+    expect(node.sent.length).toBe(1);
+
+    // Decode the lp-framed CBOR content_frame and assert the correlationId rode along.
+    const sentChunk = node.sent[0];
+    async function* source(): AsyncGenerator<Uint8Array> { yield sentChunk; }
+    let frame: Record<string, unknown> | undefined;
+    for await (const msg of lp.decode(source())) {
+      const bytes = (msg as { subarray(): Uint8Array }).subarray();
+      frame = cborDecode(bytes) as Record<string, unknown>;
+      break;
+    }
+    expect(frame).toBeDefined();
+    expect(frame!["type"]).toBe("content_frame");
+    expect(frame!["correlation_id"]).toBe(correlationId);
+  });
+
+  it("AC-001 correlationId: ingestReceivedContent threads correlationId into received + appended events", () => {
+    const mgr = new SessionNodeManager({ factory: new ControlledFactory(new ConfigurableFakeNode()), logger, dbPath: join(tempDir, "ci.db") });
+    // initialize() is async but ingest does not require the standing receiver; run after init.
+    return mgr.initialize().then(async () => {
+      await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      const content = new TextEncoder().encode("from-bob");
+      const correlationId = "flow-xyz-789";
+      mgr.ingestReceivedContent(sid, content, msgLeafHash(content), correlationId);
+      const recv = events.find((e) => e.event === "session.content.received");
+      expect(recv).toBeDefined();
+      expect(recv!.context.correlationId).toBe(correlationId);
+      const appended = events.find((e) => e.event === "session.tree.appended");
+      expect(appended).toBeDefined();
+      expect(appended!.context.correlationId).toBe(correlationId);
+    });
+  });
+
+  it("AC-001 correlationId (round-trip): content sent over the stream is ingested with the SAME correlationId", async () => {
+    const node = new LoopbackFakeNode();
+    const mgr = await makeManager(logger, join(tempDir, "lb.db"), node as unknown as CelloNode);
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    const content = new TextEncoder().encode("loopback-hi");
+    const correlationId = "flow-roundtrip-1";
+    const res = await mgr.sendContent(sid, content, msgLeafHash(content), correlationId);
+    expect(res.ok).toBe(true);
+    // The loopback delivers synchronously into the handler, which ingests async — drain.
+    await new Promise((r) => setImmediate(r));
+
+    const recv = events.find((e) => e.event === "session.content.received");
+    expect(recv).toBeDefined();
+    // The receiver shares the sender's correlationId — extracted from the frame, not minted.
+    expect(recv!.context.correlationId).toBe(correlationId);
+    const buffered = mgr.takeReceivedContent(sid);
+    expect(buffered).not.toBeNull();
+    expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("loopback-hi");
+  });
+
+  // ── medium finding: in-memory tree + received-content maps must be evicted on teardown ──
+  it("eviction: destroySessionNode clears the buffered received content (no plaintext retention)", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "ev.db"), new ConfigurableFakeNode());
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    const content = new TextEncoder().encode("secret-payload");
+    mgr.ingestReceivedContent(sid, content, msgLeafHash(content));
+    const persistedRoot = mgr.getSessionTreeRootHex(sid);
+
+    await mgr.destroySessionNode(sid, "sealed");
+
+    // The in-memory plaintext buffer is gone after teardown.
+    expect(mgr.takeReceivedContent(sid)).toBeNull();
+    // But the durable transcript is intact — the tree reloads from SQLite with the
+    // same root, proving eviction dropped only the in-memory cache, not durable state.
+    expect(mgr.getSessionTreeRootHex(sid)).toBe(persistedRoot);
   });
 });

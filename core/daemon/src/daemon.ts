@@ -1396,7 +1396,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
 
-    const sendResult = await sessionNodeManager.sendContent(sessionId, contentBytes, new Uint8Array(contentHash));
+    const sendResult = await sessionNodeManager.sendContent(sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
