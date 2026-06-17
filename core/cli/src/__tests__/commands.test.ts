@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startDaemon, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
-import { logout, status } from "../commands.js";
+import { logout, status, register } from "../commands.js";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -93,6 +93,34 @@ describe("cli commands", () => {
       expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
       expect(Array.isArray(parsed.connections)).toBe(true);
+    });
+  });
+
+  describe("register", () => {
+    it("returns exit 1 with usage when args are missing", async () => {
+      const result = await register(tempDir, "", "");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("Usage: cello register");
+    });
+
+    it("returns exit 1 'No daemon running' when no daemon is up", async () => {
+      const result = await register(tempDir, "alice", "preauth-token");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("No daemon running");
+    });
+
+    it("round-trips to the daemon and returns agent_not_found for an unknown agent", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+
+      // No agents are loaded in this temp dir → the daemon's cello_register
+      // handler rejects with agent_not_found (full CLI → IPC → handler path).
+      const result = await register(tempDir, "ghost-agent", "preauth-token");
+      expect(result.exitCode).toBe(1);
+      const parsed = JSON.parse(result.output);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.reason).toBe("agent_not_found");
+      expect(typeof parsed.guidance).toBe("string");
     });
   });
 });

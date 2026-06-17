@@ -74,6 +74,64 @@ export async function logout(celloDir: string): Promise<CommandResult> {
   }
 }
 
+/**
+ * register(celloDir, agent, preAuthToken, phoneStub):
+ *  - Read lock file to find socket path (daemon must be running)
+ *  - Connect to daemon, send 'cello_register' with { agent, preAuthToken, phoneStub }
+ *  - The daemon runs ML-DSA keygen → FROST DKG → register_success and persists
+ *    the agent's key material + registration state + agent→user link.
+ *  - Print structured JSON; exit 0 on success, 1 on failure.
+ */
+export async function register(
+  celloDir: string,
+  agent: string,
+  preAuthToken: string,
+  phoneStub = "",
+): Promise<CommandResult> {
+  if (!agent || !preAuthToken) {
+    return {
+      exitCode: 1,
+      output: "Usage: cello register <agent> <preAuthToken>  (or set CELLO_PREAUTH_TOKEN). The pre-authorization ticket comes from the CELLO Operations Agent.",
+    };
+  }
+
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry registration." };
+  }
+
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const result = (await client.send("cello_register", { agent, preAuthToken, phoneStub })) as {
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      agent_id?: string;
+      primary_pubkey?: string;
+    };
+    client.close();
+
+    if (!result.ok) {
+      return {
+        exitCode: 1,
+        output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2),
+      };
+    }
+    return {
+      exitCode: 0,
+      output: JSON.stringify(
+        { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
+        null,
+        2,
+      ),
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: `Failed to register: ${message}` };
+  }
+}
+
 export async function status(celloDir: string): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);

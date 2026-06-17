@@ -3,18 +3,23 @@
  * cello — the CELLO CLI binary.
  *
  * Commands:
- *   cello login   — Start the daemon (or connect to existing), exit 0
- *   cello logout  — Send shutdown command to daemon
- *   cello status  — Query daemon and print structured JSON response
+ *   cello login    — Start the daemon (or connect to existing), exit 0
+ *   cello logout   — Send shutdown command to daemon
+ *   cello status   — Query daemon and print structured JSON response
+ *   cello register — Register a loaded agent with the directory (ML-DSA + FROST DKG)
  */
 
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status } from "../commands.js";
+import { login, logout, status, register } from "../commands.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
+  debug(event: string, context: Record<string, unknown>): void {
+    const line = JSON.stringify({ level: "debug", event, ...context, ts: new Date().toISOString() });
+    process.stderr.write(line + "\n");
+  },
   info(event: string, context: Record<string, unknown>): void {
     const line = JSON.stringify({ level: "info", event, ...context, ts: new Date().toISOString() });
     process.stderr.write(line + "\n");
@@ -50,8 +55,17 @@ async function main(): Promise<void> {
     case "status":
       result = await status(celloDir);
       break;
+    case "register": {
+      // cello register <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN
+      // so it need not appear in shell history). Optional phone stub follows.
+      const agent = process.argv[3] ?? "";
+      const preAuthToken = process.argv[4] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
+      const phoneStub = process.argv[5] ?? "";
+      result = await register(celloDir, agent, preAuthToken, phoneStub);
+      break;
+    }
     default:
-      process.stdout.write("Usage: cello <login|logout|status>\n");
+      process.stdout.write("Usage: cello <login|logout|status|register>\n");
       process.exit(command ? 1 : 0);
       return;
   }
