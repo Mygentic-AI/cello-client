@@ -796,7 +796,13 @@ export class SessionNodeManager {
    */
   async #watchRelayStream(sessionId: string, stream: Stream, messageCount: number): Promise<void> {
     let receivedInterruptFrame = false;
-    const source = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+    // CELLO-M7-TRANSPORT-001: cast the stream input to lp.decode. Adding the
+    // @libp2p/autonat service (interface@3.2.2 / uint8arraylist v2) to the
+    // transport package surfaced a benign mixed-version split between the Stream
+    // type (now v2) and it-length-prefixed's expected Uint8ArrayList (v3). The two
+    // are structurally identical at runtime — this is a build-time-only artifact.
+    const lpSource = stream as unknown as AsyncIterable<Uint8Array>;
+    const source = (lp.decode(lpSource) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
     try {
       while (true) {
         let result: IteratorResult<Uint8Array>;

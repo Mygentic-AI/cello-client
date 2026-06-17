@@ -190,9 +190,18 @@ export class TransportSelector implements ITransportSelector {
     try {
       const relayAddr = this.#dialer.relayCircuitAddr(assignment);
       await this.#dialer.dialRelay(relayAddr, peerId);
-    } catch {
+    } catch (err) {
       // Terminal: both direct and relay failed. session.transport.mode.selected is
-      // NOT logged (no mode was selected — AC-008).
+      // NOT logged (no mode was selected — AC-008). We DO log the underlying relay
+      // failure reason at WARN so the on-call engineer can diagnose why the
+      // fallback failed (never swallow the exception silently).
+      this.#logger.warn("session.transport.relay_fallback.failed", {
+        sessionId,
+        counterpartyPeerId: peerId,
+        failureReason: errMessage(err),
+        reason: TRANSPORT_ERROR.RELAY_FALLBACK_ALSO_FAILED,
+        correlationId,
+      });
       return {
         ok: false,
         reason: TRANSPORT_ERROR.RELAY_FALLBACK_ALSO_FAILED,
@@ -253,7 +262,6 @@ export class LocalTransportSelectorStub implements ITransportSelector {
       result ?? { ok: true, mode: "relay", dcutrSettled: Promise.resolve(false) };
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async dial(_assignment: SessionAssignment, _opts: TransportDialOptions): Promise<TransportResult> {
     return this.#result;
   }
