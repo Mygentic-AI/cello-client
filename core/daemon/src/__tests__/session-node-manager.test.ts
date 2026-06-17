@@ -149,8 +149,12 @@ class FakeCelloNode {
   async newStream(_p: string, _pid: string): Promise<unknown> { return {}; }
   getProtocols(): string[] { return []; }
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
+  hasDirectConnectionTo(_peerId: string): boolean { return false; }
   onPeerConnect(_h: (_p: string) => void): void {}
   onPeerDisconnect(_h: (_p: string) => void): void {}
+  // CELLO-M7-TRANSPORT-001: dialability observable (loopback fake → never dialable).
+  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
+  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   get keyProvider() { return { getPublicKey: async () => new Uint8Array(32), sign: async (m: Uint8Array) => m }; }
 }
 

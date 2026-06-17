@@ -18,7 +18,6 @@ import {
   type ITransportSelector,
   type TransportDialer,
 } from "./transport-selector.js";
-import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import type { Logger } from "./types.js";
 
 export type CelloEnv = "local" | "test" | "dev" | "staging" | "production";
@@ -67,26 +66,9 @@ export function createTransportSelector(opts: {
   return new TransportSelector({ dialer: transportDialer, logger, directDialTimeoutMs });
 }
 
-/**
- * Build the AutoNAT service adapter for the given environment. Stub (default
- * dialable=false) for local/test; for production variants a real adapter must be
- * supplied (it wraps the standing-receiver node's libp2p AutoNAT observable).
- */
-export function createAutoNatService(opts: {
-  env: CelloEnv;
-  autoNatService?: IAutoNatService;
-}): IAutoNatService {
-  const { env, autoNatService } = opts;
-  if (!isProductionVariant(env)) {
-    return autoNatService ?? new LocalAutoNatStub();
-  }
-  if (!autoNatService) {
-    throw new Error(
-      `CELLO_ENV='${env}' requires an AutoNAT service adapter (backed by the standing ` +
-        `receiver's libp2p node), but none was provided to the daemon composition root. ` +
-        `Dialability cannot be determined without it — fix the daemon configuration ` +
-        `(config.autoNatService) before startup.`,
-    );
-  }
-  return autoNatService;
-}
+// NOTE (CELLO-M7-TRANSPORT-001): there is no createAutoNatService here. The
+// daemon's runtime IAutoNatService is the NodeAutoNatService wrapping the standing
+// receiver node — that node is created inside startDaemon (after this composition
+// runs), so the AutoNAT service is resolved from SessionNodeManager.
+// getStandingReceiverAutoNat() rather than constructed in the composition root.
+// config.autoNatService remains an explicit test override.

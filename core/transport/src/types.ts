@@ -142,6 +142,15 @@ export interface CelloNode {
   getConnections(): Array<{ peerId: string; encryption: string | undefined }>;
 
   /**
+   * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed
+   * (direct) connection to peerId. Used by the transport selector's dcutr path to
+   * observe whether a relay-fallback connection has been hole-punch upgraded to
+   * direct connectivity. A relayed connection's remote multiaddr contains
+   * '/p2p-circuit'; a direct one does not.
+   */
+  hasDirectConnectionTo(peerId: string): boolean;
+
+  /**
    * Subscribe to peer connect/disconnect events for observability logging.
    * Callback fires whenever a new libp2p connection is established or closed.
    */

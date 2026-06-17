@@ -74,7 +74,8 @@ import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
-import type { CelloNode } from "@cello-protocol/transport";
+import type { CelloNode, IAutoNatService } from "@cello-protocol/transport";
+import { NodeAutoNatService } from "@cello-protocol/transport";
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -106,6 +107,12 @@ interface ActiveSessionEntry {
   counterpartyPubkey: string;
   gater: SessionConnectionGater;
   correlationId: string;
+  /**
+   * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping this session node. Emits
+   * transport.autonat.result on each probe cycle; stopped when the node is torn
+   * down so its node subscription is released.
+   */
+  autoNat: NodeAutoNatService;
 }
 
 // ─── Result types ─────────────────────────────────────────────────────────────
@@ -122,8 +129,12 @@ export class SessionNodeManager {
   readonly #dbPath: string;
   #db: DatabaseSync | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
-  #standingReceiver: { node: CelloNode; gater: SessionConnectionGater } | null = null;
+  #standingReceiver: { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null = null;
   #standingReceiverReady = false;
+  // CELLO-M7-TRANSPORT-001: the directory-node multiaddrs serving as AutoNAT
+  // probers (SI-002). Empty () => [] when the directory is in 'reconnecting'
+  // state — AutoNAT cannot run and dialability stays the conservative default.
+  readonly #autoNatProbers: () => string[];
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -143,10 +154,17 @@ export class SessionNodeManager {
     factory: ISessionNodeFactory;
     logger: Logger;
     dbPath: string;
+    /**
+     * CELLO-M7-TRANSPORT-001: provider for the AutoNAT directory-node prober set
+     * (SI-002). Defaults to () => [] (reconnecting — no probers), which makes
+     * dialability the conservative default and fires transport.autonat.unavailable.
+     */
+    autoNatProbers?: () => string[];
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
     this.#dbPath = opts.dbPath;
+    this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
   }
 
   // ─── Initialization ──────────────────────────────────────────────────────
@@ -257,6 +275,17 @@ export class SessionNodeManager {
   }
 
   /**
+   * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping the current standing
+   * receiver node, or null if the standing receiver is not ready. The composition
+   * root uses this as the daemon's runtime IAutoNatService — its getDialability()
+   * drives the SessionAssignment advertised address (AC-004/AC-019), and it is the
+   * source of the transport.autonat.result / transport.autonat.unavailable events.
+   */
+  getStandingReceiverAutoNat(): IAutoNatService | null {
+    return this.#standingReceiver?.autoNat ?? null;
+  }
+
+  /**
    * M7-SESSION-001 (M-1 PUSH): register the session-state-change callback.
    * Called by the composition root (daemon.ts) after the NotificationDispatcher
    * exists. Setter injection avoids a construction-order/circular dependency.
@@ -347,6 +376,17 @@ export class SessionNodeManager {
       correlationId,
     });
 
+    // CELLO-M7-TRANSPORT-001: session nodes also need dialability awareness for the
+    // dcutr decision path (AC-002). Wrap the node in a NodeAutoNatService and emit
+    // its initial result (nodeType: 'session').
+    const autoNat = new NodeAutoNatService({
+      node,
+      logger: this.#logger,
+      nodeType: "session",
+      probers: this.#autoNatProbers(),
+    });
+    autoNat.emitInitialResult();
+
     // Add to active map
     this.#activeNodes.set(sessionId, {
       node,
@@ -354,6 +394,7 @@ export class SessionNodeManager {
       counterpartyPubkey,
       gater,
       correlationId,
+      autoNat,
     });
 
     return { ok: true, peerId, addrs };
@@ -400,7 +441,7 @@ export class SessionNodeManager {
       };
     }
 
-    const { node, gater } = this.#standingReceiver;
+    const { node, gater, autoNat } = this.#standingReceiver;
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
     gater.setAllowedPeer(initiatorPeerId);
@@ -419,7 +460,8 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    // Remove from standing receiver slot and add to active map
+    // Remove from standing receiver slot and add to active map. The handed-off
+    // node keeps its AutoNAT service (it continues to surface dialability).
     this.#standingReceiver = null;
     this.#standingReceiverReady = false;
     this.#activeNodes.set(sessionId, {
@@ -428,6 +470,7 @@ export class SessionNodeManager {
       counterpartyPubkey,
       gater,
       correlationId,
+      autoNat,
     });
 
     // Immediately spin up a replacement (async — do NOT await, AC-003)
@@ -447,6 +490,7 @@ export class SessionNodeManager {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) return;
 
+    entry.autoNat.stop();
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -509,6 +553,7 @@ export class SessionNodeManager {
     // (mirrors destroySessionNode ordering: stop first, log destroyed after)
     const stopPromises: Promise<void>[] = [];
     for (const [sessionId, entry] of this.#activeNodes) {
+      entry.autoNat.stop();
       stopPromises.push(
         entry.node.stop().then(() => {
           this.#logger.info("session.node.destroyed", {
@@ -531,6 +576,7 @@ export class SessionNodeManager {
 
     // Stop standing receiver
     if (this.#standingReceiver) {
+      this.#standingReceiver.autoNat.stop();
       try {
         await this.#standingReceiver.node.stop();
       } catch (err: unknown) {
@@ -617,6 +663,7 @@ export class SessionNodeManager {
 
     // Tear down the in-memory session node if it exists
     if (entry) {
+      entry.autoNat.stop();
       try {
         await entry.node.stop();
       } catch (err: unknown) {
@@ -890,7 +937,19 @@ export class SessionNodeManager {
       return; // standing receiver not ready — callers check #standingReceiverReady
     }
 
-    this.#standingReceiver = { node, gater };
+    // CELLO-M7-TRANSPORT-001: wrap the standing receiver in a NodeAutoNatService so
+    // its dialability drives session-address advertisement and the
+    // transport.autonat.result / transport.autonat.unavailable events fire. With
+    // no probers (reconnecting) it emits the dual unavailable event (AC-004/DB-001).
+    const autoNat = new NodeAutoNatService({
+      node,
+      logger: this.#logger,
+      nodeType: "standing_receiver",
+      probers: this.#autoNatProbers(),
+    });
+    autoNat.emitInitialResult();
+
+    this.#standingReceiver = { node, gater, autoNat };
     this.#standingReceiverReady = true;
 
     this.#logger.info("session.node.created", {

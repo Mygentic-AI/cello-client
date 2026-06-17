@@ -1,27 +1,32 @@
 /**
- * CELLO-M7-TRANSPORT-001 — transport-composition.test.ts (AC-010)
+ * CELLO-M7-TRANSPORT-001 — transport-composition.test.ts (AC-010 + C2)
  *
  * ─── Specification (Phase S) ──────────────────────────────────────────────────
- * AC-010 — the daemon composition root instantiates the IAutoNatService and
- * ITransportSelector adapters, selecting the in-process stubs when CELLO_ENV is
- * 'local'|'test' and the real implementations for 'dev'|'staging'|'production'.
- * A production variant missing required config fails at STARTUP with a clear error
- * naming the missing config — not at first session establishment.
+ * AC-010 — the daemon composition root wires the transport selector by CELLO_ENV
+ * (stub for 'local'|'test'; real for production variants, failing at STARTUP with
+ * a clear error when the transport dialer is missing). The AutoNAT service is the
+ * NodeAutoNatService wrapping the standing receiver node (resolved after init).
  *
- * This binary/startDaemon-level test is the only test that catches a dead-code
- * adapter (M7 lesson L3): it starts the daemon and exercises the wired selector.
+ * AC-010(c) is exercised THROUGH cello_initiate_session (not a test-only getter):
+ * calling it drives the wired transport selector and returns a defined result —
+ * it never crashes with "adapter not wired". A stub SessionNegotiator supplies the
+ * SessionAssignment that WIRE-001/SIGNAL-001 will produce in production.
+ *
+ * C2 — starting the daemon fires transport.autonat.result (INFO) and, because no
+ * directory probers are connected (reconnecting), transport.autonat.unavailable
+ * (WARN) for the standing receiver. This is the dead-code-adapter guard (L3): the
+ * AutoNAT events only fire if the NodeAutoNatService is actually wired.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import {
-  resolveCelloEnv,
-  createTransportSelector,
-  createAutoNatService,
-} from "../transport-composition.js";
+import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { resolveCelloEnv, createTransportSelector } from "../transport-composition.js";
+import type { SessionNegotiator } from "../transport-selector.js";
+import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 
@@ -30,6 +35,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
   let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
   let logger: Logger;
   let handle: DaemonHandle | null;
+  let clients: IpcClient[];
   let prevEnv: string | undefined;
 
   beforeEach(async () => {
@@ -42,10 +48,14 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
       error(event, context) { logEvents.push({ level: "error", event, context }); },
     };
     handle = null;
+    clients = [];
     prevEnv = process.env["CELLO_ENV"];
   });
 
   afterEach(async () => {
+    for (const c of clients) {
+      try { c.close(); } catch { /* already closed */ }
+    }
     if (handle) {
       try { await handle.stop("test_cleanup"); } catch { /* already stopped */ }
     }
@@ -66,7 +76,13 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     };
   }
 
-  function makeAssignment(): SessionAssignment {
+  async function setupAgent(name: string): Promise<void> {
+    const agentsDir = join(tempDir, "agents", name);
+    await mkdir(agentsDir, { recursive: true });
+    await FileKeyProvider.load(join(agentsDir, "key"));
+  }
+
+  function makeAssignment(transportMode: "direct" | "relay"): SessionAssignment {
     return {
       session_id: new Uint8Array(16).fill(9),
       participant_a: { pubkey: new Uint8Array(32).fill(1), peer_id: "12D3KooWA", multiaddrs: [] },
@@ -80,8 +96,20 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
       signer_pubkey: new Uint8Array(32).fill(5),
       counterparty_session_peer_id: "12D3KooWCounter",
       counterparty_session_addrs: ["/ip4/203.0.113.50/tcp/4001/p2p/12D3KooWCounter"],
-      transport_mode: "relay",
+      transport_mode: transportMode,
     };
+  }
+
+  /** Stub negotiator: returns a canned assignment (the WIRE-001/SIGNAL-001 seam). */
+  function stubNegotiator(assignment: SessionAssignment): SessionNegotiator {
+    return { negotiate: async () => ({ ok: true, assignment }) };
+  }
+
+  async function connectMcp(socketPath: string): Promise<IpcClient> {
+    const client = await connectToDaemon(socketPath);
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "mcp" });
+    return client;
   }
 
   it("CELLO_ENV=local: daemon starts, logs transport.adapters.wired(stub), AutoNAT defaults to not dialable", async () => {
@@ -94,14 +122,64 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     // wiring event fired with the stub selection
     const wired = logEvents.find((e) => e.event === "transport.adapters.wired");
     expect(wired).toBeDefined();
-    expect(wired!.context).toMatchObject({ env: "local", selector: "stub", autonat: "stub" });
+    expect(wired!.context).toMatchObject({ env: "local", selector: "stub" });
 
-    // (b) AutoNAT service accessible, returns the stub default
+    // (b) AutoNAT service accessible, returns the conservative default (standing
+    // receiver is loopback + no probers).
     expect(handle.getAutoNatService().getDialability()).toEqual({ dialable: false, publicAddr: null });
+  });
 
-    // (c) the transport selector path is exercisable — does NOT crash with "adapter not wired"
-    const result = await handle.getTransportSelector().dial(makeAssignment(), { correlationId: "cid-010" });
+  it("C2: starting the daemon emits transport.autonat.result and transport.autonat.unavailable", async () => {
+    process.env["CELLO_ENV"] = "local";
+    handle = await startDaemon(makeConfig());
+
+    const result = logEvents.find((e) => e.event === "transport.autonat.result");
+    expect(result).toBeDefined();
+    expect(result!.level).toBe("info");
+    expect(result!.context).toMatchObject({ dialable: false, publicAddr: null, nodeType: "standing_receiver" });
+
+    // No directory probers connected → AutoNAT cannot run → unavailable WARN fires.
+    const unavailable = logEvents.find((e) => e.event === "transport.autonat.unavailable");
+    expect(unavailable).toBeDefined();
+    expect(unavailable!.level).toBe("warn");
+    expect(unavailable!.context).toMatchObject({ nodeType: "standing_receiver" });
+  });
+
+  it("AC-010(c): cello_initiate_session drives the wired transport selector (does not crash with 'adapter not wired')", async () => {
+    process.env["CELLO_ENV"] = "local";
+    await setupAgent("alice");
+    // Inject a stub negotiator so the selector path is exercised end-to-end. The
+    // LocalTransportSelectorStub (default) returns a successful relay selection.
+    handle = await startDaemon(makeConfig({ sessionNegotiator: stubNegotiator(makeAssignment("relay")) }));
+
+    const client = await connectMcp(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const result = (await client.send("cello_initiate_session", {})) as {
+      ok: boolean;
+      transportMode?: string;
+      reason?: string;
+    };
+
+    // The wired selector ran and returned a defined transport result — NOT a
+    // not_implemented / adapter-not-wired crash.
     expect(result.ok).toBe(true);
+    expect(result.transportMode).toBe("relay");
+  });
+
+  it("cello_initiate_session without a negotiator returns directory_signaling_not_configured (graceful, adapters still wired)", async () => {
+    process.env["CELLO_ENV"] = "local";
+    await setupAgent("alice");
+    handle = await startDaemon(makeConfig());
+
+    const client = await connectMcp(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const result = (await client.send("cello_initiate_session", {})) as { ok: boolean; reason?: string };
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("directory_signaling_not_configured");
   });
 
   it("production variant without a transport dialer fails at startup naming the missing config", async () => {
@@ -123,10 +201,5 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(() => createTransportSelector({ env: "production", logger })).toThrow(/transport dialer/i);
     const stub = createTransportSelector({ env: "local", logger });
     expect(stub).toBeDefined();
-  });
-
-  it("createAutoNatService throws for production without an adapter; returns stub for local", () => {
-    expect(() => createAutoNatService({ env: "staging" })).toThrow(/AutoNAT service adapter/i);
-    expect(createAutoNatService({ env: "test" }).getDialability()).toEqual({ dialable: false, publicAddr: null });
   });
 });

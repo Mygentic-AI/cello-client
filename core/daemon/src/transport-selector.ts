@@ -103,6 +103,42 @@ export interface ITransportSelector {
   dial(assignment: SessionAssignment, opts: TransportDialOptions): Promise<TransportResult>;
 }
 
+// ─── SessionNegotiator (the WIRE-001/SIGNAL-001 seam) ─────────────────────────
+
+/**
+ * The advertised address this daemon offers to the directory for a new session,
+ * derived from the standing receiver's AutoNAT dialability (AC-004 / AC-019):
+ * a direct multiaddr when dialable, the relay circuit address otherwise.
+ */
+export interface SessionNegotiationContext {
+  agentName: string;
+  correlationId: string;
+  advertisedAddress: AdvertisedAddress;
+  params: Record<string, unknown>;
+}
+
+/**
+ * Outcome of directory session negotiation. On success it carries the
+ * FROST-signed SessionAssignment (transport_mode + counterparty_session_addrs)
+ * that the TransportSelector then consumes.
+ */
+export type SessionNegotiationResult =
+  | { ok: true; assignment: SessionAssignment }
+  | { ok: false; reason: string; guidance: string };
+
+/**
+ * Adapter that performs directory session negotiation and returns the
+ * FROST-signed SessionAssignment. The real implementation is owned by
+ * WIRE-001/SIGNAL-001 (directory signaling); it is injected into the daemon
+ * composition root. When absent, cello_initiate_session reports
+ * directory_signaling_not_configured (it does NOT crash — the transport adapters
+ * are still wired). This is the seam that lets cello_initiate_session drive the
+ * transport selector once an assignment exists (AC-010(c)).
+ */
+export interface SessionNegotiator {
+  negotiate(ctx: SessionNegotiationContext): Promise<SessionNegotiationResult>;
+}
+
 // ─── TransportDialer ──────────────────────────────────────────────────────────
 
 /**

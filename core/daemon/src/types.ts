@@ -14,7 +14,7 @@ import type {
   ConnectResult,
   IAutoNatService,
 } from "@cello-protocol/transport";
-import type { TransportDialer } from "./transport-selector.js";
+import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
@@ -193,6 +193,23 @@ export interface DaemonConfig {
    * observable. For 'local'/'test' the composition root uses a stub (dialable=false).
    */
   autoNatService?: IAutoNatService;
+  /**
+   * CELLO-M7-TRANSPORT-001: directory session negotiation adapter (WIRE-001/
+   * SIGNAL-001). cello_initiate_session calls negotiate() to obtain the
+   * FROST-signed SessionAssignment, then drives the transport selector to dial the
+   * counterparty (AC-005/AC-006/AC-008/AC-010c). When absent, cello_initiate_session
+   * reports directory_signaling_not_configured — it does NOT crash, proving the
+   * transport adapters are wired.
+   */
+  sessionNegotiator?: SessionNegotiator;
+  /**
+   * CELLO-M7-TRANSPORT-001: returns this daemon's relay circuit address (from the
+   * relay registry populated at directory connection) for the SessionAssignment
+   * advertised address when the standing receiver is NOT dialable (AC-004). When
+   * absent, an empty advertised relay address is used (the negotiator supplies the
+   * real one in production).
+   */
+  getRelayCircuitAddress?: () => string;
 }
 
 // --- Session node types ---

@@ -13,7 +13,8 @@
   },
   "pnpm": {
     "overrides": {
-      "@cello-protocol/interfaces": "0.0.3"
+      "@cello-protocol/interfaces": "0.0.3",
+      "@libp2p/interface": "3.2.2"
     },
     "onlyBuiltDependencies": [
       "@journeyapps/sqlcipher",

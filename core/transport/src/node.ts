@@ -303,6 +303,18 @@ class CelloNodeImpl implements CelloNode {
     }));
   }
 
+  hasDirectConnectionTo(peerIdStr: string): boolean {
+    let peerId;
+    try {
+      peerId = peerIdFromString(peerIdStr);
+    } catch {
+      return false;
+    }
+    return this.#libp2p.getConnections(peerId).some(
+      (c) => c.status === "open" && !c.remoteAddr.toString().includes("/p2p-circuit"),
+    );
+  }
+
   onPeerConnect(handler: (peerId: string) => void): void {
     this.#libp2p.addEventListener("peer:connect", (evt) => {
       handler(evt.detail.toString());
