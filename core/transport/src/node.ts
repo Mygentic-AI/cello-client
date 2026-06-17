@@ -300,6 +300,13 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       dcutr: dcutr(),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
+    // M7-SESSION-003 AC-005: configure the keepalive ping interval so a peer that
+    // vanished without a clean close is detected within a bounded window. A failed
+    // ping aborts the connection (abortConnectionOnPingFailure default true),
+    // firing peer:disconnect → counterparty_liveness drives to 'gone'.
+    ...(opts.keepAliveIntervalMs !== undefined
+      ? { connectionMonitor: { pingInterval: opts.keepAliveIntervalMs } }
+      : {}),
   });
 
   // Return node in STOPPED state — caller must call start()
