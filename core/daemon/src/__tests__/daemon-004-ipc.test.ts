@@ -95,16 +95,6 @@ class FixedFactory implements ISessionNodeFactory {
   async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }
 }
 
-/** Capturing signaling stream: records frames sent by the daemon. */
-function makeCapturingSignaling(captured: Record<string, unknown>[]): () => Promise<ConnectResult> {
-  const stream: SignalingStream = {
-    send: async (frame: unknown) => { captured.push(frame as Record<string, unknown>); },
-    onMessage: (_h: (frame: unknown) => void) => {},
-    close: () => {},
-  };
-  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
-}
-
 /** Canonical SEAL-INTERRUPTED leaf bytes — MUST match daemon.ts exactly. */
 function canonicalLeafBytes(leaf: {
   type: string; sessionId: string; leafCount: number;
