@@ -69,9 +69,9 @@ class ConfigurableFakeNode implements Partial<CelloNode> {
   onPeerDisconnect(_h: (p: string) => void): void {}
   async newStream(_peer: string, _proto: string): Promise<Stream> {
     if (this.opts.newStreamFails) throw new Error("connection_lost: stream dead");
-    const self = this;
+    const sink = this.sent;
     const stream = {
-      send(data: Uint8Array) { self.sent.push(data); },
+      send(data: Uint8Array) { sink.push(data); },
       async close() {},
       abort() {},
       status: "open",
