@@ -873,8 +873,8 @@ export class SessionNodeManager {
   /**
    * DAEMON-004: send content over the session node's direct P2P content stream.
    * On a dead/missing stream this returns a NAMED, diagnosable failure — never a
-   * silent success and never a desync (closing the old silent
-   * `void sendContentFrame(...)` catch at session-manager.ts:621-623).
+   * silent success and never a desync (closing the old silent fire-and-forget
+   * content catch in the retired in-process client send path).
    *
    * The relay hash-submit round-trip that assigns the global sequence number is
    * the live-session path (AC-001 under CELLO_E2E_LIVE) and is layered by MSG-001.

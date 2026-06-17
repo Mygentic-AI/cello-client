@@ -27,7 +27,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import type {
   DaemonConfig,
@@ -100,6 +100,56 @@ async function buildSignedSealInterruptedLeaf(
   return { ...partial, signature: Buffer.from(sig).toString("hex") };
 }
 
+/**
+ * CELLO-M7-DAEMON-004: canonical byte encoding of an active-session SEAL ctrl
+ * leaf for Ed25519 signing/verification. Deterministic field order. The leaf
+ * commits to the daemon's OWN current Merkle root (SI-001 — never a
+ * caller-supplied root). Crypto: Ed25519 RFC 8032.
+ */
+interface ActiveSealLeaf {
+  type: "SEAL";
+  sessionId: string;
+  merkleRoot: string;
+  leafCount: number;
+  timestamp: number;
+  signerPubkey: string;
+  signature: string;
+}
+
+function canonicalSealLeafBytes(leaf: Omit<ActiveSealLeaf, "signature">): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({
+      type: leaf.type,
+      sessionId: leaf.sessionId,
+      merkleRoot: leaf.merkleRoot,
+      leafCount: leaf.leafCount,
+      timestamp: leaf.timestamp,
+      signerPubkey: leaf.signerPubkey,
+    }),
+  );
+}
+
+/**
+ * CELLO-M7-DAEMON-004: build and K_local-sign an active-session SEAL leaf over
+ * the daemon's own tree root. The private key never leaves keyProvider (SI-003:
+ * only the signing party's own node ever produces this signature).
+ */
+async function buildSignedActiveSealLeaf(
+  keyProvider: KeyProvider,
+  opts: { sessionId: string; merkleRoot: string; leafCount: number; signerPubkeyHex: string },
+): Promise<ActiveSealLeaf> {
+  const partial = {
+    type: "SEAL" as const,
+    sessionId: opts.sessionId,
+    merkleRoot: opts.merkleRoot,
+    leafCount: opts.leafCount,
+    timestamp: Date.now(),
+    signerPubkey: opts.signerPubkeyHex,
+  };
+  const sig = await keyProvider.sign(canonicalSealLeafBytes(partial));
+  return { ...partial, signature: Buffer.from(sig).toString("hex") };
+}
+
 export interface DaemonHandle {
   stop(reason: string): Promise<void>;
   getStatus(): DaemonStatusResponse;
@@ -136,7 +186,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore, manifestPollScheduler,
-    signalingConnect, challengeVerifier,
+    signalingConnect, challengeVerifier, sessionNodeFactory,
   } = config;
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
@@ -286,7 +336,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //   1. The standing receiver is ready before any cello_await_session call.
   //   2. Interrupted session detection runs before any tool call can race.
   const sessionNodeManager = new SessionNodeManager({
-    factory: new ProductionSessionNodeFactory(),
+    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
     logger,
     dbPath: join(celloDir, "sessions.db"),
   });
@@ -475,9 +525,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   // ─── MCP-001: no_current_agent guard for session tools ───
+  // cello_send / cello_receive are NOT in this stub list — DAEMON-004 registers
+  // real handlers for them below (each enforces the no_current_agent guard inline).
   const SESSION_TOOLS_REQUIRING_AGENT = [
-    "cello_send",
-    "cello_receive",
     "cello_receive_session",
     "cello_initiate_session",
     "cello_await_session",
@@ -580,11 +630,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
     }
 
-    // Active session — normal (non-interrupted) close not yet implemented
+    // CELLO-M7-DAEMON-004 (AC-003): ACTIVE session — initiate the active-session
+    // seal over the daemon's OWN tree root. SI-001: any caller-supplied
+    // merkleRoot is IGNORED; the daemon signs only the root it built itself.
+    if (record.status === "active") {
+      const correlationId = randomUUID();
+      return await handleActiveSealFlow(sessionId, record, correlationId);
+    }
+
+    // Any other status (e.g. seal_interrupted_pending) — nothing to do.
     return {
       ok: false,
-      reason: "not_implemented",
-      guidance: "cello_close_session for active sessions is not yet implemented. Use this tool on interrupted sessions (status: 'interrupted') to initiate the seal-interrupted flow.",
+      reason: "session_not_closeable",
+      guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_list_sessions; a seal_interrupted_pending session is awaiting FROST notarization.`,
     };
   });
 
@@ -1119,6 +1177,213 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true, sessionId, status: "seal_interrupted_pending" };
     }
   }
+
+  // ─── CELLO-M7-DAEMON-004: active-session seal initiation ─────────────────────
+  //
+  // Pseudocode (SPARC Phase P):
+  //   1. DB-002: if signaling reconnecting → return signaling_reconnecting and do
+  //      NOT initiate a partial seal that cannot be notarized.
+  //   2. SI-001: read the merkle root from the daemon's OWN tree (never a caller param).
+  //   3. K_local-sign a SEAL ctrl leaf over that root (SI-003: signed by our own node).
+  //   4. Fire session.seal.initiated with rootHex == our own tree root, role:'initiator'.
+  //   5. Submit the SEAL to the relay/counterparty + coordinate FROST via signaling,
+  //      reusing the same signaling stream the interrupted-seal flow (SESSION-001) uses.
+  //      The bilateral counterparty ack + FROST threshold notarization complete the
+  //      seal end-to-end (AC-004, exercised under CELLO_E2E_LIVE) — the daemon never
+  //      synthesizes the counterparty's signature.
+  type ActiveSealResult =
+    | { ok: true; sessionId: string; status: "seal_initiated"; rootHex: string }
+    | { ok: false; reason: string; guidance: string };
+
+  async function handleActiveSealFlow(
+    sessionId: string,
+    record: import("./types.js").SessionRecord,
+    correlationId: string,
+  ): Promise<ActiveSealResult> {
+    const agent = agents.find((a) => a.name === record.agent_name);
+    const myPubkeyHex = agent?.pubkey ?? "";
+    const kp = keyProviders.get(record.agent_name);
+
+    // DB-002: never initiate a partial seal while signaling is reconnecting.
+    if (signalingManager.status === "reconnecting") {
+      return {
+        ok: false,
+        reason: "signaling_reconnecting",
+        guidance: "The directory signaling stream is reconnecting. Wait for directory_signaling to show connected in cello status before retrying the close. The daemon reconnects automatically.",
+      };
+    }
+
+    if (!kp || !myPubkeyHex) {
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason: "signing_key_unavailable",
+        errorMessage: "no key provider or pubkey for the agent that owns this session",
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "signing_key_unavailable",
+        guidance: "The signing key for the agent that owns this session could not be loaded. Confirm the agent's key file exists under ~/.cello/agents and restart the daemon.",
+      };
+    }
+
+    // SI-001: the root is the daemon's OWN tree root — computed from the leaves it
+    // appended itself. Any caller-supplied merkleRoot is never read here.
+    const ownRootHex = sessionNodeManager.getSessionTreeRootHex(sessionId);
+    const leafCount = sessionNodeManager.getSessionTree(sessionId).size();
+
+    let sealLeaf: ActiveSealLeaf;
+    try {
+      sealLeaf = await buildSignedActiveSealLeaf(kp, {
+        sessionId,
+        merkleRoot: ownRootHex,
+        leafCount,
+        signerPubkeyHex: myPubkeyHex,
+      });
+    } catch (err: unknown) {
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason: "seal_leaf_signing_failed",
+        errorMessage: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "seal_leaf_signing_failed",
+        guidance: "The SEAL leaf could not be signed. Check the daemon logs for the signing error and confirm the agent key is intact.",
+      };
+    }
+
+    // AC-003: session.seal.initiated — rootHex MUST equal the daemon's own root.
+    logger.info("session.seal.initiated", {
+      sessionId,
+      rootHex: ownRootHex,
+      role: "initiator",
+      correlationId,
+    });
+
+    // Submit the SEAL to the directory signaling stream (relay + FROST coordination).
+    const sendResult = await signalingManager.sendRaw({
+      type: "seal_request",
+      sessionId,
+      initiatorPubkey: myPubkeyHex,
+      counterpartyPubkey: record.counterparty_pubkey,
+      merkleRoot: ownRootHex,
+      leafCount,
+      sealLeaf,
+    });
+    if (!sendResult.ok) {
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason: sendResult.reason,
+        errorMessage: sendResult.reason,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: sendResult.reason,
+        guidance: "guidance" in sendResult && typeof sendResult.guidance === "string"
+          ? sendResult.guidance
+          : "The seal could not be submitted to the directory. Retry once cello status shows directory_signaling connected.",
+      };
+    }
+
+    return { ok: true, sessionId, status: "seal_initiated", rootHex: ownRootHex };
+  }
+
+  // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
+  handlers.set("cello_send", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
+
+    const sessionId = params?.sessionId as string | undefined;
+    const contentStr = typeof params?.content === "string" ? params.content : undefined;
+    if (!sessionId || contentStr === undefined) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'sessionId' (hex) and 'content' (string) parameters." };
+    }
+
+    const record = sessionNodeManager.getSessionRecord(sessionId);
+    if (!record) {
+      return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions for active sessions." };
+    }
+    if (record.status !== "active") {
+      return { ok: false, reason: "session_not_active", guidance: `Session is '${record.status}', not active. Content can only be sent on an active session. If it is interrupted, call cello_close_session to seal it.` };
+    }
+
+    const correlationId = randomUUID();
+    const contentBytes = new TextEncoder().encode(contentStr);
+    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    const recipientPubkey = record.counterparty_pubkey;
+
+    const sendResult = await sessionNodeManager.sendContent(sessionId, contentBytes, new Uint8Array(contentHash));
+    if (!sendResult.ok) {
+      // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
+      // the content in the durable retry_queue so it is retried on reconnect, and
+      // surface a named, diagnosable failure.
+      const nonce = randomUUID();
+      try {
+        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), contentBytes);
+      } catch (err: unknown) {
+        logger.error("session.content.queue.failed", {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      }
+      logger.warn("session.content.send.failed", {
+        sessionId,
+        recipientPubkey,
+        reason: sendResult.reason,
+        errorMessage: sendResult.error,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: sendResult.reason,
+        guidance: "The content could not be delivered over the session stream right now. It has been queued in the durable retry queue and will be retried when the counterparty reconnects. The session remains usable — check cello_list_connections for the counterparty's status.",
+      };
+    }
+
+    // Delivered — append the message leaf to the daemon-owned tree (advances root).
+    const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
+    logger.info("session.content.sent", {
+      sessionId,
+      recipientPubkey,
+      contentHashHex,
+      sequenceNumber: leafIndex,
+      correlationId,
+    });
+    void newRootHex;
+    return { ok: true, sequence_number: leafIndex };
+  });
+
+  // ─── CELLO-M7-DAEMON-004: cello_receive (returns from the daemon's own buffer) ──
+  handlers.set("cello_receive", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
+
+    const sessionId = params?.sessionId as string | undefined;
+    if (!sessionId) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'sessionId' (hex) to receive content for a specific session." };
+    }
+    const record = sessionNodeManager.getSessionRecord(sessionId);
+    if (!record) {
+      return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
+    }
+
+    const entry = sessionNodeManager.takeReceivedContent(sessionId);
+    if (!entry) {
+      return { ok: true, content: null, guidance: "No content is currently buffered for this session. Call cello_receive again after the counterparty sends, or use the blocking receive variant." };
+    }
+    return {
+      ok: true,
+      content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
+      sessionId,
+      sequence_number: entry.sequenceNumber,
+      senderPubkey: entry.senderPubkey,
+    };
+  });
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {
