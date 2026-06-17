@@ -384,4 +384,55 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     // same root, proving eviction dropped only the in-memory cache, not durable state.
     expect(mgr.getSessionTreeRootHex(sid)).toBe(persistedRoot);
   });
+
+  // ── round-2 finding #5: a frozen session must not let late inbound content mutate
+  //    the committed tree. Once the bilateral seal commitment advances the session
+  //    out of 'active', ingestReceivedContent must reject — otherwise a frame that
+  //    arrives after the SEAL leaf was signed would diverge the transcript from the
+  //    root that was just committed (and that a later FROST notarization attests).
+  it("finding #5: ingestReceivedContent rejects late content once the session is frozen (not active)", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+
+    // One leaf arrives while active — accepted, then drained.
+    const c1 = new TextEncoder().encode("m1");
+    expect(mgr.ingestReceivedContent(sid, c1, msgLeafHash(c1)).ok).toBe(true);
+    expect(mgr.getSessionTree(sid).size()).toBe(1);
+    expect(mgr.takeReceivedContent(sid)).not.toBeNull();
+
+    // Freeze: the seal commitment advances the session out of 'active'.
+    mgr.persistSealInterruptedCommitment({
+      sessionId: sid, role: "initiator", ownLeaf: {}, counterpartyLeaf: {},
+      merkleRoot: mgr.getSessionTreeRootHex(sid), nonce: "n1",
+    });
+    expect(mgr.getSessionRecord(sid)!.status).toBe("seal_interrupted_pending");
+    const rootAfterCommit = mgr.getSessionTreeRootHex(sid);
+
+    // A late inbound frame MUST be rejected — the frozen tree is not mutated.
+    const c2 = new TextEncoder().encode("late-frame");
+    const res = mgr.ingestReceivedContent(sid, c2, msgLeafHash(c2));
+    expect(res.ok).toBe(false);
+    expect(mgr.getSessionTree(sid).size()).toBe(1);
+    expect(mgr.getSessionTreeRootHex(sid)).toBe(rootAfterCommit);
+    // No content buffered from the rejected frame.
+    expect(mgr.takeReceivedContent(sid)).toBeNull();
+  });
+
+  // ── round-2 finding #7: message_count must track the daemon-owned tree across an
+  //    interrupt, not a stale registration value (default 0). Both seal flows prefer
+  //    tree.size(), but the column must not be left inconsistent with the tree.
+  it("finding #7: markInterruptedWithDetails keeps message_count synced to the daemon-owned tree, not a stale value", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    for (const m of ["a", "b", "c"]) {
+      mgr.appendSessionLeaf(sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
+    }
+    expect(mgr.getSessionTree(sid).size()).toBe(3);
+
+    // Interrupt with a STALE registration count of 0 (the registerRelayStream default).
+    await mgr.markInterruptedWithDetails(sid, 0, "stream_close");
+
+    // message_count reflects the daemon-owned tree (3), not the stale 0.
+    expect(mgr.getSessionRecord(sid)!.message_count).toBe(3);
+  });
 });

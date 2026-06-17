@@ -71,10 +71,11 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
 
 class FakeNode implements Partial<CelloNode> {
   sent: Uint8Array[] = [];
+  stopped = false;
   constructor(private opts: { newStreamFails?: boolean } = {}) {}
   readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
   async start(): Promise<void> {}
-  async stop(): Promise<void> {}
+  async stop(): Promise<void> { this.stopped = true; }
   getPeerId(): string { return this.#peerId; }
   listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
@@ -131,6 +132,7 @@ function makeRespondingSignaling(
   captured: Record<string, unknown>[],
   cpKp: KeyProvider,
   cpPubkeyHex: string,
+  ackDelayMs = 0,
 ): () => Promise<ConnectResult> {
   let inbound: ((frame: unknown) => void) | null = null;
   const stream: SignalingStream = {
@@ -144,18 +146,41 @@ function makeRespondingSignaling(
           merkleRootAtInterruption: f.merkleRootAtInterruption as string,
           signerPubkeyHex: cpPubkeyHex,
         });
-        setImmediate(() => inbound?.({
+        const deliver = () => inbound?.({
           type: "seal_interrupted_ack",
           sessionId: f.sessionId,
           initiatorPubkey: f.initiatorPubkey,
           nonce: f.nonce,
           sealInterruptedLeaf: leaf,
-        }));
+        });
+        // ackDelayMs > 0 keeps the initiator flow in-progress long enough to make
+        // the concurrency guard (finding #4) observable; 0 → next-tick (default).
+        if (ackDelayMs > 0) setTimeout(deliver, ackDelayMs);
+        else setImmediate(deliver);
       }
     },
     onMessage: (h: (frame: unknown) => void) => { inbound = h; },
     close: () => {},
   };
+  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
+}
+
+/**
+ * Signaling stub that captures outbound frames AND lets the test inject an inbound
+ * frame (via injectRef.inject). Used to drive the bilateral RESPONDER path
+ * (handleInboundSealInterruptedRequest) directly — finding #6 / SI-001.
+ */
+function makeInjectableSignaling(
+  captured: Record<string, unknown>[],
+  injectRef: { inject?: (frame: unknown) => void },
+): () => Promise<ConnectResult> {
+  let inbound: ((frame: unknown) => void) | null = null;
+  const stream: SignalingStream = {
+    send: async (frame: unknown) => { captured.push(frame as Record<string, unknown>); },
+    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
+    close: () => {},
+  };
+  injectRef.inject = (frame: unknown) => inbound?.(frame);
   return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
 }
 
@@ -423,6 +448,105 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const art = snm2.getSealInterruptedArtifacts(SID);
     expect(art).not.toBeNull();
     expect(art!.merkleRoot).toBe(rootBeforeCrash);
+  });
+
+  it("finding #4: two concurrent active cello_close_session calls — only one initiates a seal; the other is rejected seal_interrupted_in_progress", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    // Delay the ack so the FIRST close is still in-progress when the SECOND arrives.
+    const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex, 120) });
+    await new Promise((r) => setTimeout(r, 50));
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const [r1, r2] = await Promise.all([
+        client.send("cello_close_session", { sessionId: SID }),
+        client.send("cello_close_session", { sessionId: SID }),
+      ]) as Record<string, unknown>[];
+      const results = [r1, r2];
+      const inProgress = results.filter((r) => r.reason === "seal_interrupted_in_progress");
+      const initiated = results.filter((r) => r.ok === true && r.status === "seal_initiated");
+      // Exactly one initiates the seal; the other is rejected by the concurrency guard.
+      expect(inProgress).toHaveLength(1);
+      expect(initiated).toHaveLength(1);
+    } finally { client.close(); }
+
+    // Only ONE seal_interrupted_request was sent — no double seal.
+    expect(captured.filter((f) => f.type === "seal_interrupted_request")).toHaveLength(1);
+  });
+
+  it("finding #5: after an active seal initiates, the session node is torn down (no leaked libp2p node, content handler retired)", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
+    await new Promise((r) => setTimeout(r, 50));
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    expect(node.stopped).toBe(false);
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const res = await client.send("cello_close_session", { sessionId: SID }) as Record<string, unknown>;
+      expect(res.ok).toBe(true);
+    } finally { client.close(); }
+
+    // The session's libp2p node was stopped — no leak per active close.
+    expect(node.stopped).toBe(true);
+    // The durable transcript survives teardown (tree reloads from SQLite).
+    expect(snm.getSessionTree(SID).size()).toBe(1);
+  });
+
+  it("finding #6 (SI-001 responder): an active-session responder co-signs its OWN tree root, never the initiator-supplied root", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await new Promise((r) => setTimeout(r, 50));
+    const snm = h.getSessionNodeManager();
+    const initiatorPubkey = "cd".repeat(32);
+    // Bob has an ACTIVE session with no content yet — his own tree is empty.
+    await snm.createSessionNode(SID, "bob", initiatorPubkey, "alice-peer-id", "corr");
+    const bobOwnRoot = snm.getSessionTreeRootHex(SID); // canonical empty-tree root
+
+    // The initiator sends a BOGUS merkleRoot. SI-001: Bob must co-sign his OWN root.
+    injectRef.inject!({
+      type: "seal_interrupted_request",
+      sessionId: SID,
+      initiatorPubkey,
+      counterpartyPubkey: bobPubkey,
+      leafCountAtInterruption: 0,
+      merkleRootAtInterruption: "ff".repeat(32),
+      nonce: "nonce-r6",
+    });
+    await new Promise((r) => setTimeout(r, 80));
+
+    const ack = captured.find((f) => f.type === "seal_interrupted_ack") as Record<string, unknown> | undefined;
+    expect(ack).toBeDefined();
+    const leaf = ack!.sealInterruptedLeaf as Record<string, unknown>;
+    // SI-001: Bob signed his OWN empty-tree root, NOT the initiator-supplied "ff..".
+    expect(leaf.merkleRootAtInterruption).toBe(bobOwnRoot);
+    expect(leaf.merkleRootAtInterruption).not.toBe("ff".repeat(32));
+    expect(leaf.signerPubkey).toBe(bobPubkey);
   });
 
   it("DB-002: active close while signaling reconnecting returns signaling_reconnecting and does NOT initiate a seal", async () => {

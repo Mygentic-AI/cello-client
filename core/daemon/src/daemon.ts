@@ -670,9 +670,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // CELLO-M7-DAEMON-004 (AC-003): ACTIVE session — initiate the active-session
     // seal over the daemon's OWN tree root. SI-001: any caller-supplied
     // merkleRoot is IGNORED; the daemon signs only the root it built itself.
+    //
+    // round-2 finding #4: the active path must take the SAME concurrency guard as
+    // the interrupted path (the top-of-handler check at sealInterruptedInProgress.has
+    // rejects re-entry). Without adding to the set here, two concurrent active closes
+    // would both send a seal_interrupted_request and both await acks (double seal).
     if (record.status === "active") {
+      sealInterruptedInProgress.add(sessionId);
       const correlationId = randomUUID();
-      return await handleActiveSealFlow(sessionId, record, correlationId);
+      try {
+        return await handleActiveSealFlow(sessionId, record, correlationId);
+      } finally {
+        sealInterruptedInProgress.delete(sessionId);
+      }
     }
 
     // Any other status (e.g. seal_interrupted_pending) — nothing to do.
@@ -814,15 +824,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // From our perspective the initiator is our counterparty.
     if (localRecord.counterparty_pubkey !== initiatorPubkey) { await reject("initiator_mismatch"); return; }
 
-    // DAEMON-004 (SI-001): prefer OUR OWN daemon-owned tree. When we hold a
-    // non-empty tree for this session we sign over OUR OWN root + size (each node
-    // signs the root it built — SI-001), and the bilateral leaf-count check uses
-    // our own tree size. Only when no tree was ever persisted do we fall back to
-    // message_count + echoing the initiator-supplied root (SESSION-001 behavior).
+    // DAEMON-004 (SI-001): we sign over OUR OWN daemon-owned tree, never the
+    // initiator-supplied root.
+    //
+    // round-2 finding #6: for an ACTIVE session the daemon ALWAYS binds its own tree
+    // root — even the canonical EMPTY-tree root when no content has flowed — never the
+    // initiator-supplied `merkleRootReq`. Echoing the caller's root would let an
+    // initiator dictate the root a responder signs (the SI-001 trust hole). Only a
+    // LEGACY 'interrupted' session that predates DAEMON-004 (no tree ever persisted)
+    // falls back to message_count + the supplied root (SESSION-001 behavior).
     const ownTree = sessionNodeManager.getSessionTree(sessionId);
-    const hasOwnTree = ownTree.size() > 0;
-    const ownLeafCount = hasOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
-    const ownRoot = hasOwnTree ? sessionNodeManager.getSessionTreeRootHex(sessionId) : merkleRootReq;
+    const isActive = localRecord.status === "active";
+    const useOwnTree = isActive || ownTree.size() > 0;
+    const ownLeafCount = useOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
+    const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(sessionId) : merkleRootReq;
 
     // SI-002/AC-008: leaf-count agreement against our own state.
     if (ownLeafCount !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
@@ -1364,6 +1379,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         guidance: "The bilateral seal commitment could not be persisted because the session changed state. Re-check cello status — it may already be pending or sealed.",
       };
     }
+
+    // round-2 finding #5: the session is now frozen at 'seal_interrupted_pending'.
+    // Retire its live libp2p node so no further inbound content can arrive (which
+    // ingestReceivedContent now also rejects) and so the node is not leaked per
+    // active close. retireSessionNode stops the node WITHOUT changing the DB status.
+    await sessionNodeManager.retireSessionNode(sessionId);
 
     return { ok: true, sessionId, status: "seal_initiated", rootHex: ownRootHex };
   }

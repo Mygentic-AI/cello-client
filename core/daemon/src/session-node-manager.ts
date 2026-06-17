@@ -522,6 +522,38 @@ export class SessionNodeManager {
     });
   }
 
+  /**
+   * round-2 finding #5: retire a session's live libp2p node WITHOUT changing its
+   * DB status. Used after the active-session bilateral seal commitment has already
+   * advanced the row to 'seal_interrupted_pending': the session is frozen, so we
+   * stop the node and unregister its /cello/content handler (no more inbound leaves,
+   * no leaked node per active close) but must NOT overwrite the pending/sealed status
+   * the way destroySessionNode would. The durable tree stays in SQLite (getSessionTree
+   * reloads it); the in-memory plaintext buffer is evicted.
+   */
+  async retireSessionNode(sessionId: string): Promise<void> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) return;
+    try {
+      await entry.node.stop();
+    } catch (err: unknown) {
+      this.#logger.error("session.node.stop.failed", {
+        sessionId,
+        agentName: entry.agentName,
+        error: err instanceof Error ? err.message : String(err),
+        correlationId: entry.correlationId,
+      });
+      // Fall through — still remove from active map.
+    }
+    this.#activeNodes.delete(sessionId);
+    this.#evictSessionCaches(sessionId);
+    this.#logger.info("session.node.destroyed", {
+      sessionId,
+      agentName: entry.agentName,
+      reason: "sealing",
+    });
+  }
+
   /** Drop the in-memory tree + received-content caches for a torn-down session. */
   #evictSessionCaches(sessionId: string): void {
     this.#trees.delete(sessionId);
@@ -648,6 +680,14 @@ export class SessionNodeManager {
     const now = Date.now();
     const interruptedAt = new Date(now).toISOString();
 
+    // round-2 finding #7: the daemon-owned tree is the authoritative transcript
+    // length. The `messageCount` arg comes from registerRelayStream time and defaults
+    // to 0, so writing it blindly would clobber the column out of sync with the tree
+    // (both seal flows prefer tree.size(), but the column must not lie). When a tree
+    // exists for this session, persist its size; otherwise fall back to the arg.
+    const treeSize = this.getSessionTree(sessionId).size();
+    const authoritativeCount = treeSize > 0 ? treeSize : messageCount;
+
     try {
       // The `AND status = 'active'` predicate is the authoritative guard: even if
       // the pre-check above raced (it cannot — DatabaseSync is synchronous), the
@@ -656,7 +696,7 @@ export class SessionNodeManager {
         .prepare(
           "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE session_id = ? AND status = 'active'",
         )
-        .run(now, messageCount, interruptedAt, sessionId);
+        .run(now, authoritativeCount, interruptedAt, sessionId);
     } catch (err: unknown) {
       this.#logger.error("session.interrupt.db.write.failed", {
         sessionId,
@@ -975,6 +1015,23 @@ export class SessionNodeManager {
     contentHash: Uint8Array,
     correlationId?: string,
   ): { ok: true; leafIndex: number; sequenceNumber: number } | { ok: false; reason: string } {
+    // round-2 finding #5: once a session leaves 'active' (the bilateral seal
+    // commitment advances it to 'seal_interrupted_pending', or it is 'sealed' /
+    // 'interrupted'), its transcript is FROZEN. A late inbound frame must NOT append
+    // a new leaf — doing so would diverge the local tree from the root that was just
+    // committed and signed (and that a later FROST notarization attests). We reject
+    // it here. (A session with no DB row at all is a test-only path and is allowed.)
+    const record = this.getSessionRecord(sessionId);
+    if (record && record.status !== "active") {
+      this.#logger.warn("session.content.cross_check.failed", {
+        sessionId,
+        reason: "session_not_active",
+        currentStatus: record.status,
+        correlationId,
+      });
+      return { ok: false, reason: "session_not_active" };
+    }
+
     const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     if (Buffer.from(computed).toString("hex") !== contentHashHex) {
