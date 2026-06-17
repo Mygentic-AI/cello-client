@@ -113,7 +113,11 @@ export interface DaemonHandle {
   /**
    * M7 Action 2: the live directory-facing libp2p node (or null when signaling is not
    * connected). Registration's FROST DKG and future ceremonies open streams to the
-   * directory on this node. Consumers must gate use on signaling being connected.
+   * directory on this node. Consumers must gate use on signaling being connected AND
+   * always null-check the result: there is a brief window during stream death where the
+   * reference is already cleared (null) while signalingManager.status still reads
+   * "connected". Null is the safe direction (never a tearing-down node); do not assume
+   * non-null just because status is connected.
    */
   getDirectoryNode(): CelloNode | null;
 }

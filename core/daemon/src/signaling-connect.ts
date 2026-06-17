@@ -256,6 +256,10 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
         manifestVersion: deps.getManifestVersion?.() ?? 0,
       };
     } catch (err: unknown) {
+      // Symmetry with publishNode(node): if anything threw after we published (or in a
+      // reconnect attempt), clear the daemon's reference so it never points at a node
+      // we're about to stop. No-op when nothing was published this attempt.
+      deps.publishNode?.(null);
       try {
         sigStream.abort(new Error("directory_auth_error"));
       } catch {
