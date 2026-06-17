@@ -200,6 +200,23 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     expect(mgr.getSessionTreeRootHex(sid)).toBe(rootBefore);
   });
 
+  it("finding #2: appendSessionLeaf keeps sessions.message_count synced to the tree size", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    expect(mgr.getSessionRecord(sid)!.message_count ?? 0).toBe(0);
+
+    // A sent leaf advances message_count.
+    mgr.appendSessionLeaf(sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("a"))).toString("hex"));
+    expect(mgr.getSessionRecord(sid)!.message_count).toBe(1);
+
+    // A received leaf (via ingest) also advances it — column tracks the tree, so a
+    // post-active-messaging seal binds the real transcript length, not 0.
+    const content = new TextEncoder().encode("b");
+    mgr.ingestReceivedContent(sid, content, msgLeafHash(content));
+    expect(mgr.getSessionRecord(sid)!.message_count).toBe(2);
+    expect(mgr.getSessionTree(sid).size()).toBe(2);
+  });
+
   it("AC-001 receive: ingestReceivedContent cross-checks, appends the leaf, buffers, fires session.content.received", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");

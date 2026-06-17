@@ -101,53 +101,81 @@ async function buildSignedSealInterruptedLeaf(
 }
 
 /**
- * CELLO-M7-DAEMON-004: canonical byte encoding of an active-session SEAL ctrl
- * leaf for Ed25519 signing/verification. Deterministic field order. The leaf
- * commits to the daemon's OWN current Merkle root (SI-001 — never a
- * caller-supplied root). Crypto: Ed25519 RFC 8032.
+ * M7-SESSION-001 / DAEMON-004: verify a counterparty's SEAL-INTERRUPTED ack leaf.
+ *
+ * Shared by BOTH the interrupted-seal flow (SESSION-001) and the active-session
+ * seal flow (DAEMON-004 finding #1) so the two paths perform an identical
+ * bilateral check. Returns a generic reason; each caller maps it to its own
+ * reason codes / observability events / guidance.
+ *
+ * Checks, in order:
+ *   1. L-2: the ack echoes the exact nonce we sent (replay / stale-response guard).
+ *   2. leafCount agreement: the counterparty's leafCount equals our own — an
+ *      independent value, so a genuine divergence in transcript length is caught.
+ *   3. SI-002 / SI-003: the leaf carries a valid Ed25519 signature produced by the
+ *      counterparty's OWN key (signerPubkey must equal the expected counterparty).
+ *
+ * Crypto: Ed25519 RFC 8032.
  */
-interface ActiveSealLeaf {
-  type: "SEAL";
-  sessionId: string;
-  merkleRoot: string;
-  leafCount: number;
-  timestamp: number;
-  signerPubkey: string;
-  signature: string;
-}
+type SealLeafVerifyReason = "nonce_mismatch" | "leaf_count_mismatch" | "leaf_signature_invalid";
+function verifyCounterpartySealLeaf(opts: {
+  leaf: Record<string, unknown>;
+  sentNonce: string;
+  ackNonce: string | null;
+  ownLeafCount: number;
+  expectedCounterpartyPubkey: string;
+}): { ok: true } | { ok: false; reason: SealLeafVerifyReason; error: string } {
+  const { leaf, sentNonce, ackNonce, ownLeafCount, expectedCounterpartyPubkey } = opts;
 
-function canonicalSealLeafBytes(leaf: Omit<ActiveSealLeaf, "signature">): Uint8Array {
-  return new TextEncoder().encode(
-    JSON.stringify({
-      type: leaf.type,
-      sessionId: leaf.sessionId,
-      merkleRoot: leaf.merkleRoot,
-      leafCount: leaf.leafCount,
-      timestamp: leaf.timestamp,
-      signerPubkey: leaf.signerPubkey,
-    }),
-  );
-}
+  // 1. L-2: the counterparty MUST echo the exact nonce we sent.
+  if (ackNonce !== sentNonce) {
+    return { ok: false, reason: "nonce_mismatch", error: "ack nonce did not match the request nonce" };
+  }
 
-/**
- * CELLO-M7-DAEMON-004: build and K_local-sign an active-session SEAL leaf over
- * the daemon's own tree root. The private key never leaves keyProvider (SI-003:
- * only the signing party's own node ever produces this signature).
- */
-async function buildSignedActiveSealLeaf(
-  keyProvider: KeyProvider,
-  opts: { sessionId: string; merkleRoot: string; leafCount: number; signerPubkeyHex: string },
-): Promise<ActiveSealLeaf> {
-  const partial = {
-    type: "SEAL" as const,
-    sessionId: opts.sessionId,
-    merkleRoot: opts.merkleRoot,
-    leafCount: opts.leafCount,
-    timestamp: Date.now(),
-    signerPubkey: opts.signerPubkeyHex,
-  };
-  const sig = await keyProvider.sign(canonicalSealLeafBytes(partial));
-  return { ...partial, signature: Buffer.from(sig).toString("hex") };
+  // 2. leafCount agreement against our own independent count.
+  const cpLeafCount = typeof leaf["leafCount"] === "number" ? (leaf["leafCount"] as number) : null;
+  if (cpLeafCount !== ownLeafCount) {
+    return {
+      ok: false,
+      reason: "leaf_count_mismatch",
+      error: `counterparty leafCount ${String(cpLeafCount)} != own leafCount ${ownLeafCount}`,
+    };
+  }
+
+  // 3. SI-002/SI-003: verify the counterparty's Ed25519 signature on its OWN leaf.
+  try {
+    const signerPubkeyHex = typeof leaf["signerPubkey"] === "string" ? (leaf["signerPubkey"] as string) : null;
+    const signatureHex = typeof leaf["signature"] === "string" ? (leaf["signature"] as string) : null;
+    if (!signerPubkeyHex || !signatureHex) {
+      throw new Error("leaf missing signerPubkey or signature");
+    }
+    if (signerPubkeyHex !== expectedCounterpartyPubkey) {
+      throw new Error(
+        `leaf signerPubkey ${signerPubkeyHex.slice(0, 16)} does not match counterparty ${expectedCounterpartyPubkey.slice(0, 16)}`,
+      );
+    }
+    const canonicalLeaf = {
+      type: leaf["type"],
+      sessionId: leaf["sessionId"],
+      leafCount: leaf["leafCount"],
+      merkleRootAtInterruption: leaf["merkleRootAtInterruption"],
+      timestamp: leaf["timestamp"],
+      signerPubkey: leaf["signerPubkey"],
+    };
+    const leafBytes = new TextEncoder().encode(JSON.stringify(canonicalLeaf));
+    const pubkeyBytes = new Uint8Array(Buffer.from(signerPubkeyHex, "hex"));
+    const sigBytes = new Uint8Array(Buffer.from(signatureHex, "hex"));
+    if (!ed25519Verify(pubkeyBytes, leafBytes, sigBytes)) {
+      return { ok: false, reason: "leaf_signature_invalid", error: "Ed25519 signature verification failed on SEAL-INTERRUPTED leaf" };
+    }
+    return { ok: true };
+  } catch (verifyErr: unknown) {
+    return {
+      ok: false,
+      reason: "leaf_signature_invalid",
+      error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+    };
+  }
 }
 
 export interface DaemonHandle {
@@ -583,6 +611,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
+    // Ownership: the current agent on this connection must own the session.
+    if (record.agent_name !== connState.currentAgent) {
+      return {
+        ok: false,
+        reason: "session_not_owned",
+        guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it (see cello_list_sessions), then retry.",
+      };
+    }
+
     // AC-010: already sealed
     if (record.status === "sealed") {
       return {
@@ -763,31 +800,42 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     const localRecord = sessionNodeManager.getSessionRecord(sessionId);
     if (!localRecord) { await reject("session_not_found"); return; }
-    // Only an interrupted session is eligible — never re-process a sealed or
-    // already-pending one (and never an active one).
-    if (localRecord.status !== "interrupted") { await reject("session_not_interrupted"); return; }
+    // DAEMON-004: an 'active' session is eligible too (the active-session seal
+    // reuses this exchange). We still never re-process a terminal 'sealed' row or
+    // an already-pending one.
+    if (localRecord.status !== "interrupted" && localRecord.status !== "active") {
+      await reject("session_not_interrupted");
+      return;
+    }
     // The request must be addressed to one of our agents (counterpartyPubkey is
     // OUR pubkey from the initiator's perspective).
     const localAgent = agents.find((a) => a.pubkey === counterpartyPubkey);
     if (!localAgent) { await reject("unknown_counterparty"); return; }
     // From our perspective the initiator is our counterparty.
     if (localRecord.counterparty_pubkey !== initiatorPubkey) { await reject("initiator_mismatch"); return; }
+
+    // DAEMON-004 (SI-001): prefer OUR OWN daemon-owned tree. When we hold a
+    // non-empty tree for this session we sign over OUR OWN root + size (each node
+    // signs the root it built — SI-001), and the bilateral leaf-count check uses
+    // our own tree size. Only when no tree was ever persisted do we fall back to
+    // message_count + echoing the initiator-supplied root (SESSION-001 behavior).
+    const ownTree = sessionNodeManager.getSessionTree(sessionId);
+    const hasOwnTree = ownTree.size() > 0;
+    const ownLeafCount = hasOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
+    const ownRoot = hasOwnTree ? sessionNodeManager.getSessionTreeRootHex(sessionId) : merkleRootReq;
+
     // SI-002/AC-008: leaf-count agreement against our own state.
-    if ((localRecord.message_count ?? 0) !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
+    if (ownLeafCount !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
 
     const kp = keyProviders.get(localAgent.name);
     if (!kp) { await reject("signing_key_unavailable"); return; }
 
-    // Co-sign our SEAL-INTERRUPTED leaf over the same Merkle root the initiator sent.
-    // C-1: the daemon holds no session Merkle tree, so the responder cannot compute
-    // its own root — it echoes the initiator-supplied merkleRootReq back unchanged.
-    // The meaningful bilateral check at this layer is the leaf-count comparison above
-    // (against our OWN message_count); true Merkle-root agreement is a deferred
-    // FROST-seal concern (see the H-1 SCOPE note).
+    // Co-sign our SEAL-INTERRUPTED leaf. When we hold our own tree the root is
+    // ours (SI-001); otherwise we echo the initiator-supplied root unchanged.
     const ownLeaf = await buildSignedSealInterruptedLeaf(kp, {
       sessionId,
-      leafCount: localRecord.message_count ?? 0,
-      merkleRootAtInterruption: merkleRootReq,
+      leafCount: ownLeafCount,
+      merkleRootAtInterruption: ownRoot,
       signerPubkeyHex: counterpartyPubkey,
     });
 
@@ -800,7 +848,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       role: "responder",
       ownLeaf,
       counterpartyLeaf: null,
-      merkleRoot: merkleRootReq,
+      merkleRoot: ownRoot,
       nonce,
     });
 
@@ -824,7 +872,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger.info("session.interrupted.responder.acked", {
       sessionId,
       agentName: localAgent.name,
-      leafCount: localRecord.message_count ?? 0,
+      leafCount: ownLeafCount,
       correlationId,
     });
   }
@@ -862,19 +910,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //       deep architectural surgery.
   //     - the daemon holds no FrostThresholdSigner instance and no directory FROST
   //       ceremony client.
-  //     - the daemon holds NO session Merkle tree (it tracks only message_count),
-  //       so it cannot itself compute or independently verify the Merkle root — the
-  //       root must be supplied by the client. The responder in particular has no
-  //       synchronous client interaction to obtain its own root; it echoes the
-  //       initiator-supplied root back in its leaf rather than computing one.
-  //   Consequence for cross-checking (C-1): Merkle-root agreement is NOT verified
-  //   at this daemon leaf-exchange layer. The leafCount agreement (responder vs its
-  //   own SQLite message_count, and initiator vs its own ownLeafCount) is the
-  //   bilateral check available here. True Merkle-root agreement is verified at the
-  //   FROST seal step against the directory-held tree, which is deferred. We still
-  //   persist the initiator-supplied merkleRootAtInterruption in the artifacts table
-  //   because it is the value the eventual FROST seal will use — but the daemon does
-  //   not, and cannot, independently verify it.
+  //     - DAEMON-004 UPDATE: the daemon now DOES own a per-session Merkle tree
+  //       (SessionNodeManager / SessionTree). When a non-empty tree exists for the
+  //       session (e.g. reloaded from session_tree_leaves after a restart) BOTH the
+  //       initiator and the responder bind over their OWN tree root + size (SI-001),
+  //       and message_count is kept synced to the tree. Only legacy sessions with no
+  //       persisted tree fall back to message_count + the caller-supplied root.
+  //   Consequence for cross-checking (C-1): leafCount agreement (each side vs its own
+  //   tree size, or message_count when no tree exists) is the bilateral check at this
+  //   layer. Merkle-root agreement is still NOT compared here — under concurrent
+  //   bidirectional traffic the two sides' local append orders (and thus roots) can
+  //   diverge until the relay-assigned canonical sequence (MSG-001) exists; true
+  //   root agreement is the deferred FROST-seal step against the directory-held tree.
   //   Per the audit instruction, we therefore STOP at the persisted bilateral
   //   commitment under 'seal_interrupted_pending' rather than fake a completed seal.
   //   Wiring the real FROST seal requires injecting a SealManager adapter from a
@@ -883,6 +930,50 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   type SealFlowResult =
     | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
     | { ok: false; reason: string; guidance: string };
+
+  // M7-SESSION-001 / DAEMON-004: shared bilateral ack-await machinery. The
+  // interrupted-seal flow AND the active-session seal flow both send a
+  // `seal_interrupted_request` and wait on the directory signaling stream for the
+  // counterparty's `seal_interrupted_ack` / `seal_interrupted_rejection` (or time
+  // out). Extracted so the two flows wait identically — the directory pass-through
+  // routing (directory-node.ts) is the only wired transport for this exchange.
+  const SEAL_INTERRUPTED_TIMEOUT_MS = 30_000;
+  type SealAckResult =
+    | { type: "seal_interrupted_ack"; sealInterruptedLeaf: Record<string, unknown>; nonce: string | null }
+    | { type: "seal_interrupted_rejection"; reason: string }
+    | { type: "timeout" };
+
+  function awaitSealAck(sessionId: string): Promise<SealAckResult> {
+    return new Promise<SealAckResult>((resolve) => {
+      const timeoutHandle = setTimeout(() => {
+        unregister();
+        resolve({ type: "timeout" });
+      }, SEAL_INTERRUPTED_TIMEOUT_MS);
+
+      const unregister = signalingManager.registerInboundHandler((frame) => {
+        if (frame.type !== "seal_interrupted_ack" && frame.type !== "seal_interrupted_rejection") {
+          return;
+        }
+        if (typeof frame.sessionId !== "string" || frame.sessionId !== sessionId) return;
+
+        clearTimeout(timeoutHandle);
+        unregister();
+
+        if (frame.type === "seal_interrupted_ack") {
+          resolve({
+            type: "seal_interrupted_ack",
+            sealInterruptedLeaf: (frame.sealInterruptedLeaf as Record<string, unknown>) ?? {},
+            nonce: typeof frame.nonce === "string" ? frame.nonce : null,
+          });
+        } else {
+          resolve({
+            type: "seal_interrupted_rejection",
+            reason: typeof frame.reason === "string" ? frame.reason : "unknown",
+          });
+        }
+      });
+    });
+  }
 
   async function handleSealInterruptedFlow(
     sessionId: string,
@@ -897,7 +988,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const agent = agents.find((a) => a.name === record.agent_name);
     const myPubkeyHex = agent?.pubkey ?? "";
     const counterpartyPubkey = record.counterparty_pubkey;
-    const ownLeafCount = record.message_count ?? 0;
+
+    // DAEMON-004 (AC-007 / SI-001 / finding #2): prefer the daemon-owned tree.
+    // After a SIGKILL+restart the active session is forced to 'interrupted' and
+    // its Merkle tree is reloaded from session_tree_leaves. When that reloaded
+    // tree is non-empty it is the authoritative transcript: the seal binds over
+    // the daemon's OWN reloaded root + size, and any caller-supplied
+    // merkleRootAtInterruption is IGNORED (SI-001). Only when no tree was ever
+    // persisted (legacy / pre-DAEMON-004 sessions) do we fall back to the
+    // caller-supplied root and the message_count column (SESSION-001 behavior).
+    const reloadedTree = sessionNodeManager.getSessionTree(sessionId);
+    const hasOwnTree = reloadedTree.size() > 0;
+    const ownLeafCount = hasOwnTree ? reloadedTree.size() : (record.message_count ?? 0);
+    const effectiveRoot = hasOwnTree
+      ? sessionNodeManager.getSessionTreeRootHex(sessionId)
+      : merkleRootAtInterruption;
 
     // DB-001: check signaling status before attempting to send
     if (signalingManager.status === "reconnecting") {
@@ -934,7 +1039,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const ownLeaf = await buildSignedSealInterruptedLeaf(myKeyProvider, {
       sessionId,
       leafCount: ownLeafCount,
-      merkleRootAtInterruption,
+      merkleRootAtInterruption: effectiveRoot,
       signerPubkeyHex: myPubkeyHex,
     });
 
@@ -945,7 +1050,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       initiatorPubkey: myPubkeyHex,
       counterpartyPubkey,
       leafCountAtInterruption: ownLeafCount,
-      merkleRootAtInterruption,
+      merkleRootAtInterruption: effectiveRoot,
       nonce,
     };
 
@@ -965,42 +1070,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    // Wait for counterparty ack/rejection via registered inbound handler
-    const SEAL_INTERRUPTED_TIMEOUT_MS = 30_000;
-    type AckResult =
-      | { type: "seal_interrupted_ack"; sealInterruptedLeaf: Record<string, unknown>; nonce: string | null }
-      | { type: "seal_interrupted_rejection"; reason: string }
-      | { type: "timeout" };
-
-    const ackResult = await new Promise<AckResult>((resolve) => {
-      const timeoutHandle = setTimeout(() => {
-        unregister();
-        resolve({ type: "timeout" });
-      }, SEAL_INTERRUPTED_TIMEOUT_MS);
-
-      const unregister = signalingManager.registerInboundHandler((frame) => {
-        if (frame.type !== "seal_interrupted_ack" && frame.type !== "seal_interrupted_rejection") {
-          return;
-        }
-        if (typeof frame.sessionId !== "string" || frame.sessionId !== sessionId) return;
-
-        clearTimeout(timeoutHandle);
-        unregister();
-
-        if (frame.type === "seal_interrupted_ack") {
-          resolve({
-            type: "seal_interrupted_ack",
-            sealInterruptedLeaf: (frame.sealInterruptedLeaf as Record<string, unknown>) ?? {},
-            nonce: typeof frame.nonce === "string" ? frame.nonce : null,
-          });
-        } else {
-          resolve({
-            type: "seal_interrupted_rejection",
-            reason: typeof frame.reason === "string" ? frame.reason : "unknown",
-          });
-        }
-      });
-    });
+    // Wait for counterparty ack/rejection via the shared signaling await machinery.
+    const ackResult = await awaitSealAck(sessionId);
 
     if (ackResult.type === "timeout") {
       logger.error("session.interrupted.seal.failed", {
@@ -1036,108 +1107,38 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     {
       const leaf = ackResult.sealInterruptedLeaf;
 
-      // L-2: the counterparty MUST echo the exact nonce we sent. A missing or
-      // mismatched nonce indicates a stale or replayed response — reject it.
-      if (ackResult.nonce !== nonce) {
+      // C-1 / SI-002 / SI-003: nonce (L-2), leafCount agreement, and the
+      // counterparty's own Ed25519 signature are verified by the shared helper.
+      // We compare against our OWN ownLeafCount (an independent value) so a real
+      // divergence in transcript length is caught. Merkle-root agreement is NOT
+      // verified at this leaf-exchange layer (it is the FROST-seal step's job
+      // against the directory-held tree); see the H-1 SCOPE note above.
+      const verified = verifyCounterpartySealLeaf({
+        leaf,
+        sentNonce: nonce,
+        ackNonce: ackResult.nonce,
+        ownLeafCount,
+        expectedCounterpartyPubkey: record.counterparty_pubkey,
+      });
+      if (!verified.ok) {
+        const reasonMap = {
+          nonce_mismatch: "seal_interrupted_nonce_mismatch",
+          leaf_count_mismatch: "seal_interrupted_leaf_count_mismatch",
+          leaf_signature_invalid: "seal_interrupted_leaf_signature_invalid",
+        } as const;
+        const guidanceMap = {
+          nonce_mismatch: "The counterparty's acknowledgement did not echo the expected nonce. This indicates a stale or replayed response. The session remains interrupted — retry cello_close_session.",
+          leaf_count_mismatch: "The counterparty's recorded message count at interruption does not match ours. The two sides have divergent session histories and cannot form a bilateral commitment. Compare cello status on both ends before retrying.",
+          leaf_signature_invalid: "The counterparty's SEAL-INTERRUPTED leaf signature did not verify. The seal flow has been aborted. The session remains interrupted — retry cello_close_session after confirming the counterparty is using a compatible version.",
+        } as const;
         logger.error("session.interrupted.seal.failed", {
           sessionId,
           agentName: record.agent_name,
-          reason: "seal_interrupted_nonce_mismatch",
-          error: "ack nonce did not match the request nonce",
+          reason: reasonMap[verified.reason],
+          error: verified.error,
           correlationId,
         });
-        return {
-          ok: false,
-          reason: "seal_interrupted_nonce_mismatch",
-          guidance: "The counterparty's acknowledgement did not echo the expected nonce. This indicates a stale or replayed response. The session remains interrupted — retry cello_close_session.",
-        };
-      }
-
-      // C-1 / SI-002 / AC-008: leafCount agreement is the ONE bilateral check
-      // available at this layer. We compare the counterparty's returned leafCount
-      // against our OWN message_count — a genuinely independent value — so a real
-      // divergence in session length is caught here.
-      //
-      // Merkle-root agreement is NOT verified at the daemon leaf-exchange layer
-      // because the daemon holds no session Merkle tree. The responder does not
-      // independently compute a root; it echoes the initiator-supplied
-      // merkleRootAtInterruption back in its leaf, so comparing the returned root
-      // against our own would always be true for an honest network and could only
-      // ever fire on wire corruption — never on real divergence. We therefore do
-      // NOT perform that comparison rather than claim a guarantee we cannot provide.
-      // True Merkle-root agreement is verified at the FROST seal step against the
-      // directory-held tree, which is deferred (see the H-1 SCOPE note above).
-      const cpLeafCount = typeof leaf.leafCount === "number" ? leaf.leafCount : null;
-      if (cpLeafCount !== ownLeafCount) {
-        logger.error("session.interrupted.seal.failed", {
-          sessionId,
-          agentName: record.agent_name,
-          reason: "seal_interrupted_leaf_count_mismatch",
-          error: `counterparty leafCount ${String(cpLeafCount)} != own leafCount ${ownLeafCount}`,
-          correlationId,
-        });
-        return {
-          ok: false,
-          reason: "seal_interrupted_leaf_count_mismatch",
-          guidance: "The counterparty's recorded message count at interruption does not match ours. The two sides have divergent session histories and cannot form a bilateral commitment. Compare cello status on both ends before retrying.",
-        };
-      }
-
-      // SI-002: verify counterparty's K_local Ed25519 signature on the SEAL-INTERRUPTED leaf.
-      // The leaf.signerPubkey must match the expected counterparty pubkey (record.counterparty_pubkey).
-      // Canonical leaf content to verify: JSON.stringify({type, sessionId, leafCount,
-      //   merkleRootAtInterruption, timestamp, signerPubkey}) — deterministic field ordering.
-      let sigVerified = false;
-      try {
-        const signerPubkeyHex = typeof leaf.signerPubkey === "string" ? leaf.signerPubkey : null;
-        const signatureHex = typeof leaf.signature === "string" ? leaf.signature : null;
-        if (!signerPubkeyHex || !signatureHex) {
-          throw new Error("leaf missing signerPubkey or signature");
-        }
-        // SI-002: signerPubkey must match the expected counterparty
-        if (signerPubkeyHex !== record.counterparty_pubkey) {
-          throw new Error(`leaf signerPubkey ${signerPubkeyHex.slice(0, 16)} does not match counterparty ${record.counterparty_pubkey.slice(0, 16)}`);
-        }
-        const canonicalLeaf = {
-          type: leaf.type,
-          sessionId: leaf.sessionId,
-          leafCount: leaf.leafCount,
-          merkleRootAtInterruption: leaf.merkleRootAtInterruption,
-          timestamp: leaf.timestamp,
-          signerPubkey: leaf.signerPubkey,
-        };
-        const leafBytes = new TextEncoder().encode(JSON.stringify(canonicalLeaf));
-        const pubkeyBytes = new Uint8Array(Buffer.from(signerPubkeyHex, "hex"));
-        const sigBytes = new Uint8Array(Buffer.from(signatureHex, "hex"));
-        sigVerified = ed25519Verify(pubkeyBytes, leafBytes, sigBytes);
-      } catch (verifyErr: unknown) {
-        logger.error("session.interrupted.seal.failed", {
-          sessionId,
-          agentName: record.agent_name,
-          reason: "seal_interrupted_leaf_signature_invalid",
-          error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
-          correlationId,
-        });
-        return {
-          ok: false,
-          reason: "seal_interrupted_leaf_signature_invalid",
-          guidance: "The counterparty's SEAL-INTERRUPTED leaf signature could not be verified. The seal flow has been aborted. The session remains interrupted — retry cello_close_session after confirming the counterparty is using a compatible version.",
-        };
-      }
-
-      if (!sigVerified) {
-        logger.error("session.interrupted.seal.failed", {
-          sessionId,
-          agentName: record.agent_name,
-          reason: "seal_interrupted_leaf_signature_invalid",
-          error: "Ed25519 signature verification failed on SEAL-INTERRUPTED leaf",
-          correlationId,
-        });
-        return {
-          ok: false,
-          reason: "seal_interrupted_leaf_signature_invalid",
-          guidance: "The counterparty's SEAL-INTERRUPTED leaf signature did not verify. The seal flow has been aborted. The session remains interrupted — retry cello_close_session after confirming the counterparty is using a compatible version.",
-        };
+        return { ok: false, reason: reasonMap[verified.reason], guidance: guidanceMap[verified.reason] };
       }
 
       // H-1: signature + nonce + cross-checks all passed. We have a VERIFIED
@@ -1151,7 +1152,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         role: "initiator",
         ownLeaf,
         counterpartyLeaf: leaf,
-        merkleRoot: merkleRootAtInterruption,
+        merkleRoot: effectiveRoot,
         nonce,
       });
       if (!advanced) {
@@ -1231,13 +1232,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // appended itself. Any caller-supplied merkleRoot is never read here.
     const ownRootHex = sessionNodeManager.getSessionTreeRootHex(sessionId);
     const leafCount = sessionNodeManager.getSessionTree(sessionId).size();
+    const nonce = randomUUID();
 
-    let sealLeaf: ActiveSealLeaf;
+    // SI-003: K_local-sign our OWN SEAL leaf over our own root. We reuse the
+    // wired SEAL-INTERRUPTED leaf shape so the counterparty co-signs an identical
+    // canonical form (the active and interrupted bilateral exchanges share the
+    // directory pass-through routing — there is no separate `seal_request`
+    // transport, and inventing one silently drops the frame at the directory).
+    let ownLeaf: SealInterruptedLeaf;
     try {
-      sealLeaf = await buildSignedActiveSealLeaf(kp, {
+      ownLeaf = await buildSignedSealInterruptedLeaf(kp, {
         sessionId,
-        merkleRoot: ownRootHex,
         leafCount,
+        merkleRootAtInterruption: ownRootHex,
         signerPubkeyHex: myPubkeyHex,
       });
     } catch (err: unknown) {
@@ -1262,15 +1269,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       correlationId,
     });
 
-    // Submit the SEAL to the directory signaling stream (relay + FROST coordination).
+    // Submit the SEAL request over the directory signaling stream (the SAME wired
+    // pass-through the interrupted-seal flow uses) and AWAIT the counterparty's
+    // bilateral ack. We never report success on a fire-and-forget send.
     const sendResult = await signalingManager.sendRaw({
-      type: "seal_request",
+      type: "seal_interrupted_request",
       sessionId,
       initiatorPubkey: myPubkeyHex,
       counterpartyPubkey: record.counterparty_pubkey,
-      merkleRoot: ownRootHex,
-      leafCount,
-      sealLeaf,
+      leafCountAtInterruption: leafCount,
+      merkleRootAtInterruption: ownRootHex,
+      nonce,
     });
     if (!sendResult.ok) {
       logger.error("session.seal.initiate.failed", {
@@ -1285,6 +1294,74 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         guidance: "guidance" in sendResult && typeof sendResult.guidance === "string"
           ? sendResult.guidance
           : "The seal could not be submitted to the directory. Retry once cello status shows directory_signaling connected.",
+      };
+    }
+
+    // Wait for the counterparty's bilateral ack (or rejection / timeout).
+    const ackResult = await awaitSealAck(sessionId);
+    if (ackResult.type === "timeout" || ackResult.type === "seal_interrupted_rejection") {
+      const reason = ackResult.type === "timeout" ? "seal_counterparty_unavailable" : "seal_rejected_by_counterparty";
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason,
+        errorMessage: ackResult.type === "timeout" ? "seal_response_timeout" : ackResult.reason,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason,
+        guidance: ackResult.type === "timeout"
+          ? "The counterparty did not acknowledge the seal in time. Retry when they are online — check cello_list_connections. The session remains active and usable."
+          : "The counterparty rejected the seal request. Their session state may be inconsistent. Ask them to check cello status before retrying.",
+      };
+    }
+
+    // SI-002 / SI-003: verify the counterparty's own-signed ack leaf over our root.
+    const verified = verifyCounterpartySealLeaf({
+      leaf: ackResult.sealInterruptedLeaf,
+      sentNonce: nonce,
+      ackNonce: ackResult.nonce,
+      ownLeafCount: leafCount,
+      expectedCounterpartyPubkey: record.counterparty_pubkey,
+    });
+    if (!verified.ok) {
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason: `seal_${verified.reason}`,
+        errorMessage: verified.error,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: `seal_${verified.reason}`,
+        guidance: "The counterparty's seal acknowledgement failed verification (nonce, leaf count, or signature). The session remains active — retry cello_close_session once both sides agree on the transcript.",
+      };
+    }
+
+    // Verified bilateral commitment over the daemon's OWN root. Persist both
+    // signed leaves and advance the session out of 'active'. As in the
+    // interrupted flow, we stop at the bilateral commitment ('seal_interrupted_pending');
+    // the FROST threshold notarization that finalizes 'sealed' is the deferred
+    // directory step (AC-004, exercised under CELLO_E2E_LIVE).
+    const advanced = sessionNodeManager.persistSealInterruptedCommitment({
+      sessionId,
+      role: "initiator",
+      ownLeaf,
+      counterpartyLeaf: ackResult.sealInterruptedLeaf,
+      merkleRoot: ownRootHex,
+      nonce,
+    });
+    if (!advanced) {
+      logger.error("session.seal.initiate.failed", {
+        sessionId,
+        reason: "seal_persist_failed",
+        errorMessage: "session row was not in an active/interrupted state at commit time",
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "seal_persist_failed",
+        guidance: "The bilateral seal commitment could not be persisted because the session changed state. Re-check cello status — it may already be pending or sealed.",
       };
     }
 
@@ -1305,6 +1382,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const record = sessionNodeManager.getSessionRecord(sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions for active sessions." };
+    }
+    if (record.agent_name !== connState.currentAgent) {
+      return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
     if (record.status !== "active") {
       return { ok: false, reason: "session_not_active", guidance: `Session is '${record.status}', not active. Content can only be sent on an active session. If it is interrupted, call cello_close_session to seal it.` };
@@ -1370,6 +1450,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const record = sessionNodeManager.getSessionRecord(sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
+    }
+    if (record.agent_name !== connState.currentAgent) {
+      return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
 
     const entry = sessionNodeManager.takeReceivedContent(sessionId);

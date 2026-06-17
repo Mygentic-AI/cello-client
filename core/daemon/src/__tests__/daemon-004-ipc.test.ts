@@ -43,7 +43,8 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider, verify as ed25519Verify } from "@cello-protocol/crypto";
+import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -99,6 +100,70 @@ function makeCapturingSignaling(captured: Record<string, unknown>[]): () => Prom
   const stream: SignalingStream = {
     send: async (frame: unknown) => { captured.push(frame as Record<string, unknown>); },
     onMessage: (_h: (frame: unknown) => void) => {},
+    close: () => {},
+  };
+  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
+}
+
+/** Canonical SEAL-INTERRUPTED leaf bytes — MUST match daemon.ts exactly. */
+function canonicalLeafBytes(leaf: {
+  type: string; sessionId: string; leafCount: number;
+  merkleRootAtInterruption: string; timestamp: number; signerPubkey: string;
+}): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify({
+    type: leaf.type, sessionId: leaf.sessionId, leafCount: leaf.leafCount,
+    merkleRootAtInterruption: leaf.merkleRootAtInterruption, timestamp: leaf.timestamp,
+    signerPubkey: leaf.signerPubkey,
+  }));
+}
+
+/** Build a real K_local-signed SEAL-INTERRUPTED leaf using a real keypair. */
+async function signLeaf(
+  kp: KeyProvider,
+  opts: { sessionId: string; leafCount: number; merkleRootAtInterruption: string; signerPubkeyHex: string },
+): Promise<Record<string, unknown>> {
+  const partial = {
+    type: "SEAL_INTERRUPTED", sessionId: opts.sessionId, leafCount: opts.leafCount,
+    merkleRootAtInterruption: opts.merkleRootAtInterruption, timestamp: Date.now(),
+    signerPubkey: opts.signerPubkeyHex,
+  };
+  const sig = await kp.sign(canonicalLeafBytes(partial));
+  return { ...partial, signature: Buffer.from(sig).toString("hex") };
+}
+
+/**
+ * Signaling stream that records sent frames AND plays the counterparty: on a
+ * `seal_interrupted_request` it co-signs a SEAL-INTERRUPTED ack leaf with the
+ * counterparty key (over whatever root + leafCount the initiator sent) and
+ * delivers the ack back. Mirrors the SESSION-001 initiator-flow test stub.
+ */
+function makeRespondingSignaling(
+  captured: Record<string, unknown>[],
+  cpKp: KeyProvider,
+  cpPubkeyHex: string,
+): () => Promise<ConnectResult> {
+  let inbound: ((frame: unknown) => void) | null = null;
+  const stream: SignalingStream = {
+    send: async (frame: unknown) => {
+      const f = frame as Record<string, unknown>;
+      captured.push(f);
+      if (f.type === "seal_interrupted_request") {
+        const leaf = await signLeaf(cpKp, {
+          sessionId: f.sessionId as string,
+          leafCount: f.leafCountAtInterruption as number,
+          merkleRootAtInterruption: f.merkleRootAtInterruption as string,
+          signerPubkeyHex: cpPubkeyHex,
+        });
+        setImmediate(() => inbound?.({
+          type: "seal_interrupted_ack",
+          sessionId: f.sessionId,
+          initiatorPubkey: f.initiatorPubkey,
+          nonce: f.nonce,
+          sealInterruptedLeaf: leaf,
+        }));
+      }
+    },
+    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
     close: () => {},
   };
   return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
@@ -235,15 +300,18 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     } finally { client.close(); }
   });
 
-  it("AC-003 + SI-001 + SI-003: active close initiates a seal over the daemon's OWN root, ignoring a caller merkleRoot", async () => {
+  it("AC-003 + SI-001 + SI-003: active close initiates a bilateral seal over the daemon's OWN root, ignoring a caller merkleRoot, and awaits the counterparty's own-signed ack", async () => {
     const { logger, events } = makeLogger();
     const alicePubkey = await makeAgentDir("alice");
+    // Real counterparty keypair so its ack leaf carries a verifiable signature.
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
     const node = new FakeNode();
     const captured: Record<string, unknown>[] = [];
-    const h = await start({ logger, node, signalingConnect: makeCapturingSignaling(captured) });
+    const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
     await new Promise((r) => setTimeout(r, 50)); // let signaling connect
     const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // Append two message leaves so the tree has a non-empty, real root.
     snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
     snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m2"))).toString("hex"));
@@ -258,6 +326,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       const res = await client.send("cello_close_session", { sessionId: SID, merkleRoot: "ff".repeat(32) }) as Record<string, unknown>;
       expect(res.reason).not.toBe("not_implemented");
       expect(res.ok).toBe(true);
+      expect(res.status).toBe("seal_initiated");
     } finally { client.close(); }
 
     // AC-003: session.seal.initiated with rootHex == daemon's OWN tree root.
@@ -270,24 +339,100 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     expect(initiated!.context.rootHex).toBe(ownRoot);
     expect(initiated!.context.rootHex).not.toBe("ff".repeat(32));
 
-    // SI-003: the SEAL leaf submitted is signed by the closing party's own key.
-    const sealReq = captured.find((f) => f.type === "seal_request");
+    // Finding #1: the daemon sends the WIRED seal_interrupted_request (the only
+    // frame the directory routes), NOT an unwired seal_request. It binds the
+    // daemon's OWN root + size (SI-001), never the caller's "ff..." value.
+    const sealReq = captured.find((f) => f.type === "seal_interrupted_request");
     expect(sealReq).toBeDefined();
-    const leaf = sealReq!.sealLeaf as Record<string, unknown>;
-    expect(leaf.signerPubkey).toBe(alicePubkey);
-    // The submitted frame carries no counterparty signature — the initiator never produces it.
+    expect(captured.find((f) => f.type === "seal_request")).toBeUndefined();
+    expect(sealReq!.merkleRootAtInterruption).toBe(ownRoot);
+    expect(sealReq!.merkleRootAtInterruption).not.toBe("ff".repeat(32));
+    expect(sealReq!.leafCountAtInterruption).toBe(2);
+    expect(sealReq!.initiatorPubkey).toBe(alicePubkey);
+    // The request frame carries no counterparty signature — the initiator never produces it.
+    expect(sealReq!.sealInterruptedLeaf).toBeUndefined();
     expect(sealReq!.counterpartySignature).toBeUndefined();
-    // And the initiator's own SEAL leaf signature verifies under the initiator key.
-    const canonical = JSON.stringify({
-      type: leaf.type, sessionId: leaf.sessionId, merkleRoot: leaf.merkleRoot,
-      leafCount: leaf.leafCount, timestamp: leaf.timestamp, signerPubkey: leaf.signerPubkey,
-    });
-    const ok = ed25519Verify(
-      new Uint8Array(Buffer.from(alicePubkey, "hex")),
-      new TextEncoder().encode(canonical),
-      new Uint8Array(Buffer.from(leaf.signature as string, "hex")),
+
+    // SI-003: the persisted bilateral commitment has BOTH leaves signed by their
+    // OWN owners — alice's own leaf by alice, the counterparty leaf by the
+    // counterparty's own key (never synthesized by the initiator).
+    const art = snm.getSealInterruptedArtifacts(SID);
+    expect(art).not.toBeNull();
+    expect(art!.role).toBe("initiator");
+    expect(art!.merkleRoot).toBe(ownRoot);
+    const ownLeaf = art!.ownLeaf as Record<string, unknown>;
+    const cpLeaf = art!.counterpartyLeaf as Record<string, unknown>;
+    expect(ownLeaf.signerPubkey).toBe(alicePubkey);
+    expect(cpLeaf.signerPubkey).toBe(cpPubkeyHex);
+    // The counterparty's ack leaf verifies under the COUNTERPARTY's key (SI-003).
+    const cpOk = ed25519Verify(
+      new Uint8Array(Buffer.from(cpPubkeyHex, "hex")),
+      canonicalLeafBytes(cpLeaf as { type: string; sessionId: string; leafCount: number; merkleRootAtInterruption: string; timestamp: number; signerPubkey: string }),
+      new Uint8Array(Buffer.from(cpLeaf.signature as string, "hex")),
     );
-    expect(ok).toBe(true);
+    expect(cpOk).toBe(true);
+    // alice's own leaf verifies under alice's key.
+    const ownOk = ed25519Verify(
+      new Uint8Array(Buffer.from(alicePubkey, "hex")),
+      canonicalLeafBytes(ownLeaf as { type: string; sessionId: string; leafCount: number; merkleRootAtInterruption: string; timestamp: number; signerPubkey: string }),
+      new Uint8Array(Buffer.from(ownLeaf.signature as string, "hex")),
+    );
+    expect(ownOk).toBe(true);
+  });
+
+  it("AC-007: after SIGKILL+restart, cello_close_session seals over the RELOADED daemon-owned root (not message_count / caller root)", async () => {
+    const { logger } = makeLogger();
+    const alicePubkey = await makeAgentDir("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+
+    // ── Daemon 1: build a transcript of 3 leaves, then "crash" (stop). ──
+    const node1 = new FakeNode();
+    const h1 = await start({ logger, node: node1 });
+    const snm1 = h1.getSessionNodeManager();
+    await snm1.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    for (const m of ["m1", "m2", "m3"]) {
+      snm1.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
+    }
+    const rootBeforeCrash = snm1.getSessionTreeRootHex(SID);
+    expect(snm1.getSessionTree(SID).size()).toBe(3);
+    await h1.stop("simulated_sigkill");
+    handle = null;
+
+    // ── Daemon 2: restart over the SAME celloDir. initialize() forces the
+    //    active session → interrupted; the tree reloads from session_tree_leaves. ──
+    const captured: Record<string, unknown>[] = [];
+    const node2 = new FakeNode();
+    const h2 = await start({ logger, node: node2, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
+    await new Promise((r) => setTimeout(r, 50));
+    const snm2 = h2.getSessionNodeManager();
+    // Transcript survived the restart boundary.
+    expect(snm2.getSessionTree(SID).size()).toBe(3);
+    expect(snm2.getSessionTreeRootHex(SID)).toBe(rootBeforeCrash);
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      // SI-001: a bogus caller root must be ignored — the reloaded tree root wins.
+      const res = await client.send("cello_close_session", { sessionId: SID, merkleRootAtInterruption: "ff".repeat(32) }) as Record<string, unknown>;
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe("seal_interrupted_pending");
+    } finally { client.close(); }
+
+    // The seal request bound the RELOADED root + size — not message_count=0, not "ff...".
+    const sealReq = captured.find((f) => f.type === "seal_interrupted_request");
+    expect(sealReq).toBeDefined();
+    expect(sealReq!.merkleRootAtInterruption).toBe(rootBeforeCrash);
+    expect(sealReq!.merkleRootAtInterruption).not.toBe("ff".repeat(32));
+    expect(sealReq!.leafCountAtInterruption).toBe(3);
+    expect(sealReq!.initiatorPubkey).toBe(alicePubkey);
+
+    // The persisted commitment seals over the reloaded root.
+    const art = snm2.getSealInterruptedArtifacts(SID);
+    expect(art).not.toBeNull();
+    expect(art!.merkleRoot).toBe(rootBeforeCrash);
   });
 
   it("DB-002: active close while signaling reconnecting returns signaling_reconnecting and does NOT initiate a seal", async () => {

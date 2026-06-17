@@ -6,6 +6,10 @@
  * or seal-manager.ts. The dead stack is RETIRED, not merely bypassed — verified
  * by a grep over the daemon and adapter production source (outside __tests__)
  * for `new CelloClient`, `session-manager`, and `seal-manager`. Zero matches.
+ *
+ * AC-006 (finding #7): the check also greps the BUILT production bundles (dist)
+ * when present, matching the AC's "built daemon and adapter production bundles"
+ * wording — source-clean is the proxy, bundle-clean is the literal artifact.
  */
 
 import { describe, it, expect } from "vitest";
@@ -35,6 +39,23 @@ function collectTsFiles(dir: string): string[] {
   return out;
 }
 
+/** Collect built .js bundle files under a dist directory (excludes test bundles). */
+function collectJsFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) {
+      if (entry === "__tests__" || entry === "node_modules") continue;
+      out.push(...collectJsFiles(full));
+    } else if (entry.endsWith(".js")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 describe("DAEMON-004: SI-002 dead-stack retirement", () => {
   it("daemon + adapter production source contains no CelloClient / session-manager / seal-manager references", () => {
     const dirs = [
@@ -44,6 +65,28 @@ describe("DAEMON-004: SI-002 dead-stack retirement", () => {
     const offenders: string[] = [];
     for (const dir of dirs) {
       for (const file of collectTsFiles(dir)) {
+        const text = readFileSync(file, "utf8");
+        for (const token of FORBIDDEN) {
+          if (text.includes(token)) {
+            offenders.push(`${file}: contains "${token}"`);
+          }
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("AC-006: the BUILT daemon + adapter dist bundles contain no CelloClient / session-manager / seal-manager references", () => {
+    const distDirs = [
+      join(CORE_ROOT, "daemon", "dist"),
+      join(CORE_ROOT, "adapter-claude-code", "dist"),
+    ];
+    const offenders: string[] = [];
+    for (const dir of distDirs) {
+      // dist may be absent if the build gate has not yet run in this checkout;
+      // collectJsFiles returns [] in that case and the source-level check above
+      // remains the active guard. When dist IS present it must also be clean.
+      for (const file of collectJsFiles(dir)) {
         const text = readFileSync(file, "utf8");
         for (const token of FORBIDDEN) {
           if (text.includes(token)) {

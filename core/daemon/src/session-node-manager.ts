@@ -751,9 +751,13 @@ export class SessionNodeManager {
       return false;
     }
 
+    // DAEMON-004: the bilateral commitment advances a session out of either
+    // 'interrupted' (SESSION-001 interrupted-seal flow) OR 'active' (DAEMON-004
+    // active-session seal). The guard still refuses to overwrite a terminal
+    // 'sealed' row or an already-pending one.
     const result = this.#db
       .prepare(
-        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE session_id = ? AND status = 'interrupted'",
+        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE session_id = ? AND status IN ('active', 'interrupted')",
       )
       .run(now, opts.sessionId);
     return Number(result.changes) > 0;
@@ -848,6 +852,15 @@ export class SessionNodeManager {
              VALUES (?, ?, ?, ?, ?)`,
           )
           .run(sessionId, leafIndex, kind, leafHashHex, Date.now());
+        // DAEMON-004 (finding #2): keep sessions.message_count synced to the tree
+        // size. message_count is the bilateral leafCount the seal flow signs over
+        // (handleSealInterruptedFlow / the responder). If it diverged from the
+        // daemon-owned tree, a post-active-messaging seal would attest to a
+        // truncated transcript and the bilateral leafCount check would mismatch.
+        // The tree (leafIndex + 1 leaves) is authoritative; the column tracks it.
+        this.#db
+          .prepare("UPDATE sessions SET message_count = ?, updated_at = ? WHERE session_id = ?")
+          .run(leafIndex + 1, Date.now(), sessionId);
       } catch (err: unknown) {
         // A persist failure must be visible, not swallowed: the in-memory tree
         // has advanced but the durable transcript has not, which would diverge
@@ -876,8 +889,18 @@ export class SessionNodeManager {
    * silent success and never a desync (closing the old silent fire-and-forget
    * content catch in the retired in-process client send path).
    *
-   * The relay hash-submit round-trip that assigns the global sequence number is
-   * the live-session path (AC-001 under CELLO_E2E_LIVE) and is layered by MSG-001.
+   * SCOPE / findings #3 + #4 — what this send path does and does NOT do today:
+   *   - #4: it delivers the content over the direct /cello/content/1.0.0 P2P
+   *     stream only. It does NOT also submit a K_local-SIGNED content_hash leaf to
+   *     the RELAY on /cello/relay/1.0.0 (EARS behavior #1). That relay hash-submit
+   *     is MSG-001's scope; AC-001's "relay log shows a hash_submit" evidence is
+   *     produced once MSG-001 lands.
+   *   - #3: because there is no relay yet, the sequence number cello_send returns
+   *     is the LOCAL leaf index, not a relay-assigned canonical global sequence.
+   *     Each daemon appends leaves in its own LOCAL observation order, so two
+   *     daemons' roots agree only under perfectly ping-ponged traffic. Canonical
+   *     cross-process ordering (and thus AC-002 root agreement under concurrent
+   *     bidirectional traffic) requires the relay-assigned sequence from MSG-001.
    */
   async sendContent(
     sessionId: string,
@@ -913,6 +936,16 @@ export class SessionNodeManager {
    * DAEMON-004: cross-check received content against its hash, append the
    * verified leaf to the daemon-owned tree, and buffer it for cello_receive.
    * A hash MISMATCH is genuine tamper — rejected without append or buffer.
+   *
+   * SCOPE / finding #5 — what this cross-check does and does NOT prove today:
+   * `contentHash` here is carried in the SAME content_frame as `content`, so this
+   * comparison only catches wire corruption of a single frame — it does NOT prove
+   * the content matches what the sender independently committed. Full tamper-
+   * evidence (EARS behavior #2) requires cross-checking against the K_local-signed
+   * content_hash leaf the sender submits to the RELAY on a separate channel; that
+   * relay hash-submit path is MSG-001's scope and does not exist yet. Until MSG-001
+   * lands, a malicious sender that sends matching (content, hash) in one frame is
+   * not detected here — only the relay-relayed signed leaf closes that gap.
    *
    * @returns the appended leaf index (as sequenceNumber) on success.
    */
