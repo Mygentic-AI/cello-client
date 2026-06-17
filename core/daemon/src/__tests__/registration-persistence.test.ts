@@ -19,7 +19,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, stat, readdir } from "node:fs/promises";
+import { mkdtemp, rm, stat, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mlDsaKeygenWithBytes, mlDsaVerify, InMemoryMlDsaKeyProvider } from "@cello-protocol/crypto";
@@ -162,6 +162,21 @@ describe("registration-persistence (daemon)", () => {
 
     expect((await alice.loadRegistrationState())!.agentId).toBe("alice-id");
     expect(await bob.loadRegistrationState()).toBeNull();
+  });
+
+  // ─── Corrupt-file handling (loud, not silent coercion) ────────────────────
+
+  it("throws a clear error on a corrupt registration file rather than coercing", async () => {
+    const p = new FileRegistrationPersistence({ agentDir, logger });
+    await p.persistRegistrationState({
+      agentId: "agent-1", primaryPubkey: "aa".repeat(32), mlDsaPubkey: "bb".repeat(32), registeredAt: 1,
+    });
+
+    // Corrupt the file: valid JSON, but the required fields are gone. A silent
+    // coercion would read this as registeredAt=NaN, which must not happen.
+    await writeFile(join(agentDir, "registration-state.json"), JSON.stringify({ status: "active" }));
+
+    await expect(p.loadRegistrationState()).rejects.toThrow(/corrupt/);
   });
 
   // ─── Security invariants ──────────────────────────────────────────────────

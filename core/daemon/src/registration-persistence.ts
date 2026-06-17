@@ -16,7 +16,8 @@
  * never appear in a log event — only the files hold them.
  */
 
-import { mkdir, readFile, rename, chmod, open as fsOpen } from "node:fs/promises";
+import { mkdir, readFile, rename, chmod, unlink, open as fsOpen } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import type { Logger } from "./types.js";
 
@@ -88,6 +89,27 @@ const SECRET_FILE_MODE = 0o600;
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 const unhex = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, "hex"));
+
+/**
+ * Required-field accessors. A registration file that exists but is missing or
+ * mistypes a field is corrupt — surface it loudly rather than silently coercing
+ * to NaN / an empty buffer (which would read as "unregistered" or hand crypto a
+ * zero-length key). Atomic writes make this unreachable in normal operation.
+ */
+function reqStr(obj: Record<string, unknown>, key: string, file: string): string {
+  const v = obj[key];
+  if (typeof v !== "string") {
+    throw new Error(`registration file '${file}' is corrupt: missing or non-string field '${key}'`);
+  }
+  return v;
+}
+function reqNum(obj: Record<string, unknown>, key: string, file: string): number {
+  const v = obj[key];
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new Error(`registration file '${file}' is corrupt: missing or non-numeric field '${key}'`);
+  }
+  return v;
+}
 
 /**
  * File-backed implementation. One instance is scoped to a single agent's
@@ -173,11 +195,11 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     const obj = await this.#readJson(FILE_REGISTRATION_STATE);
     if (!obj) return null;
     return {
-      agentId: String(obj["agentId"]),
-      primaryPubkey: String(obj["primaryPubkey"]),
-      mlDsaPubkey: String(obj["mlDsaPubkey"]),
-      registeredAt: Number(obj["registeredAt"]),
-      status: String(obj["status"]),
+      agentId: reqStr(obj, "agentId", FILE_REGISTRATION_STATE),
+      primaryPubkey: reqStr(obj, "primaryPubkey", FILE_REGISTRATION_STATE),
+      mlDsaPubkey: reqStr(obj, "mlDsaPubkey", FILE_REGISTRATION_STATE),
+      registeredAt: reqNum(obj, "registeredAt", FILE_REGISTRATION_STATE),
+      status: reqStr(obj, "status", FILE_REGISTRATION_STATE),
     };
   }
 
@@ -185,9 +207,9 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     const obj = await this.#readJson(FILE_MLDSA_KEYPAIR);
     if (!obj) return null;
     return {
-      mlDsaPubkey: String(obj["mlDsaPubkey"]),
-      secretKeyBlob: unhex(String(obj["secretKeyBlob"])),
-      algorithm: String(obj["algorithm"]),
+      mlDsaPubkey: reqStr(obj, "mlDsaPubkey", FILE_MLDSA_KEYPAIR),
+      secretKeyBlob: unhex(reqStr(obj, "secretKeyBlob", FILE_MLDSA_KEYPAIR)),
+      algorithm: reqStr(obj, "algorithm", FILE_MLDSA_KEYPAIR),
     };
   }
 
@@ -195,15 +217,15 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     const obj = await this.#readJson(FILE_FROST_SHARE);
     if (!obj) return null;
     return {
-      epochId: String(obj["epochId"]),
-      primaryPubkey: String(obj["primaryPubkey"]),
-      identifier: String(obj["identifier"]),
-      signingShare: unhex(String(obj["signingShare"])),
-      threshold: Number(obj["threshold"]),
-      participants: Number(obj["participants"]),
-      commitmentsCbor: unhex(String(obj["commitmentsCbor"])),
-      verifyingSharesCbor: unhex(String(obj["verifyingSharesCbor"])),
-      dkgMethod: String(obj["dkgMethod"]),
+      epochId: reqStr(obj, "epochId", FILE_FROST_SHARE),
+      primaryPubkey: reqStr(obj, "primaryPubkey", FILE_FROST_SHARE),
+      identifier: reqStr(obj, "identifier", FILE_FROST_SHARE),
+      signingShare: unhex(reqStr(obj, "signingShare", FILE_FROST_SHARE)),
+      threshold: reqNum(obj, "threshold", FILE_FROST_SHARE),
+      participants: reqNum(obj, "participants", FILE_FROST_SHARE),
+      commitmentsCbor: unhex(reqStr(obj, "commitmentsCbor", FILE_FROST_SHARE)),
+      verifyingSharesCbor: unhex(reqStr(obj, "verifyingSharesCbor", FILE_FROST_SHARE)),
+      dkgMethod: reqStr(obj, "dkgMethod", FILE_FROST_SHARE),
     };
   }
 
@@ -224,21 +246,50 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
   async #writeJsonAtomic(name: string, value: Record<string, unknown>): Promise<void> {
     await mkdir(this.#agentDir, { recursive: true });
     const finalPath = join(this.#agentDir, name);
+    // Random suffix (not just pid+counter) so two FileRegistrationPersistence
+    // instances sharing an agentDir in one process can never collide on the tmp
+    // path and truncate each other's write.
     const tmpPath = join(
       dirname(finalPath),
-      `.cello-reg-tmp-${process.pid}-${++this.#tmpCounter}-${name}`,
+      `.cello-reg-tmp-${process.pid}-${++this.#tmpCounter}-${randomBytes(6).toString("hex")}-${name}`,
     );
     const body = Buffer.from(JSON.stringify(value), "utf8");
-    const fd = await fsOpen(tmpPath, "w", SECRET_FILE_MODE);
     try {
-      await fd.write(body);
-      await fd.chmod(SECRET_FILE_MODE);
-    } finally {
-      await fd.close();
+      const fd = await fsOpen(tmpPath, "w", SECRET_FILE_MODE);
+      try {
+        await fd.write(body);
+        await fd.chmod(SECRET_FILE_MODE);
+        // fsync the data before rename so a crash between write and rename can't
+        // surface an empty/partial key file on recovery.
+        await fd.sync();
+      } finally {
+        await fd.close();
+      }
+      await rename(tmpPath, finalPath);
+      // rename preserves the tmp file's mode; chmod the final path defensively in
+      // case it pre-existed with looser permissions.
+      await chmod(finalPath, SECRET_FILE_MODE);
+      // Best-effort durability of the rename itself (parent-dir fsync). Not all
+      // platforms/filesystems support directory fsync — ignore failures.
+      await this.#fsyncDir(this.#agentDir);
+    } catch (err) {
+      // Never leave plaintext secret material (ML-DSA secret / FROST share) as
+      // orphaned tmp litter if the write or rename failed partway.
+      await unlink(tmpPath).catch(() => {});
+      throw err;
     }
-    await rename(tmpPath, finalPath);
-    // rename preserves the tmp file's mode; chmod the final path defensively in
-    // case it pre-existed with looser permissions.
-    await chmod(finalPath, SECRET_FILE_MODE);
+  }
+
+  async #fsyncDir(dir: string): Promise<void> {
+    try {
+      const dh = await fsOpen(dir, "r");
+      try {
+        await dh.sync();
+      } finally {
+        await dh.close();
+      }
+    } catch {
+      // Directory fsync is best-effort; some platforms reject opening a dir for sync.
+    }
   }
 }
