@@ -99,25 +99,28 @@ describe("fetchBootstrapMultiaddr", () => {
 });
 
 describe("createDirectoryEndpointResolver", () => {
-  it("resolves a DirectoryEndpoint and caches it (fetch called once)", async () => {
-    const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }));
+  it("re-resolves on every call (per-connect re-resolution, picks up address changes)", async () => {
+    const otherPeer = "12D3KooWOTHERotherotherotherotherotherotherotherother";
+    const otherAddr = `/dns4/dir2/tcp/443/wss/p2p/${otherPeer}`;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ multiaddr: MULTIADDR }))
+      .mockResolvedValueOnce(jsonResponse({ multiaddr: otherAddr }));
     const resolver = createDirectoryEndpointResolver({
       logger: silentLogger,
       directoryUrl: "http://dir.example",
       fetchFn: fetchFn as unknown as typeof fetch,
     });
 
-    const first = await resolver();
-    const second = await resolver();
-    expect(first).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
-    expect(second).toBe(first);
-    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
+    expect(await resolver()).toEqual({ peerId: otherPeer, multiaddr: otherAddr });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it("returns null and re-attempts until the bootstrap succeeds", async () => {
     const fetchFn = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse({}, false)) // first attempt fails
+      .mockResolvedValueOnce(jsonResponse({}, false)) // first attempt fails, no last-good yet
       .mockResolvedValueOnce(jsonResponse({ multiaddr: MULTIADDR })); // second succeeds
     const resolver = createDirectoryEndpointResolver({
       logger: silentLogger,
@@ -126,6 +129,22 @@ describe("createDirectoryEndpointResolver", () => {
     });
 
     expect(await resolver()).toBeNull();
+    expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the last known-good endpoint when a later fetch fails", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ multiaddr: MULTIADDR })) // succeeds → cached as last-good
+      .mockResolvedValueOnce(jsonResponse({}, false)); // transient failure → reuse last-good
+    const resolver = createDirectoryEndpointResolver({
+      logger: silentLogger,
+      directoryUrl: "http://dir.example",
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+
+    expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(fetchFn).toHaveBeenCalledTimes(2);
   });

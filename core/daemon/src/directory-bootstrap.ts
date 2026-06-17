@@ -77,31 +77,42 @@ export interface DirectoryEndpointResolverOptions {
 }
 
 /**
- * Build an async `getDirectoryEndpoint` for createSignalingConnect. Caches the
- * first successful resolution; re-attempts the bootstrap fetch until then.
+ * Build an async `getDirectoryEndpoint` for createSignalingConnect.
+ *
+ * Re-resolves the bootstrap on EVERY call (i.e. every connect attempt) so a
+ * directory address change — failover, DNS/port change, or peer-ID rotation — is
+ * picked up on the next reconnect. The last successfully-resolved endpoint is kept
+ * only as a fallback: if a fresh fetch fails, the resolver returns the last
+ * known-good endpoint so a transient /bootstrap blip doesn't strand a working daemon.
  */
 export function createDirectoryEndpointResolver(
   opts: DirectoryEndpointResolverOptions,
 ): () => Promise<DirectoryEndpoint | null> {
   const directoryUrl = opts.directoryUrl ?? resolveDirectoryUrl();
   const fetchFn = opts.fetchFn ?? fetch;
-  let cached: DirectoryEndpoint | null = null;
+  let lastGood: DirectoryEndpoint | null = null;
 
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
-    if (cached) return cached;
-
     const multiaddr = await fetchBootstrapMultiaddr(directoryUrl, fetchFn);
-    if (!multiaddr) {
-      opts.logger.warn("directory.bootstrap.unavailable", { directoryUrl });
-      return null;
-    }
-    const peerId = parsePeerIdFromMultiaddr(multiaddr);
-    if (!peerId) {
+    if (multiaddr) {
+      const peerId = parsePeerIdFromMultiaddr(multiaddr);
+      if (peerId) {
+        // Log only when the resolved endpoint actually changes (avoids per-connect noise).
+        if (!lastGood || lastGood.multiaddr !== multiaddr) {
+          opts.logger.info("directory.bootstrap.resolved", { directoryUrl, peerId });
+        }
+        lastGood = { peerId, multiaddr };
+        return lastGood;
+      }
       opts.logger.error("directory.bootstrap.no_peer_id", { directoryUrl, multiaddr });
-      return null;
+    } else {
+      opts.logger.warn("directory.bootstrap.unavailable", { directoryUrl });
     }
-    cached = { peerId, multiaddr };
-    opts.logger.info("directory.bootstrap.resolved", { directoryUrl, peerId });
-    return cached;
+    // Fresh resolution failed — reuse the last known-good endpoint if we have one.
+    if (lastGood) {
+      opts.logger.warn("directory.bootstrap.using_last_known", { directoryUrl, peerId: lastGood.peerId });
+      return lastGood;
+    }
+    return null;
   };
 }

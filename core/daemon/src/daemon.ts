@@ -283,10 +283,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //
   // NOTE (multi-agent, Action 2+): per-agent directory operations under distinct
   // identities are out of keystone scope. This establishes the directory door.
+  // L4: sort by name so the "primary" agent is STABLE across restarts — readdir
+  // order (agent-loader) is platform-dependent and unsorted, which would otherwise
+  // let the authenticating identity change between daemon restarts.
+  const primaryAgent = [...loadedAgents].sort((a, b) => a.name.localeCompare(b.name))[0];
   const getAuthIdentity = (): SignalingAuthIdentity | null => {
-    const primary = loadedAgents[0];
-    if (!primary) return null;
-    return { keyProvider: primary.keyProvider, pubkeyHex: primary.pubkey };
+    if (!primaryAgent) return null;
+    return { keyProvider: primaryAgent.keyProvider, pubkeyHex: primaryAgent.pubkey };
   };
 
   // Production builds signalingConnect from the bootstrap resolver + agent identity.
@@ -306,10 +309,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         })
       : defaultConnect);
 
+  // H1: a long-running daemon must ride out directory outages — notably the
+  // 25-30 min multi-region directory deploy. The transport default of 10 reconnect
+  // attempts (~5 min with default backoff) transitions the manager to terminal
+  // "lost" mid-deploy, with no public way to re-enter the loop — the daemon would
+  // never recover without a cello logout/login. Use an effectively-unbounded attempt
+  // budget with a capped backoff so it keeps retrying and reconnects within
+  // ~maxBackoffMs of the directory returning. (Availability is a first-class invariant.)
+  //
+  // L3: challengeVerifier is NOT passed here — the dialer (createSignalingConnect)
+  // performs step-6 verification itself, matching #doOpen. The manager's copy would
+  // be dead (processStep5Frame is only invoked inside connect()).
   const signalingManager = new SignalingManager({
     connect: resolvedConnect,
     logger,
-    challengeVerifier,
+    maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
+    maxBackoffMs: 30_000,
   });
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.

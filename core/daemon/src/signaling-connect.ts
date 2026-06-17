@@ -137,16 +137,23 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
     const node = deps.createDirectoryNode
       ? await deps.createDirectoryNode(identity.keyProvider)
       : await createNode({ keyProvider: identity.keyProvider, listenAddresses: ["/ip4/0.0.0.0/tcp/0"] });
-    await node.start();
 
     let sigStream: Stream;
     try {
+      // L1: start() is inside the try so a start failure is caught and the
+      // partially-started node is torn down (safeStop) rather than leaked.
+      await node.start();
       if (endpoint.multiaddr) {
         // Best-effort dial; newStream below surfaces the real failure if unreachable.
         try {
           await node.dial(endpoint.multiaddr);
-        } catch {
-          /* may already be connected, or dial-by-peerId works without it */
+        } catch (dialErr: unknown) {
+          // L2: non-fatal (dial-by-peerId may still work / already connected), but
+          // keep the real reason — newStream's error is generic.
+          deps.logger.debug("directory.dial.failed", {
+            multiaddr: endpoint.multiaddr,
+            error: errMsg(dialErr),
+          });
         }
       }
       sigStream = await node.newStream(endpoint.peerId, SIGNALING_PROTOCOL_ID);
