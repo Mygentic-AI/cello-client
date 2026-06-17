@@ -239,7 +239,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_send", { sessionId: SID, content: "hello" }) as Record<string, unknown>;
+      const res = await client.send("cello_send", { session_id: SID, content: "hello" }) as Record<string, unknown>;
       expect(res.reason).not.toBe("not_implemented");
       expect(res.ok).toBe(true);
       expect(typeof res.sequence_number).toBe("number");
@@ -251,6 +251,63 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     expect(snm.getSessionTree(SID).size()).toBe(1);
     expect(events.find((e) => e.event === "session.content.sent")).toBeDefined();
     expect(events.find((e) => e.event === "session.tree.appended")).toBeDefined();
+  });
+
+  // ─── round-2 BLOCKING regression: production proxy param contract ───────────
+  // The only shipped producer of these IPC calls is cello-mcp.ts, which forwards
+  // the public MCP tool fields VERBATIM through IpcProxy.call (ipc-proxy.ts:128 →
+  // JSON.stringify({ id, method, params })). connectToDaemon().send (ipc-client.ts:60)
+  // is the byte-identical passthrough — neither side rewrites keys. So sending the
+  // snake_case public field `session_id` here reproduces the exact wire frame the
+  // shipped binary emits. Before this fix the daemon read camelCase `params.sessionId`,
+  // so EVERY real cello_send/cello_receive/cello_close_session returned missing_params.
+  // This test fails closed if the daemon ever drifts back to camelCase.
+  it("production param contract: cello_send/receive/close_session accept snake_case session_id (the shipped proxy shape) and reject camelCase sessionId", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    // Real counterparty keypair so the active close can complete the bilateral ack.
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
+    await new Promise((r) => setTimeout(r, 50)); // let signaling connect
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // Buffer one inbound message so cello_receive has something to return.
+    const inbound = new TextEncoder().encode("from-bob");
+    snm.ingestReceivedContent(SID, inbound, msgLeafHash(inbound));
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      // ── snake_case (the real proxy shape) → works ──
+      const sendOk = await client.send("cello_send", { session_id: SID, content: "hello" }) as Record<string, unknown>;
+      expect(sendOk.ok).toBe(true);
+      expect(sendOk.reason).toBeUndefined();
+      const recvOk = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
+      expect(recvOk.ok).toBe(true);
+      expect(recvOk.content).toBe("from-bob");
+
+      // ── camelCase (the pre-fix bug shape) → rejected as missing_params, NOT silently accepted ──
+      const sendCamel = await client.send("cello_send", { sessionId: SID, content: "hello" }) as Record<string, unknown>;
+      expect(sendCamel.ok).toBe(false);
+      expect(sendCamel.reason).toBe("missing_params");
+      const recvCamel = await client.send("cello_receive", { sessionId: SID }) as Record<string, unknown>;
+      expect(recvCamel.ok).toBe(false);
+      expect(recvCamel.reason).toBe("missing_params");
+      const closeCamel = await client.send("cello_close_session", { sessionId: SID }) as Record<string, unknown>;
+      expect(closeCamel.ok).toBe(false);
+      expect(closeCamel.reason).toBe("missing_params");
+
+      // ── snake_case close on the active session → seal_interrupted_pending (matches persisted row) ──
+      const closeOk = await client.send("cello_close_session", { session_id: SID }) as Record<string, unknown>;
+      expect(closeOk.ok).toBe(true);
+      expect(closeOk.status).toBe("seal_interrupted_pending");
+    } finally { client.close(); }
   });
 
   it("AC-005 + DB-001: cello_send over a DEAD stream returns a named failure, fires session.content.send.failed, queues the leaf, session stays usable", async () => {
@@ -266,14 +323,14 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_send", { sessionId: SID, content: "hello" }) as Record<string, unknown>;
+      const res = await client.send("cello_send", { session_id: SID, content: "hello" }) as Record<string, unknown>;
       expect(res.ok).toBe(false);
       expect(res.reason).not.toBe("not_implemented");
       expect(typeof res.reason).toBe("string");
       expect((res.reason as string).length).toBeGreaterThan(0);
       expect(typeof res.guidance).toBe("string");
       // session still usable — a second send still reaches the send path (same failure, not desync)
-      const res2 = await client.send("cello_send", { sessionId: SID, content: "again" }) as Record<string, unknown>;
+      const res2 = await client.send("cello_send", { session_id: SID, content: "again" }) as Record<string, unknown>;
       expect(res2.ok).toBe(false);
       expect(res2.reason).not.toBe("session_desynchronized");
     } finally { client.close(); }
@@ -308,7 +365,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_receive", { sessionId: SID }) as Record<string, unknown>;
+      const res = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
       expect(res.reason).not.toBe("not_implemented");
       expect(res.ok).toBe(true);
       expect(res.content).toBe("from-bob");
@@ -338,10 +395,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
       // SI-001: supply a bogus caller merkleRoot — it MUST be ignored.
-      const res = await client.send("cello_close_session", { sessionId: SID, merkleRoot: "ff".repeat(32) }) as Record<string, unknown>;
+      const res = await client.send("cello_close_session", { session_id: SID, merkleRoot: "ff".repeat(32) }) as Record<string, unknown>;
       expect(res.reason).not.toBe("not_implemented");
       expect(res.ok).toBe(true);
-      expect(res.status).toBe("seal_initiated");
+      expect(res.status).toBe("seal_interrupted_pending");
     } finally { client.close(); }
 
     // AC-003: session.seal.initiated with rootHex == daemon's OWN tree root.
@@ -431,7 +488,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
       // SI-001: a bogus caller root must be ignored — the reloaded tree root wins.
-      const res = await client.send("cello_close_session", { sessionId: SID, merkleRootAtInterruption: "ff".repeat(32) }) as Record<string, unknown>;
+      const res = await client.send("cello_close_session", { session_id: SID, merkleRootAtInterruption: "ff".repeat(32) }) as Record<string, unknown>;
       expect(res.ok).toBe(true);
       expect(res.status).toBe("seal_interrupted_pending");
     } finally { client.close(); }
@@ -470,12 +527,12 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
       const [r1, r2] = await Promise.all([
-        client.send("cello_close_session", { sessionId: SID }),
-        client.send("cello_close_session", { sessionId: SID }),
+        client.send("cello_close_session", { session_id: SID }),
+        client.send("cello_close_session", { session_id: SID }),
       ]) as Record<string, unknown>[];
       const results = [r1, r2];
       const inProgress = results.filter((r) => r.reason === "seal_interrupted_in_progress");
-      const initiated = results.filter((r) => r.ok === true && r.status === "seal_initiated");
+      const initiated = results.filter((r) => r.ok === true && r.status === "seal_interrupted_pending");
       // Exactly one initiates the seal; the other is rejected by the concurrency guard.
       expect(inProgress).toHaveLength(1);
       expect(initiated).toHaveLength(1);
@@ -504,7 +561,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_close_session", { sessionId: SID }) as Record<string, unknown>;
+      const res = await client.send("cello_close_session", { session_id: SID }) as Record<string, unknown>;
       expect(res.ok).toBe(true);
     } finally { client.close(); }
 
@@ -564,7 +621,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_close_session", { sessionId: SID }) as Record<string, unknown>;
+      const res = await client.send("cello_close_session", { session_id: SID }) as Record<string, unknown>;
       expect(res.ok).toBe(false);
       expect(res.reason).toBe("signaling_reconnecting");
       expect(typeof res.guidance).toBe("string");

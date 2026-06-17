@@ -605,7 +605,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const result = await client.send("cello_close_session", { sessionId }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("session_already_sealed");
       expect(typeof result.guidance).toBe("string");
@@ -633,7 +633,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const result = await client.send("cello_close_session", { sessionId }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("signaling_reconnecting");
       expect(typeof result.guidance).toBe("string");
@@ -749,14 +749,14 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
       // sealInterruptedInProgress before the first await.
       // Attach .catch() to suppress the unhandled rejection when the daemon stops (afterEach)
       // and the IPC socket closes, rejecting this pending promise.
-      client.send("cello_close_session", { sessionId }).catch(() => {/* expected: daemon stop closes the socket */});
+      client.send("cello_close_session", { session_id: sessionId }).catch(() => {/* expected: daemon stop closes the socket */});
 
       // Yield to let the IPC server process the first request's socket data and
       // execute the handler synchronously up to the first await (where sealInterruptedInProgress.add fires)
       await new Promise<void>((r) => setTimeout(r, 20));
 
       // Second call must hit the guard
-      const second = await client.send("cello_close_session", { sessionId }) as Record<string, unknown>;
+      const second = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
       expect(second.ok).toBe(false);
       expect(second.reason).toBe("seal_interrupted_in_progress");
       expect(typeof second.guidance).toBe("string");
@@ -882,7 +882,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
 
       // Call cello_close_session — the flow will send the request, then receive the
       // tampered ack, verify the signature, detect it is invalid, and return an error.
-      const result = await client.send("cello_close_session", { sessionId }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
 
       // Must NOT return ok:true with status:'sealed'
       expect(result.ok).not.toBe(true);
@@ -1319,7 +1319,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const result = await client.send("cello_close_session", { sessionId, merkleRootAtInterruption: MROOT }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId, merkleRootAtInterruption: MROOT }) as Record<string, unknown>;
 
       expect(result.ok).toBe(true);
       expect(result.status).toBe("seal_interrupted_pending");
@@ -1395,7 +1395,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       await client.send("ipc.connect", { clientType: "test" });
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
-      const result = await client.send("cello_close_session", { sessionId, merkleRootAtInterruption: "ab" }) as Record<string, unknown>;
+      const result = await client.send("cello_close_session", { session_id: sessionId, merkleRootAtInterruption: "ab" }) as Record<string, unknown>;
 
       expect(result.ok).not.toBe(true);
       expect(result.reason).toBe("seal_interrupted_nonce_mismatch");

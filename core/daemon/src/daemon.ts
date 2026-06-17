@@ -593,12 +593,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return NO_CURRENT_AGENT_RESPONSE;
     }
 
-    const sessionId = params?.sessionId as string | undefined;
+    // round-2 BLOCKING: the public IPC contract field is snake_case `session_id`
+    // (this is what cello-mcp.ts forwards verbatim through IpcProxy, matching the
+    // rest of the public MCP tool surface — target_pubkey, content_hash, timeout_ms).
+    // Reading camelCase `sessionId` here meant every real proxy invocation produced
+    // undefined → missing_params. Consume the field the producer actually sends.
+    const sessionId = params?.session_id as string | undefined;
     if (!sessionId) {
       return {
         ok: false,
         reason: "missing_params",
-        guidance: "Provide 'sessionId' parameter with the hex session ID to close.",
+        guidance: "Provide 'session_id' parameter with the hex session ID to close.",
       };
     }
 
@@ -1207,8 +1212,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //      The bilateral counterparty ack + FROST threshold notarization complete the
   //      seal end-to-end (AC-004, exercised under CELLO_E2E_LIVE) — the daemon never
   //      synthesizes the counterparty's signature.
+  // round-2 [medium]: the IPC return status MUST match the persisted row. The
+  // active-seal flow advances the session to 'seal_interrupted_pending' (the same
+  // non-terminal bilateral-commitment state the interrupted flow uses); returning
+  // a distinct 'seal_initiated' here meant the close response and a subsequent
+  // cello_status / cello_list_sessions showed two names for one state. One name.
   type ActiveSealResult =
-    | { ok: true; sessionId: string; status: "seal_initiated"; rootHex: string }
+    | { ok: true; sessionId: string; status: "seal_interrupted_pending"; rootHex: string }
     | { ok: false; reason: string; guidance: string };
 
   async function handleActiveSealFlow(
@@ -1386,7 +1396,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // active close. retireSessionNode stops the node WITHOUT changing the DB status.
     await sessionNodeManager.retireSessionNode(sessionId);
 
-    return { ok: true, sessionId, status: "seal_initiated", rootHex: ownRootHex };
+    return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
   }
 
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
@@ -1394,10 +1404,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const connState = perConnectionState.get(connectionId);
     if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
 
-    const sessionId = params?.sessionId as string | undefined;
+    // round-2 BLOCKING: read the snake_case public field cello-mcp.ts actually sends.
+    const sessionId = params?.session_id as string | undefined;
     const contentStr = typeof params?.content === "string" ? params.content : undefined;
     if (!sessionId || contentStr === undefined) {
-      return { ok: false, reason: "missing_params", guidance: "Provide 'sessionId' (hex) and 'content' (string) parameters." };
+      return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) and 'content' (string) parameters." };
     }
 
     const record = sessionNodeManager.getSessionRecord(sessionId);
@@ -1464,9 +1475,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const connState = perConnectionState.get(connectionId);
     if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
 
-    const sessionId = params?.sessionId as string | undefined;
+    // round-2 BLOCKING: read the snake_case public field cello-mcp.ts actually sends.
+    const sessionId = params?.session_id as string | undefined;
     if (!sessionId) {
-      return { ok: false, reason: "missing_params", guidance: "Provide 'sessionId' (hex) to receive content for a specific session." };
+      return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) to receive content for a specific session." };
     }
     const record = sessionNodeManager.getSessionRecord(sessionId);
     if (!record) {
