@@ -45,6 +45,9 @@ import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
+import { RegistrationManager } from "./registration-manager.js";
+import { DaemonRegistrationContext } from "./registration-context.js";
+import { FileRegistrationPersistence } from "./registration-persistence.js";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
@@ -529,6 +532,81 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // ─── MCP-001: cello_list_agents handler ───
   handlers.set("cello_list_agents", async (_params, connectionId) => {
     return { agents: getAgentsForConnection(connectionId) };
+  });
+
+  // ─── M7-REGISTRATION (Action 2): cello_register handler ───
+  // Registers a LOADED agent (one with a K_local `key` under ~/.cello/agents/<name>/)
+  // with the directory: ML-DSA keygen → register_request → FROST DKG → register_success,
+  // persisting the ML-DSA keypair, FROST share, registration state, and agent→user link.
+  // Always invoked with a pre-authorization ticket from the CELLO Operations Agent.
+  const registrationGuidance = (reason: string): string => {
+    switch (reason) {
+      case "already_registered":
+        return "This agent is already registered with the directory. No action needed.";
+      case "directory_unreachable":
+        return "The directory signaling stream is not connected (or its bootstrap endpoint could not be resolved). Wait for directory_signaling to show connected in cello status, then retry.";
+      case "dkg_failed":
+        return "The FROST DKG ceremony with the directory failed. This usually means the directory rejected the pre-authorization token or a node was unavailable mid-ceremony. Verify the preAuthToken is valid/unused and retry.";
+      case "timeout":
+        return "The directory did not respond within the registration timeout. Retry once directory_signaling is connected.";
+      default:
+        return `Registration failed: ${reason}. Check the daemon logs (registration.* events) and that the preAuthToken is valid.`;
+    }
+  };
+
+  handlers.set("cello_register", async (params, _connectionId) => {
+    const name = params?.agent as string | undefined;
+    const preAuthToken = params?.preAuthToken as string | undefined;
+    const phoneStub = (params?.phoneStub as string | undefined) ?? "";
+    if (!name) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
+    }
+    if (!preAuthToken) {
+      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry cello_register." };
+    }
+    const keyProvider = keyProviders.get(name);
+    if (!keyProvider) {
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' has no local K_local key loaded. Its key must exist at ~/.cello/agents/${name}/key before registration — create it and restart the daemon, then retry cello_register.` };
+    }
+    if (!directoryEndpointResolver) {
+      return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };
+    }
+
+    // Resolve the directory endpoint once for this registration (the context's
+    // getDirectoryEndpoint is synchronous; the daemon's resolver is async with a
+    // last-known-good fallback). The endpoint is stable for the duration of one
+    // registration — if it changed mid-flow the DKG streams would break anyway.
+    const ep = await directoryEndpointResolver();
+    if (!ep || !ep.multiaddr) {
+      // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
+      // multiaddr is required (DirectoryEndpoint.multiaddr is optional for the
+      // already-connected signaling case, but registration needs to open streams).
+      return { ok: false, reason: "directory_unreachable", guidance: "Could not resolve a dialable directory bootstrap endpoint (GET /bootstrap). Check CELLO_DIRECTORY_URL and network connectivity, then retry." };
+    }
+    const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
+
+    const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
+    const ctx = new DaemonRegistrationContext({
+      signaling: signalingManager,
+      getDirectoryNode,
+      getDirectoryEndpoint: () => directoryEndpoint,
+      keyProvider,
+      persistence,
+      logger,
+    });
+    try {
+      const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
+      if ("error" in result) {
+        logger.warn("registration.failed", { agentName: name, reason: result.error });
+        return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
+      }
+      // Capture-now-or-lose-it: persist the agent→user link (using it is future trust-layer work).
+      await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
+      logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
+      return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
+    } finally {
+      ctx.dispose();
+    }
   });
 
   // M7-SESSION-001: tracks seal-interrupted flows currently in progress.
