@@ -50,6 +50,18 @@ export interface FrostKeyShareRecord {
 }
 
 /**
+ * The agent→user linkage captured at registration. The pre-authorization ticket
+ * (issued by the CELLO Operations Agent) binds this agent to a user; recording it
+ * here is the M7 "capture-now-or-lose-it" requirement — *using* the link (trust
+ * signals that attach to the user) is future trust-layer work.
+ */
+export interface AgentUserLinkRecord {
+  agentId: string;
+  preAuthToken: string;
+  linkedAt: number;
+}
+
+/**
  * Narrow persistence seam consumed by the daemon's RegistrationManager. Exactly
  * the three persist operations the registration flow performs, plus the matching
  * load operations needed to rehydrate an already-registered agent on restart.
@@ -84,6 +96,7 @@ export interface DaemonRegistrationPersistence {
 const FILE_REGISTRATION_STATE = "registration-state.json";
 const FILE_MLDSA_KEYPAIR = "ml-dsa-keypair.json";
 const FILE_FROST_SHARE = "frost-share.json";
+const FILE_AGENT_USER_LINK = "agent-user-link.json";
 
 const SECRET_FILE_MODE = 0o600;
 
@@ -189,6 +202,21 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     });
   }
 
+  /**
+   * Capture the agent→user link at registration (M7 capture-now-or-lose-it). Not
+   * part of the RegistrationManager seam — called by the cello_register handler
+   * after a successful register(), since only the handler holds the pre-auth ticket.
+   */
+  async persistAgentUserLink(opts: { agentId: string; preAuthToken: string; linkedAt: number }): Promise<void> {
+    // SI: the preAuthToken is a bearer ticket — written to disk only, never logged.
+    await this.#writeJsonAtomic(FILE_AGENT_USER_LINK, {
+      agentId: opts.agentId,
+      preAuthToken: opts.preAuthToken,
+      linkedAt: opts.linkedAt,
+    });
+    this.#logger.info("registration.user_link.persisted", { agentId: opts.agentId });
+  }
+
   // ─── Load (restart rehydration) ──────────────────────────────────────────────
 
   async loadRegistrationState(): Promise<RegistrationStateRecord | null> {
@@ -226,6 +254,16 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       commitmentsCbor: unhex(reqStr(obj, "commitmentsCbor", FILE_FROST_SHARE)),
       verifyingSharesCbor: unhex(reqStr(obj, "verifyingSharesCbor", FILE_FROST_SHARE)),
       dkgMethod: reqStr(obj, "dkgMethod", FILE_FROST_SHARE),
+    };
+  }
+
+  async loadAgentUserLink(): Promise<AgentUserLinkRecord | null> {
+    const obj = await this.#readJson(FILE_AGENT_USER_LINK);
+    if (!obj) return null;
+    return {
+      agentId: reqStr(obj, "agentId", FILE_AGENT_USER_LINK),
+      preAuthToken: reqStr(obj, "preAuthToken", FILE_AGENT_USER_LINK),
+      linkedAt: reqNum(obj, "linkedAt", FILE_AGENT_USER_LINK),
     };
   }
 

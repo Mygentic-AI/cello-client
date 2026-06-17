@@ -164,6 +164,25 @@ describe("registration-persistence (daemon)", () => {
     expect(await bob.loadRegistrationState()).toBeNull();
   });
 
+  // ─── Agent→user link (capture-now-or-lose-it) ─────────────────────────────
+
+  it("round-trips the agent→user link and never logs the pre-auth token", async () => {
+    const p = new FileRegistrationPersistence({ agentDir, logger });
+    const preAuthToken = "preauth-secret-ticket-xyz";
+    await p.persistAgentUserLink({ agentId: "agent-9", preAuthToken, linkedAt: 1781730000000 });
+
+    const loaded = await p.loadAgentUserLink();
+    expect(loaded).toEqual({ agentId: "agent-9", preAuthToken, linkedAt: 1781730000000 });
+    // SI: the bearer ticket must not appear in any log event.
+    expect(JSON.stringify(logEvents)).not.toContain(preAuthToken);
+    expect(logEvents.some((e) => e.event === "registration.user_link.persisted")).toBe(true);
+  });
+
+  it("loadAgentUserLink returns null when no link captured", async () => {
+    const p = new FileRegistrationPersistence({ agentDir, logger });
+    expect(await p.loadAgentUserLink()).toBeNull();
+  });
+
   // ─── Corrupt-file handling (loud, not silent coercion) ────────────────────
 
   it("throws a clear error on a corrupt registration file rather than coercing", async () => {
