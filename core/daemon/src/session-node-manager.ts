@@ -380,6 +380,16 @@ export class SessionNodeManager {
   }
 
   /**
+   * The libp2p Peer ID of an active session's node (N_A for an initiated session), or
+   * null if no active node exists for it. This is the initiator's session peer id that an
+   * inbound session_assignment must carry to the counterparty (so the counterparty gates
+   * its handed-off receiver to it). Read-only.
+   */
+  getSessionNodePeerId(sessionId: string): string | null {
+    return this.#activeNodes.get(sessionId)?.node.getPeerId() ?? null;
+  }
+
+  /**
    * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping the current standing
    * receiver node, or null if the standing receiver is not ready. The composition
    * root uses this as the daemon's runtime IAutoNatService — its getDialability()

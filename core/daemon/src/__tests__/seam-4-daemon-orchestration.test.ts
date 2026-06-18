@@ -1,0 +1,242 @@
+/**
+ * Seam 4 — full daemon-IPC two-daemon local orchestration, in-process, real libp2p.
+ *
+ * The end-to-end M6B-parity proof for the DIRECT path: two real daemons (A initiator,
+ * B counterparty) drive a complete session through their public IPC tool handlers —
+ * cello_initiate_session, cello_await_session, cello_send, cello_receive — with content
+ * crossing real Noise/yamux TCP between N_A and B's accepted session node.
+ *
+ *   A.cello_initiate_session  → stub negotiator returns an assignment (B's standing-receiver
+ *                               coords as counterparty, transport_mode:'direct') →
+ *                               createSessionNode(N_A) + connectToCounterparty (N_A dials B)
+ *   directory push to B        → session_assignment over B's signaling hub carrying N_A's
+ *                               peer id → seam-2 handler → B.acceptSession
+ *   B.cello_await_session      → returns the inbound session (also the sync point: the event
+ *                               is enqueued only after acceptSession registers B's handler)
+ *   A.cello_send               → content_frame over the live N_A ↔ B connection
+ *   B.cello_receive            → the delivered content; A's awaiting-ACK resolves
+ *
+ * The test plays the directory's two-round role explicitly (a stub negotiator on A +
+ * the assignment push to B) — the same in-process pattern as seams 2/3. No infra, no
+ * relay, no live directory. CELLO_ENV is unset → the transport selector is the local stub,
+ * so the real dial is connectToCounterparty (seam 1b), not a composition-root dialer.
+ *
+ * KNOWN follow-on (NOT proven here, intentionally): a SINGLE-round production negotiator
+ * cannot yet produce a complete assignment because cello_initiate_session creates N_A
+ * AFTER negotiate, so the initiator_session_peer_id is not known at negotiate time — the
+ * test supplies it on the push. The WIRE-001 restructure (create N_A before the assignment
+ * is finalized) is tracked in the M7 handoff §0/§5.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { createNode } from "@cello-protocol/transport";
+import { startDaemon } from "../daemon.js";
+import { connectToDaemon } from "../ipc-client.js";
+import type { Logger, DaemonConfig } from "../types.js";
+import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import type { SessionNegotiator } from "../transport-selector.js";
+import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
+import type { SessionAssignment } from "@cello-protocol/protocol-types";
+
+interface LogEvent { level: string; event: string; context: Record<string, unknown> }
+
+function makeLogger(): { logger: Logger; events: LogEvent[] } {
+  const events: LogEvent[] = [];
+  const logger: Logger = {
+    debug(event, context) { events.push({ level: "debug", event, context }); },
+    info(event, context) { events.push({ level: "info", event, context }); },
+    warn(event, context) { events.push({ level: "warn", event, context }); },
+    error(event, context) { events.push({ level: "error", event, context }); },
+  };
+  return { logger, events };
+}
+
+class RealNodeFactory implements ISessionNodeFactory {
+  async createNode(config: SessionNodeConfig): Promise<CelloNode> {
+    return createNode({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      connectionGater: config.connectionGater,
+      nodeType: config.nodeType,
+    });
+  }
+}
+
+/** Injectable signaling: records outbound frames; injectRef.inject pushes inbound. */
+function makeInjectableSignaling(injectRef: { inject?: (frame: unknown) => void }): () => Promise<ConnectResult> {
+  let inbound: ((frame: unknown) => void) | null = null;
+  const stream: SignalingStream = {
+    send: async () => {},
+    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
+    close: () => {},
+  };
+  injectRef.inject = (frame: unknown) => inbound?.(frame);
+  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
+}
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
+  let tempDir: string;
+  const handles: Array<Awaited<ReturnType<typeof startDaemon>>> = [];
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-seam4-"));
+    handles.length = 0;
+  });
+  afterEach(async () => {
+    for (const h of handles) { try { await h.stop("test_cleanup"); } catch { /* ignore */ } }
+    handles.length = 0;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  /** Create an agent key dir under a daemon's celloDir; return its pubkey hex. */
+  async function makeAgent(celloDir: string, name: string): Promise<string> {
+    const dir = join(celloDir, "agents", name);
+    await mkdir(dir, { recursive: true });
+    const kp = await FileKeyProvider.load(join(dir, "key"));
+    return Buffer.from(await kp.getPublicKey()).toString("hex");
+  }
+
+  async function startOne(opts: {
+    celloDir: string;
+    signalingConnect: () => Promise<ConnectResult>;
+    sessionNegotiator?: SessionNegotiator;
+  }): Promise<Awaited<ReturnType<typeof startDaemon>>> {
+    const { logger, events } = makeLogger();
+    const config: DaemonConfig = {
+      celloDir: opts.celloDir,
+      socketPath: join(opts.celloDir, "daemon.sock"),
+      lockFilePath: join(opts.celloDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger,
+      sessionNodeFactory: new RealNodeFactory(),
+      signalingConnect: opts.signalingConnect,
+      sessionNegotiator: opts.sessionNegotiator,
+    };
+    const h = await startDaemon(config);
+    handles.push(h);
+    (h as unknown as { __events: LogEvent[] }).__events = events;
+    return h;
+  }
+
+  const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 7));
+  const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
+  const TS = 1_700_000_000_000;
+
+  it("A initiates → B accepts via signaling → A.cello_send → B.cello_receive, with A's awaiting-ACK resolved", async () => {
+    const dirA = join(tempDir, "A");
+    const dirB = join(tempDir, "B");
+    const alicePubkey = await makeAgent(dirA, "alice");
+    const bobPubkey = await makeAgent(dirB, "bob");
+
+    // ── Bring up B (counterparty) with injectable signaling, so its standing receiver
+    //    exists and its coordinates can be advertised to A's negotiator.
+    const injectB: { inject?: (frame: unknown) => void } = {};
+    const B = await startOne({ celloDir: dirB, signalingConnect: makeInjectableSignaling(injectB) });
+    await wait(50);
+    const bInfo = B.getSessionNodeManager().getStandingReceiverInfo();
+    expect(bInfo).not.toBeNull();
+
+    // ── A's stub negotiator: returns a complete direct-mode assignment whose counterparty
+    //    is B's standing receiver. (Crypto fields are zero-filled — nothing verifies them on
+    //    the local path; the transport selector is the local stub.)
+    const negotiator: SessionNegotiator = {
+      async negotiate() {
+        const assignment: SessionAssignment = {
+          session_id: SID_BYTES,
+          participant_a: { pubkey: Buffer.from(alicePubkey, "hex"), peer_id: "", multiaddrs: [] },
+          participant_b: { pubkey: Buffer.from(bobPubkey, "hex"), peer_id: bInfo!.peerId, multiaddrs: bInfo!.addrs },
+          relay_endpoint: { peer_id: "", multiaddrs: [] },
+          directory_endpoint: { peer_id: "", multiaddrs: [] },
+          session_timestamp: TS,
+          directory_pubkey: new Uint8Array(32),
+          directory_signature: new Uint8Array(64),
+          transport_mode: "direct",
+          counterparty_session_peer_id: bInfo!.peerId,
+          counterparty_session_addrs: bInfo!.addrs,
+          signature_type: "frost",
+          signer_pubkey: new Uint8Array(32),
+        };
+        return { ok: true, assignment };
+      },
+    };
+    const A = await startOne({ celloDir: dirA, signalingConnect: makeInjectableSignaling({}), sessionNegotiator: negotiator });
+    await wait(50);
+
+    // ── B's agent blocks on cello_await_session (also the sync point: the inbound event is
+    //    enqueued only after seam-2's acceptSession registers B's content handler).
+    const clientB = await connectToDaemon(join(dirB, "daemon.sock"));
+    const clientA = await connectToDaemon(join(dirA, "daemon.sock"));
+    try {
+      await clientB.send("ipc.connect", { clientType: "test" });
+      await clientB.send("cello_start_agent", { name: "bob" });
+      await clientB.send("cello_use_agent", { name: "bob" });
+      const awaitP = clientB.send("cello_await_session", { timeout_ms: 5000 }) as Promise<Record<string, unknown>>;
+      await wait(30);
+
+      // ── A initiates. createSessionNode(N_A) + connectToCounterparty (N_A dials B's SR).
+      await clientA.send("ipc.connect", { clientType: "test" });
+      await clientA.send("cello_start_agent", { name: "alice" });
+      await clientA.send("cello_use_agent", { name: "alice" });
+      const initRes = await clientA.send("cello_initiate_session", { counterparty_pubkey: bobPubkey }) as Record<string, unknown>;
+      expect(initRes.ok).toBe(true);
+      expect(initRes.sessionId).toBe(SID_HEX);
+
+      // ── The directory pushes the assignment to B, carrying N_A's peer id (known only now).
+      const naPeerId = A.getSessionNodeManager().getSessionNodePeerId(SID_HEX);
+      expect(typeof naPeerId).toBe("string");
+      injectB.inject!({
+        type: "session_assignment",
+        assignment: {
+          session_id: SID_BYTES,
+          participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
+          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+          initiator_session_peer_id: naPeerId,
+          session_timestamp: TS,
+          signature_type: "frost",
+        },
+      });
+
+      // ── B discovers the session via the blocked await (proves seam-2 acceptSession ran).
+      const awaited = await awaitP;
+      expect(awaited.type).toBe("new_session");
+      expect(awaited.session_id).toBe(SID_HEX);
+      expect(awaited.counterparty_pubkey).toBe(alicePubkey);
+
+      // ── A sends; B receives over the live N_A ↔ B connection.
+      const text = "hello from alice over the full daemon stack";
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: text }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      expect(sent.sequence_number).toBe(0);
+
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(recv).not.toBeNull();
+      expect(recv!.content).toBe(text);
+      expect(recv!.sequence_number).toBe(0);
+      expect(recv!.senderPubkey).toBe(alicePubkey);
+
+      // ── A's awaiting-ACK resolved (the delivery-ACK round-tripped back over N_A's link).
+      const aEvents = (A as unknown as { __events: LogEvent[] }).__events;
+      let acked = false;
+      for (let i = 0; i < 80; i++) {
+        if (aEvents.find((e) => e.event === "content.delivery.acked")) { acked = true; break; }
+        await wait(25);
+      }
+      expect(acked).toBe(true);
+    } finally {
+      clientA.close();
+      clientB.close();
+    }
+  }, 40_000);
+});
