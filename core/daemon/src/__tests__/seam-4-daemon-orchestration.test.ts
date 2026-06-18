@@ -1,10 +1,12 @@
 /**
  * Seam 4 — full daemon-IPC two-daemon local orchestration, in-process, real libp2p.
  *
- * The end-to-end M6B-parity proof for the DIRECT path: two real daemons (A initiator,
- * B counterparty) drive a complete session through their public IPC tool handlers —
- * cello_initiate_session, cello_await_session, cello_send, cello_receive — with content
- * crossing real Noise/yamux TCP between N_A and B's accepted session node.
+ * In-process M6B-BEHAVIORAL parity for the DIRECT path (NOT a substitute for the live
+ * multi-process smoke test — the milestone-close gate is still a separate, real
+ * multi-process run). Two real daemons (A initiator, B counterparty) drive a complete
+ * session through their PUBLIC IPC tool handlers — cello_initiate_session,
+ * cello_await_session, cello_send, cello_receive — with content crossing real Noise/yamux
+ * TCP between N_A and B's accepted session node.
  *
  *   A.cello_initiate_session  → stub negotiator returns an assignment (B's standing-receiver
  *                               coords as counterparty, transport_mode:'direct') →
@@ -18,8 +20,8 @@
  *
  * The test plays the directory's two-round role explicitly (a stub negotiator on A +
  * the assignment push to B) — the same in-process pattern as seams 2/3. No infra, no
- * relay, no live directory. CELLO_ENV is unset → the transport selector is the local stub,
- * so the real dial is connectToCounterparty (seam 1b), not a composition-root dialer.
+ * relay, no live directory. CELLO_ENV is forced to 'local' → the transport selector is the
+ * local stub, so the real dial is connectToCounterparty (seam 1b), not a composition dialer.
  *
  * KNOWN follow-on (NOT proven here, intentionally): a SINGLE-round production negotiator
  * cannot yet produce a complete assignment because cello_initiate_session creates N_A
@@ -82,9 +84,15 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
   let tempDir: string;
+  let priorCelloEnv: string | undefined;
   const handles: Array<Awaited<ReturnType<typeof startDaemon>>> = [];
 
   beforeEach(async () => {
+    // The seam REQUIRES the local transport-selector stub (CELLO_ENV local/test/unset).
+    // Force it hermetically so a runner with CELLO_ENV=dev|staging|production can't make
+    // createTransportSelector throw and break the test for an unrelated reason (review M2).
+    priorCelloEnv = process.env["CELLO_ENV"];
+    process.env["CELLO_ENV"] = "local";
     tempDir = await mkdtemp(join(tmpdir(), "cello-seam4-"));
     handles.length = 0;
   });
@@ -92,6 +100,8 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
     for (const h of handles) { try { await h.stop("test_cleanup"); } catch { /* ignore */ } }
     handles.length = 0;
     await rm(tempDir, { recursive: true, force: true });
+    if (priorCelloEnv === undefined) delete process.env["CELLO_ENV"];
+    else process.env["CELLO_ENV"] = priorCelloEnv;
   });
 
   /** Create an agent key dir under a daemon's celloDir; return its pubkey hex. */
@@ -106,7 +116,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
     celloDir: string;
     signalingConnect: () => Promise<ConnectResult>;
     sessionNegotiator?: SessionNegotiator;
-  }): Promise<Awaited<ReturnType<typeof startDaemon>>> {
+  }): Promise<{ h: Awaited<ReturnType<typeof startDaemon>>; events: LogEvent[] }> {
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
       celloDir: opts.celloDir,
@@ -121,8 +131,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
     };
     const h = await startDaemon(config);
     handles.push(h);
-    (h as unknown as { __events: LogEvent[] }).__events = events;
-    return h;
+    return { h, events };
   }
 
   const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 7));
@@ -135,11 +144,10 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
     const alicePubkey = await makeAgent(dirA, "alice");
     const bobPubkey = await makeAgent(dirB, "bob");
 
-    // ── Bring up B (counterparty) with injectable signaling, so its standing receiver
-    //    exists and its coordinates can be advertised to A's negotiator.
+    // ── Bring up B (counterparty). startDaemon awaits SessionNodeManager.initialize(),
+    //    which awaits standing-receiver creation, so its coordinates are ready immediately.
     const injectB: { inject?: (frame: unknown) => void } = {};
-    const B = await startOne({ celloDir: dirB, signalingConnect: makeInjectableSignaling(injectB) });
-    await wait(50);
+    const { h: B } = await startOne({ celloDir: dirB, signalingConnect: makeInjectableSignaling(injectB) });
     const bInfo = B.getSessionNodeManager().getStandingReceiverInfo();
     expect(bInfo).not.toBeNull();
 
@@ -166,24 +174,27 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
         return { ok: true, assignment };
       },
     };
-    const A = await startOne({ celloDir: dirA, signalingConnect: makeInjectableSignaling({}), sessionNegotiator: negotiator });
-    await wait(50);
+    const { h: A, events: aEvents } = await startOne({
+      celloDir: dirA,
+      signalingConnect: makeInjectableSignaling({}),
+      sessionNegotiator: negotiator,
+    });
 
-    // ── B's agent blocks on cello_await_session (also the sync point: the inbound event is
-    //    enqueued only after seam-2's acceptSession registers B's content handler).
     const clientB = await connectToDaemon(join(dirB, "daemon.sock"));
     const clientA = await connectToDaemon(join(dirA, "daemon.sock"));
     try {
       await clientB.send("ipc.connect", { clientType: "test" });
-      await clientB.send("cello_start_agent", { name: "bob" });
-      await clientB.send("cello_use_agent", { name: "bob" });
-      const awaitP = clientB.send("cello_await_session", { timeout_ms: 5000 }) as Promise<Record<string, unknown>>;
-      await wait(30);
+      expect(((await clientB.send("cello_start_agent", { name: "bob" })) as Record<string, unknown>).ok).toBe(true);
+      expect(((await clientB.send("cello_use_agent", { name: "bob" })) as Record<string, unknown>).ok).toBe(true);
+      // Inner await deadline is generous (governed by the 40s `it` budget, not a value
+      // smaller than A's real-libp2p initiate must take — review M1).
+      const awaitP = clientB.send("cello_await_session", { timeout_ms: 30_000 }) as Promise<Record<string, unknown>>;
+      await wait(30); // ensure the waiter is registered before A initiates
 
       // ── A initiates. createSessionNode(N_A) + connectToCounterparty (N_A dials B's SR).
       await clientA.send("ipc.connect", { clientType: "test" });
-      await clientA.send("cello_start_agent", { name: "alice" });
-      await clientA.send("cello_use_agent", { name: "alice" });
+      expect(((await clientA.send("cello_start_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
+      expect(((await clientA.send("cello_use_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
       const initRes = await clientA.send("cello_initiate_session", { counterparty_pubkey: bobPubkey }) as Record<string, unknown>;
       expect(initRes.ok).toBe(true);
       expect(initRes.sessionId).toBe(SID_HEX);
@@ -227,7 +238,6 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       expect(recv!.senderPubkey).toBe(alicePubkey);
 
       // ── A's awaiting-ACK resolved (the delivery-ACK round-tripped back over N_A's link).
-      const aEvents = (A as unknown as { __events: LogEvent[] }).__events;
       let acked = false;
       for (let i = 0; i < 80; i++) {
         if (aEvents.find((e) => e.event === "content.delivery.acked")) { acked = true; break; }
