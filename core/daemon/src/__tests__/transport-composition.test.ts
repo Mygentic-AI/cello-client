@@ -168,6 +168,37 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(result.transportMode).toBe("relay");
   });
 
+  it("SEAM: cello_initiate_session creates the DAEMON-004 session-core session (queryable + active, not just a transport dial)", async () => {
+    // The integration-first seam: before this wiring, initiate established a transport
+    // connection but never created a session in the daemon's session-core — a later
+    // cello_send would hit session_not_found. This proves initiate now connects to the
+    // DAEMON-004 session core: a real session node + DB row exist and are queryable.
+    process.env["CELLO_ENV"] = "local";
+    await setupAgent("alice");
+    handle = await startDaemon(makeConfig({ sessionNegotiator: stubNegotiator(makeAssignment("relay")) }));
+
+    const client = await connectMcp(join(tempDir, "daemon.sock"));
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const result = (await client.send("cello_initiate_session", {
+      counterparty_pubkey: "bb".repeat(32),
+    })) as { ok: boolean; sessionId?: string };
+    expect(result.ok).toBe(true);
+
+    // session_id is the hex of the negotiated assignment's session_id (16 bytes of 0x09).
+    const sessionId = Buffer.from(new Uint8Array(16).fill(9)).toString("hex");
+    expect(result.sessionId).toBe(sessionId);
+
+    // The session EXISTS in the session-core now — active, owned by alice, bound to the
+    // counterparty pubkey the caller named.
+    const record = handle!.getSessionNodeManager().getSessionRecord(sessionId);
+    expect(record).not.toBeNull();
+    expect(record?.status).toBe("active");
+    expect(record?.agent_name).toBe("alice");
+    expect(record?.counterparty_pubkey).toBe("bb".repeat(32));
+  });
+
   it("cello_initiate_session without a negotiator returns directory_signaling_not_configured (graceful, adapters still wired)", async () => {
     process.env["CELLO_ENV"] = "local";
     await setupAgent("alice");

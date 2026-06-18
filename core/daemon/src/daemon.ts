@@ -940,6 +940,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // Terminal: both direct and relay failed (AC-008). Pass the error through.
       return { ok: false, reason: result.reason, guidance: result.guidance };
     }
+
+    // SEAM (initiate → DAEMON-004 session-core): transport is now established, but the
+    // session does not yet exist in the daemon's session-core. Without this, initiate
+    // would set up a connection no session can use and a subsequent cello_send would
+    // report session_not_found. Create the DAEMON-004 session node + DB row, bound (via
+    // its connection gater) to the counterparty's negotiated session peer id, so the
+    // session is queryable and usable (cello_send / cello_receive / cello_close_session).
+    //
+    // NOTE (seam 1b, next): the session node N_A created here does NOT yet share the
+    // connection that transportSelector.dial established on the separate transportDialer
+    // node — so its content newStream cannot ride that link until the dial is routed
+    // THROUGH N_A. Tracked as the dialer/session-node reconciliation; this seam only
+    // establishes that initiate creates the session-core session.
+    const counterpartyPubkey =
+      typeof params?.counterparty_pubkey === "string" ? params.counterparty_pubkey : "";
+    const counterpartyPeerId = assignment.counterparty_session_peer_id ?? "";
+    const created = await sessionNodeManager.createSessionNode(
+      sessionId,
+      agentName,
+      counterpartyPubkey,
+      counterpartyPeerId,
+      correlationId,
+    );
+    if (!created.ok) {
+      return { ok: false, reason: created.reason, guidance: created.guidance };
+    }
+
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
     return { ok: true, sessionId, transportMode: result.mode, correlationId };
