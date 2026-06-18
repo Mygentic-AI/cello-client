@@ -19,7 +19,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 
 // AC-020 (1): --version flag — exit cleanly with the package version.
@@ -50,8 +50,15 @@ if (process.stdin.isTTY) {
   process.exit(0);
 }
 
-// AC-020 (3): Tee stderr to a log file for diagnostics.
-const stderrLog = createWriteStream("/tmp/cello-mcp-stderr.log", { flags: "a" });
+// Resolve CELLO_DIR once (honored exactly as cello-daemon and the cello CLI do) and
+// ensure it exists. Used for BOTH the diagnostics log and the daemon socket below, so
+// every per-home isolation boundary CELLO_DIR establishes is respected — including the
+// stderr tee, which previously went to a single global /tmp file shared across homes.
+const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
+mkdirSync(celloDir, { recursive: true });
+
+// AC-020 (3): Tee stderr to a log file under the home for diagnostics.
+const stderrLog = createWriteStream(join(celloDir, "cello-mcp-stderr.log"), { flags: "a" });
 const origWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write;
 process.stderr.write = (
   chunk: string | Uint8Array,
@@ -67,10 +74,9 @@ process.stderr.write = (
   return origWrite(chunk as string);
 };
 
-// Connect to daemon IPC socket. Honor CELLO_DIR exactly as cello-daemon and the cello
-// CLI do — otherwise an operator (or test) running the daemon under a non-default home
-// would have cello-mcp look in ~/.cello and fail to find the socket.
-const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
+// Connect to daemon IPC socket under the same CELLO_DIR resolved above — otherwise an
+// operator (or test) running the daemon under a non-default home would have cello-mcp
+// look in ~/.cello and fail to find the socket.
 const socketPath = join(celloDir, "daemon.sock");
 const proxy = new IpcProxy(socketPath);
 
