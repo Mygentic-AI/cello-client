@@ -359,6 +359,22 @@ export class SessionNodeManager {
   }
 
   /**
+   * The current standing receiver node's session-transport coordinates (peer id +
+   * listen multiaddrs), or null if it is not ready. These are the addresses a local
+   * SessionNegotiator advertises as this node's counterparty endpoint so the initiator
+   * can dial it, and the value an inbound session_assignment carries in its
+   * counterparty_session_* fields. Read-only — does NOT consume the standing receiver
+   * (unlike acceptSession, which hands it off).
+   */
+  getStandingReceiverInfo(): { peerId: string; addrs: string[] } | null {
+    if (!this.#standingReceiverReady || this.#standingReceiver === null) return null;
+    return {
+      peerId: this.#standingReceiver.node.getPeerId(),
+      addrs: this.#standingReceiver.node.listenAddresses(),
+    };
+  }
+
+  /**
    * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping the current standing
    * receiver node, or null if the standing receiver is not ready. The composition
    * root uses this as the daemon's runtime IAutoNatService — its getDialability()
