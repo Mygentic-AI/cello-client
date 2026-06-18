@@ -319,6 +319,7 @@ export interface SessionSealedSingle {
   sealed_root: Uint8Array;         // 32-byte final Merkle root
   directory_signature: Uint8Array; // 64-byte Ed25519 over canonical CBOR([session_id, sealed_root, close_timestamp])
   close_timestamp: number;         // Unix ms
+  legibility?: SealLegibility;     // M7-SESSION-004: receipt-not-assent + frontiers + final_message
 }
 
 /**
@@ -334,10 +335,90 @@ export interface SessionSealedFrost {
   signer_pubkey: Uint8Array;       // 32-byte initiator primary_pubkey (group public key)
   close_timestamp: number;         // Unix ms
   leaf_count?: number;             // total leaves in the sealed tree (SESSION-005 H-003)
+  legibility?: SealLegibility;     // M7-SESSION-004: receipt-not-assent + frontiers + final_message
 }
 
 /** Discriminated union: M2 sends SessionSealedFrost; old M1 wire format is SessionSealedSingle. */
 export type SessionSealed = SessionSealedSingle | SessionSealedFrost;
+
+// ─── Seal certificate legibility (M7-SESSION-004) ─────────────────────────────
+//
+// POSTMORTEM Part 3 (C-1 / C-2 / C-6, all SETTLED). The seal certificate gains a
+// first-class, machine-readable `legibility` object stating that its signatures
+// attest RECEIPT — not assent — and publishing each party's content-frontier, a
+// per-attestation live-vs-recovered marker, and whether the final message was
+// answered. A signature over a hash chain can prove exactly three things — these
+// bytes existed, in this order, delivered to/from me — and is cryptographically
+// INCAPABLE of proving agreement. "Sealed" must never be read as "agreed".
+//
+// These properties are DERIVED by the directory at seal time from the leaves it
+// already verifies (the signed last_seen_seq, sender pubkeys, sequence numbers)
+// and the receipt-not-assent constant; they are carried on this wire frame and
+// persisted CLIENT-SIDE in SQLite. No new persisted directory column is added.
+
+/**
+ * Per-attestation marker.
+ *   'live'      — the participant produced their SEAL acknowledgement leaf
+ *                 contemporaneously in this ceremony (full-bilateral / present-party).
+ *   'absent'    — the participant produced no acknowledgement (counterparty ABSENT;
+ *                 populated by the unilateral-notarization flow, Workstream A).
+ *   'recovered' — the acknowledgement was added post-hoc on return (populated by the
+ *                 bilateral-upgrade flow, Workstream C).
+ */
+export type AttestationMode = "live" | "recovered" | "absent";
+
+/**
+ * Canonical, human-readable receipt-not-assent disclaimer carried on every seal
+ * certificate. Constant — the receipt-not-assent property is not session-specific.
+ */
+export const SEAL_RECEIPT_DISCLAIMER =
+  "This certificate attests faithful receipt, integrity, and ordering of the " +
+  "transcript. No signature in this certificate implies agreement to, or assent " +
+  "to, the contents of any message. Agreement is always a separate, explicit act " +
+  "(its own signed reply). A sealed transcript is a receipt, never a record of agreement.";
+
+export interface SealLegibilityParticipant {
+  /** 32-byte K_local pubkey of this participant. */
+  pubkey: Uint8Array;
+  /**
+   * The highest counterparty sequence number this party PROVABLY received —
+   * the maximum signed last_seen_seq across that party's OWN signed leaves.
+   * Tree sequence numbers greater than this were merely sent/committed, not
+   * provably received by this party.
+   */
+  content_frontier_seq: number;
+  /** The highest sequence number this party authored. */
+  last_authored_seq: number;
+  /** Per-attestation live-vs-recovered-vs-absent marker. */
+  attestation_mode: AttestationMode;
+}
+
+export interface SealLegibilityFinalMessage {
+  /** 32-byte pubkey of the author of the highest-sequence content (non-control) leaf. */
+  sender_pubkey: Uint8Array;
+  /** Sequence number of that final content leaf. */
+  seq: number;
+  /**
+   * false => the final-message-unanswered case: composition + submission is
+   * proven, receipt by the counterparty is not. A malicious tail
+   * ("…you agreed to send me $1000") reads as delivered-but-unanswered.
+   */
+  answered: boolean;
+}
+
+/**
+ * Reader-facing legibility object attached to the SessionSealed certificate.
+ * Built by the directory at seal time; persisted client-side; exposed intact to
+ * any reader (human, agent, arbitrator). NO field asserts, implies, or can be
+ * parsed as agreement; `implies_assent` is always the literal `false`.
+ */
+export interface SealLegibility {
+  attests: "receipt";
+  implies_assent: false;
+  disclaimer: string;
+  participants: SealLegibilityParticipant[];
+  final_message: SealLegibilityFinalMessage;
+}
 
 export type SealRejectionReason =
   | "merkle_root_mismatch"
