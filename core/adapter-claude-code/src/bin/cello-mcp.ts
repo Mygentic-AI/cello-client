@@ -67,8 +67,11 @@ process.stderr.write = (
   return origWrite(chunk as string);
 };
 
-// Connect to daemon IPC socket
-const socketPath = join(homedir(), ".cello", "daemon.sock");
+// Connect to daemon IPC socket. Honor CELLO_DIR exactly as cello-daemon and the cello
+// CLI do — otherwise an operator (or test) running the daemon under a non-default home
+// would have cello-mcp look in ~/.cello and fail to find the socket.
+const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
+const socketPath = join(celloDir, "daemon.sock");
 const proxy = new IpcProxy(socketPath);
 
 try {
