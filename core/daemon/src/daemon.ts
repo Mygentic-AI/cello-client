@@ -469,6 +469,80 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     maxBackoffMs: 30_000,
   });
 
+  // ─── Per-agent directory signaling (multi-agent: one signaling stream per agent) ──
+  // The keystone `signalingManager` above authenticates as the PRIMARY agent (first
+  // loaded, sorted) and is the daemon's directory door for that agent. But the
+  // directory routes EVERY signaling frame — dkg_complete, register_success, and
+  // inbound session_request — by the pubkey that AUTHENTICATED the stream it arrived
+  // on. So a non-primary agent registering over the primary's stream has its
+  // dkg_complete misrouted (the directory keys `#pendingDkgComplete` by the stream's
+  // authed pubkey, which is the primary's, not the registrant's) and the registration
+  // times out after a completed DKG. The fix is the M7 intent: each agent gets its OWN
+  // directory signaling stream, authenticated as itself, so the directory routes its
+  // frames to it. This realises the "Online — directory connection active, per agent"
+  // model the keystone note (at `primaryAgent` above) flagged as the follow-on.
+  //
+  // The primary agent reuses the keystone manager; every other agent gets a dedicated
+  // SignalingManager authed as that agent. Managers are created lazily (on first
+  // registration / online) and kept connected for the agent's directory presence.
+  interface AgentSignaling {
+    signaling: SignalingManager;
+    getNode: () => CelloNode | null;
+  }
+  const perAgentSignaling = new Map<string, AgentSignaling>();
+
+  /**
+   * Return the directory signaling stream for `agentName`, authenticated as that
+   * agent. The primary agent reuses the keystone manager + its published node; any
+   * other agent gets (and caches) a dedicated manager. Falls back to the keystone
+   * manager when no production bootstrap resolver is configured (in-process tests
+   * inject a single `signalingConnect` and never exercise the per-agent path).
+   */
+  function getAgentSignaling(
+    agentName: string,
+    agentKeyProvider: import("@cello-protocol/crypto").KeyProvider,
+    agentPubkeyHex: string,
+  ): AgentSignaling {
+    if (primaryAgent && agentName === primaryAgent.name) {
+      return { signaling: signalingManager, getNode: getDirectoryNode };
+    }
+    const existing = perAgentSignaling.get(agentName);
+    if (existing) return existing;
+    if (!directoryEndpointResolver) {
+      return { signaling: signalingManager, getNode: getDirectoryNode };
+    }
+    let nodeRef: CelloNode | null = null;
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: directoryEndpointResolver,
+      getAuthIdentity: () => ({ keyProvider: agentKeyProvider, pubkeyHex: agentPubkeyHex }),
+      logger,
+      challengeVerifier,
+      getManifestVersion: () => verifiedManifestVersion,
+      publishNode: (n) => {
+        nodeRef = n;
+      },
+    });
+    const mgr = new SignalingManager({
+      connect,
+      logger,
+      maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
+      maxBackoffMs: 30_000,
+    });
+    const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
+    perAgentSignaling.set(agentName, entry);
+    logger.info("agent.signaling.created", { agentName, agentPubkey: agentPubkeyHex });
+    return entry;
+  }
+
+  /** Resolve once `mgr` reaches "connected", or false on timeout. */
+  async function waitForSignalingConnected(mgr: SignalingManager, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (mgr.status !== "connected" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return mgr.status === "connected";
+  }
+
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
   const perConnectionState = new Map<string, { currentAgent: string | null; clientType: string }>();
@@ -791,10 +865,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
       const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
 
+      // Multi-agent: register over THIS agent's own directory signaling stream (authed
+      // as this agent), so the directory routes its dkg_complete/register_success back
+      // to it. The primary agent reuses the keystone stream; any other agent gets a
+      // dedicated one. The DKG's FROST streams open on this agent's directory node.
+      const agentRecord = loadedAgents.find((a) => a.name === name);
+      const agentPubkeyHex = agentRecord?.pubkey ?? Buffer.from(await keyProvider.getPublicKey()).toString("hex");
+      const { signaling: agentSignaling, getNode: agentGetNode } = getAgentSignaling(name, keyProvider, agentPubkeyHex);
+
+      // A non-primary agent's stream connects lazily — wait for it before the DKG
+      // (RegistrationManager returns directory_unreachable if signaling isn't connected).
+      const signalingConnected = await waitForSignalingConnected(agentSignaling, 10_000);
+      if (!signalingConnected) {
+        return {
+          ok: false,
+          reason: "directory_unreachable",
+          guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry cello_register.`,
+        };
+      }
+
       const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
       const ctx = new DaemonRegistrationContext({
-        signaling: signalingManager,
-        getDirectoryNode,
+        signaling: agentSignaling,
+        getDirectoryNode: agentGetNode,
         getDirectoryEndpoint: () => directoryEndpoint,
         keyProvider,
         persistence,
@@ -2394,6 +2487,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // Stop SignalingManager (flushes pending ops with shutdown error, cancels reconnect loop)
     await signalingManager.stop();
+    // Stop every per-agent signaling stream too (multi-agent), so no agent's directory
+    // node / reconnect loop is orphaned past shutdown.
+    for (const entry of perAgentSignaling.values()) {
+      await entry.signaling.stop();
+    }
     // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
     await sessionNodeManager.gracefulShutdown();
     await ipcServer.stop();
