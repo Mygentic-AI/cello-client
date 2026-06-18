@@ -497,6 +497,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
    * other agent gets (and caches) a dedicated manager. Falls back to the keystone
    * manager when no production bootstrap resolver is configured (in-process tests
    * inject a single `signalingConnect` and never exercise the per-agent path).
+   *
+   * SCOPE (SPINE-5 follow-on): this wires per-agent signaling for REGISTRATION (the
+   * registration reply frames are routed via the per-agent DaemonRegistrationContext's
+   * own inbound handler). The daemon's INBOUND SESSION handlers (session_assignment /
+   * session_request, registerInboundHandler below) are still attached to the keystone
+   * `signalingManager` only — so a NON-primary agent can register but cannot yet RECEIVE
+   * inbound sessions on its dedicated stream (frames there are unhandled). Not a
+   * regression (before this, a non-primary agent could not register at all); closing it
+   * is SPINE-5, which attaches the session inbound handlers per-agent. Tracked in the
+   * M7 build journal + DoD SPINE-5 scope note.
    */
   function getAgentSignaling(
     agentName: string,
@@ -541,6 +551,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       await new Promise((r) => setTimeout(r, 100));
     }
     return mgr.status === "connected";
+  }
+
+  /**
+   * Stop and forget a dedicated per-agent signaling manager. Called when an agent's
+   * registration fails terminally — otherwise the lazily-created manager (and its
+   * libp2p node + effectively-unbounded reconnect loop) would keep reconnecting forever
+   * for an agent that is not registered/online. No-op for the primary (it reuses the
+   * keystone manager, which is never stored here) and for agents with no dedicated
+   * manager. On a later retry, getAgentSignaling re-creates it.
+   */
+  async function dropAgentSignaling(agentName: string): Promise<void> {
+    const entry = perAgentSignaling.get(agentName);
+    if (!entry) return;
+    perAgentSignaling.delete(agentName);
+    await entry.signaling.stop();
+    logger.info("agent.signaling.dropped", { agentName });
   }
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
@@ -877,9 +903,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // (RegistrationManager returns directory_unreachable if signaling isn't connected).
       const signalingConnected = await waitForSignalingConnected(agentSignaling, 10_000);
       if (!signalingConnected) {
+        // Distinct cause → distinct code (M7 error discipline): this is specifically the
+        // per-agent signaling stream failing to come up in time, not a missing/unresolvable
+        // directory endpoint. Drop the manager so it doesn't reconnect forever for an
+        // unregistered agent (it is re-created on the next cello_register).
+        await dropAgentSignaling(name);
         return {
           ok: false,
-          reason: "directory_unreachable",
+          reason: "directory_signaling_timeout",
           guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry cello_register.`,
         };
       }
@@ -897,6 +928,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
         if ("error" in result) {
           logger.warn("registration.failed", { agentName: name, reason: result.error });
+          // Terminal failure for THIS agent — drop its dedicated signaling manager so it
+          // does not reconnect forever for an unregistered agent (re-created on retry).
+          await dropAgentSignaling(name);
           return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
         }
         // Capture-now-or-lose-it: persist the agent→user link (using it is future
