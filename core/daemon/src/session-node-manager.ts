@@ -152,6 +152,11 @@ export class SessionNodeManager {
   #activeNodes = new Map<string, ActiveSessionEntry>();
   #standingReceiver: { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null = null;
   #standingReceiverReady = false;
+  // Set once gracefulShutdown begins. The standing-receiver replacement that
+  // acceptSession kicks off runs un-awaited (AC-003), so it can be in flight when
+  // shutdown starts; #createStandingReceiver checks this flag and stops a freshly
+  // built node instead of leaving an orphan bound to a TCP port (review M2).
+  #shuttingDown = false;
   // DAEMON-004: lazily-loaded in-memory cache of each session's daemon-owned
   // Merkle tree. The authoritative store is the session_tree_leaves table —
   // the cache is rebuilt from it on first access (so it survives a restart).
@@ -500,7 +505,7 @@ export class SessionNodeManager {
 
     // DAEMON-004: register the content stream handler so inbound content_frames
     // are cross-checked, appended to the daemon-owned tree, and buffered.
-    this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    await this.#registerContentHandler(sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
     // liveness. The session connection IS the authority for a direct session.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
@@ -570,13 +575,13 @@ export class SessionNodeManager {
    * the node's multiaddr to the caller. This closes the window where an
    * unexpected peer could connect during the hand-off.
    */
-  acceptSession(
+  async acceptSession(
     sessionId: string,
     agentName: string,
     counterpartyPubkey: string,
     initiatorPeerId: string,
     correlationId: string,
-  ): CreateSessionResult {
+  ): Promise<CreateSessionResult> {
     if (!this.#standingReceiverReady || this.#standingReceiver === null) {
       return {
         ok: false,
@@ -637,7 +642,7 @@ export class SessionNodeManager {
     });
 
     // DAEMON-004: register the content stream handler for the inbound session.
-    this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    await this.#registerContentHandler(sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
@@ -744,6 +749,17 @@ export class SessionNodeManager {
    * SQLite writes complete before this method returns.
    */
   async gracefulShutdown(): Promise<void> {
+    // Signal any in-flight standing-receiver replacement to self-stop (review M2).
+    this.#shuttingDown = true;
+
+    // Cancel every armed awaiting-ACK timer so an un-acked send (e.g. a rejected /
+    // tampered frame that never produced a `persisted` ACK) does not leave a 20s
+    // timer pinning the content + this manager in memory past teardown (review M1).
+    for (const bySession of this.#awaitingAck.values()) {
+      for (const entry of bySession.values()) clearTimeout(entry.timer);
+    }
+    this.#awaitingAck.clear();
+
     // Mark ALL 'active' rows interrupted in SQLite — single batch UPDATE covers
     // both in-memory managed nodes AND any rows that were inserted directly
     // (e.g. by the binary AC-009 SIGTERM test inserting synthetic rows).
@@ -812,6 +828,13 @@ export class SessionNodeManager {
       }
       this.#standingReceiver = null;
       this.#standingReceiverReady = false;
+    }
+
+    // Release the SQLite handle so the DB file is no longer held open after shutdown
+    // (review L5). Queries guard on `#db === null` and degrade to empty/null.
+    if (this.#db) {
+      try { this.#db.close(); } catch { /* already closed */ }
+      this.#db = null;
     }
   }
 
@@ -1447,15 +1470,21 @@ export class SessionNodeManager {
    * DAEMON-004: register the /cello/content/1.0.0 handler on a session node so
    * inbound content_frames are decoded, cross-checked, and ingested.
    */
-  #registerContentHandler(sessionId: string, node: CelloNode, _counterpartyPubkey: string): void {
-    void node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
-      void this.#handleContentStream(sessionId, stream);
-    }).catch((err: unknown) => {
+  // Awaited by createSessionNode / acceptSession so the /cello/content/1.0.0 handler
+  // is provably registered before the caller returns (and thus before any peer sends
+  // content). libp2p registers the protocol synchronously today, but awaiting removes
+  // the fragile dependency on that internal timing (review L4).
+  async #registerContentHandler(sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
+    try {
+      await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
+        void this.#handleContentStream(sessionId, stream);
+      });
+    } catch (err: unknown) {
       this.#logger.error("session.content.handler.register.failed", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
-    });
+    }
   }
 
   async #handleContentStream(sessionId: string, stream: Stream): Promise<void> {
@@ -1629,6 +1658,14 @@ export class SessionNodeManager {
         correlationId,
       });
       return; // standing receiver not ready — callers check #standingReceiverReady
+    }
+
+    // M2: gracefulShutdown may have begun while this node was starting (the
+    // replacement runs un-awaited). Don't install an orphan bound to a TCP port —
+    // stop it and bail. The just-completed shutdown already nulled #standingReceiver.
+    if (this.#shuttingDown) {
+      try { await node.stop(); } catch { /* best-effort */ }
+      return;
     }
 
     // CELLO-M7-TRANSPORT-001: wrap the standing receiver in a NodeAutoNatService so

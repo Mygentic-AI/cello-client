@@ -294,14 +294,14 @@ describe("SessionNodeManager — unit tests", () => {
 
   // ── AC-008: standing receiver not ready ───────────────────────────────────
 
-  it("AC-008: acceptSession when standing receiver not ready → standing_receiver_unavailable", () => {
+  it("AC-008: acceptSession when standing receiver not ready → standing_receiver_unavailable", async () => {
     const stub = new StubNodeFactory();
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "test.db");
     const manager = new SessionNodeManager({ factory: stub, logger, dbPath });
     // Note: initialize() not called, so standing receiver is not ready
 
-    const result = manager.acceptSession(
+    const result = await manager.acceptSession(
       "session-1",
       "test-agent",
       "pubkey-1",
@@ -379,7 +379,7 @@ describe("SessionNodeManager — unit tests", () => {
     const manager = new SessionNodeManager({ factory: failing, logger, dbPath });
     await manager.initialize(); // initialize fails to create standing receiver — that's expected
 
-    const result = manager.acceptSession("ac013-sr-session", "agent", "pk", "initiator-peer", "corr");
+    const result = await manager.acceptSession("ac013-sr-session", "agent", "pk", "initiator-peer", "corr");
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("standing_receiver_unavailable");
@@ -499,7 +499,7 @@ describe("SessionNodeManager — unit tests", () => {
     callOrder.length = 0;
 
     // Call acceptSession
-    const result = manager2.acceptSession(
+    const result = await manager2.acceptSession(
       "inbound-session-1",
       "test-agent",
       "pubkey-1",
@@ -872,7 +872,7 @@ describe("SessionNodeManager — integration tests", () => {
       const oldSrPeerId = srEventBefore!.context.sessionPeerId as string;
 
       // Accept an inbound session
-      const result = manager.acceptSession(
+      const result = await manager.acceptSession(
         "inbound-ac003",
         "bob",
         "pubkey-bob",

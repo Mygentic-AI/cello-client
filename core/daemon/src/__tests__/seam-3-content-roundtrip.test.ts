@@ -47,13 +47,18 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
   return { logger, events };
 }
 
-/** Factory that creates real libp2p nodes on loopback TCP (honoring the session gater). */
+/**
+ * Factory that creates real libp2p nodes on loopback TCP, honoring the session gater
+ * AND forwarding nodeType so each node's dcutr/config matches production
+ * (createSessionNode → 'session', standing receiver → 'standing_receiver') — review L3.
+ */
 class RealNodeFactory implements ISessionNodeFactory {
   async createNode(config: SessionNodeConfig): Promise<CelloNode> {
     return createNode({
       keyProvider: generateKeypair(),
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
       connectionGater: config.connectionGater,
+      nodeType: config.nodeType,
     });
   }
 }
@@ -119,7 +124,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
 
     // B: accept the inbound session (seam 2 core) — hands off the standing receiver gated
     // to N_A and registers B's content handler. MUST happen before A sends.
-    const accepted = B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
     expect(accepted.ok).toBe(true);
 
     // A: send content over the live N_A ↔ B connection.
@@ -153,11 +158,14 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     await B.manager.initialize();
 
     const bInfo = B.manager.getStandingReceiverInfo();
+    expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) return;
-    await A.manager.connectToCounterparty(SID, bInfo!.addrs);
-    B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    const connected = await A.manager.connectToCounterparty(SID, bInfo!.addrs);
+    expect(connected.ok).toBe(true);
+    const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    expect(accepted.ok).toBe(true);
 
     // Send content under a hash that does NOT match it (wire tamper of a single frame).
     const content = new TextEncoder().encode("genuine content");

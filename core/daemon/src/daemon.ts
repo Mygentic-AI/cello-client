@@ -1485,7 +1485,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         });
         return;
       }
-      const result = sessionNodeManager.acceptSession(
+      const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
         agentName,
         parsed.participantAPubkeyHex, // the initiator is OUR counterparty
