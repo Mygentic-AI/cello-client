@@ -53,7 +53,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 import {
   resolveCelloEnv,
@@ -1374,18 +1374,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     counterpartyPubkeyHex: string;
     genesisPrevRootHex: string;
   }
+  // A blocked cello_await_session waiter. connectionId is carried so the disconnect
+  // hook can evict waiters belonging to a dead connection (otherwise enqueue would hand
+  // an inbound event to a closed connection and the event would be lost — review H2).
+  interface InboundSessionWaiter {
+    connectionId: string;
+    deliver: (e: InboundSessionEvent | null) => void; // clears its own timeout; null = evicted
+  }
   // Per-agent FIFO queue (events accepted while no cello_await_session is blocked) and
-  // the per-agent list of blocked cello_await_session waiters. Inbound sessions are
-  // addressed to a specific local agent (participant_b), so both are keyed by agent name.
+  // the per-agent list of blocked waiters. Inbound sessions are addressed to a specific
+  // local agent (participant_b), so both are keyed by agent name.
   const inboundSessionQueues = new Map<string, InboundSessionEvent[]>();
-  const inboundSessionWaiters = new Map<string, Array<(e: InboundSessionEvent) => void>>();
+  const inboundSessionWaiters = new Map<string, InboundSessionWaiter[]>();
+  // Session ids whose acceptInboundAssignment is in flight (the accept step is async
+  // because it may wait for the standing receiver to rebuild). Guards against two
+  // simultaneous frames for the SAME session both passing the getSessionRecord check
+  // before either has inserted the row (review M1, race half).
+  const inboundInFlight = new Set<string>();
+  // Inbound accepts are SERIALIZED through this chain. acceptSession synchronously
+  // consumes the single standing receiver and rebuilds a replacement asynchronously;
+  // running two accepts concurrently would let the second pass its readiness check on
+  // the receiver the first is about to consume, then fail on the consumed receiver
+  // (review M2, race). Serializing makes the second accept wait for the first's rebuild.
+  let inboundAcceptChain: Promise<void> = Promise.resolve();
 
   function enqueueInboundSession(agentName: string, event: InboundSessionEvent): void {
     const waiters = inboundSessionWaiters.get(agentName);
     if (waiters && waiters.length > 0) {
-      // Hand straight to the oldest blocked waiter (it clears its own timeout).
-      const resolve = waiters.shift()!;
-      resolve(event);
+      // Hand straight to the oldest blocked waiter (deliver clears its own timeout).
+      const w = waiters.shift()!;
+      w.deliver(event);
       return;
     }
     const q = inboundSessionQueues.get(agentName) ?? [];
@@ -1393,18 +1411,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     inboundSessionQueues.set(agentName, q);
   }
 
-  // Pull the participant pubkeys + session id out of a pushed session_assignment frame.
-  // CBOR-decoded byte fields arrive as Uint8Array or Buffer; the field may also already
-  // be a hex string. Returns null when the frame is not a usable counterparty-push
-  // assignment (so the handler ignores it rather than throwing on a malformed frame).
+  // CBOR-decoded byte fields arrive as Uint8Array or Buffer; a field may also already be
+  // a hex string. Hex strings are lowercased so the case-sensitive agent-pubkey match
+  // (agents store lowercase hex) cannot silently miss (review L2).
   function frameValueToHex(v: unknown): string | null {
     if (v instanceof Uint8Array) return Buffer.from(v).toString("hex");
     if (Buffer.isBuffer(v)) return Buffer.from(v as Buffer).toString("hex");
-    if (typeof v === "string") return v;
+    if (typeof v === "string") return v.toLowerCase();
     return null;
   }
+  // Pull the fields out of a pushed session_assignment frame. Returns null when the frame
+  // carries no usable assignment object / is missing the essential ids (the handler then
+  // ignores it rather than throwing). Field-level validity (peer id, signature type) is
+  // checked in the handler so it can emit a distinct, diagnosable event per failure.
   function extractInboundSessionAssignment(frame: Record<string, unknown>):
-    | { sessionIdHex: string; participantAPubkeyHex: string; participantBPubkeyHex: string; initiatorPeerId: string }
+    | {
+        sessionIdHex: string;
+        participantAPubkeyHex: string;
+        participantBPubkeyHex: string;
+        initiatorPeerId: string;
+        sessionTimestamp: number;
+        signatureType: string | null;
+      }
     | null {
     const raw = frame["assignment"];
     if (!raw || typeof raw !== "object") return null;
@@ -1414,15 +1442,135 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const sessionIdHex = frameValueToHex(a["session_id"]);
     const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
     const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
-    const initiatorPeerId =
-      typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "";
     if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
-    return { sessionIdHex, participantAPubkeyHex, participantBPubkeyHex, initiatorPeerId };
+    return {
+      sessionIdHex,
+      participantAPubkeyHex,
+      participantBPubkeyHex,
+      initiatorPeerId:
+        typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
+      sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
+      signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+    };
+  }
+
+  // Wait (bounded) for the standing receiver to be ready. acceptSession consumes the one
+  // standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
+  // assignments would otherwise drop all but the first (review M2). Polling readiness lets
+  // each accept proceed once the prior rebuild completes, rather than being lost.
+  async function waitForStandingReceiver(maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
+    if (sessionNodeManager.getStandingReceiverReady()) return true;
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, stepMs));
+      if (sessionNodeManager.getStandingReceiverReady()) return true;
+    }
+    return sessionNodeManager.getStandingReceiverReady();
+  }
+
+  async function acceptInboundAssignment(
+    parsed: NonNullable<ReturnType<typeof extractInboundSessionAssignment>>,
+    agentName: string,
+    correlationId: string,
+  ): Promise<void> {
+    try {
+      // M2: do not drop the session if the standing receiver is mid-rebuild.
+      const ready = await waitForStandingReceiver();
+      if (!ready) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: "standing_receiver_unavailable",
+          correlationId,
+        });
+        return;
+      }
+      const result = sessionNodeManager.acceptSession(
+        parsed.sessionIdHex,
+        agentName,
+        parsed.participantAPubkeyHex, // the initiator is OUR counterparty
+        parsed.initiatorPeerId,
+        correlationId,
+      );
+      if (!result.ok) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: result.reason,
+          correlationId,
+        });
+        return;
+      }
+
+      // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
+      // baked into the FROST-signed session-establishment TBS and derived by the initiator
+      // and directory — NOT the daemon's (empty) tree root. computeGenesisPrevRoot sorts
+      // the pubkeys internally, so natural (A, B) order is correct.
+      const genesisPrevRootHex = Buffer.from(
+        computeGenesisPrevRoot(
+          Buffer.from(parsed.participantAPubkeyHex, "hex"),
+          Buffer.from(parsed.participantBPubkeyHex, "hex"),
+          Buffer.from(parsed.sessionIdHex, "hex"),
+          parsed.sessionTimestamp,
+        ),
+      ).toString("hex");
+
+      logger.info("session.inbound.accepted", {
+        sessionId: parsed.sessionIdHex,
+        agentName,
+        sessionPeerId: result.peerId,
+        correlationId,
+      });
+      enqueueInboundSession(agentName, {
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        genesisPrevRootHex,
+      });
+      notificationDispatcher.dispatchSessionStateChanged(
+        agentName,
+        parsed.sessionIdHex,
+        "created",
+        parsed.participantAPubkeyHex,
+      );
+    } finally {
+      inboundInFlight.delete(parsed.sessionIdHex);
+    }
   }
 
   function handleInboundSessionAssignment(frame: Record<string, unknown>): void {
+    // M4: one correlationId minted per inbound flow, threaded through EVERY event below.
+    const correlationId = randomUUID();
     const parsed = extractInboundSessionAssignment(frame);
-    if (!parsed) return; // not a usable counterparty-push assignment → ignore
+    if (!parsed) {
+      logger.warn("session.inbound.assignment.malformed", {
+        reason: "missing_assignment_or_ids",
+        correlationId,
+      });
+      return;
+    }
+
+    // L1: refuse M1 single-key assignments outright (downgrade guard). Distinct from the
+    // deferred FROST verification below — track it so SESSION-004's re-home keeps it.
+    if (parsed.signatureType === "single") {
+      logger.warn("session.inbound.assignment.refused", {
+        sessionId: parsed.sessionIdHex,
+        reason: "unsupported_signature_type",
+        correlationId,
+      });
+      return;
+    }
+
+    // M3: the initiator session peer id is the AC-015 hand-off gate (acceptSession passes
+    // it to gater.setAllowedPeer). An empty value would gate the handed-off receiver to "",
+    // defeating "only the initiator may connect". The dead stack treated this as malformed.
+    if (!parsed.initiatorPeerId) {
+      logger.warn("session.inbound.assignment.malformed", {
+        sessionId: parsed.sessionIdHex,
+        reason: "missing_initiator_peer_id",
+        correlationId,
+      });
+      return;
+    }
 
     // Resolve which local agent is participant_b. participant pubkeys are the agents'
     // K_local identity pubkeys (same convention as the seal-interrupted responder's
@@ -1430,58 +1578,53 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // assignment is not for this daemon — drop it.
     const localAgent = agents.find((ag) => ag.pubkey === parsed.participantBPubkeyHex);
     if (!localAgent) {
-      logger.debug("session.inbound.not_local", { sessionId: parsed.sessionIdHex });
-      return;
-    }
-
-    // SECURITY — DEFERRED (SESSION-004 re-home): the directory's FROST threshold
-    // signature on the assignment (directory_signature over the TBS, verified against
-    // signer_pubkey) is NOT yet verified here. The old client's receiveSessionAssignment
-    // performed that check; it must be re-homed natively before this path faces a real
-    // (untrusted) directory. Until then we accept directory-pushed assignments on trust —
-    // the in-process seam tests inject trusted frames. This is logged loudly, never silent.
-    logger.warn("session.inbound.assignment.unverified", {
-      sessionId: parsed.sessionIdHex,
-      agentName: localAgent.name,
-      note: "FROST assignment signature verification deferred to SESSION-004 re-home",
-    });
-
-    const correlationId = randomUUID();
-    const result = sessionNodeManager.acceptSession(
-      parsed.sessionIdHex,
-      localAgent.name,
-      parsed.participantAPubkeyHex, // the initiator is OUR counterparty
-      parsed.initiatorPeerId,
-      correlationId,
-    );
-    if (!result.ok) {
-      logger.warn("session.inbound.accept.failed", {
+      logger.debug("session.inbound.not_local", {
         sessionId: parsed.sessionIdHex,
-        agentName: localAgent.name,
-        reason: result.reason,
+        counterpartyPubkey: parsed.participantBPubkeyHex,
         correlationId,
       });
       return;
     }
 
-    const genesisPrevRootHex = sessionNodeManager.getSessionTreeRootHex(parsed.sessionIdHex);
-    logger.info("session.inbound.accepted", {
+    // M1: idempotency — a retransmitted assignment for an already-known session (persisted
+    // row OR currently in flight) must not double-accept (orphaned node) or double-enqueue.
+    if (inboundInFlight.has(parsed.sessionIdHex) || sessionNodeManager.getSessionRecord(parsed.sessionIdHex)) {
+      logger.info("session.inbound.duplicate.ignored", {
+        sessionId: parsed.sessionIdHex,
+        agentName: localAgent.name,
+        correlationId,
+      });
+      return;
+    }
+
+    // SECURITY — DEFERRED (SESSION-004 re-home): the directory's FROST threshold signature
+    // on the assignment (directory_signature over the TBS, verified against signer_pubkey)
+    // is NOT yet verified here. The old client's receiveSessionAssignment performed that
+    // check; it must be re-homed natively before this path faces a real (untrusted)
+    // directory. Until then we accept directory-pushed assignments on trust — the in-process
+    // seam tests inject trusted frames. This is logged loudly, never silent.
+    logger.warn("session.inbound.assignment.unverified", {
       sessionId: parsed.sessionIdHex,
       agentName: localAgent.name,
-      sessionPeerId: result.peerId,
+      note: "FROST assignment signature verification deferred to SESSION-004 re-home",
       correlationId,
     });
-    enqueueInboundSession(localAgent.name, {
-      sessionIdHex: parsed.sessionIdHex,
-      counterpartyPubkeyHex: parsed.participantAPubkeyHex,
-      genesisPrevRootHex,
-    });
-    notificationDispatcher.dispatchSessionStateChanged(
-      localAgent.name,
-      parsed.sessionIdHex,
-      "created",
-      parsed.participantAPubkeyHex,
-    );
+
+    inboundInFlight.add(parsed.sessionIdHex);
+    // Serialize: the next accept does not begin until this one (and any standing-receiver
+    // rebuild it triggers) settles. A throw inside one accept must not break the chain.
+    const agentName = localAgent.name;
+    inboundAcceptChain = inboundAcceptChain
+      .then(() => acceptInboundAssignment(parsed, agentName, correlationId))
+      .catch((err: unknown) => {
+        inboundInFlight.delete(parsed.sessionIdHex);
+        logger.error("session.inbound.accept.error", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
   }
 
   signalingManager.registerInboundHandler((frame) => {
@@ -1515,16 +1658,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     const event = await new Promise<InboundSessionEvent | null>((resolve) => {
       const waiters = inboundSessionWaiters.get(agentName) ?? [];
-      const onEvent = (e: InboundSessionEvent): void => {
-        clearTimeout(timer);
-        resolve(e);
+      const waiter: InboundSessionWaiter = {
+        connectionId,
+        deliver: (e) => {
+          clearTimeout(timer);
+          resolve(e);
+        },
       };
-      waiters.push(onEvent);
+      waiters.push(waiter);
       inboundSessionWaiters.set(agentName, waiters);
       const timer = setTimeout(() => {
         const list = inboundSessionWaiters.get(agentName);
         if (list) {
-          const idx = list.indexOf(onEvent);
+          const idx = list.indexOf(waiter);
           if (idx !== -1) list.splice(idx, 1);
         }
         resolve(null);
@@ -2199,6 +2345,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   ipcServer.onDisconnect((connectionId) => {
     perConnectionState.delete(connectionId);
     notificationDispatcher.unregisterConnection(connectionId);
+    // Seam 2 (review H2): evict any cello_await_session waiters owned by this connection.
+    // Otherwise enqueueInboundSession would hand the next inbound session to a closed
+    // connection's waiter and the event would be lost. deliver(null) clears the waiter's
+    // timer and resolves its (now-orphaned) promise as a timeout.
+    for (const [agentName, waiters] of inboundSessionWaiters) {
+      const survivors: typeof waiters = [];
+      for (const w of waiters) {
+        if (w.connectionId === connectionId) w.deliver(null);
+        else survivors.push(w);
+      }
+      if (survivors.length > 0) inboundSessionWaiters.set(agentName, survivors);
+      else inboundSessionWaiters.delete(agentName);
+    }
   });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)

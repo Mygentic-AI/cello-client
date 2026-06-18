@@ -16,7 +16,7 @@
  *     → SessionNodeManager.acceptSession (standing receiver handed off, bound to A)
  *     → session-core has an ACTIVE session row (queryable)
  *     → inbound event enqueued
- *     → cello_await_session returns { type: "new_session", session_id, counterparty_pubkey, genesis_prev_root }
+ *     → cello_await_session returns { type:"new_session", session_id, counterparty_pubkey, genesis_prev_root }
  *
  * No infra, no relay, no real directory — the directory's push is injected as a
  * trusted frame. The FROST signature verification of the assignment is the
@@ -29,6 +29,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -95,6 +96,8 @@ function makeInjectableSignaling(
   return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
 }
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 describe("Seam 2: inbound session_assignment → acceptSession → cello_await_session", () => {
   let tempDir: string;
   let handle: Awaited<ReturnType<typeof startDaemon>> | null;
@@ -138,24 +141,32 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
   // session_id is 16 bytes per the protocol; the daemon hex-encodes it.
   const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 1));
   const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
+  const TS = 1_700_000_000_000;
 
   /** Build a directory-pushed session_assignment frame addressed to participant_b. */
   function assignmentFrame(opts: {
-    sessionId: Uint8Array;
-    initiatorPubkeyHex: string;   // participant_a (our counterparty)
+    sessionId?: Uint8Array;
+    initiatorPubkeyHex: string;    // participant_a (our counterparty)
     counterpartyPubkeyHex: string; // participant_b (the local agent)
-    initiatorPeerId: string;
+    initiatorPeerId?: string;
+    sessionTimestamp?: number;
+    signatureType?: string;
   }): Record<string, unknown> {
-    return {
-      type: "session_assignment",
-      assignment: {
-        session_id: opts.sessionId,
-        participant_a: { pubkey: Buffer.from(opts.initiatorPubkeyHex, "hex") },
-        participant_b: { pubkey: Buffer.from(opts.counterpartyPubkeyHex, "hex") },
-        initiator_session_peer_id: opts.initiatorPeerId,
-        signature_type: "frost",
-      },
+    const assignment: Record<string, unknown> = {
+      session_id: opts.sessionId ?? SID_BYTES,
+      participant_a: { pubkey: Buffer.from(opts.initiatorPubkeyHex, "hex") },
+      participant_b: { pubkey: Buffer.from(opts.counterpartyPubkeyHex, "hex") },
+      session_timestamp: opts.sessionTimestamp ?? TS,
+      signature_type: opts.signatureType ?? "frost",
     };
+    if (opts.initiatorPeerId !== undefined) assignment["initiator_session_peer_id"] = opts.initiatorPeerId;
+    return { type: "session_assignment", assignment };
+  }
+
+  function expectedGenesisHex(initiatorHex: string, counterpartyHex: string, sid: Uint8Array, ts: number): string {
+    return Buffer.from(
+      computeGenesisPrevRoot(Buffer.from(initiatorHex, "hex"), Buffer.from(counterpartyHex, "hex"), sid, ts),
+    ).toString("hex");
   }
 
   it("turns a pushed session_assignment into an active inbound session that cello_await_session returns", async () => {
@@ -165,19 +176,17 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
-    await new Promise((r) => setTimeout(r, 50)); // let signaling connect + standing receiver come up
+    await wait(50); // let signaling connect + standing receiver come up
 
     const snm = h.getSessionNodeManager();
     const initiatorPubkey = "cd".repeat(32);
 
-    // The directory pushes the assignment to bob (participant_b).
     injectRef.inject!(assignmentFrame({
-      sessionId: SID_BYTES,
       initiatorPubkeyHex: initiatorPubkey,
       counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-session-peer-id",
     }));
-    await new Promise((r) => setTimeout(r, 80)); // async inbound handler
+    await wait(120); // async inbound handler (accept may wait on standing receiver)
 
     // (1) Session-core observable: bob now has an ACTIVE session row bound to alice.
     const record = snm.getSessionRecord(SID_HEX);
@@ -190,7 +199,8 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     expect(events.find((e) => e.event === "session.inbound.assignment.unverified")).toBeDefined();
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeDefined();
 
-    // (3) cello_await_session returns the queued inbound session for bob's connection.
+    // (3) cello_await_session returns the queued inbound session for bob's connection,
+    //     with the CANONICAL two-party genesis_prev_root (not the empty-tree root).
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
       await client.send("ipc.connect", { clientType: "test" });
@@ -200,7 +210,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       expect(res.type).toBe("new_session");
       expect(res.session_id).toBe(SID_HEX);
       expect(res.counterparty_pubkey).toBe(initiatorPubkey);
-      expect(typeof res.genesis_prev_root).toBe("string");
+      expect(res.genesis_prev_root).toBe(expectedGenesisHex(initiatorPubkey, bobPubkey, SID_BYTES, TS));
     } finally { client.close(); }
   });
 
@@ -211,7 +221,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
-    await new Promise((r) => setTimeout(r, 50));
+    await wait(50);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -221,11 +231,10 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
 
       // Start the blocking await BEFORE any assignment exists.
       const awaitP = client.send("cello_await_session", { timeout_ms: 2000 }) as Promise<Record<string, unknown>>;
-      await new Promise((r) => setTimeout(r, 40)); // ensure the waiter is registered
+      await wait(40); // ensure the waiter is registered
 
       const initiatorPubkey = "ab".repeat(32);
       injectRef.inject!(assignmentFrame({
-        sessionId: SID_BYTES,
         initiatorPubkeyHex: initiatorPubkey,
         counterpartyPubkeyHex: bobPubkey,
         initiatorPeerId: "alice-session-peer-id",
@@ -238,6 +247,150 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     } finally { client.close(); }
   });
 
+  it("M1: ignores a retransmitted assignment for an already-accepted session (no double accept/enqueue)", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    const initiatorPubkey = "cd".repeat(32);
+    const frame = assignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" });
+    injectRef.inject!(frame);
+    await wait(120);
+    injectRef.inject!(frame); // retransmit
+    await wait(80);
+
+    // Exactly one accept; the retransmit was ignored as a duplicate.
+    expect(events.filter((e) => e.event === "session.inbound.accepted").length).toBe(1);
+    expect(events.find((e) => e.event === "session.inbound.duplicate.ignored")).toBeDefined();
+
+    // And exactly one queued event is available to await.
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "bob" });
+      await client.send("cello_use_agent", { name: "bob" });
+      const first = await client.send("cello_await_session", { timeout_ms: 500 }) as Record<string, unknown>;
+      expect(first.type).toBe("new_session");
+      const second = await client.send("cello_await_session", { timeout_ms: 200 }) as Record<string, unknown>;
+      expect(second.type).toBe("timeout"); // no second event
+    } finally { client.close(); }
+    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).not.toBeNull();
+  });
+
+  it("M2: a burst of two assignments for the same agent are both accepted (standing receiver rebuild not lost)", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    const sidB = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 100));
+    const initA = "11".repeat(32);
+    const initB = "22".repeat(32);
+    // Two pushes back-to-back: the first consumes the standing receiver; the second
+    // must wait for the async rebuild rather than being dropped.
+    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: initA, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-a" }));
+    injectRef.inject!(assignmentFrame({ sessionId: sidB, initiatorPubkeyHex: initB, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-b" }));
+    await wait(300);
+
+    expect(events.filter((e) => e.event === "session.inbound.accepted").length).toBe(2);
+    expect(events.find((e) => e.event === "session.inbound.accept.failed")).toBeUndefined();
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "bob" });
+      await client.send("cello_use_agent", { name: "bob" });
+      const r1 = await client.send("cello_await_session", { timeout_ms: 500 }) as Record<string, unknown>;
+      const r2 = await client.send("cello_await_session", { timeout_ms: 500 }) as Record<string, unknown>;
+      const ids = [r1.session_id, r2.session_id].sort();
+      expect(ids).toEqual([SID_HEX, Buffer.from(sidB).toString("hex")].sort());
+    } finally { client.close(); }
+  });
+
+  it("M3: ignores an assignment missing initiator_session_peer_id (would gate the receiver to \"\")", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: "cd".repeat(32), counterpartyPubkeyHex: bobPubkey })); // no peer id
+    await wait(80);
+
+    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    const malformed = events.find((e) => e.event === "session.inbound.assignment.malformed");
+    expect(malformed).toBeDefined();
+    expect(malformed!.context["reason"]).toBe("missing_initiator_peer_id");
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+  });
+
+  it("L1: refuses a single-key (M1) assignment as unsupported_signature_type", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    injectRef.inject!(assignmentFrame({
+      initiatorPubkeyHex: "cd".repeat(32), counterpartyPubkeyHex: bobPubkey,
+      initiatorPeerId: "alice-peer", signatureType: "single",
+    }));
+    await wait(80);
+
+    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    const refused = events.find((e) => e.event === "session.inbound.assignment.refused");
+    expect(refused).toBeDefined();
+    expect(refused!.context["reason"]).toBe("unsupported_signature_type");
+  });
+
+  it("H2: a session arriving after the awaiting connection disconnected is NOT lost (delivered to a fresh await)", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    // Connection 1 blocks on await, then disconnects before any session arrives.
+    const c1 = await connectToDaemon(join(tempDir, "daemon.sock"));
+    await c1.send("ipc.connect", { clientType: "test" });
+    await c1.send("cello_start_agent", { name: "bob" });
+    await c1.send("cello_use_agent", { name: "bob" });
+    void (c1.send("cello_await_session", { timeout_ms: 5000 }) as Promise<unknown>).catch(() => {});
+    await wait(40); // waiter registered
+    c1.close();
+    await wait(60); // onDisconnect evicts the dead waiter
+
+    // Now the directory pushes the session. The dead waiter must NOT swallow it.
+    const initiatorPubkey = "ef".repeat(32);
+    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" }));
+    await wait(120);
+
+    // A fresh connection's await receives the session (it landed in the queue, not a dead waiter).
+    const c2 = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await c2.send("ipc.connect", { clientType: "test" });
+      await c2.send("cello_start_agent", { name: "bob" });
+      await c2.send("cello_use_agent", { name: "bob" });
+      const res = await c2.send("cello_await_session", { timeout_ms: 1000 }) as Record<string, unknown>;
+      expect(res.type).toBe("new_session");
+      expect(res.session_id).toBe(SID_HEX);
+      expect(res.counterparty_pubkey).toBe(initiatorPubkey);
+    } finally { c2.close(); }
+  });
+
   it("ignores a session_assignment not addressed to any local agent (no session, no enqueue)", async () => {
     const { logger, events } = makeLogger();
     await makeAgentDir("bob");
@@ -245,35 +398,36 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
-    await new Promise((r) => setTimeout(r, 50));
+    await wait(50);
 
-    // participant_b is some OTHER pubkey, not bob.
     injectRef.inject!(assignmentFrame({
-      sessionId: SID_BYTES,
       initiatorPubkeyHex: "cd".repeat(32),
       counterpartyPubkeyHex: "ee".repeat(32), // not a local agent
       initiatorPeerId: "alice-session-peer-id",
     }));
-    await new Promise((r) => setTimeout(r, 80));
+    await wait(80);
 
     expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
     expect(events.find((e) => e.event === "session.inbound.not_local")).toBeDefined();
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 
-  it("ignores a malformed session_assignment frame (no assignment payload) without throwing", async () => {
+  it("logs malformed and ignores a session_assignment frame with no assignment payload", async () => {
     const { logger, events } = makeLogger();
     await makeAgentDir("bob");
     const node = new FakeNode();
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
-    await new Promise((r) => setTimeout(r, 50));
+    await wait(50);
 
     injectRef.inject!({ type: "session_assignment" }); // no `assignment`
-    await new Promise((r) => setTimeout(r, 50));
+    await wait(50);
 
     expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    const malformed = events.find((e) => e.event === "session.inbound.assignment.malformed");
+    expect(malformed).toBeDefined();
+    expect(malformed!.context["reason"]).toBe("missing_assignment_or_ids");
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 });
