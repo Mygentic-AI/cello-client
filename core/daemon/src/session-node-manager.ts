@@ -156,14 +156,49 @@ export class SessionNodeManager {
       ) => void)
     | null = null;
 
+  // CELLO-M7-MSG-001 (AC-001/AC-002/AC-003): the send is no longer fire-and-forget.
+  // After a content_frame is delivered over the direct session channel, the sender
+  // arms a TTF timer and waits for an unsigned, transport-authenticated `persisted`
+  // delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels
+  // the timer (content.delivery.acked); TTF expiry hands the content to the park
+  // backstop. Keyed sessionId → contentHashHex → entry.
+  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string }>>();
+  // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
+  // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
+  #contentTtfMs = 20_000;
+  // CELLO-M7-MSG-001: side-effect hooks the composition root wires to the durable
+  // retry_queue (and, in 3b, the relay park deposit). Injected after construction
+  // because RetryQueue is built later in daemon.ts. When unset, the awaiting-ACK timer
+  // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
+  #onAwaitingPersisted: ((sessionId: string, contentHashHex: string) => void) | null = null;
+  #onAwaitingTtf: ((sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+
   constructor(opts: {
     factory: ISessionNodeFactory;
     logger: Logger;
     dbPath: string;
+    contentTtfMs?: number;
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
     this.#dbPath = opts.dbPath;
+    if (typeof opts.contentTtfMs === "number" && opts.contentTtfMs > 0) {
+      this.#contentTtfMs = opts.contentTtfMs;
+    }
+  }
+
+  /**
+   * CELLO-M7-MSG-001: wire the durable-backstop side effects of the awaiting-ACK
+   * lifecycle. `onPersisted` clears the durable retry_queue entry when a persisted ACK
+   * arrives; `onTtf` records/parks the un-acked content when the TTF timer fires.
+   * Injected by the composition root (daemon.ts) after the RetryQueue exists.
+   */
+  setAwaitingAckHooks(hooks: {
+    onPersisted?: (sessionId: string, contentHashHex: string) => void;
+    onTtf?: (sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+  }): void {
+    this.#onAwaitingPersisted = hooks.onPersisted ?? null;
+    this.#onAwaitingTtf = hooks.onTtf ?? null;
   }
 
   // ─── Initialization ──────────────────────────────────────────────────────
@@ -558,6 +593,9 @@ export class SessionNodeManager {
   #evictSessionCaches(sessionId: string): void {
     this.#trees.delete(sessionId);
     this.#receivedContent.delete(sessionId);
+    // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
+    // fires a park backstop (or keeps a timer) after it is gone.
+    this.#clearAwaitingForSession(sessionId);
   }
 
   /**
@@ -969,9 +1007,15 @@ export class SessionNodeManager {
     }
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      // AC-001: the sender's correlationId rides in the frame so the receiver's
-      // session.content.received shares ONE correlationId with the sender's
-      // session.content.sent — a single async flow traceable across the two daemons.
+      // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
+      // receiver's `persisted` ACK can come back fast (in-process / low-latency
+      // transports), so registering the awaiting entry after send would let the ACK
+      // race ahead of it and be dropped — the timer would then spuriously fire. The
+      // content is delivered to the wire but NOT yet confirmed persisted; the ACK
+      // resolves it (content.delivery.acked) and TTF expiry hands it to the park
+      // backstop. Fire-and-forget is retired. The correlationId rides in the frame so
+      // the receiver's session.content.received shares ONE flow id with the sender.
+      this.#trackAwaitingAck(sessionId, content, contentHash, correlationId);
       const frame = CBOR_ENC.encode({
         type: "content_frame",
         session_id: sessionId,
@@ -983,6 +1027,9 @@ export class SessionNodeManager {
       try { await stream.close(); } catch { /* best-effort close */ }
       return { ok: true };
     } catch (err: unknown) {
+      // The send failed after (possibly) arming the awaiting tracking — drop it so a
+      // never-delivered frame does not later fire a spurious TTF park.
+      this.#untrackAwaitingAck(sessionId, contentHash);
       // error.message extracted — never [object Object].
       return {
         ok: false,
@@ -1072,6 +1119,131 @@ export class SessionNodeManager {
     return buf.shift() ?? null;
   }
 
+  // ─── CELLO-M7-MSG-001: delivery ACK / TTF tracking (send side) ──────────────
+
+  /**
+   * Arm awaiting-ACK tracking for a just-sent content frame (AC-001/AC-003). Records
+   * the content + a TTF timer keyed by content hash; a `persisted` ACK on the inbound
+   * content stream resolves it, TTF expiry hands it to the park backstop. The timer is
+   * `unref`'d so an in-flight wait never keeps the daemon process (or a test runner)
+   * alive on its own.
+   */
+  #trackAwaitingAck(sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string): void {
+    const hashHex = Buffer.from(contentHash).toString("hex");
+    let bySession = this.#awaitingAck.get(sessionId);
+    if (!bySession) { bySession = new Map(); this.#awaitingAck.set(sessionId, bySession); }
+    // Replace any prior timer for the same (session, hash) so we never leak a timer.
+    const prior = bySession.get(hashHex);
+    if (prior) clearTimeout(prior.timer);
+    const timer = setTimeout(() => {
+      this.#handleTtfExpiry(sessionId, hashHex);
+    }, this.#contentTtfMs);
+    if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();
+    bySession.set(hashHex, { timer, content, correlationId });
+  }
+
+  /**
+   * Resolve an awaiting-ACK entry on a `persisted` delivery ACK (AC-001/AC-002): cancel
+   * the TTF timer, emit content.delivery.acked, and clear the durable backstop entry.
+   * A `received`-level ACK is NOT handled here — the protocol acts on `persisted` only,
+   * so a received ACK leaves the timer armed.
+   */
+  #resolveAwaitingAck(sessionId: string, contentHash: Uint8Array): void {
+    const hashHex = Buffer.from(contentHash).toString("hex");
+    const bySession = this.#awaitingAck.get(sessionId);
+    const entry = bySession?.get(hashHex);
+    if (!entry || !bySession) return; // unknown / already resolved — idempotent
+    clearTimeout(entry.timer);
+    bySession.delete(hashHex);
+    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+    this.#logger.info("content.delivery.acked", {
+      sessionId,
+      contentHash: hashHex,
+      level: "persisted",
+      correlationId: entry.correlationId,
+    });
+    // Clear the durable crash-backstop entry so the startup flush does not re-park
+    // already-delivered content.
+    try {
+      this.#onAwaitingPersisted?.(sessionId, hashHex);
+    } catch (err: unknown) {
+      this.#logger.error("content.delivery.ack.backstop.failed", {
+        sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * TTF timer fired with no `persisted` ACK (AC-003/AC-019): hand the un-acked content
+   * to the park backstop (the durable retry_queue today; the relay store-and-forward
+   * deposit in 3b). The session is never killed and the operator is never interrupted —
+   * parking is best-effort durability.
+   */
+  #handleTtfExpiry(sessionId: string, hashHex: string): void {
+    const bySession = this.#awaitingAck.get(sessionId);
+    const entry = bySession?.get(hashHex);
+    if (!entry || !bySession) return;
+    bySession.delete(hashHex);
+    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+    this.#logger.debug("content.delivery.ttf_expired", { sessionId, contentHash: hashHex });
+    try {
+      this.#onAwaitingTtf?.(sessionId, hashHex, entry.content);
+    } catch (err: unknown) {
+      this.#logger.error("content.park.backstop.failed", {
+        sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Send an unsigned `persisted` delivery ACK back to the sender over the same
+   * /cello/content/1.0.0 protocol (AC-001). Best-effort: authentication is the Noise
+   * session channel, so the ACK carries no signature; a failed ACK send is logged and
+   * the sender recovers via its TTF/recovery path rather than a thrown error here.
+   */
+  async #sendDeliveryAck(sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) return;
+    try {
+      const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      const frame = CBOR_ENC.encode({
+        type: "content_delivery_ack",
+        session_id: sessionId,
+        content_hash: contentHash,
+        level: "persisted",
+        correlation_id: correlationId,
+      }) as Uint8Array;
+      stream.send(lp.encode.single(frame));
+      try { await stream.close(); } catch { /* best-effort close */ }
+    } catch (err: unknown) {
+      this.#logger.warn("content.delivery.ack.send.failed", {
+        sessionId,
+        contentHash: Buffer.from(contentHash).toString("hex"),
+        error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
+  }
+
+  /** Cancel and drop a single awaiting-ACK entry (e.g. the send failed after arming). */
+  #untrackAwaitingAck(sessionId: string, contentHash: Uint8Array): void {
+    const hashHex = Buffer.from(contentHash).toString("hex");
+    const bySession = this.#awaitingAck.get(sessionId);
+    const entry = bySession?.get(hashHex);
+    if (!entry || !bySession) return;
+    clearTimeout(entry.timer);
+    bySession.delete(hashHex);
+    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+  }
+
+  /** Cancel and drop all awaiting-ACK timers for a session (teardown). */
+  #clearAwaitingForSession(sessionId: string): void {
+    const bySession = this.#awaitingAck.get(sessionId);
+    if (!bySession) return;
+    for (const entry of bySession.values()) clearTimeout(entry.timer);
+    this.#awaitingAck.delete(sessionId);
+  }
+
   #loadTreeFromDb(sessionId: string): SessionTree {
     if (!this.#db) return SessionTree.empty();
     const rows = this.#db
@@ -1108,14 +1280,34 @@ export class SessionNodeManager {
         : Buffer.isBuffer(result.value) ? new Uint8Array(result.value as Buffer)
         : (result.value as { slice(): Uint8Array }).slice();
       const frame = decode(bytes) as Record<string, unknown>;
+      const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
+
+      // CELLO-M7-MSG-001 (AC-001/AC-002): a `persisted` delivery ACK arriving on the
+      // same /cello/content/1.0.0 protocol resolves the sender's awaiting-ACK timer.
+      // The protocol acts on `persisted` ONLY — any other level leaves the timer armed.
+      if (frame["type"] === "content_delivery_ack") {
+        const ackHash = frame["content_hash"];
+        const level = frame["level"];
+        if (ackHash instanceof Uint8Array && level === "persisted") {
+          this.#resolveAwaitingAck(sessionId, ackHash);
+        }
+        return;
+      }
+
       if (frame["type"] !== "content_frame") return;
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
       if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
-      const correlationId = typeof frame["correlation_id"] === "string" ? frame["correlation_id"] : undefined;
-      this.ingestReceivedContent(sessionId, contentBytes, contentHash, correlationId);
+      const ingest = this.ingestReceivedContent(sessionId, contentBytes, contentHash, correlationId);
+      // AC-001: after the content is durably ingested AND its hash cross-check
+      // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
+      // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
+      // path can park / recover.
+      if (ingest.ok) {
+        void this.#sendDeliveryAck(sessionId, contentHash, correlationId);
+      }
     } catch (err: unknown) {
       this.#logger.warn("session.content.stream.read.failed", {
         sessionId,

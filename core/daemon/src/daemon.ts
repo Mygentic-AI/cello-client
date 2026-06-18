@@ -447,6 +447,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
     logger,
     dbPath: join(celloDir, "sessions.db"),
+    contentTtfMs: config.contentTtfMs,
   });
   await sessionNodeManager.initialize();
 
@@ -455,6 +456,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
   const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
   retryQueue.loadFromDb();
+
+  // CELLO-M7-MSG-001 (AC-001/AC-003/AC-019): wire the awaiting-ACK lifecycle's durable
+  // side effects to the retry_queue. A `persisted` delivery ACK clears the durable
+  // entry; a TTF expiry records the un-acked content for the crash backstop (the relay
+  // park deposit itself is added in 3b). Both side effects are best-effort and never
+  // throw into the content stream handler.
+  sessionNodeManager.setAwaitingAckHooks({
+    onPersisted: (sessionId, contentHashHex) => {
+      retryQueue.markContentAcked(sessionId, Buffer.from(contentHashHex, "hex"));
+    },
+    onTtf: (sessionId, contentHashHex, content) => {
+      retryQueue.enqueueAwaitingContent(sessionId, Buffer.from(contentHashHex, "hex"), content);
+    },
+  });
 
   // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked
   // content (the crash backstop). Runs HERE — before the IPC socket opens, consistent

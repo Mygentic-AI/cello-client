@@ -216,6 +216,13 @@ export interface DaemonConfig {
    * for the next startup that has a park target.
    */
   contentParkFn?: import("./retry-queue.js").ParkFn;
+  /**
+   * CELLO-M7-MSG-001 (AC-001/AC-003): the TTF (time-to-flush) window, in ms, the
+   * sender waits for a `persisted` delivery ACK before handing un-acked content to the
+   * park backstop. Default 20_000 (Part-4 proposed 10–30s band). Tests inject a small
+   * value to drive TTF expiry deterministically.
+   */
+  contentTtfMs?: number;
 }
 
 // --- Session node types ---
