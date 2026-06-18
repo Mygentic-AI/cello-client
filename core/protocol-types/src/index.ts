@@ -161,3 +161,15 @@ export {
   isContentResendRequest,
   isContentParkDeposit,
 } from "./content-delivery.js";
+// M7-SESSION-003: Session-path liveness wire types + codec
+export type {
+  SessionLiveness,
+  SessionLivenessQuery,
+  SessionLivenessResponse,
+} from "./session-liveness.js";
+export {
+  encodeSessionLivenessQuery,
+  decodeSessionLivenessQuery,
+  encodeSessionLivenessResponse,
+  decodeSessionLivenessResponse,
+} from "./session-liveness.js";

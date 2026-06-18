@@ -64,6 +64,20 @@ export interface CreateNodeOptions {
    * AutoNAT is included for every nodeType.
    */
   nodeType?: "session" | "standing_receiver";
+  /**
+   * CELLO-M7-SESSION-003 (AC-005): transport keepalive interval in milliseconds.
+   * Wires libp2p's connectionMonitor pingInterval so that a counterparty that
+   * vanishes WITHOUT a clean stream close (cable pulled / SIGKILL with no FIN) is
+   * detected — the failed keepalive ping aborts the connection, surfacing a
+   * libp2p peer:disconnect within a bounded window. This is the fourth keepalive
+   * relationship (the peer↔peer SESSION connection) that the three-relationships
+   * design (relay↔dir, client↔dir, client↔relay) did not cover.
+   *
+   * Injectable so tests can assert the dead-connection transition with a short
+   * interval — no synthetic clock manipulation required. When undefined, libp2p's
+   * default connectionMonitor interval applies.
+   */
+  keepAliveIntervalMs?: number;
 }
 
 // ─── StreamHandler ──────────────────────────────────────────────────────────

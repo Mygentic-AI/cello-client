@@ -99,6 +99,12 @@ export interface SessionNodeConfig {
    * 'standing_receiver'). AutoNAT is present for both.
    */
   nodeType?: "session" | "standing_receiver";
+  /**
+   * M7-SESSION-003 (AC-005): keepalive ping interval for the session node so a
+   * counterparty that vanishes without a clean close is detected within a bounded
+   * window. Factories should forward this to createNode({ keepAliveIntervalMs }).
+   */
+  keepAliveIntervalMs?: number;
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -157,6 +163,11 @@ export class SessionNodeManager {
   // probers (SI-002). Empty () => [] when the directory is in 'reconnecting'
   // state — AutoNAT cannot run and dialability stays the conservative default.
   readonly #autoNatProbers: () => string[];
+  // M7-SESSION-003: per-session direct-path counterparty liveness, observed on the
+  // session node's onPeerConnect ('alive') / onPeerDisconnect ('gone'). This is
+  // the liveness authority for direct sessions — the unilateral-seal gate reads
+  // it (relay sessions query the relay instead). NEVER the directory (SI-002).
+  #sessionLiveness = new Map<string, "alive" | "gone">();
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -474,8 +485,65 @@ export class SessionNodeManager {
     // DAEMON-004: register the content stream handler so inbound content_frames
     // are cross-checked, appended to the daemon-owned tree, and buffered.
     this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
+    // liveness. The session connection IS the authority for a direct session.
+    this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
     return { ok: true, peerId, addrs };
+  }
+
+  /**
+   * M7-SESSION-003 AC-004: wire a session node's peer-connect / peer-disconnect
+   * events to per-session direct-path liveness. onPeerConnect → 'alive'; the
+   * session node's gater restricts connections to the designated counterparty, so
+   * a connect/disconnect on this node is the counterparty's session-path liveness.
+   * onPeerDisconnect → 'gone' (the hook the client did not act on before),
+   * emitting session.liveness.changed at WARN. Combined with the transport
+   * keepalive (AC-005), a peer that vanished without a clean close still surfaces
+   * a disconnect and drives 'gone'.
+   */
+  #wireSessionLiveness(
+    sessionId: string,
+    node: CelloNode,
+    counterpartyPubkey: string,
+    correlationId: string,
+  ): void {
+    node.onPeerConnect(() => {
+      const prior = this.#sessionLiveness.get(sessionId);
+      this.#sessionLiveness.set(sessionId, "alive");
+      if (prior !== "alive") {
+        this.#logger.info("session.liveness.changed", {
+          sessionId,
+          counterpartyPubkey,
+          transportPath: "direct",
+          liveness: "alive",
+          observedBy: "session_node",
+          correlationId,
+        });
+      }
+    });
+    node.onPeerDisconnect(() => {
+      const prior = this.#sessionLiveness.get(sessionId);
+      this.#sessionLiveness.set(sessionId, "gone");
+      if (prior !== "gone") {
+        this.#logger.warn("session.liveness.changed", {
+          sessionId,
+          counterpartyPubkey,
+          transportPath: "direct",
+          liveness: "gone",
+          observedBy: "session_node",
+          correlationId,
+        });
+      }
+    });
+  }
+
+  /**
+   * M7-SESSION-003: read the direct-path counterparty liveness for a session.
+   * 'unknown' when no session node observation has occurred yet.
+   */
+  getSessionLiveness(sessionId: string): "alive" | "gone" | "unknown" {
+    return this.#sessionLiveness.get(sessionId) ?? "unknown";
   }
 
   /**
@@ -554,6 +622,8 @@ export class SessionNodeManager {
 
     // DAEMON-004: register the content stream handler for the inbound session.
     this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
+    this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
     // Immediately spin up a replacement (async — do NOT await, AC-003)
     this.#createStandingReceiverWithRetry(correlationId);
@@ -597,6 +667,8 @@ export class SessionNodeManager {
     // SQLite (getSessionTree reloads it on demand), and the received-content buffer
     // holds plaintext that must not linger after a session ends. Without this, both
     // maps grow unbounded by total sessions seen over a long-lived daemon.
+    // (#evictSessionCaches also drops the M7-SESSION-003 liveness flag, so both the
+    // destroy and retire teardown paths clear it — no stale verdict survives.)
     this.#evictSessionCaches(sessionId);
 
     this.#logger.info("session.node.destroyed", {
@@ -645,6 +717,9 @@ export class SessionNodeManager {
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
     // fires a park backstop (or keeps a timer) after it is gone.
     this.#clearAwaitingForSession(sessionId);
+    // M7-SESSION-003: drop the direct-path liveness flag (the seal gate already read
+    // its verdict) so a destroyed/retired session retains no stale alive/gone state.
+    this.#sessionLiveness.delete(sessionId);
   }
 
   /**
