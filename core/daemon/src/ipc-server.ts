@@ -95,7 +95,18 @@ export function createIpcServer(
 
     logger.info("daemon.ipc.accepted", { connectionId });
 
-    const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB per connection
+    // CELLO-M7-MSG-001: the IPC buffer cap MUST exceed the application content cap
+    // (MAX_CONTENT_BYTES = 1 MB) plus the JSON request envelope, or a max-size
+    // cello_send message would trip this overflow and the connection would be killed
+    // BEFORE cello_send's content_too_large check could run — turning a clean,
+    // recoverable "content_too_large" into a fatal connection drop, and making even a
+    // VALID 1 MB message unsendable. 4 MB matches the it-length-prefixed transport
+    // default (IT_LENGTH_PREFIX_DEFAULT_MAX) so the IPC, app-cap, and transport layers
+    // are coherent: content up to the 1 MB cap always traverses IPC, oversize content
+    // reaches cello_send and is rejected with content_too_large, and only a payload
+    // beyond the transport frame is a hard stop. Must stay in sync with the matching
+    // constant in adapter-claude-code/src/ipc-proxy.ts.
+    const MAX_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB per connection (> 1MB content cap + envelope)
     let buffer = "";
 
     socket.on("data", (chunk: Buffer) => {

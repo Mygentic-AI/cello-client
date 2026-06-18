@@ -40,7 +40,11 @@ const IPC_DESERIALIZATION_ERROR = {
     "The daemon sent a malformed response — this may be transient. Retry your operation. If the error persists, run `cello-mcp --version` and `cello status` to check for a version mismatch between cello-mcp and the running daemon.",
 };
 
-const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB — matches IPC server limit
+// CELLO-M7-MSG-001: must stay in sync with ipc-server.ts MAX_BUFFER_SIZE. Raised to
+// 4 MB so a max-size (1 MB) cello_send content message + JSON envelope traverses IPC and
+// reaches the daemon's content_too_large check, instead of tripping a fatal buffer
+// overflow at the 1 MB content cap boundary.
+const MAX_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB — matches IPC server limit
 
 export class IpcProxy {
   readonly #socketPath: string;

@@ -51,6 +51,9 @@ import { FileRegistrationPersistence } from "./registration-persistence.js";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
+// CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
+// at the send point here (the receive point lives in the transport content decode).
+import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
 
 /**
@@ -1681,6 +1684,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     const correlationId = randomUUID();
     const contentBytes = new TextEncoder().encode(contentStr);
+
+    // CELLO-M7-MSG-001 (AC-013/AC-018/AC-021): enforce the 1 MB application content cap
+    // BEFORE any transmission or hash/leaf production. This replaces the silent oversize
+    // decode-failure → desync: the send is rejected with a distinct, diagnosable reason
+    // and actionable guidance; no content frame is transmitted, no leaf is appended, and
+    // the session stays usable.
+    if (contentBytes.length > MAX_CONTENT_BYTES) {
+      logger.warn("content.rejected.too_large", {
+        sessionId,
+        contentSize: contentBytes.length,
+        cap: MAX_CONTENT_BYTES,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "content_too_large",
+        guidance: `This message is ${contentBytes.length} bytes, over the ${MAX_CONTENT_BYTES}-byte (1 MB) per-message content cap. Split it into multiple messages each under the cap, or use the large-object/file transfer path for large payloads (not cello_send). Nothing was sent and the session is still active — retry with smaller content.`,
+      };
+    }
+
     const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
