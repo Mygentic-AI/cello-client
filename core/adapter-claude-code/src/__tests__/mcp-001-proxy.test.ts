@@ -192,6 +192,67 @@ describe("MCP-001 AC-020: binary behaviors", () => {
   });
 });
 
+// ─── CELLO-M7-DAEMON-004 (round-2 BLOCKING): producer side of the session_id
+// param contract. The daemon consumes the snake_case public field `session_id`;
+// this verifies the shipped producer (cello-mcp.ts → IpcProxy) actually emits it
+// VERBATIM on the wire — closing the producer/consumer loop the original bug split.
+describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire shape)", () => {
+  it("proxy.call(cello_send/cello_receive/cello_close_session) puts snake_case session_id on the wire, never camelCase", async () => {
+    const { IpcProxy } = await import("../ipc-proxy.js");
+
+    const tempDir = await mkdtemp(join(tmpdir(), "cello-d004-proxy-"));
+    const socketPath = join(tempDir, "test.sock");
+    const capturedFrames: Array<{ method: string; params: Record<string, unknown> }> = [];
+
+    let server: Server | null = null;
+    try {
+      server = createServer((socket) => {
+        let buffer = "";
+        socket.on("data", (chunk) => {
+          buffer += chunk.toString();
+          let idx: number;
+          while ((idx = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 1);
+            if (!line.trim()) continue;
+            const req = JSON.parse(line) as { id: string; method: string; params: Record<string, unknown> };
+            capturedFrames.push({ method: req.method, params: req.params });
+            socket.write(JSON.stringify({ id: req.id, result: { ok: true } }) + "\n");
+          }
+        });
+      });
+      await new Promise<void>((resolve) => server!.listen(socketPath, resolve));
+
+      const proxy = new IpcProxy(socketPath);
+      await proxy.connect();
+
+      const SID = "ab".repeat(32);
+      // Exactly the param shapes cello-mcp.ts forwards (see bin/cello-mcp.ts L164/172/187).
+      await proxy.call("cello_send", { session_id: SID, content: "hi" });
+      await proxy.call("cello_receive", { session_id: SID, timeout_ms: 1000 });
+      await proxy.call("cello_close_session", { session_id: SID });
+      proxy.close();
+
+      for (const method of ["cello_send", "cello_receive", "cello_close_session"]) {
+        const frame = capturedFrames.find((f) => f.method === method);
+        expect(frame, `${method} frame must reach the wire`).toBeDefined();
+        expect(frame!.params.session_id, `${method} must carry snake_case session_id`).toBe(SID);
+        expect(frame!.params).not.toHaveProperty("sessionId");
+      }
+    } finally {
+      if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cello-mcp.ts forwards the snake_case session_id field for all three session tools", () => {
+    const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+    expect(src).toContain('proxy.call("cello_send", { session_id, content })');
+    expect(src).toContain('proxy.call("cello_receive", { session_id, timeout_ms })');
+    expect(src).toContain('proxy.call("cello_close_session", { session_id })');
+  });
+});
+
 // ─── AC-014: Distinct reason codes ───
 describe("MCP-001 AC-014: distinct reason codes", () => {
   it("ipc_proxy returns ipc_connection_lost when socket is closed", async () => {

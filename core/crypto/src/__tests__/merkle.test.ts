@@ -382,3 +382,31 @@ describe("leaf-hash-vectors.json fixture (MERKLE-002 domain separation)", () => 
     });
   }
 });
+
+// ── "hash" leaf-kind variant (used by the daemon-owned SessionTree, DAEMON-004) ──
+// A { kind: "hash" } leaf supplies a PRE-COMPUTED 32-byte leaf hash that is used
+// as-is (no prefix re-applied). SessionTree persists leaves this way so it can
+// reconstruct the exact root from hex without ever holding the plaintext.
+describe("'hash' leaf-kind variant (DAEMON-004 SessionTree)", () => {
+  it("a 'hash' leaf carrying msgLeafHash(data) yields the SAME root as a 'msg' leaf of data", () => {
+    const data = new Uint8Array([0x01, 0x02, 0x03]);
+    const msgTree = buildMerkleTree([msgLeaf(data)]);
+    const hashTree = buildMerkleTree([{ kind: "hash", data: msgLeafHash(data) }]);
+    expect(toHex(merkleRoot(hashTree))).toBe(toHex(merkleRoot(msgTree)));
+  });
+
+  it("multi-leaf: pre-hashed 'hash' leaves reproduce the 'msg' tree root in order", () => {
+    const raw = [new Uint8Array([0xaa]), new Uint8Array([0xbb]), new Uint8Array([0xcc])];
+    const msgRoot = toHex(merkleRoot(buildMerkleTree(raw.map((d) => msgLeaf(d)))));
+    const hashRoot = toHex(
+      merkleRoot(buildMerkleTree(raw.map((d) => ({ kind: "hash" as const, data: msgLeafHash(d) })))),
+    );
+    expect(hashRoot).toBe(msgRoot);
+  });
+
+  it("a single 'hash' leaf is the root verbatim (no prefix applied)", () => {
+    const pre = new Uint8Array(32).fill(0x7e);
+    const tree = buildMerkleTree([{ kind: "hash", data: pre }]);
+    expect(toHex(merkleRoot(tree))).toBe(toHex(pre));
+  });
+});

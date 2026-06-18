@@ -192,6 +192,14 @@ export interface DaemonConfig {
    * identity. Ignored when signalingConnect is provided directly.
    */
   directoryEndpointResolver?: () => Promise<DirectoryEndpoint | null>;
+  /**
+   * CELLO-M7-DAEMON-004: injectable session-node factory for the composition root.
+   * When absent, the production factory (real libp2p via createNode) is used.
+   * Tests inject a controllable factory to exercise the send/receive/tree path
+   * without the real transport stack — the same adapter-injection pattern
+   * DAEMON-002 established for ISessionNodeFactory.
+   */
+  sessionNodeFactory?: import("./session-node-manager.js").ISessionNodeFactory;
 }
 
 // --- Session node types ---
