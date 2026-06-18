@@ -704,6 +704,52 @@ describe("SessionNodeManager — integration tests", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
+  // ── SEAM 1b: the session node is the dialer ────────────────────────────────
+
+  it("SEAM 1b: connectToCounterparty dials the counterparty THROUGH the session node (N_A holds the connection)", async () => {
+    const { manager } = await makeManager({ factory: new RealNodeFactory() });
+    await manager.initialize();
+    // The counterparty: a plain real node, listening, with no restrictive gater.
+    const counterparty = await makeRealNode();
+    cleanupNodes.push(counterparty);
+    try {
+      const sid = "1b".repeat(16);
+      const created = await manager.createSessionNode(sid, "alice", "bpub", counterparty.getPeerId(), "corr");
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+
+      // Dial the counterparty THROUGH N_A — this is the reconciliation: the session
+      // node, not a separate dialer, holds the connection.
+      const r = await manager.connectToCounterparty(sid, counterparty.listenAddresses());
+      expect(r.ok).toBe(true);
+
+      // The counterparty sees an inbound connection FROM N_A's peer id — i.e. the
+      // session node itself dialed out and is now connected (content newStream can ride it).
+      let connected = false;
+      for (let i = 0; i < 60; i++) {
+        if (counterparty.getConnections().some((c) => c.peerId === created.peerId)) { connected = true; break; }
+        await new Promise((res) => setTimeout(res, 25));
+      }
+      expect(connected).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 30_000);
+
+  it("SEAM 1b: connectToCounterparty returns no_counterparty_addrs when the assignment carried no addrs", async () => {
+    const { manager } = await makeManager({ factory: new RealNodeFactory() });
+    await manager.initialize();
+    try {
+      const sid = "1c".repeat(16);
+      await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
+      const r = await manager.connectToCounterparty(sid, []);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("no_counterparty_addrs");
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 30_000);
+
   // ── AC-002: standing receiver ready before any session ─────────────────────
 
   it("AC-002: after initialize(), getStandingReceiverReady() is true and session.node.created logged for standing receiver", async () => {

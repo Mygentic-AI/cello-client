@@ -967,6 +967,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
 
+    // SEAM 1b: for direct mode, the session node N_A must hold the connection its
+    // content stream rides — so dial the counterparty THROUGH N_A (not the separate
+    // composition-root dialer). On failure, tear the just-created session down rather
+    // than leave a dangling 'active' row that cello_send would then fail on.
+    // (relay mode dials via N_A through the relay circuit — a later seam — so it is
+    // skipped here and the session is left active for that path.)
+    if (assignment.transport_mode === "direct") {
+      const connected = await sessionNodeManager.connectToCounterparty(
+        sessionId,
+        assignment.counterparty_session_addrs ?? [],
+      );
+      if (!connected.ok) {
+        await sessionNodeManager.destroySessionNode(sessionId, "interrupted");
+        logger.warn("session.initiate.connect.failed", {
+          sessionId,
+          reason: connected.reason,
+          error: connected.error,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: connected.reason,
+          guidance:
+            "The session was negotiated but the counterparty's session node could not be " +
+            "reached on its direct addresses. Verify the counterparty is online and retry; " +
+            "the daemon will fall back to the relay path once that seam is wired.",
+        };
+      }
+    }
+
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
     return { ok: true, sessionId, transportMode: result.mode, correlationId };

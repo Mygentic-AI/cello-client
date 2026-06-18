@@ -1104,6 +1104,50 @@ export class SessionNodeManager {
   }
 
   /**
+   * SEAM 1b (dialer ⇄ session-node reconciliation): dial the counterparty THROUGH
+   * this session's OWN node, so the session node N_A holds the connection its content
+   * newStream actually rides. TRANSPORT-001's transport selector dialed on a separate
+   * (composition-root) node whose connection N_A could not use — the per-session node
+   * must be the dialer. Direct mode only here (the default content path, Part 4 D-a);
+   * relay-circuit + dcutr strategy via N_A is a later seam. Tries each addr in turn;
+   * succeeds on the first connection, returns a named failure if none connect.
+   */
+  async connectToCounterparty(
+    sessionId: string,
+    addrs: string[],
+  ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) {
+      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
+    }
+    if (addrs.length === 0) {
+      return { ok: false, reason: "no_counterparty_addrs", error: "the assignment carried no counterparty session addrs to dial" };
+    }
+    let lastError = "";
+    for (const addr of addrs) {
+      try {
+        await entry.node.dial(addr);
+        this.#logger.info("session.transport.connected", {
+          sessionId,
+          addr,
+          correlationId: entry.correlationId,
+        });
+        return { ok: true };
+      } catch (err: unknown) {
+        // error.message extracted — never [object Object]; try the next addr.
+        lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    this.#logger.warn("session.transport.connect.failed", {
+      sessionId,
+      reason: "counterparty_dial_failed",
+      error: lastError,
+      correlationId: entry.correlationId,
+    });
+    return { ok: false, reason: "counterparty_dial_failed", error: lastError };
+  }
+
+  /**
    * DAEMON-004: send content over the session node's direct P2P content stream.
    * On a dead/missing stream this returns a NAMED, diagnosable failure — never a
    * silent success and never a desync (closing the old silent fire-and-forget
