@@ -140,3 +140,24 @@ export type {
   SessionInterruptedFrame,
   SealInterruptedSignalingMessage,
 } from "./seal-interrupted.js";
+
+// M7-MSG-001: content-delivery (delivery ACK, recovery, park) wire types
+export type {
+  ContentAckLevel,
+  ContentDeliveryAck,
+  ContentResendRequest,
+  ContentParkDeposit,
+  ContentParkDepositAck,
+  ContentParkNotify,
+  ContentParkPullRequest,
+  ContentParkPullResponse,
+} from "./content-delivery.js";
+export {
+  IT_LENGTH_PREFIX_DEFAULT_MAX,
+  CONTENT_PARK_PROTOCOL_ID,
+  CONTENT_PARK_AUTH_DOMAIN,
+  buildContentParkAuthMsg,
+  isContentDeliveryAck,
+  isContentResendRequest,
+  isContentParkDeposit,
+} from "./content-delivery.js";

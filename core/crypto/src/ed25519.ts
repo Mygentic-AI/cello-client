@@ -3,6 +3,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { readFile, rename, mkdir, open as fsOpen } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { KeyProvider, PublicKey, Signature } from "./types.js";
+import { openSealed } from "./content-seal.js";
 
 const INSPECT = Symbol.for("nodejs.util.inspect.custom");
 const KEY_FILE_MAGIC = new Uint8Array([0xce, 0x11, 0x0e, 0x01]); // "CELLO\x01"
@@ -27,6 +28,11 @@ export class InMemoryKeyProvider implements KeyProvider {
 
   async sign(data: Uint8Array): Promise<Signature> {
     return ed25519.sign(data, this.#seed);
+  }
+
+  /** CELLO-M7-MSG-001: open a content-park sealed blob addressed to this identity key. */
+  async openContentSeal(blob: Uint8Array): Promise<Uint8Array | null> {
+    return openSealed(this.#seed, blob);
   }
 
   toJSON(): Record<string, string> {
@@ -110,6 +116,11 @@ export class FileKeyProvider implements KeyProvider {
 
   async sign(data: Uint8Array): Promise<Signature> {
     return this.#inner.sign(data);
+  }
+
+  /** CELLO-M7-MSG-001: open a content-park sealed blob addressed to this identity key. */
+  async openContentSeal(blob: Uint8Array): Promise<Uint8Array | null> {
+    return this.#inner.openContentSeal(blob);
   }
 
   toJSON(): Record<string, unknown> {

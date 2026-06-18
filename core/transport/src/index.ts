@@ -15,6 +15,10 @@ export type {
 } from "./types.js";
 export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "./protocols.js";
 
+// M7-MSG-001: content-size cap on inbound content decode
+export { readCappedContentFrame } from "./content-cap.js";
+export type { CappedFrameResult } from "./content-cap.js";
+
 // M7-MANIFEST-002: manifest interfaces
 export type {
   IManifestVersionStore,

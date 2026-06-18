@@ -41,6 +41,9 @@ export { buildCheckpointTbs, computeCheckpointHash } from "./checkpoint.js";
 // FEDERATION-003: relay registration TBS and signature verification
 export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./relay-registration.js";
 
+// M7-MSG-001: recipient content sealed box (E2E encryption for parked content)
+export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./content-seal.js";
+
 // M7-MANIFEST-001: consortium manifest verification and root key constants
 export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
 export { canonicalManifestBody, verifyManifest } from "./manifest.js";
