@@ -30,6 +30,22 @@ export { connectOrStart, type ConnectResult } from "./connect-or-start.js";
 export { RetryQueue, type RetryQueueEntry, type ResendFn, type ResendResult, RETRY_QUEUE_CAP } from "./retry-queue.js";
 export { NonceDedupStore, NONCE_DEDUP_CAP } from "./nonce-dedup.js";
 
+// CELLO-M7-TRANSPORT-001: direct-P2P transport selection with relay fallback + dcutr
+export {
+  TransportSelector,
+  LocalTransportSelectorStub,
+  TRANSPORT_ERROR,
+  DEFAULT_DIRECT_DIAL_TIMEOUT_MS,
+  selectAdvertisedAddress,
+} from "./transport-selector.js";
+export type {
+  ITransportSelector,
+  TransportResult,
+  TransportDialer,
+  TransportDialOptions,
+  AdvertisedAddress,
+} from "./transport-selector.js";
+
 // M7-MANIFEST-002: manifest loading, verification, and polling
 export { FileManifestProvider } from "./manifest-loader.js";
 export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll-scheduler.js";

@@ -12,7 +12,9 @@ import type {
   IManifestPollScheduler,
   IDirectoryChallengeVerifier,
   ConnectResult,
+  IAutoNatService,
 } from "@cello-protocol/transport";
+import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
@@ -223,6 +225,36 @@ export interface DaemonConfig {
    * value to drive TTF expiry deterministically.
    */
   contentTtfMs?: number;
+  /**
+   * CELLO-M7-TRANSPORT-001: low-level dialer backing the transport selector in
+   * production environments (dev/staging/production). Wraps a CelloNode (direct +
+   * relay circuit dial) and the daemon relay registry. Required for production
+   * CELLO_ENV; for 'local'/'test' the composition root uses an in-process stub.
+   */
+  transportDialer?: TransportDialer;
+  /**
+   * CELLO-M7-TRANSPORT-001: AutoNAT service adapter backing dialability detection
+   * in production environments. Wraps the standing-receiver node's libp2p AutoNAT
+   * observable. For 'local'/'test' the composition root uses a stub (dialable=false).
+   */
+  autoNatService?: IAutoNatService;
+  /**
+   * CELLO-M7-TRANSPORT-001: directory session negotiation adapter (WIRE-001/
+   * SIGNAL-001). cello_initiate_session calls negotiate() to obtain the
+   * FROST-signed SessionAssignment, then drives the transport selector to dial the
+   * counterparty (AC-005/AC-006/AC-008/AC-010c). When absent, cello_initiate_session
+   * reports directory_signaling_not_configured — it does NOT crash, proving the
+   * transport adapters are wired.
+   */
+  sessionNegotiator?: SessionNegotiator;
+  /**
+   * CELLO-M7-TRANSPORT-001: returns this daemon's relay circuit address (from the
+   * relay registry populated at directory connection) for the SessionAssignment
+   * advertised address when the standing receiver is NOT dialable (AC-004). When
+   * absent, an empty advertised relay address is used (the negotiator supplies the
+   * real one in production).
+   */
+  getRelayCircuitAddress?: () => string;
 }
 
 // --- Session node types ---

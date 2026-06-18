@@ -86,8 +86,12 @@ class FakeCelloNode {
   async handle(_protocolId: string, _handler: unknown, _opts?: unknown): Promise<void> {}
   getProtocols(): string[] { return []; }
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
+  hasDirectConnectionTo(_peerId: string): boolean { return false; }
   onPeerConnect(_handler: (peerId: string) => void): void {}
   onPeerDisconnect(_handler: (peerId: string) => void): void {}
+  // CELLO-M7-TRANSPORT-001: dialability observable (loopback fake → never dialable).
+  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
+  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
 }
 
 class StubNodeFactory implements ISessionNodeFactory {

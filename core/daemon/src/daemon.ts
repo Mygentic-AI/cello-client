@@ -55,6 +55,14 @@ import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // at the send point here (the receive point lives in the transport content decode).
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
+import {
+  resolveCelloEnv,
+  createTransportSelector,
+  isProductionVariant,
+} from "./transport-composition.js";
+import type { ITransportSelector } from "./transport-selector.js";
+import { selectAdvertisedAddress } from "./transport-selector.js";
+import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -204,6 +212,17 @@ export interface DaemonHandle {
    * non-null just because status is connected.
    */
   getDirectoryNode(): CelloNode | null;
+  /**
+   * CELLO-M7-TRANSPORT-001 (AC-010): exposes the composition-root transport
+   * selector so integration tests can confirm the adapter is wired (not dead
+   * code) and exercise the selection path without "adapter not wired".
+   */
+  getTransportSelector(): ITransportSelector;
+  /**
+   * CELLO-M7-TRANSPORT-001 (AC-010): exposes the composition-root AutoNAT service
+   * adapter (stub default dialable=false in local/test).
+   */
+  getAutoNatService(): IAutoNatService;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -222,6 +241,9 @@ class ProductionSessionNodeFactory implements ISessionNodeFactory {
       keyProvider: SESSION_NODE_KEY_STUB,
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
       connectionGater: config.connectionGater,
+      // CELLO-M7-TRANSPORT-001: forward the role so AutoNAT/dcutr are configured
+      // correctly (session nodes get dcutr; standing receivers do not).
+      nodeType: config.nodeType,
     });
   }
 }
@@ -232,7 +254,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore, manifestPollScheduler,
     signalingConnect, challengeVerifier, directoryEndpointResolver, sessionNodeFactory,
+    sessionNegotiator, getRelayCircuitAddress,
   } = config;
+
+  // CELLO-M7-TRANSPORT-001: composition-root selection of the transport selector.
+  // Driven by CELLO_ENV; fails fast at startup (here, not at first session) when a
+  // production environment is missing the required transport dialer (AC-010).
+  const celloEnv = resolveCelloEnv(process.env["CELLO_ENV"]);
+  const transportSelector = createTransportSelector({
+    env: celloEnv,
+    logger,
+    transportDialer: config.transportDialer,
+  });
+  logger.info("transport.adapters.wired", {
+    env: celloEnv,
+    selector: isProductionVariant(celloEnv) ? "real" : "stub",
+  });
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
   //
@@ -448,8 +485,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger,
     dbPath: join(celloDir, "sessions.db"),
     contentTtfMs: config.contentTtfMs,
+    // CELLO-M7-TRANSPORT-001: directory-node AutoNAT probers (SI-002). The
+    // directory connection (SIGNAL-001) is not yet wired into the daemon, so the
+    // prober set is empty — AutoNAT cannot run and the standing receiver reports
+    // the conservative default + transport.autonat.unavailable (AC-004/DB-001).
+    autoNatProbers: () => [],
   });
   await sessionNodeManager.initialize();
+
+  // CELLO-M7-TRANSPORT-001: the daemon's runtime AutoNAT service is the one
+  // wrapping the standing receiver node (it emits transport.autonat.result /
+  // transport.autonat.unavailable and its dialability drives the SessionAssignment
+  // advertised address — AC-004/AC-019). config.autoNatService is an explicit
+  // override (tests); otherwise we use the standing receiver's, falling back to a
+  // stub only if the standing receiver failed to come up.
+  const autoNatService: IAutoNatService =
+    config.autoNatService ??
+    sessionNodeManager.getStandingReceiverAutoNat() ??
+    new LocalAutoNatStub();
 
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
@@ -806,7 +859,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // real handlers for them below (each enforces the no_current_agent guard inline).
   const SESSION_TOOLS_REQUIRING_AGENT = [
     "cello_receive_session",
-    "cello_initiate_session",
     "cello_await_session",
     "cello_list_sessions",
   ];
@@ -827,6 +879,71 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "not_implemented", guidance: `Session tool '${tool}' routing is not yet implemented in the daemon. This will be available after the session node manager is wired to the IPC layer.` };
     });
   }
+
+  // ─── CELLO-M7-TRANSPORT-001: cello_initiate_session ─────────────────────────
+  // Direct-P2P-by-default transport selection (AC-005/AC-006/AC-008/AC-010c).
+  // Flow:
+  //   1. Require a current agent.
+  //   2. Mint a correlationId for the whole session-establishment flow.
+  //   3. Read the standing receiver's AutoNAT dialability → choose the advertised
+  //      address (direct when dialable, relay circuit otherwise — AC-004/AC-019).
+  //   4. Negotiate the FROST-signed SessionAssignment via the directory
+  //      (sessionNegotiator — WIRE-001/SIGNAL-001). When no negotiator is wired,
+  //      return directory_signaling_not_configured (graceful — the transport
+  //      adapters ARE wired; this proves it does not crash with "adapter not wired").
+  //   5. Drive the transport selector to dial the counterparty using the
+  //      assignment's authoritative transport_mode (SI-001). Map the TransportResult
+  //      to the MCP response.
+  handlers.set("cello_initiate_session", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const agentName = connState.currentAgent;
+    const correlationId = randomUUID();
+
+    // AC-004/AC-019: the advertised address is chosen from the standing receiver's
+    // current dialability. Not dialable (or AutoNAT unavailable) → relay circuit.
+    const dialability = autoNatService.getDialability();
+    const relayCircuitAddr = getRelayCircuitAddress ? getRelayCircuitAddress() : "";
+    const advertisedAddress = selectAdvertisedAddress(dialability, relayCircuitAddr);
+
+    if (!sessionNegotiator) {
+      return {
+        ok: false,
+        reason: "directory_signaling_not_configured",
+        guidance:
+          "Session initiation requires a directory signaling connection to negotiate " +
+          "the session assignment. The daemon's transport adapters are wired, but no " +
+          "directory negotiator is configured for this environment. Configure the " +
+          "directory connection (CELLO_ENV dev/staging/production) and retry.",
+      };
+    }
+
+    const negotiation = await sessionNegotiator.negotiate({
+      agentName,
+      correlationId,
+      advertisedAddress,
+      params: params ?? {},
+    });
+    if (!negotiation.ok) {
+      return { ok: false, reason: negotiation.reason, guidance: negotiation.guidance };
+    }
+
+    // SI-001: the selector consumes the assignment's signed transport_mode as the
+    // sole dial authority — never inferred from address format.
+    const assignment = negotiation.assignment;
+    const result = await transportSelector.dial(assignment, { correlationId });
+    const sessionId = Buffer.from(assignment.session_id).toString("hex");
+
+    if (!result.ok) {
+      // Terminal: both direct and relay failed (AC-008). Pass the error through.
+      return { ok: false, reason: result.reason, guidance: result.guidance };
+    }
+    // AC-007: the session is usable immediately upon (relay) connection — the dcutr
+    // upgrade runs in the background and is intentionally NOT awaited here.
+    return { ok: true, sessionId, transportMode: result.mode, correlationId };
+  });
 
   // ─── M7-SESSION-001: cello_close_session ────────────────────────────────────
   // M7 error discipline: each distinct failure cause produces a distinct error code.
@@ -1889,5 +2006,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return sessionNodeManager;
   }
 
-  return { stop, getStatus, getSessionNodeManager, getDirectoryNode };
+  function getTransportSelector(): ITransportSelector {
+    return transportSelector;
+  }
+
+  function getAutoNatService(): IAutoNatService {
+    return autoNatService;
+  }
+
+  return { stop, getStatus, getSessionNodeManager, getDirectoryNode, getTransportSelector, getAutoNatService };
 }

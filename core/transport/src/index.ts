@@ -13,7 +13,19 @@ export type {
   NodeStoppedError,
   ListenFailedError,
 } from "./types.js";
-export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID } from "./protocols.js";
+export { CELLO_PROTOCOL_ID, CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID, CELLO_CONTENT_PROTOCOL_ID, AUTONAT_PROTOCOL_ID } from "./protocols.js";
+
+// CELLO-M7-TRANSPORT-001: AutoNAT dialability adapter + stub
+export type { IAutoNatService, Dialability, Unsubscribe } from "./autonat.js";
+export { LocalAutoNatStub, DEFAULT_DIALABILITY } from "./autonat.js";
+// CELLO-M7-TRANSPORT-001: real IAutoNatService over a live CelloNode (emits the
+// transport.autonat.result / transport.autonat.unavailable observability events).
+export { NodeAutoNatService } from "./autonat-service.js";
+export type {
+  AutoNatLogger,
+  AutoNatNodeType,
+  NodeAutoNatServiceOptions,
+} from "./autonat-service.js";
 
 // M7-MSG-001: content-size cap on inbound content decode
 export { readCappedContentFrame } from "./content-cap.js";

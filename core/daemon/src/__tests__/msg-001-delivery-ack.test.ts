@@ -68,6 +68,8 @@ class WiredNode implements Partial<CelloNode>, FrameSink {
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
   onPeerConnect(_h: (p: string) => void): void {}
   onPeerDisconnect(_h: (p: string) => void): void {}
+  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
+  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   invokeHandler(data: unknown): void {
     const h = this.#handler;
     if (!h) return;

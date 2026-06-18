@@ -56,6 +56,8 @@ class FakeNode implements Partial<CelloNode> {
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
   onPeerConnect(_h: (p: string) => void): void {}
   onPeerDisconnect(_h: (p: string) => void): void {}
+  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
+  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
     const sink = this.sent;
     return { send(d: Uint8Array) { sink.push(d); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;
