@@ -200,6 +200,22 @@ export interface DaemonConfig {
    * DAEMON-002 established for ISessionNodeFactory.
    */
   sessionNodeFactory?: import("./session-node-manager.js").ISessionNodeFactory;
+  /**
+   * CELLO-M7-MSG-001 (AC-004/AC-005): park target for the startup flush of un-acked
+   * content. On startup — BEFORE the IPC socket opens — the daemon drains retry_queue
+   * entries still awaiting a `persisted` delivery ACK and re-parks each to the relay
+   * store-and-forward queue via this function (the crash backstop, D-d). The function
+   * performs the encrypted relay deposit and is the natural emitter of
+   * content.park.deposited (it holds the recipient context).
+   *
+   * Re-home (Option A): this is supplied by the daemon's OWN send path — the daemon
+   * owns the session core, so it constructs the relay-deposit function natively (NOT a
+   * hosted CelloClient / RelayStreamManager). When absent (a daemon started without the
+   * content send path, or unit tests), the startup flush is a documented no-op
+   * (content.park.flush.deferred at WARN) and the durable awaiting entries remain queued
+   * for the next startup that has a park target.
+   */
+  contentParkFn?: import("./retry-queue.js").ParkFn;
 }
 
 // --- Session node types ---

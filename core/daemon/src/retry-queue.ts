@@ -72,13 +72,32 @@ export type ResendResult = { delivered: true } | { delivered: false; error: stri
 
 export type ResendFn = (contentBlob: Uint8Array) => Promise<ResendResult>;
 
+/**
+ * CELLO-M7-MSG-001: an un-acked content entry awaiting a `persisted` delivery ACK.
+ * Stored in the SAME retry_queue table (awaiting_ack = 1) — no new table. Drains to
+ * the relay store-and-forward queue (park target) instead of direct-P2P resend.
+ */
+export interface AwaitingContentEntry {
+  sessionId: string;
+  contentHashHex: string;
+  contentBlob: Uint8Array;
+  queuedAt: number;
+  position: number;
+}
+
+/** Result of a park attempt during the awaiting-ACK drain. */
+export type ParkResult = { parked: true } | { parked: false; error: string };
+export type ParkFn = (entry: AwaitingContentEntry) => Promise<ParkResult>;
+
 export class RetryQueue {
   readonly #db: DatabaseSync;
   readonly #logger: Logger;
-  /** Per-session FIFO arrays, ordered by position ascending. */
+  /** Per-session FIFO arrays of DIRECT-resend entries, ordered by position ascending. */
   #queues = new Map<string, RetryQueueEntry[]>();
   /** Per-session position counter for monotonic increment. */
   #positionCounters = new Map<string, number>();
+  /** CELLO-M7-MSG-001: per-session FIFO arrays of awaiting-ACK content (park target). */
+  #awaiting = new Map<string, AwaitingContentEntry[]>();
 
   constructor(db: DatabaseSync, logger: Logger) {
     this.#db = db;
@@ -101,6 +120,16 @@ export class RetryQueue {
       CREATE INDEX IF NOT EXISTS retry_queue_by_session_position
         ON retry_queue(session_id, position ASC)
     `);
+    // CELLO-M7-MSG-001 (AC-005): extend the SAME table with awaiting-ACK content state.
+    // No new table — guarded ALTERs make this idempotent across client upgrades.
+    const cols = this.#db.prepare("PRAGMA table_info(retry_queue)").all() as unknown as Array<{ name: string }>;
+    const hasCol = (n: string): boolean => cols.some((c) => c.name === n);
+    if (!hasCol("awaiting_ack")) {
+      this.#db.exec("ALTER TABLE retry_queue ADD COLUMN awaiting_ack INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!hasCol("content_hash_hex")) {
+      this.#db.exec("ALTER TABLE retry_queue ADD COLUMN content_hash_hex TEXT");
+    }
   }
 
   /**
@@ -109,7 +138,7 @@ export class RetryQueue {
    */
   loadFromDb(): void {
     const rows = this.#db
-      .prepare("SELECT session_id, nonce_hex, content_blob, queued_at, attempts, position FROM retry_queue ORDER BY session_id, position ASC")
+      .prepare("SELECT session_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex FROM retry_queue ORDER BY session_id, position ASC")
       .all() as unknown as Array<{
         session_id: string;
         nonce_hex: string;
@@ -117,12 +146,34 @@ export class RetryQueue {
         queued_at: number;
         attempts: number;
         position: number;
+        awaiting_ack: number;
+        content_hash_hex: string | null;
       }>;
 
     this.#queues.clear();
     this.#positionCounters.clear();
+    this.#awaiting.clear();
 
     for (const row of rows) {
+      // Track max position per session across BOTH direct and awaiting entries.
+      const currentMax = this.#positionCounters.get(row.session_id) ?? 0;
+      if (row.position > currentMax) this.#positionCounters.set(row.session_id, row.position);
+
+      if (row.awaiting_ack === 1) {
+        // CELLO-M7-MSG-001 (AC-004): un-acked content to re-park at startup.
+        const entry: AwaitingContentEntry = {
+          sessionId: row.session_id,
+          contentHashHex: row.content_hash_hex ?? row.nonce_hex,
+          contentBlob: Uint8Array.from(row.content_blob),
+          queuedAt: row.queued_at,
+          position: row.position,
+        };
+        let q = this.#awaiting.get(entry.sessionId);
+        if (!q) { q = []; this.#awaiting.set(entry.sessionId, q); }
+        q.push(entry);
+        continue;
+      }
+
       const entry: RetryQueueEntry = {
         sessionId: row.session_id,
         nonceHex: row.nonce_hex,
@@ -138,12 +189,6 @@ export class RetryQueue {
         this.#queues.set(entry.sessionId, sessionQueue);
       }
       sessionQueue.push(entry);
-
-      // Track max position per session
-      const currentMax = this.#positionCounters.get(entry.sessionId) ?? 0;
-      if (entry.position > currentMax) {
-        this.#positionCounters.set(entry.sessionId, entry.position);
-      }
     }
   }
 
@@ -316,5 +361,108 @@ export class RetryQueue {
   getSessionEntries(sessionId: string): RetryQueueEntry[] {
     const queue = this.#queues.get(sessionId);
     return queue ? [...queue] : [];
+  }
+
+  // ─── CELLO-M7-MSG-001 (AC-004/AC-005/AC-019): awaiting-ACK content (park target) ──
+
+  /**
+   * Record un-acked content awaiting a `persisted` delivery ACK (TTF-trigger path,
+   * AC-005). Persisted to the SAME retry_queue table (awaiting_ack = 1) so a crash
+   * before the relay park confirms is recoverable at startup (AC-004). Idempotent on
+   * (sessionId, contentHash).
+   */
+  enqueueAwaitingContent(sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array): void {
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    let q = this.#awaiting.get(sessionId);
+    if (!q) { q = []; this.#awaiting.set(sessionId, q); }
+    if (q.some((e) => e.contentHashHex === contentHashHex)) return; // idempotent
+
+    const currentMax = this.#positionCounters.get(sessionId) ?? 0;
+    const position = currentMax + 1;
+    this.#positionCounters.set(sessionId, position);
+    const queuedAt = Date.now();
+
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO retry_queue (session_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+        )
+        .run(sessionId, contentHashHex, Buffer.from(contentBlob), queuedAt, 1, position, contentHashHex);
+    } catch (err: unknown) {
+      this.#logger.error("message.retry.persist.failed", {
+        sessionId,
+        nonce: contentHashHex,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // In-memory only (DB-001 fallback) — still re-parkable this run.
+    }
+
+    q.push({ sessionId, contentHashHex, contentBlob, queuedAt, position });
+  }
+
+  /** Remove an awaiting-ACK entry once its `persisted` ACK arrives. */
+  markContentAcked(sessionId: string, contentHash: Uint8Array): void {
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    const q = this.#awaiting.get(sessionId);
+    if (q) {
+      const idx = q.findIndex((e) => e.contentHashHex === contentHashHex);
+      if (idx !== -1) q.splice(idx, 1);
+      if (q.length === 0) this.#awaiting.delete(sessionId);
+    }
+    try {
+      this.#db
+        .prepare("DELETE FROM retry_queue WHERE session_id = ? AND content_hash_hex = ? AND awaiting_ack = 1")
+        .run(sessionId, contentHashHex);
+    } catch (err: unknown) {
+      this.#logger.error("message.retry.persist.failed", {
+        sessionId, nonce: contentHashHex, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** Awaiting-ACK depth for a session (un-acked content count). */
+  getAwaitingDepth(sessionId: string): number {
+    return this.#awaiting.get(sessionId)?.length ?? 0;
+  }
+
+  /** All sessions that currently hold awaiting-ACK content (for the startup flush). */
+  getAwaitingSessions(): string[] {
+    return [...this.#awaiting.keys()].filter((s) => (this.#awaiting.get(s)?.length ?? 0) > 0);
+  }
+
+  /**
+   * Drain a session's awaiting-ACK content to the relay park target (AC-005). Each item
+   * is independent — unlike the direct FIFO resend, a park failure does NOT halt the
+   * rest; the failed item stays queued for the next reconnect / startup flush (DB-001,
+   * AC-019). Returns the number of entries successfully parked.
+   */
+  async drainAwaitingToPark(sessionId: string, parkFn: ParkFn): Promise<number> {
+    const q = this.#awaiting.get(sessionId);
+    if (!q || q.length === 0) return 0;
+    let parked = 0;
+    for (const entry of [...q]) {
+      let result: ParkResult;
+      try {
+        result = await parkFn(entry);
+      } catch (err: unknown) {
+        result = { parked: false, error: err instanceof Error ? err.message : String(err) };
+      }
+      if (!result.parked) continue; // keep for next reconnect / startup flush (AC-019)
+      const idx = q.indexOf(entry);
+      if (idx !== -1) q.splice(idx, 1);
+      try {
+        this.#db
+          .prepare("DELETE FROM retry_queue WHERE session_id = ? AND content_hash_hex = ? AND awaiting_ack = 1")
+          .run(sessionId, entry.contentHashHex);
+      } catch (err: unknown) {
+        this.#logger.error("message.retry.persist.failed", {
+          sessionId, nonce: entry.contentHashHex, error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      parked += 1;
+    }
+    if (q.length === 0) this.#awaiting.delete(sessionId);
+    return parked;
   }
 }

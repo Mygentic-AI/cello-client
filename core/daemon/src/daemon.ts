@@ -453,6 +453,47 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
   retryQueue.loadFromDb();
 
+  // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked
+  // content (the crash backstop). Runs HERE — before the IPC socket opens, consistent
+  // with DAEMON-003 startup loading (AC-007) — so a sender that crashed before its TTF
+  // park confirmed re-parks its un-acked content to the relay store-and-forward queue on
+  // restart. Best-effort: a failed park stays queued (drainAwaitingToPark does not evict
+  // on failure), to be retried at the next startup flush or reconnect.
+  //
+  // Re-home note (Option A): the park target (config.contentParkFn) is supplied natively
+  // by the daemon's own send path — NOT by a hosted CelloClient. When it is absent (e.g.
+  // a daemon started without the content send path wired, or unit tests), the flush is a
+  // documented no-op (content.park.flush.deferred at WARN) and the durable awaiting
+  // entries simply remain queued for the next startup that has a park target.
+  const awaitingSessions = retryQueue.getAwaitingSessions();
+  if (awaitingSessions.length > 0) {
+    const parkFn = config.contentParkFn;
+    if (parkFn) {
+      let parkedTotal = 0;
+      for (const sid of awaitingSessions) {
+        try {
+          parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
+        } catch (err: unknown) {
+          logger.error("content.park.flush.failed", {
+            sessionId: sid,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      logger.info("content.park.flush.completed", {
+        sessionCount: awaitingSessions.length,
+        parkedCount: parkedTotal,
+      });
+    } else {
+      const pendingCount = awaitingSessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
+      logger.warn("content.park.flush.deferred", {
+        sessionCount: awaitingSessions.length,
+        pendingCount,
+        reason: "no_content_park_target",
+      });
+    }
+  }
+
   const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
   nonceDedupStore.loadFromDb();
 
@@ -908,6 +949,32 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const content = Buffer.from(contentHex, "hex");
     retryQueue.enqueue(sessionId, nonce, content);
     return { queued: true, queueDepth: retryQueue.getSessionDepth(sessionId) };
+  });
+
+  // CELLO-M7-MSG-001 (AC-004/AC-005): the send path records un-acked content here when
+  // its TTF timer fires, so a crash before the relay park confirms is recoverable at the
+  // next startup flush. Stored in the SAME retry_queue table (awaiting_ack = 1).
+  handlers.set("enqueue_awaiting_content", async (params, _connectionId) => {
+    const sessionId = params?.sessionId as string | undefined;
+    const contentHashHex = params?.contentHash as string | undefined;
+    const contentHex = params?.content as string | undefined;
+    if (!sessionId || !contentHashHex || !contentHex) {
+      return { error: "missing_params", guidance: "Provide sessionId, contentHash (hex), and content (hex)." };
+    }
+    retryQueue.enqueueAwaitingContent(sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
+    return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(sessionId) };
+  });
+
+  // CELLO-M7-MSG-001: a `persisted` delivery ACK (or a confirmed park) clears the durable
+  // awaiting-ACK entry so the startup flush does not re-park already-delivered content.
+  handlers.set("mark_content_acked", async (params, _connectionId) => {
+    const sessionId = params?.sessionId as string | undefined;
+    const contentHashHex = params?.contentHash as string | undefined;
+    if (!sessionId || !contentHashHex) {
+      return { error: "missing_params", guidance: "Provide sessionId and contentHash (hex)." };
+    }
+    retryQueue.markContentAcked(sessionId, Buffer.from(contentHashHex, "hex"));
+    return { acked: true, awaitingDepth: retryQueue.getAwaitingDepth(sessionId) };
   });
 
   handlers.set("check_nonce", async (params, _connectionId) => {
