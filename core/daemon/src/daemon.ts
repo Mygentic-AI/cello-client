@@ -857,9 +857,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // ─── MCP-001: no_current_agent guard for session tools ───
   // cello_send / cello_receive are NOT in this stub list — DAEMON-004 registers
   // real handlers for them below (each enforces the no_current_agent guard inline).
+  // NOTE: cello_await_session is NOT in this stub list — Seam 2 registers a real
+  // handler for it below (inbound session establishment), with its own inline
+  // no_current_agent guard.
   const SESSION_TOOLS_REQUIRING_AGENT = [
     "cello_receive_session",
-    "cello_await_session",
     "cello_list_sessions",
   ];
 
@@ -1351,6 +1353,186 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   signalingManager.registerInboundHandler((frame) => {
     if (frame["type"] !== "seal_interrupted_request") return;
     void handleInboundSealInterruptedRequest(frame);
+  });
+
+  // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
+  //
+  // When agent A initiates a session, the directory FROST-signs a SessionAssignment
+  // and PUSHES it to the counterparty B over B's directory signaling stream (an
+  // unsolicited `session_assignment` frame). The daemon turns that frame into a live
+  // inbound session: it resolves which local agent is participant_b, calls
+  // SessionNodeManager.acceptSession (which hands off the standing receiver node bound
+  // to A's session peer id), and enqueues an inbound session event that a blocked
+  // cello_await_session call returns. This is the inbound mirror of cello_initiate_session.
+  //
+  // Reference (Option A native re-home): the dead client stack did this in
+  // core/client/src/frame-dispatch.ts (session_assignment → receiveSessionAssignment)
+  // and core/adapter-claude-code/src/server.ts (sessionEventQueue + cello_await_session).
+  // We reimplement natively here — the daemon never imports @cello-protocol/client.
+  interface InboundSessionEvent {
+    sessionIdHex: string;
+    counterpartyPubkeyHex: string;
+    genesisPrevRootHex: string;
+  }
+  // Per-agent FIFO queue (events accepted while no cello_await_session is blocked) and
+  // the per-agent list of blocked cello_await_session waiters. Inbound sessions are
+  // addressed to a specific local agent (participant_b), so both are keyed by agent name.
+  const inboundSessionQueues = new Map<string, InboundSessionEvent[]>();
+  const inboundSessionWaiters = new Map<string, Array<(e: InboundSessionEvent) => void>>();
+
+  function enqueueInboundSession(agentName: string, event: InboundSessionEvent): void {
+    const waiters = inboundSessionWaiters.get(agentName);
+    if (waiters && waiters.length > 0) {
+      // Hand straight to the oldest blocked waiter (it clears its own timeout).
+      const resolve = waiters.shift()!;
+      resolve(event);
+      return;
+    }
+    const q = inboundSessionQueues.get(agentName) ?? [];
+    q.push(event);
+    inboundSessionQueues.set(agentName, q);
+  }
+
+  // Pull the participant pubkeys + session id out of a pushed session_assignment frame.
+  // CBOR-decoded byte fields arrive as Uint8Array or Buffer; the field may also already
+  // be a hex string. Returns null when the frame is not a usable counterparty-push
+  // assignment (so the handler ignores it rather than throwing on a malformed frame).
+  function frameValueToHex(v: unknown): string | null {
+    if (v instanceof Uint8Array) return Buffer.from(v).toString("hex");
+    if (Buffer.isBuffer(v)) return Buffer.from(v as Buffer).toString("hex");
+    if (typeof v === "string") return v;
+    return null;
+  }
+  function extractInboundSessionAssignment(frame: Record<string, unknown>):
+    | { sessionIdHex: string; participantAPubkeyHex: string; participantBPubkeyHex: string; initiatorPeerId: string }
+    | null {
+    const raw = frame["assignment"];
+    if (!raw || typeof raw !== "object") return null;
+    const a = raw as Record<string, unknown>;
+    const pa = a["participant_a"] as Record<string, unknown> | undefined;
+    const pb = a["participant_b"] as Record<string, unknown> | undefined;
+    const sessionIdHex = frameValueToHex(a["session_id"]);
+    const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
+    const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
+    const initiatorPeerId =
+      typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "";
+    if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
+    return { sessionIdHex, participantAPubkeyHex, participantBPubkeyHex, initiatorPeerId };
+  }
+
+  function handleInboundSessionAssignment(frame: Record<string, unknown>): void {
+    const parsed = extractInboundSessionAssignment(frame);
+    if (!parsed) return; // not a usable counterparty-push assignment → ignore
+
+    // Resolve which local agent is participant_b. participant pubkeys are the agents'
+    // K_local identity pubkeys (same convention as the seal-interrupted responder's
+    // counterparty match above). If none of our agents is the counterparty, this
+    // assignment is not for this daemon — drop it.
+    const localAgent = agents.find((ag) => ag.pubkey === parsed.participantBPubkeyHex);
+    if (!localAgent) {
+      logger.debug("session.inbound.not_local", { sessionId: parsed.sessionIdHex });
+      return;
+    }
+
+    // SECURITY — DEFERRED (SESSION-004 re-home): the directory's FROST threshold
+    // signature on the assignment (directory_signature over the TBS, verified against
+    // signer_pubkey) is NOT yet verified here. The old client's receiveSessionAssignment
+    // performed that check; it must be re-homed natively before this path faces a real
+    // (untrusted) directory. Until then we accept directory-pushed assignments on trust —
+    // the in-process seam tests inject trusted frames. This is logged loudly, never silent.
+    logger.warn("session.inbound.assignment.unverified", {
+      sessionId: parsed.sessionIdHex,
+      agentName: localAgent.name,
+      note: "FROST assignment signature verification deferred to SESSION-004 re-home",
+    });
+
+    const correlationId = randomUUID();
+    const result = sessionNodeManager.acceptSession(
+      parsed.sessionIdHex,
+      localAgent.name,
+      parsed.participantAPubkeyHex, // the initiator is OUR counterparty
+      parsed.initiatorPeerId,
+      correlationId,
+    );
+    if (!result.ok) {
+      logger.warn("session.inbound.accept.failed", {
+        sessionId: parsed.sessionIdHex,
+        agentName: localAgent.name,
+        reason: result.reason,
+        correlationId,
+      });
+      return;
+    }
+
+    const genesisPrevRootHex = sessionNodeManager.getSessionTreeRootHex(parsed.sessionIdHex);
+    logger.info("session.inbound.accepted", {
+      sessionId: parsed.sessionIdHex,
+      agentName: localAgent.name,
+      sessionPeerId: result.peerId,
+      correlationId,
+    });
+    enqueueInboundSession(localAgent.name, {
+      sessionIdHex: parsed.sessionIdHex,
+      counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+      genesisPrevRootHex,
+    });
+    notificationDispatcher.dispatchSessionStateChanged(
+      localAgent.name,
+      parsed.sessionIdHex,
+      "created",
+      parsed.participantAPubkeyHex,
+    );
+  }
+
+  signalingManager.registerInboundHandler((frame) => {
+    if (frame["type"] !== "session_assignment") return;
+    handleInboundSessionAssignment(frame);
+  });
+
+  // cello_await_session — the counterparty's blocking pull for the next inbound session.
+  // Returns immediately if one is already queued for the current agent (FIFO), otherwise
+  // blocks until one arrives or timeout_ms elapses. Response shape matches the established
+  // contract (core/adapter-claude-code/src/server.ts) so the E2E fixture migration is drop-in.
+  handlers.set("cello_await_session", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const agentName = connState.currentAgent;
+    const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
+
+    const toResponse = (e: InboundSessionEvent) => ({
+      type: "new_session",
+      session_id: e.sessionIdHex,
+      counterparty_pubkey: e.counterpartyPubkeyHex,
+      genesis_prev_root: e.genesisPrevRootHex,
+    });
+
+    const queued = inboundSessionQueues.get(agentName);
+    if (queued && queued.length > 0) {
+      return toResponse(queued.shift()!);
+    }
+
+    const event = await new Promise<InboundSessionEvent | null>((resolve) => {
+      const waiters = inboundSessionWaiters.get(agentName) ?? [];
+      const onEvent = (e: InboundSessionEvent): void => {
+        clearTimeout(timer);
+        resolve(e);
+      };
+      waiters.push(onEvent);
+      inboundSessionWaiters.set(agentName, waiters);
+      const timer = setTimeout(() => {
+        const list = inboundSessionWaiters.get(agentName);
+        if (list) {
+          const idx = list.indexOf(onEvent);
+          if (idx !== -1) list.splice(idx, 1);
+        }
+        resolve(null);
+      }, timeoutMs);
+    });
+
+    if (event === null) return { type: "timeout" };
+    return toResponse(event);
   });
 
   // M7-SESSION-001 AC-008 (H-1): seal-interrupted bilateral INITIATOR flow.
