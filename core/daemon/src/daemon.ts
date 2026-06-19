@@ -60,8 +60,9 @@ import {
   createTransportSelector,
   isProductionVariant,
 } from "./transport-composition.js";
-import type { ITransportSelector } from "./transport-selector.js";
+import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
+import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -604,6 +605,109 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     sessionNodeManager.getStandingReceiverAutoNat() ??
     new LocalAutoNatStub();
 
+  // ─── DOD-SPINE-5: real client-side session negotiator (built internally) ──────
+  // The directory already brokers `session_request` → FROST-signed `session_assignment`
+  // live; the missing half was the CLIENT driver. This negotiator sends `session_request`
+  // over the CURRENT agent's OWN signaling stream (so the directory routes the signed
+  // assignment back to that agent — same per-agent routing SPINE-4 established), advertising
+  // the standing receiver's session endpoint (WIRE-001: the directory rejects a request
+  // with no initiator session Peer ID), then parses the returned assignment. Ported from
+  // core/client `initiateSession` (NOT imported — that stack is dead). Tests still inject
+  // their own `sessionNegotiator`; the binary now gets a real one instead of
+  // directory_signaling_not_configured.
+  const resolvedSessionNegotiator: SessionNegotiator = sessionNegotiator ?? {
+    negotiate: async (ctx): Promise<SessionNegotiationResult> => {
+      const kp = keyProviders.get(ctx.agentName);
+      const agentRec = loadedAgents.find((a) => a.name === ctx.agentName);
+      if (!kp || !agentRec) {
+        return { ok: false, reason: "agent_not_found", guidance: `Agent '${ctx.agentName}' is not loaded on this daemon.` };
+      }
+      const targetHex =
+        typeof ctx.params["target_pubkey"] === "string"
+          ? (ctx.params["target_pubkey"] as string)
+          : typeof ctx.params["counterparty_pubkey"] === "string"
+            ? (ctx.params["counterparty_pubkey"] as string)
+            : "";
+      if (!/^[0-9a-fA-F]{64}$/.test(targetHex)) {
+        return {
+          ok: false,
+          reason: "invalid_target_pubkey",
+          guidance: "cello_initiate_session requires 'target_pubkey' as the counterparty's 32-byte hex K_local public key.",
+        };
+      }
+      const sr = sessionNodeManager.getStandingReceiverInfo();
+      if (!sr) {
+        return {
+          ok: false,
+          reason: "standing_receiver_unavailable",
+          guidance: "The standing receiver is not ready, so no initiator session endpoint can be advertised. Retry once the daemon has finished starting.",
+        };
+      }
+      const { signaling } = getAgentSignaling(ctx.agentName, kp, agentRec.pubkey);
+      if (!(await waitForSignalingConnected(signaling, 10_000))) {
+        return {
+          ok: false,
+          reason: "directory_signaling_timeout",
+          guidance: `Agent '${ctx.agentName}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry.`,
+        };
+      }
+
+      // Await the directory's reply on THIS agent's stream. A fresh handler per call,
+      // unregistered in finally — concurrent initiations on different agents use
+      // different streams; same-agent concurrency overwrites the resolver (the prior
+      // request times out), matching the core/client single-slot semantics.
+      let resolveFrame!: (f: Record<string, unknown>) => void;
+      const pending = new Promise<Record<string, unknown>>((r) => {
+        resolveFrame = r;
+      });
+      const unregister = signaling.registerInboundHandler((frame) => {
+        const t = frame["type"];
+        if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
+      });
+      try {
+        const sent = await signaling.sendRaw({
+          type: "session_request",
+          target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
+          initiator_session_peer_id: sr.peerId,
+          initiator_session_addrs: sr.addrs,
+        });
+        if (!sent.ok) {
+          return {
+            ok: false,
+            reason: sent.reason ?? "directory_unreachable",
+            guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream.",
+          };
+        }
+        let timer!: ReturnType<typeof setTimeout>;
+        const timeoutP = new Promise<Record<string, unknown>>((r) => {
+          timer = setTimeout(() => r({ type: "__timeout__" }), 30_000);
+        });
+        const frame = await Promise.race([pending, timeoutP]);
+        clearTimeout(timer);
+        if (frame["type"] === "__timeout__") {
+          return { ok: false, reason: "timeout", guidance: "The directory did not return a session assignment within 30s. Retry once cello status shows directory_signaling connected." };
+        }
+        if (frame["type"] === "session_request_error") {
+          const reason = sessionRequestErrorReason(frame);
+          return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
+        }
+        const raw = frame["assignment"] as Record<string, unknown> | undefined;
+        const assignment = raw ? parseSessionAssignment(raw) : null;
+        if (!assignment) {
+          return { ok: false, reason: "assignment_parse_failed", guidance: "The directory's session_assignment was missing or malformed." };
+        }
+        logger.info("session.negotiate.assignment.received", {
+          agentName: ctx.agentName,
+          correlationId: ctx.correlationId,
+          signatureType: assignment.signature_type,
+        });
+        return { ok: true, assignment };
+      } finally {
+        unregister();
+      }
+    },
+  };
+
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
@@ -1037,19 +1141,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const relayCircuitAddr = getRelayCircuitAddress ? getRelayCircuitAddress() : "";
     const advertisedAddress = selectAdvertisedAddress(dialability, relayCircuitAddr);
 
-    if (!sessionNegotiator) {
-      return {
-        ok: false,
-        reason: "directory_signaling_not_configured",
-        guidance:
-          "Session initiation requires a directory signaling connection to negotiate " +
-          "the session assignment. The daemon's transport adapters are wired, but no " +
-          "directory negotiator is configured for this environment. Configure the " +
-          "directory connection (CELLO_ENV dev/staging/production) and retry.",
-      };
-    }
-
-    const negotiation = await sessionNegotiator.negotiate({
+    // resolvedSessionNegotiator is always defined (the daemon builds a real internal
+    // negotiator when none is injected), so directory_signaling_not_configured no longer
+    // fires on the live binary — session_request is actually negotiated with the directory.
+    const negotiation = await resolvedSessionNegotiator.negotiate({
       agentName,
       correlationId,
       advertisedAddress,
