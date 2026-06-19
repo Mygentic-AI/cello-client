@@ -63,6 +63,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
+import { wireSessionCeremonyHandler } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -542,6 +543,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
     perAgentSignaling.set(agentName, entry);
     logger.info("agent.signaling.created", { agentName, agentPubkey: agentPubkeyHex });
+    // DOD-SPINE-5: answer the directory's delegated-signing `ceremony_request` on THIS
+    // agent's stream (the session FROST ceremony — the per-agent counterpart to SPINE-4's
+    // registration routing). Unregistered implicitly when the manager is stopped.
+    wireSessionCeremonyHandler({
+      agentName,
+      agentDir: join(celloDir, "agents", agentName),
+      agentPubkeyHex,
+      getNode: entry.getNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: mgr,
+      logger,
+    });
     return entry;
   }
 
@@ -568,6 +581,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     perAgentSignaling.delete(agentName);
     await entry.signaling.stop();
     logger.info("agent.signaling.dropped", { agentName });
+  }
+
+  // DOD-SPINE-5: the PRIMARY agent registers + initiates over the keystone signaling
+  // stream (not a per-agent one), so wire its ceremony_request handler on the keystone
+  // manager too — otherwise a primary-agent initiator's session ceremony would time out.
+  if (primaryAgent) {
+    wireSessionCeremonyHandler({
+      agentName: primaryAgent.name,
+      agentDir: join(celloDir, "agents", primaryAgent.name),
+      agentPubkeyHex: primaryAgent.pubkey,
+      getNode: getDirectoryNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: signalingManager,
+      logger,
+    });
   }
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
