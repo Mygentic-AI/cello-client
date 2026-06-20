@@ -1154,6 +1154,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Prevents duplicate concurrent seal-interrupted attempts for the same session (AC-011).
   const sealInterruptedInProgress = new Set<string>();
 
+  // M7 DOD-SPINE-7: relay-mediated bilateral seal. cello_close_session registers a waiter
+  // per session_id (hex); the directory's session_sealed frame — delivered over the agent's
+  // signaling stream after FROST notarization, once BOTH parties have submitted their SEAL
+  // ctrl leaf — resolves it with the sealed_root.
+  const pendingSealWaiters = new Map<string, (sealedRootHex: string) => void>();
+
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {
     return {
@@ -1413,7 +1419,45 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       sealInterruptedInProgress.add(sessionId);
       const correlationId = randomUUID();
       try {
-        return await handleActiveSealFlow(sessionId, record, correlationId);
+        // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
+        // relay witness; when the counterparty ALSO closes, the relay's #maybeProcessSeal
+        // fires → directory processSeal rebuilds + verifies the signed chain → FROST
+        // notarization → session_sealed to BOTH parties. Register the waiter BEFORE
+        // submitting so the notification can never race ahead of us.
+        let resolveSeal!: (rootHex: string) => void;
+        const sealedP = new Promise<string>((r) => { resolveSeal = r; });
+        pendingSealWaiters.set(sessionId, resolveSeal);
+        const submit = await sessionNodeManager.submitSealLeaf(sessionId, correlationId);
+        if (!submit.ok) {
+          pendingSealWaiters.delete(sessionId);
+          if (submit.reason === "relay_unavailable") {
+            // No relay witness for this session (direct/interrupted) — fall back to the
+            // directory-mediated bilateral-ack seal.
+            return await handleActiveSealFlow(sessionId, record, correlationId);
+          }
+          return {
+            ok: false,
+            reason: submit.reason,
+            guidance: "The SEAL leaf could not be submitted to the relay witness. Retry once the relay is reachable (cello status).",
+          };
+        }
+        // Both parties must close for the directory to notarize. Await session_sealed; a
+        // timeout means the counterparty has not closed yet (our leaf is recorded — the
+        // session seals when they call cello_close_session).
+        let timer!: ReturnType<typeof setTimeout>;
+        const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), 30_000); });
+        const sealedRoot = await Promise.race([sealedP, timeoutP]);
+        clearTimeout(timer);
+        pendingSealWaiters.delete(sessionId);
+        if (sealedRoot === null) {
+          return {
+            ok: false,
+            reason: "seal_counterparty_pending",
+            guidance: "Your SEAL leaf was submitted to the relay, but the counterparty has not closed yet, so the directory has not notarized. The session seals once they call cello_close_session — retry to confirm.",
+          };
+        }
+        logger.info("session.seal.completed", { sessionId, sealedRoot, role: "bilateral", correlationId });
+        return { ok: true, sealed_root: sealedRoot };
       } finally {
         sealInterruptedInProgress.delete(sessionId);
       }
@@ -1961,6 +2005,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   signalingManager.registerInboundHandler((frame) => {
     if (frame["type"] !== "session_assignment") return;
     handleInboundSessionAssignment(frame);
+  });
+
+  // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the signaling
+  // stream after the relay-mediated bilateral seal notarizes (both parties' SEAL ctrl leaves
+  // → relay #maybeProcessSeal → directory processSeal → FROST). Resolve the close waiter with
+  // the sealed_root and mark the session sealed. (Per-agent streams for non-primary agents are
+  // the SPINE-4/5/6 follow-on; the keystone covers the primary agent / two-daemon spine.)
+  signalingManager.registerInboundHandler((frame) => {
+    if (frame["type"] !== "session_sealed") return;
+    const sidHex = frameValueToHex(frame["session_id"]);
+    const rootHex = frameValueToHex(frame["sealed_root"]);
+    if (!sidHex || !rootHex) return;
+    logger.info("session.sealed.received", { sessionId: sidHex, sealedRoot: rootHex });
+    const waiter = pendingSealWaiters.get(sidHex);
+    if (waiter) {
+      pendingSealWaiters.delete(sidHex);
+      waiter(rootHex);
+    }
+    // Mark the session sealed + tear the node down (idempotent — safe if already gone).
+    void sessionNodeManager.destroySessionNode(sidHex, "sealed");
   });
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
