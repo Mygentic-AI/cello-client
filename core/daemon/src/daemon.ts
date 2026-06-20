@@ -2014,6 +2014,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the SPINE-4/5/6 follow-on; the keystone covers the primary agent / two-daemon spine.)
   signalingManager.registerInboundHandler((frame) => {
     if (frame["type"] !== "session_sealed") return;
+    // DIAG (top-of-listener): log on type match BEFORE field extraction so we can tell
+    // "frame never arrived" from "frame arrived but fields didn't decode".
+    logger.info("session.sealed.frame.arrived", {
+      signatureType: typeof frame["signature_type"] === "string" ? frame["signature_type"] : "?",
+      hasSessionId: frame["session_id"] !== undefined,
+      hasSealedRoot: frame["sealed_root"] !== undefined,
+    });
     const sidHex = frameValueToHex(frame["session_id"]);
     const rootHex = frameValueToHex(frame["sealed_root"]);
     if (!sidHex || !rootHex) return;
