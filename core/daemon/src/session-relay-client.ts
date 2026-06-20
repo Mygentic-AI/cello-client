@@ -228,12 +228,28 @@ export class AgentRelayClient {
     if (seq > prev) this.#lastSeen.set(sessionIdHex, seq);
   }
 
+  /** True if this Structure-1 leaf was authored by US (sender_pubkey === our K_local). */
+  #isOwnLeaf(structure1Cbor: Uint8Array): boolean {
+    try {
+      const arr = decode(structure1Cbor) as unknown[];
+      // Structure 1 = [1, content_hash, sender_pubkey, session_id, last_seen_seq, ts].
+      const senderPubkey = toU8(arr[2]);
+      return Buffer.from(senderPubkey).equals(Buffer.from(this.#senderPubkey));
+    } catch {
+      // Undecodable → treat as NOT ours (conservative: don't suppress a real counterparty leaf).
+      return false;
+    }
+  }
+
   #dispatch(frame: Record<string, unknown>): void {
     const type = frame["type"];
     if (type === "hash_submit_ack") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
-      // The ack carries no session_id — it belongs to the one in-flight submit (FIFO).
-      if (this.#pendingAckSessionHex) this.#bumpLastSeen(this.#pendingAckSessionHex, seq);
+      // DO NOT advance #lastSeen here: the ack is for OUR OWN leaf. last_seen_seq must track
+      // the highest COUNTERPARTY sequence we've observed (the directory's causal check —
+      // SESSION-003 SI-003 — rejects a leaf whose last_seen_seq exceeds the max sequence of
+      // OTHER-sender leaves before it). Advancing on our own ack would inflate it and trip
+      // causal_chain_violated on a subsequent submit (e.g. the SEAL leaf after a sent message).
       this.#settlePending(seq >= 0 ? { ok: true, sequence_number: seq } : { ok: false, reason: "relay_ack_malformed" });
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
@@ -241,14 +257,16 @@ export class AgentRelayClient {
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
-      // leaf_deliver DOES carry session_id — advance that session's own high-water mark.
-      this.#bumpLastSeen(sidHex, seq);
+      const s1 = toU8(frame["structure1_cbor"]);
+      // Advance last_seen_seq ONLY for a COUNTERPARTY leaf. The relay also echoes our OWN
+      // leaf back as a leaf_deliver — that must NOT advance it (same reason as the ack above).
+      if (seq >= 0 && !this.#isOwnLeaf(s1)) this.#bumpLastSeen(sidHex, seq);
       const session = this.#sessions.get(sidHex);
       if (session && seq >= 0) {
         session.onLeafDeliver({
           sequence_number: seq,
           leaf_kind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
-          structure1_cbor: toU8(frame["structure1_cbor"]),
+          structure1_cbor: s1,
           structure2_cbor: toU8(frame["structure2_cbor"]),
         });
       }
