@@ -432,6 +432,7 @@ export class SessionNodeManager {
     counterpartyPubkey: string,
     counterpartyPeerId: string,
     correlationId: string,
+    reuseStandingReceiver = false,
   ): Promise<CreateSessionResult> {
     // Cap enforcement (AC-006)
     if (this.#activeNodes.size >= MAX_SESSION_NODES) {
@@ -449,32 +450,65 @@ export class SessionNodeManager {
       };
     }
 
-    // Create restricted gater — allows only counterpartyPeerId
-    const gater = new SessionConnectionGater({
-      sessionId,
-      allowedPeerId: counterpartyPeerId,
-      logger: this.#logger,
-    });
-
+    // The session node N_A: either a FRESH ephemeral node (default), or — for the initiator
+    // path (reuseStandingReceiver) — the standing receiver handed off as the session node. The
+    // latter makes N_A's peer id equal the SESSION endpoint the initiator ADVERTISED to the
+    // directory (its standing receiver), so the counterparty's connection gater (set to that
+    // advertised peer id) admits N_A's dial. Mirrors acceptSession, which already hands off the
+    // standing receiver on the receiver side. WIRE-001/INV-5: a fully-fresh ephemeral initiator
+    // node would require advertising N_A's peer id pre-negotiation (a session-node lifecycle
+    // split); the symmetric standing-receiver handoff is the consistent interim model.
     let node: CelloNode;
-    try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
-      await node.start();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      this.#logger.error("session.node.create.failed", {
+    let gater: SessionConnectionGater;
+    let autoNat: NodeAutoNatService;
+    if (reuseStandingReceiver) {
+      if (!this.#standingReceiverReady || this.#standingReceiver === null) {
+        return {
+          ok: false,
+          reason: "standing_receiver_unavailable",
+          guidance: "The standing receiver node is initializing (completes within 200ms). Retry the session in a moment.",
+        };
+      }
+      ({ node, gater, autoNat } = this.#standingReceiver);
+      gater.setAllowedPeer(counterpartyPeerId);
+      // Hand the standing receiver off to this session; a replacement is spun up below.
+      this.#standingReceiver = null;
+      this.#standingReceiverReady = false;
+    } else {
+      gater = new SessionConnectionGater({
         sessionId,
-        agentName,
-        error: errorMessage,
-        correlationId,
+        allowedPeerId: counterpartyPeerId,
+        logger: this.#logger,
       });
-      return {
-        ok: false,
-        reason: "session_node_creation_failed",
-        guidance:
-          "Failed to create session transport node. The daemon logged the cause in " +
-          "session.node.create.failed. Check that the system has available ports and sufficient memory.",
-      };
+      try {
+        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
+        await node.start();
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        this.#logger.error("session.node.create.failed", {
+          sessionId,
+          agentName,
+          error: errorMessage,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "session_node_creation_failed",
+          guidance:
+            "Failed to create session transport node. The daemon logged the cause in " +
+            "session.node.create.failed. Check that the system has available ports and sufficient memory.",
+        };
+      }
+      // CELLO-M7-TRANSPORT-001: session nodes also need dialability awareness for the
+      // dcutr decision path (AC-002). Wrap the node in a NodeAutoNatService and emit
+      // its initial result (nodeType: 'session').
+      autoNat = new NodeAutoNatService({
+        node,
+        logger: this.#logger,
+        nodeType: "session",
+        probers: this.#autoNatProbers(),
+      });
+      autoNat.emitInitialResult();
     }
 
     const peerId = node.getPeerId();
@@ -490,17 +524,6 @@ export class SessionNodeManager {
       sessionPeerId: peerId,
       correlationId,
     });
-
-    // CELLO-M7-TRANSPORT-001: session nodes also need dialability awareness for the
-    // dcutr decision path (AC-002). Wrap the node in a NodeAutoNatService and emit
-    // its initial result (nodeType: 'session').
-    const autoNat = new NodeAutoNatService({
-      node,
-      logger: this.#logger,
-      nodeType: "session",
-      probers: this.#autoNatProbers(),
-    });
-    autoNat.emitInitialResult();
 
     // Add to active map
     this.#activeNodes.set(sessionId, {
@@ -519,6 +542,11 @@ export class SessionNodeManager {
     // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
     // liveness. The session connection IS the authority for a direct session.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
+
+    // If we consumed the standing receiver, spin up a replacement (async — do NOT await).
+    if (reuseStandingReceiver) {
+      this.#createStandingReceiverWithRetry(correlationId);
+    }
 
     return { ok: true, peerId, addrs };
   }

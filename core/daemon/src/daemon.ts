@@ -1245,6 +1245,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       counterpartyPubkey,
       counterpartyPeerId,
       correlationId,
+      // Reuse the standing receiver as N_A so its peer id matches the session endpoint the
+      // negotiator advertised — the counterparty's gater admits the dial (WIRE-002).
+      true,
     );
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
