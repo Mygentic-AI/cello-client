@@ -643,12 +643,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // core/client `initiateSession` (NOT imported — that stack is dead). Tests still inject
   // their own `sessionNegotiator`; the binary now gets a real one instead of
   // directory_signaling_not_configured.
+  // M3: a `session_assignment` frame carries no echoed request id, so two overlapping
+  // initiations on ONE agent's stream would race to resolve on whichever assignment
+  // arrives first — request A could complete with B's assignment. Guard with a per-agent
+  // single-flight slot (genuine single-slot, as the prior comment falsely claimed). Cross-
+  // agent concurrency is unaffected (separate streams). A directory-side echoed request id
+  // would allow true concurrency later; this is the correct minimum.
+  const negotiationInProgress = new Set<string>();
   const resolvedSessionNegotiator: SessionNegotiator = sessionNegotiator ?? {
     negotiate: async (ctx): Promise<SessionNegotiationResult> => {
       const kp = keyProviders.get(ctx.agentName);
       const agentRec = loadedAgents.find((a) => a.name === ctx.agentName);
       if (!kp || !agentRec) {
         return { ok: false, reason: "agent_not_found", guidance: `Agent '${ctx.agentName}' is not loaded on this daemon.` };
+      }
+      if (negotiationInProgress.has(ctx.agentName)) {
+        return {
+          ok: false,
+          reason: "session_negotiation_in_progress",
+          guidance: `Another session initiation is already in progress for agent '${ctx.agentName}'. Wait for it to finish, then retry.`,
+        };
       }
       const targetHex =
         typeof ctx.params["target_pubkey"] === "string"
@@ -680,10 +694,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         };
       }
 
-      // Await the directory's reply on THIS agent's stream. A fresh handler per call,
-      // unregistered in finally — concurrent initiations on different agents use
-      // different streams; same-agent concurrency overwrites the resolver (the prior
-      // request times out), matching the core/client single-slot semantics.
+      // Single-flight claimed (above) → safe to register one inbound handler for this
+      // agent's reply; unregistered + slot released in finally.
+      negotiationInProgress.add(ctx.agentName);
       let resolveFrame!: (f: Record<string, unknown>) => void;
       const pending = new Promise<Record<string, unknown>>((r) => {
         resolveFrame = r;
@@ -732,6 +745,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         return { ok: true, assignment };
       } finally {
         unregister();
+        negotiationInProgress.delete(ctx.agentName);
       }
     },
   };

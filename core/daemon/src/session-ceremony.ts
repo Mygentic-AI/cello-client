@@ -69,8 +69,12 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
         verifyingShares[k] = v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : new Uint8Array(0);
       }
     }
-  } catch {
-    deps.logger.error("session.ceremony.share.load.failed", { agentName: deps.agentName, reason: "cbor_deserialize_failed" });
+  } catch (err: unknown) {
+    deps.logger.error("session.ceremony.share.load.failed", {
+      agentName: deps.agentName,
+      reason: "cbor_deserialize_failed",
+      detail: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 
@@ -83,8 +87,12 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
       frostSecret as unknown as Parameters<typeof storeDkgResult>[1],
       frostPublic as unknown as Parameters<typeof storeDkgResult>[2],
     );
-  } catch {
-    deps.logger.error("session.ceremony.share.load.failed", { agentName: deps.agentName, reason: "storeDkgResult_failed" });
+  } catch (err: unknown) {
+    deps.logger.error("session.ceremony.share.load.failed", {
+      agentName: deps.agentName,
+      reason: "storeDkgResult_failed",
+      detail: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 
@@ -115,53 +123,65 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
  * unregister function. SI-001: tbs/signature never logged.
  */
 export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void {
-  let signerPromise: Promise<IThresholdSigner | null> | null = null;
-  const getSigner = (): Promise<IThresholdSigner | null> => {
-    if (!signerPromise) signerPromise = reconstructThresholdSigner(deps);
-    return signerPromise;
-  };
-
   return deps.signaling.registerInboundHandler((frame) => {
     if (frame["type"] !== "ceremony_request") return;
     void (async () => {
       const ceremonyId = typeof frame["ceremony_id"] === "string" ? (frame["ceremony_id"] as string) : undefined;
-      if (!ceremonyId) return;
       const tbsRaw = frame["tbs"];
       const tbs = tbsRaw instanceof Uint8Array ? tbsRaw : Buffer.isBuffer(tbsRaw) ? new Uint8Array(tbsRaw as Buffer) : null;
       const context = typeof frame["context"] === "string" ? (frame["context"] as string) : undefined;
 
-      const replyNull = async (): Promise<void> => {
-        await deps.signaling.sendRaw({ type: "ceremony_result", ceremony_id: ceremonyId, signature: null });
+      // L3: the reply send is best-effort — a throw here must not become an unhandled
+      // rejection in this fire-and-forget handler.
+      const reply = async (signature: Uint8Array | null): Promise<void> => {
+        if (!ceremonyId) return;
+        try {
+          await deps.signaling.sendRaw({ type: "ceremony_result", ceremony_id: ceremonyId, signature });
+        } catch (err: unknown) {
+          deps.logger.warn("session.ceremony.reply.failed", {
+            agentName: deps.agentName,
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
       };
 
-      const signer = await getSigner();
-      if (!signer || !tbs || !context) {
-        deps.logger.warn("session.ceremony.abort", {
-          agentName: deps.agentName,
-          reason: !signer ? "no_signer" : !tbs ? "no_tbs" : "no_context",
-        });
-        await replyNull();
+      // L1: a request with no addressable ceremony_id cannot be replied to (the reply is
+      // keyed by it) — log and drop rather than send an unkeyed result.
+      if (!ceremonyId) {
+        deps.logger.warn("session.ceremony.abort", { agentName: deps.agentName, reason: "no_ceremony_id" });
+        return;
+      }
+      if (!tbs || !context) {
+        deps.logger.warn("session.ceremony.abort", { agentName: deps.agentName, reason: !tbs ? "no_tbs" : "no_context" });
+        await reply(null);
+        return;
+      }
+
+      // H1 / M1 / concurrency: reconstruct a FRESH signer (fresh directory endpoint +
+      // NetworkDirectoryNode) PER ceremony. No caching — so signaling reconnecting to a
+      // different directory node is picked up, a transient reconstruction failure retries
+      // on the next request, and concurrent ceremonies never share one signer's FROST
+      // state. (storeDkgResult is idempotent for the same share; reconstruction is cheap.)
+      const signer = await reconstructThresholdSigner(deps);
+      if (!signer) {
+        deps.logger.warn("session.ceremony.abort", { agentName: deps.agentName, reason: "no_signer" });
+        await reply(null);
         return;
       }
       try {
         const result = await signer.participateInCeremony(ceremonyId, tbs, context as FrostContext);
-        const sig = result.ok ? result.signature : null;
         deps.logger.info("session.ceremony.participated", {
           agentName: deps.agentName,
           ceremonyId: ceremonyId.slice(0, 16),
           ok: result.ok,
         });
-        await deps.signaling.sendRaw({
-          type: "ceremony_result",
-          ceremony_id: ceremonyId,
-          signature: sig ? new Uint8Array(sig) : null,
-        });
+        await reply(result.ok ? new Uint8Array(result.signature) : null);
       } catch (err: unknown) {
         deps.logger.warn("session.ceremony.failed", {
           agentName: deps.agentName,
-          error: err instanceof Error ? err.message : String(err),
+          detail: err instanceof Error ? err.message : String(err),
         });
-        await replyNull();
+        await reply(null);
       }
     })();
   });
