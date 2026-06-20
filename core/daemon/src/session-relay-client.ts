@@ -42,6 +42,8 @@ export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
 /** Structure 1 leaf kind: 0x00 = message, 0x02 = control (matches the relay). */
 export const LEAF_KIND_MSG = 0x00;
+/** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
+export const LEAF_KIND_CTRL = 0x02;
 
 const RELAY_AUTH_TIMEOUT_MS = 5_000;
 const HASH_SUBMIT_TIMEOUT_MS = 10_000;
@@ -413,19 +415,28 @@ export class AgentRelayClient {
   }
 
   /**
-   * Submit a session's message-leaf hash to the relay. Connects/re-connects from `node`
-   * if needed. Globally FIFO across the agent's sessions (the ack has no session_id).
+   * Submit a session's MESSAGE-leaf (0x00) hash to the relay. Connects/re-connects from
+   * `node` if needed. Globally FIFO across the agent's sessions (the ack has no session_id).
    */
   async submitMessageHash(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array): Promise<SubmitResult> {
+    return this.submitLeaf(node, sessionId, contentHash, LEAF_KIND_MSG);
+  }
+
+  /**
+   * Submit a leaf hash of a given kind (0x00 message / 0x02 control) to the relay. The SEAL
+   * ctrl leaf (DOD-SPINE-7) rides this path: two distinct-sender ctrl leaves in the relay's
+   * log trigger the directory's FROST notarization (relay `#maybeProcessSeal`).
+   */
+  async submitLeaf(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
     // Chain on the prior submit so only one is outstanding at a time (FIFO). The ack
     // carries no session_id, so concurrent submits on one stream would be ambiguous.
-    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash));
+    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind));
     // Keep the chain alive regardless of this submit's outcome.
     this.#submitChain = run.then(() => undefined, () => undefined);
     return run;
   }
 
-  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array): Promise<SubmitResult> {
+  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
     const stream = this.#stream;
@@ -440,7 +451,7 @@ export class AgentRelayClient {
     const frame = CBOR_ENC.encode({
       type: "hash_submit",
       session_id: sessionId,
-      leaf_kind: LEAF_KIND_MSG,
+      leaf_kind: leafKind,
       structure1_cbor: structure1,
       sender_signature: signature,
     }) as Uint8Array;
