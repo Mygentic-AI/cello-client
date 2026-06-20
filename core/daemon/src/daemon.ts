@@ -63,7 +63,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
-import { wireSessionCeremonyHandler } from "./session-ceremony.js";
+import { wireSessionCeremonyHandler, wireSessionOfferHandler } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -555,6 +555,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: mgr,
       logger,
     });
+    // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
+    // standing-receiver session endpoint so the assignment carries a reachable counterparty).
+    wireSessionOfferHandler({
+      agentName,
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(),
+      signaling: mgr,
+      logger,
+    });
     return entry;
   }
 
@@ -593,6 +601,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentPubkeyHex: primaryAgent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: signalingManager,
+      logger,
+    });
+    wireSessionOfferHandler({
+      agentName: primaryAgent.name,
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(),
       signaling: signalingManager,
       logger,
     });
@@ -711,6 +725,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
           initiator_session_peer_id: sr.peerId,
           initiator_session_addrs: sr.addrs,
+          // WIRE-002 opt-in: ask the directory to run the session_offer→accept round-trip so
+          // the assignment carries the counterparty's reachable session endpoint.
+          wants_session_offer: true,
         });
         if (!sent.ok) {
           return {

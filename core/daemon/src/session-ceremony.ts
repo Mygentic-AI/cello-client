@@ -29,6 +29,56 @@ import { FileRegistrationPersistence } from "./registration-persistence.js";
 import type { SignalingSeam } from "./registration-context.js";
 import type { Logger } from "./types.js";
 
+/**
+ * WIRE-002: answer the directory's `session_offer` on a per-agent signaling stream. When an
+ * initiator's session_request names this agent as the target, the directory sends a
+ * `session_offer {session_id}` before it builds the FROST-signed assignment; the agent must
+ * reply `session_offer_accept` advertising its SESSION endpoint (its standing receiver, which
+ * `acceptSession` reuses as the receiver-side session node) so the directory can fold the
+ * counterparty endpoint into the assignment and the initiator can reach it. Without this, the
+ * assignment carries an empty counterparty endpoint and content delivery can never connect.
+ */
+export function wireSessionOfferHandler(deps: {
+  agentName: string;
+  getStandingReceiverEndpoint: () => { peerId: string; addrs: string[] } | null;
+  signaling: SignalingSeam;
+  logger: Logger;
+}): () => void {
+  return deps.signaling.registerInboundHandler((frame) => {
+    if (frame["type"] !== "session_offer") return;
+    void (async () => {
+      const sidRaw = frame["session_id"];
+      const sessionId = sidRaw instanceof Uint8Array ? sidRaw : Buffer.isBuffer(sidRaw) ? new Uint8Array(sidRaw as Buffer) : null;
+      if (!sessionId) {
+        deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "no_session_id" });
+        return;
+      }
+      const sr = deps.getStandingReceiverEndpoint();
+      if (!sr) {
+        deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "standing_receiver_unavailable" });
+        return;
+      }
+      try {
+        await deps.signaling.sendRaw({
+          type: "session_offer_accept",
+          session_id: sessionId,
+          counterparty_session_peer_id: sr.peerId,
+          counterparty_session_addrs: sr.addrs,
+        });
+        deps.logger.info("session.offer.accepted", {
+          agentName: deps.agentName,
+          sessionPeerId: sr.peerId,
+        });
+      } catch (err: unknown) {
+        deps.logger.warn("session.offer.accept.failed", {
+          agentName: deps.agentName,
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  });
+}
+
 export interface CeremonyWiringDeps {
   agentName: string;
   /** `${celloDir}/agents/<name>` — holds frost-share.json. */
