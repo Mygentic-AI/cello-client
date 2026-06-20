@@ -77,7 +77,8 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { AgentRelayClient } from "./session-relay-client.js";
+import { encodeSealPayload } from "@cello-protocol/protocol-types";
+import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -1473,6 +1474,47 @@ export class SessionNodeManager {
               })();
       return { ok: false, reason: "session_stream_unavailable", error: errMsg };
     }
+  }
+
+  /**
+   * M7 DOD-SPINE-7: submit THIS party's SEAL ctrl leaf (0x02) to the relay witness.
+   * Structure: content_hash = SHA-256(0x02 || encodeSealPayload({session_id, final_root,
+   * close_timestamp, "PENDING"})), where final_root is the daemon's OWN tree root. Two
+   * distinct-sender SEAL leaves in the relay's log trigger the relay's #maybeProcessSeal
+   * → directory processSeal (rebuild + verify the signed chain) → FROST notarization →
+   * session_sealed. Requires an active relay client; the caller falls back to the
+   * directory-mediated path when this returns relay_unavailable.
+   */
+  async submitSealLeaf(
+    sessionId: string,
+    correlationId?: string,
+  ): Promise<{ ok: true; sequenceNumber: number } | { ok: false; reason: string }> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) return { ok: false, reason: "session_node_unavailable" };
+    if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
+
+    const finalRootHex = this.getSessionTreeRootHex(sessionId);
+    const sealPayload = encodeSealPayload({
+      session_id: entry.relaySessionIdBytes,
+      final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
+      close_timestamp: Date.now(),
+      attestation: "PENDING",
+    });
+    // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
+    const contentHash = new Uint8Array(
+      createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
+    );
+    const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
+    if (!result.ok) {
+      this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
+      return { ok: false, reason: result.reason };
+    }
+    this.#logger.info("session.seal.leaf.submitted", {
+      sessionId,
+      sequenceNumber: result.sequence_number,
+      correlationId,
+    });
+    return { ok: true, sequenceNumber: result.sequence_number };
   }
 
   /**
