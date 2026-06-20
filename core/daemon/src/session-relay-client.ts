@@ -375,6 +375,10 @@ export class AgentRelayClient {
         while (!this.#closed && this.#stream === stream) {
           const res = await iter.next();
           if (res.done || res.value === undefined) break;
+          // The await above can suspend across a #resetStream() (timeout) that supersedes this
+          // stream. Re-check identity before dispatching so a late frame from a stale stream
+          // (e.g. a buffered ack for a timed-out submit) can't bump/settle the wrong session.
+          if (this.#stream !== stream) break;
           let frame: Record<string, unknown>;
           try {
             frame = decode(toU8(res.value)) as Record<string, unknown>;
