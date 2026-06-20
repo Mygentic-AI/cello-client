@@ -588,6 +588,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: mgr,
       logger,
     });
+    // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
+    registerSessionSealedListener(mgr);
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
@@ -1179,6 +1181,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // signaling stream after FROST notarization, once BOTH parties have submitted their SEAL
   // ctrl leaf — resolves it with the sealed_root.
   const pendingSealWaiters = new Map<string, (sealedRootHex: string) => void>();
+
+  // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling seam (keystone
+  // for the primary agent, per-agent for the rest — the directory routes session_sealed to the
+  // session-owning agent's authenticated stream). Function declaration so getAgentSignaling
+  // (defined earlier, called at runtime) can wire it per-agent.
+  function registerSessionSealedListener(signaling: SignalingManager): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_sealed") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      const rootHex = frameValueToHex(frame["sealed_root"]);
+      if (!sidHex || !rootHex) return;
+      logger.info("session.sealed.received", { sessionId: sidHex, sealedRoot: rootHex });
+      const waiter = pendingSealWaiters.get(sidHex);
+      if (waiter) {
+        pendingSealWaiters.delete(sidHex);
+        waiter(rootHex);
+      }
+      // Mark the session sealed + tear the node down (idempotent — safe if already gone).
+      void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+    });
+  }
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {
@@ -2027,25 +2050,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     handleInboundSessionAssignment(frame);
   });
 
-  // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the signaling
-  // stream after the relay-mediated bilateral seal notarizes (both parties' SEAL ctrl leaves
-  // → relay #maybeProcessSeal → directory processSeal → FROST). Resolve the close waiter with
-  // the sealed_root and mark the session sealed. (Per-agent streams for non-primary agents are
-  // the SPINE-4/5/6 follow-on; the keystone covers the primary agent / two-daemon spine.)
-  signalingManager.registerInboundHandler((frame) => {
-    if (frame["type"] !== "session_sealed") return;
-    const sidHex = frameValueToHex(frame["session_id"]);
-    const rootHex = frameValueToHex(frame["sealed_root"]);
-    if (!sidHex || !rootHex) return;
-    logger.info("session.sealed.received", { sessionId: sidHex, sealedRoot: rootHex });
-    const waiter = pendingSealWaiters.get(sidHex);
-    if (waiter) {
-      pendingSealWaiters.delete(sidHex);
-      waiter(rootHex);
-    }
-    // Mark the session sealed + tear the node down (idempotent — safe if already gone).
-    void sessionNodeManager.destroySessionNode(sidHex, "sealed");
-  });
+  // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the SESSION-OWNING
+  // agent's signaling stream after the relay-mediated bilateral seal notarizes. Registered on the
+  // keystone (primary agent) here AND per-agent in getAgentSignaling — for a non-primary agent the
+  // directory routes session_sealed to its per-agent stream, so a keystone-only listener would
+  // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
+  // the sealed_root and mark the session sealed.
+  registerSessionSealedListener(signalingManager);
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
