@@ -1233,33 +1233,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
 
-    // SEAM 1b: for direct mode, the session node N_A must hold the connection its
-    // content stream rides — so dial the counterparty THROUGH N_A (not the separate
-    // composition-root dialer). On failure, tear the just-created session down rather
-    // than leave a dangling 'active' row that cello_send would then fail on.
-    // (relay mode dials via N_A through the relay circuit — a later seam — so it is
-    // skipped here and the session is left active for that path.)
-    if (assignment.transport_mode === "direct") {
-      const connected = await sessionNodeManager.connectToCounterparty(
-        sessionId,
-        assignment.counterparty_session_addrs ?? [],
-      );
+    // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
+    // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
+    // the source of truth for dialability (a NATed node advertises a relay-circuit address; a
+    // directly-reachable one — localhost or a public addr — advertises a direct multiaddr), so
+    // attempt the dial whenever the assignment carries counterparty session addrs, regardless
+    // of the transport_mode LABEL (the local selector stub labels everything "relay" even when
+    // the addrs are directly dialable). A failure is NOT fatal: per the dead-channel contract,
+    // the session stays active and a later cello_send queues the content in the durable retry
+    // queue until a route exists (the relay-park path is MSG-001-3b).
+    const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
+    if (counterpartyAddrs.length > 0) {
+      const connected = await sessionNodeManager.connectToCounterparty(sessionId, counterpartyAddrs);
       if (!connected.ok) {
-        await sessionNodeManager.destroySessionNode(sessionId, "interrupted");
         logger.warn("session.initiate.connect.failed", {
           sessionId,
           reason: connected.reason,
           error: connected.error,
+          transportMode: assignment.transport_mode,
           correlationId,
         });
-        return {
-          ok: false,
-          reason: connected.reason,
-          guidance:
-            "The session was negotiated but the counterparty's session node could not be " +
-            "reached on its direct addresses. Verify the counterparty is online and retry; " +
-            "the daemon will fall back to the relay path once that seam is wired.",
-        };
       }
     }
 

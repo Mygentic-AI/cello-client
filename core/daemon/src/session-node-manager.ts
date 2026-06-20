@@ -1250,12 +1250,21 @@ export class SessionNodeManager {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
       this.#untrackAwaitingAck(sessionId, contentHash);
-      // error.message extracted — never [object Object].
-      return {
-        ok: false,
-        reason: "session_stream_unavailable",
-        error: err instanceof Error ? err.message : String(err),
-      };
+      // error.message extracted — never [object Object]. libp2p/cross-package errors are not
+      // always `instanceof Error` in this realm, so fall back to a message property / JSON.
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string"
+            ? (err as { message: string }).message
+            : (() => {
+                try {
+                  return JSON.stringify(err);
+                } catch {
+                  return String(err);
+                }
+              })();
+      return { ok: false, reason: "session_stream_unavailable", error: errMsg };
     }
   }
 
