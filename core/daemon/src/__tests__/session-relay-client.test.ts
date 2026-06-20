@@ -11,10 +11,19 @@ import { createHash } from "node:crypto";
 import { decode } from "cbor-x";
 import { generateKeypair, verify } from "@cello-protocol/crypto";
 import {
+  AgentRelayClient,
   buildRelayAuthPayload,
   encodeStructure1,
   RELAY_AUTH_DOMAIN,
 } from "../session-relay-client.js";
+import type { Logger } from "../types.js";
+
+const noopLogger: Logger = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+} as unknown as Logger;
 
 describe("session-relay-client: relay auth payload", () => {
   it("builds SHA-256(domain || nonce || pubkey) — the exact bytes the relay verifies", async () => {
@@ -69,5 +78,52 @@ describe("session-relay-client: Structure 1", () => {
     const sig = await kp.sign(s1);
     // The relay calls verify(sender_pubkey, frame.structure1_cbor, sender_signature).
     expect(verify(senderPubkey, s1, sig)).toBe(true);
+  });
+});
+
+describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
+  // The relay keys delivery by agent pubkey, so ONE client serves all of an agent's
+  // sessions. These assert the session registry + lifecycle without a live relay (the
+  // wire round-trip is covered by J-SPINE).
+  async function makeClient(): Promise<AgentRelayClient> {
+    const kp = generateKeypair();
+    return new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+  }
+
+  it("tracks multiple sessions and only reports empty when all are removed", async () => {
+    const client = await makeClient();
+    expect(client.hasSessions()).toBe(false);
+    client.registerSession("aaaa");
+    client.registerSession("bbbb");
+    expect(client.hasSessions()).toBe(true);
+    client.unregisterSession("aaaa");
+    expect(client.hasSessions()).toBe(true); // bbbb still present — client must NOT close
+    client.unregisterSession("bbbb");
+    expect(client.hasSessions()).toBe(false);
+    client.close();
+  });
+
+  it("registerSession is idempotent (re-register does not duplicate)", async () => {
+    const client = await makeClient();
+    client.registerSession("aaaa");
+    client.registerSession("aaaa");
+    client.unregisterSession("aaaa");
+    expect(client.hasSessions()).toBe(false);
+    client.close();
+  });
+
+  it("submitMessageHash after close returns a named failure, not a hang", async () => {
+    const client = await makeClient();
+    client.close();
+    const fakeNode = { dial: async () => {}, newStream: async () => { throw new Error("closed"); } } as never;
+    const r = await client.submitMessageHash(fakeNode, new Uint8Array(16), new Uint8Array(32));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("relay_client_closed");
   });
 });

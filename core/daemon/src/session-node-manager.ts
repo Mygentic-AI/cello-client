@@ -77,7 +77,7 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { connectSessionRelay, type RelaySessionClient } from "./session-relay-client.js";
+import { AgentRelayClient } from "./session-relay-client.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -145,12 +145,14 @@ interface ActiveSessionEntry {
    */
   autoNat: NodeAutoNatService;
   /**
-   * M7 DOD-SPINE-6 / MSG-001-3b: the authenticated relay witness stream for this
-   * session. Present once the session node has connected + authed to the relay; the
-   * leaf submit path uses it on cello_send. Absent when the relay is unreachable —
-   * the direct content path still delivers.
+   * M7 DOD-SPINE-6 / MSG-001-3b: the agent's shared relay witness client (one stream per
+   * agent, multiplexing all that agent's sessions — the relay keys delivery by agent
+   * pubkey). The leaf submit path uses it on cello_send. Absent when the relay is
+   * unreachable — the direct content path still delivers.
    */
-  relayClient?: RelaySessionClient;
+  relayClient?: AgentRelayClient;
+  /** The 16-byte session id, for relay leaf submission (the relay frame carries it). */
+  relaySessionIdBytes?: Uint8Array;
 }
 
 /** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
@@ -174,6 +176,10 @@ export class SessionNodeManager {
   readonly #dbPath: string;
   #db: DatabaseSync | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
+  // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
+  // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
+  // agent's sessions share one authenticated relay stream (each frame carries session_id).
+  #relayClients = new Map<string, AgentRelayClient>();
   #standingReceiver: { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null = null;
   #standingReceiverReady = false;
   // Set once gracefulShutdown begins. The standing-receiver replacement that
@@ -571,7 +577,7 @@ export class SessionNodeManager {
     // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
     // Structure-2 witness (non-fatal — direct content still works without it).
     if (relay) {
-      await this.#connectSessionRelay(sessionId, node, relay, correlationId);
+      await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
     }
 
     // If we consumed the standing receiver, spin up a replacement (async — do NOT await).
@@ -591,6 +597,7 @@ export class SessionNodeManager {
   async #connectSessionRelay(
     sessionId: string,
     node: CelloNode,
+    agentName: string,
     relay: RelayConnectParams,
     correlationId: string,
   ): Promise<void> {
@@ -599,41 +606,72 @@ export class SessionNodeManager {
       // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
       // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
       this.#activeNodes.get(sessionId)?.gater.setAllowedOutboundPeer(relay.relayPeerId);
-      const client = await connectSessionRelay({
-        node,
-        relayPeerId: relay.relayPeerId,
-        relayAddrs: relay.relayAddrs,
-        keyProvider: relay.keyProvider,
-        senderPubkey: relay.senderPubkey,
-        sessionId: relay.sessionIdBytes,
-        logger: this.#logger,
-        correlationId,
-        onLeafDeliver: (frame) => {
-          // The counterparty's witnessed leaf arrived with its canonical sequence.
-          // The plaintext is delivered separately over the direct content stream; this
-          // is the ordering/witness signal. Surface it for observability; full
-          // canonical-sequence reconciliation against the local tree is MSG-001-3b.
-          this.#logger.info("session.relay.leaf.delivered", {
-            sessionId,
-            sequenceNumber: frame.sequence_number,
-            leafKind: frame.leaf_kind,
-            correlationId,
-          });
-        },
-      });
-      const entry = this.#activeNodes.get(sessionId);
-      if (client && entry) {
-        entry.relayClient = client;
-      } else if (client && !entry) {
-        // The session was torn down while we were connecting — don't leak the stream.
-        client.close();
+
+      // One relay client per AGENT (the relay keys by agent pubkey). Reuse the agent's
+      // existing client across its sessions; register this session's leaf handler.
+      let client = this.#relayClients.get(agentName);
+      if (!client) {
+        client = new AgentRelayClient({
+          relayPeerId: relay.relayPeerId,
+          relayAddrs: relay.relayAddrs,
+          keyProvider: relay.keyProvider,
+          senderPubkey: relay.senderPubkey,
+          logger: this.#logger,
+        });
+        this.#relayClients.set(agentName, client);
       }
+      const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
+      client.registerSession(sessionIdHexForRelay, (frame) => {
+        // The counterparty's witnessed leaf arrived with its canonical sequence. The
+        // plaintext is delivered separately over the direct content stream; this is the
+        // ordering/witness signal. Full canonical-sequence reconciliation against the
+        // local tree is MSG-001-3b (J-CONTENT).
+        this.#logger.info("session.relay.leaf.delivered", {
+          sessionId,
+          sequenceNumber: frame.sequence_number,
+          leafKind: frame.leaf_kind,
+          correlationId,
+        });
+      });
+
+      const entry = this.#activeNodes.get(sessionId);
+      if (entry) {
+        entry.relayClient = client;
+        entry.relaySessionIdBytes = relay.sessionIdBytes;
+      } else {
+        // The session was torn down while we were wiring — undo the registration.
+        client.unregisterSession(sessionIdHexForRelay);
+        if (!client.hasSessions()) {
+          client.close();
+          this.#relayClients.delete(agentName);
+        }
+        return;
+      }
+
+      // Proactively connect so the relay has this agent's stream to deliver leaves to
+      // (the RECEIVER must be connected before the counterparty submits). Best-effort.
+      await client.connect(node);
     } catch (err: unknown) {
       this.#logger.warn("session.relay.connect.error", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
         correlationId,
       });
+    }
+  }
+
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: detach a session from its agent's relay client and
+   * close the client when the agent has no remaining sessions. Idempotent.
+   */
+  #detachSessionRelay(entry: ActiveSessionEntry): void {
+    const client = entry.relayClient;
+    if (!client || !entry.relaySessionIdBytes) return;
+    const sidHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
+    client.unregisterSession(sidHex);
+    if (!client.hasSessions()) {
+      client.close();
+      this.#relayClients.delete(entry.agentName);
     }
   }
 
@@ -774,7 +812,7 @@ export class SessionNodeManager {
     // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
     // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
     if (relay) {
-      await this.#connectSessionRelay(sessionId, node, relay, correlationId);
+      await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
     }
 
     // Immediately spin up a replacement (async — do NOT await, AC-003)
@@ -796,7 +834,7 @@ export class SessionNodeManager {
 
     entry.autoNat.stop();
     // M7 DOD-SPINE-6 / MSG-001-3b: close the relay witness stream so we don't leak it.
-    entry.relayClient?.close();
+    this.#detachSessionRelay(entry);
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -844,7 +882,7 @@ export class SessionNodeManager {
   async retireSessionNode(sessionId: string): Promise<void> {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) return;
-    entry.relayClient?.close();
+    this.#detachSessionRelay(entry);
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -923,6 +961,9 @@ export class SessionNodeManager {
     const stopPromises: Promise<void>[] = [];
     for (const [sessionId, entry] of this.#activeNodes) {
       entry.autoNat.stop();
+      // M7 DOD-SPINE-6: detach from the agent relay client (closes it when its last
+      // session goes) — consistent with the other teardown paths.
+      this.#detachSessionRelay(entry);
       stopPromises.push(
         entry.node.stop().then(() => {
           this.#logger.info("session.node.destroyed", {
@@ -1052,7 +1093,7 @@ export class SessionNodeManager {
     // Tear down the in-memory session node if it exists
     if (entry) {
       entry.autoNat.stop();
-      entry.relayClient?.close();
+      this.#detachSessionRelay(entry);
       try {
         await entry.node.stop();
       } catch (err: unknown) {
@@ -1377,9 +1418,9 @@ export class SessionNodeManager {
       // counterparty. Best-effort: the direct content already delivered, so a relay
       // miss must NOT fail the send — it degrades to local-only sequencing (the gap
       // MSG-001-3b's recovery path closes). INV-3: the relay never sees plaintext here.
-      if (entry.relayClient) {
+      if (entry.relayClient && entry.relaySessionIdBytes) {
         try {
-          const witnessed = await entry.relayClient.submitMessageHash(contentHash);
+          const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash);
           if (witnessed.ok) {
             this.#logger.info("session.relay.hash.submitted", {
               sessionId,
