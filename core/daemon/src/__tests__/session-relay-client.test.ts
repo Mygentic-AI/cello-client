@@ -8,7 +8,8 @@
  */
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
-import { decode } from "cbor-x";
+import { Encoder, decode } from "cbor-x";
+import * as lp from "it-length-prefixed";
 import { generateKeypair, verify } from "@cello-protocol/crypto";
 import {
   AgentRelayClient,
@@ -18,12 +19,60 @@ import {
 } from "../session-relay-client.js";
 import type { Logger } from "../types.js";
 
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
+
 const noopLogger: Logger = {
   debug: () => {},
   info: () => {},
   warn: () => {},
   error: () => {},
 } as unknown as Logger;
+
+const fakeNode = { dial: async () => {}, newStream: async () => { throw new Error("no-stream"); } } as never;
+
+/**
+ * A controllable fake relay stream + node. Captures outbound frames (decoded from the
+ * length-prefixed wire) and lets the test push inbound frames the client's reader consumes.
+ */
+function makeFakeRelay() {
+  const inbound: Uint8Array[] = [];
+  let notify: (() => void) | null = null;
+  let ended = false;
+  const sentFrames: Record<string, unknown>[] = [];
+
+  const stream = {
+    send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
+      // b is lp.encode.single(cbor) — un-frame it via lp.decode to read the CBOR back.
+      const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
+      void (async () => {
+        for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
+          const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
+          sentFrames.push(decode(u8) as Record<string, unknown>);
+        }
+      })();
+    },
+    close: async () => { ended = true; notify?.(); },
+    async *[Symbol.asyncIterator]() {
+      while (!ended) {
+        while (inbound.length) yield inbound.shift()!;
+        if (ended) return;
+        await new Promise<void>((r) => { notify = r; });
+        notify = null;
+      }
+    },
+  };
+
+  const push = (frame: Record<string, unknown>): void => {
+    const encoded = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
+    inbound.push(encoded instanceof Uint8Array ? encoded : (encoded as { subarray(): Uint8Array }).subarray());
+    notify?.();
+  };
+
+  const node = { dial: async () => {}, newStream: async () => stream } as never;
+  return { node, push, sentFrames };
+}
+
+const tick = () => new Promise((r) => setTimeout(r, 5));
 
 describe("session-relay-client: relay auth payload", () => {
   it("builds SHA-256(domain || nonce || pubkey) — the exact bytes the relay verifies", async () => {
@@ -99,8 +148,8 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
   it("tracks multiple sessions and only reports empty when all are removed", async () => {
     const client = await makeClient();
     expect(client.hasSessions()).toBe(false);
-    client.registerSession("aaaa");
-    client.registerSession("bbbb");
+    client.registerSession("aaaa", fakeNode);
+    client.registerSession("bbbb", fakeNode);
     expect(client.hasSessions()).toBe(true);
     client.unregisterSession("aaaa");
     expect(client.hasSessions()).toBe(true); // bbbb still present — client must NOT close
@@ -111,8 +160,8 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
 
   it("registerSession is idempotent (re-register does not duplicate)", async () => {
     const client = await makeClient();
-    client.registerSession("aaaa");
-    client.registerSession("aaaa");
+    client.registerSession("aaaa", fakeNode);
+    client.registerSession("aaaa", fakeNode);
     client.unregisterSession("aaaa");
     expect(client.hasSessions()).toBe(false);
     client.close();
@@ -121,9 +170,55 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
   it("submitMessageHash after close returns a named failure, not a hang", async () => {
     const client = await makeClient();
     client.close();
-    const fakeNode = { dial: async () => {}, newStream: async () => { throw new Error("closed"); } } as never;
     const r = await client.submitMessageHash(fakeNode, new Uint8Array(16), new Uint8Array(32));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("relay_client_closed");
+  });
+
+  // The H1 fix's load-bearing correctness: each session's submit must carry ITS OWN
+  // last_seen_seq, never an agent-global one — else a newer session looks "ahead" of the
+  // relay's per-session counter and gets rejected (last_seen_seq_ahead). Regression for the
+  // second-review BLOCKING finding.
+  it("BLOCKING regression: a second session submits last_seen_seq from its OWN counter, not agent-global", async () => {
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+    const relay = makeFakeRelay();
+    const sidA = new Uint8Array(16).fill(0x0a);
+    const sidB = new Uint8Array(16).fill(0x0b);
+    client.registerSession(Buffer.from(sidA).toString("hex"), relay.node);
+    client.registerSession(Buffer.from(sidB).toString("hex"), relay.node);
+
+    // Drive the relay's challenge → auth_ok so the client authenticates on first submit.
+    const submit1 = client.submitMessageHash(relay.node, sidA, new Uint8Array(32).fill(1));
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    // Session A's first leaf → relay assigns seq 5 (and echoes/acks).
+    relay.push({ type: "hash_submit_ack", sequence_number: 5 });
+    expect((await submit1).ok).toBe(true);
+
+    // Now session B's FIRST submit. Its own relay counter is 0, so it must send last_seen_seq 0
+    // — NOT session A's 5. With the old agent-global #lastSeen this would be 5 → relay rejects.
+    const submit2 = client.submitMessageHash(relay.node, sidB, new Uint8Array(32).fill(2));
+    await tick();
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    expect((await submit2).ok).toBe(true);
+
+    // Decode the two hash_submit frames the client actually sent and read last_seen_seq (S1[4]).
+    const submits = relay.sentFrames.filter((f) => f["type"] === "hash_submit");
+    expect(submits.length).toBe(2);
+    const s1A = decode(submits[0]!["structure1_cbor"] as Uint8Array) as unknown[];
+    const s1B = decode(submits[1]!["structure1_cbor"] as Uint8Array) as unknown[];
+    expect(s1A[4]).toBe(0); // session A's first submit: last_seen_seq 0
+    expect(s1B[4]).toBe(0); // session B's first submit: last_seen_seq 0 (NOT 5) — the fix
+    client.close();
   });
 });

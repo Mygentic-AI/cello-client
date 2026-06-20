@@ -154,14 +154,21 @@ export class AgentRelayClient {
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
   #closed = false;
-  /** Highest relay-assigned sequence observed across this agent's sessions (ack/deliver). */
-  #lastSeen = 0;
+  /**
+   * PER-SESSION highest relay-assigned sequence (session_id hex → seq). The relay's
+   * `seq_counter` is per session, and it rejects `last_seen_seq > seq_counter`, so each
+   * session's submit MUST carry that session's own high-water mark — NOT an agent-global
+   * one (which would make a newer session's first submit look ahead and get rejected).
+   */
+  readonly #lastSeen = new Map<string, number>();
   /** The one outstanding submit's resolver (global FIFO — ack carries no session_id). */
   #pendingAck: AckResolver | null = null;
+  /** The session_id hex of the in-flight submit, so its ack updates the right #lastSeen. */
+  #pendingAckSessionHex: string | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
-  /** session_id hex → inbound leaf handler. */
-  readonly #sessions = new Map<string, (frame: LeafDeliverFrame) => void>();
+  /** session_id hex → { the live node to (re)dial from, inbound leaf handler }. */
+  readonly #sessions = new Map<string, { node: CelloNode; onLeafDeliver: (frame: LeafDeliverFrame) => void }>();
 
   constructor(opts: AgentRelayClientOpts) {
     this.#relayPeerId = opts.relayPeerId;
@@ -171,14 +178,19 @@ export class AgentRelayClient {
     this.#logger = opts.logger;
   }
 
-  /** Register a session's inbound leaf handler (idempotent). */
-  registerSession(sessionIdHex: string, onLeafDeliver?: (frame: LeafDeliverFrame) => void): void {
-    this.#sessions.set(sessionIdHex, onLeafDeliver ?? (() => {}));
+  /**
+   * Register a session's inbound leaf handler + a live node to (re)dial the relay from
+   * (idempotent). Storing the node per session lets a pure-receiver session re-establish
+   * the shared stream if the node that originally dialed is torn down (L5).
+   */
+  registerSession(sessionIdHex: string, node: CelloNode, onLeafDeliver?: (frame: LeafDeliverFrame) => void): void {
+    this.#sessions.set(sessionIdHex, { node, onLeafDeliver: onLeafDeliver ?? (() => {}) });
   }
 
   /** Remove a session; caller closes the client when no sessions remain. */
   unregisterSession(sessionIdHex: string): void {
     this.#sessions.delete(sessionIdHex);
+    this.#lastSeen.delete(sessionIdHex);
   }
 
   hasSessions(): boolean {
@@ -189,25 +201,49 @@ export class AgentRelayClient {
   #settlePending(r: SubmitResult): void {
     const resolve: AckResolver | null = this.#pendingAck;
     this.#pendingAck = null;
+    this.#pendingAckSessionHex = null;
     if (resolve) resolve(r);
+  }
+
+  /**
+   * Tear down the current stream (drops it so the next submit re-dials). Used on a submit
+   * timeout: because `hash_submit_ack` carries no session_id, ack↔submit matching is purely
+   * FIFO, so a LATE ack from a timed-out submit would settle the NEXT submit's resolver and
+   * shift every subsequent ack by one. Resetting the stream prevents that desync (the relay
+   * re-auths + re-drains on the reconnect).
+   */
+  #resetStream(): void {
+    const stream = this.#stream;
+    this.#stream = null;
+    if (stream) {
+      try { void stream.close(); } catch { /* best-effort */ }
+    }
+  }
+
+  #bumpLastSeen(sessionIdHex: string, seq: number): void {
+    if (seq < 0) return;
+    const prev = this.#lastSeen.get(sessionIdHex) ?? 0;
+    if (seq > prev) this.#lastSeen.set(sessionIdHex, seq);
   }
 
   #dispatch(frame: Record<string, unknown>): void {
     const type = frame["type"];
     if (type === "hash_submit_ack") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
-      if (seq > this.#lastSeen) this.#lastSeen = seq;
+      // The ack carries no session_id — it belongs to the one in-flight submit (FIFO).
+      if (this.#pendingAckSessionHex) this.#bumpLastSeen(this.#pendingAckSessionHex, seq);
       this.#settlePending(seq >= 0 ? { ok: true, sequence_number: seq } : { ok: false, reason: "relay_ack_malformed" });
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
       this.#settlePending({ ok: false, reason });
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
-      if (seq > this.#lastSeen) this.#lastSeen = seq;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
-      const handler = this.#sessions.get(sidHex);
-      if (handler && seq >= 0) {
-        handler({
+      // leaf_deliver DOES carry session_id — advance that session's own high-water mark.
+      this.#bumpLastSeen(sidHex, seq);
+      const session = this.#sessions.get(sidHex);
+      if (session && seq >= 0) {
+        session.onLeafDeliver({
           sequence_number: seq,
           leaf_kind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
           structure1_cbor: toU8(frame["structure1_cbor"]),
@@ -353,8 +389,23 @@ export class AgentRelayClient {
         // Stream gone — clear it so the next submit re-dials, and fail any in-flight submit.
         if (this.#stream === stream) this.#stream = null;
         this.#settlePending({ ok: false, reason: "relay_stream_closed" });
+        // L5: a pure-receiver session issues no submit, so it would never trigger a re-dial
+        // after the node that owned the stream is torn down. If sessions remain, proactively
+        // re-establish from any still-live registered session node so queued leaf_delivers
+        // are drained (the relay queues by pubkey and re-delivers on reconnect).
+        if (!this.#closed && this.#sessions.size > 0) {
+          void this.#reconnectFromAnySession();
+        }
       }
     })();
+  }
+
+  /** Re-establish the shared stream from any registered session's node (first that dials). */
+  async #reconnectFromAnySession(): Promise<void> {
+    if (this.#closed || this.#stream) return;
+    for (const { node } of this.#sessions.values()) {
+      if (await this.#ensureConnected(node)) return;
+    }
   }
 
   /**
@@ -376,7 +427,11 @@ export class AgentRelayClient {
     const stream = this.#stream;
     if (!stream) return { ok: false, reason: "relay_unavailable" };
 
-    const structure1 = encodeStructure1(contentHash, this.#senderPubkey, sessionId, this.#lastSeen, Date.now());
+    const sessionIdHex = Buffer.from(sessionId).toString("hex");
+    // This session's OWN high-water mark (NOT an agent-global one) — the relay's seq_counter
+    // is per session and rejects last_seen_seq > seq_counter.
+    const lastSeenForSession = this.#lastSeen.get(sessionIdHex) ?? 0;
+    const structure1 = encodeStructure1(contentHash, this.#senderPubkey, sessionId, lastSeenForSession, Date.now());
     const signature = await this.#keyProvider.sign(structure1);
     const frame = CBOR_ENC.encode({
       type: "hash_submit",
@@ -391,10 +446,11 @@ export class AgentRelayClient {
     let resolveAck!: AckResolver;
     const ackPromise = new Promise<SubmitResult>((r) => { resolveAck = r; });
     this.#pendingAck = resolveAck;
+    this.#pendingAckSessionHex = sessionIdHex;
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
-      if (this.#pendingAck === resolveAck) this.#pendingAck = null;
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; }
       this.#logger.warn("session.relay.submit.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
       return { ok: false, reason: "relay_submit_send_failed" };
     }
@@ -403,15 +459,19 @@ export class AgentRelayClient {
       timer = setTimeout(() => r({ ok: false, reason: "relay_submit_timeout" }), HASH_SUBMIT_TIMEOUT_MS);
     });
     try {
-      return await Promise.race([ackPromise, timeout]);
+      const result = await Promise.race([ackPromise, timeout]);
+      // On timeout, reset the stream so a late ack can't settle a LATER submit (FIFO desync).
+      if (!result.ok && result.reason === "relay_submit_timeout") this.#resetStream();
+      return result;
     } finally {
       clearTimeout(timer);
-      if (this.#pendingAck === resolveAck) this.#pendingAck = null;
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; }
     }
   }
 
-  lastSeenSeq(): number {
-    return this.#lastSeen;
+  /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
+  lastSeenSeq(sessionIdHex: string): number {
+    return this.#lastSeen.get(sessionIdHex) ?? 0;
   }
 
   close(): void {

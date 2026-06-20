@@ -153,6 +153,8 @@ interface ActiveSessionEntry {
   relayClient?: AgentRelayClient;
   /** The 16-byte session id, for relay leaf submission (the relay frame carries it). */
   relaySessionIdBytes?: Uint8Array;
+  /** The `#relayClients` map key (agentName + relay peer id) — federation-safe teardown. */
+  relayClientKey?: string;
 }
 
 /** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
@@ -607,9 +609,11 @@ export class SessionNodeManager {
       // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
       this.#activeNodes.get(sessionId)?.gater.setAllowedOutboundPeer(relay.relayPeerId);
 
-      // One relay client per AGENT (the relay keys by agent pubkey). Reuse the agent's
-      // existing client across its sessions; register this session's leaf handler.
-      let client = this.#relayClients.get(agentName);
+      // One relay client per (AGENT, RELAY NODE). The relay keys by agent pubkey, so the
+      // collision H1 addresses is per relay; CELLO is federated, so a different session for
+      // the same agent may be assigned a DIFFERENT relay — that needs its own client.
+      const clientKey = `${agentName}::${relay.relayPeerId}`;
+      let client = this.#relayClients.get(clientKey);
       if (!client) {
         client = new AgentRelayClient({
           relayPeerId: relay.relayPeerId,
@@ -618,10 +622,10 @@ export class SessionNodeManager {
           senderPubkey: relay.senderPubkey,
           logger: this.#logger,
         });
-        this.#relayClients.set(agentName, client);
+        this.#relayClients.set(clientKey, client);
       }
       const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
-      client.registerSession(sessionIdHexForRelay, (frame) => {
+      client.registerSession(sessionIdHexForRelay, node, (frame) => {
         // The counterparty's witnessed leaf arrived with its canonical sequence. The
         // plaintext is delivered separately over the direct content stream; this is the
         // ordering/witness signal. Full canonical-sequence reconciliation against the
@@ -638,12 +642,13 @@ export class SessionNodeManager {
       if (entry) {
         entry.relayClient = client;
         entry.relaySessionIdBytes = relay.sessionIdBytes;
+        entry.relayClientKey = clientKey;
       } else {
         // The session was torn down while we were wiring — undo the registration.
         client.unregisterSession(sessionIdHexForRelay);
-        if (!client.hasSessions()) {
+        if (!client.hasSessions() && this.#relayClients.get(clientKey) === client) {
           client.close();
-          this.#relayClients.delete(agentName);
+          this.#relayClients.delete(clientKey);
         }
         return;
       }
@@ -661,17 +666,22 @@ export class SessionNodeManager {
   }
 
   /**
-   * M7 DOD-SPINE-6 / MSG-001-3b: detach a session from its agent's relay client and
-   * close the client when the agent has no remaining sessions. Idempotent.
+   * M7 DOD-SPINE-6 / MSG-001-3b: detach a session from its (agent, relay) client and
+   * close the client when it has no remaining sessions. Idempotent and identity-guarded:
+   * the map delete only fires if the map still holds THIS client (a racing teardown of a
+   * sibling session must not close a freshly-created replacement client for the same key).
    */
   #detachSessionRelay(entry: ActiveSessionEntry): void {
     const client = entry.relayClient;
+    const key = entry.relayClientKey;
     if (!client || !entry.relaySessionIdBytes) return;
+    // Idempotent: clear the entry's reference so a second teardown of the same entry no-ops.
+    entry.relayClient = undefined;
     const sidHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
     client.unregisterSession(sidHex);
-    if (!client.hasSessions()) {
+    if (!client.hasSessions() && key && this.#relayClients.get(key) === client) {
       client.close();
-      this.#relayClients.delete(entry.agentName);
+      this.#relayClients.delete(key);
     }
   }
 
