@@ -76,8 +76,25 @@ import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
+import type { KeyProvider } from "@cello-protocol/crypto";
+import { connectSessionRelay, type RelaySessionClient } from "./session-relay-client.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
+
+/**
+ * M7 DOD-SPINE-6 / MSG-001-3b: the inputs a session node needs to connect to the relay
+ * as the Structure-2 witness (relay endpoint from the FROST-signed assignment + the
+ * agent's K_local identity + the 16-byte session id). Optional on node creation: when
+ * absent (or connect fails), the session still works over the direct content path — the
+ * relay just doesn't witness the leaf yet.
+ */
+export interface RelayConnectParams {
+  relayPeerId: string;
+  relayAddrs: string[];
+  keyProvider: KeyProvider;
+  senderPubkey: Uint8Array;
+  sessionIdBytes: Uint8Array;
+}
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -127,6 +144,13 @@ interface ActiveSessionEntry {
    * down so its node subscription is released.
    */
   autoNat: NodeAutoNatService;
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: the authenticated relay witness stream for this
+   * session. Present once the session node has connected + authed to the relay; the
+   * leaf submit path uses it on cello_send. Absent when the relay is unreachable —
+   * the direct content path still delivers.
+   */
+  relayClient?: RelaySessionClient;
 }
 
 /** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
@@ -433,6 +457,7 @@ export class SessionNodeManager {
     counterpartyPeerId: string,
     correlationId: string,
     reuseStandingReceiver = false,
+    relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
     // Cap enforcement (AC-006)
     if (this.#activeNodes.size >= MAX_SESSION_NODES) {
@@ -543,12 +568,69 @@ export class SessionNodeManager {
     // liveness. The session connection IS the authority for a direct session.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
+    // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
+    // Structure-2 witness (non-fatal — direct content still works without it).
+    if (relay) {
+      await this.#connectSessionRelay(sessionId, node, relay, correlationId);
+    }
+
     // If we consumed the standing receiver, spin up a replacement (async — do NOT await).
     if (reuseStandingReceiver) {
       this.#createStandingReceiverWithRetry(correlationId);
     }
 
     return { ok: true, peerId, addrs };
+  }
+
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: connect a session node to the relay witness and
+   * store the client on the active entry. Best-effort: a connect/auth failure logs
+   * and leaves relayClient undefined — the session is NOT destroyed and the direct
+   * content path keeps working (the relay-park/recovery path is MSG-001-3b's domain).
+   */
+  async #connectSessionRelay(
+    sessionId: string,
+    node: CelloNode,
+    relay: RelayConnectParams,
+    correlationId: string,
+  ): Promise<void> {
+    try {
+      const client = await connectSessionRelay({
+        node,
+        relayPeerId: relay.relayPeerId,
+        relayAddrs: relay.relayAddrs,
+        keyProvider: relay.keyProvider,
+        senderPubkey: relay.senderPubkey,
+        sessionId: relay.sessionIdBytes,
+        logger: this.#logger,
+        correlationId,
+        onLeafDeliver: (frame) => {
+          // The counterparty's witnessed leaf arrived with its canonical sequence.
+          // The plaintext is delivered separately over the direct content stream; this
+          // is the ordering/witness signal. Surface it for observability; full
+          // canonical-sequence reconciliation against the local tree is MSG-001-3b.
+          this.#logger.info("session.relay.leaf.delivered", {
+            sessionId,
+            sequenceNumber: frame.sequence_number,
+            leafKind: frame.leaf_kind,
+            correlationId,
+          });
+        },
+      });
+      const entry = this.#activeNodes.get(sessionId);
+      if (client && entry) {
+        entry.relayClient = client;
+      } else if (client && !entry) {
+        // The session was torn down while we were connecting — don't leak the stream.
+        client.close();
+      }
+    } catch (err: unknown) {
+      this.#logger.warn("session.relay.connect.error", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
   }
 
   /**
@@ -619,6 +701,7 @@ export class SessionNodeManager {
     counterpartyPubkey: string,
     initiatorPeerId: string,
     correlationId: string,
+    relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
     if (!this.#standingReceiverReady || this.#standingReceiver === null) {
       return {
@@ -684,6 +767,12 @@ export class SessionNodeManager {
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
+    // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
+    // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
+    if (relay) {
+      await this.#connectSessionRelay(sessionId, node, relay, correlationId);
+    }
+
     // Immediately spin up a replacement (async — do NOT await, AC-003)
     this.#createStandingReceiverWithRetry(correlationId);
 
@@ -702,6 +791,8 @@ export class SessionNodeManager {
     if (!entry) return;
 
     entry.autoNat.stop();
+    // M7 DOD-SPINE-6 / MSG-001-3b: close the relay witness stream so we don't leak it.
+    entry.relayClient?.close();
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -749,6 +840,7 @@ export class SessionNodeManager {
   async retireSessionNode(sessionId: string): Promise<void> {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) return;
+    entry.relayClient?.close();
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -956,6 +1048,7 @@ export class SessionNodeManager {
     // Tear down the in-memory session node if it exists
     if (entry) {
       entry.autoNat.stop();
+      entry.relayClient?.close();
       try {
         await entry.node.stop();
       } catch (err: unknown) {
@@ -1273,6 +1366,37 @@ export class SessionNodeManager {
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
+
+      // M7 DOD-SPINE-6 / MSG-001-3b: submit the message-leaf HASH to the relay witness
+      // (Structure 2). Content went peer↔peer above; only the signed hash goes to the
+      // relay, which assigns the canonical sequence and forwards leaf_deliver to the
+      // counterparty. Best-effort: the direct content already delivered, so a relay
+      // miss must NOT fail the send — it degrades to local-only sequencing (the gap
+      // MSG-001-3b's recovery path closes). INV-3: the relay never sees plaintext here.
+      if (entry.relayClient) {
+        try {
+          const witnessed = await entry.relayClient.submitMessageHash(contentHash);
+          if (witnessed.ok) {
+            this.#logger.info("session.relay.hash.submitted", {
+              sessionId,
+              sequenceNumber: witnessed.sequence_number,
+              correlationId,
+            });
+          } else {
+            this.#logger.warn("session.relay.hash.submit.failed", {
+              sessionId,
+              reason: witnessed.reason,
+              correlationId,
+            });
+          }
+        } catch (relayErr: unknown) {
+          this.#logger.warn("session.relay.hash.submit.failed", {
+            sessionId,
+            reason: relayErr instanceof Error ? relayErr.message : String(relayErr),
+            correlationId,
+          });
+        }
+      }
       return { ok: true };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a

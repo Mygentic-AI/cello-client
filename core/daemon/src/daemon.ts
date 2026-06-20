@@ -54,7 +54,7 @@ import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
 import { MAX_CONTENT_BYTES, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
+import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import {
   resolveCelloEnv,
   createTransportSelector,
@@ -398,6 +398,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   for (const a of loadedAgents) {
     keyProviders.set(a.name, a.keyProvider);
   }
+
+  // M7 DOD-SPINE-6 / MSG-001-3b: assemble the relay-witness connect params for a
+  // session node from the FROST-signed assignment (relay endpoint + 16-byte session id)
+  // and the acting agent's K_local. Returns undefined when the agent key or relay
+  // endpoint is missing — the session then runs on the direct content path without a
+  // relay witness (degraded, never blocked).
+  const buildRelayConnectParams = async (
+    agentName: string,
+    assignment: NonNullable<ReturnType<typeof parseSessionAssignment>>,
+  ): Promise<RelayConnectParams | undefined> => {
+    const kp = keyProviders.get(agentName);
+    const endpoint = assignment.relay_endpoint;
+    if (!kp || !endpoint || !endpoint.peer_id || !endpoint.multiaddrs || endpoint.multiaddrs.length === 0) {
+      return undefined;
+    }
+    return {
+      relayPeerId: endpoint.peer_id,
+      relayAddrs: endpoint.multiaddrs,
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: assignment.session_id,
+    };
+  };
 
   // Stub: all connections marked as 'unverified' until connection validation is wired
   const connections: ConnectionInfo[] = [];
@@ -1239,6 +1262,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const counterpartyPubkey =
       typeof params?.counterparty_pubkey === "string" ? params.counterparty_pubkey : "";
     const counterpartyPeerId = assignment.counterparty_session_peer_id ?? "";
+    // M7 DOD-SPINE-6 / MSG-001-3b: relay witness params from the FROST-signed assignment
+    // + this agent's K_local. N_A connects to the relay and submits message-leaf hashes.
+    const relayParams = await buildRelayConnectParams(agentName, assignment);
     const created = await sessionNodeManager.createSessionNode(
       sessionId,
       agentName,
@@ -1248,6 +1274,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // Reuse the standing receiver as N_A so its peer id matches the session endpoint the
       // negotiator advertised — the counterparty's gater admits the dial (WIRE-002).
       true,
+      relayParams,
     );
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
@@ -1709,6 +1736,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         initiatorPeerId: string;
         sessionTimestamp: number;
         signatureType: string | null;
+        relayPeerId: string;
+        relayAddrs: string[];
       }
     | null {
     const raw = frame["assignment"];
@@ -1720,6 +1749,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
     const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
     if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
+    // M7 DOD-SPINE-6 / MSG-001-3b: relay endpoint so the receiver also connects to the
+    // relay witness (so the relay can deliver the initiator's witnessed leaves to it).
+    const relayEndpoint = a["relay_endpoint"] as Record<string, unknown> | undefined;
+    const relayPeerId =
+      relayEndpoint && typeof relayEndpoint["peer_id"] === "string" ? relayEndpoint["peer_id"] : "";
+    const relayAddrs =
+      relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
+        ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
+        : [];
     return {
       sessionIdHex,
       participantAPubkeyHex,
@@ -1728,6 +1766,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
       sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
       signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+      relayPeerId,
+      relayAddrs,
     };
   }
 
@@ -1762,12 +1802,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         });
         return;
       }
+      // M7 DOD-SPINE-6 / MSG-001-3b: relay witness for the receiver. Build from the
+      // inbound assignment's relay endpoint + this agent's K_local + the 16-byte session id.
+      const kp = keyProviders.get(agentName);
+      let relayParams: RelayConnectParams | undefined;
+      if (kp && parsed.relayPeerId && parsed.relayAddrs.length > 0) {
+        relayParams = {
+          relayPeerId: parsed.relayPeerId,
+          relayAddrs: parsed.relayAddrs,
+          keyProvider: kp,
+          senderPubkey: await kp.getPublicKey(),
+          sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
+        };
+      }
       const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
         agentName,
         parsed.participantAPubkeyHex, // the initiator is OUR counterparty
         parsed.initiatorPeerId,
         correlationId,
+        relayParams,
       );
       if (!result.ok) {
         logger.warn("session.inbound.accept.failed", {
