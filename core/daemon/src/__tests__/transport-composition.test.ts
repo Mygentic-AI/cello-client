@@ -199,7 +199,10 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(record?.counterparty_pubkey).toBe("bb".repeat(32));
   });
 
-  it("cello_initiate_session without a negotiator returns directory_signaling_not_configured (graceful, adapters still wired)", async () => {
+  it("cello_initiate_session wires a real internal negotiator (DOD-SPINE-5); empty params → invalid_target_pubkey", async () => {
+    // SPINE-5: the daemon now always builds a real internal SessionNegotiator (it no longer
+    // returns the wired-out directory_signaling_not_configured). With no target_pubkey, the
+    // negotiator's input validation rejects first — proving it is actually wired + validating.
     process.env["CELLO_ENV"] = "local";
     await setupAgent("alice");
     handle = await startDaemon(makeConfig());
@@ -210,7 +213,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
 
     const result = (await client.send("cello_initiate_session", {})) as { ok: boolean; reason?: string };
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("directory_signaling_not_configured");
+    expect(result.reason).toBe("invalid_target_pubkey");
   });
 
   it("production variant without a transport dialer fails at startup naming the missing config", async () => {
