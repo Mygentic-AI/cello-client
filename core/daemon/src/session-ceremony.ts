@@ -19,6 +19,7 @@
  */
 
 import { decode } from "cbor-x";
+import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { FrostThresholdSigner } from "@cello-protocol/crypto";
 import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { IThresholdSigner } from "@cello-protocol/crypto";
@@ -172,6 +173,80 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
  * reply with `ceremony_result`. The signer is reconstructed lazily and cached. Returns the
  * unregister function. SI-001: tbs/signature never logged.
  */
+/**
+ * DOD-SPINE-7: register a `seal_verified` handler on the agent's signaling seam. After the
+ * directory rebuilds + verifies the bilateral seal's signed Merkle chain (relay-mediated
+ * processSeal FROST path), it sends the SEAL INITIATOR a `seal_verified` {session_id,
+ * sealed_root, leaf_count, timestamp} and waits for the initiator to COORDINATE the seal FROST
+ * ceremony. This handler reconstructs the agent's threshold signer (same machinery as the
+ * session ceremony), runs participateInCeremony over buildSealTbs with context
+ * "cello-frost-seal-v1", and replies `seal_frost_signature` {session_id, frost_signature}. The
+ * directory's #processSealFrostSignature then completes notarization and delivers
+ * `session_sealed` (the byte-identical sealed_root) to both parties.
+ *
+ * Faithful port of core/client `SealManager.handleSealVerified` (the dead stack); the daemon
+ * must NOT import that stack. SI-001: tbs/signature never logged.
+ */
+export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
+  return deps.signaling.registerInboundHandler((frame) => {
+    if (frame["type"] !== "seal_verified") return;
+    void (async () => {
+      const toU8 = (v: unknown): Uint8Array | null =>
+        v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
+      const sessionId = toU8(frame["session_id"]);
+      const sealedRoot = toU8(frame["sealed_root"]);
+      const leafCountRaw = frame["leaf_count"];
+      const leafCount = typeof leafCountRaw === "number" ? leafCountRaw : null;
+      const tsRaw = frame["timestamp"];
+      const timestamp = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
+      if (!sessionId || !sealedRoot || leafCount === null || timestamp === null) {
+        deps.logger.warn("session.seal.ceremony.abort", {
+          agentName: deps.agentName,
+          reason: !sessionId ? "no_session_id" : !sealedRoot ? "no_sealed_root" : leafCount === null ? "no_leaf_count" : "no_timestamp",
+        });
+        return;
+      }
+      const sidHex = Buffer.from(sessionId).toString("hex");
+
+      // Reconstruct a FRESH signer per ceremony (same rationale as the session ceremony:
+      // fresh directory endpoint, no shared FROST state across concurrent ceremonies).
+      const signer = await reconstructThresholdSigner(deps);
+      if (!signer) {
+        deps.logger.warn("session.seal.ceremony.abort", { agentName: deps.agentName, sessionId: sidHex, reason: "no_signer" });
+        return;
+      }
+      const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, timestamp);
+      let frostSignature: Uint8Array | null = null;
+      try {
+        // The initiator COORDINATES the seal FROST ceremony (its signer drives the
+        // /cello/frost round-trips with the directory's K_server shares via directoryNodeStubs).
+        const result = await signer.participateInCeremony(`seal:${sidHex}`, tbs, "cello-frost-seal-v1" as FrostContext);
+        frostSignature = result.ok ? new Uint8Array(result.signature) : null;
+        deps.logger.info("session.seal.ceremony.participated", { agentName: deps.agentName, sessionId: sidHex, ok: result.ok });
+      } catch (err: unknown) {
+        deps.logger.warn("session.seal.ceremony.failed", {
+          agentName: deps.agentName,
+          sessionId: sidHex,
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      if (!frostSignature) return; // ceremony failed (threshold not met) — no signature to send
+
+      try {
+        await deps.signaling.sendRaw({ type: "seal_frost_signature", session_id: sessionId, frost_signature: frostSignature });
+        deps.logger.info("session.seal.frost.signature.sent", { agentName: deps.agentName, sessionId: sidHex });
+      } catch (err: unknown) {
+        deps.logger.warn("session.seal.frost.signature.send.failed", {
+          agentName: deps.agentName,
+          sessionId: sidHex,
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+  });
+}
+
 export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void {
   return deps.signaling.registerInboundHandler((frame) => {
     if (frame["type"] !== "ceremony_request") return;

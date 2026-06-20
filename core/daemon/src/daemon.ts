@@ -63,7 +63,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
-import { wireSessionCeremonyHandler, wireSessionOfferHandler } from "./session-ceremony.js";
+import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -578,6 +578,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: mgr,
       logger,
     });
+    // DOD-SPINE-7: coordinate the SEAL FROST ceremony on this agent's stream too.
+    wireSealCeremonyHandler({
+      agentName,
+      agentDir: join(celloDir, "agents", agentName),
+      agentPubkeyHex,
+      getNode: entry.getNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: mgr,
+      logger,
+    });
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
@@ -619,6 +629,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // manager too — otherwise a primary-agent initiator's session ceremony would time out.
   if (primaryAgent) {
     wireSessionCeremonyHandler({
+      agentName: primaryAgent.name,
+      agentDir: join(celloDir, "agents", primaryAgent.name),
+      agentPubkeyHex: primaryAgent.pubkey,
+      getNode: getDirectoryNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: signalingManager,
+      logger,
+    });
+    // DOD-SPINE-7: the primary agent also coordinates the SEAL FROST ceremony on the keystone.
+    wireSealCeremonyHandler({
       agentName: primaryAgent.name,
       agentDir: join(celloDir, "agents", primaryAgent.name),
       agentPubkeyHex: primaryAgent.pubkey,
