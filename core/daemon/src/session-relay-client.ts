@@ -109,6 +109,23 @@ export interface ConnectSessionRelayOpts {
   onLeafDeliver?: (frame: LeafDeliverFrame) => void;
 }
 
+/**
+ * Extract a real message from a thrown value. libp2p / cross-package errors are not
+ * always `instanceof Error` in this realm (multi-version split), so fall back to a
+ * `message` property or JSON — never the useless "[object Object]".
+ */
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+    return (err as { message: string }).message;
+  }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 function toU8(v: unknown): Uint8Array {
   if (v instanceof Uint8Array) return v;
   if (Buffer.isBuffer(v)) return new Uint8Array(v as Buffer);
@@ -157,11 +174,19 @@ export async function connectSessionRelay(opts: ConnectSessionRelayOpts): Promis
       dialed = true;
       break;
     } catch (err: unknown) {
-      lastDialError = err instanceof Error ? err.message : String(err);
+      // libp2p / cross-package errors are not always `instanceof Error` in this realm —
+      // extract a real message (never [object Object]) so the failure is diagnosable.
+      lastDialError = extractErrorMessage(err);
     }
   }
   if (!dialed && relayAddrs.length > 0) {
-    logger.warn("session.relay.dial.failed", { sessionId: sessionIdHex, error: lastDialError, correlationId });
+    logger.warn("session.relay.dial.failed", {
+      sessionId: sessionIdHex,
+      relayPeerId,
+      relayAddrs,
+      error: lastDialError,
+      correlationId,
+    });
     return null;
   }
 
@@ -171,7 +196,7 @@ export async function connectSessionRelay(opts: ConnectSessionRelayOpts): Promis
   } catch (err: unknown) {
     logger.warn("session.relay.stream.failed", {
       sessionId: sessionIdHex,
-      error: err instanceof Error ? err.message : String(err),
+      error: extractErrorMessage(err),
       correlationId,
     });
     return null;
@@ -212,7 +237,7 @@ export async function connectSessionRelay(opts: ConnectSessionRelayOpts): Promis
     logger.warn("session.relay.auth.failed", {
       sessionId: sessionIdHex,
       reason: "response_send",
-      error: err instanceof Error ? err.message : String(err),
+      error: extractErrorMessage(err),
       correlationId,
     });
     return null;

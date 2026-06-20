@@ -595,6 +595,10 @@ export class SessionNodeManager {
     correlationId: string,
   ): Promise<void> {
     try {
+      // The session node's gater admits only the counterparty; the relay witness is a
+      // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
+      // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
+      this.#activeNodes.get(sessionId)?.gater.setAllowedOutboundPeer(relay.relayPeerId);
       const client = await connectSessionRelay({
         node,
         relayPeerId: relay.relayPeerId,

@@ -683,6 +683,34 @@ describe("SessionNodeManager — unit tests", () => {
       expect(gater.denyInboundEncryptedConnection({ toString: () => targetPeerId } as PeerId, fakeMaConn)).toBe(false);
       expect(gater.denyInboundEncryptedConnection({ toString: () => intruderPeerId } as PeerId, fakeMaConn)).toBe(true);
     });
+
+    // M7 DOD-SPINE-6: the session node must reach the relay witness (a third peer) while
+    // still admitting ONLY the counterparty inbound. The relay is allowed OUTBOUND only.
+    it("setAllowedOutboundPeer admits the relay outbound but NOT inbound (INV-5 preserved)", () => {
+      const { logger } = makeLogger();
+      const counterpartyPeerId = "12D3KooWCounterparty";
+      const relayPeerId = "12D3KooWRelayWitness";
+      const intruderPeerId = "12D3KooWIntruder";
+      const fakeMaConn = {} as MultiaddrConnection;
+      const gater = new SessionConnectionGater({
+        sessionId: "test",
+        allowedPeerId: counterpartyPeerId,
+        logger,
+      });
+
+      gater.setAllowedOutboundPeer(relayPeerId);
+
+      // Outbound: counterparty AND relay are allowed; a random peer is denied.
+      expect(gater.denyOutboundEncryptedConnection({ toString: () => counterpartyPeerId } as PeerId, fakeMaConn)).toBe(false);
+      expect(gater.denyOutboundEncryptedConnection({ toString: () => relayPeerId } as PeerId, fakeMaConn)).toBe(false);
+      expect(gater.denyOutboundEncryptedConnection({ toString: () => intruderPeerId } as PeerId, fakeMaConn)).toBe(true);
+
+      // Inbound: ONLY the counterparty — the relay (and everyone else) is denied inbound.
+      // INV-5 third-party-dial-rejected is unaffected by the outbound relay allowance.
+      expect(gater.denyInboundEncryptedConnection({ toString: () => counterpartyPeerId } as PeerId, fakeMaConn)).toBe(false);
+      expect(gater.denyInboundEncryptedConnection({ toString: () => relayPeerId } as PeerId, fakeMaConn)).toBe(true);
+      expect(gater.denyInboundEncryptedConnection({ toString: () => intruderPeerId } as PeerId, fakeMaConn)).toBe(true);
+    });
   });
 });
 
