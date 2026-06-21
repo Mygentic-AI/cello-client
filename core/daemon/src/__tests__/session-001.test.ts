@@ -497,10 +497,10 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     const sid1 = "aabb1122334455667788aabbcc001122334455667788aabbcc00112233445566";
     const sid2 = "bbcc1122334455667788aabbcc001122334455667788aabbcc00112233445567";
     db.prepare(
-      "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sid1, "alice", "pubkey1", "interrupted", now, now, 3, isoNow);
     db.prepare(
-      "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sid2, "bob", "pubkey2", "interrupted", now, now, 0, isoNow);
     db.close();
 
@@ -586,7 +586,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sessionId, agentName, "counterparty_pubkey_hex", status, now, now, messageCount, new Date(now).toISOString());
     db.close();
   }
@@ -738,7 +738,7 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sessionId, "alice", "counterparty_pubkey_hex", "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
@@ -874,7 +874,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sessionId, "alice", counterpartyPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
@@ -1314,7 +1314,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const dbPath = join(tempDir, "sessions.db");
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
@@ -1390,7 +1390,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const dbPath = join(tempDir, "sessions.db");
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
@@ -1441,7 +1441,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const dbPath = join(tempDir, "sessions.db");
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
     db.close();
 
@@ -1511,7 +1511,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const dbPath = join(tempDir, "sessions.db");
     const db = new DatabaseSync(dbPath);
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
     db.close();
 

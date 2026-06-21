@@ -1236,7 +1236,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // per session_id (hex); the directory's session_sealed frame — delivered over the agent's
   // signaling stream after FROST notarization, once BOTH parties have submitted their SEAL
   // ctrl leaf — resolves it with the sealed_root.
-  const pendingSealWaiters = new Map<string, (sealedRootHex: string) => void>();
+  // M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility
+  // certificate (receipt-not-assent, per-party frontiers, attestation modes, final_message).
+  type SealCompletion = { rootHex: string; legibility?: unknown };
+  const pendingSealWaiters = new Map<string, (completion: SealCompletion) => void>();
 
   // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling seam (keystone
   // for the primary agent, per-agent for the rest — the directory routes session_sealed to the
@@ -1248,11 +1251,37 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       const sidHex = frameValueToHex(frame["session_id"]);
       const rootHex = frameValueToHex(frame["sealed_root"]);
       if (!sidHex || !rootHex) return;
-      logger.info("session.sealed.received", { sessionId: sidHex, sealedRoot: rootHex });
+      // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
+      // JSON-safe certificate and persist it with the sealed record so it survives a restart and
+      // is readable via cello_get_sealed_receipt — receipt-not-assent, per-party frontiers,
+      // attestation modes, and final_message.answered. Carried verbatim from the directory; the
+      // daemon does not re-derive or alter it here (the SI-002 re-derive guard is DOD-LEG-2).
+      const legibility = normalizeLegibility(frame["legibility"]);
+      logger.info("session.sealed.received", {
+        sessionId: sidHex,
+        sealedRoot: rootHex,
+        hasLegibility: legibility !== undefined,
+        finalMessageAnswered:
+          legibility && typeof legibility === "object" && "final_message" in legibility
+            ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
+            : undefined,
+      });
+      if (legibility !== undefined) {
+        try {
+          sessionNodeManager.recordSealCertificate(sidHex, rootHex, JSON.stringify(legibility));
+        } catch (error) {
+          // A persistence failure must not block the seal completion — the cert still flows
+          // through the live return path. Surface the cause rather than swallowing it.
+          logger.warn("seal.certificate.persist.failed", {
+            sessionId: sidHex,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       const waiter = pendingSealWaiters.get(sidHex);
       if (waiter) {
         pendingSealWaiters.delete(sidHex);
-        waiter(rootHex);
+        waiter({ rootHex, legibility });
       }
       // Mark the session sealed + tear the node down (idempotent — safe if already gone).
       void sessionNodeManager.destroySessionNode(sidHex, "sealed");
@@ -1596,8 +1625,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // fires → directory processSeal rebuilds + verifies the signed chain → FROST
         // notarization → session_sealed to BOTH parties. Register the waiter BEFORE
         // submitting so the notification can never race ahead of us.
-        let resolveSeal!: (rootHex: string) => void;
-        const sealedP = new Promise<string>((r) => { resolveSeal = r; });
+        let resolveSeal!: (completion: SealCompletion) => void;
+        const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
         pendingSealWaiters.set(sessionId, resolveSeal);
         const submit = await sessionNodeManager.submitSealLeaf(sessionId, correlationId);
         if (!submit.ok) {
@@ -1620,12 +1649,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 30_000;
         let timer!: ReturnType<typeof setTimeout>;
         const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
-        const sealedRoot = await Promise.race([sealedP, timeoutP]);
+        const sealedCompletion = await Promise.race([sealedP, timeoutP]);
         clearTimeout(timer);
         pendingSealWaiters.delete(sessionId);
-        if (sealedRoot !== null) {
-          logger.info("session.seal.completed", { sessionId, sealedRoot, role: "bilateral", correlationId });
-          return { ok: true, sealed_root: sealedRoot };
+        if (sealedCompletion !== null) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
+          // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
+          // a reader gets it on the same surface that proves the seal — receipt-not-assent,
+          // per-party frontiers, attestation modes, and final_message.answered.
+          return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
         }
 
         // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
@@ -1687,11 +1719,35 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   // ─── MCP-001: stubs for tools registered in cello-mcp.ts but not yet implemented ───
   // These return not_implemented (same as session tools) so LLMs get consistent guidance.
-  for (const tool of ["cello_backup", "cello_restore", "cello_get_sealed_receipt", "cello_get_inclusion_proof"]) {
+  for (const tool of ["cello_backup", "cello_restore", "cello_get_inclusion_proof"]) {
     handlers.set(tool, async (_params, _connectionId) => {
       return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
     });
   }
+
+  // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
+  // The cert-read surface: returns the receipt-not-assent certificate for a sealed session —
+  // per-party content frontiers, attestation modes, and whether the final message was answered.
+  // Reads the PERSISTED record, so it works after a daemon restart and from a DIFFERENT process
+  // than the one that built the certificate (an arbitrator reading the receiving side). The
+  // legibility states, as a first-class machine-readable property, that a signature attests
+  // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
+  // delivered-but-unanswered (final_message.answered: false), never agreed.
+  handlers.set("cello_get_sealed_receipt", async (params, _connectionId) => {
+    const sessionId = params?.["sessionId"] as string | undefined;
+    if (!sessionId || typeof sessionId !== "string") {
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the sessionId (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
+    }
+    const cert = sessionNodeManager.getSealCertificate(sessionId);
+    if (!cert) {
+      return {
+        ok: false,
+        reason: "sealed_receipt_not_found",
+        guidance: "No sealed certificate is recorded for this session. It may not be sealed yet, or the sessionId is wrong — close it with cello_close_session and confirm it reports sealed, then retry.",
+      };
+    }
+    return { ok: true, sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+  });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
   handlers.set("queue_failed_send", async (params, _connectionId) => {
@@ -2072,6 +2128,43 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (Buffer.isBuffer(v)) return Buffer.from(v as Buffer).toString("hex");
     if (typeof v === "string") return v.toLowerCase();
     return null;
+  }
+  // M7-SESSION-004 (AC-005): normalise the wire `legibility` object — CBOR-decoded, so pubkeys
+  // arrive as Uint8Array/Buffer — into a JSON-safe certificate with hex-encoded pubkeys. Returns
+  // undefined for an absent or structurally-implausible object (pre-M7 frame, or a malformed
+  // field), in which case nothing is persisted and the seal still completes. The receipt-not-
+  // assent constants (attests/implies_assent/disclaimer) and the integers/booleans are carried
+  // verbatim; only the byte fields are re-encoded. The daemon never invents or alters the
+  // certificate's meaning — it is the directory's derivation, surfaced.
+  function normalizeLegibility(raw: unknown): unknown | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o["attests"] !== "receipt") return undefined;
+    const participantsRaw = o["participants"];
+    const finalRaw = o["final_message"];
+    if (!Array.isArray(participantsRaw) || !finalRaw || typeof finalRaw !== "object") return undefined;
+    const participants = participantsRaw.map((p) => {
+      const pp = p as Record<string, unknown>;
+      return {
+        pubkey: frameValueToHex(pp["pubkey"]),
+        content_frontier_seq: typeof pp["content_frontier_seq"] === "number" ? pp["content_frontier_seq"] : null,
+        last_authored_seq: typeof pp["last_authored_seq"] === "number" ? pp["last_authored_seq"] : null,
+        attestation_mode: pp["attestation_mode"],
+      };
+    });
+    const fm = finalRaw as Record<string, unknown>;
+    const final_message = {
+      sender_pubkey: frameValueToHex(fm["sender_pubkey"]),
+      seq: typeof fm["seq"] === "number" ? fm["seq"] : null,
+      answered: fm["answered"] === true,
+    };
+    return {
+      attests: "receipt" as const,
+      implies_assent: false as const,
+      disclaimer: typeof o["disclaimer"] === "string" ? o["disclaimer"] : "",
+      participants,
+      final_message,
+    };
   }
   // Pull the fields out of a pushed session_assignment frame. Returns null when the frame
   // carries no usable assignment object / is missing the essential ids (the handler then

@@ -353,6 +353,12 @@ export class SessionNodeManager {
       // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
       "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
       "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
+      // M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
+      // sealed record so it survives a daemon restart and is readable on the cert-read surface
+      // (cello_get_sealed_receipt). JSON string with hex-encoded pubkeys; NULL until sealed.
+      // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
+      "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
+      "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1117,6 +1123,45 @@ export class SessionNodeManager {
     return this.#db
       .prepare("SELECT * FROM sessions WHERE status = ?")
       .all(status) as unknown as SessionRecord[];
+  }
+
+  /**
+   * M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
+   * sealed record. Stored as a JSON string (hex-encoded pubkeys) so it round-trips a
+   * daemon restart and is returned intact on the cert-read surface. The caller normalises
+   * the raw wire legibility (Uint8Array pubkeys) into a JSON-safe shape before storing.
+   * Best-effort: a session row may not yet exist (the seal arrived before the row was
+   * persisted); in that case we no-op rather than throw — the cert still flows through the
+   * live return path. The legibility content is identical regardless of delivery timing.
+   */
+  recordSealCertificate(sessionId: string, sealedRootHex: string, legibilityJson: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE session_id = ?")
+      .run(legibilityJson, sealedRootHex, Date.now(), sessionId);
+  }
+
+  /**
+   * M7-SESSION-004 (AC-005/AC-006): read the persisted seal certificate for a session.
+   * Returns the sealed root and the parsed legibility object (JSON-safe, hex pubkeys), or
+   * null if the session is unknown or not yet sealed. This is the cert-read surface a
+   * reader (operator, agent, arbitrator) — possibly in a DIFFERENT process than the one
+   * that built the certificate — uses to determine receipt-not-assent, per-party frontiers,
+   * attestation modes, and whether the final message was answered.
+   */
+  getSealCertificate(sessionId: string): { sealed_root: string; legibility: unknown } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
+    if (!row || !row.seal_legibility || !row.sealed_root_hex) return null;
+    let legibility: unknown;
+    try {
+      legibility = JSON.parse(row.seal_legibility);
+    } catch {
+      return null;
+    }
+    return { sealed_root: row.sealed_root_hex, legibility };
   }
 
   /**
