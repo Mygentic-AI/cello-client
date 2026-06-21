@@ -42,6 +42,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
+import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
@@ -1595,6 +1596,58 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const depth = retryQueue.getSessionDepth(sessionId);
     const entries = retryQueue.getSessionEntries(sessionId);
     return { pendingCount: depth, nonces: entries.map(e => e.nonceHex) };
+  });
+
+  // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
+  // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
+  // proven (J-CONTENT increment 1) before the send/receive-path integration. The relay
+  // multiaddr (with /p2p/<peerId>) comes from the session assignment's relay endpoint;
+  // dials run from the standing receiver (open-gater) node.
+  const parseRelayPeer = (multiaddr: string | undefined): { peerId: string; addr: string } | null => {
+    if (!multiaddr) return null;
+    const peerId = multiaddr.split("/p2p/")[1];
+    return peerId ? { peerId, addr: multiaddr } : null;
+  };
+
+  handlers.set("content_park_deposit", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    const contentHash = params?.contentHash as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    const ciphertext = params?.ciphertext as string | undefined;
+    if (!relay || !recipientPubkey || !contentHash || !sessionId || !ciphertext) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId, ciphertext — all hex." };
+    }
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    return await client.deposit(node, {
+      recipientPubkey: Buffer.from(recipientPubkey, "hex"),
+      contentHash: Buffer.from(contentHash, "hex"),
+      sessionId: Buffer.from(sessionId, "hex"),
+      ciphertext: Buffer.from(ciphertext, "hex"),
+    });
+  });
+
+  handlers.set("content_park_pull", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    if (!relay || !recipientPubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
+    }
+    // The recipient must be a local agent — its K_local signs the relay's auth challenge.
+    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
+    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey; only the recipient can pull its own parked content." };
+    const kp = keyProviders.get(recipientAgent.name);
+    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    return {
+      ok: true,
+      entries: entries.map((e) => ({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, ciphertext: Buffer.from(e.ciphertext).toString("hex") })),
+    };
   });
 
   // MCP-002: Test-only handler to emit session lifecycle events.

@@ -413,6 +413,17 @@ export class SessionNodeManager {
   }
 
   /**
+   * The standing receiver's libp2p node — a general-purpose, OPEN-gater node usable for
+   * OUTBOUND dials that are not session-scoped (e.g. the content-park deposit/pull to the
+   * relay, MSG-001-3b). Session nodes have restrictive gaters; the standing receiver does not.
+   * Returns null until the receiver is ready.
+   */
+  getStandingReceiverNode(): CelloNode | null {
+    if (!this.#standingReceiverReady || this.#standingReceiver === null) return null;
+    return this.#standingReceiver.node;
+  }
+
+  /**
    * The libp2p Peer ID of an active session's node (N_A for an initiated session), or
    * null if no active node exists for it. This is the initiator's session peer id that an
    * inbound session_assignment must carry to the counterparty (so the counterparty gates
