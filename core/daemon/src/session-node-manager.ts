@@ -1602,7 +1602,7 @@ export class SessionNodeManager {
   async submitSealLeaf(
     sessionId: string,
     correlationId?: string,
-  ): Promise<{ ok: true; sequenceNumber: number } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | { ok: false; reason: string }> {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) return { ok: false, reason: "session_node_unavailable" };
     if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
@@ -1623,12 +1623,19 @@ export class SessionNodeManager {
       this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
       return { ok: false, reason: result.reason };
     }
+    // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
+    // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
+    // rebuilds from the relay's content-hash chain (the relay records the identical
+    // content_hash for this ctrl leaf). Computed without mutating the durable tree /
+    // message_count, so the bilateral + interrupted seal paths are unaffected.
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    const reportedRootHex = this.getSessionTree(sessionId).rootWithAppendedHex(contentHashHex);
     this.#logger.info("session.seal.leaf.submitted", {
       sessionId,
       sequenceNumber: result.sequence_number,
       correlationId,
     });
-    return { ok: true, sequenceNumber: result.sequence_number };
+    return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
   }
 
   /**

@@ -99,6 +99,23 @@ export class SessionTree {
     const tree = buildMerkleTree(inputs);
     return bytesToHex(merkleRoot(tree));
   }
+
+  /**
+   * SESSION-002: the Merkle root this tree WOULD have if one more leaf (hashHex) were
+   * appended — WITHOUT mutating the tree. Used to compute the reported_root for a unilateral
+   * seal: the post-SEAL-ctrl-leaf root the directory rebuilds from the relay's content-hash
+   * chain and verifies, without advancing the durable tree / message_count.
+   */
+  rootWithAppendedHex(hashHex: string): string {
+    if (!/^[0-9a-f]{64}$/.test(hashHex)) {
+      throw new Error(`SessionTree.rootWithAppendedHex: hashHex must be 64 lowercase hex chars (32 bytes), got length ${hashHex.length}`);
+    }
+    const inputs: LeafInput[] = [...this.#leaves, { kind: "ctrl" as const, hashHex }].map((l) => ({
+      kind: "hash" as const,
+      data: hexToBytes(l.hashHex),
+    }));
+    return bytesToHex(merkleRoot(buildMerkleTree(inputs)));
+  }
 }
 
 function hexToBytes(hex: string): Uint8Array {

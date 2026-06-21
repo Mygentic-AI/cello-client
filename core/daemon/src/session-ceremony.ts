@@ -247,6 +247,58 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
   });
 }
 
+/**
+ * SESSION-002 (DOD-SEAL-3): verify a unilateral seal certificate WITHOUT trusting the
+ * channel. Rebuilds the canonical seal TBS from the cert fields and verifies the signature
+ * against a key trusted independently of the delivering frame: the session primary_pubkey
+ * (commitments[0] of this agent's FROST share) for 'frost'. A channel-swapped sealed_root
+ * (or any TBS-bound field) fails this check (SI-003). The 'single' (pre-DKG) variant verifies
+ * against the directory node key from the consortium manifest — not yet wired on the daemon;
+ * surfaced honestly rather than accepted on faith.
+ */
+export async function verifyUnilateralCertificate(
+  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger },
+  cert: {
+    sessionId: Uint8Array;
+    sealedRoot: Uint8Array;
+    leafCount: number;
+    closeTimestamp: number;
+    frostSignature: Uint8Array;
+    signatureType: "frost" | "single";
+  },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const tbs = buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp);
+
+  if (cert.signatureType !== "frost") {
+    // 'single' (pre-DKG) — verify vs the directory node key from the manifest. Not wired yet.
+    return { ok: false, reason: "single_key_verification_unsupported" };
+  }
+
+  const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
+  const share = await persistence.loadActiveFrostKeyShare();
+  if (!share) return { ok: false, reason: "no_frost_share" };
+
+  let primaryPubkey: Uint8Array | null = null;
+  try {
+    const dc = decode(Buffer.from(share.commitmentsCbor)) as unknown;
+    if (Array.isArray(dc) && dc.length > 0) {
+      const c0 = dc[0];
+      primaryPubkey = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
+    }
+  } catch (err: unknown) {
+    deps.logger.warn("session.unilateral.certificate.share.decode.failed", {
+      agentPubkey: deps.agentPubkeyHex,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    return { ok: false, reason: "share_decode_failed" };
+  }
+  if (!primaryPubkey || primaryPubkey.length !== 32) return { ok: false, reason: "no_primary_pubkey" };
+
+  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
+  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, primaryPubkey);
+  return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
+}
+
 export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void {
   return deps.signaling.registerInboundHandler((frame) => {
     if (frame["type"] !== "ceremony_request") return;

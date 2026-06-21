@@ -64,7 +64,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
-import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
+import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -591,6 +591,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
     // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
     registerSessionSealedListener(mgr);
+    // SESSION-002: resolve seal_unilateral_confirmed (verify the cert) on this agent's stream.
+    registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
@@ -1257,6 +1259,70 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
   }
 
+  // SESSION-002 (DOD-SEAL): cello_close_session escalates to a UNILATERAL seal when the
+  // counterparty never co-closes. The waiter is resolved by the seal_unilateral_confirmed
+  // listener AFTER it verifies the certificate signature (channel-independent), or by
+  // seal_unilateral_too_early (grace not elapsed). Keyed by session_id hex.
+  type UnilateralResult = { ok: true; sealedRootHex: string } | { ok: false; reason: string };
+  const pendingUnilateralWaiters = new Map<string, (r: UnilateralResult) => void>();
+
+  // SESSION-002: per-agent listener for the unilateral certificate. Verifies the FROST
+  // signature over the rebuilt TBS against the agent's own primary_pubkey BEFORE resolving
+  // the close as sealed (SI-003: a channel-swapped sealed_root fails the signature check).
+  function registerUnilateralConfirmedListener(
+    signaling: SignalingManager,
+    agentName: string,
+    agentPubkeyHex: string,
+  ): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      const ftype = frame["type"];
+      if (ftype !== "seal_unilateral_confirmed" && ftype !== "seal_unilateral_too_early") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      if (!sidHex) return;
+      const waiter = pendingUnilateralWaiters.get(sidHex);
+      if (!waiter) return;
+
+      if (ftype === "seal_unilateral_too_early") {
+        pendingUnilateralWaiters.delete(sidHex);
+        waiter({ ok: false, reason: "seal_unilateral_too_early" });
+        return;
+      }
+
+      void (async () => {
+        const toU8 = (v: unknown): Uint8Array | null =>
+          v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
+        const sessionId = toU8(frame["session_id"]);
+        const sealedRoot = toU8(frame["sealed_root"]);
+        const frostSig = toU8(frame["frost_signature"]);
+        const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
+        const tsRaw = frame["close_timestamp"];
+        const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
+        const sigType = frame["signature_type"];
+        if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null ||
+            (sigType !== "frost" && sigType !== "single")) {
+          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: "malformed_certificate" });
+          pendingUnilateralWaiters.delete(sidHex);
+          waiter({ ok: false, reason: "malformed_certificate" });
+          return;
+        }
+        const result = await verifyUnilateralCertificate(
+          { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+          { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
+        );
+        pendingUnilateralWaiters.delete(sidHex);
+        if (!result.ok) {
+          // SI-003: do NOT mark sealed when the certificate signature does not verify.
+          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: result.reason, signatureType: sigType });
+          waiter({ ok: false, reason: `certificate_invalid:${result.reason}` });
+          return;
+        }
+        logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, signatureType: sigType, party: "present" });
+        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+        waiter({ ok: true, sealedRootHex: Buffer.from(sealedRoot).toString("hex") });
+      })();
+    });
+  }
+
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {
     return {
@@ -1549,21 +1615,63 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         }
         // Both parties must close for the directory to notarize. Await session_sealed; a
         // timeout means the counterparty has not closed yet (our leaf is recorded — the
-        // session seals when they call cello_close_session).
+        // session seals when they call cello_close_session). CELLO_SEAL_BILATERAL_TIMEOUT_MS
+        // tunes how long to wait for the counterparty before escalating to a unilateral seal.
+        const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 30_000;
         let timer!: ReturnType<typeof setTimeout>;
-        const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), 30_000); });
+        const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
         const sealedRoot = await Promise.race([sealedP, timeoutP]);
         clearTimeout(timer);
         pendingSealWaiters.delete(sessionId);
-        if (sealedRoot === null) {
+        if (sealedRoot !== null) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot, role: "bilateral", correlationId });
+          return { ok: true, sealed_root: sealedRoot };
+        }
+
+        // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
+        // seal — submit a seal_unilateral request carrying our reported_root (the content-hash
+        // root the directory rebuilds from the relay chain and verifies). The directory enforces
+        // the delivery-grace gate; if grace has not elapsed it replies seal_unilateral_too_early.
+        let resolveUni!: (r: UnilateralResult) => void;
+        const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
+        pendingUnilateralWaiters.set(sessionId, resolveUni);
+        const sent = await signalingManager.sendRaw({
+          type: "seal_unilateral",
+          session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
+          reported_root: new Uint8Array(Buffer.from(submit.reportedRootHex, "hex")),
+          reported_seq: submit.sequenceNumber,
+        });
+        if (!sent.ok) {
+          pendingUnilateralWaiters.delete(sessionId);
+          return {
+            ok: false,
+            reason: "seal_unilateral_send_failed",
+            guidance: "The unilateral seal request could not be sent to the directory. Check the directory connection (cello status) and retry cello_close_session.",
+          };
+        }
+        let uniTimer!: ReturnType<typeof setTimeout>;
+        const uniTimeoutP = new Promise<UnilateralResult>((r) => {
+          uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), 30_000);
+        });
+        const uniResult = await Promise.race([uniP, uniTimeoutP]);
+        clearTimeout(uniTimer);
+        pendingUnilateralWaiters.delete(sessionId);
+        if (uniResult.ok) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
+          return { ok: true, sealed_root: uniResult.sealedRootHex, seal_type: "unilateral" };
+        }
+        if (uniResult.reason === "seal_unilateral_too_early") {
           return {
             ok: false,
             reason: "seal_counterparty_pending",
-            guidance: "Your SEAL leaf was submitted to the relay, but the counterparty has not closed yet, so the directory has not notarized. The session seals once they call cello_close_session — retry to confirm.",
+            guidance: "Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. Retry cello_close_session after the grace period, or once the counterparty closes.",
           };
         }
-        logger.info("session.seal.completed", { sessionId, sealedRoot, role: "bilateral", correlationId });
-        return { ok: true, sealed_root: sealedRoot };
+        return {
+          ok: false,
+          reason: uniResult.reason,
+          guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_list_sessions) before retrying cello_close_session.",
+        };
       } finally {
         sealInterruptedInProgress.delete(sessionId);
       }
@@ -2211,6 +2319,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
   // the sealed_root and mark the session sealed.
   registerSessionSealedListener(signalingManager);
+
+  // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
+  // primary agent closes over the keystone stream, so the directory routes its
+  // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
+  if (primaryAgent) {
+    registerUnilateralConfirmedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
+  }
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
