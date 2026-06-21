@@ -1413,6 +1413,43 @@ export class SessionNodeManager {
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
     }
+    // R1 (MSG-001-3b): witness the message-leaf HASH to the relay FIRST, INDEPENDENT of
+    // direct delivery. The relay is the ordering authority (Structure 2): it assigns the
+    // canonical sequence from the hash whether or not the counterparty is reachable for direct
+    // content. So an OFFLINE recipient still gets a sequence, and the parked content is later
+    // recovered AT that sequence (DOD-MSG-4 recovery-not-desync). The relay only ever sees the
+    // hash (INV-3). Best-effort: a relay miss degrades to local-only sequencing. Previously this
+    // ran AFTER a successful direct send, so an offline recipient's content got NO sequence — the
+    // gap R1 closes.
+    if (entry.relayClient && entry.relaySessionIdBytes) {
+      try {
+        const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash);
+        if (witnessed.ok) {
+          this.#logger.info("session.relay.hash.submitted", {
+            sessionId,
+            sequenceNumber: witnessed.sequence_number,
+            correlationId,
+          });
+        } else {
+          this.#logger.warn("session.relay.hash.submit.failed", {
+            sessionId,
+            reason: witnessed.reason,
+            correlationId,
+          });
+        }
+      } catch (relayErr: unknown) {
+        this.#logger.warn("session.relay.hash.submit.failed", {
+          sessionId,
+          reason: relayErr instanceof Error ? relayErr.message : String(relayErr),
+          correlationId,
+        });
+      }
+    }
+
+    // Attempt direct peer↔peer content delivery. On success the receiver's `persisted` ACK
+    // resolves the awaiting timer; on failure (counterparty offline) the hash is already
+    // witnessed above, so the caller / TTF path parks the SEALED content to the relay
+    // store-and-forward backstop and the recipient recovers it at the witnessed sequence (2b).
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
@@ -1421,8 +1458,8 @@ export class SessionNodeManager {
       // race ahead of it and be dropped — the timer would then spuriously fire. The
       // content is delivered to the wire but NOT yet confirmed persisted; the ACK
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
-      // backstop. Fire-and-forget is retired. The correlationId rides in the frame so
-      // the receiver's session.content.received shares ONE flow id with the sender.
+      // backstop. The correlationId rides in the frame so the receiver's
+      // session.content.received shares ONE flow id with the sender.
       this.#trackAwaitingAck(sessionId, content, contentHash, correlationId);
       const frame = CBOR_ENC.encode({
         type: "content_frame",
@@ -1433,37 +1470,6 @@ export class SessionNodeManager {
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
-
-      // M7 DOD-SPINE-6 / MSG-001-3b: submit the message-leaf HASH to the relay witness
-      // (Structure 2). Content went peer↔peer above; only the signed hash goes to the
-      // relay, which assigns the canonical sequence and forwards leaf_deliver to the
-      // counterparty. Best-effort: the direct content already delivered, so a relay
-      // miss must NOT fail the send — it degrades to local-only sequencing (the gap
-      // MSG-001-3b's recovery path closes). INV-3: the relay never sees plaintext here.
-      if (entry.relayClient && entry.relaySessionIdBytes) {
-        try {
-          const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash);
-          if (witnessed.ok) {
-            this.#logger.info("session.relay.hash.submitted", {
-              sessionId,
-              sequenceNumber: witnessed.sequence_number,
-              correlationId,
-            });
-          } else {
-            this.#logger.warn("session.relay.hash.submit.failed", {
-              sessionId,
-              reason: witnessed.reason,
-              correlationId,
-            });
-          }
-        } catch (relayErr: unknown) {
-          this.#logger.warn("session.relay.hash.submit.failed", {
-            sessionId,
-            reason: relayErr instanceof Error ? relayErr.message : String(relayErr),
-            correlationId,
-          });
-        }
-      }
       return { ok: true };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
