@@ -1677,6 +1677,45 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     };
   });
 
+  // MSG-001-3b (increment 3): RECOVER parked content. Pulls the recipient's parked entries,
+  // decrypts each IN-DAEMON (openContentSeal — the relay never sees plaintext), and routes the
+  // plaintext through ingestReceivedContent — the SAME inbound chokepoint as a direct receive
+  // (M9 single-funnel AC). The content completes the recipient's transcript view of an already-
+  // witnessed message so it can be read (cello_receive) and the session bilaterally sealed
+  // (DOD-INT-2). This is content-completion, NOT a resumption — the session stays interrupted.
+  handlers.set("content_park_recover", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    if (!relay || !recipientPubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
+    }
+    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
+    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey." };
+    const kp = keyProviders.get(recipientAgent.name);
+    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
+    if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal", guidance: `Agent '${recipientAgent.name}' key provider cannot open content seals.` };
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    let recovered = 0;
+    for (const e of entries) {
+      const plaintext = await kp.openContentSeal(e.ciphertext);
+      if (!plaintext) {
+        logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
+        continue;
+      }
+      const ingest = sessionNodeManager.ingestReceivedContent(e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
+      if (ingest.ok) {
+        recovered++;
+        logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
+      } else {
+        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason });
+      }
+    }
+    return { ok: true, recovered, pulled: entries.length };
+  });
+
   // MCP-002: Test-only handler to emit session lifecycle events.
   // Guarded by CELLO_ENV=test — never available in production.
   if (process.env["CELLO_ENV"] === "test") {

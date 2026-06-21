@@ -1617,21 +1617,25 @@ export class SessionNodeManager {
     contentHash: Uint8Array,
     correlationId?: string,
   ): { ok: true; leafIndex: number; sequenceNumber: number } | { ok: false; reason: string } {
-    // round-2 finding #5: once a session leaves 'active' (the bilateral seal
-    // commitment advances it to 'seal_interrupted_pending', or it is 'sealed' /
-    // 'interrupted'), its transcript is FROZEN. A late inbound frame must NOT append
-    // a new leaf — doing so would diverge the local tree from the root that was just
-    // committed and signed (and that a later FROST notarization attests). We reject
-    // it here. (A session with no DB row at all is a test-only path and is allowed.)
+    // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
+    // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
+    // notarization attests that exact root; a late leaf would diverge from it.
+    //
+    // MSG-001-3b recovery: a merely 'interrupted' session is NOT yet committed. The
+    // counterparty's last message(s) may have been parked while this party was offline, so its
+    // local transcript is INCOMPLETE (not frozen-final). Recovering that parked content COMPLETES
+    // the local view to match the counterparty BEFORE the bilateral seal — it is not a resumption
+    // (no new activity, no re-accept) and its root was never committed. So allow 'active' AND
+    // 'interrupted'; reject only the two committed states. (No DB row = test-only path, allowed.)
     const record = this.getSessionRecord(sessionId);
-    if (record && record.status !== "active") {
+    if (record && (record.status === "sealed" || record.status === "seal_interrupted_pending")) {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
-        reason: "session_not_active",
+        reason: "session_committed",
         currentStatus: record.status,
         correlationId,
       });
-      return { ok: false, reason: "session_not_active" };
+      return { ok: false, reason: "session_committed" };
     }
 
     const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
