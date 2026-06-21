@@ -49,7 +49,7 @@ import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { FileRegistrationPersistence } from "./registration-persistence.js";
-import { verify as ed25519Verify } from "@cello-protocol/crypto";
+import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
@@ -831,6 +831,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     onTtf: (sessionId, contentHashHex, content) => {
       retryQueue.enqueueAwaitingContent(sessionId, Buffer.from(contentHashHex, "hex"), content);
     },
+  });
+
+  // MSG-001-3b (2b): the LIVE content-park deposit. On a not-confirmed send (direct delivery
+  // failed, or TTF with no `persisted` ACK) the session manager calls this with the recipient +
+  // the session's relay endpoint; we seal the content to the recipient (E2E — the relay never sees
+  // plaintext, INV-3) and deposit it to that relay's store-and-forward mailbox via the standing
+  // receiver node. The recipient pulls + recovers it at the witnessed sequence (R1) on next online.
+  sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content }) => {
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) {
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: "standing_receiver_unavailable" });
+      return;
+    }
+    const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
+    const ciphertext = sealToRecipient(recipientPubkey, content);
+    const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
+    const res = await client.deposit(node, {
+      recipientPubkey,
+      contentHash: Buffer.from(contentHashHex, "hex"),
+      sessionId: Buffer.from(sessionId, "hex"),
+      ciphertext,
+    });
+    if (res.ok) {
+      logger.info("content.park.deposited", { sessionId, contentHash: contentHashHex, recipientPubkey: recipientPubkeyHex.slice(0, 16) });
+    } else {
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: res.reason });
+    }
   });
 
   // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked

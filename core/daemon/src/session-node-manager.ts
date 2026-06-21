@@ -156,6 +156,14 @@ interface ActiveSessionEntry {
   relaySessionIdBytes?: Uint8Array;
   /** The `#relayClients` map key (agentName + relay peer id) — federation-safe teardown. */
   relayClientKey?: string;
+  /**
+   * MSG-001-3b (2b): the session's relay endpoint (peer id + addrs) from the FROST assignment.
+   * Held so the content-park backstop can deposit to the SAME relay this session is witnessed by
+   * when direct delivery fails. In-memory only (not persisted — the startup-flush park is the
+   * separate schema concern; this live park has the endpoint in hand).
+   */
+  relayPeerId?: string;
+  relayAddrs?: string[];
 }
 
 /** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
@@ -237,6 +245,15 @@ export class SessionNodeManager {
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  /**
+   * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
+   * endpoint from the session entry and calls this when a send is NOT confirmed delivered
+   * (direct-fail or TTF expiry). The daemon's hook seals (sealToRecipient) + deposits via
+   * ContentParkClient. Best-effort.
+   */
+  #contentParkHook:
+    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>)
+    | null = null;
 
   constructor(opts: {
     factory: ISessionNodeFactory;
@@ -271,6 +288,42 @@ export class SessionNodeManager {
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
+  }
+
+  /**
+   * MSG-001-3b (2b): inject the live content-park deposit (seal + ContentParkClient.deposit).
+   * Injected by the composition root (daemon.ts). When absent, a not-confirmed send still records
+   * the durable awaiting entry (crash backstop) but does not deposit live.
+   */
+  setContentParkHook(
+    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>,
+  ): void {
+    this.#contentParkHook = fn;
+  }
+
+  /**
+   * MSG-001-3b (2b): deposit un-confirmed content to the relay store-and-forward backstop — keyed
+   * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
+   * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
+   */
+  #parkContent(sessionId: string, contentHashHex: string, content: Uint8Array): void {
+    const hook = this.#contentParkHook;
+    const entry = this.#activeNodes.get(sessionId);
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return;
+    void hook({
+      sessionId,
+      recipientPubkeyHex: entry.counterpartyPubkey,
+      relayPeerId: entry.relayPeerId,
+      relayAddrs: entry.relayAddrs,
+      contentHashHex,
+      content,
+    }).catch((err: unknown) => {
+      this.#logger.warn("content.park.deposit.failed", {
+        sessionId,
+        contentHash: contentHashHex,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   // ─── Initialization ──────────────────────────────────────────────────────
@@ -655,6 +708,9 @@ export class SessionNodeManager {
         entry.relayClient = client;
         entry.relaySessionIdBytes = relay.sessionIdBytes;
         entry.relayClientKey = clientKey;
+        // 2b: remember the relay endpoint so the content-park backstop deposits to the SAME relay.
+        entry.relayPeerId = relay.relayPeerId;
+        entry.relayAddrs = relay.relayAddrs;
       } else {
         // The session was torn down while we were wiring — undo the registration.
         client.unregisterSession(sessionIdHexForRelay);
@@ -1475,6 +1531,10 @@ export class SessionNodeManager {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
       this.#untrackAwaitingAck(sessionId, contentHash);
+      // 2b: direct delivery failed (counterparty offline). The hash is already witnessed (R1, the
+      // sequence is assigned), so deposit the content to the relay store-and-forward backstop now;
+      // the recipient pulls + recovers it on next online (DOD-MSG-3/4).
+      this.#parkContent(sessionId, Buffer.from(contentHash).toString("hex"), content);
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
       const errMsg =
@@ -1688,6 +1748,10 @@ export class SessionNodeManager {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
       });
     }
+    // 2b: delivered to the wire but never confirmed `persisted` — deposit it to the relay
+    // store-and-forward so the recipient recovers it (at the witnessed sequence). The durable
+    // awaiting entry above remains the crash backstop.
+    this.#parkContent(sessionId, hashHex, entry.content);
   }
 
   /**
