@@ -1734,19 +1734,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
   // delivered-but-unanswered (final_message.answered: false), never agreed.
   handlers.set("cello_get_sealed_receipt", async (params, _connectionId) => {
-    const sessionId = params?.["sessionId"] as string | undefined;
+    // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
+    const sessionId = params?.["session_id"] as string | undefined;
     if (!sessionId || typeof sessionId !== "string") {
-      return { ok: false, reason: "missing_session_id", guidance: "Provide the sessionId (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
     }
     const cert = sessionNodeManager.getSealCertificate(sessionId);
     if (!cert) {
       return {
         ok: false,
         reason: "sealed_receipt_not_found",
-        guidance: "No sealed certificate is recorded for this session. It may not be sealed yet, or the sessionId is wrong — close it with cello_close_session and confirm it reports sealed, then retry.",
+        guidance: "No sealed certificate is recorded for this session. It may not be sealed yet, or the session_id is wrong — close it with cello_close_session and confirm it reports sealed, then retry.",
       };
     }
-    return { ok: true, sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+    return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
   });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
