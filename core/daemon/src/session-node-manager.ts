@@ -1654,6 +1654,22 @@ export class SessionNodeManager {
       ?? this.getSessionRecord(sessionId)?.counterparty_pubkey
       ?? "unknown";
 
+    // DOD-MSG-5: a content_hash satisfies AT MOST ONE Merkle leaf, exactly once. If this hash is
+    // already a leaf in the tree — it arrived BOTH directly and via the relay-park backstop, or it
+    // is a replay — do NOT append a second leaf and do NOT double-count it. The recipient already
+    // holds this message at its assigned sequence. (In the normal single-delivery case this find is
+    // -1, so the live/recover append paths are unchanged.)
+    const existingIdx = this.getSessionTree(sessionId).leaves().findIndex((l) => l.hashHex === contentHashHex);
+    if (existingIdx >= 0) {
+      this.#logger.info("session.content.deduplicated", {
+        sessionId,
+        contentHashHex,
+        sequenceNumber: existingIdx,
+        correlationId,
+      });
+      return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx };
+    }
+
     const { leafIndex, newRootHex } = this.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
 
     let buf = this.#receivedContent.get(sessionId);
