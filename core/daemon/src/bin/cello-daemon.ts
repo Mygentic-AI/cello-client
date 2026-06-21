@@ -15,8 +15,9 @@ import { join } from "node:path";
 import { startDaemon } from "../daemon.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { FileManifestProvider } from "../file-manifest-provider.js";
+import { FileManifestVersionStore } from "../manifest-version-store-file.js";
 import type { Logger } from "../types.js";
-import { ManifestDirectoryChallengeVerifier, type IManifestProvider, type IDirectoryChallengeVerifier } from "@cello-protocol/transport";
+import { ManifestDirectoryChallengeVerifier, type IManifestProvider, type IDirectoryChallengeVerifier, type IManifestVersionStore } from "@cello-protocol/transport";
 
 const MAX_CONNECTIONS = 16;
 
@@ -62,6 +63,7 @@ function buildManifestDeps(logger: Logger): {
   manifestRootKeys?: readonly string[];
   manifestThreshold?: number;
   challengeVerifier?: IDirectoryChallengeVerifier;
+  manifestVersionStore?: IManifestVersionStore;
 } {
   const manifestPath = process.env.CELLO_CONSORTIUM_MANIFEST;
   if (!manifestPath) return {};
@@ -77,12 +79,17 @@ function buildManifestDeps(logger: Logger): {
 
   const manifestProvider = new FileManifestProvider({ path: manifestPath });
   const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+  // Anti-rollback (DOD-AUTH-2 / TUF): persist the last-verified manifest version under
+  // ~/.cello so the daemon refuses a manifest whose version regressed across restarts.
+  // The daemon (startDaemon) reads getLastSeenVersion() before accepting a manifest and
+  // persistVersion() on success; a version < trusted → directory.auth.manifest.version.rollback.
+  const manifestVersionStore = new FileManifestVersionStore(join(celloDir, "manifest-version.json"));
   logger.info("daemon.manifest.configured", {
     manifestPath,
     rootKeyCount: manifestRootKeys.length,
     threshold: manifestThreshold,
   });
-  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier };
+  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestVersionStore };
 }
 
 async function main(): Promise<void> {
