@@ -348,6 +348,11 @@ export class SessionNodeManager {
     for (const ddl of [
       "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
+      // MSG-001-3b (MSG-2 startup-flush): persist the session's relay endpoint so the
+      // crash-backstop flush can deposit un-acked content after a restart, when the
+      // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
+      "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
+      "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -711,6 +716,18 @@ export class SessionNodeManager {
         // 2b: remember the relay endpoint so the content-park backstop deposits to the SAME relay.
         entry.relayPeerId = relay.relayPeerId;
         entry.relayAddrs = relay.relayAddrs;
+        // MSG-2 startup-flush: also PERSIST it, so a restart's crash-backstop flush (which runs
+        // before the in-memory entry exists) can deposit un-acked content to the same relay.
+        try {
+          this.#db
+            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE session_id = ?")
+            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), sessionId);
+        } catch (err: unknown) {
+          this.#logger.warn("session.relay.endpoint.persist.failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       } else {
         // The session was torn down while we were wiring — undo the registration.
         client.unregisterSession(sessionIdHexForRelay);
@@ -1319,6 +1336,26 @@ export class SessionNodeManager {
       .prepare("SELECT * FROM sessions WHERE session_id = ?")
       .get(sessionId) as unknown as SessionRecord | undefined;
     return row ?? null;
+  }
+
+  /**
+   * MSG-2 startup-flush: the persisted relay endpoint for a session, or null if none was
+   * recorded. Used by the crash-backstop flush, which runs at startup BEFORE the in-memory
+   * session entries exist, so it cannot use `entry.relayPeerId`.
+   */
+  getPersistedRelayEndpoint(sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
+    if (!row?.relay_peer_id || !row?.relay_addrs) return null;
+    try {
+      const addrs = JSON.parse(row.relay_addrs) as unknown;
+      if (!Array.isArray(addrs) || addrs.length === 0) return null;
+      return { relayPeerId: row.relay_peer_id, relayAddrs: addrs as string[] };
+    } catch {
+      return null;
+    }
   }
 
   // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────

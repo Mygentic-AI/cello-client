@@ -872,9 +872,35 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // a daemon started without the content send path wired, or unit tests), the flush is a
   // documented no-op (content.park.flush.deferred at WARN) and the durable awaiting
   // entries simply remain queued for the next startup that has a park target.
+  // MSG-2 startup-flush park target: seal + deposit an un-acked awaiting entry sourced from
+  // PERSISTED session state (the in-memory entry is gone after a restart). Same seal + deposit
+  // as the live hook above; the endpoint + recipient come from the sessions row.
+  const startupParkFn: import("./retry-queue.js").ParkFn = async (entry) => {
+    const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.sessionId);
+    const record = sessionNodeManager.getSessionRecord(entry.sessionId);
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!ep) return { parked: false, error: "no_persisted_relay_endpoint" };
+    if (!record?.counterparty_pubkey) return { parked: false, error: "no_counterparty" };
+    if (!node) return { parked: false, error: "standing_receiver_unavailable" };
+    const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
+    const ciphertext = sealToRecipient(recipientPubkey, entry.contentBlob);
+    const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
+    const res = await client.deposit(node, {
+      recipientPubkey,
+      contentHash: Buffer.from(entry.contentHashHex, "hex"),
+      sessionId: Buffer.from(entry.sessionId, "hex"),
+      ciphertext,
+    });
+    if (res.ok) {
+      logger.info("content.park.deposited", { sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
+      return { parked: true };
+    }
+    return { parked: false, error: res.reason ?? "deposit_failed" };
+  };
+
   const awaitingSessions = retryQueue.getAwaitingSessions();
   if (awaitingSessions.length > 0) {
-    const parkFn = config.contentParkFn;
+    const parkFn = config.contentParkFn ?? startupParkFn;
     if (parkFn) {
       let parkedTotal = 0;
       for (const sid of awaitingSessions) {
