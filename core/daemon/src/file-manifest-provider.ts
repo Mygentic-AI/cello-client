@@ -11,9 +11,15 @@
  * verified, and a tampered / expired / rolled-back manifest is refused at load
  * (DOD-AUTH-2 / TUF).
  *
- * The interface contract (manifest-interfaces.ts): loadAndVerify "Throws on
- * signature failure, expiry, or missing nodes." This implementation honours that
- * — every distinct failure cause throws a distinct, named error (DOD-INV-6).
+ * Scope — signatures + structure ONLY. loadAndVerify verifies the threshold officer
+ * signatures and rejects an empty node set; it deliberately does NOT enforce the
+ * not_before/expires validity window or version monotonicity. That policy lives in
+ * the daemon (startDaemon), which checks the window after loadAndVerify returns and
+ * emits the named events `directory.auth.manifest.expired` /
+ * `directory.auth.manifest.version.rollback`. If this provider threw on expiry, it
+ * would preempt those named events (the daemon would only see `manifest.load.failed`)
+ * and make the daemon's policy layer dead code. Anchoring to the daemon's actual
+ * behaviour keeps the observability taxonomy intact (DOD-INV-6/8).
  */
 import { readFileSync } from "node:fs";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
@@ -32,18 +38,14 @@ export class ManifestLoadError extends Error {
 export interface FileManifestProviderOpts {
   /** Absolute path to the consortium manifest JSON. */
   path: string;
-  /** Injectable clock (ms epoch) for the validity-window check. Defaults to Date.now. */
-  now?: () => number;
 }
 
 export class FileManifestProvider implements IManifestProvider {
   readonly #path: string;
-  readonly #now: () => number;
   #manifest: ConsortiumManifest | null = null;
 
   constructor(opts: FileManifestProviderOpts) {
     this.#path = opts.path;
-    this.#now = opts.now ?? (() => Date.now());
   }
 
   async loadAndVerify(rootKeys: readonly string[], threshold: number): Promise<ConsortiumManifest> {
@@ -62,25 +64,11 @@ export class FileManifestProvider implements IManifestProvider {
     }
 
     // Threshold officer-signature verification (RFC 8032). verifyManifest also
-    // rejects an empty node set. This is the TUF root-of-trust gate.
+    // rejects an empty node set. This is the TUF root-of-trust gate. Expiry / version
+    // monotonicity are enforced by the daemon (named events), not here.
     const result = verifyManifest(parsed as unknown as ConsortiumManifestInput, rootKeys, threshold);
     if (!result.ok) {
       throw new ManifestLoadError("manifest_signature_invalid", result.detail);
-    }
-
-    // Validity window — a structurally-valid but stale manifest must be refused so
-    // a withdrawn/rotated consortium cannot be replayed (DOD-AUTH-2 expiry).
-    const nowMs = this.#now();
-    const notBeforeMs = Date.parse(parsed.not_before);
-    const expiresMs = Date.parse(parsed.expires);
-    if (Number.isNaN(notBeforeMs) || Number.isNaN(expiresMs)) {
-      throw new ManifestLoadError("manifest_malformed", "not_before/expires not ISO 8601");
-    }
-    if (nowMs < notBeforeMs) {
-      throw new ManifestLoadError("manifest_not_yet_valid", `not_before=${parsed.not_before}`);
-    }
-    if (nowMs >= expiresMs) {
-      throw new ManifestLoadError("manifest_expired", `expires=${parsed.expires}`);
     }
 
     this.#manifest = parsed;
