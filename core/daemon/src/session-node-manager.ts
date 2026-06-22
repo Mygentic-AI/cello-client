@@ -2377,10 +2377,17 @@ export class SessionNodeManager {
         this.#logger.warn("session.content.ordering.bad_signature", { sessionId, correlationId });
         return;
       }
-      // Sovereign-node cross-check: the signer must be THIS session's counterparty, not an unrelated key.
+      // Sovereign-node cross-check: the signer MUST be THIS session's counterparty, not an unrelated
+      // key. FAIL CLOSED (review L) — if the counterparty pubkey is unknown we cannot prove the signer,
+      // so we do NOT trust the framed ordering record (fall back to the witness stream / arrival). The
+      // "B does not trust the counterparty for ordering" invariant is non-negotiable; never fail open.
       const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-      if (counterparty && Buffer.from(s1Pubkey).toString("hex") !== counterparty) {
-        this.#logger.warn("session.content.ordering.wrong_signer", { sessionId, correlationId });
+      if (!counterparty || Buffer.from(s1Pubkey).toString("hex") !== counterparty) {
+        this.#logger.warn("session.content.ordering.wrong_signer", {
+          sessionId,
+          reason: counterparty ? "signer_not_counterparty" : "counterparty_unknown",
+          correlationId,
+        });
         return;
       }
       // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
