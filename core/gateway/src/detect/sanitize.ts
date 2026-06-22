@@ -53,7 +53,7 @@ function isSmuggled(cp: number): boolean {
   if (cp >= 0xe0100 && cp <= 0xe01ef) return true; // variation selectors supplement
   return false;
 }
-function stripInvisible(text: string): { text: string; removed: number } {
+export function stripInvisible(text: string): { text: string; removed: number } {
   let out = "";
   let removed = 0;
   for (const ch of text) {
@@ -129,13 +129,22 @@ function shannonBits(s: string): number {
   for (const c of freq.values()) { const p = c / s.length; h -= p * Math.log2(p); }
   return h;
 }
-function scoreEntropy(text: string): number {
-  let suspicion = 0;
+// An encoded-blob candidate is a long run drawn purely from a base64/base64url/hex alphabet —
+// which excludes URLs, file paths, and prose (they carry `:` `/` `.` or whitespace). This keeps
+// the entropy signal on actual encoded payloads, not legitimate long tokens like a URL.
+const ENCODED_CHARSET = /^[A-Za-z0-9+/=_-]+$/;
+/** The space-free, encoded-alphabet, high-entropy tokens (encoded-blob candidates) in `text`. */
+export function highEntropyTokens(text: string): string[] {
+  const found: string[] = [];
   for (const token of text.split(/\s+/)) {
     if (token.length < ENTROPY_MIN_TOKEN_LEN) continue;
-    if (shannonBits(token) >= ENTROPY_BITS_THRESHOLD) suspicion++;
+    if (!ENCODED_CHARSET.test(token)) continue;
+    if (shannonBits(token) >= ENTROPY_BITS_THRESHOLD) found.push(token);
   }
-  return suspicion;
+  return found;
+}
+function scoreEntropy(text: string): number {
+  return highEntropyTokens(text).length;
 }
 
 // ── Step 9 (markers): chat-template / special-token strip ────────────────────
