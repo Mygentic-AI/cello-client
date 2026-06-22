@@ -16,8 +16,9 @@ import { startDaemon } from "../daemon.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { FileManifestProvider } from "../file-manifest-provider.js";
 import { FileManifestVersionStore } from "../manifest-version-store-file.js";
+import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 import type { Logger } from "../types.js";
-import { ManifestDirectoryChallengeVerifier, type IManifestProvider, type IDirectoryChallengeVerifier, type IManifestVersionStore } from "@cello-protocol/transport";
+import { ManifestDirectoryChallengeVerifier, type IManifestProvider, type IDirectoryChallengeVerifier, type IManifestVersionStore, type IManifestPollScheduler } from "@cello-protocol/transport";
 
 const MAX_CONNECTIONS = 16;
 
@@ -64,6 +65,7 @@ function buildManifestDeps(logger: Logger): {
   manifestThreshold?: number;
   challengeVerifier?: IDirectoryChallengeVerifier;
   manifestVersionStore?: IManifestVersionStore;
+  manifestPollScheduler?: IManifestPollScheduler;
 } {
   const manifestPath = process.env.CELLO_CONSORTIUM_MANIFEST;
   if (!manifestPath) return {};
@@ -84,12 +86,23 @@ function buildManifestDeps(logger: Logger): {
   // The daemon (startDaemon) reads getLastSeenVersion() before accepting a manifest and
   // persistVersion() on success; a version < trusted → directory.auth.manifest.version.rollback.
   const manifestVersionStore = new FileManifestVersionStore(join(celloDir, "manifest-version.json"));
+  // DOD-AUTH-2: background manifest poll. The directory is re-polled on a randomized
+  // 6–12h interval (thundering-herd avoidance) and a newer signed manifest is adopted.
+  // The interval is env-injectable so the live binary test can poll sub-second instead
+  // of waiting hours; production leaves these unset → the 6–12h default window.
+  const pollMinMs = Number.parseInt(process.env.CELLO_MANIFEST_POLL_MIN_MS ?? "", 10);
+  const pollMaxMs = Number.parseInt(process.env.CELLO_MANIFEST_POLL_MAX_MS ?? "", 10);
+  const pollOpts =
+    Number.isNaN(pollMinMs) || Number.isNaN(pollMaxMs) ? undefined : { minMs: pollMinMs, maxMs: pollMaxMs };
+  const manifestPollScheduler = new RandomizedPollScheduler(pollOpts);
   logger.info("daemon.manifest.configured", {
     manifestPath,
     rootKeyCount: manifestRootKeys.length,
     threshold: manifestThreshold,
+    pollMinMs: pollOpts?.minMs ?? null,
+    pollMaxMs: pollOpts?.maxMs ?? null,
   });
-  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestVersionStore };
+  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestVersionStore, manifestPollScheduler };
 }
 
 async function main(): Promise<void> {

@@ -494,6 +494,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger,
     maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
     maxBackoffMs: 30_000,
+    // DOD-AUTH-2: the keystone manager (primary agent's directory door) carries the
+    // manifest-poll deps so it re-polls the directory on its live stream and adopts a
+    // newer signed manifest. The SAME shared manifestProvider instance the startup load
+    // + challengeVerifier use, so an adopted manifest updates the cache step-6 reads from.
+    // All optional — undefined on the M6 backward-compat path → polling is simply off.
+    pollScheduler: manifestPollScheduler,
+    manifestProvider,
+    manifestVersionStore,
+    rootKeys: manifestRootKeys,
+    threshold: manifestThreshold,
   });
 
   // ─── Per-agent directory signaling (multi-agent: one signaling stream per agent) ──
@@ -3409,15 +3419,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     manifestVerified,
   });
 
-  // M7-MANIFEST-002: Background manifest polling.
-  // TODO(SIGNAL-001): Wire real SignalingManager here when SIGNAL-001 integrates the
-  // signaling stream. The poll scheduler + outbound queue need a live signaling stream
-  // to deliver manifest_poll_request frames. Until then, polling is deferred.
-  if (manifestPollScheduler && manifestVerified) {
-    logger.debug("directory.auth.manifest.poll.deferred", {
-      reason: "signaling_stream_not_yet_wired",
-    });
-  }
+  // M7-MANIFEST-002 / DOD-AUTH-2: background manifest polling is now ACTIVE. The keystone
+  // SignalingManager (constructed above with the poll deps) calls startPolling() when its
+  // stream reaches connected — it re-polls the directory on the randomized 6–12h interval
+  // and adopts a newer signed manifest (handleManifestPollResponse). No separate wiring
+  // needed here; poll lifecycle = the keystone connection lifecycle.
 
   // Graceful shutdown
   async function stop(reason: string): Promise<void> {

@@ -221,7 +221,12 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     expect(rollbackEvent?.context.lastSeenVersion).toBe(10);
   });
 
-  it("ADV-007: poll deferred log emitted when manifest verified (polling not yet wired)", async () => {
+  it("ADV-007: manifest poll is NO LONGER deferred when a scheduler is configured (DOD-AUTH-2)", async () => {
+    // The poll used to be a deferred stub (directory.auth.manifest.poll.deferred). DOD-AUTH-2
+    // activated it: the keystone SignalingManager now starts polling on connect. This guards
+    // against the deferral regressing back in. (The actual dispatch over the live stream is
+    // proven by the transport poll-on-connect unit test + the J-AUTH live binary test — a
+    // daemon unit harness has no real directory stream to dispatch onto.)
     const logger = makeLogger();
     const manifest = makeValidManifest();
     const manifestProvider = new TestManifestProvider(manifest);
@@ -238,8 +243,9 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
       manifestPollScheduler: scheduler,
     }));
 
-    const deferredEvent = logger.events.find((e) => e.event === "directory.auth.manifest.poll.deferred");
-    expect(deferredEvent).toBeDefined();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.deferred")).toBeUndefined();
+    // The manifest still loads + verifies — activation didn't break the startup gate.
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.verified")).toBeDefined();
   });
 
   it("equal version passes (same version as last-seen is not a rollback)", async () => {
