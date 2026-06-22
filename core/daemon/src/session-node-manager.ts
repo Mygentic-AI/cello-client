@@ -276,7 +276,7 @@ export class SessionNodeManager {
   // delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels
   // the timer (content.delivery.acked); TTF expiry hands the content to the park
   // backstop. Keyed sessionId → contentHashHex → entry.
-  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string }>>();
+  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }>>();
   // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
   // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
   #contentTtfMs = 20_000;
@@ -1759,7 +1759,7 @@ export class SessionNodeManager {
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
-      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId);
+      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2);
       const frame = CBOR_ENC.encode({
         type: "content_frame",
         session_id: sessionId,
@@ -1979,7 +1979,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean } | { ok: false; reason: string } {
+  ): { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number } | { ok: false; reason: string } {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -2081,8 +2081,10 @@ export class SessionNodeManager {
 
     const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
-    this.#releaseHeld(agentName, sessionId, senderPubkey);
-    return { ok: true, leafIndex, sequenceNumber: leafIndex };
+    // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
+    // leaves ACTUALLY written, not just the directly-ingested one (review #3).
+    const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
+    return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released };
   }
 
   /**
@@ -2146,16 +2148,18 @@ export class SessionNodeManager {
    * held entry whose canonical sequence equals the new next-expected index is now in order — append
    * it, then check again (a single fill can release a run of consecutive held messages).
    */
-  #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): void {
+  #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): number {
     const key = this.#k(agentName, sessionId);
     const held = this.#heldContent.get(key);
-    if (!held) return;
+    if (!held) return 0;
+    let released = 0;
     for (;;) {
       const nextExpected = this.getSessionTree(agentName, sessionId).size();
       const entry = held.get(nextExpected);
       if (!entry) break;
       held.delete(nextExpected);
       this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId);
+      released++;
       this.#logger.info("session.content.released", {
         sessionId,
         sequenceNumber: nextExpected,
@@ -2163,6 +2167,7 @@ export class SessionNodeManager {
       });
       if (held.size === 0) { this.#heldContent.delete(key); break; }
     }
+    return released;
   }
 
   /** DAEMON-004: pop the oldest verified received content for cello_receive. */
@@ -2181,7 +2186,7 @@ export class SessionNodeManager {
    * `unref`'d so an in-flight wait never keeps the daemon process (or a test runner)
    * alive on its own.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#k(agentName, sessionId);
     let bySession = this.#awaitingAck.get(ackKey);
@@ -2193,7 +2198,9 @@ export class SessionNodeManager {
       this.#handleTtfExpiry(agentName, sessionId, hashHex);
     }, this.#contentTtfMs);
     if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();
-    bySession.set(hashHex, { timer, content, correlationId });
+    // DOD-MSG-4 (2b, review #1): retain the relay's ordering record so a TTF-triggered park carries
+    // it too (not only the direct-dial-fail park) — so a TTF-parked entry is self-ordering on recover.
+    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor });
   }
 
   /**
@@ -2251,8 +2258,9 @@ export class SessionNodeManager {
     }
     // 2b: delivered to the wire but never confirmed `persisted` — deposit it to the relay
     // store-and-forward so the recipient recovers it (at the witnessed sequence). The durable
-    // awaiting entry above remains the crash backstop.
-    this.#parkContent(agentName, sessionId, hashHex, entry.content);
+    // awaiting entry above remains the crash backstop. Carry the retained ordering record (review #1)
+    // so a TTF-parked entry self-orders on recover, exactly like the direct-dial-fail park.
+    this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
   }
 
   /**
@@ -2368,7 +2376,10 @@ export class SessionNodeManager {
   decodeParkEnvelope(plaintext: Uint8Array): { content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array } {
     try {
       const arr = decode(plaintext) as unknown[];
-      if (Array.isArray(arr) && arr[0] === 1 && arr[1] instanceof Uint8Array) {
+      // Discriminator (review #2): a 4-element array tagged with version 1 + a byte-string content.
+      // The content-hash cross-check in ingestReceivedContent is the real safety net, but narrowing
+      // to length 4 makes a bare-content false-positive astronomically less likely still.
+      if (Array.isArray(arr) && arr.length === 4 && arr[0] === 1 && arr[1] instanceof Uint8Array) {
         return {
           content: arr[1],
           structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,

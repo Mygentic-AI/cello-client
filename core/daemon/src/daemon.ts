@@ -2032,7 +2032,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // distinctly so the tally reflects leaves actually written, not content still queued in memory.
         logger.info("content.recover.held", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, canonicalSeq: ingest.sequenceNumber });
       } else if (ingest.ok) {
-        recovered++;
+        // DOD-MSG-4 (review #3): count leaves ACTUALLY written — the directly-ingested leaf PLUS any
+        // held out-of-order entries this ingest unblocked (appendedCount), not just 1.
+        recovered += ingest.appendedCount ?? 1;
         logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
       } else {
         logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason });
