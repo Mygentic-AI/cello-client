@@ -231,6 +231,24 @@ export class SessionNodeManager {
   // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
   // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
   #contentDesynced = new Set<string>();
+  // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
+  // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
+  // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
+  // — and orders its transcript by THIS, never by a sender-stamped field (sovereign-node: B does
+  // not trust the counterparty for ordering). When B has no witness for an arriving hash
+  // (relay-degraded), it falls back to arrival-order append.
+  #witnessedSeq = new Map<string, Map<string, number>>();
+  // DOD-MSG-4: out-of-order direct arrivals. A content frame whose canonical sequence is AHEAD of
+  // the next expected leaf is HELD here (keyed #k(agent,session) -> (canonicalSeq -> entry)) instead
+  // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
+  // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
+  // memory only — evicted on teardown, same as #receivedContent.
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; contentHashHex: string; correlationId?: string }>>();
+  // DOD-MSG-4 (catch-up-before-live): the relay's high-water canonical sequence for this session —
+  // the largest sequence the relay has witnessed (max over leaf_deliver). On reconnect B must hold
+  // live arrivals until its tree reaches this, so it cannot append a fresh message ahead of earlier
+  // ones still parked in the mailbox. Keyed #k(agent,session).
+  #highWaterSeq = new Map<string, number>();
   // M7-UPGRADE-002: sessions for which B has already submitted its responder SEAL leaf (via
   // auto-ack OR cello_close_session). Idempotency guard — A's SEAL ctrl leaf may be delivered
   // more than once (and the relay echoes leaves), so auto-ack fires AT MOST ONCE per session.
@@ -1098,6 +1116,11 @@ export class SessionNodeManager {
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
     this.#responderSealSubmitted.delete(key);
+    // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
+    // so a torn-down session retains no stale ordering state or buffered plaintext.
+    this.#witnessedSeq.delete(key);
+    this.#heldContent.delete(key);
+    this.#highWaterSeq.delete(key);
   }
 
   /**
@@ -1910,7 +1933,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): { ok: true; leafIndex: number; sequenceNumber: number } | { ok: false; reason: string } {
+  ): { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean } | { ok: false; reason: string } {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -1968,13 +1991,80 @@ export class SessionNodeManager {
       return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx };
     }
 
-    const { leafIndex, newRootHex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+    // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
+    // canonical sequence for this hash (witnessed via leaf_deliver) and it is AHEAD of the next
+    // expected leaf, HOLD the content rather than append it out of order. The missing in-between
+    // sequence(s) are recovered from the relay mailbox; #releaseHeld then drains the held entries
+    // in canonical order. This keeps the daemon-owned leaf index === the canonical sequence by
+    // construction, so two parties' roots match even when direct delivery and park-recovery
+    // interleave. With NO witness for this hash (relay-degraded) B falls back to arrival-order
+    // append — the pre-MSG-4 behavior (no ordering signal available).
+    const key = this.#k(agentName, sessionId);
+    const canonicalSeq = this.#witnessedSeq.get(key)?.get(contentHashHex);
+    const nextExpected = this.getSessionTree(agentName, sessionId).size();
+    if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
+      let held = this.#heldContent.get(key);
+      if (!held) { held = new Map(); this.#heldContent.set(key, held); }
+      held.set(canonicalSeq, { content, contentHashHex, correlationId });
+      this.#logger.info("session.content.held", {
+        sessionId,
+        canonicalSeq,
+        nextExpected,
+        gap: canonicalSeq - nextExpected,
+        correlationId,
+      });
+      // Held content is NOT yet a durable leaf, so it is deliberately NOT acknowledged `persisted`
+      // (the caller checks `held`). The sender's TTF→park backstop and the recover/dedup path
+      // guarantee eventual delivery; B never claims persisted for content it only holds in memory.
+      return { ok: true, leafIndex: canonicalSeq, sequenceNumber: canonicalSeq, held: true };
+    }
 
+    const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);
+    // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
+    this.#releaseHeld(agentName, sessionId, senderPubkey);
+    return { ok: true, leafIndex, sequenceNumber: leafIndex };
+  }
+
+  /**
+   * DOD-MSG-4: record the relay-witnessed canonical sequence for a content hash. The relay is the
+   * ordering authority (Structure 2): it assigns each message a sequence from its hash and delivers
+   * B the (content_hash -> sequence) binding via leaf_deliver. The strict-in-order gate orders the
+   * transcript by THIS — never a sender-stamped field. Also advances the per-session high-water mark
+   * (the largest witnessed sequence) used for catch-up-before-live on reconnect. Idempotent.
+   */
+  recordWitnessedSequence(agentName: string, sessionId: string, contentHashHex: string, sequenceNumber: number): void {
+    if (sequenceNumber < 0) return;
+    const key = this.#k(agentName, sessionId);
+    let map = this.#witnessedSeq.get(key);
+    if (!map) { map = new Map(); this.#witnessedSeq.set(key, map); }
+    map.set(contentHashHex, sequenceNumber);
+    const hw = this.#highWaterSeq.get(key) ?? -1;
+    if (sequenceNumber > hw) this.#highWaterSeq.set(key, sequenceNumber);
+  }
+
+  /**
+   * DOD-MSG-4: the relay's high-water canonical sequence for this session (largest witnessed leaf),
+   * or -1 if none. catch-up-before-live: on reconnect B must hold live arrivals until its tree
+   * reaches this — it has more messages to recover than it has appended.
+   */
+  getHighWaterSeq(agentName: string, sessionId: string): number {
+    return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
+  }
+
+  /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
+  #appendVerifiedContent(
+    agentName: string,
+    sessionId: string,
+    content: Uint8Array,
+    contentHashHex: string,
+    senderPubkey: string,
+    correlationId?: string,
+  ): { leafIndex: number } {
+    const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
     const recvKey = this.#k(agentName, sessionId);
     let buf = this.#receivedContent.get(recvKey);
     if (!buf) { buf = []; this.#receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
-
     this.#logger.info("session.content.received", {
       sessionId,
       senderPubkey,
@@ -1982,8 +2072,31 @@ export class SessionNodeManager {
       sequenceNumber: leafIndex,
       correlationId,
     });
-    void newRootHex;
-    return { ok: true, leafIndex, sequenceNumber: leafIndex };
+    return { leafIndex };
+  }
+
+  /**
+   * DOD-MSG-4: drain held out-of-order content in canonical order. After a leaf is appended, any
+   * held entry whose canonical sequence equals the new next-expected index is now in order — append
+   * it, then check again (a single fill can release a run of consecutive held messages).
+   */
+  #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): void {
+    const key = this.#k(agentName, sessionId);
+    const held = this.#heldContent.get(key);
+    if (!held) return;
+    for (;;) {
+      const nextExpected = this.getSessionTree(agentName, sessionId).size();
+      const entry = held.get(nextExpected);
+      if (!entry) break;
+      held.delete(nextExpected);
+      this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId);
+      this.#logger.info("session.content.released", {
+        sessionId,
+        sequenceNumber: nextExpected,
+        correlationId: entry.correlationId,
+      });
+      if (held.size === 0) { this.#heldContent.delete(key); break; }
+    }
   }
 
   /** DAEMON-004: pop the oldest verified received content for cello_receive. */
@@ -2194,7 +2307,10 @@ export class SessionNodeManager {
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
       // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
       // path can park / recover.
-      if (ingest.ok) {
+      // DOD-MSG-4: a HELD (out-of-order) frame is NOT yet a durable leaf, so it is NOT
+      // acknowledged `persisted` — the sender's TTF→park backstop then guarantees the
+      // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
+      if (ingest.ok && !ingest.held) {
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {
