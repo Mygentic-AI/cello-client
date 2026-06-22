@@ -1047,6 +1047,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // pre-IPC startup flush because no agent was online yet).
     void sessionNodeManager.ensureStandingReceiverForAgent(name)
       .then(() => flushAwaitingContent(name))
+      // DOD-MSG-4 (auto-recover-on-reconnect): SENDER re-parks un-acked content (flush above); the
+      // RECEIVER drains its parked mailbox from every relay it has sessions on. Without this nothing
+      // in production pulls store-and-forward content. Best-effort; retried on the next agent-online.
+      .then(() => autoRecoverForAgent(name))
       .catch((err: unknown) => {
         logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
       });
@@ -1994,20 +1998,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // (M9 single-funnel AC). The content completes the recipient's transcript view of an already-
   // witnessed message so it can be read (cello_receive) and the session bilaterally sealed
   // (DOD-INT-2). This is content-completion, NOT a resumption — the session stays interrupted.
-  handlers.set("content_park_recover", async (params, _connectionId) => {
-    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
-    const recipientPubkey = params?.recipientPubkey as string | undefined;
-    if (!relay || !recipientPubkey) {
-      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
-    }
-    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
-    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey." };
+  // DOD-MSG-4: pull a recipient agent's parked mailbox from ONE relay and recover each entry through
+  // the inbound funnel (decode envelope → verify+order the signed Structure2 → ingest). Shared by the
+  // explicit IPC handler and the auto-recover-on-reconnect trigger below.
+  async function recoverParkedFromRelay(
+    recipientAgent: { name: string; pubkey?: string },
+    relayPeerId: string,
+    relayAddrs: string[],
+  ): Promise<{ ok: true; recovered: number; pulled: number } | { ok: false; reason: string }> {
     const kp = keyProviders.get(recipientAgent.name);
-    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
-    if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal", guidance: `Agent '${recipientAgent.name}' key provider cannot open content seals.` };
+    if (!kp) return { ok: false, reason: "signing_key_unavailable" };
+    if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal" };
     const node = sessionNodeManager.getStandingReceiverNode();
-    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
-    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable" };
+    const recipientPubkey = recipientAgent.pubkey ?? "";
+    const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
     let recovered = 0;
     for (const e of entries) {
@@ -2041,6 +2046,47 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
     }
     return { ok: true, recovered, pulled: entries.length };
+  }
+
+  // DOD-MSG-4 (auto-recover-on-reconnect): when an agent comes online, drain its parked mailbox from
+  // every relay it has sessions on — symmetric to the SENDER's flushAwaitingContent. Without this,
+  // nothing in production pulls a recipient's store-and-forward mailbox and parked content is never
+  // delivered. Best-effort; a relay miss is retried on the next agent-online.
+  async function autoRecoverForAgent(agentName: string): Promise<void> {
+    const agent = agents.find((a) => a.name === agentName);
+    if (!agent?.pubkey) return;
+    const relays = sessionNodeManager.getAgentRelayEndpoints(agentName);
+    if (relays.length === 0) return;
+    let total = 0;
+    for (const r of relays) {
+      try {
+        const res = await recoverParkedFromRelay(agent, r.relayPeerId, r.relayAddrs);
+        if (res.ok) total += res.recovered;
+      } catch (err: unknown) {
+        logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    if (total > 0) logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length });
+  }
+
+  handlers.set("content_park_recover", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    if (!relay || !recipientPubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
+    }
+    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
+    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey." };
+    const res = await recoverParkedFromRelay(recipientAgent, relay.peerId, [relay.addr]);
+    if (!res.ok) {
+      const guidanceByReason: Record<string, string> = {
+        signing_key_unavailable: `Signing key for '${recipientAgent.name}' is not loaded.`,
+        cannot_unseal: `Agent '${recipientAgent.name}' key provider cannot open content seals.`,
+        standing_receiver_unavailable: "The daemon's standing receiver is not ready yet; retry after startup.",
+      };
+      return { ok: false, reason: res.reason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
+    }
+    return { ok: true, recovered: res.recovered, pulled: res.pulled };
   });
 
   // MCP-002: Test-only handler to emit session lifecycle events.

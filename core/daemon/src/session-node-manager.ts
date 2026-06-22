@@ -1552,6 +1552,31 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-MSG-4 (auto-recover): the DISTINCT relay endpoints this agent has sessions on, so the daemon
+   * can pull the agent's parked mailbox from each on reconnect (the relay mailbox is keyed by recipient
+   * pubkey, so one pull per relay drains all of the agent's parked content there). Distinct by relay
+   * peer id.
+   */
+  getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> {
+    if (!this.#db) return [];
+    const rows = this.#db
+      .prepare("SELECT DISTINCT relay_peer_id, relay_addrs FROM sessions WHERE agent_name = ? AND relay_peer_id IS NOT NULL")
+      .all(agentName) as Array<{ relay_peer_id?: string | null; relay_addrs?: string | null }>;
+    const byPeer = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
+    for (const row of rows) {
+      if (!row.relay_peer_id || !row.relay_addrs) continue;
+      try {
+        const addrs = JSON.parse(row.relay_addrs) as unknown;
+        if (!Array.isArray(addrs) || addrs.length === 0) continue;
+        if (!byPeer.has(row.relay_peer_id)) byPeer.set(row.relay_peer_id, { relayPeerId: row.relay_peer_id, relayAddrs: addrs as string[] });
+      } catch {
+        /* skip malformed */
+      }
+    }
+    return [...byPeer.values()];
+  }
+
   // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
 
   /**
@@ -2034,7 +2059,9 @@ export class SessionNodeManager {
         sequenceNumber: existingIdx,
         correlationId,
       });
-      return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx };
+      // appendedCount 0 — a dedup appends NO new leaf, so a recover that re-pulls an already-ingested
+      // entry (e.g. after auto-recover already drained it) must not count it as a fresh recovery.
+      return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx, appendedCount: 0 };
     }
 
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
