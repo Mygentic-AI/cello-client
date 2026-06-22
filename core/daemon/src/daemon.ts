@@ -598,7 +598,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
       agentName,
-      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(),
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       signaling: mgr,
       logger,
     });
@@ -655,7 +655,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
     wireSessionOfferHandler({
       agentName: primaryAgent.name,
-      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(),
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(primaryAgent.name),
       signaling: signalingManager,
       logger,
     });
@@ -740,7 +740,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           guidance: "cello_initiate_session requires 'target_pubkey' as the counterparty's 32-byte hex K_local public key.",
         };
       }
-      const sr = sessionNodeManager.getStandingReceiverInfo();
+      const sr = sessionNodeManager.getStandingReceiverInfo(ctx.agentName);
       if (!sr) {
         return {
           ok: false,
@@ -1018,6 +1018,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.add(name);
+    // DOD-LOOP-1: each online agent gets its OWN standing receiver, so two agents on one daemon
+    // (loopback) never contend for a single one. Fire-and-forget (initiate/accept also ensure on
+    // demand); never let it throw out of the handler.
+    void sessionNodeManager.ensureStandingReceiverForAgent(name).catch((err: unknown) => {
+      logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+    });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
@@ -1039,6 +1045,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.delete(name);
+    // DOD-LOOP-1: tear down this agent's standing receiver (fire-and-forget, never throws out).
+    void sessionNodeManager.removeStandingReceiverForAgent(name).catch(() => { /* best-effort */ });
     logger.info("agent.offline", { agentName: name, reason: "stopped" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "offline", "stopped");

@@ -209,7 +209,9 @@ describe("SessionNodeManager — unit tests", () => {
       expect(result.ok).toBe(true);
       sessions.push(`session-${i}`);
     }
-    expect(stub.createdNodes.length).toBe(MAX_SESSION_NODES + 1); // +1 for standing receiver
+    // No standing receiver is created at initialize() in the per-agent model (DOD-LOOP-1) — and no
+    // agent was started here — so only the 32 session nodes exist.
+    expect(stub.createdNodes.length).toBe(MAX_SESSION_NODES);
 
     // 33rd attempt should fail
     const result = await manager.createSessionNode(
@@ -233,7 +235,7 @@ describe("SessionNodeManager — unit tests", () => {
     expect(capEvent!.context.agentName).toBe("test-agent");
 
     // No new node was created
-    expect(stub.createdNodes.length).toBe(MAX_SESSION_NODES + 1);
+    expect(stub.createdNodes.length).toBe(MAX_SESSION_NODES);
 
     await manager.gracefulShutdown();
   }, 30_000);
@@ -485,6 +487,8 @@ describe("SessionNodeManager — unit tests", () => {
     const { logger: logger2 } = makeLogger();
     const manager2 = new SessionNodeManager({ factory: captureFactory, logger: logger2, dbPath: dbPath2 });
     await manager2.initialize();
+    // DOD-LOOP-1: bring the agent online so its standing receiver (and gater) is created.
+    await manager2.ensureStandingReceiverForAgent("test-agent");
 
     // Spy on the captured gater's setAllowedPeer
     expect(capturedGater).not.toBeNull();
@@ -778,20 +782,32 @@ describe("SessionNodeManager — integration tests", () => {
     }
   }, 30_000);
 
-  // ── AC-002: standing receiver ready before any session ─────────────────────
+  // ── AC-002: per-agent standing receiver ready once the agent is online ──────
+  // DOD-LOOP-1: no daemon-global SR is created at initialize() — each agent gets its OWN standing
+  // receiver when it comes online (cello_start_agent → ensureStandingReceiverForAgent), so two of
+  // the operator's agents can both receive on one daemon.
 
-  it("AC-002: after initialize(), getStandingReceiverReady() is true and session.node.created logged for standing receiver", async () => {
+  it("AC-002: after ensureStandingReceiverForAgent(), getStandingReceiverReady(agent) is true and session.node.created logged", async () => {
     const real = new RealNodeFactory();
     const { manager, events } = await makeManager({ factory: real });
     await manager.initialize();
 
     try {
-      expect(manager.getStandingReceiverReady()).toBe(true);
+      // No SR until an agent comes online.
+      expect(manager.getStandingReceiverReady()).toBe(false);
+      expect(manager.getStandingReceiverReady("alice")).toBe(false);
 
-      // Check session.node.created was logged for standing receiver
+      await manager.ensureStandingReceiverForAgent("alice");
+      expect(manager.getStandingReceiverReady("alice")).toBe(true);
+      expect(manager.getStandingReceiverReady()).toBe(true); // any agent has one
+
+      // A different agent that hasn't come online still has none.
+      expect(manager.getStandingReceiverReady("bob")).toBe(false);
+
+      // Check session.node.created was logged for alice's standing receiver.
       const createdEvents = events.filter((e) => e.event === "session.node.created");
       const srEvent = createdEvents.find(
-        (e) => e.context.agentName === STANDING_RECEIVER_AGENT_NAME,
+        (e) => e.context.agentName === `${STANDING_RECEIVER_AGENT_NAME}:alice`,
       );
       expect(srEvent).toBeDefined();
       expect(srEvent!.context.sessionPeerId).toBeDefined();
@@ -866,40 +882,24 @@ describe("SessionNodeManager — integration tests", () => {
     await manager.initialize();
 
     try {
-      // Assert standing receiver ready before accept — via internal accessor AND via
-      // daemon status (AC-003 requires tests go through the daemon status response)
-      expect(manager.getStandingReceiverReady()).toBe(true);
-
-      // Also verify via the composition root status path (simulates cello status)
-      const { startDaemon } = await import("../daemon.js");
-      const { logger: daemonLogger } = makeLogger();
-      const daemonHandle = await startDaemon({
-        celloDir: tempDir,
-        socketPath: join(tempDir, "daemon-ac003.sock"),
-        lockFilePath: join(tempDir, "daemon-ac003.lock"),
-        maxConnections: 16,
-        version: "0.0.1-test",
-        logger: daemonLogger,
-      });
-      try {
-        const statusBefore = daemonHandle.getStatus();
-        expect(statusBefore.standing_receiver_ready).toBe(true);
-      } finally {
-        await daemonHandle.stop("test-cleanup");
-      }
+      // DOD-LOOP-1: bring bob online so he has his own standing receiver, then assert it's ready.
+      // (The composition-root status path — standing_receiver_ready surfaced via cello status — is
+      // covered by AC-011.)
+      await manager.ensureStandingReceiverForAgent("bob");
+      expect(manager.getStandingReceiverReady("bob")).toBe(true);
 
       // Count session.node.created events before accepting
       const beforeCount = events.filter((e) => e.event === "session.node.created").length;
 
-      // Find the current standing receiver's Peer ID from the log
+      // Find bob's current standing receiver Peer ID from the log
       const srEventBefore = events.find(
         (e) => e.event === "session.node.created" &&
-          e.context.agentName === STANDING_RECEIVER_AGENT_NAME,
+          e.context.agentName === `${STANDING_RECEIVER_AGENT_NAME}:bob`,
       );
       expect(srEventBefore).toBeDefined();
       const oldSrPeerId = srEventBefore!.context.sessionPeerId as string;
 
-      // Accept an inbound session
+      // Accept an inbound session for bob — consumes bob's SR, replacement rebuilt async.
       const result = await manager.acceptSession(
         "inbound-ac003",
         "bob",
@@ -909,24 +909,24 @@ describe("SessionNodeManager — integration tests", () => {
       );
       expect(result.ok).toBe(true);
 
-      // Immediately after accept, standing_receiver_ready may briefly be false
-      // while replacement is being created. Wait for it to become true.
+      // Immediately after accept, bob's standing receiver may briefly be absent
+      // while the replacement is being created. Wait for it to become ready again.
       let attempts = 0;
-      while (!manager.getStandingReceiverReady() && attempts < 40) {
+      while (!manager.getStandingReceiverReady("bob") && attempts < 40) {
         await new Promise((r) => setTimeout(r, 50));
         attempts++;
       }
 
-      // After 2 seconds max, standing receiver must be ready again
-      expect(manager.getStandingReceiverReady()).toBe(true);
+      // After 2 seconds max, bob's standing receiver must be ready again
+      expect(manager.getStandingReceiverReady("bob")).toBe(true);
 
-      // A new session.node.created event for the replacement standing receiver must fire
+      // A new session.node.created event for bob's replacement standing receiver must fire
       const createdEvents = events.filter((e) => e.event === "session.node.created");
       expect(createdEvents.length).toBeGreaterThan(beforeCount);
 
-      // Find the new standing receiver's creation event
+      // Find bob's standing receiver creation events
       const newSrEvents = createdEvents.filter(
-        (e) => e.context.agentName === STANDING_RECEIVER_AGENT_NAME,
+        (e) => e.context.agentName === `${STANDING_RECEIVER_AGENT_NAME}:bob`,
       );
       expect(newSrEvents.length).toBeGreaterThanOrEqual(2); // initial + replacement
 
@@ -1269,10 +1269,12 @@ describe("SessionNodeManager — integration tests", () => {
   }, 15_000);
 
   // ── AC-011: composition root wires SessionNodeManager ─────────────────────
-  // The binary.test.ts already verifies daemon.started. Here we verify
-  // standing_receiver_ready: true via startDaemon() (which calls SessionNodeManager.initialize()).
+  // The binary.test.ts already verifies daemon.started. Here we verify the status wiring:
+  // DOD-LOOP-1 — standing_receiver_ready is false with no agents online, and flips to true once an
+  // agent's per-agent standing receiver is created (as cello_start_agent does). The
+  // cello_start_agent → ensureStandingReceiverForAgent IPC path is covered by the seam-2 tests.
 
-  it("AC-011: startDaemon() composition root → standing_receiver_ready: true in status", async () => {
+  it("AC-011: startDaemon() composition root → standing_receiver_ready reflects per-agent SR in status", async () => {
     const { startDaemon } = await import("../daemon.js");
     const { logger, events } = makeLogger();
 
@@ -1286,13 +1288,17 @@ describe("SessionNodeManager — integration tests", () => {
     });
 
     try {
-      const status = handle.getStatus();
-      expect(status.standing_receiver_ready).toBe(true);
+      // No agent online yet → no standing receiver.
+      expect(handle.getStatus().standing_receiver_ready).toBe(false);
 
-      // session.node.created must have been logged for the standing receiver
+      // Bring an agent online (the same call cello_start_agent makes).
+      await handle.getSessionNodeManager().ensureStandingReceiverForAgent("alice");
+      expect(handle.getStatus().standing_receiver_ready).toBe(true);
+
+      // session.node.created must have been logged for alice's standing receiver
       const srCreated = events.find(
         (e) => e.event === "session.node.created" &&
-          e.context.agentName === STANDING_RECEIVER_AGENT_NAME,
+          e.context.agentName === `${STANDING_RECEIVER_AGENT_NAME}:alice`,
       );
       expect(srCreated).toBeDefined();
     } finally {

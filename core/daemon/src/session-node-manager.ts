@@ -191,8 +191,13 @@ export class SessionNodeManager {
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
   // agent's sessions share one authenticated relay stream (each frame carries session_id).
   #relayClients = new Map<string, AgentRelayClient>();
-  #standingReceiver: { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null = null;
-  #standingReceiverReady = false;
+  // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
+  // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
+  // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
+  // would contend for a single node and thrash. Keyed by agentName. A creation-in-flight guard set
+  // prevents two concurrent ensure() calls from building two nodes for the same agent.
+  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService }>();
+  #standingReceiverCreating = new Set<string>();
   // Set once gracefulShutdown begins. The standing-receiver replacement that
   // acceptSession kicks off runs un-awaited (AC-003), so it can be in flight when
   // shutdown starts; #createStandingReceiver checks this flag and stops a freshly
@@ -449,9 +454,9 @@ export class SessionNodeManager {
       }
     }
 
-    // Step 3: Create the standing receiver node (eager — AC-002 requires it
-    // to be ready before the IPC socket opens).
-    await this.#createStandingReceiver();
+    // DOD-LOOP-1: standing receivers are now PER-AGENT, created when each agent comes online
+    // (cello_start_agent → ensureStandingReceiverForAgent). No daemon-global receiver is created at
+    // init (no agent is online yet). The initiate/accept paths kick off creation on demand if missing.
   }
 
   // ─── Public API ──────────────────────────────────────────────────────────
@@ -468,9 +473,16 @@ export class SessionNodeManager {
     return this.#db;
   }
 
-  /** Whether the standing receiver node is ready for the next inbound session. */
-  getStandingReceiverReady(): boolean {
-    return this.#standingReceiverReady;
+  /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
+  getStandingReceiverReady(agentName?: string): boolean {
+    if (agentName !== undefined) return this.#standingReceivers.has(agentName);
+    return this.#standingReceivers.size > 0;
+  }
+
+  /** First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use (gater-open). */
+  #anyStandingReceiver(): { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null {
+    for (const sr of this.#standingReceivers.values()) return sr;
+    return null;
   }
 
   /**
@@ -481,12 +493,12 @@ export class SessionNodeManager {
    * counterparty_session_* fields. Read-only — does NOT consume the standing receiver
    * (unlike acceptSession, which hands it off).
    */
-  getStandingReceiverInfo(): { peerId: string; addrs: string[] } | null {
-    if (!this.#standingReceiverReady || this.#standingReceiver === null) return null;
-    return {
-      peerId: this.#standingReceiver.node.getPeerId(),
-      addrs: this.#standingReceiver.node.listenAddresses(),
-    };
+  getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null {
+    // DOD-LOOP-1: the initiator advertises ITS OWN agent's standing receiver, which it then reuses
+    // as the session node — so the advertised endpoint matches the node the counterparty dials.
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return null;
+    return { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() };
   }
 
   /**
@@ -496,8 +508,9 @@ export class SessionNodeManager {
    * Returns null until the receiver is ready.
    */
   getStandingReceiverNode(): CelloNode | null {
-    if (!this.#standingReceiverReady || this.#standingReceiver === null) return null;
-    return this.#standingReceiver.node;
+    // Agent-agnostic OUTBOUND node (content-park deposit/pull). Any ready standing receiver serves —
+    // its gater is open and the dial is not session-scoped.
+    return this.#anyStandingReceiver()?.node ?? null;
   }
 
   /**
@@ -518,7 +531,10 @@ export class SessionNodeManager {
    * source of the transport.autonat.result / transport.autonat.unavailable events.
    */
   getStandingReceiverAutoNat(): IAutoNatService | null {
-    return this.#standingReceiver?.autoNat ?? null;
+    // DOD-LOOP-1: the daemon-level autonat source is any ready standing receiver; null until one
+    // exists (the composition root falls back to LocalAutoNatStub). Per-session advertised dialability
+    // comes from the initiating agent's own SR via getStandingReceiverInfo, not this daemon-level value.
+    return this.#anyStandingReceiver()?.autoNat ?? null;
   }
 
   /**
@@ -584,18 +600,22 @@ export class SessionNodeManager {
     let gater: SessionConnectionGater;
     let autoNat: NodeAutoNatService;
     if (reuseStandingReceiver) {
-      if (!this.#standingReceiverReady || this.#standingReceiver === null) {
+      const sr = this.#standingReceivers.get(agentName);
+      if (!sr) {
+        // DOD-LOOP-1: this agent has no standing receiver ready — kick off (idempotent) creation
+        // so a retry finds it, and report unavailable. Per-agent, so the initiator consuming its
+        // OWN agent's receiver never contends with a co-resident responder agent (the loopback case).
+        void this.#ensureStandingReceiver(agentName, correlationId);
         return {
           ok: false,
           reason: "standing_receiver_unavailable",
           guidance: "The standing receiver node is initializing (completes within 200ms). Retry the session in a moment.",
         };
       }
-      ({ node, gater, autoNat } = this.#standingReceiver);
+      ({ node, gater, autoNat } = sr);
       gater.setAllowedPeer(counterpartyPeerId);
-      // Hand the standing receiver off to this session; a replacement is spun up below.
-      this.#standingReceiver = null;
-      this.#standingReceiverReady = false;
+      // Hand this agent's standing receiver off to this session; a replacement is spun up below.
+      this.#standingReceivers.delete(agentName);
     } else {
       gater = new SessionConnectionGater({
         sessionId,
@@ -671,9 +691,9 @@ export class SessionNodeManager {
       await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
     }
 
-    // If we consumed the standing receiver, spin up a replacement (async — do NOT await).
+    // If we consumed this agent's standing receiver, spin up a replacement (async — do NOT await).
     if (reuseStandingReceiver) {
-      this.#createStandingReceiverWithRetry(correlationId);
+      void this.#ensureStandingReceiver(agentName, correlationId);
     }
 
     return { ok: true, peerId, addrs };
@@ -866,7 +886,10 @@ export class SessionNodeManager {
     correlationId: string,
     relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
-    if (!this.#standingReceiverReady || this.#standingReceiver === null) {
+    const inboundSr = this.#standingReceivers.get(agentName);
+    if (!inboundSr) {
+      // DOD-LOOP-1: per-agent — kick off (idempotent) creation so a retry finds it.
+      void this.#ensureStandingReceiver(agentName, correlationId);
       return {
         ok: false,
         reason: "standing_receiver_unavailable",
@@ -892,7 +915,7 @@ export class SessionNodeManager {
       };
     }
 
-    const { node, gater, autoNat } = this.#standingReceiver;
+    const { node, gater, autoNat } = inboundSr;
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
     gater.setAllowedPeer(initiatorPeerId);
@@ -911,10 +934,9 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    // Remove from standing receiver slot and add to active map. The handed-off
+    // Remove this agent's standing receiver from the slot and add to active map. The handed-off
     // node keeps its AutoNAT service (it continues to surface dialability).
-    this.#standingReceiver = null;
-    this.#standingReceiverReady = false;
+    this.#standingReceivers.delete(agentName);
     this.#activeNodes.set(sessionId, {
       node,
       agentName,
@@ -936,8 +958,8 @@ export class SessionNodeManager {
       await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
     }
 
-    // Immediately spin up a replacement (async — do NOT await, AC-003)
-    this.#createStandingReceiverWithRetry(correlationId);
+    // Immediately spin up a replacement for THIS agent (async — do NOT await, AC-003)
+    void this.#ensureStandingReceiver(agentName, correlationId);
 
     return { ok: true, peerId, addrs };
   }
@@ -1112,22 +1134,21 @@ export class SessionNodeManager {
     this.#trees.clear();
     this.#receivedContent.clear();
 
-    // Stop standing receiver
-    if (this.#standingReceiver) {
-      this.#standingReceiver.autoNat.stop();
+    // Stop ALL per-agent standing receivers (DOD-LOOP-1).
+    for (const [agentName, sr] of this.#standingReceivers) {
+      sr.autoNat.stop();
       try {
-        await this.#standingReceiver.node.stop();
+        await sr.node.stop();
       } catch (err: unknown) {
         this.#logger.error("session.node.stop.failed", {
           sessionId: "standing_receiver_shutdown",
-          agentName: STANDING_RECEIVER_AGENT_NAME,
+          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
           error: err instanceof Error ? err.message : String(err),
           correlationId: "n/a",
         });
       }
-      this.#standingReceiver = null;
-      this.#standingReceiverReady = false;
     }
+    this.#standingReceivers.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.
@@ -2236,60 +2257,82 @@ export class SessionNodeManager {
 
   // ─── Private helpers ──────────────────────────────────────────────────────
 
-  async #createStandingReceiver(): Promise<void> {
-    const sessionId = `standing_receiver_${randomUUID()}`;
-    // Mint a correlationId per creation attempt so log events are trackable
-    const correlationId = randomUUID();
-    const gater = new SessionConnectionGater({
-      sessionId,
-      allowedPeerId: null, // open — counterparty unknown at creation time
-      logger: this.#logger,
-    });
-
-    let node: CelloNode;
+  /**
+   * DOD-LOOP-1: ensure the given agent has a standing receiver node (idempotent). Created when an
+   * agent comes online (cello_start_agent) and replaced after it is handed off to a session. The
+   * `#standingReceiverCreating` guard prevents two concurrent ensure() calls (e.g. the
+   * cello_start_agent hook racing a consume-site retry) from building two nodes for one agent. A
+   * create failure logs + leaves no entry; the next consume-site ensure() call retries on demand.
+   */
+  async #ensureStandingReceiver(agentName: string, correlationId: string = randomUUID()): Promise<void> {
+    if (this.#standingReceivers.has(agentName) || this.#standingReceiverCreating.has(agentName)) return;
+    if (this.#shuttingDown) return;
+    this.#standingReceiverCreating.add(agentName);
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
-      await node.start();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      this.#logger.error("session.node.create.failed", {
+      const sessionId = `standing_receiver_${randomUUID()}`;
+      const gater = new SessionConnectionGater({
         sessionId,
-        agentName: STANDING_RECEIVER_AGENT_NAME,
-        error: errorMessage,
+        allowedPeerId: null, // open — counterparty unknown at creation time
+        logger: this.#logger,
+      });
+
+      let node: CelloNode;
+      try {
+        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
+        await node.start();
+      } catch (err: unknown) {
+        this.#logger.error("session.node.create.failed", {
+          sessionId,
+          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+        return; // not ready — callers check getStandingReceiverReady / retry via ensure on demand
+      }
+
+      // M2: gracefulShutdown may have begun while this node was starting (ensure runs un-awaited).
+      // Don't install an orphan bound to a TCP port — stop it and bail.
+      if (this.#shuttingDown) {
+        try { await node.stop(); } catch { /* best-effort */ }
+        return;
+      }
+
+      // CELLO-M7-TRANSPORT-001: wrap in a NodeAutoNatService so its dialability drives session-
+      // address advertisement and the transport.autonat.* events fire.
+      const autoNat = new NodeAutoNatService({
+        node,
+        logger: this.#logger,
+        nodeType: "standing_receiver",
+        probers: this.#autoNatProbers(),
+      });
+      autoNat.emitInitialResult();
+
+      this.#standingReceivers.set(agentName, { node, gater, autoNat });
+      this.#logger.info("session.node.created", {
+        sessionId,
+        agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+        sessionPeerId: node.getPeerId(),
         correlationId,
       });
-      return; // standing receiver not ready — callers check #standingReceiverReady
+    } finally {
+      this.#standingReceiverCreating.delete(agentName);
     }
+  }
 
-    // M2: gracefulShutdown may have begun while this node was starting (the
-    // replacement runs un-awaited). Don't install an orphan bound to a TCP port —
-    // stop it and bail. The just-completed shutdown already nulled #standingReceiver.
-    if (this.#shuttingDown) {
-      try { await node.stop(); } catch { /* best-effort */ }
-      return;
-    }
+  /**
+   * DOD-LOOP-1: public hook for the composition root to create an agent's standing receiver when
+   * the agent comes online (cello_start_agent), and to tear it down when it goes offline.
+   */
+  async ensureStandingReceiverForAgent(agentName: string): Promise<void> {
+    await this.#ensureStandingReceiver(agentName);
+  }
 
-    // CELLO-M7-TRANSPORT-001: wrap the standing receiver in a NodeAutoNatService so
-    // its dialability drives session-address advertisement and the
-    // transport.autonat.result / transport.autonat.unavailable events fire. With
-    // no probers (reconnecting) it emits the dual unavailable event (AC-004/DB-001).
-    const autoNat = new NodeAutoNatService({
-      node,
-      logger: this.#logger,
-      nodeType: "standing_receiver",
-      probers: this.#autoNatProbers(),
-    });
-    autoNat.emitInitialResult();
-
-    this.#standingReceiver = { node, gater, autoNat };
-    this.#standingReceiverReady = true;
-
-    this.#logger.info("session.node.created", {
-      sessionId,
-      agentName: STANDING_RECEIVER_AGENT_NAME,
-      sessionPeerId: node.getPeerId(),
-      correlationId,
-    });
+  async removeStandingReceiverForAgent(agentName: string): Promise<void> {
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return;
+    this.#standingReceivers.delete(agentName);
+    sr.autoNat.stop();
+    try { await sr.node.stop(); } catch { /* best-effort */ }
   }
 
   #insertSessionRow(
@@ -2316,30 +2359,6 @@ export class SessionNodeManager {
       });
       return false;
     }
-  }
-
-  async #createStandingReceiverWithRetry(correlationId: string): Promise<void> {
-    const MAX_RETRIES = 3;
-    const BACKOFF_MS = [100, 500, 2000];
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        await this.#createStandingReceiver();
-        return;
-      } catch (err: unknown) {
-        this.#logger.error("session.node.create.failed", {
-          sessionId: "standing_receiver_replacement",
-          agentName: STANDING_RECEIVER_AGENT_NAME,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
-        if (attempt < MAX_RETRIES - 1) {
-          await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
-        }
-      }
-    }
-    this.#logger.error("session.standing_receiver.permanently_unavailable", {
-      correlationId,
-    });
   }
 
   #updateSessionStatus(

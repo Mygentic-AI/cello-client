@@ -144,12 +144,13 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
     const alicePubkey = await makeAgent(dirA, "alice");
     const bobPubkey = await makeAgent(dirB, "bob");
 
-    // ── Bring up B (counterparty). startDaemon awaits SessionNodeManager.initialize(),
-    //    which awaits standing-receiver creation, so its coordinates are ready immediately.
+    // ── Bring up B (counterparty). DOD-LOOP-1: B's standing receiver is now per-agent — its
+    //    coordinates only exist once bob's agent comes online (cello_start_agent, below). Read
+    //    them after bob starts (mirrors reality: the directory learns B's session coordinates
+    //    only once B is online and advertised).
     const injectB: { inject?: (frame: unknown) => void } = {};
     const { h: B } = await startOne({ celloDir: dirB, signalingConnect: makeInjectableSignaling(injectB) });
-    const bInfo = B.getSessionNodeManager().getStandingReceiverInfo();
-    expect(bInfo).not.toBeNull();
+    let bInfo: { peerId: string; addrs: string[] } | null = null;
 
     // ── A's stub negotiator: returns a complete direct-mode assignment whose counterparty
     //    is B's standing receiver. (Crypto fields are zero-filled — nothing verifies them on
@@ -186,6 +187,14 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       await clientB.send("ipc.connect", { clientType: "test" });
       expect(((await clientB.send("cello_start_agent", { name: "bob" })) as Record<string, unknown>).ok).toBe(true);
       expect(((await clientB.send("cello_use_agent", { name: "bob" })) as Record<string, unknown>).ok).toBe(true);
+      // bob is online → poll the async per-agent SR ensure (cello_start_agent kicked it off) for
+      // his coordinates. A's stub negotiator (below) reads bInfo at initiate time.
+      for (let i = 0; i < 100 && !bInfo; i++) {
+        bInfo = B.getSessionNodeManager().getStandingReceiverInfo("bob");
+        if (bInfo) break;
+        await wait(25);
+      }
+      expect(bInfo).not.toBeNull();
       // Inner await deadline is generous (governed by the 40s `it` budget, not a value
       // smaller than A's real-libp2p initiate must take — review M1).
       const awaitP = clientB.send("cello_await_session", { timeout_ms: 30_000 }) as Promise<Record<string, unknown>>;

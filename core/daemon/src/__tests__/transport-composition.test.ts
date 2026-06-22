@@ -129,11 +129,22 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(handle.getAutoNatService().getDialability()).toEqual({ dialable: false, publicAddr: null });
   });
 
-  it("C2: starting the daemon emits transport.autonat.result and transport.autonat.unavailable", async () => {
+  it("C2: an agent coming online emits transport.autonat.result and transport.autonat.unavailable for its standing receiver", async () => {
     process.env["CELLO_ENV"] = "local";
+    await setupAgent("alice");
     handle = await startDaemon(makeConfig());
 
-    const result = logEvents.find((e) => e.event === "transport.autonat.result");
+    // DOD-LOOP-1: the standing receiver is now per-agent — its AutoNAT result fires when the agent
+    // comes online (cello_start_agent → ensureStandingReceiverForAgent), not at daemon start.
+    const client = await connectMcp(join(tempDir, "daemon.sock"));
+    expect(((await client.send("cello_start_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
+
+    let result: { level: string; event: string; context: Record<string, unknown> } | undefined;
+    for (let i = 0; i < 100 && !result; i++) {
+      result = logEvents.find((e) => e.event === "transport.autonat.result");
+      if (result) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
     expect(result).toBeDefined();
     expect(result!.level).toBe("info");
     expect(result!.context).toMatchObject({ dialable: false, publicAddr: null, nodeType: "standing_receiver" });
