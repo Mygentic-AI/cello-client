@@ -1670,6 +1670,16 @@ export class SessionNodeManager {
     if (!entry) return { ok: false, reason: "session_node_unavailable" };
     if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
 
+    // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
+    // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
+    // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
+    // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
+    // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
+    if (this.#responderSealSubmitted.has(sessionId)) {
+      return { ok: false, reason: "responder_seal_already_submitted" };
+    }
+    this.#responderSealSubmitted.add(sessionId);
+
     const finalRootHex = this.getSessionTreeRootHex(sessionId);
     const sealPayload = encodeSealPayload({
       session_id: entry.relaySessionIdBytes,
@@ -1683,6 +1693,8 @@ export class SessionNodeManager {
     );
     const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
     if (!result.ok) {
+      // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
+      this.#responderSealSubmitted.delete(sessionId);
       this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
       return { ok: false, reason: result.reason };
     }
@@ -1698,10 +1710,8 @@ export class SessionNodeManager {
       sequenceNumber: result.sequence_number,
       correlationId,
     });
-    // M7-UPGRADE-002: this party's responder SEAL leaf is now submitted (via auto-ack OR
-    // cello_close_session) — the idempotency guard prevents a redelivered counterparty SEAL ctrl
-    // leaf from triggering a second auto-ack.
-    this.#responderSealSubmitted.add(sessionId);
+    // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
+    // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
     return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
   }
 
@@ -1744,8 +1754,8 @@ export class SessionNodeManager {
     }
     const entry = this.#activeNodes.get(sessionId);
     const responderPubkey = entry?.relayClient?.senderPubkeyHex ?? "unknown";
-    // Mark BEFORE the async submit so a rapidly-redelivered ctrl leaf cannot race a second submit.
-    this.#responderSealSubmitted.add(sessionId);
+    // submitSealLeaf owns the #responderSealSubmitted idempotency mark (set synchronously at its
+    // top), so the auto-ack does not pre-mark — it just reacts to the result.
     void this.submitSealLeaf(sessionId, correlationId)
       .then((result) => {
         if (result.ok) {
@@ -1755,10 +1765,12 @@ export class SessionNodeManager {
             responderPubkey,
             correlationId,
           });
+        } else if (result.reason === "responder_seal_already_submitted") {
+          // B's agent close already submitted the responder seal (it won the race) — nothing to do.
+          return;
         } else {
-          // Submission failed (e.g. relay path down) — clear the guard so an agent close / reconnect
-          // can still complete the seal; never a silent half-seal (DB-001).
-          this.#responderSealSubmitted.delete(sessionId);
+          // Submission failed (e.g. relay path down) — the agent close / reconnect can still
+          // complete the seal; never a silent half-seal (DB-001).
           this.#logger.warn("session.seal.autoack.skipped", {
             sessionId,
             reason: result.reason,
@@ -1767,7 +1779,6 @@ export class SessionNodeManager {
         }
       })
       .catch((err: unknown) => {
-        this.#responderSealSubmitted.delete(sessionId);
         this.#logger.warn("session.seal.autoack.skipped", {
           sessionId,
           reason: err instanceof Error ? err.message : String(err),

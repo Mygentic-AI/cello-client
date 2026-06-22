@@ -1629,7 +1629,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
         pendingSealWaiters.set(sessionId, resolveSeal);
         const submit = await sessionNodeManager.submitSealLeaf(sessionId, correlationId);
-        if (!submit.ok) {
+        // M7-UPGRADE-002: the auto-acknowledge path may have already submitted THIS party's
+        // responder SEAL leaf (it won the race against this explicit close). That is success, not
+        // failure — keep the waiter registered and fall through to await session_sealed (the
+        // auto-ack's submission drives the same bilateral seal).
+        if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
           pendingSealWaiters.delete(sessionId);
           if (submit.reason === "relay_unavailable") {
             // No relay witness for this session (direct/interrupted) — fall back to the
@@ -1658,6 +1662,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           // a reader gets it on the same surface that proves the seal — receipt-not-assent,
           // per-party frontiers, attestation modes, and final_message.answered.
           return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
+        }
+
+        // M7-UPGRADE-002: if THIS close fell through via the auto-ack 'already submitted' path, we
+        // hold no local reported_root to escalate with — and we should not need to: the
+        // counterparty's SEAL ctrl leaf is what triggered our auto-ack, so its seal is already on
+        // the relay and the bilateral seal should finalize. A timeout here is unexpected; report it
+        // as pending rather than escalating to a unilateral seal with no root.
+        if (!submit.ok) {
+          return {
+            ok: false,
+            reason: "seal_pending_bilateral",
+            guidance: "Your SEAL leaf is recorded (auto-acknowledged) and the bilateral seal is completing, but it did not finalize within the wait window. Check cello status and the daemon logs; retry cello_close_session if the session remains unsealed.",
+          };
         }
 
         // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
