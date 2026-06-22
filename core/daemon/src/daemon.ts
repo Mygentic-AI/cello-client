@@ -40,6 +40,7 @@ import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
+import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -672,6 +673,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // This runs before the IPC socket opens so:
   //   1. The standing receiver is ready before any cello_await_session call.
   //   2. Interrupted session detection runs before any tool call can race.
+  // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
+  // cello_send and the inbound screen inside SessionNodeManager. Absent config falls back to a
+  // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
+  // still returning a verdict (SI-001).
+  const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
+
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
     logger,
@@ -682,6 +689,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // prober set is empty — AutoNAT cannot run and the standing receiver reports
     // the conservative default + transport.autonat.unavailable (AC-004/DB-001).
     autoNatProbers: () => [],
+    securityGateway,
   });
   await sessionNodeManager.initialize();
 
@@ -2035,7 +2043,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       if (env.structure1Cbor && env.structure2Cbor) {
         sessionNodeManager.recordOrderingRecord(recipientAgent.name, e.sessionIdHex, env.structure1Cbor, env.structure2Cbor, contentHashBytes);
       }
-      const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
+      const ingest = await sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
@@ -3258,6 +3266,35 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
+
+    // M9-CORE-001: the outbound screening seam (INV-5/SI-001). Screen BEFORE sendContent — before
+    // anything reaches the wire. A non-allow verdict means nothing is transmitted: the handler
+    // returns the verdict's reason + guidance and the session stays usable. A configured-but-
+    // unreachable gateway fails closed (gateway_unavailable), so a screening outage can never let
+    // an unscreened message leave the machine. (redact/warn handling is M9-FEED-001; this story
+    // acts on allow vs. not-allow only.)
+    const outboundVerdict = await securityGateway.screenOutbound(contentBytes, {
+      direction: "outbound",
+      agentName: record.agent_name,
+      sessionId,
+      correlationId,
+    });
+    if (outboundVerdict.disposition !== "allow") {
+      logger.warn("security.gateway.outbound.blocked", {
+        sessionId,
+        recipientPubkey,
+        disposition: outboundVerdict.disposition,
+        reason: outboundVerdict.reason,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: outboundVerdict.reason ?? "outbound_screen_blocked",
+        guidance:
+          outboundVerdict.guidance ??
+          "The security gateway did not allow this message to be sent. Nothing was sent and the session is still active.",
+      };
+    }
 
     const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {

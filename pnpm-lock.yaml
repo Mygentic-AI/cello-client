@@ -157,6 +157,9 @@ importers:
       '@cello-protocol/crypto':
         specifier: workspace:*
         version: link:../crypto
+      '@cello-protocol/gateway':
+        specifier: workspace:*
+        version: link:../gateway
       '@cello-protocol/protocol-types':
         specifier: workspace:*
         version: link:../protocol-types
@@ -172,6 +175,15 @@ importers:
       it-length-prefixed:
         specifier: ^10.0.1
         version: 10.0.2
+    devDependencies:
+      '@types/node':
+        specifier: ^25.6.2
+        version: 25.9.1
+      tsx:
+        specifier: ^4.22.4
+        version: 4.22.4
+
+  core/gateway:
     devDependencies:
       '@types/node':
         specifier: ^25.6.2

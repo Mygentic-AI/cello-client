@@ -6,6 +6,7 @@
     { "path": "core/transport" },
     { "path": "core/test-fixtures" },
     { "path": "core/client" },
-    { "path": "core/adapter-claude-code" }
+    { "path": "core/adapter-claude-code" },
+    { "path": "core/gateway" }
   ]
 }

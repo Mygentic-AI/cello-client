@@ -278,7 +278,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // Buffer one inbound message so cello_receive has something to return.
     const inbound = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -360,7 +360,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     const content = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {

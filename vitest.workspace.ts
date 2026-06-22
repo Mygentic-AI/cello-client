@@ -7,4 +7,5 @@ export default defineWorkspace([
   "core/test-fixtures",
   "core/client",
   "core/adapter-claude-code",
+  "core/gateway",
 ]);

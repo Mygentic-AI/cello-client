@@ -80,6 +80,10 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
+import {
+  PassthroughGatewayClient,
+  type SecurityGatewayClient,
+} from "@cello-protocol/gateway";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -189,6 +193,11 @@ export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
   readonly #dbPath: string;
+  // M9-CORE-001: the inbound screening seam. Every byte that reaches the agent passes
+  // through #appendVerifiedContent's buffer write; screenInbound gates it there, on every
+  // arrival path (direct, held-release, recovered-park). Defaults to always-allow when no
+  // gateway is configured (SI-001: still a verdict, not an ungated pass).
+  readonly #securityGateway: SecurityGatewayClient;
   #db: DatabaseSync | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
   // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
@@ -307,6 +316,11 @@ export class SessionNodeManager {
      * dialability the conservative default and fires transport.autonat.unavailable.
      */
     autoNatProbers?: () => string[];
+    /**
+     * M9-CORE-001: the inbound security-screening seam. When absent, a
+     * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
+     */
+    securityGateway?: SecurityGatewayClient;
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
@@ -315,6 +329,7 @@ export class SessionNodeManager {
       this.#contentTtfMs = opts.contentTtfMs;
     }
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
+    this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
   }
 
   /**
@@ -1998,13 +2013,13 @@ export class SessionNodeManager {
    *
    * @returns the appended leaf index (as sequenceNumber) on success.
    */
-  ingestReceivedContent(
+  async ingestReceivedContent(
     agentName: string,
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number } | { ok: false; reason: string } {
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -2062,6 +2077,30 @@ export class SessionNodeManager {
       // appendedCount 0 — a dedup appends NO new leaf, so a recover that re-pulls an already-ingested
       // entry (e.g. after auto-recover already drained it) must not count it as a fresh recovery.
       return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx, appendedCount: 0 };
+    }
+
+    // M9-CORE-001: the inbound screening seam (INV-5). Screen here — after the content is proven
+    // authentic (hash cross-check) and confirmed not a duplicate, before it is either held for
+    // ordering or appended to the agent-facing buffer. This is the SINGLE inbound funnel: direct
+    // arrivals, recovered/parked content (daemon recover → here), and held-then-released content
+    // (held below, screened now, released already-screened) all pass this point. A non-allow
+    // verdict means the content is NOT delivered to the agent: it is not held, not buffered, and
+    // no leaf is appended — the message stays un-acked so the sender's TTF/park/retry redelivers
+    // it once the gateway is reachable again (DB-001 fail-closed: hold, never expose ungated).
+    const inboundVerdict = await this.#securityGateway.screenInbound(content, {
+      direction: "inbound",
+      agentName,
+      sessionId,
+      correlationId,
+    });
+    if (inboundVerdict.disposition !== "allow") {
+      this.#logger.warn("security.gateway.inbound.held", {
+        sessionId,
+        disposition: inboundVerdict.disposition,
+        reason: inboundVerdict.reason,
+        correlationId,
+      });
+      return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
 
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
@@ -2535,7 +2574,7 @@ export class SessionNodeManager {
       }
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
-      const ingest = this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId);
+      const ingest = await this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId);
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
       // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF

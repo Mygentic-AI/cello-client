@@ -113,17 +113,17 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     mgr.recordWitnessedSequence(AGENT, sid, hx(h2), 2);
 
     // c2 (canonical seq 2) arrives FIRST. nextExpected is 0 → it must be HELD, NOT appended.
-    const r2 = mgr.ingestReceivedContent(AGENT, sid, c2, h2, "corr-1");
+    const r2 = await mgr.ingestReceivedContent(AGENT, sid, c2, h2, "corr-1");
     expect(r2.ok).toBe(true);
     expect(mgr.getSessionTree(AGENT, sid).size(), "out-of-order content is held, tree stays empty").toBe(0);
     expect(events.some((e) => e.event === "session.content.held")).toBe(true);
 
     // c0 (seq 0) arrives → appended as leaf 0. c2 still held (gap at seq 1).
-    mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+    await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
     expect(mgr.getSessionTree(AGENT, sid).size(), "only seq 0 lands; seq 2 still held behind the gap").toBe(1);
 
     // c1 (seq 1) arrives → appended leaf 1, and now c2 is released → leaf 2. Order preserved.
-    mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+    await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(3);
     expect(leafHashes(mgr), "leaf order is the canonical sequence, not arrival order").toEqual([hx(h0), hx(h1), hx(h2)]);
 
@@ -138,11 +138,11 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     const msgs = ["a", "b", "c"].map((s) => new TextEncoder().encode(s));
     const hashes = msgs.map(msgLeafHash);
     hashes.forEach((h, i) => mgr.recordWitnessedSequence(AGENT, sid, Buffer.from(h).toString("hex"), i));
-    msgs.forEach((c, i) => {
-      const r = mgr.ingestReceivedContent(AGENT, sid, c, hashes[i], "corr-1");
+    for (let i = 0; i < msgs.length; i++) {
+      const r = await mgr.ingestReceivedContent(AGENT, sid, msgs[i], hashes[i], "corr-1");
       expect(r.ok).toBe(true);
       expect(mgr.getSessionTree(AGENT, sid).size()).toBe(i + 1);
-    });
+    }
     expect(leafHashes(mgr)).toEqual(hashes.map((h) => Buffer.from(h).toString("hex")));
   });
 
@@ -153,7 +153,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     // back to the pre-MSG-4 behavior (append on arrival). This preserves delivery when the
     // relay witness is unavailable.
     const c = new TextEncoder().encode("ungated");
-    const r = mgr.ingestReceivedContent(AGENT, sid, c, msgLeafHash(c), "corr-1");
+    const r = await mgr.ingestReceivedContent(AGENT, sid, c, msgLeafHash(c), "corr-1");
     expect(r.ok).toBe(true);
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
   });
@@ -239,7 +239,7 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
     const rec = await buildRecord(kp, c, 1); // relay seq 1 → 0-based idx 0
     mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
     expect(fired("session.content.ordering.recorded"), "valid record is accepted").toBe(true);
-    expect(mgr.ingestReceivedContent("alice", sid, c, rec.contentHash).ok).toBe(true);
+    expect((await mgr.ingestReceivedContent("alice", sid, c, rec.contentHash)).ok).toBe(true);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
   });
 
@@ -253,7 +253,7 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
     expect(fired("session.content.ordering.bad_signature")).toBe(true);
     // The forged seq-5 was NOT recorded, so the honest arrival is NOT held forever behind a fake gap —
     // it appends in arrival order. (If verification were stripped, seq-5 would record and HOLD this.)
-    const r = mgr.ingestReceivedContent("alice", sid, c, rec.contentHash);
+    const r = await mgr.ingestReceivedContent("alice", sid, c, rec.contentHash);
     expect(r.ok && r.held !== true, "fail-closed on the record, but the message still delivers").toBe(true);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
   });
@@ -267,7 +267,7 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
     mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
     expect(fired("session.content.ordering.recorded"), "a non-counterparty signer must NOT record ordering").toBe(false);
     expect(fired("session.content.ordering.wrong_signer")).toBe(true);
-    expect(mgr.ingestReceivedContent("alice", sid, c, rec.contentHash).ok).toBe(true);
+    expect((await mgr.ingestReceivedContent("alice", sid, c, rec.contentHash)).ok).toBe(true);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
   });
 

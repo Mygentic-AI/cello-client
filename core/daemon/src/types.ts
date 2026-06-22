@@ -15,6 +15,10 @@ import type {
   IAutoNatService,
 } from "@cello-protocol/transport";
 import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
+import type { SecurityGatewayClient } from "@cello-protocol/gateway";
+
+// Re-export for daemon consumers (the composition root supplies the impl).
+export type { SecurityGatewayClient };
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
@@ -255,6 +259,15 @@ export interface DaemonConfig {
    * real one in production).
    */
   getRelayCircuitAddress?: () => string;
+  /**
+   * M9-CORE-001: the security gateway client. Every outbound message is screened in
+   * cello_send before sessionNodeManager.sendContent; every inbound message is screened
+   * in the inbound funnel before it enters the receive buffer. The daemon holds ONLY this
+   * narrow interface — all detection lives in the separate gateway program. When absent,
+   * the composition root falls back to a PassthroughGatewayClient (always-allow), so the
+   * seam still returns a verdict (SI-001) and pre-M9 daemons behave unchanged.
+   */
+  securityGateway?: SecurityGatewayClient;
 }
 
 // --- Session node types ---
