@@ -881,9 +881,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const startupParkFn: import("./retry-queue.js").ParkFn = async (entry) => {
     const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.sessionId);
     const record = sessionNodeManager.getSessionRecord(entry.sessionId);
-    const node = sessionNodeManager.getStandingReceiverNode();
     if (!ep) return { parked: false, error: "no_persisted_relay_endpoint" };
     if (!record?.counterparty_pubkey) return { parked: false, error: "no_counterparty" };
+    // DOD-LOOP-1: the re-park must originate from the session's OWNING agent (the original
+    // sender), so use THAT agent's standing-receiver node — not "any" agent's. Post-DOD-LOOP-1 the
+    // owning agent's SR exists only once it is online, which is why the native flush is
+    // (re-)triggered per-agent on agent-online (see flushAwaitingContent / cello_start_agent), not
+    // only at pre-IPC startup when no agent is online yet.
+    const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
     if (!node) return { parked: false, error: "standing_receiver_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
     const ciphertext = sealToRecipient(recipientPubkey, entry.contentBlob);
@@ -901,34 +906,46 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { parked: false, error: res.reason ?? "deposit_failed" };
   };
 
-  const awaitingSessions = retryQueue.getAwaitingSessions();
-  if (awaitingSessions.length > 0) {
+  // Re-park un-acked awaiting content to the relay store-and-forward queue. Runs once pre-IPC
+  // (the crash backstop) and again per-agent when an agent comes online — because post-DOD-LOOP-1
+  // the native `startupParkFn` needs the OWNING agent's standing receiver, which exists only once
+  // that agent is online. `filterAgent` scopes the drain to one agent's sessions on the agent-
+  // online re-run; with no filter it attempts all (the pre-IPC pass / injected-target test path).
+  async function flushAwaitingContent(filterAgent?: string): Promise<void> {
+    const all = retryQueue.getAwaitingSessions();
+    const sessions = filterAgent === undefined
+      ? all
+      : all.filter((sid) => sessionNodeManager.getSessionRecord(sid)?.agent_name === filterAgent);
+    if (sessions.length === 0) return;
     const parkFn = config.contentParkFn ?? startupParkFn;
-    if (parkFn) {
-      let parkedTotal = 0;
-      for (const sid of awaitingSessions) {
-        try {
-          parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
-        } catch (err: unknown) {
-          logger.error("content.park.flush.failed", {
-            sessionId: sid,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-      logger.info("content.park.flush.completed", {
-        sessionCount: awaitingSessions.length,
-        parkedCount: parkedTotal,
-      });
-    } else {
-      const pendingCount = awaitingSessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
+    if (!parkFn) {
+      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
       logger.warn("content.park.flush.deferred", {
-        sessionCount: awaitingSessions.length,
+        sessionCount: sessions.length,
         pendingCount,
         reason: "no_content_park_target",
       });
+      return;
     }
+    let parkedTotal = 0;
+    for (const sid of sessions) {
+      try {
+        parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
+      } catch (err: unknown) {
+        logger.error("content.park.flush.failed", {
+          sessionId: sid,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    logger.info("content.park.flush.completed", {
+      sessionCount: sessions.length,
+      parkedCount: parkedTotal,
+      ...(filterAgent !== undefined ? { agentName: filterAgent } : {}),
+    });
   }
+
+  await flushAwaitingContent();
 
   const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
   nonceDedupStore.loadFromDb();
@@ -1020,10 +1037,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     onlineAgents.add(name);
     // DOD-LOOP-1: each online agent gets its OWN standing receiver, so two agents on one daemon
     // (loopback) never contend for a single one. Fire-and-forget (initiate/accept also ensure on
-    // demand); never let it throw out of the handler.
-    void sessionNodeManager.ensureStandingReceiverForAgent(name).catch((err: unknown) => {
-      logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
-    });
+    // demand); never let it throw out of the handler. Once the SR is up, re-park any of THIS
+    // agent's un-acked awaiting content (the crash backstop — its node was unavailable at the
+    // pre-IPC startup flush because no agent was online yet).
+    void sessionNodeManager.ensureStandingReceiverForAgent(name)
+      .then(() => flushAwaitingContent(name))
+      .catch((err: unknown) => {
+        logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+      });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
@@ -2306,18 +2327,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     };
   }
 
-  // Wait (bounded) for the standing receiver to be ready. acceptSession consumes the one
-  // standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
-  // assignments would otherwise drop all but the first (review M2). Polling readiness lets
-  // each accept proceed once the prior rebuild completes, rather than being lost.
-  async function waitForStandingReceiver(maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
-    if (sessionNodeManager.getStandingReceiverReady()) return true;
+  // Wait (bounded) for THIS AGENT's standing receiver to be ready. acceptSession consumes the
+  // agent's standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
+  // assignments for that agent would otherwise drop all but the first (review M2). Polling the
+  // per-agent readiness lets each accept proceed once the prior rebuild completes. Must check the
+  // OWNING agent — `getStandingReceiverReady()` with no arg returns true if ANY agent has one,
+  // which in the loopback case (alice + bob on one daemon) would falsely pass while bob's own SR
+  // is still mid-rebuild and drop bob's session (DOD-LOOP-1).
+  async function waitForStandingReceiver(agentName: string, maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
+    if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, stepMs));
-      if (sessionNodeManager.getStandingReceiverReady()) return true;
+      if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
     }
-    return sessionNodeManager.getStandingReceiverReady();
+    return sessionNodeManager.getStandingReceiverReady(agentName);
   }
 
   async function acceptInboundAssignment(
@@ -2326,8 +2350,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     correlationId: string,
   ): Promise<void> {
     try {
-      // M2: do not drop the session if the standing receiver is mid-rebuild.
-      const ready = await waitForStandingReceiver();
+      // M2: do not drop the session if this agent's standing receiver is mid-rebuild.
+      const ready = await waitForStandingReceiver(agentName);
       if (!ready) {
         logger.warn("session.inbound.accept.failed", {
           sessionId: parsed.sessionIdHex,

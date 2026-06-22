@@ -198,6 +198,11 @@ export class SessionNodeManager {
   // prevents two concurrent ensure() calls from building two nodes for the same agent.
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService }>();
   #standingReceiverCreating = new Set<string>();
+  // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
+  // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
+  // ensure checks this after start() and tears the fresh node down instead of installing an SR for
+  // an agent that has since gone offline (cello_stop_agent race). A fresh ensure clears it.
+  #standingReceiverRemoving = new Set<string>();
   // Set once gracefulShutdown begins. The standing-receiver replacement that
   // acceptSession kicks off runs un-awaited (AC-003), so it can be in flight when
   // shutdown starts; #createStandingReceiver checks this flag and stops a freshly
@@ -507,9 +512,12 @@ export class SessionNodeManager {
    * relay, MSG-001-3b). Session nodes have restrictive gaters; the standing receiver does not.
    * Returns null until the receiver is ready.
    */
-  getStandingReceiverNode(): CelloNode | null {
-    // Agent-agnostic OUTBOUND node (content-park deposit/pull). Any ready standing receiver serves —
-    // its gater is open and the dial is not session-scoped.
+  getStandingReceiverNode(agentName?: string): CelloNode | null {
+    // With an agentName: that agent's own standing-receiver node (needed when the dial must
+    // originate from a SPECIFIC agent — e.g. the startup content-park re-park, where the
+    // depositor is the original sender). Without one: any ready standing receiver (outbound
+    // content-park deposit/pull to the relay — open gater, not session-scoped).
+    if (agentName !== undefined) return this.#standingReceivers.get(agentName)?.node ?? null;
     return this.#anyStandingReceiver()?.node ?? null;
   }
 
@@ -2267,6 +2275,8 @@ export class SessionNodeManager {
   async #ensureStandingReceiver(agentName: string, correlationId: string = randomUUID()): Promise<void> {
     if (this.#standingReceivers.has(agentName) || this.#standingReceiverCreating.has(agentName)) return;
     if (this.#shuttingDown) return;
+    // A fresh ensure request supersedes any pending removal (agent toggled offline→online).
+    this.#standingReceiverRemoving.delete(agentName);
     this.#standingReceiverCreating.add(agentName);
     try {
       const sessionId = `standing_receiver_${randomUUID()}`;
@@ -2293,6 +2303,16 @@ export class SessionNodeManager {
       // M2: gracefulShutdown may have begun while this node was starting (ensure runs un-awaited).
       // Don't install an orphan bound to a TCP port — stop it and bail.
       if (this.#shuttingDown) {
+        try { await node.stop(); } catch { /* best-effort */ }
+        return;
+      }
+
+      // L1: the agent may have gone offline (cello_stop_agent → removeStandingReceiverForAgent)
+      // while this ensure was parked on start(). Removal found no map entry to delete, so the
+      // tombstone is how we learn of it — tear the fresh node down rather than install an SR for
+      // an offline agent.
+      if (this.#standingReceiverRemoving.has(agentName)) {
+        this.#standingReceiverRemoving.delete(agentName);
         try { await node.stop(); } catch { /* best-effort */ }
         return;
       }
@@ -2329,7 +2349,14 @@ export class SessionNodeManager {
 
   async removeStandingReceiverForAgent(agentName: string): Promise<void> {
     const sr = this.#standingReceivers.get(agentName);
-    if (!sr) return;
+    if (!sr) {
+      // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no
+      // map entry yet). Leave a tombstone — that ensure tears its fresh node down on completion
+      // instead of installing an SR for an agent that is now offline. Also drop any stale creating
+      // marker so a later start can re-ensure.
+      if (this.#standingReceiverCreating.has(agentName)) this.#standingReceiverRemoving.add(agentName);
+      return;
+    }
     this.#standingReceivers.delete(agentName);
     sr.autoNat.stop();
     try { await sr.node.stop(); } catch { /* best-effort */ }

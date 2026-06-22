@@ -27,8 +27,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, createHash } from "node:crypto";
+import { mkdir } from "node:fs/promises";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ParkResult, AwaitingContentEntry } from "../retry-queue.js";
 
@@ -172,39 +174,52 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     expect(logEvents.find((e) => e.event === "content.park.deposited")).toBeUndefined();
   });
 
-  it("AC-005/DB-001: with no park target wired, the startup flush defers and the entry stays durably queued", async () => {
-    const sessionId = "flush-session-C";
-    const content = randomBytes(48);
-    const contentHashHex = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest().toString("hex");
+  // DOD-LOOP-1: the native (non-injected) startup flush re-parks via the session's OWNING agent's
+  // standing receiver — which, after the per-agent SR rework, exists only once that agent is
+  // online. The pre-IPC startup flush therefore cannot deposit (no agent online yet); the re-park
+  // fires when the owning agent comes online (cello_start_agent). This guards the regression where
+  // the flush silently became a permanent no-op because no daemon-global SR exists at startup.
+  // (The prior "no park target wired → flush.deferred" assertion was obsolete: the daemon's native
+  // `startupParkFn` is an unconditional fallback, so the deferred branch is never taken in
+  // production. The deposit-success path is covered by AC-004's injected target + the spine.)
+  it("AC-005/DOD-LOOP-1: the native startup flush re-parks a session's un-acked content when its OWNING agent comes online", async () => {
+    // alice must be a loadable agent (cello_start_agent loads from celloDir/agents).
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
 
-    handle = await startDaemon(makeConfig());
-    const socketPath = join(tempDir, "daemon.sock");
-    {
-      const client = await connectToDaemon(socketPath);
-      try {
-        await client.send("enqueue_awaiting_content", {
-          sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"),
-        });
-      } finally { client.close(); }
-    }
-    await handle.stop("test_restart");
-    handle = null;
+    handle = await startDaemon(makeConfig()); // native path — no injected contentParkFn
+    const snm = handle.getSessionNodeManager();
 
-    // Restart WITHOUT a park target — flush must defer (not crash, not drop the entry).
-    logEvents.length = 0;
-    handle = await startDaemon(makeConfig());
-    const deferred = logEvents.find((e) => e.event === "content.park.flush.deferred");
-    expect(deferred).toBeDefined();
-    expect(deferred!.context.pendingCount).toBe(1);
-    expect(deferred!.context.reason).toBe("no_content_park_target");
+    // Persist a session OWNED BY alice with a relay endpoint (what the crash-backstop flush reads).
+    const sessionId = randomBytes(16).toString("hex");
+    const counterparty = "cd".repeat(32);
+    const now = Date.now();
+    snm.getDb()
+      .prepare("INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, relay_peer_id, relay_addrs) VALUES (?,?,?,?,?,?,?,?)")
+      .run(sessionId, "alice", counterparty, "interrupted", now, now, "12D3KooWRelayStub", JSON.stringify(["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelayStub"]));
 
-    // The entry is still durably queued — a later restart WITH a target re-parks it.
-    await handle.stop("test_restart_2");
-    handle = null;
-    const parked: AwaitingContentEntry[] = [];
-    const contentParkFn = async (entry: AwaitingContentEntry): Promise<ParkResult> => { parked.push(entry); return { parked: true }; };
-    handle = await startDaemon(makeConfig({ contentParkFn }));
-    expect(parked.length).toBe(1);
-    expect(parked[0].contentHashHex).toBe(contentHashHex);
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      const content = randomBytes(48);
+      const contentHashHex = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest().toString("hex");
+      await client.send("enqueue_awaiting_content", { sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex") });
+
+      // Bring alice online → her standing receiver comes up → the per-agent re-park flush fires.
+      logEvents.length = 0;
+      expect(((await client.send("cello_start_agent", { name: "alice" })) as { ok?: boolean }).ok).toBe(true);
+
+      // The per-agent re-park flush ran FOR alice — proves the DOD-LOOP-1 trigger + agent filter +
+      // owning-agent node resolution all executed. The relay is unreachable here so the deposit
+      // does not complete (parkedCount may be 0); this test guards the TRIGGER, not the deposit.
+      let perAgentFlush: { level: string; event: string; context: Record<string, unknown> } | undefined;
+      for (let i = 0; i < 160 && !perAgentFlush; i++) {
+        perAgentFlush = logEvents.find((e) => e.event === "content.park.flush.completed" && e.context.agentName === "alice");
+        if (perAgentFlush) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(perAgentFlush, "owning-agent coming online must trigger a per-agent re-park flush").toBeDefined();
+      expect(perAgentFlush!.context.sessionCount).toBe(1);
+    } finally { client.close(); }
   });
 });
