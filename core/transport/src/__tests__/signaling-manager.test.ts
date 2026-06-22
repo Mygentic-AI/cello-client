@@ -528,10 +528,13 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
 // ─── AC-010: Poll round-trip ───────────────────────────────────────────────────
 
 describe("AC-010: Manifest poll round-trip", () => {
-  it("dispatchManifestPoll enqueues manifest_poll_request frame", () => {
+  it("dispatchManifestPoll is a safe no-op when not connected (sends nothing, never throws)", () => {
+    // DOD-AUTH-2: the poll now goes out over the LIVE signaling stream (sendRaw), not a
+    // never-drained outbound queue. With no connection up, dispatch must be a harmless
+    // no-op — the scheduler reschedules and the next poll fires once connected.
     const { manager, queue } = makeManagerConfig();
-    manager.dispatchManifestPoll();
-    expect(queue.getFrames()[0]).toEqual({ type: "manifest_poll_request" });
+    expect(() => manager.dispatchManifestPoll()).not.toThrow();
+    expect(queue.getFrames()).toHaveLength(0);
   });
 
   it("handleManifestPollResponse persists version and logs manifest.poll.success", async () => {
@@ -701,10 +704,11 @@ interface MockStream {
   simulateMessage(frame: unknown): void;
 }
 
-function createMockStream(opts?: { sendShouldThrow?: Error; closeCalled?: { count: number } }): MockStream {
+function createMockStream(opts?: { sendShouldThrow?: Error; closeCalled?: { count: number }; sentFrames?: unknown[] }): MockStream {
   let messageHandler: ((frame: unknown) => void) | null = null;
   return {
-    async send(_frame: unknown) {
+    async send(frame: unknown) {
+      opts?.sentFrames?.push(frame);
       if (opts?.sendShouldThrow) throw opts.sendShouldThrow;
     },
     onMessage(handler: (frame: unknown) => void) { messageHandler = handler; },
@@ -1114,6 +1118,53 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
       const result = await manager.submitInternalOperation(async () => "done");
       expect(result).toBe("done");
       expect(manager.queueDepth).toBe(0);
+    });
+  });
+
+  describe("DOD-AUTH-2: manifest poll activates on connect (lifecycle = connection lifecycle)", () => {
+    function pollDeps(sentFrames: unknown[]) {
+      return {
+        connect: async () => ({ stream: createMockStream({ sentFrames }), directoryNodeId: "local", manifestVersion: 1 }),
+        // Heartbeat parked far out so the only frames sent are the poll request.
+        heartbeatIntervalMs: 60_000,
+        heartbeatTimeoutMs: 60_000,
+        maxReconnectAttempts: 1,
+        initialBackoffMs: SHORT_BACKOFF,
+        maxBackoffMs: SHORT_MAX_BACKOFF,
+      };
+    }
+
+    it("dispatches manifest_poll_request on the live stream once connected", async () => {
+      const sentFrames: unknown[] = [];
+      const { logger, events } = createTestLogger();
+      manager = new SignalingManager({
+        ...pollDeps(sentFrames),
+        logger,
+        pollScheduler: new ImmediatePollScheduler(0),
+        manifestProvider: new TestManifestProvider(
+          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as ConsortiumManifest,
+        ),
+        manifestVersionStore: new InMemoryManifestVersionStore(),
+        rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+        threshold: TEST_CONSORTIUM_THRESHOLD,
+      });
+      await delay(80); // connect + the immediate poll fire
+      expect(manager.status).toBe("connected");
+      expect(sentFrames).toContainEqual({ type: "manifest_poll_request" });
+      expect(events.find((e) => e.event === "directory.auth.manifest.poll.dispatched")).toBeDefined();
+    });
+
+    it("does not poll when no pollScheduler is configured (M6 backward-compat)", async () => {
+      const sentFrames: unknown[] = [];
+      const { logger } = createTestLogger();
+      manager = new SignalingManager({
+        ...pollDeps(sentFrames),
+        logger,
+        // no pollScheduler / manifest deps
+      });
+      await delay(80);
+      expect(manager.status).toBe("connected");
+      expect(sentFrames).not.toContainEqual({ type: "manifest_poll_request" });
     });
   });
 

@@ -564,12 +564,21 @@ export class SignalingManager {
     this.#schedulePoll();
   }
 
-  /** Dispatch a manifest_poll_request frame over the signaling stream. */
+  /**
+   * Dispatch a manifest_poll_request frame over the LIVE signaling stream.
+   * A no-op when not connected — the scheduler reschedules and the next poll fires
+   * once the stream is back up (DOD-AUTH-2; previously this enqueued to a never-drained
+   * outbound queue, which is why background polling never reached the directory).
+   */
   dispatchManifestPoll(): void {
-    if (!this._outboundQueue) return;
-    this._outboundQueue.enqueue({ type: "manifest_poll_request" });
-    this._logger.info("directory.auth.manifest.poll.dispatched", {
-      correlationId: this._correlationId,
+    void this.sendRaw({ type: "manifest_poll_request" }).then((res) => {
+      // Skips only happen if the stream died between the timer firing and the send;
+      // the poll scheduler reschedules, so a quiet no-op is correct here.
+      if (res.ok) {
+        this._logger.info("directory.auth.manifest.poll.dispatched", {
+          correlationId: this._correlationId,
+        });
+      }
     });
   }
 
@@ -689,6 +698,12 @@ export class SignalingManager {
     if (this._stopped) return;
 
     this.startHeartbeat();
+
+    // DOD-AUTH-2: start the background manifest poll now the stream is live. Poll
+    // lifecycle = connection lifecycle — stopPolling() is the symmetric call on stream
+    // death below. #schedulePoll is a no-op when no pollScheduler was configured (M6
+    // backward-compat), so this is safe on every connection.
+    this.startPolling();
 
     await this.waitForStreamDeath();
 
