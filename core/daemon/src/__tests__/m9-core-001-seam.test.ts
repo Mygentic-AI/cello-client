@@ -242,7 +242,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   it("AC-001/AC-002 happy path: both gateways screen the real content; send + receive succeed", async () => {
     const a = await spawnGateway("ga");
     const b = await spawnGateway("gb");
-    const { clientA, clientB, alicePubkey } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
 
     const text = "hello over the gateway-screened stack";
     const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: text }) as Record<string, unknown>;
