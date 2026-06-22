@@ -80,6 +80,13 @@ export interface LeafDeliverFrame {
   leaf_kind: number;
   structure1_cbor: Uint8Array;
   structure2_cbor: Uint8Array;
+  /**
+   * M7-UPGRADE-002: true when the relay echoed back OUR OWN submitted leaf (sender_pubkey ===
+   * our K_local), false when it is a genuine COUNTERPARTY leaf. The auto-acknowledge gate uses
+   * this to never auto-co-sign in response to its own SEAL ctrl leaf (which would loop). An
+   * explicit field — the consumer must not have to re-decode structure1_cbor to learn it.
+   */
+  authored_by_us: boolean;
 }
 
 /** Result of a single relay hash submission. */
@@ -180,6 +187,11 @@ export class AgentRelayClient {
     this.#logger = opts.logger;
   }
 
+  /** The agent's K_local public key as hex — the responder identity for auto-acknowledge (UPGRADE-002). */
+  get senderPubkeyHex(): string {
+    return Buffer.from(this.#senderPubkey).toString("hex");
+  }
+
   /**
    * Register a session's inbound leaf handler + a live node to (re)dial the relay from
    * (idempotent). Storing the node per session lets a pure-receiver session re-establish
@@ -260,7 +272,8 @@ export class AgentRelayClient {
       const s1 = toU8(frame["structure1_cbor"]);
       // Advance last_seen_seq ONLY for a COUNTERPARTY leaf. The relay also echoes our OWN
       // leaf back as a leaf_deliver — that must NOT advance it (same reason as the ack above).
-      if (seq >= 0 && !this.#isOwnLeaf(s1)) this.#bumpLastSeen(sidHex, seq);
+      const authoredByUs = this.#isOwnLeaf(s1);
+      if (seq >= 0 && !authoredByUs) this.#bumpLastSeen(sidHex, seq);
       const session = this.#sessions.get(sidHex);
       if (session && seq >= 0) {
         session.onLeafDeliver({
@@ -268,6 +281,9 @@ export class AgentRelayClient {
           leaf_kind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
           structure1_cbor: s1,
           structure2_cbor: toU8(frame["structure2_cbor"]),
+          // M7-UPGRADE-002: tell the consumer whether this is our own echoed leaf (so the
+          // auto-acknowledge gate never co-signs in response to its own SEAL ctrl leaf).
+          authored_by_us: authoredByUs,
         });
       }
     }

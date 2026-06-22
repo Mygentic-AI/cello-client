@@ -214,6 +214,14 @@ export class SessionNodeManager {
   // the liveness authority for direct sessions — the unilateral-seal gate reads
   // it (relay sessions query the relay instead). NEVER the directory (SI-002).
   #sessionLiveness = new Map<string, "alive" | "gone">();
+  // M7-UPGRADE-002: sessions whose content integrity could NOT be verified (a content_hash
+  // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
+  // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
+  #contentDesynced = new Set<string>();
+  // M7-UPGRADE-002: sessions for which B has already submitted its responder SEAL leaf (via
+  // auto-ack OR cello_close_session). Idempotency guard — A's SEAL ctrl leaf may be delivered
+  // more than once (and the relay echoes leaves), so auto-ack fires AT MOST ONCE per session.
+  #responderSealSubmitted = new Set<string>();
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -712,6 +720,13 @@ export class SessionNodeManager {
           leafKind: frame.leaf_kind,
           correlationId,
         });
+        // M7-UPGRADE-002: auto-acknowledge close. When the COUNTERPARTY's SEAL ctrl leaf (0x02)
+        // arrives and B has verified the content, B's OWN node auto-co-signs the responder SEAL
+        // leaf — no agent prompt — so the bilateral seal completes promptly instead of degrading
+        // to unilateral on a slow/busy/crashed agent. Never auto-ack our OWN echoed ctrl leaf.
+        if (frame.leaf_kind === LEAF_KIND_CTRL && !frame.authored_by_us) {
+          this.#maybeAutoAcknowledgeSeal(sessionId, correlationId);
+        }
       });
 
       const entry = this.#activeNodes.get(sessionId);
@@ -1014,6 +1029,9 @@ export class SessionNodeManager {
     // M7-SESSION-003: drop the direct-path liveness flag (the seal gate already read
     // its verdict) so a destroyed/retired session retains no stale alive/gone state.
     this.#sessionLiveness.delete(sessionId);
+    // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
+    this.#contentDesynced.delete(sessionId);
+    this.#responderSealSubmitted.delete(sessionId);
   }
 
   /**
@@ -1680,7 +1698,82 @@ export class SessionNodeManager {
       sequenceNumber: result.sequence_number,
       correlationId,
     });
+    // M7-UPGRADE-002: this party's responder SEAL leaf is now submitted (via auto-ack OR
+    // cello_close_session) — the idempotency guard prevents a redelivered counterparty SEAL ctrl
+    // leaf from triggering a second auto-ack.
+    this.#responderSealSubmitted.add(sessionId);
     return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
+  }
+
+  /**
+   * M7-UPGRADE-002: auto-acknowledge close (POSTMORTEM Workstream E / C-5). When B's daemon
+   * ingests the COUNTERPARTY's SEAL control leaf and B has verified the content, B's OWN node
+   * auto-co-signs + submits its responder SEAL leaf WITHOUT waiting for B's agent to call
+   * cello_close_session — so a bilateral seal completes promptly instead of degrading to
+   * unilateral on a slow/busy/crashed agent.
+   *
+   * SI-001 (non-negotiable): B's signature is ALWAYS produced by B's own node — submitSealLeaf
+   * signs the responder SEAL leaf with B's K_local. We remove the agent PROMPT, never the SIGNER;
+   * nothing here lets the directory or the peer synthesize B's acknowledgement.
+   *
+   * SI-002 (verifiability gate): auto-ack ONLY content B has verified. A session whose content
+   * cross-check failed (content_hash_mismatch = tamper, recorded in #contentDesynced) is NEVER
+   * auto-signed — it surfaces to the agent as a genuine decision point. DISAGREEMENT with the
+   * content is NOT a gate failure (C-6): the gate is "can I verify integrity?", never "do I agree?"
+   * — a verified-but-disliked tail is auto-sealed and the transcript speaks for B.
+   *
+   * Idempotent + non-throwing: marks #responderSealSubmitted BEFORE the async submit so a
+   * redelivered ctrl leaf cannot double-submit; clears the mark on submit failure so a later
+   * agent close / reconnect can still complete the seal (DB-001 — never a silent half-seal).
+   */
+  #maybeAutoAcknowledgeSeal(sessionId: string, correlationId: string): void {
+    // Idempotency: at most one responder seal per session (auto-ack or agent close).
+    if (this.#responderSealSubmitted.has(sessionId)) return;
+    const record = this.getSessionRecord(sessionId);
+    // Only an ACTIVE session auto-acks. A committed/sealing/sealed/interrupted session is out of
+    // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
+    if (!record || record.status !== "active") return;
+    // SI-002 verifiability gate: never auto-sign a session whose content we could not verify.
+    if (this.#contentDesynced.has(sessionId)) {
+      this.#logger.warn("session.seal.autoack.skipped", {
+        sessionId,
+        reason: "content_unverifiable",
+        correlationId,
+      });
+      return;
+    }
+    const entry = this.#activeNodes.get(sessionId);
+    const responderPubkey = entry?.relayClient?.senderPubkeyHex ?? "unknown";
+    // Mark BEFORE the async submit so a rapidly-redelivered ctrl leaf cannot race a second submit.
+    this.#responderSealSubmitted.add(sessionId);
+    void this.submitSealLeaf(sessionId, correlationId)
+      .then((result) => {
+        if (result.ok) {
+          // SI-001: the responder SEAL leaf was signed by B's OWN node (K_local) in submitSealLeaf.
+          this.#logger.info("session.seal.autoacknowledged", {
+            sessionId,
+            responderPubkey,
+            correlationId,
+          });
+        } else {
+          // Submission failed (e.g. relay path down) — clear the guard so an agent close / reconnect
+          // can still complete the seal; never a silent half-seal (DB-001).
+          this.#responderSealSubmitted.delete(sessionId);
+          this.#logger.warn("session.seal.autoack.skipped", {
+            sessionId,
+            reason: result.reason,
+            correlationId,
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        this.#responderSealSubmitted.delete(sessionId);
+        this.#logger.warn("session.seal.autoack.skipped", {
+          sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
   }
 
   /**
@@ -1735,6 +1828,10 @@ export class SessionNodeManager {
         reason: "content_hash_mismatch",
         correlationId,
       });
+      // M7-UPGRADE-002 (SI-002): a tamper makes this session's content unverifiable — the
+      // auto-acknowledge gate must never auto-co-sign it. The session stays alive (DOD-MSG-7),
+      // but the responder seal now requires the agent's explicit decision, not an auto-ack.
+      this.#contentDesynced.add(sessionId);
       return { ok: false, reason: "content_hash_mismatch" };
     }
 
