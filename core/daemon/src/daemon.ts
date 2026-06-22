@@ -2012,7 +2012,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         continue;
       }
       const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
-      if (ingest.ok) {
+      if (ingest.ok && ingest.held) {
+        // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
+        // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
+        // distinctly so the tally reflects leaves actually written, not content still queued in memory.
+        logger.info("content.recover.held", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, canonicalSeq: ingest.sequenceNumber });
+      } else if (ingest.ok) {
         recovered++;
         logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
       } else {

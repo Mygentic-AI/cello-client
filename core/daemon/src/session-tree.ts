@@ -50,9 +50,22 @@ export interface SessionTreeLeaf {
  */
 export class SessionTree {
   readonly #leaves: SessionTreeLeaf[];
+  // O(1) content-hash -> first leaf index, so the inbound dedup check (DOD-MSG-5) is not a linear
+  // scan per message (review finding #5). Stores the FIRST occurrence to match findIndex semantics.
+  // Rebuilt from #leaves in the constructor, so it survives the fromLeaves() restart path for free.
+  readonly #indexByHash: Map<string, number>;
 
   private constructor(leaves: SessionTreeLeaf[]) {
     this.#leaves = leaves;
+    this.#indexByHash = new Map();
+    for (let i = 0; i < leaves.length; i++) {
+      if (!this.#indexByHash.has(leaves[i].hashHex)) this.#indexByHash.set(leaves[i].hashHex, i);
+    }
+  }
+
+  /** O(1) index of the first leaf with this content-hash, or -1 if absent (DOD-MSG-5 dedup). */
+  indexOfHash(hashHex: string): number {
+    return this.#indexByHash.get(hashHex) ?? -1;
   }
 
   /** Construct an empty tree. */
@@ -84,7 +97,9 @@ export class SessionTree {
       throw new Error(`SessionTree.appendLeafHash: hashHex must be 64 lowercase hex chars (32 bytes), got length ${hashHex.length}`);
     }
     this.#leaves.push({ kind, hashHex });
-    return { leafIndex: this.#leaves.length - 1, newRootHex: this.rootHex() };
+    const leafIndex = this.#leaves.length - 1;
+    if (!this.#indexByHash.has(hashHex)) this.#indexByHash.set(hashHex, leafIndex);
+    return { leafIndex, newRootHex: this.rootHex() };
   }
 
   /**

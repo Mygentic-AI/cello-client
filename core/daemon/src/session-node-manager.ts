@@ -244,10 +244,11 @@ export class SessionNodeManager {
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
   #heldContent = new Map<string, Map<number, { content: Uint8Array; contentHashHex: string; correlationId?: string }>>();
-  // DOD-MSG-4 (catch-up-before-live): the relay's high-water canonical sequence for this session —
-  // the largest sequence the relay has witnessed (max over leaf_deliver). On reconnect B must hold
-  // live arrivals until its tree reaches this, so it cannot append a fresh message ahead of earlier
-  // ones still parked in the mailbox. Keyed #k(agent,session).
+  // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
+  // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
+  // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
+  // so a fresh message can't append ahead of earlier ones still parked) — it is NOT yet consumed by
+  // the gate, which today holds purely on the per-message `canonicalSeq > nextExpected` test.
   #highWaterSeq = new Map<string, number>();
   // M7-UPGRADE-002: sessions for which B has already submitted its responder SEAL leaf (via
   // auto-ack OR cello_close_session). Idempotency guard — A's SEAL ctrl leaf may be delivered
@@ -2006,7 +2007,7 @@ export class SessionNodeManager {
     // is a replay — do NOT append a second leaf and do NOT double-count it. The recipient already
     // holds this message at its assigned sequence. (In the normal single-delivery case this find is
     // -1, so the live/recover append paths are unchanged.)
-    const existingIdx = this.getSessionTree(agentName, sessionId).leaves().findIndex((l) => l.hashHex === contentHashHex);
+    const existingIdx = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
     if (existingIdx >= 0) {
       this.#logger.info("session.content.deduplicated", {
         sessionId,
@@ -2044,6 +2045,20 @@ export class SessionNodeManager {
       // guarantee eventual delivery; B never claims persisted for content it only holds in memory.
       return { ok: true, leafIndex: canonicalSeq, sequenceNumber: canonicalSeq, held: true };
     }
+    if (canonicalSeq !== undefined && canonicalSeq < nextExpected) {
+      // Contradiction (review finding #2): the witness says this hash belongs BEHIND the current
+      // tree, yet the dedup scan above found no existing leaf for it — so it is neither a duplicate
+      // nor in canonical order. This is only reachable via the accepted content-before-witness /
+      // relay-degraded interleaving (the next sub-increment's pending-witness buffer closes it). Log
+      // it loudly (the leaf-index===sequence invariant is at risk) and append rather than DROP the
+      // message — losing content is worse than a transient mis-order the seal cross-check will catch.
+      this.#logger.warn("session.content.sequence_behind_tree", {
+        sessionId,
+        canonicalSeq,
+        nextExpected,
+        correlationId,
+      });
+    }
 
     const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
@@ -2056,7 +2071,7 @@ export class SessionNodeManager {
    * ordering authority (Structure 2): it assigns each message a sequence from its hash and delivers
    * B the (content_hash -> sequence) binding via leaf_deliver. The strict-in-order gate orders the
    * transcript by THIS — never a sender-stamped field. Also advances the per-session high-water mark
-   * (the largest witnessed sequence) used for catch-up-before-live on reconnect. Idempotent.
+   * (the largest witnessed sequence) reserved for the future catch-up-before-live increment. Idempotent.
    */
   recordWitnessedSequence(agentName: string, sessionId: string, contentHashHex: string, sequenceNumber: number): void {
     if (sequenceNumber < 0) return;
@@ -2070,8 +2085,9 @@ export class SessionNodeManager {
 
   /**
    * DOD-MSG-4: the relay's high-water canonical sequence for this session (largest witnessed leaf),
-   * or -1 if none. catch-up-before-live: on reconnect B must hold live arrivals until its tree
-   * reaches this — it has more messages to recover than it has appended.
+   * or -1 if none. Exposed for the next sub-increment (catch-up-before-live — on reconnect B holds
+   * live arrivals until its tree reaches this, because it has more to recover than it has appended);
+   * NOT yet consumed by the gate. Also `recordWitnessedSequence` maintains it.
    */
   getHighWaterSeq(agentName: string, sessionId: string): number {
     return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
@@ -2088,6 +2104,11 @@ export class SessionNodeManager {
   ): { leafIndex: number } {
     const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
     const recvKey = this.#k(agentName, sessionId);
+    // Review finding #6: the witness for this hash has done its ordering job once the leaf is
+    // appended — drop it so #witnessedSeq stays proportional to held/pending content, not the whole
+    // transcript. A later replay of the same hash is still caught by the dedup leaf-scan, which is
+    // independent of the witness map.
+    this.#witnessedSeq.get(recvKey)?.delete(contentHashHex);
     let buf = this.#receivedContent.get(recvKey);
     if (!buf) { buf = []; this.#receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
