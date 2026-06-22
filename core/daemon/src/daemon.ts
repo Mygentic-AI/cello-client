@@ -2488,13 +2488,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // keystone (primary agent) here AND per-agent in getAgentSignaling — for a non-primary agent the
   // directory routes session_sealed to its per-agent stream, so a keystone-only listener would
   // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
-  // the sealed_root and mark the session sealed.
-  registerSessionSealedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
-
-  // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
-  // primary agent closes over the keystone stream, so the directory routes its
-  // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
+  // the sealed_root and mark the session sealed. Guarded on primaryAgent: the keystone listener now
+  // needs the primary agent's name/pubkey to verify the seal signature (legibility-TBS-binding), and
+  // with no agents there are no keystone sessions to seal anyway.
   if (primaryAgent) {
+    registerSessionSealedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
+    // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
+    // primary agent closes over the keystone stream, so the directory routes its
+    // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
     registerUnilateralConfirmedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
   }
 
