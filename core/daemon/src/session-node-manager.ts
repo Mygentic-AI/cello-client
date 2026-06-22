@@ -1744,12 +1744,29 @@ export class SessionNodeManager {
     // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
     if (!record || record.status !== "active") return;
     // SI-002 verifiability gate: never auto-sign a session whose content we could not verify.
+    // Today the ONLY tracked unverifiable cause is a content_hash mismatch = TAMPER (#contentDesynced
+    // is set only there). Genuine tamper is a SECURITY event — log it at ERROR with the distinct
+    // reason `content_tamper` so the AC-008 tamper alarm can fire (it keys on that reason). The other
+    // two specced reasons — `desynced` (B's tree is behind the canonical sealed tail) and
+    // `content_unverifiable` (parked content unrecoverable) — require the MSG-001-3b canonical-
+    // sequence reconciliation that is deferred; they are reserved for that follow-on.
     if (this.#contentDesynced.has(sessionId)) {
-      this.#logger.warn("session.seal.autoack.skipped", {
+      this.#logger.error("session.seal.autoack.skipped", {
         sessionId,
-        reason: "content_unverifiable",
+        reason: "content_tamper",
         correlationId,
       });
+      // AC-002: the verifiability gate refused — surface counterparty_closing to B's agent as a
+      // GENUINE decision point (the seal will not auto-complete; B must decide). Uses the existing
+      // session-state push to the live MCP clients; best-effort (never throws out of this gate).
+      try {
+        this.#onSessionStateChanged?.(record.agent_name, sessionId, "counterparty_closing", record.counterparty_pubkey);
+      } catch (err: unknown) {
+        this.#logger.debug("session.state.notify.failed", {
+          sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
       return;
     }
     const entry = this.#activeNodes.get(sessionId);
