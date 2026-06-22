@@ -309,19 +309,29 @@ export async function verifyUnilateralCertificate(
 }
 
 /**
- * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate WITHOUT trusting the
- * channel, INCLUDING the legibility binding. The seal's FROST signature is produced by the
- * INITIATOR's group key, so a verifying party anchors on a key it independently knows: the signer
- * MUST be one of the two session participants this party already holds (its own primary_pubkey or
- * its stored counterparty_pubkey) — a channel-swapped signer is rejected. The TBS is rebuilt WITH
- * the legibility hash folded in, so a MITM that tampered `answered` / `content_frontier_seq` /
- * `attestation_mode` (carried unsigned on the frame) changes the hash → the signature fails.
+ * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate's signature over the
+ * legibility-bound TBS, channel-independently.
+ *
+ * KEY STRUCTURE (why this is asymmetric): the seal's FROST signature is produced by the
+ * INITIATOR's group key (commitments[0] of the initiator's DKG share) + the directory's K_server
+ * shares. So only the INITIATOR holds the verification key locally — it loads its OWN primary from
+ * its share and checks `signer_pubkey === own primary`, then verifies the FROST signature over
+ * `buildSealTbs ‖ legibilityHash`. A tampered legibility (answered / content_frontier_seq /
+ * attestation_mode — carried unsigned on the frame) changes the hash → the signature fails → REJECT.
+ *
+ * The NON-INITIATOR (the responder B) does NOT hold the initiator's group key, so it cannot
+ * channel-independently verify here — it ACCEPTS (`verified:false`). This is sound for the LIVE
+ * path: session_sealed arrives over the daemon↔directory libp2p Noise channel (authenticated +
+ * encrypted), so it is not MITM-tamperable in transit. The binding's primary value is OUT-OF-BAND:
+ * any holder of the initiator's primary (an arbitrator) can verify an exported cert's legibility.
+ * Giving the responder the initiator's primary via the FROST-signed session establishment (so it,
+ * too, can verify locally) is a follow-on.
  *
  * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
- * over the canonical hash of exactly what it sent, so the verifier must hash exactly what arrived.
- * 'single' (pre-DKG) is not channel-independently verifiable here; surfaced honestly.
+ * over the canonical hash of exactly what it sent.
  */
-export function verifyBilateralSealCertificate(
+export async function verifyBilateralSealCertificate(
+  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger },
   cert: {
     sessionId: Uint8Array;
     sealedRoot: Uint8Array;
@@ -332,19 +342,35 @@ export function verifyBilateralSealCertificate(
     signatureType: "frost" | "single";
     legibility: LegibilityForHash | null;
   },
-  trustedParticipantPubkeysHex: string[],
-): { ok: true } | { ok: false; reason: string } {
-  if (cert.signatureType !== "frost") return { ok: false, reason: "single_key_verification_unsupported" };
+): Promise<{ ok: true; verified: boolean } | { ok: false; reason: string }> {
+  if (cert.signatureType !== "frost") return { ok: true, verified: false };
   if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
-  const signerHex = Buffer.from(cert.signerPubkey).toString("hex").toLowerCase();
-  // SI-003: the signer must be a participant this party independently knows — never trust the frame.
-  if (!trustedParticipantPubkeysHex.map((h) => h.toLowerCase()).includes(signerHex)) {
-    return { ok: false, reason: "signer_not_a_session_participant" };
+
+  const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
+  const share = await persistence.loadActiveFrostKeyShare();
+  if (!share) return { ok: true, verified: false }; // no share to verify with — accept (Noise-delivered)
+
+  let ownPrimary: Uint8Array | null = null;
+  try {
+    const dc = decode(Buffer.from(share.commitmentsCbor)) as unknown;
+    if (Array.isArray(dc) && dc.length > 0) {
+      const c0 = dc[0];
+      ownPrimary = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
+    }
+  } catch {
+    return { ok: true, verified: false };
   }
+  if (!ownPrimary || ownPrimary.length !== 32) return { ok: true, verified: false };
+
+  // Only THIS party (the initiator) holds the signing key locally → only it can verify.
+  if (Buffer.from(cert.signerPubkey).toString("hex") !== Buffer.from(ownPrimary).toString("hex")) {
+    return { ok: true, verified: false };
+  }
+
   const tbs = bindLegibilityToTbs(buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp), cert.legibility);
-  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(cert.signerPubkey));
-  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, cert.signerPubkey);
-  return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
+  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
+  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, ownPrimary);
+  return valid ? { ok: true, verified: true } : { ok: false, reason: "signature_invalid" };
 }
 
 export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void {

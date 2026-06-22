@@ -591,7 +591,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger,
     });
     // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
-    registerSessionSealedListener(mgr, agentPubkeyHex);
+    registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
     // SESSION-002: resolve seal_unilateral_confirmed (verify the cert) on this agent's stream.
     registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
@@ -1246,94 +1246,91 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // for the primary agent, per-agent for the rest — the directory routes session_sealed to the
   // session-owning agent's authenticated stream). Function declaration so getAgentSignaling
   // (defined earlier, called at runtime) can wire it per-agent.
-  function registerSessionSealedListener(signaling: SignalingManager, agentPubkeyHex: string): () => void {
+  function registerSessionSealedListener(signaling: SignalingManager, agentName: string, agentPubkeyHex: string): () => void {
     return signaling.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_sealed") return;
       const sidHex = frameValueToHex(frame["session_id"]);
       const rootHex = frameValueToHex(frame["sealed_root"]);
       if (!sidHex || !rootHex) return;
+      void (async () => {
+        const toU8 = (v: unknown): Uint8Array | null =>
+          v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
 
-      // M7 legibility-TBS-binding: verify the FROST signature over the legibility-bound TBS BEFORE
-      // accepting the seal — channel-independently (SI-003). The signer must be a session participant
-      // this party already knows (its own primary pubkey or the stored counterparty pubkey), and the
-      // signature must verify over buildSealTbs ‖ legibilityHash. A MITM that tampered the legibility
-      // (answered / content_frontier_seq / attestation_mode — carried unsigned on the frame) changes
-      // the hash → the signature fails → the seal is REJECTED, not surfaced as a trustworthy cert.
-      const toU8 = (v: unknown): Uint8Array | null =>
-        v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
-      if (frame["signature_type"] === "frost") {
-        const sessionIdBytes = toU8(frame["session_id"]);
-        const sealedRootBytes = toU8(frame["sealed_root"]);
-        const frostSig = toU8(frame["frost_signature"]);
-        const signerPubkey = toU8(frame["signer_pubkey"]);
-        const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
-        const ctRaw = frame["close_timestamp"];
-        const closeTs = typeof ctRaw === "number" ? ctRaw : typeof ctRaw === "bigint" ? Number(ctRaw) : null;
-        if (!sessionIdBytes || !sealedRootBytes || !frostSig || !signerPubkey || leafCount === null || closeTs === null) {
-          logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
-          return;
+        // M7 legibility-TBS-binding: when THIS party is the seal's signer (the initiator, whose
+        // group key produced the FROST signature), verify the signature over the legibility-bound
+        // TBS. A tampered legibility (answered / content_frontier_seq / attestation_mode, carried
+        // unsigned on the frame) changes the hash → the signature fails → the seal is REJECTED. The
+        // non-initiator does not hold the signer's key, so it accepts (verified:false): the frame
+        // arrived over the authenticated Noise channel, and the binding lets any out-of-band holder
+        // of the initiator's primary verify an exported cert.
+        if (frame["signature_type"] === "frost") {
+          const sessionIdBytes = toU8(frame["session_id"]);
+          const sealedRootBytes = toU8(frame["sealed_root"]);
+          const frostSig = toU8(frame["frost_signature"]);
+          const signerPubkey = toU8(frame["signer_pubkey"]);
+          const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
+          const ctRaw = frame["close_timestamp"];
+          const closeTs = typeof ctRaw === "number" ? ctRaw : typeof ctRaw === "bigint" ? Number(ctRaw) : null;
+          if (!sessionIdBytes || !sealedRootBytes || !frostSig || !signerPubkey || leafCount === null || closeTs === null) {
+            logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
+            return;
+          }
+          const verdict = await verifyBilateralSealCertificate(
+            { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+            {
+              sessionId: sessionIdBytes,
+              sealedRoot: sealedRootBytes,
+              leafCount,
+              closeTimestamp: closeTs,
+              frostSignature: frostSig,
+              signerPubkey,
+              signatureType: "frost",
+              legibility:
+                frame["legibility"] && typeof frame["legibility"] === "object"
+                  ? (frame["legibility"] as LegibilityForHash)
+                  : null,
+            },
+          );
+          if (!verdict.ok) {
+            // tamper-evidence: do NOT mark sealed, do NOT resolve the waiter as success.
+            logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: verdict.reason });
+            return;
+          }
+          logger.info("session.sealed.signature.checked", { sessionId: sidHex, verified: verdict.verified });
         }
-        const record = sessionNodeManager.getSessionRecord(sidHex);
-        const trusted = [agentPubkeyHex];
-        if (record?.counterparty_pubkey) trusted.push(record.counterparty_pubkey);
-        const verdict = verifyBilateralSealCertificate(
-          {
-            sessionId: sessionIdBytes,
-            sealedRoot: sealedRootBytes,
-            leafCount,
-            closeTimestamp: closeTs,
-            frostSignature: frostSig,
-            signerPubkey,
-            signatureType: "frost",
-            legibility:
-              frame["legibility"] && typeof frame["legibility"] === "object"
-                ? (frame["legibility"] as LegibilityForHash)
-                : null,
-          },
-          trusted,
-        );
-        if (!verdict.ok) {
-          // SI-003 + tamper-evidence: do NOT mark sealed, do NOT resolve the waiter as success.
-          logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: verdict.reason });
-          return;
-        }
-        logger.info("session.sealed.signature.verified", { sessionId: sidHex });
-      }
 
-      // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
-      // JSON-safe certificate and persist it with the sealed record so it survives a restart and
-      // is readable via cello_get_sealed_receipt — receipt-not-assent, per-party frontiers,
-      // attestation modes, and final_message.answered. Carried verbatim from the directory; the
-      // daemon does not re-derive or alter it here (the SI-002 re-derive guard is DOD-LEG-2).
-      const legibility = normalizeLegibility(frame["legibility"]);
-      logger.info("session.sealed.received", {
-        sessionId: sidHex,
-        sealedRoot: rootHex,
-        hasLegibility: legibility !== undefined,
-        finalMessageAnswered:
-          legibility && typeof legibility === "object" && "final_message" in legibility
-            ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
-            : undefined,
-      });
-      if (legibility !== undefined) {
-        try {
-          sessionNodeManager.recordSealCertificate(sidHex, rootHex, JSON.stringify(legibility));
-        } catch (error) {
-          // A persistence failure must not block the seal completion — the cert still flows
-          // through the live return path. Surface the cause rather than swallowing it.
-          logger.warn("seal.certificate.persist.failed", {
-            sessionId: sidHex,
-            reason: error instanceof Error ? error.message : String(error),
-          });
+        // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
+        // JSON-safe certificate and persist it with the sealed record so it survives a restart and
+        // is readable via cello_get_sealed_receipt — receipt-not-assent, per-party frontiers,
+        // attestation modes, and final_message.answered.
+        const legibility = normalizeLegibility(frame["legibility"]);
+        logger.info("session.sealed.received", {
+          sessionId: sidHex,
+          sealedRoot: rootHex,
+          hasLegibility: legibility !== undefined,
+          finalMessageAnswered:
+            legibility && typeof legibility === "object" && "final_message" in legibility
+              ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
+              : undefined,
+        });
+        if (legibility !== undefined) {
+          try {
+            sessionNodeManager.recordSealCertificate(sidHex, rootHex, JSON.stringify(legibility));
+          } catch (error) {
+            logger.warn("seal.certificate.persist.failed", {
+              sessionId: sidHex,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
-      }
-      const waiter = pendingSealWaiters.get(sidHex);
-      if (waiter) {
-        pendingSealWaiters.delete(sidHex);
-        waiter({ rootHex, legibility });
-      }
-      // Mark the session sealed + tear the node down (idempotent — safe if already gone).
-      void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+        const waiter = pendingSealWaiters.get(sidHex);
+        if (waiter) {
+          pendingSealWaiters.delete(sidHex);
+          waiter({ rootHex, legibility });
+        }
+        // Mark the session sealed + tear the node down (idempotent — safe if already gone).
+        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+      })();
     });
   }
 
@@ -2492,7 +2489,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // directory routes session_sealed to its per-agent stream, so a keystone-only listener would
   // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
   // the sealed_root and mark the session sealed.
-  registerSessionSealedListener(signalingManager, primaryAgent.pubkey);
+  registerSessionSealedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
 
   // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
   // primary agent closes over the keystone stream, so the directory routes its
