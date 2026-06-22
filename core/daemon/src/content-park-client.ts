@@ -169,6 +169,42 @@ export class ContentParkClient {
     }
   }
 
+  /**
+   * Confirm-delete one parked entry (recipient side). The relay is delete-on-CONFIRM, not
+   * delete-on-pull, so without this the mailbox never drains and every reconnect re-pulls the whole
+   * history. Mirrors pull's I1 auth (sign buildContentParkAuthMsg(nonce, recipientPubkey)). Called
+   * after a parked entry is durably ingested. Best-effort: a failed confirm leaves the entry (it will
+   * be re-pulled + deduped next time, and the relay TTL eventually evicts it) — never loses content.
+   */
+  async confirm(node: CelloNode, recipientPubkey: Uint8Array, contentHash: Uint8Array, signer: KeyProvider): Promise<boolean> {
+    const stream = await this.#open(node);
+    try {
+      const iter = this.#iter(stream);
+      stream.send(
+        lp.encode.single(
+          CBOR_ENC.encode({ type: "content_park_confirm", recipient_pubkey: recipientPubkey, content_hash: contentHash }) as Uint8Array,
+        ),
+      );
+      const challenge = await this.#read(iter);
+      if (!challenge || challenge["type"] !== "content_park_auth_challenge") {
+        this.#logger.warn("content.park.confirm.failed", { relayPeerId: this.#relayPeerId, reason: "no_auth_challenge" });
+        return false;
+      }
+      const nonce = asBytes(challenge["nonce"]);
+      if (!nonce) return false;
+      const signature = await signer.sign(buildContentParkAuthMsg(nonce, recipientPubkey));
+      stream.send(
+        lp.encode.single(CBOR_ENC.encode({ type: "content_park_auth_response", signature }) as Uint8Array),
+      );
+      const ack = await this.#read(iter);
+      const ok = !!ack && ack["type"] === "content_park_confirm_ack" && ack["ok"] === true;
+      if (!ok) this.#logger.warn("content.park.confirm.failed", { relayPeerId: this.#relayPeerId, reason: "no_confirm_ack" });
+      return ok;
+    } finally {
+      await stream.close().catch(() => {});
+    }
+  }
+
   /** Dial the relay (best-effort per addr) and open a content-park stream. */
   async #open(node: CelloNode): Promise<Stream> {
     for (const addr of this.#relayAddrs) {

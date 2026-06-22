@@ -1045,14 +1045,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // demand); never let it throw out of the handler. Once the SR is up, re-park any of THIS
     // agent's un-acked awaiting content (the crash backstop — its node was unavailable at the
     // pre-IPC startup flush because no agent was online yet).
+    // The standing-receiver ensure + sender re-park; a rejection here is a standing-receiver failure.
     void sessionNodeManager.ensureStandingReceiverForAgent(name)
       .then(() => flushAwaitingContent(name))
-      // DOD-MSG-4 (auto-recover-on-reconnect): SENDER re-parks un-acked content (flush above); the
-      // RECEIVER drains its parked mailbox from every relay it has sessions on. Without this nothing
-      // in production pulls store-and-forward content. Best-effort; retried on the next agent-online.
-      .then(() => autoRecoverForAgent(name))
       .catch((err: unknown) => {
         logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+      })
+      // DOD-MSG-4 (auto-recover-on-reconnect): RECEIVER drains its parked mailbox from every relay it
+      // has sessions on (symmetric to the sender re-park). Its own stage so a failure is labelled
+      // correctly (review #4), not as a standing-receiver error. autoRecoverForAgent catches per-relay
+      // errors internally, so this .catch is a backstop only.
+      .then(() => autoRecoverForAgent(name))
+      .catch((err: unknown) => {
+        logger.warn("content.recover.auto.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
       });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
@@ -2041,6 +2046,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // held out-of-order entries this ingest unblocked (appendedCount), not just 1.
         recovered += ingest.appendedCount ?? 1;
         logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
+        // Delete-on-confirm (review #1): the entry is now durably ingested (a fresh leaf, or a dedup
+        // of one already present), so confirm-delete it from the relay mailbox. The relay is
+        // delete-on-CONFIRM, not delete-on-pull — without this the queue never drains and every
+        // reconnect re-pulls the whole history. Held entries are deliberately NOT confirmed (not yet
+        // durable). Best-effort: a failed confirm leaves the entry to be re-pulled + deduped next time.
+        try {
+          await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+        } catch (err: unknown) {
+          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
+        }
       } else {
         logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason });
       }
@@ -2058,15 +2073,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const relays = sessionNodeManager.getAgentRelayEndpoints(agentName);
     if (relays.length === 0) return;
     let total = 0;
+    let failed = 0;
     for (const r of relays) {
       try {
         const res = await recoverParkedFromRelay(agent, r.relayPeerId, r.relayAddrs);
-        if (res.ok) total += res.recovered;
+        if (res.ok) {
+          total += res.recovered;
+        } else {
+          // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal /
+          // standing_receiver_unavailable) was previously silent — log the reason so a run where
+          // every relay failed is distinguishable from "nothing was parked".
+          failed++;
+          logger.warn("content.recover.auto.relay_failed", { agentName, relayPeerId: r.relayPeerId, reason: res.reason });
+        }
       } catch (err: unknown) {
+        failed++;
         logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: err instanceof Error ? err.message : String(err) });
       }
     }
-    if (total > 0) logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length });
+    // Review #2: emit the completion event UNCONDITIONALLY (not only when total > 0) so a clean
+    // "nothing parked" run is observable and distinct from an all-failed run.
+    logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length, failedRelays: failed });
   }
 
   handlers.set("content_park_recover", async (params, _connectionId) => {
