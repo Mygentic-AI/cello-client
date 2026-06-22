@@ -229,7 +229,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     });
 
     const stream = makeFakeRelayStream([sessionInterruptedFrame]);
-    mgr.registerRelayStream(sessionId, stream, 5);
+    mgr.registerRelayStream("alice", sessionId, stream, 5);
 
     // Wait for the async watcher to complete
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
@@ -271,7 +271,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
 
     // Empty stream — closes immediately without sending a session_interrupted frame
     const stream = makeFakeRelayStream([]);
-    mgr.registerRelayStream(sessionId, stream, 3);
+    mgr.registerRelayStream("bob", sessionId, stream, 3);
 
     // Wait for the async watcher to complete
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
@@ -303,7 +303,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     });
 
     const stream = makeFakeRelayStream([], { closeError: true });
-    mgr.registerRelayStream(sessionId, stream, 0);
+    mgr.registerRelayStream("carol", sessionId, stream, 0);
 
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
@@ -403,7 +403,7 @@ describe("SESSION-001: getSessionRecord", () => {
   });
 
   it("returns null for unknown session", () => {
-    const record = mgr.getSessionRecord("nonexistent");
+    const record = mgr.getSessionRecord("eve", "nonexistent");
     expect(record).toBeNull();
   });
 
@@ -418,7 +418,7 @@ describe("SESSION-001: getSessionRecord", () => {
       interruptedAt: "2026-06-15T00:00:00.000Z",
     });
 
-    const record = mgr.getSessionRecord(sessionId);
+    const record = mgr.getSessionRecord("eve", sessionId);
     expect(record).not.toBeNull();
     expect(record!.session_id).toBe(sessionId);
     expect(record!.status).toBe("interrupted");
@@ -981,7 +981,7 @@ describe("SESSION-001: AC-016 composition root wiring", () => {
       reason: "peer_disconnected",
     });
     const stream = makeFakeRelayStream([sessionInterruptedFrame]);
-    snm.registerRelayStream(sessionId, stream, 3);
+    snm.registerRelayStream("alice", sessionId, stream, 3);
 
     // Wait for the async handler to complete
     await new Promise<void>((r) => setTimeout(r, 50));
@@ -1035,7 +1035,7 @@ describe("SESSION-001 SI-001: no auto-seal on session_interrupted receipt", () =
     });
 
     const stream = makeFakeRelayStream([sessionInterruptedFrame]);
-    mgr.registerRelayStream(sessionId, stream, 0);
+    mgr.registerRelayStream("frank", sessionId, stream, 0);
 
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
@@ -1083,7 +1083,7 @@ describe("SESSION-001: markInterruptedWithDetails", () => {
       status: "active",
     });
 
-    await mgr.markInterruptedWithDetails(sessionId, 12, "relay_frame");
+    await mgr.markInterruptedWithDetails("grace", sessionId, 12, "relay_frame");
 
     const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sessionId) as SessionRecord;
     expect(row.status).toBe("interrupted");
@@ -1167,7 +1167,7 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
 
     // Deliver a session_interrupted frame naming the sealed (bound) session.
     const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: sessionId, reason: "peer_disconnected" });
-    mgr.registerRelayStream(sessionId, makeFakeRelayStream([frame]), 4);
+    mgr.registerRelayStream("alice", sessionId, makeFakeRelayStream([frame]), 4);
     await new Promise<void>((r) => setTimeout(r, 50));
 
     const row = db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
@@ -1190,7 +1190,7 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
 
     // Stream is bound to boundId but the frame names otherId (cross-session attempt).
     const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: otherId, reason: "peer_disconnected" });
-    mgr.registerRelayStream(boundId, makeFakeRelayStream([frame]), 2);
+    mgr.registerRelayStream("alice", boundId, makeFakeRelayStream([frame]), 2);
     await new Promise<void>((r) => setTimeout(r, 50));
 
     // The OTHER session is untouched — the forged frame did not target it.
@@ -1228,7 +1228,7 @@ describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
     const sessionId = "m1push0011223344556677889900aabbccddeeff00112233445566778899aabb";
     insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "active", messageCount: 3 });
 
-    await mgr.markInterruptedWithDetails(sessionId, 3, "relay_frame");
+    await mgr.markInterruptedWithDetails("alice", sessionId, 3, "relay_frame");
 
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ agentName: "alice", sessionId, state: "interrupted", cp: "cphex" });
@@ -1241,7 +1241,7 @@ describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
     const sessionId = "m1push5ea1ed11223344556677889900aabbccddeeff00112233445566778899";
     insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "sealed", messageCount: 3 });
 
-    await mgr.markInterruptedWithDetails(sessionId, 3, "relay_frame");
+    await mgr.markInterruptedWithDetails("alice", sessionId, 3, "relay_frame");
     expect(calls).toHaveLength(0);
   });
 });

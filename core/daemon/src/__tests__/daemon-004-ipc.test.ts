@@ -250,7 +250,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // content_frame was sent over the (fake) session stream.
     expect(node.sent.length).toBe(1);
     // Tree advanced + events fired.
-    expect(snm.getSessionTree(SID).size()).toBe(1);
+    expect(snm.getSessionTree("alice", SID).size()).toBe(1);
     expect(events.find((e) => e.event === "session.content.sent")).toBeDefined();
     expect(events.find((e) => e.event === "session.tree.appended")).toBeDefined();
   });
@@ -278,7 +278,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // Buffer one inbound message so cello_receive has something to return.
     const inbound = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent(SID, inbound, msgLeafHash(inbound));
+    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -349,7 +349,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // DB-001: the content was preserved in the durable retry_queue (not dropped).
     expect(h.getStatus().retryQueueDepth).toBeGreaterThanOrEqual(1);
     // Tree NOT advanced on a failed send.
-    expect(snm.getSessionTree(SID).size()).toBe(0);
+    expect(snm.getSessionTree("alice", SID).size()).toBe(0);
   });
 
   it("AC-001 receive: cello_receive returns content ingested into the daemon buffer", async () => {
@@ -360,7 +360,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     const content = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent(SID, content, msgLeafHash(content));
+    snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -387,9 +387,9 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // Append two message leaves so the tree has a non-empty, real root.
-    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
-    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m2"))).toString("hex"));
-    const ownRoot = snm.getSessionTreeRootHex(SID);
+    snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m2"))).toString("hex"));
+    const ownRoot = snm.getSessionTreeRootHex("alice", SID);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -430,7 +430,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // SI-003: the persisted bilateral commitment has BOTH leaves signed by their
     // OWN owners — alice's own leaf by alice, the counterparty leaf by the
     // counterparty's own key (never synthesized by the initiator).
-    const art = snm.getSealInterruptedArtifacts(SID);
+    const art = snm.getSealInterruptedArtifacts("alice", SID);
     expect(art).not.toBeNull();
     expect(art!.role).toBe("initiator");
     expect(art!.merkleRoot).toBe(ownRoot);
@@ -466,10 +466,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm1 = h1.getSessionNodeManager();
     await snm1.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     for (const m of ["m1", "m2", "m3"]) {
-      snm1.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
+      snm1.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
     }
-    const rootBeforeCrash = snm1.getSessionTreeRootHex(SID);
-    expect(snm1.getSessionTree(SID).size()).toBe(3);
+    const rootBeforeCrash = snm1.getSessionTreeRootHex("alice", SID);
+    expect(snm1.getSessionTree("alice", SID).size()).toBe(3);
     await h1.stop("simulated_sigkill");
     handle = null;
 
@@ -481,8 +481,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50));
     const snm2 = h2.getSessionNodeManager();
     // Transcript survived the restart boundary.
-    expect(snm2.getSessionTree(SID).size()).toBe(3);
-    expect(snm2.getSessionTreeRootHex(SID)).toBe(rootBeforeCrash);
+    expect(snm2.getSessionTree("alice", SID).size()).toBe(3);
+    expect(snm2.getSessionTreeRootHex("alice", SID)).toBe(rootBeforeCrash);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -504,7 +504,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     expect(sealReq!.initiatorPubkey).toBe(alicePubkey);
 
     // The persisted commitment seals over the reloaded root.
-    const art = snm2.getSealInterruptedArtifacts(SID);
+    const art = snm2.getSealInterruptedArtifacts("alice", SID);
     expect(art).not.toBeNull();
     expect(art!.merkleRoot).toBe(rootBeforeCrash);
   });
@@ -521,7 +521,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
-    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -555,7 +555,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
-    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
     expect(node.stopped).toBe(false);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -570,7 +570,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // The session's libp2p node was stopped — no leak per active close.
     expect(node.stopped).toBe(true);
     // The durable transcript survives teardown (tree reloads from SQLite).
-    expect(snm.getSessionTree(SID).size()).toBe(1);
+    expect(snm.getSessionTree("alice", SID).size()).toBe(1);
   });
 
   it("finding #6 (SI-001 responder): an active-session responder co-signs its OWN tree root, never the initiator-supplied root", async () => {
@@ -585,7 +585,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const initiatorPubkey = "cd".repeat(32);
     // Bob has an ACTIVE session with no content yet — his own tree is empty.
     await snm.createSessionNode(SID, "bob", initiatorPubkey, "alice-peer-id", "corr");
-    const bobOwnRoot = snm.getSessionTreeRootHex(SID); // canonical empty-tree root
+    const bobOwnRoot = snm.getSessionTreeRootHex("alice", SID); // canonical empty-tree root
 
     // The initiator sends a BOGUS merkleRoot. SI-001: Bob must co-sign his OWN root.
     injectRef.inject!({
@@ -616,7 +616,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    snm.appendSessionLeaf(SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {

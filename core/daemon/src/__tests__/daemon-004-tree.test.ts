@@ -161,16 +161,16 @@ describe("DAEMON-004: SessionNodeManager tree persistence", () => {
   it("AC-002: appendSessionLeaf advances the root and fires session.tree.appended per leaf", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     const sid = "a".repeat(64);
-    const empty = mgr.getSessionTreeRootHex(sid);
+    const empty = mgr.getSessionTreeRootHex("alice", sid);
 
     const h1 = Buffer.from(msgLeafHash(new TextEncoder().encode("one"))).toString("hex");
-    const r1 = mgr.appendSessionLeaf(sid, "msg", h1, "corr-1");
+    const r1 = mgr.appendSessionLeaf("alice", sid, "msg", h1, "corr-1");
     expect(r1.leafIndex).toBe(0);
     expect(r1.newRootHex).not.toBe(empty);
-    expect(mgr.getSessionTreeRootHex(sid)).toBe(r1.newRootHex);
+    expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(r1.newRootHex);
 
     const h2 = Buffer.from(msgLeafHash(new TextEncoder().encode("two"))).toString("hex");
-    const r2 = mgr.appendSessionLeaf(sid, "msg", h2, "corr-1");
+    const r2 = mgr.appendSessionLeaf("alice", sid, "msg", h2, "corr-1");
     expect(r2.leafIndex).toBe(1);
 
     const appended = events.filter((e) => e.event === "session.tree.appended");
@@ -186,15 +186,15 @@ describe("DAEMON-004: SessionNodeManager tree persistence", () => {
     const sid = "b".repeat(64);
     const mgr1 = await makeManager(logger, dbPath, new ConfigurableFakeNode());
     for (const c of ["m1", "m2", "m3"]) {
-      mgr1.appendSessionLeaf(sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(c))).toString("hex"));
+      mgr1.appendSessionLeaf("alice", sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(c))).toString("hex"));
     }
-    const rootBefore = mgr1.getSessionTreeRootHex(sid);
-    const sizeBefore = mgr1.getSessionTree(sid).size();
+    const rootBefore = mgr1.getSessionTreeRootHex("alice", sid);
+    const sizeBefore = mgr1.getSessionTree("alice", sid).size();
 
     // Simulate a restart: a brand-new manager instance over the same DB file.
     const mgr2 = await makeManager(makeLogger().logger, dbPath, new ConfigurableFakeNode());
-    expect(mgr2.getSessionTree(sid).size()).toBe(sizeBefore);
-    expect(mgr2.getSessionTreeRootHex(sid)).toBe(rootBefore);
+    expect(mgr2.getSessionTree("alice", sid).size()).toBe(sizeBefore);
+    expect(mgr2.getSessionTreeRootHex("alice", sid)).toBe(rootBefore);
   });
 
   it("AC-002: two managers fed the SAME ordered leaves report the SAME root", async () => {
@@ -203,10 +203,10 @@ describe("DAEMON-004: SessionNodeManager tree persistence", () => {
     const sid = "c".repeat(64);
     for (const c of ["x", "y", "z", "w"]) {
       const h = Buffer.from(msgLeafHash(new TextEncoder().encode(c))).toString("hex");
-      mgrA.appendSessionLeaf(sid, "msg", h);
-      mgrB.appendSessionLeaf(sid, "msg", h);
+      mgrA.appendSessionLeaf("alice", sid, "msg", h);
+      mgrB.appendSessionLeaf("alice", sid, "msg", h);
     }
-    expect(mgrA.getSessionTreeRootHex(sid)).toBe(mgrB.getSessionTreeRootHex(sid));
+    expect(mgrA.getSessionTreeRootHex("alice", sid)).toBe(mgrB.getSessionTreeRootHex("alice", sid));
   });
 });
 
@@ -230,7 +230,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("hello");
     const contentHash = msgLeafHash(content);
-    const res = await mgr.sendContent(sid, content, contentHash);
+    const res = await mgr.sendContent("alice", sid, content, contentHash);
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
   });
@@ -239,9 +239,9 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode({ newStreamFails: true });
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
-    const rootBefore = mgr.getSessionTreeRootHex(sid);
+    const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
     const content = new TextEncoder().encode("hello");
-    const res = await mgr.sendContent(sid, content, msgLeafHash(content));
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content));
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(typeof res.reason).toBe("string");
@@ -251,24 +251,24 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       expect(res.error).toContain("stream dead");
     }
     // No tree mutation on a failed send.
-    expect(mgr.getSessionTreeRootHex(sid)).toBe(rootBefore);
+    expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootBefore);
   });
 
   it("finding #2: appendSessionLeaf keeps sessions.message_count synced to the tree size", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
-    expect(mgr.getSessionRecord(sid)!.message_count ?? 0).toBe(0);
+    expect(mgr.getSessionRecord("alice", sid)!.message_count ?? 0).toBe(0);
 
     // A sent leaf advances message_count.
-    mgr.appendSessionLeaf(sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("a"))).toString("hex"));
-    expect(mgr.getSessionRecord(sid)!.message_count).toBe(1);
+    mgr.appendSessionLeaf("alice", sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("a"))).toString("hex"));
+    expect(mgr.getSessionRecord("alice", sid)!.message_count).toBe(1);
 
     // A received leaf (via ingest) also advances it — column tracks the tree, so a
     // post-active-messaging seal binds the real transcript length, not 0.
     const content = new TextEncoder().encode("b");
-    mgr.ingestReceivedContent(sid, content, msgLeafHash(content));
-    expect(mgr.getSessionRecord(sid)!.message_count).toBe(2);
-    expect(mgr.getSessionTree(sid).size()).toBe(2);
+    mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
+    expect(mgr.getSessionRecord("alice", sid)!.message_count).toBe(2);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(2);
   });
 
   it("AC-001 receive: ingestReceivedContent cross-checks, appends the leaf, buffers, fires session.content.received", async () => {
@@ -276,22 +276,22 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("from-bob");
     const contentHash = msgLeafHash(content);
-    const rootBefore = mgr.getSessionTreeRootHex(sid);
+    const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
 
-    const res = mgr.ingestReceivedContent(sid, content, contentHash);
+    const res = mgr.ingestReceivedContent("alice", sid, content, contentHash);
     expect(res.ok).toBe(true);
-    expect(mgr.getSessionTreeRootHex(sid)).not.toBe(rootBefore);
+    expect(mgr.getSessionTreeRootHex("alice", sid)).not.toBe(rootBefore);
 
     const recvEvent = events.find((e) => e.event === "session.content.received");
     expect(recvEvent).toBeDefined();
     expect(recvEvent!.context.sessionId).toBe(sid);
     expect(recvEvent!.context.senderPubkey).toBe("bobpubkey");
 
-    const buffered = mgr.takeReceivedContent(sid);
+    const buffered = mgr.takeReceivedContent("alice", sid);
     expect(buffered).not.toBeNull();
     expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("from-bob");
     // FIFO drained
-    expect(mgr.takeReceivedContent(sid)).toBeNull();
+    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
   });
 
   it("AC-001 receive (tamper): a content_hash MISMATCH is rejected — no append, no buffer, warn event", async () => {
@@ -299,12 +299,12 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("real");
     const wrongHash = msgLeafHash(new TextEncoder().encode("tampered"));
-    const rootBefore = mgr.getSessionTreeRootHex(sid);
+    const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
 
-    const res = mgr.ingestReceivedContent(sid, content, wrongHash);
+    const res = mgr.ingestReceivedContent("alice", sid, content, wrongHash);
     expect(res.ok).toBe(false);
-    expect(mgr.getSessionTreeRootHex(sid)).toBe(rootBefore);
-    expect(mgr.takeReceivedContent(sid)).toBeNull();
+    expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootBefore);
+    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
     const failEvent = events.find((e) => e.event === "session.content.cross_check.failed");
     expect(failEvent).toBeDefined();
     expect(failEvent!.level).toBe("warn");
@@ -317,7 +317,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("hello");
     const correlationId = "flow-abc-123";
-    const res = await mgr.sendContent(sid, content, msgLeafHash(content), correlationId);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
 
@@ -342,7 +342,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
       const content = new TextEncoder().encode("from-bob");
       const correlationId = "flow-xyz-789";
-      mgr.ingestReceivedContent(sid, content, msgLeafHash(content), correlationId);
+      mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content), correlationId);
       const recv = events.find((e) => e.event === "session.content.received");
       expect(recv).toBeDefined();
       expect(recv!.context.correlationId).toBe(correlationId);
@@ -358,7 +358,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("loopback-hi");
     const correlationId = "flow-roundtrip-1";
-    const res = await mgr.sendContent(sid, content, msgLeafHash(content), correlationId);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
     expect(res.ok).toBe(true);
     // The loopback delivers synchronously into the handler, which ingests async — drain.
     await new Promise((r) => setImmediate(r));
@@ -367,7 +367,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     expect(recv).toBeDefined();
     // The receiver shares the sender's correlationId — extracted from the frame, not minted.
     expect(recv!.context.correlationId).toBe(correlationId);
-    const buffered = mgr.takeReceivedContent(sid);
+    const buffered = mgr.takeReceivedContent("alice", sid);
     expect(buffered).not.toBeNull();
     expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("loopback-hi");
   });
@@ -377,16 +377,16 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const mgr = await makeManager(logger, join(tempDir, "ev.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("secret-payload");
-    mgr.ingestReceivedContent(sid, content, msgLeafHash(content));
-    const persistedRoot = mgr.getSessionTreeRootHex(sid);
+    mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
+    const persistedRoot = mgr.getSessionTreeRootHex("alice", sid);
 
-    await mgr.destroySessionNode(sid, "sealed");
+    await mgr.destroySessionNode("alice", sid, "sealed");
 
     // The in-memory plaintext buffer is gone after teardown.
-    expect(mgr.takeReceivedContent(sid)).toBeNull();
+    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
     // But the durable transcript is intact — the tree reloads from SQLite with the
     // same root, proving eviction dropped only the in-memory cache, not durable state.
-    expect(mgr.getSessionTreeRootHex(sid)).toBe(persistedRoot);
+    expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(persistedRoot);
   });
 
   // ── round-2 finding #5: a frozen session must not let late inbound content mutate
@@ -400,26 +400,26 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
     // One leaf arrives while active — accepted, then drained.
     const c1 = new TextEncoder().encode("m1");
-    expect(mgr.ingestReceivedContent(sid, c1, msgLeafHash(c1)).ok).toBe(true);
-    expect(mgr.getSessionTree(sid).size()).toBe(1);
-    expect(mgr.takeReceivedContent(sid)).not.toBeNull();
+    expect(mgr.ingestReceivedContent("alice", sid, c1, msgLeafHash(c1)).ok).toBe(true);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
+    expect(mgr.takeReceivedContent("alice", sid)).not.toBeNull();
 
     // Freeze: the seal commitment advances the session out of 'active'.
-    mgr.persistSealInterruptedCommitment({
+    mgr.persistSealInterruptedCommitment({ agentName: "alice",
       sessionId: sid, role: "initiator", ownLeaf: {}, counterpartyLeaf: {},
-      merkleRoot: mgr.getSessionTreeRootHex(sid), nonce: "n1",
+      merkleRoot: mgr.getSessionTreeRootHex("alice", sid), nonce: "n1",
     });
-    expect(mgr.getSessionRecord(sid)!.status).toBe("seal_interrupted_pending");
-    const rootAfterCommit = mgr.getSessionTreeRootHex(sid);
+    expect(mgr.getSessionRecord("alice", sid)!.status).toBe("seal_interrupted_pending");
+    const rootAfterCommit = mgr.getSessionTreeRootHex("alice", sid);
 
     // A late inbound frame MUST be rejected — the frozen tree is not mutated.
     const c2 = new TextEncoder().encode("late-frame");
-    const res = mgr.ingestReceivedContent(sid, c2, msgLeafHash(c2));
+    const res = mgr.ingestReceivedContent("alice", sid, c2, msgLeafHash(c2));
     expect(res.ok).toBe(false);
-    expect(mgr.getSessionTree(sid).size()).toBe(1);
-    expect(mgr.getSessionTreeRootHex(sid)).toBe(rootAfterCommit);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
+    expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootAfterCommit);
     // No content buffered from the rejected frame.
-    expect(mgr.takeReceivedContent(sid)).toBeNull();
+    expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
   });
 
   // ── round-2 finding #7: message_count must track the daemon-owned tree across an
@@ -429,14 +429,14 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     for (const m of ["a", "b", "c"]) {
-      mgr.appendSessionLeaf(sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
+      mgr.appendSessionLeaf("alice", sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
     }
-    expect(mgr.getSessionTree(sid).size()).toBe(3);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(3);
 
     // Interrupt with a STALE registration count of 0 (the registerRelayStream default).
-    await mgr.markInterruptedWithDetails(sid, 0, "stream_close");
+    await mgr.markInterruptedWithDetails("alice", sid, 0, "stream_close");
 
     // message_count reflects the daemon-owned tree (3), not the stale 0.
-    expect(mgr.getSessionRecord(sid)!.message_count).toBe(3);
+    expect(mgr.getSessionRecord("alice", sid)!.message_count).toBe(3);
   });
 });

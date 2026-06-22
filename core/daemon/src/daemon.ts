@@ -1709,7 +1709,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         let resolveSeal!: (completion: SealCompletion) => void;
         const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
         pendingSealWaiters.set(sessionId, resolveSeal);
-        const submit = await sessionNodeManager.submitSealLeaf(sessionId, correlationId);
+        const submit = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
         // M7-UPGRADE-002: the auto-acknowledge path may have already submitted THIS party's
         // responder SEAL leaf (it won the race against this explicit close). That is success, not
         // failure — keep the waiter registered and fall through to await session_sealed (the
