@@ -2144,15 +2144,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const participantsRaw = o["participants"];
     const finalRaw = o["final_message"];
     if (!Array.isArray(participantsRaw) || !finalRaw || typeof finalRaw !== "object") return undefined;
-    const participants = participantsRaw.map((p) => {
+    // Review finding (low): the disclaimer is the human-readable half of the receipt-not-assent
+    // property; a non-string value means a malformed/tampered frame, so REJECT the whole cert
+    // rather than surfacing an empty disclaimer (implies_assent:false alone is the machine-readable
+    // half, but we do not surface a half-formed certificate).
+    if (typeof o["disclaimer"] !== "string" || o["disclaimer"].length === 0) return undefined;
+    // Review finding (low): validate attestation_mode against the closed enum — never surface an
+    // arbitrary string from a malformed frame on the cert read surface (defensive parity with the
+    // coerced fields). An out-of-enum value rejects the whole cert.
+    const VALID_MODES = new Set(["live", "recovered", "absent"]);
+    const participants: Array<{
+      pubkey: string | null; content_frontier_seq: number | null; last_authored_seq: number | null; attestation_mode: string;
+    }> = [];
+    for (const p of participantsRaw) {
       const pp = p as Record<string, unknown>;
-      return {
+      const mode = pp["attestation_mode"];
+      if (typeof mode !== "string" || !VALID_MODES.has(mode)) return undefined;
+      participants.push({
         pubkey: frameValueToHex(pp["pubkey"]),
         content_frontier_seq: typeof pp["content_frontier_seq"] === "number" ? pp["content_frontier_seq"] : null,
         last_authored_seq: typeof pp["last_authored_seq"] === "number" ? pp["last_authored_seq"] : null,
-        attestation_mode: pp["attestation_mode"],
-      };
-    });
+        attestation_mode: mode,
+      });
+    }
     const fm = finalRaw as Record<string, unknown>;
     const final_message = {
       sender_pubkey: frameValueToHex(fm["sender_pubkey"]),
@@ -2162,7 +2176,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return {
       attests: "receipt" as const,
       implies_assent: false as const,
-      disclaimer: typeof o["disclaimer"] === "string" ? o["disclaimer"] : "",
+      disclaimer: o["disclaimer"],
       participants,
       final_message,
     };
