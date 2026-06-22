@@ -90,10 +90,21 @@ function buildManifestDeps(logger: Logger): {
   // 6–12h interval (thundering-herd avoidance) and a newer signed manifest is adopted.
   // The interval is env-injectable so the live binary test can poll sub-second instead
   // of waiting hours; production leaves these unset → the 6–12h default window.
-  const pollMinMs = Number.parseInt(process.env.CELLO_MANIFEST_POLL_MIN_MS ?? "", 10);
-  const pollMaxMs = Number.parseInt(process.env.CELLO_MANIFEST_POLL_MAX_MS ?? "", 10);
-  const pollOpts =
-    Number.isNaN(pollMinMs) || Number.isNaN(pollMaxMs) ? undefined : { minMs: pollMinMs, maxMs: pollMaxMs };
+  // Both-or-neither, positive, min <= max — a partial/invalid override fails LOUDLY
+  // rather than silently reverting to 6–12h or producing a negative (tight-loop) delay.
+  const rawPollMin = process.env.CELLO_MANIFEST_POLL_MIN_MS;
+  const rawPollMax = process.env.CELLO_MANIFEST_POLL_MAX_MS;
+  let pollOpts: { minMs: number; maxMs: number } | undefined;
+  if (rawPollMin !== undefined || rawPollMax !== undefined) {
+    const minMs = Number.parseInt(rawPollMin ?? "", 10);
+    const maxMs = Number.parseInt(rawPollMax ?? "", 10);
+    if (Number.isNaN(minMs) || Number.isNaN(maxMs) || minMs <= 0 || maxMs < minMs) {
+      throw new Error(
+        "CELLO_MANIFEST_POLL_MIN_MS / _MAX_MS must BOTH be set to positive integers with min <= max",
+      );
+    }
+    pollOpts = { minMs, maxMs };
+  }
   const manifestPollScheduler = new RandomizedPollScheduler(pollOpts);
   logger.info("daemon.manifest.configured", {
     manifestPath,

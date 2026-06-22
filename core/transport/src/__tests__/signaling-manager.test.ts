@@ -61,7 +61,6 @@ function makeTestNode(nodeId: string, pubkeyHex: string) {
 function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
   manager: SignalingManager;
   logger: ReturnType<typeof makeLogger>;
-  queue: InMemorySignalingOutboundQueue;
   versionStore: InMemoryManifestVersionStore;
   verifier: TestDirectoryChallengeVerifier;
   scheduler: ImmediatePollScheduler;
@@ -76,7 +75,6 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
   const versionStore = new InMemoryManifestVersionStore();
   const verifier = new TestDirectoryChallengeVerifier();
   const scheduler = new ImmediatePollScheduler(0);
-  const queue = new InMemorySignalingOutboundQueue();
   const logger = makeLogger();
 
   const manager = new SignalingManager({
@@ -84,7 +82,6 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
     pollScheduler: scheduler,
     manifestVersionStore: versionStore,
     manifestProvider,
-    outboundQueue: queue,
     logger,
     correlationId: "test-corr-001",
     rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -92,7 +89,7 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
     ...overrides,
   });
 
-  return { manager, logger, queue, versionStore, verifier, scheduler, manifestProvider, manifest };
+  return { manager, logger, versionStore, verifier, scheduler, manifestProvider, manifest };
 }
 
 // ─── AC-009: buildStep5Tbs produces correct TBS bytes ─────────────────────────
@@ -274,14 +271,12 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
-    const queue = new InMemorySignalingOutboundQueue();
     const logger = makeLogger();
     const manager = new SignalingManager({
       challengeVerifier: realVerifier,
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: new InMemoryManifestVersionStore(),
       manifestProvider,
-      outboundQueue: queue,
       logger,
       correlationId: "test-corr",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -319,14 +314,12 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
-    const queue = new InMemorySignalingOutboundQueue();
     const logger = makeLogger();
     const manager = new SignalingManager({
       challengeVerifier: realVerifier,
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: new InMemoryManifestVersionStore(),
       manifestProvider,
-      outboundQueue: queue,
       logger,
       correlationId: "fail-test",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -359,14 +352,12 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
-    const queue = new InMemorySignalingOutboundQueue();
     const logger = makeLogger();
     const manager = new SignalingManager({
       challengeVerifier: realVerifier,
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: new InMemoryManifestVersionStore(),
       manifestProvider,
-      outboundQueue: queue,
       logger,
       correlationId: "ac-007-test",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -431,14 +422,12 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
 
-    const queue = new InMemorySignalingOutboundQueue();
     const logger = makeLogger();
     const manager = new SignalingManager({
       challengeVerifier: realVerifier,
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: new InMemoryManifestVersionStore(),
       manifestProvider,
-      outboundQueue: queue,
       logger,
       correlationId: "replay-test",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -528,13 +517,15 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
 // ─── AC-010: Poll round-trip ───────────────────────────────────────────────────
 
 describe("AC-010: Manifest poll round-trip", () => {
-  it("dispatchManifestPoll is a safe no-op when not connected (sends nothing, never throws)", () => {
-    // DOD-AUTH-2: the poll now goes out over the LIVE signaling stream (sendRaw), not a
-    // never-drained outbound queue. With no connection up, dispatch must be a harmless
-    // no-op — the scheduler reschedules and the next poll fires once connected.
-    const { manager, queue } = makeManagerConfig();
+  it("dispatchManifestPoll is a safe no-op when not connected (never throws, emits no dispatched event)", async () => {
+    // DOD-AUTH-2: the poll now goes out over the LIVE signaling stream (sendRaw). With no
+    // connection up, dispatch must be a harmless no-op — it must not throw and must NOT log
+    // poll.dispatched (that event only emits on a real ok send), so nothing is mistaken for
+    // a delivered poll. (makeManagerConfig has no connect → the manager never connects.)
+    const { manager, logger } = makeManagerConfig();
     expect(() => manager.dispatchManifestPoll()).not.toThrow();
-    expect(queue.getFrames()).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 10)); // let the sendRaw promise settle
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.dispatched")).toBeUndefined();
   });
 
   it("handleManifestPollResponse persists version and logs manifest.poll.success", async () => {
@@ -569,6 +560,55 @@ describe("AC-010: Manifest poll round-trip", () => {
     expect(rollbackEvent?.context.lastSeenVersion).toBe(5);
   });
 
+  // ─── Verify-before-adopt: the directory is ONLY transport, NEVER trusted for the
+  // manifest's content. Each polled manifest is independently re-verified before adoption.
+  // (cello-test-attacker BLOCKING: these checks were untested at the poll layer — an impl
+  // that stripped verifyManifest / the validity-window block from handleManifestPollResponse
+  // passed every test. These pin the security path; teeth proven by neutering → red.)
+
+  it("rejects a FORGED-signature manifest over the poll path (does not adopt)", async () => {
+    const { manager, logger, versionStore } = makeManagerConfig();
+    const forged: ConsortiumManifest = makeTestManifest([
+      makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
+    ], { version: 2 }) as ConsortiumManifest;
+    // A compromised/rogue directory serves a structurally-valid manifest signed by ATTACKER
+    // keys (here: corrupted officer sigs). The daemon must re-verify and refuse to adopt.
+    (forged as { signatures: Array<{ officerIndex: number; signature: string }> }).signatures =
+      forged.signatures.map((s) => ({ ...s, signature: "00".repeat(64) }));
+
+    await manager.handleManifestPollResponse(forged);
+
+    expect(await versionStore.getLastSeenVersion()).toBeNull(); // NOT persisted
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.signature.invalid")).toBeDefined();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.success")).toBeUndefined();
+  });
+
+  it("rejects an EXPIRED manifest over the poll path (does not adopt)", async () => {
+    const { manager, logger, versionStore } = makeManagerConfig();
+    const expired: ConsortiumManifest = makeTestManifest([
+      makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
+    ], { version: 2, expires: "2020-01-01T00:00:00Z" }) as ConsortiumManifest;
+
+    await manager.handleManifestPollResponse(expired);
+
+    expect(await versionStore.getLastSeenVersion()).toBeNull();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.expired")).toBeDefined();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.success")).toBeUndefined();
+  });
+
+  it("rejects a NOT-YET-VALID manifest over the poll path (does not adopt)", async () => {
+    const { manager, logger, versionStore } = makeManagerConfig();
+    const future: ConsortiumManifest = makeTestManifest([
+      makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
+    ], { version: 2, notBefore: "2099-01-01T00:00:00Z" }) as ConsortiumManifest;
+
+    await manager.handleManifestPollResponse(future);
+
+    expect(await versionStore.getLastSeenVersion()).toBeNull();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.not.yet.valid")).toBeDefined();
+    expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.success")).toBeUndefined();
+  });
+
   it("AC-005: version store persists across manager restart (same store reused)", async () => {
     const store = new InMemoryManifestVersionStore();
     await store.persistVersion(10);
@@ -579,7 +619,6 @@ describe("AC-010: Manifest poll round-trip", () => {
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: store, // same store instance
       manifestProvider: new TestManifestProvider(makeTestManifest([]) as ConsortiumManifest),
-      outboundQueue: new InMemorySignalingOutboundQueue(),
       logger: makeLogger(),
       correlationId: "restart-test",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -1165,6 +1204,31 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
       await delay(80);
       expect(manager.status).toBe("connected");
       expect(sentFrames).not.toContainEqual({ type: "manifest_poll_request" });
+    });
+
+    it("keeps polling on the interval even when NO response ever arrives (self-healing — code review HIGH)", async () => {
+      // The poll loop must be time-driven, not response-driven: if a manifest_poll_response
+      // is lost or the directory ignores the request, future polls must still fire. We never
+      // feed a response here; with the loop re-armed from the dispatch side, multiple poll
+      // requests must go out. (Pre-fix, dispatch fired exactly once and the loop died.)
+      const sentFrames: unknown[] = [];
+      const { logger } = createTestLogger();
+      manager = new SignalingManager({
+        ...pollDeps(sentFrames),
+        logger,
+        pollScheduler: new ImmediatePollScheduler(20), // fires ~every 20ms via re-arm
+        manifestProvider: new TestManifestProvider(
+          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as ConsortiumManifest,
+        ),
+        manifestVersionStore: new InMemoryManifestVersionStore(),
+        rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+        threshold: TEST_CONSORTIUM_THRESHOLD,
+      });
+      await delay(120);
+      const pollFrames = sentFrames.filter(
+        (f) => (f as { type?: string }).type === "manifest_poll_request",
+      );
+      expect(pollFrames.length).toBeGreaterThanOrEqual(2); // re-armed without any response
     });
   });
 

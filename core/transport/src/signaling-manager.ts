@@ -195,7 +195,6 @@ export interface SignalingManagerOptions {
   pollScheduler?: IManifestPollScheduler;
   manifestVersionStore?: IManifestVersionStore;
   manifestProvider?: IManifestProvider;
-  outboundQueue?: ISignalingOutboundQueue;
   correlationId?: string;
   rootKeys?: readonly string[];
   threshold?: number;
@@ -258,10 +257,13 @@ export class SignalingManager {
   private readonly _pollScheduler: IManifestPollScheduler | undefined;
   private readonly _manifestVersionStore: IManifestVersionStore | undefined;
   private readonly _manifestProvider: IManifestProvider | undefined;
-  private readonly _outboundQueue: ISignalingOutboundQueue | undefined;
   private readonly _correlationId: string;
   private readonly _rootKeys: readonly string[];
   private readonly _threshold: number;
+  // Per-poll-cycle correlation id, minted at dispatch and threaded through to the
+  // response handler so every event in one poll flow is correlatable (DOD-INV-8).
+  #pollCounter = 0;
+  #pollCorrelationId = "";
 
   constructor(opts: SignalingManagerOptions) {
     this._connect = opts.connect ?? (() => Promise.reject(new Error("no_connect_configured")));
@@ -278,7 +280,6 @@ export class SignalingManager {
     this._pollScheduler = opts.pollScheduler;
     this._manifestVersionStore = opts.manifestVersionStore;
     this._manifestProvider = opts.manifestProvider;
-    this._outboundQueue = opts.outboundQueue;
     this._correlationId = opts.correlationId ?? "";
     this._rootKeys = opts.rootKeys ?? [];
     this._threshold = opts.threshold ?? 0;
@@ -494,6 +495,24 @@ export class SignalingManager {
    */
   async handleManifestPollResponse(manifest: ConsortiumManifest): Promise<void> {
     if (!this._manifestProvider || !this._manifestVersionStore) return;
+    const correlationId = this.#pollCorrelationId || this._correlationId;
+
+    // Verify-before-adopt: the directory is ONLY a transport for the manifest, never a
+    // trust anchor. A rogue/compromised directory cannot make us adopt a forged, expired,
+    // or rolled-back manifest. Rescheduling is NOT done here — the poll loop is driven
+    // from the dispatch side (#schedulePoll) so a lost/ignored response can't stall it.
+
+    // Defense-in-depth: never adopt against a 0/missing threshold (verifyManifest would
+    // pass an unsigned manifest at threshold 0). The daemon composition root already
+    // rejects threshold < 1 before wiring poll deps; this guards the manager directly.
+    if (this._threshold < 1) {
+      this._logger.error("directory.auth.manifest.threshold.invalid", {
+        correlationId,
+        manifestVersion: manifest.version,
+        threshold: this._threshold,
+      });
+      return;
+    }
 
     const verifyResult = verifyManifest(
       manifest as unknown as ConsortiumManifestInput,
@@ -502,12 +521,11 @@ export class SignalingManager {
     );
     if (!verifyResult.ok) {
       this._logger.error("directory.auth.manifest.signature.invalid", {
-        correlationId: this._correlationId,
+        correlationId,
         manifestVersion: manifest.version,
         reason: verifyResult.reason,
         detail: verifyResult.detail,
       });
-      this.#schedulePoll();
       return;
     }
 
@@ -515,22 +533,20 @@ export class SignalingManager {
     const notBefore = new Date(manifest.not_before);
     if (now < notBefore) {
       this._logger.warn("directory.auth.manifest.not.yet.valid", {
-        correlationId: this._correlationId,
+        correlationId,
         manifestVersion: manifest.version,
         notBefore: manifest.not_before,
       });
-      this.#schedulePoll();
       return;
     }
 
     const expiresAt = new Date(manifest.expires);
     if (expiresAt <= now) {
       this._logger.error("directory.auth.manifest.expired", {
-        correlationId: this._correlationId,
+        correlationId,
         manifestVersion: manifest.version,
         expiresAt: manifest.expires,
       });
-      this.#schedulePoll();
       return;
     }
 
@@ -538,16 +554,15 @@ export class SignalingManager {
 
     if (lastSeen !== null && manifest.version < lastSeen) {
       this._logger.warn("directory.auth.manifest.version.rollback", {
-        correlationId: this._correlationId,
+        correlationId,
         manifestVersion: manifest.version,
         lastSeenVersion: lastSeen,
       });
-      this.#schedulePoll();
       return;
     }
 
     if (lastSeen !== null && manifest.version === lastSeen) {
-      this.#schedulePoll();
+      // Already current — nothing to adopt.
       return;
     }
 
@@ -556,28 +571,25 @@ export class SignalingManager {
     await this._manifestVersionStore.persistVersion(manifest.version);
 
     this._logger.info("directory.auth.manifest.poll.success", {
-      correlationId: this._correlationId,
+      correlationId,
       oldVersion,
       newVersion: manifest.version,
     });
-
-    this.#schedulePoll();
   }
 
   /**
-   * Dispatch a manifest_poll_request frame over the LIVE signaling stream.
-   * A no-op when not connected — the scheduler reschedules and the next poll fires
-   * once the stream is back up (DOD-AUTH-2; previously this enqueued to a never-drained
-   * outbound queue, which is why background polling never reached the directory).
+   * Dispatch a manifest_poll_request frame over the LIVE signaling stream. Mints a fresh
+   * per-cycle correlation id so the dispatch and its eventual response are correlatable.
+   * A no-op send when not connected — the next interval still fires (see #schedulePoll),
+   * and a clean reconnect restarts polling via runConnectedPhase.
    */
   dispatchManifestPoll(): void {
+    this.#pollCounter += 1;
+    this.#pollCorrelationId = `${this._correlationId || "daemon"}:manifest-poll:${this.#pollCounter}`;
+    const correlationId = this.#pollCorrelationId;
     void this.sendRaw({ type: "manifest_poll_request" }).then((res) => {
-      // Skips only happen if the stream died between the timer firing and the send;
-      // the poll scheduler reschedules, so a quiet no-op is correct here.
       if (res.ok) {
-        this._logger.info("directory.auth.manifest.poll.dispatched", {
-          correlationId: this._correlationId,
-        });
+        this._logger.info("directory.auth.manifest.poll.dispatched", { correlationId });
       }
     });
   }
@@ -595,7 +607,15 @@ export class SignalingManager {
   #schedulePoll(): void {
     if (!this._pollScheduler) return;
     this._pollScheduler.scheduleNext(async () => {
+      if (this._stopped) return;
+      // Re-arm the NEXT poll around dispatching so the loop is purely time-driven and
+      // self-healing: a lost, failed, or ignored manifest_poll_response can never stall
+      // future polls (code review HIGH). stopPolling()/stop() cancel the armed timer on
+      // disconnect; runConnectedPhase re-arms on reconnect. Both #schedulePoll() and the
+      // sync part of dispatchManifestPoll run without an await, so a concurrent
+      // stop/cancel cannot interleave to resurrect a cancelled loop.
       this.dispatchManifestPoll();
+      this.#schedulePoll();
     });
   }
 
