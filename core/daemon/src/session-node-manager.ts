@@ -293,7 +293,7 @@ export class SessionNodeManager {
    * ContentParkClient. Best-effort.
    */
   #contentParkHook:
-    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>)
+    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<void>)
     | null = null;
 
   constructor(opts: {
@@ -337,7 +337,7 @@ export class SessionNodeManager {
    * the durable awaiting entry (crash backstop) but does not deposit live.
    */
   setContentParkHook(
-    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>,
+    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<void>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -347,7 +347,7 @@ export class SessionNodeManager {
    * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
    * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
    */
-  #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array): void {
+  #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): void {
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return;
@@ -358,6 +358,10 @@ export class SessionNodeManager {
       relayAddrs: entry.relayAddrs,
       contentHashHex,
       content,
+      // DOD-MSG-4 (2b): carry the relay's signed ordering record so the parked entry is self-ordering
+      // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
+      structure1Cbor,
+      structure2Cbor,
     }).catch((err: unknown) => {
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
@@ -1779,7 +1783,7 @@ export class SessionNodeManager {
       // 2b: direct delivery failed (counterparty offline). The hash is already witnessed (R1, the
       // sequence is assigned), so deposit the content to the relay store-and-forward backstop now;
       // the recipient pulls + recovers it on next online (DOD-MSG-3/4).
-      this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content);
+      this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content, orderingS1, orderingS2);
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
       const errMsg =
@@ -2346,6 +2350,52 @@ export class SessionNodeManager {
    *   the EXACT bytes the sender signed (needed to verify; Structure2 omits session_id/last_seen/ts).
    * structure2_cbor = [seq, sender_pubkey, content_hash, sender_signature, scan_result, prev_root].
    */
+  /**
+   * DOD-MSG-4 (2b): encode the pre-seal park envelope `[1, content, structure1_cbor|null,
+   * structure2_cbor|null]`. The daemon seals THIS (not the bare content) so a parked entry carries
+   * its own signed ordering record — recover then orders it the same way the direct frame does. The
+   * relay still only ever holds the sealed ciphertext (INV-3 preserved).
+   */
+  encodeParkEnvelope(content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Uint8Array {
+    return CBOR_ENC.encode([1, content, structure1Cbor ?? null, structure2Cbor ?? null]) as Uint8Array;
+  }
+
+  /**
+   * DOD-MSG-4 (2b): decode a park envelope produced by encodeParkEnvelope. Falls back to treating the
+   * whole plaintext as raw content (no ordering record) for entries sealed the old way (e.g. test
+   * fixtures that seal bare content) — so recover stays backward-compatible.
+   */
+  decodeParkEnvelope(plaintext: Uint8Array): { content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array } {
+    try {
+      const arr = decode(plaintext) as unknown[];
+      if (Array.isArray(arr) && arr[0] === 1 && arr[1] instanceof Uint8Array) {
+        return {
+          content: arr[1],
+          structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
+          structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
+        };
+      }
+    } catch {
+      /* not an envelope — fall through to raw */
+    }
+    return { content: plaintext };
+  }
+
+  /**
+   * DOD-MSG-4 (2b): public entry for the recover path to verify + record a parked entry's ordering
+   * record (the recover handler lives in daemon.ts, which has no access to the private method).
+   */
+  recordOrderingRecord(
+    agentName: string,
+    sessionId: string,
+    structure1Cbor: Uint8Array,
+    structure2Cbor: Uint8Array,
+    contentHash: Uint8Array,
+    correlationId?: string,
+  ): void {
+    this.#recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park");
+  }
+
   #recordFrameOrdering(
     agentName: string,
     sessionId: string,
@@ -2353,6 +2403,7 @@ export class SessionNodeManager {
     structure2Cbor: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
+    source: string = "content_frame",
   ): void {
     try {
       const s1 = decode(structure1Cbor) as unknown[];
@@ -2395,7 +2446,7 @@ export class SessionNodeManager {
       this.#logger.info("session.content.ordering.recorded", {
         sessionId,
         canonicalSeq: seq - 1,
-        source: "content_frame",
+        source,
         correlationId,
       });
     } catch (err: unknown) {

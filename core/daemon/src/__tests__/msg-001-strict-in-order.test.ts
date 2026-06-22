@@ -154,4 +154,29 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     expect(r.ok).toBe(true);
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
   });
+
+  it("2b: park envelope round-trips content + ordering record; bare content falls back (backward compat)", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "env.db"));
+    const content = new TextEncoder().encode("payload");
+    const s1 = new Uint8Array([0x01, 0x02, 0x03]);
+    const s2 = new Uint8Array([0x04, 0x05, 0x06]);
+
+    // With the ordering record (the live-park path).
+    const dec = mgr.decodeParkEnvelope(mgr.encodeParkEnvelope(content, s1, s2));
+    expect(Buffer.from(dec.content).toString()).toBe("payload");
+    expect(dec.structure1Cbor && Buffer.from(dec.structure1Cbor).toString("hex")).toBe(Buffer.from(s1).toString("hex"));
+    expect(dec.structure2Cbor && Buffer.from(dec.structure2Cbor).toString("hex")).toBe(Buffer.from(s2).toString("hex"));
+
+    // Without a record (the startup-flush crash-backstop path).
+    const dec2 = mgr.decodeParkEnvelope(mgr.encodeParkEnvelope(content));
+    expect(Buffer.from(dec2.content).toString()).toBe("payload");
+    expect(dec2.structure1Cbor).toBeUndefined();
+    expect(dec2.structure2Cbor).toBeUndefined();
+
+    // Backward compat: a bare-content seal (old/test-fixture path, not an envelope) → content only.
+    const bare = new TextEncoder().encode("legacy bare content, not an envelope at all");
+    const decBare = mgr.decodeParkEnvelope(bare);
+    expect(Buffer.from(decBare.content).toString("hex")).toBe(Buffer.from(bare).toString("hex"));
+    expect(decBare.structure2Cbor).toBeUndefined();
+  });
 });

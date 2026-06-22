@@ -841,14 +841,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the session's relay endpoint; we seal the content to the recipient (E2E — the relay never sees
   // plaintext, INV-3) and deposit it to that relay's store-and-forward mailbox via the standing
   // receiver node. The recipient pulls + recovers it at the witnessed sequence (R1) on next online.
-  sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content }) => {
+  sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: "standing_receiver_unavailable" });
       return;
     }
     const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
-    const ciphertext = sealToRecipient(recipientPubkey, content);
+    // DOD-MSG-4 (2b): seal the ORDERING ENVELOPE (content + the relay's signed Structure2), not bare
+    // content, so the parked entry is self-ordering on recover. The relay still holds only ciphertext.
+    const ciphertext = sealToRecipient(recipientPubkey, sessionNodeManager.encodeParkEnvelope(content, structure1Cbor, structure2Cbor));
     const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -891,7 +893,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
     if (!node) return { parked: false, error: "standing_receiver_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
-    const ciphertext = sealToRecipient(recipientPubkey, entry.contentBlob);
+    // DOD-MSG-4 (2b): seal the envelope shape too (content only — the durable awaiting queue does not
+    // persist the ordering record, so a crash-backstop re-park recovers in arrival order; the common
+    // live-park path above carries the full Structure2). Keeps ONE envelope format on the recover side.
+    const ciphertext = sealToRecipient(recipientPubkey, sessionNodeManager.encodeParkEnvelope(entry.contentBlob));
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -2006,12 +2011,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
     let recovered = 0;
     for (const e of entries) {
-      const plaintext = await kp.openContentSeal(e.ciphertext);
-      if (!plaintext) {
+      const unsealed = await kp.openContentSeal(e.ciphertext);
+      if (!unsealed) {
         logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
         continue;
       }
-      const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
+      // DOD-MSG-4 (2b): the unsealed blob is the ordering envelope (content + the relay's signed
+      // Structure2). Extract the content; if the record is present, verify it and feed the strict-in-
+      // order gate the canonical sequence BEFORE ingest — so recovered messages order the same way a
+      // direct frame does (closes review finding #3). Old/bare-content seals decode to content alone.
+      const env = sessionNodeManager.decodeParkEnvelope(unsealed);
+      const contentHashBytes = Buffer.from(e.contentHashHex, "hex");
+      if (env.structure1Cbor && env.structure2Cbor) {
+        sessionNodeManager.recordOrderingRecord(recipientAgent.name, e.sessionIdHex, env.structure1Cbor, env.structure2Cbor, contentHashBytes);
+      }
+      const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
