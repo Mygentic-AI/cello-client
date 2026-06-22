@@ -1258,8 +1258,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
   });
 
+  // DOD-LOOP-1: daemon-level seal bookkeeping is keyed by (agentName, sessionId), NOT sessionId
+  // alone — two of the operator's agents can hold both ends of the same session_id on one daemon
+  // (loopback), and each end seals independently. Keying by session_id alone would let A's close
+  // block B's (false seal_interrupted_in_progress) and make their seal waiters collide.
+  const sealKey = (agentName: string, sessionId: string): string => `${agentName}\x1f${sessionId}`;
+
   // M7-SESSION-001: tracks seal-interrupted flows currently in progress.
-  // Prevents duplicate concurrent seal-interrupted attempts for the same session (AC-011).
+  // Prevents duplicate concurrent seal-interrupted attempts for the same (agent, session) (AC-011).
   const sealInterruptedInProgress = new Set<string>();
 
   // M7 DOD-SPINE-7: relay-mediated bilateral seal. cello_close_session registers a waiter
@@ -1353,9 +1359,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             });
           }
         }
-        const waiter = pendingSealWaiters.get(sidHex);
+        const waiter = pendingSealWaiters.get(sealKey(agentName, sidHex));
         if (waiter) {
-          pendingSealWaiters.delete(sidHex);
+          pendingSealWaiters.delete(sealKey(agentName, sidHex));
           waiter({ rootHex, legibility });
         }
         // Mark the session sealed + tear the node down (idempotent — safe if already gone).
@@ -1652,7 +1658,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     // AC-011: seal-interrupted already in progress
-    if (sealInterruptedInProgress.has(sessionId)) {
+    if (sealInterruptedInProgress.has(sealKey(record.agent_name, sessionId))) {
       return {
         ok: false,
         reason: "seal_interrupted_in_progress",
@@ -1680,12 +1686,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // which case the bilateral commitment binds leafCount only.
       const merkleRootAtInterruption =
         typeof params?.merkleRootAtInterruption === "string" ? params.merkleRootAtInterruption : "";
-      sealInterruptedInProgress.add(sessionId);
+      sealInterruptedInProgress.add(sealKey(record.agent_name, sessionId));
       const correlationId = randomUUID();
       try {
         return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
       } finally {
-        sealInterruptedInProgress.delete(sessionId);
+        sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
     }
 
@@ -1698,7 +1704,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // rejects re-entry). Without adding to the set here, two concurrent active closes
     // would both send a seal_interrupted_request and both await acks (double seal).
     if (record.status === "active") {
-      sealInterruptedInProgress.add(sessionId);
+      sealInterruptedInProgress.add(sealKey(record.agent_name, sessionId));
       const correlationId = randomUUID();
       try {
         // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
@@ -1708,14 +1714,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // submitting so the notification can never race ahead of us.
         let resolveSeal!: (completion: SealCompletion) => void;
         const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
-        pendingSealWaiters.set(sessionId, resolveSeal);
+        pendingSealWaiters.set(sealKey(record.agent_name, sessionId), resolveSeal);
         const submit = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
         // M7-UPGRADE-002: the auto-acknowledge path may have already submitted THIS party's
         // responder SEAL leaf (it won the race against this explicit close). That is success, not
         // failure — keep the waiter registered and fall through to await session_sealed (the
         // auto-ack's submission drives the same bilateral seal).
         if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
-          pendingSealWaiters.delete(sessionId);
+          pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
           if (submit.reason === "relay_unavailable") {
             // No relay witness for this session (direct/interrupted) — fall back to the
             // directory-mediated bilateral-ack seal.
@@ -1736,7 +1742,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
         const sealedCompletion = await Promise.race([sealedP, timeoutP]);
         clearTimeout(timer);
-        pendingSealWaiters.delete(sessionId);
+        pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
         if (sealedCompletion !== null) {
           logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
           // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
@@ -1803,7 +1809,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_list_sessions) before retrying cello_close_session.",
         };
       } finally {
-        sealInterruptedInProgress.delete(sessionId);
+        sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
     }
 
