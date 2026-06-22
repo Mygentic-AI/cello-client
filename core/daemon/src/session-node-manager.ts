@@ -797,6 +797,32 @@ export class SessionNodeManager {
           leafKind: frame.leaf_kind,
           correlationId,
         });
+        // DOD-MSG-4 (strict in-order): record the relay-witnessed canonical sequence for the
+        // counterparty's MSG leaves. The relay is the ordering authority; structure1_cbor =
+        // [1, content_hash(32), sender_pubkey, session_id, last_seen_seq, ts]. The relay sequence
+        // is 1-based and global per session; the daemon tree is 0-based — normalize with -1. Only
+        // COUNTERPARTY leaves (the ones B will ingest); our own echoed leaf already lands via the
+        // send path. The gate (ingestReceivedContent) reads this map to hold out-of-order arrivals.
+        if (!frame.authored_by_us && frame.leaf_kind !== LEAF_KIND_CTRL) {
+          try {
+            const s1 = decode(frame.structure1_cbor) as unknown[];
+            const contentHash = s1?.[1];
+            if (contentHash instanceof Uint8Array && frame.sequence_number > 0) {
+              this.recordWitnessedSequence(
+                agentName,
+                sessionId,
+                Buffer.from(contentHash).toString("hex"),
+                frame.sequence_number - 1,
+              );
+            }
+          } catch (err: unknown) {
+            this.#logger.warn("session.relay.leaf.witness.decode.failed", {
+              sessionId,
+              error: err instanceof Error ? err.message : String(err),
+              correlationId,
+            });
+          }
+        }
         // M7-UPGRADE-002: auto-acknowledge close. When the COUNTERPARTY's SEAL ctrl leaf (0x02)
         // arrives and B has verified the content, B's OWN node auto-co-signs the responder SEAL
         // leaf — no agent prompt — so the bilateral seal completes promptly instead of degrading
