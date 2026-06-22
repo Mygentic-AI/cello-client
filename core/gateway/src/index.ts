@@ -15,5 +15,28 @@ export type {
 export { GATEWAY_UNAVAILABLE, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 
-// Wire protocol, the local-sidecar client, the gateway server, and the spawn helper are
-// added next in M9-CORE-001 (see ./protocol.ts, ./client.ts, ./server.ts, ./spawn.ts).
+// Wire protocol (shared by the local sidecar; Phase 2's mTLS gateway reuses these shapes).
+export {
+  SCREEN_OUTBOUND,
+  SCREEN_INBOUND,
+  encodeFrame,
+  FrameDecoder,
+} from "./protocol.js";
+export type { ScreenMethod, WireScreenRequest, WireScreenResponse } from "./protocol.js";
+
+// The gateway server (the separate program) + the screen-function and logger seams.
+export { createGatewayServer } from "./server.js";
+export type {
+  GatewayScreenFn,
+  GatewayServerOptions,
+  GatewayServerHandle,
+  GatewayLogger,
+} from "./server.js";
+
+// The daemon's local-sidecar adapter.
+export { LocalSidecarGatewayClient } from "./client.js";
+export type { LocalSidecarGatewayClientOptions } from "./client.js";
+
+// Spawn the gateway as a child process (composition root + tests).
+export { spawnGatewaySidecar, GATEWAY_READY_TOKEN } from "./spawn.js";
+export type { SpawnGatewayOptions, SpawnedGateway } from "./spawn.js";
