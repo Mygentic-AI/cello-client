@@ -367,6 +367,11 @@ export class SessionNodeManager {
       // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
       "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
       "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
+      // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)
+      // pubkey, taken from the FROST-signed SessionAssignment's signer_pubkey. The responder uses
+      // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
+      // primary), not just accept it. NULL when this party initiated (it uses its own primary).
+      "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1157,6 +1162,19 @@ export class SessionNodeManager {
     this.#db
       .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE session_id = ?")
       .run(legibilityJson, sealedRootHex, Date.now(), sessionId);
+  }
+
+  /**
+   * M7 legibility-TBS-binding (responder verify): record the counterparty's FROST primary (group)
+   * pubkey from the FROST-signed SessionAssignment, so the responder can VERIFY the bilateral seal
+   * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
+   * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
+   */
+  recordCounterpartyPrimary(sessionId: string, primaryPubkeyHex: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE session_id = ?")
+      .run(primaryPubkeyHex, Date.now(), sessionId);
   }
 
   /**

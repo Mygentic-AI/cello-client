@@ -1275,8 +1275,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
             return;
           }
+          const record = sessionNodeManager.getSessionRecord(sidHex);
           const verdict = await verifyBilateralSealCertificate(
-            { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+            { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger, counterpartyPrimaryHex: record?.counterparty_primary_pubkey ?? null },
             {
               sessionId: sessionIdBytes,
               sealedRoot: sealedRootBytes,
@@ -2256,6 +2257,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         initiatorPeerId: string;
         sessionTimestamp: number;
         signatureType: string | null;
+        signerPubkeyHex: string | null;
         relayPeerId: string;
         relayAddrs: string[];
       }
@@ -2286,6 +2288,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
       sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
       signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+      // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
+      // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
+      // The responder stores it so it can verify the bilateral seal signature locally, not just
+      // accept it (session.ts: "embedded so the counterparty can verify").
+      signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
       relayPeerId,
       relayAddrs,
     };
@@ -2351,6 +2358,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           correlationId,
         });
         return;
+      }
+      // M7 legibility-TBS-binding (responder verify): store the initiator's primary (the seal
+      // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
+      // signature can be verified locally rather than accepted on faith.
+      if (parsed.signerPubkeyHex) {
+        sessionNodeManager.recordCounterpartyPrimary(parsed.sessionIdHex, parsed.signerPubkeyHex);
       }
 
       // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value

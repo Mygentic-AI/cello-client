@@ -331,7 +331,7 @@ export async function verifyUnilateralCertificate(
  * over the canonical hash of exactly what it sent.
  */
 export async function verifyBilateralSealCertificate(
-  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger },
+  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger; counterpartyPrimaryHex?: string | null },
   cert: {
     sessionId: Uint8Array;
     sealedRoot: Uint8Array;
@@ -345,6 +345,7 @@ export async function verifyBilateralSealCertificate(
 ): Promise<{ ok: true; verified: boolean } | { ok: false; reason: string }> {
   if (cert.signatureType !== "frost") return { ok: true, verified: false };
   if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
+  const signerHex = Buffer.from(cert.signerPubkey).toString("hex");
 
   const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
   const share = await persistence.loadActiveFrostKeyShare();
@@ -362,14 +363,27 @@ export async function verifyBilateralSealCertificate(
   }
   if (!ownPrimary || ownPrimary.length !== 32) return { ok: true, verified: false };
 
-  // Only THIS party (the initiator) holds the signing key locally → only it can verify.
-  if (Buffer.from(cert.signerPubkey).toString("hex") !== Buffer.from(ownPrimary).toString("hex")) {
+  // The seal is signed by the INITIATOR's primary (group) key. This party can verify against a
+  // key it holds independently: its OWN primary (when it is the initiator) or the counterparty's
+  // primary from the FROST-signed SessionAssignment (when it is the responder). SI-003: the signer
+  // must be one of these — never a key supplied only by the (untrusted) cert frame.
+  const cpHex = deps.counterpartyPrimaryHex ?? null;
+  if (signerHex === Buffer.from(ownPrimary).toString("hex")) {
+    // initiator path — verify against own primary.
+  } else if (cpHex && signerHex === cpHex.toLowerCase()) {
+    // responder path — verify against the known counterparty primary.
+  } else if (cpHex) {
+    // We know the counterparty primary and the signer is NEITHER participant → unknown signer.
+    return { ok: false, reason: "signer_not_a_session_participant" };
+  } else {
+    // We do not hold the signer's key (no counterparty primary recorded) → cannot verify; accept
+    // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
     return { ok: true, verified: false };
   }
 
   const tbs = bindLegibilityToTbs(buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp), cert.legibility);
   const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
-  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, ownPrimary);
+  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, cert.signerPubkey);
   return valid ? { ok: true, verified: true } : { ok: false, reason: "signature_invalid" };
 }
 
