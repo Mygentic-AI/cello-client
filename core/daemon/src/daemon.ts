@@ -828,11 +828,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // park deposit itself is added in 3b). Both side effects are best-effort and never
   // throw into the content stream handler.
   sessionNodeManager.setAwaitingAckHooks({
-    onPersisted: (sessionId, contentHashHex) => {
-      retryQueue.markContentAcked(sessionId, Buffer.from(contentHashHex, "hex"));
+    onPersisted: (agentName, sessionId, contentHashHex) => {
+      retryQueue.markContentAcked(agentName, sessionId, Buffer.from(contentHashHex, "hex"));
     },
-    onTtf: (sessionId, contentHashHex, content) => {
-      retryQueue.enqueueAwaitingContent(sessionId, Buffer.from(contentHashHex, "hex"), content);
+    onTtf: (agentName, sessionId, contentHashHex, content) => {
+      retryQueue.enqueueAwaitingContent(agentName, sessionId, Buffer.from(contentHashHex, "hex"), content);
     },
   });
 
@@ -879,8 +879,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // PERSISTED session state (the in-memory entry is gone after a restart). Same seal + deposit
   // as the live hook above; the endpoint + recipient come from the sessions row.
   const startupParkFn: import("./retry-queue.js").ParkFn = async (entry) => {
-    const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.sessionId);
-    const record = sessionNodeManager.getSessionRecord(entry.sessionId);
+    const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.agentName, entry.sessionId);
+    const record = sessionNodeManager.getSessionRecord(entry.agentName, entry.sessionId);
     if (!ep) return { parked: false, error: "no_persisted_relay_endpoint" };
     if (!record?.counterparty_pubkey) return { parked: false, error: "no_counterparty" };
     // DOD-LOOP-1: the re-park must originate from the session's OWNING agent (the original
@@ -915,11 +915,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const all = retryQueue.getAwaitingSessions();
     const sessions = filterAgent === undefined
       ? all
-      : all.filter((sid) => sessionNodeManager.getSessionRecord(sid)?.agent_name === filterAgent);
+      : all.filter((s) => s.agentName === filterAgent);
     if (sessions.length === 0) return;
     const parkFn = config.contentParkFn ?? startupParkFn;
     if (!parkFn) {
-      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
+      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s.agentName, s.sessionId), 0);
       logger.warn("content.park.flush.deferred", {
         sessionCount: sessions.length,
         pendingCount,
@@ -928,12 +928,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return;
     }
     let parkedTotal = 0;
-    for (const sid of sessions) {
+    for (const s of sessions) {
       try {
-        parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
+        parkedTotal += await retryQueue.drainAwaitingToPark(s.agentName, s.sessionId, parkFn);
       } catch (err: unknown) {
         logger.error("content.park.flush.failed", {
-          sessionId: sid,
+          sessionId: s.sessionId,
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1304,7 +1304,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
             return;
           }
-          const record = sessionNodeManager.getSessionRecord(sidHex);
+          const record = sessionNodeManager.getSessionRecord(agentName, sidHex);
           const verdict = await verifyBilateralSealCertificate(
             { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger, counterpartyPrimaryHex: record?.counterparty_primary_pubkey ?? null },
             {
@@ -1345,7 +1345,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         });
         if (legibility !== undefined) {
           try {
-            sessionNodeManager.recordSealCertificate(sidHex, rootHex, JSON.stringify(legibility));
+            sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
           } catch (error) {
             logger.warn("seal.certificate.persist.failed", {
               sessionId: sidHex,
@@ -1359,7 +1359,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           waiter({ rootHex, legibility });
         }
         // Mark the session sealed + tear the node down (idempotent — safe if already gone).
-        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+        void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
       })();
     });
   }
@@ -1422,7 +1422,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           return;
         }
         logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, signatureType: sigType, party: "present" });
-        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+        void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
         waiter({ ok: true, sealedRootHex: Buffer.from(sealedRoot).toString("hex") });
       })();
     });
@@ -1574,7 +1574,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // queue until a route exists (the relay-park path is MSG-001-3b).
     const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
     if (counterpartyAddrs.length > 0) {
-      const connected = await sessionNodeManager.connectToCounterparty(sessionId, counterpartyAddrs);
+      const connected = await sessionNodeManager.connectToCounterparty(agentName, sessionId, counterpartyAddrs);
       if (!connected.ok) {
         logger.warn("session.initiate.connect.failed", {
           sessionId,
@@ -1619,7 +1619,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    const record = sessionNodeManager.getSessionRecord(sessionId);
+    // DOD-LOOP-1: scope the lookup to the current agent — the composite (agent, session_id) key IS
+    // the ownership scope. A session_id owned only by a DIFFERENT agent does not exist in this
+    // agent's namespace (returns null → session_not_found), which is correct for loopback (two
+    // agents can hold the same session_id on one daemon).
+    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
     if (!record) {
       return {
         ok: false,
@@ -1628,7 +1632,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    // Ownership: the current agent on this connection must own the session.
+    // Ownership: redundant now that the lookup is agent-scoped (record.agent_name === currentAgent),
+    // kept as a defensive invariant.
     if (record.agent_name !== connState.currentAgent) {
       return {
         ok: false,
@@ -1826,13 +1831,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // legibility states, as a first-class machine-readable property, that a signature attests
   // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
   // delivered-but-unanswered (final_message.answered: false), never agreed.
-  handlers.set("cello_get_sealed_receipt", async (params, _connectionId) => {
+  handlers.set("cello_get_sealed_receipt", async (params, connectionId) => {
     // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
     const sessionId = params?.["session_id"] as string | undefined;
     if (!sessionId || typeof sessionId !== "string") {
       return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
     }
-    const cert = sessionNodeManager.getSealCertificate(sessionId);
+    // DOD-LOOP-1: the certificate is keyed by (agent, session_id) — read the current agent's.
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const cert = sessionNodeManager.getSealCertificate(connState.currentAgent, sessionId);
     if (!cert) {
       return {
         ok: false,
@@ -1860,27 +1870,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // CELLO-M7-MSG-001 (AC-004/AC-005): the send path records un-acked content here when
   // its TTF timer fires, so a crash before the relay park confirms is recoverable at the
   // next startup flush. Stored in the SAME retry_queue table (awaiting_ack = 1).
-  handlers.set("enqueue_awaiting_content", async (params, _connectionId) => {
+  handlers.set("enqueue_awaiting_content", async (params, connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const contentHashHex = params?.contentHash as string | undefined;
     const contentHex = params?.content as string | undefined;
     if (!sessionId || !contentHashHex || !contentHex) {
       return { error: "missing_params", guidance: "Provide sessionId, contentHash (hex), and content (hex)." };
     }
-    retryQueue.enqueueAwaitingContent(sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
-    return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(sessionId) };
+    // DOD-LOOP-1: awaiting content is keyed by the OWNING agent. Prefer an explicit agentName param;
+    // fall back to the connection's current agent.
+    const agentName = (params?.agentName as string | undefined)
+      ?? perConnectionState.get(connectionId)?.currentAgent ?? "";
+    retryQueue.enqueueAwaitingContent(agentName, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
+    return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(agentName, sessionId) };
   });
 
   // CELLO-M7-MSG-001: a `persisted` delivery ACK (or a confirmed park) clears the durable
   // awaiting-ACK entry so the startup flush does not re-park already-delivered content.
-  handlers.set("mark_content_acked", async (params, _connectionId) => {
+  handlers.set("mark_content_acked", async (params, connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const contentHashHex = params?.contentHash as string | undefined;
     if (!sessionId || !contentHashHex) {
       return { error: "missing_params", guidance: "Provide sessionId and contentHash (hex)." };
     }
-    retryQueue.markContentAcked(sessionId, Buffer.from(contentHashHex, "hex"));
-    return { acked: true, awaitingDepth: retryQueue.getAwaitingDepth(sessionId) };
+    const agentName = (params?.agentName as string | undefined)
+      ?? perConnectionState.get(connectionId)?.currentAgent ?? "";
+    retryQueue.markContentAcked(agentName, sessionId, Buffer.from(contentHashHex, "hex"));
+    return { acked: true, awaitingDepth: retryQueue.getAwaitingDepth(agentName, sessionId) };
   });
 
   handlers.set("check_nonce", async (params, _connectionId) => {
@@ -1989,7 +2005,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
         continue;
       }
-      const ingest = sessionNodeManager.ingestReceivedContent(e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
+      const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
       if (ingest.ok) {
         recovered++;
         logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
@@ -2067,7 +2083,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger.warn("session.interrupted.request.rejected", { sessionId, reason, correlationId });
     };
 
-    const localRecord = sessionNodeManager.getSessionRecord(sessionId);
+    // DOD-LOOP-1: resolve the addressed local agent FIRST — the composite (agent, session_id) key
+    // needs it. The request must be addressed to one of our agents (counterpartyPubkey is OUR
+    // pubkey from the initiator's perspective).
+    const localAgent = agents.find((a) => a.pubkey === counterpartyPubkey);
+    if (!localAgent) { await reject("unknown_counterparty"); return; }
+
+    const localRecord = sessionNodeManager.getSessionRecord(localAgent.name, sessionId);
     if (!localRecord) { await reject("session_not_found"); return; }
     // DAEMON-004: an 'active' session is eligible too (the active-session seal
     // reuses this exchange). We still never re-process a terminal 'sealed' row or
@@ -2076,10 +2098,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       await reject("session_not_interrupted");
       return;
     }
-    // The request must be addressed to one of our agents (counterpartyPubkey is
-    // OUR pubkey from the initiator's perspective).
-    const localAgent = agents.find((a) => a.pubkey === counterpartyPubkey);
-    if (!localAgent) { await reject("unknown_counterparty"); return; }
     // From our perspective the initiator is our counterparty.
     if (localRecord.counterparty_pubkey !== initiatorPubkey) { await reject("initiator_mismatch"); return; }
 
@@ -2092,11 +2110,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // initiator dictate the root a responder signs (the SI-001 trust hole). Only a
     // LEGACY 'interrupted' session that predates DAEMON-004 (no tree ever persisted)
     // falls back to message_count + the supplied root (SESSION-001 behavior).
-    const ownTree = sessionNodeManager.getSessionTree(sessionId);
+    const ownTree = sessionNodeManager.getSessionTree(localAgent.name, sessionId);
     const isActive = localRecord.status === "active";
     const useOwnTree = isActive || ownTree.size() > 0;
     const ownLeafCount = useOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
-    const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(sessionId) : merkleRootReq;
+    const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId) : merkleRootReq;
 
     // SI-002/AC-008: leaf-count agreement against our own state.
     if (ownLeafCount !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
@@ -2118,6 +2136,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // only its own signed leaf plus the agreed root; the full both-leaves artifact
     // lives on the initiator side. Advances status interrupted → seal_interrupted_pending.
     sessionNodeManager.persistSealInterruptedCommitment({
+      agentName: localAgent.name,
       sessionId,
       role: "responder",
       ownLeaf,
@@ -2395,7 +2414,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
       // signature can be verified locally rather than accepted on faith.
       if (parsed.signerPubkeyHex) {
-        sessionNodeManager.recordCounterpartyPrimary(parsed.sessionIdHex, parsed.signerPubkeyHex);
+        sessionNodeManager.recordCounterpartyPrimary(agentName, parsed.sessionIdHex, parsed.signerPubkeyHex);
       }
 
       // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
@@ -2484,7 +2503,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     // M1: idempotency — a retransmitted assignment for an already-known session (persisted
     // row OR currently in flight) must not double-accept (orphaned node) or double-enqueue.
-    if (inboundInFlight.has(parsed.sessionIdHex) || sessionNodeManager.getSessionRecord(parsed.sessionIdHex)) {
+    if (inboundInFlight.has(parsed.sessionIdHex) || sessionNodeManager.getSessionRecord(localAgent.name, parsed.sessionIdHex)) {
       logger.info("session.inbound.duplicate.ignored", {
         sessionId: parsed.sessionIdHex,
         agentName: localAgent.name,
@@ -2706,11 +2725,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // merkleRootAtInterruption is IGNORED (SI-001). Only when no tree was ever
     // persisted (legacy / pre-DAEMON-004 sessions) do we fall back to the
     // caller-supplied root and the message_count column (SESSION-001 behavior).
-    const reloadedTree = sessionNodeManager.getSessionTree(sessionId);
+    const reloadedTree = sessionNodeManager.getSessionTree(record.agent_name, sessionId);
     const hasOwnTree = reloadedTree.size() > 0;
     const ownLeafCount = hasOwnTree ? reloadedTree.size() : (record.message_count ?? 0);
     const effectiveRoot = hasOwnTree
-      ? sessionNodeManager.getSessionTreeRootHex(sessionId)
+      ? sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId)
       : merkleRootAtInterruption;
 
     // DB-001: check signaling status before attempting to send
@@ -2857,6 +2876,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // 'sealed' — the FROST threshold notarization has not run (see the H-1
       // SCOPE note above for exactly what blocks it).
       const advanced = sessionNodeManager.persistSealInterruptedCommitment({
+        agentName: record.agent_name,
         sessionId,
         role: "initiator",
         ownLeaf,
@@ -2944,8 +2964,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     // SI-001: the root is the daemon's OWN tree root — computed from the leaves it
     // appended itself. Any caller-supplied merkleRoot is never read here.
-    const ownRootHex = sessionNodeManager.getSessionTreeRootHex(sessionId);
-    const leafCount = sessionNodeManager.getSessionTree(sessionId).size();
+    const ownRootHex = sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId);
+    const leafCount = sessionNodeManager.getSessionTree(record.agent_name, sessionId).size();
     const nonce = randomUUID();
 
     // SI-003: K_local-sign our OWN SEAL leaf over our own root. We reuse the
@@ -3058,6 +3078,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // the FROST threshold notarization that finalizes 'sealed' is the deferred
     // directory step (AC-004, exercised under CELLO_E2E_LIVE).
     const advanced = sessionNodeManager.persistSealInterruptedCommitment({
+      agentName: record.agent_name,
       sessionId,
       role: "initiator",
       ownLeaf,
@@ -3083,7 +3104,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // Retire its live libp2p node so no further inbound content can arrive (which
     // ingestReceivedContent now also rejects) and so the node is not leaked per
     // active close. retireSessionNode stops the node WITHOUT changing the DB status.
-    await sessionNodeManager.retireSessionNode(sessionId);
+    await sessionNodeManager.retireSessionNode(record.agent_name, sessionId);
 
     return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
   }
@@ -3100,7 +3121,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) and 'content' (string) parameters." };
     }
 
-    const record = sessionNodeManager.getSessionRecord(sessionId);
+    // DOD-LOOP-1: the (agent, session_id) lookup is itself the ownership scope.
+    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions for active sessions." };
     }
@@ -3137,7 +3159,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
 
-    const sendResult = await sessionNodeManager.sendContent(sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
+    const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
@@ -3167,7 +3189,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     // Delivered — append the message leaf to the daemon-owned tree (advances root).
-    const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
+    const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
     logger.info("session.content.sent", {
       sessionId,
       recipientPubkey,
@@ -3189,7 +3211,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!sessionId) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) to receive content for a specific session." };
     }
-    const record = sessionNodeManager.getSessionRecord(sessionId);
+    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
     }
@@ -3197,7 +3219,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
 
-    const entry = sessionNodeManager.takeReceivedContent(sessionId);
+    const entry = sessionNodeManager.takeReceivedContent(connState.currentAgent, sessionId);
     if (!entry) {
       return { ok: true, content: null, guidance: "No content is currently buffered for this session. Call cello_receive again after the counterparty sends, or use the blocking receive variant." };
     }

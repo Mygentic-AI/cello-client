@@ -130,6 +130,9 @@ export interface SessionNodeConfig {
 interface ActiveSessionEntry {
   node: CelloNode;
   agentName: string;
+  /** DOD-LOOP-1: the bare session id (hex). The map key is composite (agentName, sessionId), so
+   *  iteration/logging reads the real session id from here, not from the map key. */
+  sessionId: string;
   counterpartyPubkey: string;
   gater: SessionConnectionGater;
   correlationId: string;
@@ -261,8 +264,8 @@ export class SessionNodeManager {
   // retry_queue (and, in 3b, the relay park deposit). Injected after construction
   // because RetryQueue is built later in daemon.ts. When unset, the awaiting-ACK timer
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
-  #onAwaitingPersisted: ((sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -301,8 +304,8 @@ export class SessionNodeManager {
    * Injected by the composition root (daemon.ts) after the RetryQueue exists.
    */
   setAwaitingAckHooks(hooks: {
-    onPersisted?: (sessionId: string, contentHashHex: string) => void;
-    onTtf?: (sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+    onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -324,9 +327,9 @@ export class SessionNodeManager {
    * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
    * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
    */
-  #parkContent(sessionId: string, contentHashHex: string, content: Uint8Array): void {
+  #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array): void {
     const hook = this.#contentParkHook;
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return;
     void hook({
       sessionId,
@@ -351,12 +354,16 @@ export class SessionNodeManager {
     this.#db = new DatabaseSync(this.#dbPath);
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
         agent_name TEXT NOT NULL,
         counterparty_pubkey TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        updated_at INTEGER NOT NULL,
+        -- DOD-LOOP-1: composite key so two of the operator's agents can hold both ends of the
+        -- SAME session_id on ONE daemon (the loopback case). A bare session_id PK would reject
+        -- the second end's row.
+        PRIMARY KEY (agent_name, session_id)
       )
     `);
 
@@ -402,13 +409,16 @@ export class SessionNodeManager {
     // Merkle root so the achieved commitment is never discarded.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS seal_interrupted_artifacts (
-        session_id TEXT PRIMARY KEY,
+        agent_name TEXT NOT NULL,
+        session_id TEXT NOT NULL,
         role TEXT NOT NULL,
         own_leaf TEXT NOT NULL,
         counterparty_leaf TEXT NOT NULL,
         merkle_root TEXT NOT NULL,
         nonce TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        -- DOD-LOOP-1: composite key (per-agent end of a loopback session).
+        PRIMARY KEY (agent_name, session_id)
       )
     `);
 
@@ -419,12 +429,14 @@ export class SessionNodeManager {
     // by session_id ORDER BY leaf_index is the only read pattern.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS session_tree_leaves (
+        agent_name TEXT NOT NULL,
         session_id TEXT NOT NULL,
         leaf_index INTEGER NOT NULL,
         leaf_kind TEXT NOT NULL,
         leaf_hash_hex TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        PRIMARY KEY (session_id, leaf_index)
+        -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
+        PRIMARY KEY (agent_name, session_id, leaf_index)
       )
     `);
 
@@ -442,9 +454,9 @@ export class SessionNodeManager {
         try {
           this.#db
             .prepare(
-              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE session_id = ?",
+              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE agent_name = ? AND session_id = ?",
             )
-            .run(now, interruptedAt, row.session_id);
+            .run(now, interruptedAt, row.agent_name, row.session_id);
           this.#logger.warn("session.interrupted.detected", {
             sessionId: row.session_id,
             agentName: row.agent_name,
@@ -527,8 +539,8 @@ export class SessionNodeManager {
    * inbound session_assignment must carry to the counterparty (so the counterparty gates
    * its handed-off receiver to it). Read-only.
    */
-  getSessionNodePeerId(sessionId: string): string | null {
-    return this.#activeNodes.get(sessionId)?.node.getPeerId() ?? null;
+  getSessionNodePeerId(agentName: string, sessionId: string): string | null {
+    return this.#activeNodes.get(this.#k(agentName, sessionId))?.node.getPeerId() ?? null;
   }
 
   /**
@@ -559,6 +571,19 @@ export class SessionNodeManager {
     ) => void,
   ): void {
     this.#onSessionStateChanged = cb;
+  }
+
+  /**
+   * DOD-LOOP-1: the session core is keyed by (agentName, sessionId), NOT sessionId alone. Two of
+   * the operator's own agents (the loopback case) can hold the two ends of the SAME session_id on
+   * ONE daemon, so a bare session_id is ambiguous between them. This composite string key — the
+   * agent name and the hex session id joined by a 0x1f unit separator (which appears in neither) —
+   * is the key for every in-memory session-core map (#activeNodes, #trees, #receivedContent,
+   * #sessionLiveness, #contentDesynced, #responderSealSubmitted, #awaitingAck). #relayClients is
+   * already per-agent (its own key), and the standing receivers are keyed by agent name directly.
+   */
+  #k(agentName: string, sessionId: string): string {
+    return `${agentName}\x1f${sessionId}`;
   }
 
   /**
@@ -675,10 +700,11 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    // Add to active map
-    this.#activeNodes.set(sessionId, {
+    // Add to active map (keyed by (agentName, sessionId) — DOD-LOOP-1)
+    this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
+      sessionId,
       counterpartyPubkey,
       gater,
       correlationId,
@@ -688,10 +714,10 @@ export class SessionNodeManager {
 
     // DAEMON-004: register the content stream handler so inbound content_frames
     // are cross-checked, appended to the daemon-owned tree, and buffered.
-    await this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
     // liveness. The session connection IS the authority for a direct session.
-    this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
+    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
     // Structure-2 witness (non-fatal — direct content still works without it).
@@ -724,7 +750,7 @@ export class SessionNodeManager {
       // The session node's gater admits only the counterparty; the relay witness is a
       // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
       // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
-      this.#activeNodes.get(sessionId)?.gater.setAllowedOutboundPeer(relay.relayPeerId);
+      this.#activeNodes.get(this.#k(agentName, sessionId))?.gater.setAllowedOutboundPeer(relay.relayPeerId);
 
       // One relay client per (AGENT, RELAY NODE). The relay keys by agent pubkey, so the
       // collision H1 addresses is per relay; CELLO is federated, so a different session for
@@ -758,11 +784,11 @@ export class SessionNodeManager {
         // leaf — no agent prompt — so the bilateral seal completes promptly instead of degrading
         // to unilateral on a slow/busy/crashed agent. Never auto-ack our OWN echoed ctrl leaf.
         if (frame.leaf_kind === LEAF_KIND_CTRL && !frame.authored_by_us) {
-          this.#maybeAutoAcknowledgeSeal(sessionId, correlationId);
+          this.#maybeAutoAcknowledgeSeal(agentName, sessionId, correlationId);
         }
       });
 
-      const entry = this.#activeNodes.get(sessionId);
+      const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {
         entry.relayClient = client;
         entry.relaySessionIdBytes = relay.sessionIdBytes;
@@ -774,8 +800,8 @@ export class SessionNodeManager {
         // before the in-memory entry exists) can deposit un-acked content to the same relay.
         try {
           this.#db
-            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE session_id = ?")
-            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), sessionId);
+            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
+            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), agentName, sessionId);
         } catch (err: unknown) {
           this.#logger.warn("session.relay.endpoint.persist.failed", {
             sessionId,
@@ -835,14 +861,16 @@ export class SessionNodeManager {
    * a disconnect and drives 'gone'.
    */
   #wireSessionLiveness(
+    agentName: string,
     sessionId: string,
     node: CelloNode,
     counterpartyPubkey: string,
     correlationId: string,
   ): void {
+    const key = this.#k(agentName, sessionId);
     node.onPeerConnect(() => {
-      const prior = this.#sessionLiveness.get(sessionId);
-      this.#sessionLiveness.set(sessionId, "alive");
+      const prior = this.#sessionLiveness.get(key);
+      this.#sessionLiveness.set(key, "alive");
       if (prior !== "alive") {
         this.#logger.info("session.liveness.changed", {
           sessionId,
@@ -855,8 +883,8 @@ export class SessionNodeManager {
       }
     });
     node.onPeerDisconnect(() => {
-      const prior = this.#sessionLiveness.get(sessionId);
-      this.#sessionLiveness.set(sessionId, "gone");
+      const prior = this.#sessionLiveness.get(key);
+      this.#sessionLiveness.set(key, "gone");
       if (prior !== "gone") {
         this.#logger.warn("session.liveness.changed", {
           sessionId,
@@ -874,8 +902,8 @@ export class SessionNodeManager {
    * M7-SESSION-003: read the direct-path counterparty liveness for a session.
    * 'unknown' when no session node observation has occurred yet.
    */
-  getSessionLiveness(sessionId: string): "alive" | "gone" | "unknown" {
-    return this.#sessionLiveness.get(sessionId) ?? "unknown";
+  getSessionLiveness(agentName: string, sessionId: string): "alive" | "gone" | "unknown" {
+    return this.#sessionLiveness.get(this.#k(agentName, sessionId)) ?? "unknown";
   }
 
   /**
@@ -945,9 +973,10 @@ export class SessionNodeManager {
     // Remove this agent's standing receiver from the slot and add to active map. The handed-off
     // node keeps its AutoNAT service (it continues to surface dialability).
     this.#standingReceivers.delete(agentName);
-    this.#activeNodes.set(sessionId, {
+    this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
+      sessionId,
       counterpartyPubkey,
       gater,
       correlationId,
@@ -956,9 +985,9 @@ export class SessionNodeManager {
     });
 
     // DAEMON-004: register the content stream handler for the inbound session.
-    await this.#registerContentHandler(sessionId, node, counterpartyPubkey);
+    await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
-    this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
+    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
     // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
@@ -977,10 +1006,11 @@ export class SessionNodeManager {
    * Status written to SQLite.
    */
   async destroySessionNode(
+    agentName: string,
     sessionId: string,
     reason: "sealed" | "interrupted" | "error",
   ): Promise<void> {
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
 
     entry.autoNat.stop();
@@ -1003,16 +1033,16 @@ export class SessionNodeManager {
     // surface as interrupted so AC-010 recovery handles them at next login.
     // The session.node.destroyed log preserves the original reason for observability.
     const dbStatus = reason === "sealed" ? "sealed" : "interrupted";
-    this.#updateSessionStatus(sessionId, dbStatus);
+    this.#updateSessionStatus(agentName, sessionId, dbStatus);
 
-    this.#activeNodes.delete(sessionId);
+    this.#activeNodes.delete(this.#k(agentName, sessionId));
     // Evict the in-memory per-session caches on teardown. The tree is durable in
     // SQLite (getSessionTree reloads it on demand), and the received-content buffer
     // holds plaintext that must not linger after a session ends. Without this, both
     // maps grow unbounded by total sessions seen over a long-lived daemon.
     // (#evictSessionCaches also drops the M7-SESSION-003 liveness flag, so both the
     // destroy and retire teardown paths clear it — no stale verdict survives.)
-    this.#evictSessionCaches(sessionId);
+    this.#evictSessionCaches(agentName, sessionId);
 
     this.#logger.info("session.node.destroyed", {
       sessionId,
@@ -1030,8 +1060,8 @@ export class SessionNodeManager {
    * the way destroySessionNode would. The durable tree stays in SQLite (getSessionTree
    * reloads it); the in-memory plaintext buffer is evicted.
    */
-  async retireSessionNode(sessionId: string): Promise<void> {
-    const entry = this.#activeNodes.get(sessionId);
+  async retireSessionNode(agentName: string, sessionId: string): Promise<void> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
     this.#detachSessionRelay(entry);
     try {
@@ -1045,8 +1075,8 @@ export class SessionNodeManager {
       });
       // Fall through — still remove from active map.
     }
-    this.#activeNodes.delete(sessionId);
-    this.#evictSessionCaches(sessionId);
+    this.#activeNodes.delete(this.#k(agentName, sessionId));
+    this.#evictSessionCaches(agentName, sessionId);
     this.#logger.info("session.node.destroyed", {
       sessionId,
       agentName: entry.agentName,
@@ -1054,19 +1084,20 @@ export class SessionNodeManager {
     });
   }
 
-  /** Drop the in-memory tree + received-content caches for a torn-down session. */
-  #evictSessionCaches(sessionId: string): void {
-    this.#trees.delete(sessionId);
-    this.#receivedContent.delete(sessionId);
+  /** Drop the in-memory tree + received-content caches for a torn-down session (DOD-LOOP-1: per (agent, session)). */
+  #evictSessionCaches(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    this.#trees.delete(key);
+    this.#receivedContent.delete(key);
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
     // fires a park backstop (or keeps a timer) after it is gone.
-    this.#clearAwaitingForSession(sessionId);
+    this.#clearAwaitingForSession(agentName, sessionId);
     // M7-SESSION-003: drop the direct-path liveness flag (the seal gate already read
     // its verdict) so a destroyed/retired session retains no stale alive/gone state.
-    this.#sessionLiveness.delete(sessionId);
+    this.#sessionLiveness.delete(key);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
-    this.#contentDesynced.delete(sessionId);
-    this.#responderSealSubmitted.delete(sessionId);
+    this.#contentDesynced.delete(key);
+    this.#responderSealSubmitted.delete(key);
   }
 
   /**
@@ -1113,7 +1144,7 @@ export class SessionNodeManager {
     // Stop all session nodes, then emit session.node.destroyed only on success
     // (mirrors destroySessionNode ordering: stop first, log destroyed after)
     const stopPromises: Promise<void>[] = [];
-    for (const [sessionId, entry] of this.#activeNodes) {
+    for (const entry of this.#activeNodes.values()) {
       entry.autoNat.stop();
       // M7 DOD-SPINE-6: detach from the agent relay client (closes it when its last
       // session goes) — consistent with the other teardown paths.
@@ -1121,13 +1152,13 @@ export class SessionNodeManager {
       stopPromises.push(
         entry.node.stop().then(() => {
           this.#logger.info("session.node.destroyed", {
-            sessionId,
+            sessionId: entry.sessionId,
             agentName: entry.agentName,
             reason: "interrupted",
           });
         }).catch((err: unknown) => {
           this.#logger.error("session.node.stop.failed", {
-            sessionId,
+            sessionId: entry.sessionId,
             agentName: entry.agentName,
             error: err instanceof Error ? err.message : String(err),
             correlationId: entry.correlationId,
@@ -1186,11 +1217,11 @@ export class SessionNodeManager {
    * persisted); in that case we no-op rather than throw — the cert still flows through the
    * live return path. The legibility content is identical regardless of delivery timing.
    */
-  recordSealCertificate(sessionId: string, sealedRootHex: string, legibilityJson: string): void {
+  recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void {
     if (!this.#db) return;
     this.#db
-      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE session_id = ?")
-      .run(legibilityJson, sealedRootHex, Date.now(), sessionId);
+      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
+      .run(legibilityJson, sealedRootHex, Date.now(), agentName, sessionId);
   }
 
   /**
@@ -1199,11 +1230,11 @@ export class SessionNodeManager {
    * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
    * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
    */
-  recordCounterpartyPrimary(sessionId: string, primaryPubkeyHex: string): void {
+  recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void {
     if (!this.#db) return;
     this.#db
-      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE session_id = ?")
-      .run(primaryPubkeyHex, Date.now(), sessionId);
+      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
+      .run(primaryPubkeyHex, Date.now(), agentName, sessionId);
   }
 
   /**
@@ -1214,11 +1245,11 @@ export class SessionNodeManager {
    * that built the certificate — uses to determine receipt-not-assent, per-party frontiers,
    * attestation modes, and whether the final message was answered.
    */
-  getSealCertificate(sessionId: string): { sealed_root: string; legibility: unknown } | null {
+  getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE session_id = ?")
-      .get(sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
+      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
     if (!row || !row.seal_legibility || !row.sealed_root_hex) return null;
     let legibility: unknown;
     try {
@@ -1239,6 +1270,7 @@ export class SessionNodeManager {
    * @param source 'relay_frame' | 'stream_close'
    */
   async markInterruptedWithDetails(
+    agentName: string,
     sessionId: string,
     messageCount: number,
     source: "relay_frame" | "stream_close",
@@ -1249,7 +1281,7 @@ export class SessionNodeManager {
     // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
     // or already-'interrupted' session back to 'interrupted'. This mirrors the
     // stream-close guard in #watchRelayStream below — the two paths must agree.
-    const existing = this.getSessionRecord(sessionId);
+    const existing = this.getSessionRecord(agentName, sessionId);
     if (!existing || existing.status !== "active") {
       this.#logger.warn("session.interrupt.ignored", {
         sessionId,
@@ -1268,7 +1300,7 @@ export class SessionNodeManager {
     // to 0, so writing it blindly would clobber the column out of sync with the tree
     // (both seal flows prefer tree.size(), but the column must not lie). When a tree
     // exists for this session, persist its size; otherwise fall back to the arg.
-    const treeSize = this.getSessionTree(sessionId).size();
+    const treeSize = this.getSessionTree(agentName, sessionId).size();
     const authoritativeCount = treeSize > 0 ? treeSize : messageCount;
 
     try {
@@ -1277,9 +1309,9 @@ export class SessionNodeManager {
       // UPDATE only mutates a row that is still active.
       this.#db
         .prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE session_id = ? AND status = 'active'",
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE agent_name = ? AND session_id = ? AND status = 'active'",
         )
-        .run(now, authoritativeCount, interruptedAt, sessionId);
+        .run(now, authoritativeCount, interruptedAt, agentName, sessionId);
     } catch (err: unknown) {
       this.#logger.error("session.interrupt.db.write.failed", {
         sessionId,
@@ -1287,13 +1319,8 @@ export class SessionNodeManager {
       });
     }
 
-    // Look up the entry to get agentName for the log event.
-    // Fall back to the DB row when the session isn't in the in-memory map
-    // (e.g. the session was already torn down before the stream watcher fired).
-    const entry = this.#activeNodes.get(sessionId);
-    const agentName: string = entry?.agentName
-      ?? existing.agent_name
-      ?? "unknown";
+    // Look up the in-memory entry (keyed by (agent, session)) for teardown.
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
 
     // Tear down the in-memory session node if it exists
     if (entry) {
@@ -1310,7 +1337,7 @@ export class SessionNodeManager {
         });
         // Fall through — still remove from active map
       }
-      this.#activeNodes.delete(sessionId);
+      this.#activeNodes.delete(this.#k(agentName, sessionId));
       this.#logger.info("session.node.destroyed", {
         sessionId,
         agentName,
@@ -1358,6 +1385,7 @@ export class SessionNodeManager {
    * @returns true if the session row was advanced to seal_interrupted_pending.
    */
   persistSealInterruptedCommitment(opts: {
+    agentName: string;
     sessionId: string;
     role: "initiator" | "responder";
     ownLeaf: unknown;
@@ -1371,10 +1399,11 @@ export class SessionNodeManager {
       this.#db
         .prepare(
           `INSERT OR REPLACE INTO seal_interrupted_artifacts
-           (session_id, role, own_leaf, counterparty_leaf, merkle_root, nonce, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (agent_name, session_id, role, own_leaf, counterparty_leaf, merkle_root, nonce, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
+          opts.agentName,
           opts.sessionId,
           opts.role,
           JSON.stringify(opts.ownLeaf),
@@ -1397,9 +1426,9 @@ export class SessionNodeManager {
     // 'sealed' row or an already-pending one.
     const result = this.#db
       .prepare(
-        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE session_id = ? AND status IN ('active', 'interrupted')",
+        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE agent_name = ? AND session_id = ? AND status IN ('active', 'interrupted')",
       )
-      .run(now, opts.sessionId);
+      .run(now, opts.agentName, opts.sessionId);
     return Number(result.changes) > 0;
   }
 
@@ -1407,7 +1436,7 @@ export class SessionNodeManager {
    * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
    * for a session. Returns null when none exist.
    */
-  getSealInterruptedArtifacts(sessionId: string): {
+  getSealInterruptedArtifacts(agentName: string, sessionId: string): {
     role: string;
     ownLeaf: unknown;
     counterpartyLeaf: unknown;
@@ -1416,8 +1445,8 @@ export class SessionNodeManager {
   } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE session_id = ?")
-      .get(sessionId) as
+      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as
       | {
           role: string;
           own_leaf: string;
@@ -1440,11 +1469,11 @@ export class SessionNodeManager {
    * Return the session record for a specific sessionId, regardless of status.
    * Used by cello_close_session to inspect session state.
    */
-  getSessionRecord(sessionId: string): SessionRecord | null {
+  getSessionRecord(agentName: string, sessionId: string): SessionRecord | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT * FROM sessions WHERE session_id = ?")
-      .get(sessionId) as unknown as SessionRecord | undefined;
+      .prepare("SELECT * FROM sessions WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as unknown as SessionRecord | undefined;
     return row ?? null;
   }
 
@@ -1453,11 +1482,11 @@ export class SessionNodeManager {
    * recorded. Used by the crash-backstop flush, which runs at startup BEFORE the in-memory
    * session entries exist, so it cannot use `entry.relayPeerId`.
    */
-  getPersistedRelayEndpoint(sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
+  getPersistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE session_id = ?")
-      .get(sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
+      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
     if (!row?.relay_peer_id || !row?.relay_addrs) return null;
     try {
       const addrs = JSON.parse(row.relay_addrs) as unknown;
@@ -1475,17 +1504,18 @@ export class SessionNodeManager {
    * on first access (so it survives a restart — AC-007). Never returns null;
    * an unknown session yields an empty tree.
    */
-  getSessionTree(sessionId: string): SessionTree {
-    const cached = this.#trees.get(sessionId);
+  getSessionTree(agentName: string, sessionId: string): SessionTree {
+    const key = this.#k(agentName, sessionId);
+    const cached = this.#trees.get(key);
     if (cached) return cached;
-    const tree = this.#loadTreeFromDb(sessionId);
-    this.#trees.set(sessionId, tree);
+    const tree = this.#loadTreeFromDb(agentName, sessionId);
+    this.#trees.set(key, tree);
     return tree;
   }
 
   /** Current daemon-owned tree root for a session, as hex. */
-  getSessionTreeRootHex(sessionId: string): string {
-    return this.getSessionTree(sessionId).rootHex();
+  getSessionTreeRootHex(agentName: string, sessionId: string): string {
+    return this.getSessionTree(agentName, sessionId).rootHex();
   }
 
   /**
@@ -1495,12 +1525,13 @@ export class SessionNodeManager {
    * @returns the new leaf index and the recomputed root hex.
    */
   appendSessionLeaf(
+    agentName: string,
     sessionId: string,
     kind: SessionTreeLeafKind,
     leafHashHex: string,
     correlationId?: string,
   ): { leafIndex: number; newRootHex: string } {
-    const tree = this.getSessionTree(sessionId);
+    const tree = this.getSessionTree(agentName, sessionId);
     const { leafIndex, newRootHex } = tree.appendLeafHash(kind, leafHashHex);
 
     if (this.#db) {
@@ -1508,10 +1539,10 @@ export class SessionNodeManager {
         this.#db
           .prepare(
             `INSERT INTO session_tree_leaves
-             (session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
-             VALUES (?, ?, ?, ?, ?)`,
+             (agent_name, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
           )
-          .run(sessionId, leafIndex, kind, leafHashHex, Date.now());
+          .run(agentName, sessionId, leafIndex, kind, leafHashHex, Date.now());
         // DAEMON-004 (finding #2): keep sessions.message_count synced to the tree
         // size. message_count is the bilateral leafCount the seal flow signs over
         // (handleSealInterruptedFlow / the responder). If it diverged from the
@@ -1519,8 +1550,8 @@ export class SessionNodeManager {
         // truncated transcript and the bilateral leafCount check would mismatch.
         // The tree (leafIndex + 1 leaves) is authoritative; the column tracks it.
         this.#db
-          .prepare("UPDATE sessions SET message_count = ?, updated_at = ? WHERE session_id = ?")
-          .run(leafIndex + 1, Date.now(), sessionId);
+          .prepare("UPDATE sessions SET message_count = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
+          .run(leafIndex + 1, Date.now(), agentName, sessionId);
       } catch (err: unknown) {
         // A persist failure must be visible, not swallowed: the in-memory tree
         // has advanced but the durable transcript has not, which would diverge
@@ -1553,10 +1584,11 @@ export class SessionNodeManager {
    * succeeds on the first connection, returns a named failure if none connect.
    */
   async connectToCounterparty(
+    agentName: string,
     sessionId: string,
     addrs: string[],
   ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
     }
@@ -1607,12 +1639,13 @@ export class SessionNodeManager {
    *     bidirectional traffic) requires the relay-assigned sequence from MSG-001.
    */
   async sendContent(
+    agentName: string,
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
   ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
     }
@@ -1663,7 +1696,7 @@ export class SessionNodeManager {
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
-      this.#trackAwaitingAck(sessionId, content, contentHash, correlationId);
+      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId);
       const frame = CBOR_ENC.encode({
         type: "content_frame",
         session_id: sessionId,
@@ -1677,11 +1710,11 @@ export class SessionNodeManager {
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
-      this.#untrackAwaitingAck(sessionId, contentHash);
+      this.#untrackAwaitingAck(agentName, sessionId, contentHash);
       // 2b: direct delivery failed (counterparty offline). The hash is already witnessed (R1, the
       // sequence is assigned), so deposit the content to the relay store-and-forward backstop now;
       // the recipient pulls + recovers it on next online (DOD-MSG-3/4).
-      this.#parkContent(sessionId, Buffer.from(contentHash).toString("hex"), content);
+      this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content);
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
       const errMsg =
@@ -1710,10 +1743,12 @@ export class SessionNodeManager {
    * directory-mediated path when this returns relay_unavailable.
    */
   async submitSealLeaf(
+    agentName: string,
     sessionId: string,
     correlationId?: string,
   ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | { ok: false; reason: string }> {
-    const entry = this.#activeNodes.get(sessionId);
+    const sealKey = this.#k(agentName, sessionId);
+    const entry = this.#activeNodes.get(sealKey);
     if (!entry) return { ok: false, reason: "session_node_unavailable" };
     if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
 
@@ -1722,12 +1757,12 @@ export class SessionNodeManager {
     // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
     // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
     // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
-    if (this.#responderSealSubmitted.has(sessionId)) {
+    if (this.#responderSealSubmitted.has(sealKey)) {
       return { ok: false, reason: "responder_seal_already_submitted" };
     }
-    this.#responderSealSubmitted.add(sessionId);
+    this.#responderSealSubmitted.add(sealKey);
 
-    const finalRootHex = this.getSessionTreeRootHex(sessionId);
+    const finalRootHex = this.getSessionTreeRootHex(agentName, sessionId);
     const sealPayload = encodeSealPayload({
       session_id: entry.relaySessionIdBytes,
       final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
@@ -1741,7 +1776,7 @@ export class SessionNodeManager {
     const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
     if (!result.ok) {
       // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
-      this.#responderSealSubmitted.delete(sessionId);
+      this.#responderSealSubmitted.delete(sealKey);
       this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
       return { ok: false, reason: result.reason };
     }
@@ -1751,7 +1786,7 @@ export class SessionNodeManager {
     // content_hash for this ctrl leaf). Computed without mutating the durable tree /
     // message_count, so the bilateral + interrupted seal paths are unaffected.
     const contentHashHex = Buffer.from(contentHash).toString("hex");
-    const reportedRootHex = this.getSessionTree(sessionId).rootWithAppendedHex(contentHashHex);
+    const reportedRootHex = this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex);
     this.#logger.info("session.seal.leaf.submitted", {
       sessionId,
       sequenceNumber: result.sequence_number,
@@ -1783,10 +1818,11 @@ export class SessionNodeManager {
    * redelivered ctrl leaf cannot double-submit; clears the mark on submit failure so a later
    * agent close / reconnect can still complete the seal (DB-001 — never a silent half-seal).
    */
-  #maybeAutoAcknowledgeSeal(sessionId: string, correlationId: string): void {
+  #maybeAutoAcknowledgeSeal(agentName: string, sessionId: string, correlationId: string): void {
+    const ackKey = this.#k(agentName, sessionId);
     // Idempotency: at most one responder seal per session (auto-ack or agent close).
-    if (this.#responderSealSubmitted.has(sessionId)) return;
-    const record = this.getSessionRecord(sessionId);
+    if (this.#responderSealSubmitted.has(ackKey)) return;
+    const record = this.getSessionRecord(agentName, sessionId);
     // Only an ACTIVE session auto-acks. A committed/sealing/sealed/interrupted session is out of
     // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
     if (!record || record.status !== "active") return;
@@ -1797,7 +1833,7 @@ export class SessionNodeManager {
     // two specced reasons — `desynced` (B's tree is behind the canonical sealed tail) and
     // `content_unverifiable` (parked content unrecoverable) — require the MSG-001-3b canonical-
     // sequence reconciliation that is deferred; they are reserved for that follow-on.
-    if (this.#contentDesynced.has(sessionId)) {
+    if (this.#contentDesynced.has(ackKey)) {
       this.#logger.error("session.seal.autoack.skipped", {
         sessionId,
         reason: "content_tamper",
@@ -1816,11 +1852,11 @@ export class SessionNodeManager {
       }
       return;
     }
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(ackKey);
     const responderPubkey = entry?.relayClient?.senderPubkeyHex ?? "unknown";
     // submitSealLeaf owns the #responderSealSubmitted idempotency mark (set synchronously at its
     // top), so the auto-ack does not pre-mark — it just reacts to the result.
-    void this.submitSealLeaf(sessionId, correlationId)
+    void this.submitSealLeaf(agentName, sessionId, correlationId)
       .then((result) => {
         if (result.ok) {
           // SI-001: the responder SEAL leaf was signed by B's OWN node (K_local) in submitSealLeaf.
@@ -1869,6 +1905,7 @@ export class SessionNodeManager {
    * @returns the appended leaf index (as sequenceNumber) on success.
    */
   ingestReceivedContent(
+    agentName: string,
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
@@ -1884,7 +1921,7 @@ export class SessionNodeManager {
     // the local view to match the counterparty BEFORE the bilateral seal — it is not a resumption
     // (no new activity, no re-accept) and its root was never committed. So allow 'active' AND
     // 'interrupted'; reject only the two committed states. (No DB row = test-only path, allowed.)
-    const record = this.getSessionRecord(sessionId);
+    const record = this.getSessionRecord(agentName, sessionId);
     if (record && (record.status === "sealed" || record.status === "seal_interrupted_pending")) {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
@@ -1906,13 +1943,13 @@ export class SessionNodeManager {
       // M7-UPGRADE-002 (SI-002): a tamper makes this session's content unverifiable — the
       // auto-acknowledge gate must never auto-co-sign it. The session stays alive (DOD-MSG-7),
       // but the responder seal now requires the agent's explicit decision, not an auto-ack.
-      this.#contentDesynced.add(sessionId);
+      this.#contentDesynced.add(this.#k(agentName, sessionId));
       return { ok: false, reason: "content_hash_mismatch" };
     }
 
-    const entry = this.#activeNodes.get(sessionId);
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     const senderPubkey = entry?.counterpartyPubkey
-      ?? this.getSessionRecord(sessionId)?.counterparty_pubkey
+      ?? this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey
       ?? "unknown";
 
     // DOD-MSG-5: a content_hash satisfies AT MOST ONE Merkle leaf, exactly once. If this hash is
@@ -1920,7 +1957,7 @@ export class SessionNodeManager {
     // is a replay — do NOT append a second leaf and do NOT double-count it. The recipient already
     // holds this message at its assigned sequence. (In the normal single-delivery case this find is
     // -1, so the live/recover append paths are unchanged.)
-    const existingIdx = this.getSessionTree(sessionId).leaves().findIndex((l) => l.hashHex === contentHashHex);
+    const existingIdx = this.getSessionTree(agentName, sessionId).leaves().findIndex((l) => l.hashHex === contentHashHex);
     if (existingIdx >= 0) {
       this.#logger.info("session.content.deduplicated", {
         sessionId,
@@ -1931,10 +1968,11 @@ export class SessionNodeManager {
       return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx };
     }
 
-    const { leafIndex, newRootHex } = this.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
+    const { leafIndex, newRootHex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
 
-    let buf = this.#receivedContent.get(sessionId);
-    if (!buf) { buf = []; this.#receivedContent.set(sessionId, buf); }
+    const recvKey = this.#k(agentName, sessionId);
+    let buf = this.#receivedContent.get(recvKey);
+    if (!buf) { buf = []; this.#receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
 
     this.#logger.info("session.content.received", {
@@ -1949,8 +1987,8 @@ export class SessionNodeManager {
   }
 
   /** DAEMON-004: pop the oldest verified received content for cello_receive. */
-  takeReceivedContent(sessionId: string): ReceivedContentEntry | null {
-    const buf = this.#receivedContent.get(sessionId);
+  takeReceivedContent(agentName: string, sessionId: string): ReceivedContentEntry | null {
+    const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
     if (!buf || buf.length === 0) return null;
     return buf.shift() ?? null;
   }
@@ -1964,15 +2002,16 @@ export class SessionNodeManager {
    * `unref`'d so an in-flight wait never keeps the daemon process (or a test runner)
    * alive on its own.
    */
-  #trackAwaitingAck(sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
-    let bySession = this.#awaitingAck.get(sessionId);
-    if (!bySession) { bySession = new Map(); this.#awaitingAck.set(sessionId, bySession); }
+    const ackKey = this.#k(agentName, sessionId);
+    let bySession = this.#awaitingAck.get(ackKey);
+    if (!bySession) { bySession = new Map(); this.#awaitingAck.set(ackKey, bySession); }
     // Replace any prior timer for the same (session, hash) so we never leak a timer.
     const prior = bySession.get(hashHex);
     if (prior) clearTimeout(prior.timer);
     const timer = setTimeout(() => {
-      this.#handleTtfExpiry(sessionId, hashHex);
+      this.#handleTtfExpiry(agentName, sessionId, hashHex);
     }, this.#contentTtfMs);
     if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();
     bySession.set(hashHex, { timer, content, correlationId });
@@ -1984,14 +2023,15 @@ export class SessionNodeManager {
    * A `received`-level ACK is NOT handled here — the protocol acts on `persisted` only,
    * so a received ACK leaves the timer armed.
    */
-  #resolveAwaitingAck(sessionId: string, contentHash: Uint8Array): void {
+  #resolveAwaitingAck(agentName: string, sessionId: string, contentHash: Uint8Array): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
-    const bySession = this.#awaitingAck.get(sessionId);
+    const ackKey = this.#k(agentName, sessionId);
+    const bySession = this.#awaitingAck.get(ackKey);
     const entry = bySession?.get(hashHex);
     if (!entry || !bySession) return; // unknown / already resolved — idempotent
     clearTimeout(entry.timer);
     bySession.delete(hashHex);
-    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+    if (bySession.size === 0) this.#awaitingAck.delete(ackKey);
     this.#logger.info("content.delivery.acked", {
       sessionId,
       contentHash: hashHex,
@@ -2001,7 +2041,7 @@ export class SessionNodeManager {
     // Clear the durable crash-backstop entry so the startup flush does not re-park
     // already-delivered content.
     try {
-      this.#onAwaitingPersisted?.(sessionId, hashHex);
+      this.#onAwaitingPersisted?.(agentName, sessionId, hashHex);
     } catch (err: unknown) {
       this.#logger.error("content.delivery.ack.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
@@ -2015,15 +2055,16 @@ export class SessionNodeManager {
    * deposit in 3b). The session is never killed and the operator is never interrupted —
    * parking is best-effort durability.
    */
-  #handleTtfExpiry(sessionId: string, hashHex: string): void {
-    const bySession = this.#awaitingAck.get(sessionId);
+  #handleTtfExpiry(agentName: string, sessionId: string, hashHex: string): void {
+    const ackKey = this.#k(agentName, sessionId);
+    const bySession = this.#awaitingAck.get(ackKey);
     const entry = bySession?.get(hashHex);
     if (!entry || !bySession) return;
     bySession.delete(hashHex);
-    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+    if (bySession.size === 0) this.#awaitingAck.delete(ackKey);
     this.#logger.debug("content.delivery.ttf_expired", { sessionId, contentHash: hashHex });
     try {
-      this.#onAwaitingTtf?.(sessionId, hashHex, entry.content);
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
@@ -2032,7 +2073,7 @@ export class SessionNodeManager {
     // 2b: delivered to the wire but never confirmed `persisted` — deposit it to the relay
     // store-and-forward so the recipient recovers it (at the witnessed sequence). The durable
     // awaiting entry above remains the crash backstop.
-    this.#parkContent(sessionId, hashHex, entry.content);
+    this.#parkContent(agentName, sessionId, hashHex, entry.content);
   }
 
   /**
@@ -2041,8 +2082,8 @@ export class SessionNodeManager {
    * session channel, so the ACK carries no signature; a failed ACK send is logged and
    * the sender recovers via its TTF/recovery path rather than a thrown error here.
    */
-  async #sendDeliveryAck(sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
-    const entry = this.#activeNodes.get(sessionId);
+  async #sendDeliveryAck(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
@@ -2066,31 +2107,33 @@ export class SessionNodeManager {
   }
 
   /** Cancel and drop a single awaiting-ACK entry (e.g. the send failed after arming). */
-  #untrackAwaitingAck(sessionId: string, contentHash: Uint8Array): void {
+  #untrackAwaitingAck(agentName: string, sessionId: string, contentHash: Uint8Array): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
-    const bySession = this.#awaitingAck.get(sessionId);
+    const ackKey = this.#k(agentName, sessionId);
+    const bySession = this.#awaitingAck.get(ackKey);
     const entry = bySession?.get(hashHex);
     if (!entry || !bySession) return;
     clearTimeout(entry.timer);
     bySession.delete(hashHex);
-    if (bySession.size === 0) this.#awaitingAck.delete(sessionId);
+    if (bySession.size === 0) this.#awaitingAck.delete(ackKey);
   }
 
   /** Cancel and drop all awaiting-ACK timers for a session (teardown). */
-  #clearAwaitingForSession(sessionId: string): void {
-    const bySession = this.#awaitingAck.get(sessionId);
+  #clearAwaitingForSession(agentName: string, sessionId: string): void {
+    const ackKey = this.#k(agentName, sessionId);
+    const bySession = this.#awaitingAck.get(ackKey);
     if (!bySession) return;
     for (const entry of bySession.values()) clearTimeout(entry.timer);
-    this.#awaitingAck.delete(sessionId);
+    this.#awaitingAck.delete(ackKey);
   }
 
-  #loadTreeFromDb(sessionId: string): SessionTree {
+  #loadTreeFromDb(agentName: string, sessionId: string): SessionTree {
     if (!this.#db) return SessionTree.empty();
     const rows = this.#db
       .prepare(
-        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE session_id = ? ORDER BY leaf_index ASC",
+        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE agent_name = ? AND session_id = ? ORDER BY leaf_index ASC",
       )
-      .all(sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
+      .all(agentName, sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
     return SessionTree.fromLeaves(
       rows.map((r) => ({ kind: r.leaf_kind === "ctrl" ? "ctrl" : "msg", hashHex: r.leaf_hash_hex })),
     );
@@ -2104,10 +2147,10 @@ export class SessionNodeManager {
   // is provably registered before the caller returns (and thus before any peer sends
   // content). libp2p registers the protocol synchronously today, but awaiting removes
   // the fragile dependency on that internal timing (review L4).
-  async #registerContentHandler(sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
+  async #registerContentHandler(agentName: string, sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
     try {
       await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
-        void this.#handleContentStream(sessionId, stream);
+        void this.#handleContentStream(agentName, sessionId, stream);
       });
     } catch (err: unknown) {
       this.#logger.error("session.content.handler.register.failed", {
@@ -2117,7 +2160,7 @@ export class SessionNodeManager {
     }
   }
 
-  async #handleContentStream(sessionId: string, stream: Stream): Promise<void> {
+  async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
     const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
     try {
       const result = await iter.next();
@@ -2135,7 +2178,7 @@ export class SessionNodeManager {
         const ackHash = frame["content_hash"];
         const level = frame["level"];
         if (ackHash instanceof Uint8Array && level === "persisted") {
-          this.#resolveAwaitingAck(sessionId, ackHash);
+          this.#resolveAwaitingAck(agentName, sessionId, ackHash);
         }
         return;
       }
@@ -2146,13 +2189,13 @@ export class SessionNodeManager {
       if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
-      const ingest = this.ingestReceivedContent(sessionId, contentBytes, contentHash, correlationId);
+      const ingest = this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId);
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
       // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
       // path can park / recover.
       if (ingest.ok) {
-        void this.#sendDeliveryAck(sessionId, contentHash, correlationId);
+        void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {
       this.#logger.warn("session.content.stream.read.failed", {
@@ -2177,8 +2220,8 @@ export class SessionNodeManager {
    *   (used as the count at interruption — best effort since exact count at frame
    *   receipt may differ, but this is the value available at stream setup time)
    */
-  registerRelayStream(sessionId: string, stream: Stream, messageCount: number = 0): void {
-    void this.#watchRelayStream(sessionId, stream, messageCount);
+  registerRelayStream(agentName: string, sessionId: string, stream: Stream, messageCount: number = 0): void {
+    void this.#watchRelayStream(agentName, sessionId, stream, messageCount);
   }
 
   /**
@@ -2194,7 +2237,7 @@ export class SessionNodeManager {
    *      a. If !receivedInterruptFrame:
    *         - Call markInterruptedWithDetails(sessionId, messageCount, 'stream_close')
    */
-  async #watchRelayStream(sessionId: string, stream: Stream, messageCount: number): Promise<void> {
+  async #watchRelayStream(agentName: string, sessionId: string, stream: Stream, messageCount: number): Promise<void> {
     let receivedInterruptFrame = false;
     // CELLO-M7-TRANSPORT-001: cast the stream input to lp.decode. Adding the
     // @libp2p/autonat service (interface@3.2.2 / uint8arraylist v2) to the
@@ -2245,7 +2288,7 @@ export class SessionNodeManager {
           }
           receivedInterruptFrame = true;
           // Always mark the BOUND sessionId — never the id carried in the frame.
-          await this.markInterruptedWithDetails(sessionId, messageCount, "relay_frame");
+          await this.markInterruptedWithDetails(agentName, sessionId, messageCount, "relay_frame");
           break; // No more relay frames expected after session_interrupted
         }
       }
@@ -2256,9 +2299,9 @@ export class SessionNodeManager {
     // AC-005: stream closed without a session_interrupted frame
     if (!receivedInterruptFrame) {
       // Only mark interrupted if this session is still active in SQLite
-      const record = this.getSessionRecord(sessionId);
+      const record = this.getSessionRecord(agentName, sessionId);
       if (record && record.status === "active") {
-        await this.markInterruptedWithDetails(sessionId, messageCount, "stream_close");
+        await this.markInterruptedWithDetails(agentName, sessionId, messageCount, "stream_close");
       }
     }
   }
@@ -2389,6 +2432,7 @@ export class SessionNodeManager {
   }
 
   #updateSessionStatus(
+    agentName: string,
     sessionId: string,
     status: "active" | "sealed" | "interrupted",
   ): void {
@@ -2397,9 +2441,9 @@ export class SessionNodeManager {
     try {
       this.#db
         .prepare(
-          "UPDATE sessions SET status = ?, updated_at = ? WHERE session_id = ?",
+          "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?",
         )
-        .run(status, now, sessionId);
+        .run(status, now, agentName, sessionId);
     } catch (err: unknown) {
       this.#logger.error("session.interrupt.db.write.failed", {
         sessionId,
