@@ -203,7 +203,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
       await client.send("ipc.connect", { clientType: "test" });
       const content = randomBytes(48);
       const contentHashHex = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest().toString("hex");
-      await client.send("enqueue_awaiting_content", { sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex") });
+      await client.send("enqueue_awaiting_content", { agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex") });
 
       // Bring alice online → her standing receiver comes up → the per-agent re-park flush fires.
       logEvents.length = 0;

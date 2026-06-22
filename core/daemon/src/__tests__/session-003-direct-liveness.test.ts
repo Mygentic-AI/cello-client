@@ -78,13 +78,13 @@ describe("AC-004: direct-session liveness flips to 'gone' on real session-node d
 
       // B dials A's session node — onPeerConnect fires → 'alive'
       await nodeB.dial(res.addrs[0]!);
-      await waitFor(() => mgr.getSessionLiveness(sessionId) === "alive", 5000);
-      expect(mgr.getSessionLiveness(sessionId)).toBe("alive");
+      await waitFor(() => mgr.getSessionLiveness("agentA", sessionId) === "alive", 5000);
+      expect(mgr.getSessionLiveness("agentA", sessionId)).toBe("alive");
 
       // B is terminated — A's session node observes peer:disconnect → 'gone'
       await nodeB.stop();
-      await waitFor(() => mgr.getSessionLiveness(sessionId) === "gone", 8000);
-      expect(mgr.getSessionLiveness(sessionId)).toBe("gone");
+      await waitFor(() => mgr.getSessionLiveness("agentA", sessionId) === "gone", 8000);
+      expect(mgr.getSessionLiveness("agentA", sessionId)).toBe("gone");
 
       const goneEvt = entries.find(
         (e) => e.event === "session.liveness.changed" && e.ctx["liveness"] === "gone",
@@ -104,6 +104,6 @@ describe("AC-004: direct-session liveness flips to 'gone' on real session-node d
     const { logger } = makeLogger();
     const dbPath = join(mkdtempSync(join(tmpdir(), "cello-session-003-")), "sessions.db");
     const mgr = new SessionNodeManager({ factory: new RealNodeFactory(), logger, dbPath });
-    expect(mgr.getSessionLiveness("never-tracked")).toBe("unknown");
+    expect(mgr.getSessionLiveness("agentA", "never-tracked")).toBe("unknown");
   });
 });

@@ -209,7 +209,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       expect(initRes.sessionId).toBe(SID_HEX);
 
       // ── The directory pushes the assignment to B, carrying N_A's peer id (known only now).
-      const naPeerId = A.getSessionNodeManager().getSessionNodePeerId(SID_HEX);
+      const naPeerId = A.getSessionNodeManager().getSessionNodePeerId("alice", SID_HEX);
       expect(typeof naPeerId).toBe("string");
       injectB.inject!({
         type: "session_assignment",

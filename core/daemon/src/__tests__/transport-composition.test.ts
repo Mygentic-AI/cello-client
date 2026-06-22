@@ -203,7 +203,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
 
     // The session EXISTS in the session-core now — active, owned by alice, bound to the
     // counterparty pubkey the caller named.
-    const record = handle!.getSessionNodeManager().getSessionRecord(sessionId);
+    const record = handle!.getSessionNodeManager().getSessionRecord("alice", sessionId);
     expect(record).not.toBeNull();
     expect(record?.status).toBe("active");
     expect(record?.agent_name).toBe("alice");
