@@ -27,6 +27,9 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { generateKeypair } from "@cello-protocol/crypto";
+import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
+import { encodeStructure1 } from "../session-relay-client.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -178,5 +181,104 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     const decBare = mgr.decodeParkEnvelope(bare);
     expect(Buffer.from(decBare.content).toString("hex")).toBe(Buffer.from(bare).toString("hex"));
     expect(decBare.structure2Cbor).toBeUndefined();
+  });
+});
+
+// ─── DOD-MSG-4 SECURITY: the ordering-record verification has teeth (test-attacker BLOCKING) ──────
+// The receiver MUST verify the relay-signed Structure2 carried in the frame/park envelope: the
+// SENDER signature over structure1_cbor, the signer == the session counterparty (sovereign-node — B
+// does not trust the counterparty for ordering), and the record binds to THIS content's hash. Without
+// these, a malicious counterparty/MITM stamps an arbitrary canonical sequence: a forged-ahead seq
+// parks the message in #heldContent forever (never acked persisted) = silent denial-of-delivery; a
+// rearranged seq diverges B's leaf order from A's, breaking leaf-index===canonical-sequence. These
+// tests fail if the verify / counterparty / hash-bind checks are stripped.
+describe("DOD-MSG-4: ordering-record verification is adversarially exercised", () => {
+  let tempDir: string;
+  let logger: Logger;
+  let events: LogEvent[];
+  const sid = "f".repeat(64);
+  const enc = (s: string) => new TextEncoder().encode(s);
+  const fired = (event: string) => events.some((e) => e.event === event);
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-msg4-sec-"));
+    const l = makeLogger();
+    logger = l.logger;
+    events = l.events;
+  });
+  afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
+
+  /** A self-consistent signed ordering record by `kp` for `content` at relay sequence `seq`. */
+  async function buildRecord(
+    kp: ReturnType<typeof generateKeypair>,
+    content: Uint8Array,
+    seq: number,
+    opts: { corruptSig?: boolean } = {},
+  ): Promise<{ structure1Cbor: Uint8Array; structure2Cbor: Uint8Array; contentHash: Uint8Array }> {
+    const pubkey = await kp.getPublicKey();
+    const contentHash = msgLeafHash(content); // 32-byte msg leaf hash, as the sender submits
+    const structure1Cbor = encodeStructure1(contentHash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+    let sig = await kp.sign(structure1Cbor); // 64-byte Ed25519 over the exact structure1 bytes
+    if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
+    const built = buildStructure2(seq, pubkey, contentHash, sig, new Uint8Array(32));
+    if (!built.ok) throw new Error("buildStructure2 failed: " + JSON.stringify(built.error));
+    return { structure1Cbor, structure2Cbor: encodeStructure2(built.structure2), contentHash };
+  }
+
+  async function managerWithCounterparty(kp: ReturnType<typeof generateKeypair>, dbName: string): Promise<SessionNodeManager> {
+    const mgr = await makeManager(logger, join(tempDir, dbName));
+    const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    await mgr.createSessionNode(sid, "alice", cpHex, "peer-id", "corr");
+    return mgr;
+  }
+
+  it("HAPPY: a validly-signed counterparty record IS recorded → ingest appends at the canonical sequence", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "happy.db");
+    const c = enc("m0");
+    const rec = await buildRecord(kp, c, 1); // relay seq 1 → 0-based idx 0
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
+    expect(fired("session.content.ordering.recorded"), "valid record is accepted").toBe(true);
+    expect(mgr.ingestReceivedContent("alice", sid, c, rec.contentHash).ok).toBe(true);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
+  });
+
+  it("BAD SIGNATURE is REJECTED — no ordering recorded, bad_signature warn, content still delivered (fail-closed, no loss)", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "badsig.db");
+    const c = enc("m0");
+    const rec = await buildRecord(kp, c, 5, { corruptSig: true }); // forged-ahead seq 5
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
+    expect(fired("session.content.ordering.recorded"), "a bad signature must NOT record ordering").toBe(false);
+    expect(fired("session.content.ordering.bad_signature")).toBe(true);
+    // The forged seq-5 was NOT recorded, so the honest arrival is NOT held forever behind a fake gap —
+    // it appends in arrival order. (If verification were stripped, seq-5 would record and HOLD this.)
+    const r = mgr.ingestReceivedContent("alice", sid, c, rec.contentHash);
+    expect(r.ok && r.held !== true, "fail-closed on the record, but the message still delivers").toBe(true);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
+  });
+
+  it("WRONG SIGNER (valid sig by a NON-counterparty key) is REJECTED — wrong_signer, no ordering recorded", async () => {
+    const counterparty = generateKeypair();
+    const attacker = generateKeypair(); // a different, perfectly valid key
+    const mgr = await managerWithCounterparty(counterparty, "wrongsigner.db");
+    const c = enc("m0");
+    const rec = await buildRecord(attacker, c, 9); // self-consistent, but signed by the attacker
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, rec.contentHash);
+    expect(fired("session.content.ordering.recorded"), "a non-counterparty signer must NOT record ordering").toBe(false);
+    expect(fired("session.content.ordering.wrong_signer")).toBe(true);
+    expect(mgr.ingestReceivedContent("alice", sid, c, rec.contentHash).ok).toBe(true);
+    expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
+  });
+
+  it("HASH MISMATCH (record bound to a DIFFERENT content hash) is REJECTED — hash_mismatch, no ordering recorded", async () => {
+    const kp = generateKeypair();
+    const mgr = await managerWithCounterparty(kp, "hashmismatch.db");
+    const c = enc("m0");
+    const rec = await buildRecord(kp, c, 3); // structure1 binds hash(m0)
+    const otherHash = msgLeafHash(enc("a different message")); // present the record for the wrong content
+    mgr.recordOrderingRecord("alice", sid, rec.structure1Cbor, rec.structure2Cbor, otherHash);
+    expect(fired("session.content.ordering.recorded"), "a hash-mismatched record must NOT record ordering").toBe(false);
+    expect(fired("session.content.ordering.hash_mismatch")).toBe(true);
   });
 });
