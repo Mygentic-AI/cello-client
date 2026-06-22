@@ -20,6 +20,7 @@
 
 import { decode } from "cbor-x";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
+import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
 import { FrostThresholdSigner } from "@cello-protocol/crypto";
 import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { IThresholdSigner } from "@cello-protocol/crypto";
@@ -215,7 +216,15 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
         deps.logger.warn("session.seal.ceremony.abort", { agentName: deps.agentName, sessionId: sidHex, reason: "no_signer" });
         return;
       }
-      const tbs = buildSealTbs(sessionId, sealedRoot, leafCount, timestamp);
+      // M7 legibility-TBS-binding: when the directory's seal_verified carries `legibility` (the
+      // bilateral seal), fold its canonical hash into the TBS we co-sign — so the FROST signature
+      // covers the legibility and a MITM cannot tamper answered/frontier/attestation_mode in
+      // transit. The directory binds the IDENTICAL hash (it built the TBS it verifies against);
+      // the receiving client re-binds and verifies. Unilateral seal_verified carries no legibility
+      // → plain TBS (bindLegibilityToTbs is a no-op), matching the directory's unilateral TBS.
+      const legibility = frame["legibility"];
+      const legForHash = legibility && typeof legibility === "object" ? (legibility as LegibilityForHash) : null;
+      const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, timestamp), legForHash);
       let frostSignature: Uint8Array | null = null;
       try {
         // The initiator COORDINATES the seal FROST ceremony (its signer drives the
@@ -296,6 +305,45 @@ export async function verifyUnilateralCertificate(
 
   const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(deps.agentPubkeyHex, "hex"));
   const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, primaryPubkey);
+  return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
+}
+
+/**
+ * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate WITHOUT trusting the
+ * channel, INCLUDING the legibility binding. The seal's FROST signature is produced by the
+ * INITIATOR's group key, so a verifying party anchors on a key it independently knows: the signer
+ * MUST be one of the two session participants this party already holds (its own primary_pubkey or
+ * its stored counterparty_pubkey) — a channel-swapped signer is rejected. The TBS is rebuilt WITH
+ * the legibility hash folded in, so a MITM that tampered `answered` / `content_frontier_seq` /
+ * `attestation_mode` (carried unsigned on the frame) changes the hash → the signature fails.
+ *
+ * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
+ * over the canonical hash of exactly what it sent, so the verifier must hash exactly what arrived.
+ * 'single' (pre-DKG) is not channel-independently verifiable here; surfaced honestly.
+ */
+export function verifyBilateralSealCertificate(
+  cert: {
+    sessionId: Uint8Array;
+    sealedRoot: Uint8Array;
+    leafCount: number;
+    closeTimestamp: number;
+    frostSignature: Uint8Array;
+    signerPubkey: Uint8Array;
+    signatureType: "frost" | "single";
+    legibility: LegibilityForHash | null;
+  },
+  trustedParticipantPubkeysHex: string[],
+): { ok: true } | { ok: false; reason: string } {
+  if (cert.signatureType !== "frost") return { ok: false, reason: "single_key_verification_unsupported" };
+  if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
+  const signerHex = Buffer.from(cert.signerPubkey).toString("hex").toLowerCase();
+  // SI-003: the signer must be a participant this party independently knows — never trust the frame.
+  if (!trustedParticipantPubkeysHex.map((h) => h.toLowerCase()).includes(signerHex)) {
+    return { ok: false, reason: "signer_not_a_session_participant" };
+  }
+  const tbs = bindLegibilityToTbs(buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp), cert.legibility);
+  const verifier = new FrostThresholdSigner({ threshold: 1, participants: 1 }, Buffer.from(cert.signerPubkey));
+  const valid = verifier.verifySignature(cert.frostSignature, tbs, "cello-frost-seal-v1" as FrostContext, cert.signerPubkey);
   return valid ? { ok: true } : { ok: false, reason: "signature_invalid" };
 }
 
