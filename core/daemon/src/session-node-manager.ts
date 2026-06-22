@@ -77,6 +77,7 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
 
@@ -1707,10 +1708,18 @@ export class SessionNodeManager {
     // hash (INV-3). Best-effort: a relay miss degrades to local-only sequencing. Previously this
     // ran AFTER a successful direct send, so an offline recipient's content got NO sequence — the
     // gap R1 closes.
+    // DOD-MSG-4 (self-ordering content frame): the relay's committed ordering record for this leaf,
+    // captured from the hash submit so it can be stamped into the content frame (and the parked
+    // entry). Undefined if the relay is unreachable / an old relay — the receiver then falls back to
+    // the leaf_deliver witness stream / arrival order.
+    let orderingS1: Uint8Array | undefined;
+    let orderingS2: Uint8Array | undefined;
     if (entry.relayClient && entry.relaySessionIdBytes) {
       try {
         const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash);
         if (witnessed.ok) {
+          orderingS1 = witnessed.structure1_cbor;
+          orderingS2 = witnessed.structure2_cbor;
           this.#logger.info("session.relay.hash.submitted", {
             sessionId,
             sequenceNumber: witnessed.sequence_number,
@@ -1753,6 +1762,12 @@ export class SessionNodeManager {
         content_hash: contentHash,
         content_bytes: content,
         correlation_id: correlationId,
+        // DOD-MSG-4 (self-ordering): the relay's signed ordering record, so the receiver verifies +
+        // orders from the frame ALONE (no dependence on the separate leaf_deliver witness timing).
+        // structure1_cbor = sender-signed bytes (verify); structure2_cbor = relay's committed seq +
+        // prev_root (order). Omitted if the relay was unreachable — receiver falls back to the witness.
+        structure1_cbor: orderingS1,
+        structure2_cbor: orderingS2,
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
@@ -2320,6 +2335,71 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-MSG-4 (self-ordering content frame): verify the relay's signed ordering record carried IN the
+   * content frame and record the canonical sequence for the strict-in-order gate — so ordering does
+   * not depend on the separate leaf_deliver witness arriving first. Best-effort: any failure (malformed,
+   * hash mismatch, bad signature, wrong signer) is logged and ignored — the content still ingests and
+   * orders via the witness stream / arrival, so a bad record cannot block delivery.
+   *
+   * structure1_cbor = [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts] —
+   *   the EXACT bytes the sender signed (needed to verify; Structure2 omits session_id/last_seen/ts).
+   * structure2_cbor = [seq, sender_pubkey, content_hash, sender_signature, scan_result, prev_root].
+   */
+  #recordFrameOrdering(
+    agentName: string,
+    sessionId: string,
+    structure1Cbor: Uint8Array,
+    structure2Cbor: Uint8Array,
+    contentHash: Uint8Array,
+    correlationId?: string,
+  ): void {
+    try {
+      const s1 = decode(structure1Cbor) as unknown[];
+      const s2 = decode(structure2Cbor) as unknown[];
+      const s1Hash = s1?.[1];
+      const s1Pubkey = s1?.[2];
+      const seq = typeof s2?.[0] === "number" ? s2[0] : -1;
+      const s2Sig = s2?.[3];
+      if (!(s1Hash instanceof Uint8Array) || !(s1Pubkey instanceof Uint8Array) || !(s2Sig instanceof Uint8Array) || seq < 1) {
+        this.#logger.warn("session.content.ordering.malformed", { sessionId, correlationId });
+        return;
+      }
+      // The framed ordering record must bind to THIS content (its hash) — else it orders the wrong bytes.
+      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      if (Buffer.from(s1Hash).toString("hex") !== contentHashHex) {
+        this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
+        return;
+      }
+      // Verify the SENDER's Ed25519 signature over the exact signed bytes (structure1_cbor) — the same
+      // check the relay performs. Proves the counterparty committed to this (content_hash @ sequence).
+      if (!verify(s1Pubkey, structure1Cbor, s2Sig)) {
+        this.#logger.warn("session.content.ordering.bad_signature", { sessionId, correlationId });
+        return;
+      }
+      // Sovereign-node cross-check: the signer must be THIS session's counterparty, not an unrelated key.
+      const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+      if (counterparty && Buffer.from(s1Pubkey).toString("hex") !== counterparty) {
+        this.#logger.warn("session.content.ordering.wrong_signer", { sessionId, correlationId });
+        return;
+      }
+      // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
+      this.recordWitnessedSequence(agentName, sessionId, contentHashHex, seq - 1);
+      this.#logger.info("session.content.ordering.recorded", {
+        sessionId,
+        canonicalSeq: seq - 1,
+        source: "content_frame",
+        correlationId,
+      });
+    } catch (err: unknown) {
+      this.#logger.warn("session.content.ordering.decode_failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
+  }
+
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
     const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
     try {
@@ -2347,6 +2427,16 @@ export class SessionNodeManager {
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
       if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
+      // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
+      // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
+      // ingest — so the strict-in-order gate has the position without waiting on the separate
+      // leaf_deliver witness (removes the content-before-witness race). A bad/absent record is
+      // non-fatal: the content still ingests, ordered by the witness stream / arrival as before.
+      const s1Cbor = frame["structure1_cbor"];
+      const s2Cbor = frame["structure2_cbor"];
+      if (s1Cbor instanceof Uint8Array && s2Cbor instanceof Uint8Array) {
+        this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
+      }
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
       const ingest = this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId);
