@@ -90,7 +90,18 @@ export interface LeafDeliverFrame {
 }
 
 /** Result of a single relay hash submission. */
-export type SubmitResult = { ok: true; sequence_number: number } | { ok: false; reason: string };
+export type SubmitResult =
+  | {
+      ok: true;
+      sequence_number: number;
+      // DOD-MSG-4 (self-ordering content frame): the signed ordering record for THIS leaf, so the
+      // sender can stamp it into the content frame. structure1_cbor is the sender-signed bytes
+      // (built locally); structure2_cbor is the relay's committed record (from hash_submit_ack).
+      // Both undefined against an OLD relay that does not yet return structure2_cbor.
+      structure1_cbor?: Uint8Array;
+      structure2_cbor?: Uint8Array;
+    }
+  | { ok: false; reason: string };
 type AckResolver = (r: SubmitResult) => void;
 
 export interface AgentRelayClientOpts {
@@ -172,6 +183,9 @@ export class AgentRelayClient {
   readonly #lastSeen = new Map<string, number>();
   /** The one outstanding submit's resolver (global FIFO — ack carries no session_id). */
   #pendingAck: AckResolver | null = null;
+  // DOD-MSG-4: the sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
+  // SubmitResult can carry it (the ack itself only returns the relay's structure2_cbor).
+  #pendingStructure1: Uint8Array | null = null;
   /** The session_id hex of the in-flight submit, so its ack updates the right #lastSeen. */
   #pendingAckSessionHex: string | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
@@ -216,6 +230,7 @@ export class AgentRelayClient {
     const resolve: AckResolver | null = this.#pendingAck;
     this.#pendingAck = null;
     this.#pendingAckSessionHex = null;
+    this.#pendingStructure1 = null;
     if (resolve) resolve(r);
   }
 
@@ -262,7 +277,17 @@ export class AgentRelayClient {
       // SESSION-003 SI-003 — rejects a leaf whose last_seen_seq exceeds the max sequence of
       // OTHER-sender leaves before it). Advancing on our own ack would inflate it and trip
       // causal_chain_violated on a subsequent submit (e.g. the SEAL leaf after a sent message).
-      this.#settlePending(seq >= 0 ? { ok: true, sequence_number: seq } : { ok: false, reason: "relay_ack_malformed" });
+      // DOD-MSG-4: pair the relay's committed structure2_cbor with our in-flight structure1_cbor so
+      // the SubmitResult carries the full signed ordering record for the self-ordering content frame.
+      // Captured BEFORE #settlePending clears #pendingStructure1.
+      const s2 = frame["structure2_cbor"];
+      const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
+      const structure1Cbor = this.#pendingStructure1 ?? undefined;
+      this.#settlePending(
+        seq >= 0
+          ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor }
+          : { ok: false, reason: "relay_ack_malformed" },
+      );
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
       this.#settlePending({ ok: false, reason });
@@ -496,10 +521,13 @@ export class AgentRelayClient {
     const ackPromise = new Promise<SubmitResult>((r) => { resolveAck = r; });
     this.#pendingAck = resolveAck;
     this.#pendingAckSessionHex = sessionIdHex;
+    // DOD-MSG-4: remember this submit's sender-signed structure1_cbor so its ack can return the full
+    // ordering record (the ack itself carries only the relay's structure2_cbor).
+    this.#pendingStructure1 = structure1;
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; }
       this.#logger.warn("session.relay.submit.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
       return { ok: false, reason: "relay_submit_send_failed" };
     }
@@ -514,7 +542,7 @@ export class AgentRelayClient {
       return result;
     } finally {
       clearTimeout(timer);
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; }
     }
   }
 

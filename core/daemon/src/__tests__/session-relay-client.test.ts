@@ -221,4 +221,43 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     expect(s1B[4]).toBe(0); // session B's first submit: last_seen_seq 0 (NOT 5) — the fix
     client.close();
   });
+
+  it("DOD-MSG-4: submitMessageHash returns the relay's structure2_cbor paired with the sent structure1_cbor", async () => {
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x0c);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
+
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(9));
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    // The relay's ack now carries the committed Structure2 (opaque bytes here — the round-trip is
+    // what matters; real Structure2 verification is the receiver's job in increment 3).
+    const fakeS2 = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]);
+    relay.push({ type: "hash_submit_ack", sequence_number: 3, structure2_cbor: fakeS2 });
+
+    const res = await submit;
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.sequence_number).toBe(3);
+      // structure2_cbor is the relay's record, echoed straight from the ack.
+      expect(res.structure2_cbor && Buffer.from(res.structure2_cbor).toString("hex")).toBe(Buffer.from(fakeS2).toString("hex"));
+      // structure1_cbor is the sender-signed bytes actually put on the wire (paired with the ack).
+      const sent = relay.sentFrames.find((f) => f["type"] === "hash_submit");
+      expect(res.structure1_cbor && Buffer.from(res.structure1_cbor).toString("hex")).toBe(
+        Buffer.from(sent!["structure1_cbor"] as Uint8Array).toString("hex"),
+      );
+    }
+    client.close();
+  });
 });
