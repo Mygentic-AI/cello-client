@@ -117,7 +117,7 @@ describe("MSG-001: content size cap (send side, daemon)", () => {
     const h = await start(logger, node);
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    const rootBefore = snm.getSessionTreeRootHex(SID);
+    const rootBefore = snm.getSessionTreeRootHex("alice", SID);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -136,8 +136,8 @@ describe("MSG-001: content size cap (send side, daemon)", () => {
 
     // No content frame was transmitted, and no tree leaf was appended (no desync).
     expect(node.sent.length).toBe(0);
-    expect(snm.getSessionTreeRootHex(SID)).toBe(rootBefore);
-    expect(snm.getSessionRecord(SID)?.status).toBe("active");
+    expect(snm.getSessionTreeRootHex("alice", SID)).toBe(rootBefore);
+    expect(snm.getSessionRecord("alice", SID)?.status).toBe("active");
     expect(events.find((e) => e.event === "session.content.sent")).toBeUndefined();
 
     const rejected = events.find((e) => e.event === "content.rejected.too_large");

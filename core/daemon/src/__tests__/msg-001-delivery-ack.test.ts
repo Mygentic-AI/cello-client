@@ -144,11 +144,11 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("hello over the wire");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent(SID, content, hash, "corr-a");
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a");
     expect(res.ok).toBe(true);
 
     // The receiver ingested it (buffered for cello_receive).
-    expect(await waitFor(() => mgrB.takeReceivedContent(SID) !== null)).toBe(true);
+    expect(await waitFor(() => mgrB.takeReceivedContent("bob", SID) !== null)).toBe(true);
 
     // The sender observably transitioned from awaiting → acked over a real ACK frame.
     expect(await waitFor(() => a.events.some((e) => e.event === "content.delivery.acked"))).toBe(true);
@@ -174,7 +174,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("level test");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent(SID, content, hash, "corr-a");
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a");
     expect(res.ok).toBe(true);
 
     const ackFrame = (level: string): unknown =>
