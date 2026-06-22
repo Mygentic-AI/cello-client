@@ -19,6 +19,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, readFile } from "node:fs/promises";
 import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -242,7 +243,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   it("AC-001/AC-002 happy path: both gateways screen the real content; send + receive succeed", async () => {
     const a = await spawnGateway("ga");
     const b = await spawnGateway("gb");
-    const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    const { clientA, clientB, aEvents, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+
+    // H1 observability: each daemon announced its gateway mode at startup.
+    expect(aEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
+    expect(bEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
 
     const text = "hello over the gateway-screened stack";
     const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: text }) as Record<string, unknown>;
@@ -256,24 +261,28 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }
     expect(recv?.content).toBe(text);
 
+    // Fingerprint of the EXACT bytes — binds identity, not just length, so a daemon that screened
+    // different content of equal length while sending the real bytes would fail this.
+    const expectedFp = createHash("sha256").update(Buffer.from(text)).digest("hex");
+
     // AC-001: A's gateway PROCESS recorded the outbound screen for this exact content.
     const aLog = await readGatewayLog(a.log);
     const outbound = aLog.filter((e) => e.direction === "outbound");
     expect(outbound.length).toBeGreaterThanOrEqual(1);
-    expect(outbound.some((e) => e.bytes === Buffer.byteLength(text))).toBe(true);
+    expect(outbound.some((e) => e.contentSha256 === expectedFp)).toBe(true);
 
-    // AC-002: B's gateway PROCESS recorded the inbound screen — and (proof it ran BEFORE
-    // delivery) cello_receive only returned content after that screen was logged.
+    // AC-002: B's gateway PROCESS recorded the inbound screen of the exact same bytes — and
+    // (proof it ran BEFORE delivery) cello_receive only returned content after that screen.
     const bLog = await readGatewayLog(b.log);
     const inbound = bLog.filter((e) => e.direction === "inbound");
     expect(inbound.length).toBeGreaterThanOrEqual(1);
-    expect(inbound.some((e) => e.bytes === Buffer.byteLength(text))).toBe(true);
+    expect(inbound.some((e) => e.contentSha256 === expectedFp)).toBe(true);
   }, 40_000);
 
   it("SI-001/DB-001 outbound: with A's gateway down, cello_send fails closed and nothing reaches B", async () => {
     const a = await spawnGateway("ga");
     const b = await spawnGateway("gb");
-    const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    const { clientA, clientB, aEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
 
     // Kill A's gateway AFTER the session is live but BEFORE the send.
     await a.gw.stop();
@@ -282,6 +291,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     expect(sent.ok).toBe(false);
     expect(sent.reason).toBe("gateway_unavailable");
     expect(typeof sent.guidance).toBe("string");
+
+    // H1 observability: the fail-closed outbound emitted the named error event.
+    expect(aEvents.find((e) =>
+      e.event === "security.gateway.unavailable" && e.context["direction"] === "outbound" && e.context["reason"] === "gateway_unavailable",
+    )).toBeDefined();
 
     // B must receive NOTHING — the content never went on the wire.
     for (let i = 0; i < 20; i++) {
@@ -311,23 +325,51 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }
   }, 40_000);
 
-  it("AC-003: core/daemon contains no detection pipeline — only the gateway interface + the two call sites", async () => {
+  it("AC-003: core/daemon imports no gateway detection/server symbol — it holds only the client + interface", () => {
+    // The real architectural invariant is an IMPORT ALLOWLIST over the WHOLE daemon source tree
+    // (recursive, all subdirectories — so a pipeline tucked under src/security/ is not missed; and
+    // by imported symbol, not by class-name spelling — so a differently-named detector is not
+    // missed). The detection/server side of @cello-protocol/gateway must never be imported by the
+    // daemon; only the client + interface + verdict types + the sidecar spawn helper may be.
     const daemonSrcDir = dirname(fileURLToPath(import.meta.url)).replace(/\/__tests__$/, "");
-    const files = readdirSync(daemonSrcDir).filter((f) => f.endsWith(".ts"));
-    const sources = files.map((f) => ({ f, text: readFileSync(join(daemonSrcDir, f), "utf8") }));
 
-    // The daemon must NOT pull in the gateway SERVER or screen pipeline — those are the detection
-    // side, which lives only in @cello-protocol/gateway. The daemon holds the client/interface.
-    for (const { f, text } of sources) {
-      expect(text.includes("createGatewayServer"), `${f} must not import the gateway server`).toBe(false);
-      expect(text.includes("GatewayScreenFn"), `${f} must not reference the screen-pipeline type`).toBe(false);
+    function walk(dir: string): string[] {
+      const out: string[] = [];
+      for (const ent of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, ent.name);
+        if (ent.isDirectory()) {
+          if (ent.name === "__tests__" || ent.name === "dist" || ent.name === "node_modules") continue;
+          out.push(...walk(p));
+        } else if (ent.name.endsWith(".ts")) {
+          out.push(p);
+        }
+      }
+      return out;
     }
+    const files = walk(daemonSrcDir);
+    expect(files.length).toBeGreaterThan(5); // sanity: the walk actually found the daemon tree
 
-    // And the two seam call sites exist — screening is DELEGATED through the interface, not inlined.
-    const allText = sources.map((s) => s.text).join("\n");
+    // Symbols that live on the DETECTION / server side of the gateway package. Importing any of
+    // these into the daemon would mean the pipeline (or its seam) leaked across the process split.
+    const FORBIDDEN = ["createGatewayServer", "GatewayScreenFn", "GatewayServerOptions", "GatewayServerHandle"];
+    const importRe = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+["']@cello-protocol\/gateway["']/g;
+
+    let sawGatewayImport = false;
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const m of text.matchAll(importRe)) {
+        sawGatewayImport = true;
+        const symbols = m[1].split(",").map((s) => s.replace(/\btype\b/, "").trim()).filter(Boolean);
+        for (const sym of symbols) {
+          expect(FORBIDDEN.includes(sym), `${file} imports forbidden gateway symbol '${sym}' (detection/server side)`).toBe(false);
+        }
+      }
+    }
+    expect(sawGatewayImport, "the daemon must import the gateway client/interface somewhere").toBe(true);
+
+    // Delegation present: screening goes THROUGH the injected gateway, not inlined.
+    const allText = files.map((f) => readFileSync(f, "utf8")).join("\n");
     expect(allText.includes(".screenOutbound(")).toBe(true);
     expect(allText.includes(".screenInbound(")).toBe(true);
-    // A crude detector-name guard: no homegrown detector/redactor/scanner class in the daemon.
-    expect(/class\s+\w*(Detector|Redactor|Scanner|Pipeline)\b/.test(allText)).toBe(false);
   });
 });

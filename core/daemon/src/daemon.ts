@@ -40,7 +40,7 @@ import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -678,6 +678,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
   // still returning a verdict (SI-001).
   const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
+  // M9-CORE-001 observability: announce the gateway mode at startup. The sidecar socket connects
+  // lazily on the first screen, so this records which adapter is wired (sidecar vs the always-allow
+  // passthrough default), not a live socket handshake.
+  logger.info("security.gateway.connected", {
+    mode: config.securityGateway ? "sidecar" : "passthrough",
+  });
 
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
@@ -3280,13 +3286,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       correlationId,
     });
     if (outboundVerdict.disposition !== "allow") {
-      logger.warn("security.gateway.outbound.blocked", {
-        sessionId,
-        recipientPubkey,
-        disposition: outboundVerdict.disposition,
-        reason: outboundVerdict.reason,
-        correlationId,
-      });
+      // M9-CORE-001 scope: the only outbound non-allow today is a fail-closed block from an
+      // unreachable gateway. Emit the story's named event for that case; a real detector block /
+      // redact / warn (M9-OUT-* / M9-FEED-001) gets its own handling and events.
+      if (outboundVerdict.reason === GATEWAY_UNAVAILABLE) {
+        logger.error("security.gateway.unavailable", {
+          direction: "outbound",
+          reason: outboundVerdict.reason,
+          correlationId,
+        });
+      } else {
+        logger.warn("security.gateway.outbound.blocked", {
+          sessionId,
+          recipientPubkey,
+          disposition: outboundVerdict.disposition,
+          reason: outboundVerdict.reason,
+          correlationId,
+        });
+      }
       return {
         ok: false,
         reason: outboundVerdict.reason ?? "outbound_screen_blocked",

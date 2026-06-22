@@ -80,7 +80,8 @@ export function failClosedVerdict(direction: ScreenDirection): ScreenVerdict {
       direction === "outbound"
         ? "The security gateway could not be reached, so this message was NOT sent (fail-closed). " +
           "Nothing left the machine. Check that the gateway sidecar is running, then retry."
-        : "The security gateway could not be reached, so inbound content was held unscreened " +
-          "(fail-closed) and not delivered. It will be re-screened once the gateway is reachable.",
+        : "The security gateway could not be reached, so inbound content was not delivered to the " +
+          "agent (fail-closed). It was left unacknowledged, so the sender redelivers it on a later " +
+          "attempt — and it will be screened then, once the gateway is reachable.",
   };
 }

@@ -82,6 +82,7 @@ import { encodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
 import {
   PassthroughGatewayClient,
+  GATEWAY_UNAVAILABLE,
   type SecurityGatewayClient,
 } from "@cello-protocol/gateway";
 
@@ -2094,13 +2095,49 @@ export class SessionNodeManager {
       correlationId,
     });
     if (inboundVerdict.disposition !== "allow") {
-      this.#logger.warn("security.gateway.inbound.held", {
+      // M9-CORE-001 scope: the only inbound non-allow today is a fail-closed block from an
+      // unreachable gateway (gateway_unavailable) — a TRANSIENT condition. We deliberately do
+      // NOT append a leaf or ack here: the message stays un-acked so the sender's TTF/park/retry
+      // redelivers and re-screens it once the gateway recovers. (If we committed a leaf, dedup
+      // would later swallow the redelivery and the agent would never receive it.)
+      // FORWARD (M9-IN-002 / M9-FEED-001): a TERMINAL block from a detector is different — that
+      // content WILL keep arriving, so it must be ack'd-as-received (sender stops) and a leaf
+      // recorded (tamper-evident proof the peer sent it), while still never reaching the agent
+      // buffer. That terminal-vs-transient split lands with the first real block verdict.
+      if (inboundVerdict.reason === GATEWAY_UNAVAILABLE) {
+        this.#logger.error("security.gateway.unavailable", {
+          direction: "inbound",
+          reason: inboundVerdict.reason,
+          correlationId,
+        });
+      } else {
+        this.#logger.warn("security.gateway.inbound.blocked", {
+          sessionId,
+          disposition: inboundVerdict.disposition,
+          reason: inboundVerdict.reason,
+          correlationId,
+        });
+      }
+      return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
+    }
+
+    // B1 (review): screenInbound above is the ONLY suspension point in this method. Before M9 the
+    // dedup check (indexOfHash, above) and the leaf append (below) ran with no yield between them,
+    // so check-then-append was atomic under Node's single thread. The await reopened that window:
+    // two concurrent ingests of the SAME content hash — e.g. a direct retry and a park-recovery
+    // racing on reconnect — could BOTH pass the dedup check before either appends, producing two
+    // leaves for one hash (DOD-MSG-5 break → leafIndex≠canonicalSeq → root divergence). Re-check
+    // dedup now that we have resumed; everything from here to the append is synchronous (atomic),
+    // so the first to resume appends and the second sees its leaf and dedups.
+    const dedupAfterScreen = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
+    if (dedupAfterScreen >= 0) {
+      this.#logger.info("session.content.deduplicated", {
         sessionId,
-        disposition: inboundVerdict.disposition,
-        reason: inboundVerdict.reason,
+        contentHashHex,
+        sequenceNumber: dedupAfterScreen,
         correlationId,
       });
-      return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
+      return { ok: true, leafIndex: dedupAfterScreen, sequenceNumber: dedupAfterScreen, appendedCount: 0 };
     }
 
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the

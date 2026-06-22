@@ -9,6 +9,7 @@
  */
 import { createServer, type Server, type Socket } from "node:net";
 import { appendFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
 import type { ScreenDirection, ScreenVerdict } from "./types.js";
@@ -62,7 +63,13 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
   // A stale socket file from a crashed prior run makes listen() fail with EADDRINUSE. Remove it.
   await rm(socketPath, { force: true });
 
+  // Track live connections so stop() can close them. net.Server.close() stops accepting but
+  // waits for EXISTING sockets to end; the daemon client holds its socket open for the daemon's
+  // lifetime, so without this stop() would hang (M1 review).
+  const sockets = new Set<Socket>();
+
   const server: Server = createServer((socket: Socket) => {
+    sockets.add(socket);
     const decoder = new FrameDecoder(
       (obj) => { void handleRequest(obj as WireScreenRequest, socket); },
       (err) => {
@@ -72,6 +79,7 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
     );
     socket.on("data", (chunk: Buffer) => decoder.push(chunk));
     socket.on("error", (err: Error) => logger.warn("gateway.socket.error", { error: err.message }));
+    socket.once("close", () => sockets.delete(socket));
   });
 
   async function handleRequest(req: WireScreenRequest, socket: Socket): Promise<void> {
@@ -90,6 +98,9 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
         sessionId: req.ctx.sessionId,
         correlationId: req.ctx.correlationId,
         bytes: content.length,
+        // A fingerprint of the exact bytes screened — proof-of-screening that binds identity,
+        // not just length, so a test (or audit) can confirm the gateway saw THIS content.
+        contentSha256: createHash("sha256").update(content).digest("hex"),
       });
       try {
         await appendFile(requestLogPath, line + "\n");
@@ -149,6 +160,9 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
   return {
     socketPath,
     async stop(): Promise<void> {
+      // Close live connections first — otherwise server.close() waits for them forever.
+      for (const s of sockets) s.destroy();
+      sockets.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(socketPath, { force: true });
     },

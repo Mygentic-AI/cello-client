@@ -88,13 +88,19 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
     async stop(): Promise<void> {
       if (child.exitCode !== null || child.signalCode !== null) return;
       child.kill("SIGTERM");
-      // Give it a moment to stop cleanly, then force.
+      // Give it a moment to stop cleanly, then force. Clear the force timer if it exits first so
+      // no stray timer lingers (L4 review).
       const exited = once(child, "exit");
+      let forceTimer: ReturnType<typeof setTimeout> | undefined;
       const forced = new Promise<void>((resolve) => {
-        const t = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 2_000);
-        if (typeof (t as { unref?: () => void }).unref === "function") (t as { unref: () => void }).unref();
+        forceTimer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 2_000);
+        if (typeof (forceTimer as { unref?: () => void }).unref === "function") (forceTimer as { unref: () => void }).unref();
       });
-      await Promise.race([exited, forced]);
+      try {
+        await Promise.race([exited, forced]);
+      } finally {
+        if (forceTimer) clearTimeout(forceTimer);
+      }
     },
   };
 }
