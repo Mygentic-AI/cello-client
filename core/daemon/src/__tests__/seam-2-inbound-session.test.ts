@@ -179,6 +179,9 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(50); // let signaling connect + standing receiver come up
 
     const snm = h.getSessionNodeManager();
+    // Per-agent standing receiver (DOD-LOOP-1): an inbound assignment for bob can only be accepted
+    // once bob's agent is online and his SR exists — provision it as cello_start_agent would.
+    await snm.ensureStandingReceiverForAgent("bob");
     const initiatorPubkey = "cd".repeat(32);
 
     injectRef.inject!(assignmentFrame({
@@ -256,6 +259,8 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
     await wait(50);
 
+    // Per-agent SR (DOD-LOOP-1): bob must be online for his inbound assignment to be accepted.
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
     const initiatorPubkey = "cd".repeat(32);
     const frame = assignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" });
     injectRef.inject!(frame);
@@ -287,8 +292,11 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const node = new FakeNode();
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
-    await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
     await wait(50);
+    // Per-agent SR (DOD-LOOP-1): bob online before the burst; the first push consumes his SR, the
+    // second must wait for the async per-agent rebuild rather than being dropped.
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
     const sidB = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 100));
     const initA = "11".repeat(32);

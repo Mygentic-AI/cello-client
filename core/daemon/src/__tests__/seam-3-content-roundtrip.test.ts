@@ -110,9 +110,11 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const B = makeManager();
     await A.manager.initialize();
     await B.manager.initialize();
+    // DOD-LOOP-1: bob comes online → his per-agent standing receiver is created.
+    await B.manager.ensureStandingReceiverForAgent("bob");
 
-    // B advertises its standing receiver coordinates (what a local negotiator reads).
-    const bInfo = B.manager.getStandingReceiverInfo();
+    // B advertises bob's standing receiver coordinates (what a local negotiator reads).
+    const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
 
     // A: create N_A (gated to B's standing receiver) and dial it through N_A (seam 1a/1b).
@@ -156,8 +158,9 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const B = makeManager();
     await A.manager.initialize();
     await B.manager.initialize();
+    await B.manager.ensureStandingReceiverForAgent("bob");
 
-    const bInfo = B.manager.getStandingReceiverInfo();
+    const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);

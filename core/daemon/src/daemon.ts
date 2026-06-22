@@ -42,26 +42,30 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { SessionNodeManager } from "./session-node-manager.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
+import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { FileRegistrationPersistence } from "./registration-persistence.js";
-import { verify as ed25519Verify } from "@cello-protocol/crypto";
+import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
 import { MAX_CONTENT_BYTES, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
+import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import {
   resolveCelloEnv,
   createTransportSelector,
   isProductionVariant,
 } from "./transport-composition.js";
-import type { ITransportSelector } from "./transport-selector.js";
+import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
+import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
+import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate } from "./session-ceremony.js";
+import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -397,6 +401,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     keyProviders.set(a.name, a.keyProvider);
   }
 
+  // M7 DOD-SPINE-6 / MSG-001-3b: assemble the relay-witness connect params for a
+  // session node from the FROST-signed assignment (relay endpoint + 16-byte session id)
+  // and the acting agent's K_local. Returns undefined when the agent key or relay
+  // endpoint is missing — the session then runs on the direct content path without a
+  // relay witness (degraded, never blocked).
+  const buildRelayConnectParams = async (
+    agentName: string,
+    assignment: NonNullable<ReturnType<typeof parseSessionAssignment>>,
+  ): Promise<RelayConnectParams | undefined> => {
+    const kp = keyProviders.get(agentName);
+    const endpoint = assignment.relay_endpoint;
+    if (!kp || !endpoint || !endpoint.peer_id || !endpoint.multiaddrs || endpoint.multiaddrs.length === 0) {
+      return undefined;
+    }
+    return {
+      relayPeerId: endpoint.peer_id,
+      relayAddrs: endpoint.multiaddrs,
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: assignment.session_id,
+    };
+  };
+
   // Stub: all connections marked as 'unverified' until connection validation is wired
   const connections: ConnectionInfo[] = [];
 
@@ -469,6 +496,171 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     maxBackoffMs: 30_000,
   });
 
+  // ─── Per-agent directory signaling (multi-agent: one signaling stream per agent) ──
+  // The keystone `signalingManager` above authenticates as the PRIMARY agent (first
+  // loaded, sorted) and is the daemon's directory door for that agent. But the
+  // directory routes EVERY signaling frame — dkg_complete, register_success, and
+  // inbound session_request — by the pubkey that AUTHENTICATED the stream it arrived
+  // on. So a non-primary agent registering over the primary's stream has its
+  // dkg_complete misrouted (the directory keys `#pendingDkgComplete` by the stream's
+  // authed pubkey, which is the primary's, not the registrant's) and the registration
+  // times out after a completed DKG. The fix is the M7 intent: each agent gets its OWN
+  // directory signaling stream, authenticated as itself, so the directory routes its
+  // frames to it. This realises the "Online — directory connection active, per agent"
+  // model the keystone note (at `primaryAgent` above) flagged as the follow-on.
+  //
+  // The primary agent reuses the keystone manager; every other agent gets a dedicated
+  // SignalingManager authed as that agent. Managers are created lazily (on first
+  // registration / online) and kept connected for the agent's directory presence.
+  interface AgentSignaling {
+    signaling: SignalingManager;
+    getNode: () => CelloNode | null;
+  }
+  const perAgentSignaling = new Map<string, AgentSignaling>();
+
+  /**
+   * Return the directory signaling stream for `agentName`, authenticated as that
+   * agent. The primary agent reuses the keystone manager + its published node; any
+   * other agent gets (and caches) a dedicated manager. Falls back to the keystone
+   * manager when no production bootstrap resolver is configured (in-process tests
+   * inject a single `signalingConnect` and never exercise the per-agent path).
+   *
+   * SCOPE (SPINE-5 follow-on): this wires per-agent signaling for REGISTRATION (the
+   * registration reply frames are routed via the per-agent DaemonRegistrationContext's
+   * own inbound handler). The daemon's INBOUND SESSION handlers (session_assignment /
+   * session_request, registerInboundHandler below) are still attached to the keystone
+   * `signalingManager` only — so a NON-primary agent can register but cannot yet RECEIVE
+   * inbound sessions on its dedicated stream (frames there are unhandled). Not a
+   * regression (before this, a non-primary agent could not register at all); closing it
+   * is SPINE-5, which attaches the session inbound handlers per-agent. Tracked in the
+   * M7 build journal + DoD SPINE-5 scope note.
+   */
+  function getAgentSignaling(
+    agentName: string,
+    agentKeyProvider: import("@cello-protocol/crypto").KeyProvider,
+    agentPubkeyHex: string,
+  ): AgentSignaling {
+    if (primaryAgent && agentName === primaryAgent.name) {
+      return { signaling: signalingManager, getNode: getDirectoryNode };
+    }
+    const existing = perAgentSignaling.get(agentName);
+    if (existing) return existing;
+    if (!directoryEndpointResolver) {
+      return { signaling: signalingManager, getNode: getDirectoryNode };
+    }
+    let nodeRef: CelloNode | null = null;
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: directoryEndpointResolver,
+      getAuthIdentity: () => ({ keyProvider: agentKeyProvider, pubkeyHex: agentPubkeyHex }),
+      logger,
+      challengeVerifier,
+      getManifestVersion: () => verifiedManifestVersion,
+      publishNode: (n) => {
+        nodeRef = n;
+      },
+    });
+    const mgr = new SignalingManager({
+      connect,
+      logger,
+      maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
+      maxBackoffMs: 30_000,
+    });
+    const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
+    perAgentSignaling.set(agentName, entry);
+    logger.info("agent.signaling.created", { agentName, agentPubkey: agentPubkeyHex });
+    // DOD-SPINE-5: answer the directory's delegated-signing `ceremony_request` on THIS
+    // agent's stream (the session FROST ceremony — the per-agent counterpart to SPINE-4's
+    // registration routing). Unregistered implicitly when the manager is stopped.
+    wireSessionCeremonyHandler({
+      agentName,
+      agentDir: join(celloDir, "agents", agentName),
+      agentPubkeyHex,
+      getNode: entry.getNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: mgr,
+      logger,
+    });
+    // DOD-SPINE-7: coordinate the SEAL FROST ceremony on this agent's stream too.
+    wireSealCeremonyHandler({
+      agentName,
+      agentDir: join(celloDir, "agents", agentName),
+      agentPubkeyHex,
+      getNode: entry.getNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: mgr,
+      logger,
+    });
+    // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
+    registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
+    // SESSION-002: resolve seal_unilateral_confirmed (verify the cert) on this agent's stream.
+    registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
+    // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
+    // standing-receiver session endpoint so the assignment carries a reachable counterparty).
+    wireSessionOfferHandler({
+      agentName,
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
+      signaling: mgr,
+      logger,
+    });
+    return entry;
+  }
+
+  /** Resolve once `mgr` reaches "connected", or false on timeout. */
+  async function waitForSignalingConnected(mgr: SignalingManager, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (mgr.status !== "connected" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return mgr.status === "connected";
+  }
+
+  /**
+   * Stop and forget a dedicated per-agent signaling manager. Called when an agent's
+   * registration fails terminally — otherwise the lazily-created manager (and its
+   * libp2p node + effectively-unbounded reconnect loop) would keep reconnecting forever
+   * for an agent that is not registered/online. No-op for the primary (it reuses the
+   * keystone manager, which is never stored here) and for agents with no dedicated
+   * manager. On a later retry, getAgentSignaling re-creates it.
+   */
+  async function dropAgentSignaling(agentName: string): Promise<void> {
+    const entry = perAgentSignaling.get(agentName);
+    if (!entry) return;
+    perAgentSignaling.delete(agentName);
+    await entry.signaling.stop();
+    logger.info("agent.signaling.dropped", { agentName });
+  }
+
+  // DOD-SPINE-5: the PRIMARY agent registers + initiates over the keystone signaling
+  // stream (not a per-agent one), so wire its ceremony_request handler on the keystone
+  // manager too — otherwise a primary-agent initiator's session ceremony would time out.
+  if (primaryAgent) {
+    wireSessionCeremonyHandler({
+      agentName: primaryAgent.name,
+      agentDir: join(celloDir, "agents", primaryAgent.name),
+      agentPubkeyHex: primaryAgent.pubkey,
+      getNode: getDirectoryNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: signalingManager,
+      logger,
+    });
+    // DOD-SPINE-7: the primary agent also coordinates the SEAL FROST ceremony on the keystone.
+    wireSealCeremonyHandler({
+      agentName: primaryAgent.name,
+      agentDir: join(celloDir, "agents", primaryAgent.name),
+      agentPubkeyHex: primaryAgent.pubkey,
+      getNode: getDirectoryNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      signaling: signalingManager,
+      logger,
+    });
+    wireSessionOfferHandler({
+      agentName: primaryAgent.name,
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(primaryAgent.name),
+      signaling: signalingManager,
+      logger,
+    });
+  }
+
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
   const perConnectionState = new Map<string, { currentAgent: string | null; clientType: string }>();
@@ -504,6 +696,126 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     sessionNodeManager.getStandingReceiverAutoNat() ??
     new LocalAutoNatStub();
 
+  // ─── DOD-SPINE-5: real client-side session negotiator (built internally) ──────
+  // The directory already brokers `session_request` → FROST-signed `session_assignment`
+  // live; the missing half was the CLIENT driver. This negotiator sends `session_request`
+  // over the CURRENT agent's OWN signaling stream (so the directory routes the signed
+  // assignment back to that agent — same per-agent routing SPINE-4 established), advertising
+  // the standing receiver's session endpoint (WIRE-001: the directory rejects a request
+  // with no initiator session Peer ID), then parses the returned assignment. Ported from
+  // core/client `initiateSession` (NOT imported — that stack is dead). Tests still inject
+  // their own `sessionNegotiator`; the binary now gets a real one instead of
+  // directory_signaling_not_configured.
+  // M3: a `session_assignment` frame carries no echoed request id, so two overlapping
+  // initiations on ONE agent's stream would race to resolve on whichever assignment
+  // arrives first — request A could complete with B's assignment. Guard with a per-agent
+  // single-flight slot (genuine single-slot, as the prior comment falsely claimed). Cross-
+  // agent concurrency is unaffected (separate streams). A directory-side echoed request id
+  // would allow true concurrency later; this is the correct minimum.
+  const negotiationInProgress = new Set<string>();
+  const resolvedSessionNegotiator: SessionNegotiator = sessionNegotiator ?? {
+    negotiate: async (ctx): Promise<SessionNegotiationResult> => {
+      const kp = keyProviders.get(ctx.agentName);
+      const agentRec = loadedAgents.find((a) => a.name === ctx.agentName);
+      if (!kp || !agentRec) {
+        return { ok: false, reason: "agent_not_found", guidance: `Agent '${ctx.agentName}' is not loaded on this daemon.` };
+      }
+      if (negotiationInProgress.has(ctx.agentName)) {
+        return {
+          ok: false,
+          reason: "session_negotiation_in_progress",
+          guidance: `Another session initiation is already in progress for agent '${ctx.agentName}'. Wait for it to finish, then retry.`,
+        };
+      }
+      const targetHex =
+        typeof ctx.params["target_pubkey"] === "string"
+          ? (ctx.params["target_pubkey"] as string)
+          : typeof ctx.params["counterparty_pubkey"] === "string"
+            ? (ctx.params["counterparty_pubkey"] as string)
+            : "";
+      if (!/^[0-9a-fA-F]{64}$/.test(targetHex)) {
+        return {
+          ok: false,
+          reason: "invalid_target_pubkey",
+          guidance: "cello_initiate_session requires 'target_pubkey' as the counterparty's 32-byte hex K_local public key.",
+        };
+      }
+      const sr = sessionNodeManager.getStandingReceiverInfo(ctx.agentName);
+      if (!sr) {
+        return {
+          ok: false,
+          reason: "standing_receiver_unavailable",
+          guidance: "The standing receiver is not ready, so no initiator session endpoint can be advertised. Retry once the daemon has finished starting.",
+        };
+      }
+      const { signaling } = getAgentSignaling(ctx.agentName, kp, agentRec.pubkey);
+      if (!(await waitForSignalingConnected(signaling, 10_000))) {
+        return {
+          ok: false,
+          reason: "directory_signaling_timeout",
+          guidance: `Agent '${ctx.agentName}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry.`,
+        };
+      }
+
+      // Single-flight claimed (above) → safe to register one inbound handler for this
+      // agent's reply; unregistered + slot released in finally.
+      negotiationInProgress.add(ctx.agentName);
+      let resolveFrame!: (f: Record<string, unknown>) => void;
+      const pending = new Promise<Record<string, unknown>>((r) => {
+        resolveFrame = r;
+      });
+      const unregister = signaling.registerInboundHandler((frame) => {
+        const t = frame["type"];
+        if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
+      });
+      try {
+        const sent = await signaling.sendRaw({
+          type: "session_request",
+          target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
+          initiator_session_peer_id: sr.peerId,
+          initiator_session_addrs: sr.addrs,
+          // WIRE-002 opt-in: ask the directory to run the session_offer→accept round-trip so
+          // the assignment carries the counterparty's reachable session endpoint.
+          wants_session_offer: true,
+        });
+        if (!sent.ok) {
+          return {
+            ok: false,
+            reason: sent.reason ?? "directory_unreachable",
+            guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream.",
+          };
+        }
+        let timer!: ReturnType<typeof setTimeout>;
+        const timeoutP = new Promise<Record<string, unknown>>((r) => {
+          timer = setTimeout(() => r({ type: "__timeout__" }), 30_000);
+        });
+        const frame = await Promise.race([pending, timeoutP]);
+        clearTimeout(timer);
+        if (frame["type"] === "__timeout__") {
+          return { ok: false, reason: "timeout", guidance: "The directory did not return a session assignment within 30s. Retry once cello status shows directory_signaling connected." };
+        }
+        if (frame["type"] === "session_request_error") {
+          const reason = sessionRequestErrorReason(frame);
+          return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
+        }
+        const raw = frame["assignment"] as Record<string, unknown> | undefined;
+        const assignment = raw ? parseSessionAssignment(raw) : null;
+        if (!assignment) {
+          return { ok: false, reason: "assignment_parse_failed", guidance: "The directory's session_assignment was missing or malformed." };
+        }
+        logger.info("session.negotiate.assignment.received", {
+          agentName: ctx.agentName,
+          correlationId: ctx.correlationId,
+          signatureType: assignment.signature_type,
+        });
+        return { ok: true, assignment };
+      } finally {
+        unregister();
+        negotiationInProgress.delete(ctx.agentName);
+      }
+    },
+  };
+
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
@@ -524,6 +836,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     },
   });
 
+  // MSG-001-3b (2b): the LIVE content-park deposit. On a not-confirmed send (direct delivery
+  // failed, or TTF with no `persisted` ACK) the session manager calls this with the recipient +
+  // the session's relay endpoint; we seal the content to the recipient (E2E — the relay never sees
+  // plaintext, INV-3) and deposit it to that relay's store-and-forward mailbox via the standing
+  // receiver node. The recipient pulls + recovers it at the witnessed sequence (R1) on next online.
+  sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content }) => {
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) {
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: "standing_receiver_unavailable" });
+      return;
+    }
+    const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
+    const ciphertext = sealToRecipient(recipientPubkey, content);
+    const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
+    const res = await client.deposit(node, {
+      recipientPubkey,
+      contentHash: Buffer.from(contentHashHex, "hex"),
+      sessionId: Buffer.from(sessionId, "hex"),
+      ciphertext,
+    });
+    if (res.ok) {
+      logger.info("content.park.deposited", { sessionId, contentHash: contentHashHex, recipientPubkey: recipientPubkeyHex.slice(0, 16) });
+    } else {
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: res.reason });
+    }
+  });
+
   // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked
   // content (the crash backstop). Runs HERE — before the IPC socket opens, consistent
   // with DAEMON-003 startup loading (AC-007) — so a sender that crashed before its TTF
@@ -536,34 +875,77 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // a daemon started without the content send path wired, or unit tests), the flush is a
   // documented no-op (content.park.flush.deferred at WARN) and the durable awaiting
   // entries simply remain queued for the next startup that has a park target.
-  const awaitingSessions = retryQueue.getAwaitingSessions();
-  if (awaitingSessions.length > 0) {
-    const parkFn = config.contentParkFn;
-    if (parkFn) {
-      let parkedTotal = 0;
-      for (const sid of awaitingSessions) {
-        try {
-          parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
-        } catch (err: unknown) {
-          logger.error("content.park.flush.failed", {
-            sessionId: sid,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-      logger.info("content.park.flush.completed", {
-        sessionCount: awaitingSessions.length,
-        parkedCount: parkedTotal,
-      });
-    } else {
-      const pendingCount = awaitingSessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
+  // MSG-2 startup-flush park target: seal + deposit an un-acked awaiting entry sourced from
+  // PERSISTED session state (the in-memory entry is gone after a restart). Same seal + deposit
+  // as the live hook above; the endpoint + recipient come from the sessions row.
+  const startupParkFn: import("./retry-queue.js").ParkFn = async (entry) => {
+    const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.sessionId);
+    const record = sessionNodeManager.getSessionRecord(entry.sessionId);
+    if (!ep) return { parked: false, error: "no_persisted_relay_endpoint" };
+    if (!record?.counterparty_pubkey) return { parked: false, error: "no_counterparty" };
+    // DOD-LOOP-1: the re-park must originate from the session's OWNING agent (the original
+    // sender), so use THAT agent's standing-receiver node — not "any" agent's. Post-DOD-LOOP-1 the
+    // owning agent's SR exists only once it is online, which is why the native flush is
+    // (re-)triggered per-agent on agent-online (see flushAwaitingContent / cello_start_agent), not
+    // only at pre-IPC startup when no agent is online yet.
+    const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
+    if (!node) return { parked: false, error: "standing_receiver_unavailable" };
+    const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
+    const ciphertext = sealToRecipient(recipientPubkey, entry.contentBlob);
+    const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
+    const res = await client.deposit(node, {
+      recipientPubkey,
+      contentHash: Buffer.from(entry.contentHashHex, "hex"),
+      sessionId: Buffer.from(entry.sessionId, "hex"),
+      ciphertext,
+    });
+    if (res.ok) {
+      logger.info("content.park.deposited", { sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
+      return { parked: true };
+    }
+    return { parked: false, error: res.reason ?? "deposit_failed" };
+  };
+
+  // Re-park un-acked awaiting content to the relay store-and-forward queue. Runs once pre-IPC
+  // (the crash backstop) and again per-agent when an agent comes online — because post-DOD-LOOP-1
+  // the native `startupParkFn` needs the OWNING agent's standing receiver, which exists only once
+  // that agent is online. `filterAgent` scopes the drain to one agent's sessions on the agent-
+  // online re-run; with no filter it attempts all (the pre-IPC pass / injected-target test path).
+  async function flushAwaitingContent(filterAgent?: string): Promise<void> {
+    const all = retryQueue.getAwaitingSessions();
+    const sessions = filterAgent === undefined
+      ? all
+      : all.filter((sid) => sessionNodeManager.getSessionRecord(sid)?.agent_name === filterAgent);
+    if (sessions.length === 0) return;
+    const parkFn = config.contentParkFn ?? startupParkFn;
+    if (!parkFn) {
+      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s), 0);
       logger.warn("content.park.flush.deferred", {
-        sessionCount: awaitingSessions.length,
+        sessionCount: sessions.length,
         pendingCount,
         reason: "no_content_park_target",
       });
+      return;
     }
+    let parkedTotal = 0;
+    for (const sid of sessions) {
+      try {
+        parkedTotal += await retryQueue.drainAwaitingToPark(sid, parkFn);
+      } catch (err: unknown) {
+        logger.error("content.park.flush.failed", {
+          sessionId: sid,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    logger.info("content.park.flush.completed", {
+      sessionCount: sessions.length,
+      parkedCount: parkedTotal,
+      ...(filterAgent !== undefined ? { agentName: filterAgent } : {}),
+    });
   }
+
+  await flushAwaitingContent();
 
   const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
   nonceDedupStore.loadFromDb();
@@ -653,6 +1035,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.add(name);
+    // DOD-LOOP-1: each online agent gets its OWN standing receiver, so two agents on one daemon
+    // (loopback) never contend for a single one. Fire-and-forget (initiate/accept also ensure on
+    // demand); never let it throw out of the handler. Once the SR is up, re-park any of THIS
+    // agent's un-acked awaiting content (the crash backstop — its node was unavailable at the
+    // pre-IPC startup flush because no agent was online yet).
+    void sessionNodeManager.ensureStandingReceiverForAgent(name)
+      .then(() => flushAwaitingContent(name))
+      .catch((err: unknown) => {
+        logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+      });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
@@ -674,6 +1066,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.delete(name);
+    // DOD-LOOP-1: tear down this agent's standing receiver (fire-and-forget, never throws out).
+    void sessionNodeManager.removeStandingReceiverForAgent(name).catch(() => { /* best-effort */ });
     logger.info("agent.offline", { agentName: name, reason: "stopped" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "offline", "stopped");
@@ -791,10 +1185,34 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
       const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
 
+      // Multi-agent: register over THIS agent's own directory signaling stream (authed
+      // as this agent), so the directory routes its dkg_complete/register_success back
+      // to it. The primary agent reuses the keystone stream; any other agent gets a
+      // dedicated one. The DKG's FROST streams open on this agent's directory node.
+      const agentRecord = loadedAgents.find((a) => a.name === name);
+      const agentPubkeyHex = agentRecord?.pubkey ?? Buffer.from(await keyProvider.getPublicKey()).toString("hex");
+      const { signaling: agentSignaling, getNode: agentGetNode } = getAgentSignaling(name, keyProvider, agentPubkeyHex);
+
+      // A non-primary agent's stream connects lazily — wait for it before the DKG
+      // (RegistrationManager returns directory_unreachable if signaling isn't connected).
+      const signalingConnected = await waitForSignalingConnected(agentSignaling, 10_000);
+      if (!signalingConnected) {
+        // Distinct cause → distinct code (M7 error discipline): this is specifically the
+        // per-agent signaling stream failing to come up in time, not a missing/unresolvable
+        // directory endpoint. Drop the manager so it doesn't reconnect forever for an
+        // unregistered agent (it is re-created on the next cello_register).
+        await dropAgentSignaling(name);
+        return {
+          ok: false,
+          reason: "directory_signaling_timeout",
+          guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry cello_register.`,
+        };
+      }
+
       const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
       const ctx = new DaemonRegistrationContext({
-        signaling: signalingManager,
-        getDirectoryNode,
+        signaling: agentSignaling,
+        getDirectoryNode: agentGetNode,
         getDirectoryEndpoint: () => directoryEndpoint,
         keyProvider,
         persistence,
@@ -804,6 +1222,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
         if ("error" in result) {
           logger.warn("registration.failed", { agentName: name, reason: result.error });
+          // Terminal failure for THIS agent — drop its dedicated signaling manager so it
+          // does not reconnect forever for an unregistered agent (re-created on retry).
+          await dropAgentSignaling(name);
           return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
         }
         // Capture-now-or-lose-it: persist the agent→user link (using it is future
@@ -840,6 +1261,172 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // M7-SESSION-001: tracks seal-interrupted flows currently in progress.
   // Prevents duplicate concurrent seal-interrupted attempts for the same session (AC-011).
   const sealInterruptedInProgress = new Set<string>();
+
+  // M7 DOD-SPINE-7: relay-mediated bilateral seal. cello_close_session registers a waiter
+  // per session_id (hex); the directory's session_sealed frame — delivered over the agent's
+  // signaling stream after FROST notarization, once BOTH parties have submitted their SEAL
+  // ctrl leaf — resolves it with the sealed_root.
+  // M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility
+  // certificate (receipt-not-assent, per-party frontiers, attestation modes, final_message).
+  type SealCompletion = { rootHex: string; legibility?: unknown };
+  const pendingSealWaiters = new Map<string, (completion: SealCompletion) => void>();
+
+  // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling seam (keystone
+  // for the primary agent, per-agent for the rest — the directory routes session_sealed to the
+  // session-owning agent's authenticated stream). Function declaration so getAgentSignaling
+  // (defined earlier, called at runtime) can wire it per-agent.
+  function registerSessionSealedListener(signaling: SignalingManager, agentName: string, agentPubkeyHex: string): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_sealed") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      const rootHex = frameValueToHex(frame["sealed_root"]);
+      if (!sidHex || !rootHex) return;
+      void (async () => {
+        const toU8 = (v: unknown): Uint8Array | null =>
+          v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
+
+        // M7 legibility-TBS-binding: when THIS party is the seal's signer (the initiator, whose
+        // group key produced the FROST signature), verify the signature over the legibility-bound
+        // TBS. A tampered legibility (answered / content_frontier_seq / attestation_mode, carried
+        // unsigned on the frame) changes the hash → the signature fails → the seal is REJECTED. The
+        // non-initiator does not hold the signer's key, so it accepts (verified:false): the frame
+        // arrived over the authenticated Noise channel, and the binding lets any out-of-band holder
+        // of the initiator's primary verify an exported cert.
+        if (frame["signature_type"] === "frost") {
+          const sessionIdBytes = toU8(frame["session_id"]);
+          const sealedRootBytes = toU8(frame["sealed_root"]);
+          const frostSig = toU8(frame["frost_signature"]);
+          const signerPubkey = toU8(frame["signer_pubkey"]);
+          const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
+          const ctRaw = frame["close_timestamp"];
+          const closeTs = typeof ctRaw === "number" ? ctRaw : typeof ctRaw === "bigint" ? Number(ctRaw) : null;
+          if (!sessionIdBytes || !sealedRootBytes || !frostSig || !signerPubkey || leafCount === null || closeTs === null) {
+            logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: "missing_certificate_fields" });
+            return;
+          }
+          const record = sessionNodeManager.getSessionRecord(sidHex);
+          const verdict = await verifyBilateralSealCertificate(
+            { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger, counterpartyPrimaryHex: record?.counterparty_primary_pubkey ?? null },
+            {
+              sessionId: sessionIdBytes,
+              sealedRoot: sealedRootBytes,
+              leafCount,
+              closeTimestamp: closeTs,
+              frostSignature: frostSig,
+              signerPubkey,
+              signatureType: "frost",
+              legibility:
+                frame["legibility"] && typeof frame["legibility"] === "object"
+                  ? (frame["legibility"] as LegibilityForHash)
+                  : null,
+            },
+          );
+          if (!verdict.ok) {
+            // tamper-evidence: do NOT mark sealed, do NOT resolve the waiter as success.
+            logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: verdict.reason });
+            return;
+          }
+          logger.info("session.sealed.signature.checked", { sessionId: sidHex, verified: verdict.verified });
+        }
+
+        // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
+        // JSON-safe certificate and persist it with the sealed record so it survives a restart and
+        // is readable via cello_get_sealed_receipt — receipt-not-assent, per-party frontiers,
+        // attestation modes, and final_message.answered.
+        const legibility = normalizeLegibility(frame["legibility"]);
+        logger.info("session.sealed.received", {
+          sessionId: sidHex,
+          sealedRoot: rootHex,
+          hasLegibility: legibility !== undefined,
+          finalMessageAnswered:
+            legibility && typeof legibility === "object" && "final_message" in legibility
+              ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
+              : undefined,
+        });
+        if (legibility !== undefined) {
+          try {
+            sessionNodeManager.recordSealCertificate(sidHex, rootHex, JSON.stringify(legibility));
+          } catch (error) {
+            logger.warn("seal.certificate.persist.failed", {
+              sessionId: sidHex,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+        const waiter = pendingSealWaiters.get(sidHex);
+        if (waiter) {
+          pendingSealWaiters.delete(sidHex);
+          waiter({ rootHex, legibility });
+        }
+        // Mark the session sealed + tear the node down (idempotent — safe if already gone).
+        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+      })();
+    });
+  }
+
+  // SESSION-002 (DOD-SEAL): cello_close_session escalates to a UNILATERAL seal when the
+  // counterparty never co-closes. The waiter is resolved by the seal_unilateral_confirmed
+  // listener AFTER it verifies the certificate signature (channel-independent), or by
+  // seal_unilateral_too_early (grace not elapsed). Keyed by session_id hex.
+  type UnilateralResult = { ok: true; sealedRootHex: string } | { ok: false; reason: string };
+  const pendingUnilateralWaiters = new Map<string, (r: UnilateralResult) => void>();
+
+  // SESSION-002: per-agent listener for the unilateral certificate. Verifies the FROST
+  // signature over the rebuilt TBS against the agent's own primary_pubkey BEFORE resolving
+  // the close as sealed (SI-003: a channel-swapped sealed_root fails the signature check).
+  function registerUnilateralConfirmedListener(
+    signaling: SignalingManager,
+    agentName: string,
+    agentPubkeyHex: string,
+  ): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      const ftype = frame["type"];
+      if (ftype !== "seal_unilateral_confirmed" && ftype !== "seal_unilateral_too_early") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      if (!sidHex) return;
+      const waiter = pendingUnilateralWaiters.get(sidHex);
+      if (!waiter) return;
+
+      if (ftype === "seal_unilateral_too_early") {
+        pendingUnilateralWaiters.delete(sidHex);
+        waiter({ ok: false, reason: "seal_unilateral_too_early" });
+        return;
+      }
+
+      void (async () => {
+        const toU8 = (v: unknown): Uint8Array | null =>
+          v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
+        const sessionId = toU8(frame["session_id"]);
+        const sealedRoot = toU8(frame["sealed_root"]);
+        const frostSig = toU8(frame["frost_signature"]);
+        const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
+        const tsRaw = frame["close_timestamp"];
+        const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
+        const sigType = frame["signature_type"];
+        if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null ||
+            (sigType !== "frost" && sigType !== "single")) {
+          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: "malformed_certificate" });
+          pendingUnilateralWaiters.delete(sidHex);
+          waiter({ ok: false, reason: "malformed_certificate" });
+          return;
+        }
+        const result = await verifyUnilateralCertificate(
+          { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+          { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
+        );
+        pendingUnilateralWaiters.delete(sidHex);
+        if (!result.ok) {
+          // SI-003: do NOT mark sealed when the certificate signature does not verify.
+          logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: result.reason, signatureType: sigType });
+          waiter({ ok: false, reason: `certificate_invalid:${result.reason}` });
+          return;
+        }
+        logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, signatureType: sigType, party: "present" });
+        void sessionNodeManager.destroySessionNode(sidHex, "sealed");
+        waiter({ ok: true, sealedRootHex: Buffer.from(sealedRoot).toString("hex") });
+      })();
+    });
+  }
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {
@@ -910,19 +1497,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const relayCircuitAddr = getRelayCircuitAddress ? getRelayCircuitAddress() : "";
     const advertisedAddress = selectAdvertisedAddress(dialability, relayCircuitAddr);
 
-    if (!sessionNegotiator) {
-      return {
-        ok: false,
-        reason: "directory_signaling_not_configured",
-        guidance:
-          "Session initiation requires a directory signaling connection to negotiate " +
-          "the session assignment. The daemon's transport adapters are wired, but no " +
-          "directory negotiator is configured for this environment. Configure the " +
-          "directory connection (CELLO_ENV dev/staging/production) and retry.",
-      };
-    }
-
-    const negotiation = await sessionNegotiator.negotiate({
+    // resolvedSessionNegotiator is always defined (the daemon builds a real internal
+    // negotiator when none is injected), so directory_signaling_not_configured no longer
+    // fires on the live binary — session_request is actually negotiated with the directory.
+    const negotiation = await resolvedSessionNegotiator.negotiate({
       agentName,
       correlationId,
       advertisedAddress,
@@ -955,47 +1533,56 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // node — so its content newStream cannot ride that link until the dial is routed
     // THROUGH N_A. Tracked as the dialer/session-node reconciliation; this seam only
     // establishes that initiate creates the session-core session.
+    // The initiator's session row must record WHO this session is with, so an interrupted
+    // initiator session surfaces its counterparty at next login (DOD-INT-1). The public
+    // tool param is `target_pubkey` (the counterparty's K_local) — the same field the
+    // negotiator reads above; `counterparty_pubkey` is the legacy fallback. Reading only
+    // the legacy field stored an EMPTY counterparty on every initiator session.
     const counterpartyPubkey =
-      typeof params?.counterparty_pubkey === "string" ? params.counterparty_pubkey : "";
+      typeof params?.target_pubkey === "string"
+        ? params.target_pubkey
+        : typeof params?.counterparty_pubkey === "string"
+          ? params.counterparty_pubkey
+          : "";
     const counterpartyPeerId = assignment.counterparty_session_peer_id ?? "";
+    // M7 DOD-SPINE-6 / MSG-001-3b: relay witness params from the FROST-signed assignment
+    // + this agent's K_local. N_A connects to the relay and submits message-leaf hashes.
+    const relayParams = await buildRelayConnectParams(agentName, assignment);
     const created = await sessionNodeManager.createSessionNode(
       sessionId,
       agentName,
       counterpartyPubkey,
       counterpartyPeerId,
       correlationId,
+      // Reuse the standing receiver as N_A so its peer id matches the session endpoint the
+      // negotiator advertised — the counterparty's gater admits the dial (WIRE-002).
+      true,
+      relayParams,
     );
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
 
-    // SEAM 1b: for direct mode, the session node N_A must hold the connection its
-    // content stream rides — so dial the counterparty THROUGH N_A (not the separate
-    // composition-root dialer). On failure, tear the just-created session down rather
-    // than leave a dangling 'active' row that cello_send would then fail on.
-    // (relay mode dials via N_A through the relay circuit — a later seam — so it is
-    // skipped here and the session is left active for that path.)
-    if (assignment.transport_mode === "direct") {
-      const connected = await sessionNodeManager.connectToCounterparty(
-        sessionId,
-        assignment.counterparty_session_addrs ?? [],
-      );
+    // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
+    // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
+    // the source of truth for dialability (a NATed node advertises a relay-circuit address; a
+    // directly-reachable one — localhost or a public addr — advertises a direct multiaddr), so
+    // attempt the dial whenever the assignment carries counterparty session addrs, regardless
+    // of the transport_mode LABEL (the local selector stub labels everything "relay" even when
+    // the addrs are directly dialable). A failure is NOT fatal: per the dead-channel contract,
+    // the session stays active and a later cello_send queues the content in the durable retry
+    // queue until a route exists (the relay-park path is MSG-001-3b).
+    const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
+    if (counterpartyAddrs.length > 0) {
+      const connected = await sessionNodeManager.connectToCounterparty(sessionId, counterpartyAddrs);
       if (!connected.ok) {
-        await sessionNodeManager.destroySessionNode(sessionId, "interrupted");
         logger.warn("session.initiate.connect.failed", {
           sessionId,
           reason: connected.reason,
           error: connected.error,
+          transportMode: assignment.transport_mode,
           correlationId,
         });
-        return {
-          ok: false,
-          reason: connected.reason,
-          guidance:
-            "The session was negotiated but the counterparty's session node could not be " +
-            "reached on its direct addresses. Verify the counterparty is online and retry; " +
-            "the daemon will fall back to the relay path once that seam is wired.",
-        };
       }
     }
 
@@ -1109,7 +1696,107 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       sealInterruptedInProgress.add(sessionId);
       const correlationId = randomUUID();
       try {
-        return await handleActiveSealFlow(sessionId, record, correlationId);
+        // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
+        // relay witness; when the counterparty ALSO closes, the relay's #maybeProcessSeal
+        // fires → directory processSeal rebuilds + verifies the signed chain → FROST
+        // notarization → session_sealed to BOTH parties. Register the waiter BEFORE
+        // submitting so the notification can never race ahead of us.
+        let resolveSeal!: (completion: SealCompletion) => void;
+        const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
+        pendingSealWaiters.set(sessionId, resolveSeal);
+        const submit = await sessionNodeManager.submitSealLeaf(sessionId, correlationId);
+        // M7-UPGRADE-002: the auto-acknowledge path may have already submitted THIS party's
+        // responder SEAL leaf (it won the race against this explicit close). That is success, not
+        // failure — keep the waiter registered and fall through to await session_sealed (the
+        // auto-ack's submission drives the same bilateral seal).
+        if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
+          pendingSealWaiters.delete(sessionId);
+          if (submit.reason === "relay_unavailable") {
+            // No relay witness for this session (direct/interrupted) — fall back to the
+            // directory-mediated bilateral-ack seal.
+            return await handleActiveSealFlow(sessionId, record, correlationId);
+          }
+          return {
+            ok: false,
+            reason: submit.reason,
+            guidance: "The SEAL leaf could not be submitted to the relay witness. Retry once the relay is reachable (cello status).",
+          };
+        }
+        // Both parties must close for the directory to notarize. Await session_sealed; a
+        // timeout means the counterparty has not closed yet (our leaf is recorded — the
+        // session seals when they call cello_close_session). CELLO_SEAL_BILATERAL_TIMEOUT_MS
+        // tunes how long to wait for the counterparty before escalating to a unilateral seal.
+        const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 30_000;
+        let timer!: ReturnType<typeof setTimeout>;
+        const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
+        const sealedCompletion = await Promise.race([sealedP, timeoutP]);
+        clearTimeout(timer);
+        pendingSealWaiters.delete(sessionId);
+        if (sealedCompletion !== null) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
+          // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
+          // a reader gets it on the same surface that proves the seal — receipt-not-assent,
+          // per-party frontiers, attestation modes, and final_message.answered.
+          return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
+        }
+
+        // M7-UPGRADE-002: if THIS close fell through via the auto-ack 'already submitted' path, we
+        // hold no local reported_root to escalate with — and we should not need to: the
+        // counterparty's SEAL ctrl leaf is what triggered our auto-ack, so its seal is already on
+        // the relay and the bilateral seal should finalize. A timeout here is unexpected; report it
+        // as pending rather than escalating to a unilateral seal with no root.
+        if (!submit.ok) {
+          return {
+            ok: false,
+            reason: "seal_pending_bilateral",
+            guidance: "Your SEAL leaf is recorded (auto-acknowledged) and the bilateral seal is completing, but it did not finalize within the wait window. Check cello status and the daemon logs; retry cello_close_session if the session remains unsealed.",
+          };
+        }
+
+        // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
+        // seal — submit a seal_unilateral request carrying our reported_root (the content-hash
+        // root the directory rebuilds from the relay chain and verifies). The directory enforces
+        // the delivery-grace gate; if grace has not elapsed it replies seal_unilateral_too_early.
+        let resolveUni!: (r: UnilateralResult) => void;
+        const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
+        pendingUnilateralWaiters.set(sessionId, resolveUni);
+        const sent = await signalingManager.sendRaw({
+          type: "seal_unilateral",
+          session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
+          reported_root: new Uint8Array(Buffer.from(submit.reportedRootHex, "hex")),
+          reported_seq: submit.sequenceNumber,
+        });
+        if (!sent.ok) {
+          pendingUnilateralWaiters.delete(sessionId);
+          return {
+            ok: false,
+            reason: "seal_unilateral_send_failed",
+            guidance: "The unilateral seal request could not be sent to the directory. Check the directory connection (cello status) and retry cello_close_session.",
+          };
+        }
+        let uniTimer!: ReturnType<typeof setTimeout>;
+        const uniTimeoutP = new Promise<UnilateralResult>((r) => {
+          uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), 30_000);
+        });
+        const uniResult = await Promise.race([uniP, uniTimeoutP]);
+        clearTimeout(uniTimer);
+        pendingUnilateralWaiters.delete(sessionId);
+        if (uniResult.ok) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
+          return { ok: true, sealed_root: uniResult.sealedRootHex, seal_type: "unilateral" };
+        }
+        if (uniResult.reason === "seal_unilateral_too_early") {
+          return {
+            ok: false,
+            reason: "seal_counterparty_pending",
+            guidance: "Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. Retry cello_close_session after the grace period, or once the counterparty closes.",
+          };
+        }
+        return {
+          ok: false,
+          reason: uniResult.reason,
+          guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_list_sessions) before retrying cello_close_session.",
+        };
       } finally {
         sealInterruptedInProgress.delete(sessionId);
       }
@@ -1125,11 +1812,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   // ─── MCP-001: stubs for tools registered in cello-mcp.ts but not yet implemented ───
   // These return not_implemented (same as session tools) so LLMs get consistent guidance.
-  for (const tool of ["cello_backup", "cello_restore", "cello_get_sealed_receipt", "cello_get_inclusion_proof"]) {
+  for (const tool of ["cello_backup", "cello_restore", "cello_get_inclusion_proof"]) {
     handlers.set(tool, async (_params, _connectionId) => {
       return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
     });
   }
+
+  // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
+  // The cert-read surface: returns the receipt-not-assent certificate for a sealed session —
+  // per-party content frontiers, attestation modes, and whether the final message was answered.
+  // Reads the PERSISTED record, so it works after a daemon restart and from a DIFFERENT process
+  // than the one that built the certificate (an arbitrator reading the receiving side). The
+  // legibility states, as a first-class machine-readable property, that a signature attests
+  // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
+  // delivered-but-unanswered (final_message.answered: false), never agreed.
+  handlers.set("cello_get_sealed_receipt", async (params, _connectionId) => {
+    // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
+    const sessionId = params?.["session_id"] as string | undefined;
+    if (!sessionId || typeof sessionId !== "string") {
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
+    }
+    const cert = sessionNodeManager.getSealCertificate(sessionId);
+    if (!cert) {
+      return {
+        ok: false,
+        reason: "sealed_receipt_not_found",
+        guidance: "No sealed certificate is recorded for this session. It may not be sealed yet, or the session_id is wrong — close it with cello_close_session and confirm it reports sealed, then retry.",
+      };
+    }
+    return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+  });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
   handlers.set("queue_failed_send", async (params, _connectionId) => {
@@ -1195,6 +1907,97 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const depth = retryQueue.getSessionDepth(sessionId);
     const entries = retryQueue.getSessionEntries(sessionId);
     return { pendingCount: depth, nonces: entries.map(e => e.nonceHex) };
+  });
+
+  // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
+  // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
+  // proven (J-CONTENT increment 1) before the send/receive-path integration. The relay
+  // multiaddr (with /p2p/<peerId>) comes from the session assignment's relay endpoint;
+  // dials run from the standing receiver (open-gater) node.
+  const parseRelayPeer = (multiaddr: string | undefined): { peerId: string; addr: string } | null => {
+    if (!multiaddr) return null;
+    const peerId = multiaddr.split("/p2p/")[1];
+    return peerId ? { peerId, addr: multiaddr } : null;
+  };
+
+  handlers.set("content_park_deposit", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    const contentHash = params?.contentHash as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    const ciphertext = params?.ciphertext as string | undefined;
+    if (!relay || !recipientPubkey || !contentHash || !sessionId || !ciphertext) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId, ciphertext — all hex." };
+    }
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    return await client.deposit(node, {
+      recipientPubkey: Buffer.from(recipientPubkey, "hex"),
+      contentHash: Buffer.from(contentHash, "hex"),
+      sessionId: Buffer.from(sessionId, "hex"),
+      ciphertext: Buffer.from(ciphertext, "hex"),
+    });
+  });
+
+  handlers.set("content_park_pull", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    if (!relay || !recipientPubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
+    }
+    // The recipient must be a local agent — its K_local signs the relay's auth challenge.
+    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
+    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey; only the recipient can pull its own parked content." };
+    const kp = keyProviders.get(recipientAgent.name);
+    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    return {
+      ok: true,
+      entries: entries.map((e) => ({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, ciphertext: Buffer.from(e.ciphertext).toString("hex") })),
+    };
+  });
+
+  // MSG-001-3b (increment 3): RECOVER parked content. Pulls the recipient's parked entries,
+  // decrypts each IN-DAEMON (openContentSeal — the relay never sees plaintext), and routes the
+  // plaintext through ingestReceivedContent — the SAME inbound chokepoint as a direct receive
+  // (M9 single-funnel AC). The content completes the recipient's transcript view of an already-
+  // witnessed message so it can be read (cello_receive) and the session bilaterally sealed
+  // (DOD-INT-2). This is content-completion, NOT a resumption — the session stays interrupted.
+  handlers.set("content_park_recover", async (params, _connectionId) => {
+    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
+    const recipientPubkey = params?.recipientPubkey as string | undefined;
+    if (!relay || !recipientPubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
+    }
+    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
+    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey." };
+    const kp = keyProviders.get(recipientAgent.name);
+    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
+    if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal", guidance: `Agent '${recipientAgent.name}' key provider cannot open content seals.` };
+    const node = sessionNodeManager.getStandingReceiverNode();
+    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    let recovered = 0;
+    for (const e of entries) {
+      const plaintext = await kp.openContentSeal(e.ciphertext);
+      if (!plaintext) {
+        logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
+        continue;
+      }
+      const ingest = sessionNodeManager.ingestReceivedContent(e.sessionIdHex, plaintext, Buffer.from(e.contentHashHex, "hex"));
+      if (ingest.ok) {
+        recovered++;
+        logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
+      } else {
+        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason });
+      }
+    }
+    return { ok: true, recovered, pulled: entries.length };
   });
 
   // MCP-002: Test-only handler to emit session lifecycle events.
@@ -1420,6 +2223,57 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (typeof v === "string") return v.toLowerCase();
     return null;
   }
+  // M7-SESSION-004 (AC-005): normalise the wire `legibility` object — CBOR-decoded, so pubkeys
+  // arrive as Uint8Array/Buffer — into a JSON-safe certificate with hex-encoded pubkeys. Returns
+  // undefined for an absent or structurally-implausible object (pre-M7 frame, or a malformed
+  // field), in which case nothing is persisted and the seal still completes. The receipt-not-
+  // assent constants (attests/implies_assent/disclaimer) and the integers/booleans are carried
+  // verbatim; only the byte fields are re-encoded. The daemon never invents or alters the
+  // certificate's meaning — it is the directory's derivation, surfaced.
+  function normalizeLegibility(raw: unknown): unknown | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o["attests"] !== "receipt") return undefined;
+    const participantsRaw = o["participants"];
+    const finalRaw = o["final_message"];
+    if (!Array.isArray(participantsRaw) || !finalRaw || typeof finalRaw !== "object") return undefined;
+    // Review finding (low): the disclaimer is the human-readable half of the receipt-not-assent
+    // property; a non-string value means a malformed/tampered frame, so REJECT the whole cert
+    // rather than surfacing an empty disclaimer (implies_assent:false alone is the machine-readable
+    // half, but we do not surface a half-formed certificate).
+    if (typeof o["disclaimer"] !== "string" || o["disclaimer"].length === 0) return undefined;
+    // Review finding (low): validate attestation_mode against the closed enum — never surface an
+    // arbitrary string from a malformed frame on the cert read surface (defensive parity with the
+    // coerced fields). An out-of-enum value rejects the whole cert.
+    const VALID_MODES = new Set(["live", "recovered", "absent"]);
+    const participants: Array<{
+      pubkey: string | null; content_frontier_seq: number | null; last_authored_seq: number | null; attestation_mode: string;
+    }> = [];
+    for (const p of participantsRaw) {
+      const pp = p as Record<string, unknown>;
+      const mode = pp["attestation_mode"];
+      if (typeof mode !== "string" || !VALID_MODES.has(mode)) return undefined;
+      participants.push({
+        pubkey: frameValueToHex(pp["pubkey"]),
+        content_frontier_seq: typeof pp["content_frontier_seq"] === "number" ? pp["content_frontier_seq"] : null,
+        last_authored_seq: typeof pp["last_authored_seq"] === "number" ? pp["last_authored_seq"] : null,
+        attestation_mode: mode,
+      });
+    }
+    const fm = finalRaw as Record<string, unknown>;
+    const final_message = {
+      sender_pubkey: frameValueToHex(fm["sender_pubkey"]),
+      seq: typeof fm["seq"] === "number" ? fm["seq"] : null,
+      answered: fm["answered"] === true,
+    };
+    return {
+      attests: "receipt" as const,
+      implies_assent: false as const,
+      disclaimer: o["disclaimer"],
+      participants,
+      final_message,
+    };
+  }
   // Pull the fields out of a pushed session_assignment frame. Returns null when the frame
   // carries no usable assignment object / is missing the essential ids (the handler then
   // ignores it rather than throwing). Field-level validity (peer id, signature type) is
@@ -1432,6 +2286,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         initiatorPeerId: string;
         sessionTimestamp: number;
         signatureType: string | null;
+        signerPubkeyHex: string | null;
+        relayPeerId: string;
+        relayAddrs: string[];
       }
     | null {
     const raw = frame["assignment"];
@@ -1443,6 +2300,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
     const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
     if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
+    // M7 DOD-SPINE-6 / MSG-001-3b: relay endpoint so the receiver also connects to the
+    // relay witness (so the relay can deliver the initiator's witnessed leaves to it).
+    const relayEndpoint = a["relay_endpoint"] as Record<string, unknown> | undefined;
+    const relayPeerId =
+      relayEndpoint && typeof relayEndpoint["peer_id"] === "string" ? relayEndpoint["peer_id"] : "";
+    const relayAddrs =
+      relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
+        ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
+        : [];
     return {
       sessionIdHex,
       participantAPubkeyHex,
@@ -1451,21 +2317,31 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
       sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
       signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+      // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
+      // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
+      // The responder stores it so it can verify the bilateral seal signature locally, not just
+      // accept it (session.ts: "embedded so the counterparty can verify").
+      signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
+      relayPeerId,
+      relayAddrs,
     };
   }
 
-  // Wait (bounded) for the standing receiver to be ready. acceptSession consumes the one
-  // standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
-  // assignments would otherwise drop all but the first (review M2). Polling readiness lets
-  // each accept proceed once the prior rebuild completes, rather than being lost.
-  async function waitForStandingReceiver(maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
-    if (sessionNodeManager.getStandingReceiverReady()) return true;
+  // Wait (bounded) for THIS AGENT's standing receiver to be ready. acceptSession consumes the
+  // agent's standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
+  // assignments for that agent would otherwise drop all but the first (review M2). Polling the
+  // per-agent readiness lets each accept proceed once the prior rebuild completes. Must check the
+  // OWNING agent — `getStandingReceiverReady()` with no arg returns true if ANY agent has one,
+  // which in the loopback case (alice + bob on one daemon) would falsely pass while bob's own SR
+  // is still mid-rebuild and drop bob's session (DOD-LOOP-1).
+  async function waitForStandingReceiver(agentName: string, maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
+    if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
     const deadline = Date.now() + maxWaitMs;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, stepMs));
-      if (sessionNodeManager.getStandingReceiverReady()) return true;
+      if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
     }
-    return sessionNodeManager.getStandingReceiverReady();
+    return sessionNodeManager.getStandingReceiverReady(agentName);
   }
 
   async function acceptInboundAssignment(
@@ -1474,8 +2350,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     correlationId: string,
   ): Promise<void> {
     try {
-      // M2: do not drop the session if the standing receiver is mid-rebuild.
-      const ready = await waitForStandingReceiver();
+      // M2: do not drop the session if this agent's standing receiver is mid-rebuild.
+      const ready = await waitForStandingReceiver(agentName);
       if (!ready) {
         logger.warn("session.inbound.accept.failed", {
           sessionId: parsed.sessionIdHex,
@@ -1485,12 +2361,26 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         });
         return;
       }
+      // M7 DOD-SPINE-6 / MSG-001-3b: relay witness for the receiver. Build from the
+      // inbound assignment's relay endpoint + this agent's K_local + the 16-byte session id.
+      const kp = keyProviders.get(agentName);
+      let relayParams: RelayConnectParams | undefined;
+      if (kp && parsed.relayPeerId && parsed.relayAddrs.length > 0) {
+        relayParams = {
+          relayPeerId: parsed.relayPeerId,
+          relayAddrs: parsed.relayAddrs,
+          keyProvider: kp,
+          senderPubkey: await kp.getPublicKey(),
+          sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
+        };
+      }
       const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
         agentName,
         parsed.participantAPubkeyHex, // the initiator is OUR counterparty
         parsed.initiatorPeerId,
         correlationId,
+        relayParams,
       );
       if (!result.ok) {
         logger.warn("session.inbound.accept.failed", {
@@ -1500,6 +2390,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           correlationId,
         });
         return;
+      }
+      // M7 legibility-TBS-binding (responder verify): store the initiator's primary (the seal
+      // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
+      // signature can be verified locally rather than accepted on faith.
+      if (parsed.signerPubkeyHex) {
+        sessionNodeManager.recordCounterpartyPrimary(parsed.sessionIdHex, parsed.signerPubkeyHex);
       }
 
       // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
@@ -1631,6 +2527,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (frame["type"] !== "session_assignment") return;
     handleInboundSessionAssignment(frame);
   });
+
+  // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the SESSION-OWNING
+  // agent's signaling stream after the relay-mediated bilateral seal notarizes. Registered on the
+  // keystone (primary agent) here AND per-agent in getAgentSignaling — for a non-primary agent the
+  // directory routes session_sealed to its per-agent stream, so a keystone-only listener would
+  // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
+  // the sealed_root and mark the session sealed. Guarded on primaryAgent: the keystone listener now
+  // needs the primary agent's name/pubkey to verify the seal signature (legibility-TBS-binding), and
+  // with no agents there are no keystone sessions to seal anyway.
+  if (primaryAgent) {
+    registerSessionSealedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
+    // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
+    // primary agent closes over the keystone stream, so the directory routes its
+    // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
+    registerUnilateralConfirmedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
+  }
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
@@ -2394,6 +3306,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // Stop SignalingManager (flushes pending ops with shutdown error, cancels reconnect loop)
     await signalingManager.stop();
+    // Stop every per-agent signaling stream too (multi-agent), so no agent's directory
+    // node / reconnect loop is orphaned past shutdown.
+    for (const entry of perAgentSignaling.values()) {
+      await entry.signaling.stop();
+    }
     // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
     await sessionNodeManager.gracefulShutdown();
     await ipcServer.stop();

@@ -129,11 +129,22 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(handle.getAutoNatService().getDialability()).toEqual({ dialable: false, publicAddr: null });
   });
 
-  it("C2: starting the daemon emits transport.autonat.result and transport.autonat.unavailable", async () => {
+  it("C2: an agent coming online emits transport.autonat.result and transport.autonat.unavailable for its standing receiver", async () => {
     process.env["CELLO_ENV"] = "local";
+    await setupAgent("alice");
     handle = await startDaemon(makeConfig());
 
-    const result = logEvents.find((e) => e.event === "transport.autonat.result");
+    // DOD-LOOP-1: the standing receiver is now per-agent — its AutoNAT result fires when the agent
+    // comes online (cello_start_agent → ensureStandingReceiverForAgent), not at daemon start.
+    const client = await connectMcp(join(tempDir, "daemon.sock"));
+    expect(((await client.send("cello_start_agent", { name: "alice" })) as Record<string, unknown>).ok).toBe(true);
+
+    let result: { level: string; event: string; context: Record<string, unknown> } | undefined;
+    for (let i = 0; i < 100 && !result; i++) {
+      result = logEvents.find((e) => e.event === "transport.autonat.result");
+      if (result) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
     expect(result).toBeDefined();
     expect(result!.level).toBe("info");
     expect(result!.context).toMatchObject({ dialable: false, publicAddr: null, nodeType: "standing_receiver" });
@@ -199,7 +210,10 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
     expect(record?.counterparty_pubkey).toBe("bb".repeat(32));
   });
 
-  it("cello_initiate_session without a negotiator returns directory_signaling_not_configured (graceful, adapters still wired)", async () => {
+  it("cello_initiate_session wires a real internal negotiator (DOD-SPINE-5); empty params → invalid_target_pubkey", async () => {
+    // SPINE-5: the daemon now always builds a real internal SessionNegotiator (it no longer
+    // returns the wired-out directory_signaling_not_configured). With no target_pubkey, the
+    // negotiator's input validation rejects first — proving it is actually wired + validating.
     process.env["CELLO_ENV"] = "local";
     await setupAgent("alice");
     handle = await startDaemon(makeConfig());
@@ -210,7 +224,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
 
     const result = (await client.send("cello_initiate_session", {})) as { ok: boolean; reason?: string };
     expect(result.ok).toBe(false);
-    expect(result.reason).toBe("directory_signaling_not_configured");
+    expect(result.reason).toBe("invalid_target_pubkey");
   });
 
   it("production variant without a transport dialer fails at startup naming the missing config", async () => {

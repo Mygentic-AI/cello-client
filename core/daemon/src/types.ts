@@ -296,6 +296,12 @@ export interface SessionRecord {
   message_count: number;
   /** M7-SESSION-001: ISO 8601 timestamp of interruption. Null if not yet set. */
   interrupted_at: string | null;
+  /**
+   * M7 legibility-TBS-binding: the counterparty's FROST primary (group) pubkey hex, from the
+   * SessionAssignment's signer_pubkey. The responder verifies the bilateral seal signature against
+   * it. Null when this party initiated (it verifies against its own primary).
+   */
+  counterparty_primary_pubkey?: string | null;
 }
 
 /** M7-SESSION-001: An interrupted session entry in the cello status response. */

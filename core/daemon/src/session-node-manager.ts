@@ -76,8 +76,26 @@ import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
+import type { KeyProvider } from "@cello-protocol/crypto";
+import { encodeSealPayload } from "@cello-protocol/protocol-types";
+import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
+
+/**
+ * M7 DOD-SPINE-6 / MSG-001-3b: the inputs a session node needs to connect to the relay
+ * as the Structure-2 witness (relay endpoint from the FROST-signed assignment + the
+ * agent's K_local identity + the 16-byte session id). Optional on node creation: when
+ * absent (or connect fails), the session still works over the direct content path — the
+ * relay just doesn't witness the leaf yet.
+ */
+export interface RelayConnectParams {
+  relayPeerId: string;
+  relayAddrs: string[];
+  keyProvider: KeyProvider;
+  senderPubkey: Uint8Array;
+  sessionIdBytes: Uint8Array;
+}
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -127,6 +145,25 @@ interface ActiveSessionEntry {
    * down so its node subscription is released.
    */
   autoNat: NodeAutoNatService;
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: the agent's shared relay witness client (one stream per
+   * agent, multiplexing all that agent's sessions — the relay keys delivery by agent
+   * pubkey). The leaf submit path uses it on cello_send. Absent when the relay is
+   * unreachable — the direct content path still delivers.
+   */
+  relayClient?: AgentRelayClient;
+  /** The 16-byte session id, for relay leaf submission (the relay frame carries it). */
+  relaySessionIdBytes?: Uint8Array;
+  /** The `#relayClients` map key (agentName + relay peer id) — federation-safe teardown. */
+  relayClientKey?: string;
+  /**
+   * MSG-001-3b (2b): the session's relay endpoint (peer id + addrs) from the FROST assignment.
+   * Held so the content-park backstop can deposit to the SAME relay this session is witnessed by
+   * when direct delivery fails. In-memory only (not persisted — the startup-flush park is the
+   * separate schema concern; this live park has the endpoint in hand).
+   */
+  relayPeerId?: string;
+  relayAddrs?: string[];
 }
 
 /** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
@@ -150,8 +187,22 @@ export class SessionNodeManager {
   readonly #dbPath: string;
   #db: DatabaseSync | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
-  #standingReceiver: { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null = null;
-  #standingReceiverReady = false;
+  // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
+  // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
+  // agent's sessions share one authenticated relay stream (each frame carries session_id).
+  #relayClients = new Map<string, AgentRelayClient>();
+  // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
+  // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
+  // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
+  // would contend for a single node and thrash. Keyed by agentName. A creation-in-flight guard set
+  // prevents two concurrent ensure() calls from building two nodes for the same agent.
+  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService }>();
+  #standingReceiverCreating = new Set<string>();
+  // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
+  // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
+  // ensure checks this after start() and tears the fresh node down instead of installing an SR for
+  // an agent that has since gone offline (cello_stop_agent race). A fresh ensure clears it.
+  #standingReceiverRemoving = new Set<string>();
   // Set once gracefulShutdown begins. The standing-receiver replacement that
   // acceptSession kicks off runs un-awaited (AC-003), so it can be in flight when
   // shutdown starts; #createStandingReceiver checks this flag and stops a freshly
@@ -173,6 +224,14 @@ export class SessionNodeManager {
   // the liveness authority for direct sessions — the unilateral-seal gate reads
   // it (relay sessions query the relay instead). NEVER the directory (SI-002).
   #sessionLiveness = new Map<string, "alive" | "gone">();
+  // M7-UPGRADE-002: sessions whose content integrity could NOT be verified (a content_hash
+  // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
+  // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
+  #contentDesynced = new Set<string>();
+  // M7-UPGRADE-002: sessions for which B has already submitted its responder SEAL leaf (via
+  // auto-ack OR cello_close_session). Idempotency guard — A's SEAL ctrl leaf may be delivered
+  // more than once (and the relay echoes leaves), so auto-ack fires AT MOST ONCE per session.
+  #responderSealSubmitted = new Set<string>();
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -204,6 +263,15 @@ export class SessionNodeManager {
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  /**
+   * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
+   * endpoint from the session entry and calls this when a send is NOT confirmed delivered
+   * (direct-fail or TTF expiry). The daemon's hook seals (sealToRecipient) + deposits via
+   * ContentParkClient. Best-effort.
+   */
+  #contentParkHook:
+    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>)
+    | null = null;
 
   constructor(opts: {
     factory: ISessionNodeFactory;
@@ -240,6 +308,42 @@ export class SessionNodeManager {
     this.#onAwaitingTtf = hooks.onTtf ?? null;
   }
 
+  /**
+   * MSG-001-3b (2b): inject the live content-park deposit (seal + ContentParkClient.deposit).
+   * Injected by the composition root (daemon.ts). When absent, a not-confirmed send still records
+   * the durable awaiting entry (crash backstop) but does not deposit live.
+   */
+  setContentParkHook(
+    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array }) => Promise<void>,
+  ): void {
+    this.#contentParkHook = fn;
+  }
+
+  /**
+   * MSG-001-3b (2b): deposit un-confirmed content to the relay store-and-forward backstop — keyed
+   * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
+   * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
+   */
+  #parkContent(sessionId: string, contentHashHex: string, content: Uint8Array): void {
+    const hook = this.#contentParkHook;
+    const entry = this.#activeNodes.get(sessionId);
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return;
+    void hook({
+      sessionId,
+      recipientPubkeyHex: entry.counterpartyPubkey,
+      relayPeerId: entry.relayPeerId,
+      relayAddrs: entry.relayAddrs,
+      contentHashHex,
+      content,
+    }).catch((err: unknown) => {
+      this.#logger.warn("content.park.deposit.failed", {
+        sessionId,
+        contentHash: contentHashHex,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
   // ─── Initialization ──────────────────────────────────────────────────────
 
   async initialize(): Promise<void> {
@@ -262,6 +366,22 @@ export class SessionNodeManager {
     for (const ddl of [
       "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
+      // MSG-001-3b (MSG-2 startup-flush): persist the session's relay endpoint so the
+      // crash-backstop flush can deposit un-acked content after a restart, when the
+      // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
+      "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
+      "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
+      // M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
+      // sealed record so it survives a daemon restart and is readable on the cert-read surface
+      // (cello_get_sealed_receipt). JSON string with hex-encoded pubkeys; NULL until sealed.
+      // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
+      "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
+      "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
+      // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)
+      // pubkey, taken from the FROST-signed SessionAssignment's signer_pubkey. The responder uses
+      // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
+      // primary), not just accept it. NULL when this party initiated (it uses its own primary).
+      "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -339,9 +459,9 @@ export class SessionNodeManager {
       }
     }
 
-    // Step 3: Create the standing receiver node (eager — AC-002 requires it
-    // to be ready before the IPC socket opens).
-    await this.#createStandingReceiver();
+    // DOD-LOOP-1: standing receivers are now PER-AGENT, created when each agent comes online
+    // (cello_start_agent → ensureStandingReceiverForAgent). No daemon-global receiver is created at
+    // init (no agent is online yet). The initiate/accept paths kick off creation on demand if missing.
   }
 
   // ─── Public API ──────────────────────────────────────────────────────────
@@ -358,9 +478,16 @@ export class SessionNodeManager {
     return this.#db;
   }
 
-  /** Whether the standing receiver node is ready for the next inbound session. */
-  getStandingReceiverReady(): boolean {
-    return this.#standingReceiverReady;
+  /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
+  getStandingReceiverReady(agentName?: string): boolean {
+    if (agentName !== undefined) return this.#standingReceivers.has(agentName);
+    return this.#standingReceivers.size > 0;
+  }
+
+  /** First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use (gater-open). */
+  #anyStandingReceiver(): { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null {
+    for (const sr of this.#standingReceivers.values()) return sr;
+    return null;
   }
 
   /**
@@ -371,12 +498,27 @@ export class SessionNodeManager {
    * counterparty_session_* fields. Read-only — does NOT consume the standing receiver
    * (unlike acceptSession, which hands it off).
    */
-  getStandingReceiverInfo(): { peerId: string; addrs: string[] } | null {
-    if (!this.#standingReceiverReady || this.#standingReceiver === null) return null;
-    return {
-      peerId: this.#standingReceiver.node.getPeerId(),
-      addrs: this.#standingReceiver.node.listenAddresses(),
-    };
+  getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null {
+    // DOD-LOOP-1: the initiator advertises ITS OWN agent's standing receiver, which it then reuses
+    // as the session node — so the advertised endpoint matches the node the counterparty dials.
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return null;
+    return { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() };
+  }
+
+  /**
+   * The standing receiver's libp2p node — a general-purpose, OPEN-gater node usable for
+   * OUTBOUND dials that are not session-scoped (e.g. the content-park deposit/pull to the
+   * relay, MSG-001-3b). Session nodes have restrictive gaters; the standing receiver does not.
+   * Returns null until the receiver is ready.
+   */
+  getStandingReceiverNode(agentName?: string): CelloNode | null {
+    // With an agentName: that agent's own standing-receiver node (needed when the dial must
+    // originate from a SPECIFIC agent — e.g. the startup content-park re-park, where the
+    // depositor is the original sender). Without one: any ready standing receiver (outbound
+    // content-park deposit/pull to the relay — open gater, not session-scoped).
+    if (agentName !== undefined) return this.#standingReceivers.get(agentName)?.node ?? null;
+    return this.#anyStandingReceiver()?.node ?? null;
   }
 
   /**
@@ -397,7 +539,10 @@ export class SessionNodeManager {
    * source of the transport.autonat.result / transport.autonat.unavailable events.
    */
   getStandingReceiverAutoNat(): IAutoNatService | null {
-    return this.#standingReceiver?.autoNat ?? null;
+    // DOD-LOOP-1: the daemon-level autonat source is any ready standing receiver; null until one
+    // exists (the composition root falls back to LocalAutoNatStub). Per-session advertised dialability
+    // comes from the initiating agent's own SR via getStandingReceiverInfo, not this daemon-level value.
+    return this.#anyStandingReceiver()?.autoNat ?? null;
   }
 
   /**
@@ -432,6 +577,8 @@ export class SessionNodeManager {
     counterpartyPubkey: string,
     counterpartyPeerId: string,
     correlationId: string,
+    reuseStandingReceiver = false,
+    relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
     // Cap enforcement (AC-006)
     if (this.#activeNodes.size >= MAX_SESSION_NODES) {
@@ -449,32 +596,69 @@ export class SessionNodeManager {
       };
     }
 
-    // Create restricted gater — allows only counterpartyPeerId
-    const gater = new SessionConnectionGater({
-      sessionId,
-      allowedPeerId: counterpartyPeerId,
-      logger: this.#logger,
-    });
-
+    // The session node N_A: either a FRESH ephemeral node (default), or — for the initiator
+    // path (reuseStandingReceiver) — the standing receiver handed off as the session node. The
+    // latter makes N_A's peer id equal the SESSION endpoint the initiator ADVERTISED to the
+    // directory (its standing receiver), so the counterparty's connection gater (set to that
+    // advertised peer id) admits N_A's dial. Mirrors acceptSession, which already hands off the
+    // standing receiver on the receiver side. WIRE-001/INV-5: a fully-fresh ephemeral initiator
+    // node would require advertising N_A's peer id pre-negotiation (a session-node lifecycle
+    // split); the symmetric standing-receiver handoff is the consistent interim model.
     let node: CelloNode;
-    try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
-      await node.start();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      this.#logger.error("session.node.create.failed", {
+    let gater: SessionConnectionGater;
+    let autoNat: NodeAutoNatService;
+    if (reuseStandingReceiver) {
+      const sr = this.#standingReceivers.get(agentName);
+      if (!sr) {
+        // DOD-LOOP-1: this agent has no standing receiver ready — kick off (idempotent) creation
+        // so a retry finds it, and report unavailable. Per-agent, so the initiator consuming its
+        // OWN agent's receiver never contends with a co-resident responder agent (the loopback case).
+        void this.#ensureStandingReceiver(agentName, correlationId);
+        return {
+          ok: false,
+          reason: "standing_receiver_unavailable",
+          guidance: "The standing receiver node is initializing (completes within 200ms). Retry the session in a moment.",
+        };
+      }
+      ({ node, gater, autoNat } = sr);
+      gater.setAllowedPeer(counterpartyPeerId);
+      // Hand this agent's standing receiver off to this session; a replacement is spun up below.
+      this.#standingReceivers.delete(agentName);
+    } else {
+      gater = new SessionConnectionGater({
         sessionId,
-        agentName,
-        error: errorMessage,
-        correlationId,
+        allowedPeerId: counterpartyPeerId,
+        logger: this.#logger,
       });
-      return {
-        ok: false,
-        reason: "session_node_creation_failed",
-        guidance:
-          "Failed to create session transport node. The daemon logged the cause in " +
-          "session.node.create.failed. Check that the system has available ports and sufficient memory.",
-      };
+      try {
+        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
+        await node.start();
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        this.#logger.error("session.node.create.failed", {
+          sessionId,
+          agentName,
+          error: errorMessage,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "session_node_creation_failed",
+          guidance:
+            "Failed to create session transport node. The daemon logged the cause in " +
+            "session.node.create.failed. Check that the system has available ports and sufficient memory.",
+        };
+      }
+      // CELLO-M7-TRANSPORT-001: session nodes also need dialability awareness for the
+      // dcutr decision path (AC-002). Wrap the node in a NodeAutoNatService and emit
+      // its initial result (nodeType: 'session').
+      autoNat = new NodeAutoNatService({
+        node,
+        logger: this.#logger,
+        nodeType: "session",
+        probers: this.#autoNatProbers(),
+      });
+      autoNat.emitInitialResult();
     }
 
     const peerId = node.getPeerId();
@@ -490,17 +674,6 @@ export class SessionNodeManager {
       sessionPeerId: peerId,
       correlationId,
     });
-
-    // CELLO-M7-TRANSPORT-001: session nodes also need dialability awareness for the
-    // dcutr decision path (AC-002). Wrap the node in a NodeAutoNatService and emit
-    // its initial result (nodeType: 'session').
-    const autoNat = new NodeAutoNatService({
-      node,
-      logger: this.#logger,
-      nodeType: "session",
-      probers: this.#autoNatProbers(),
-    });
-    autoNat.emitInitialResult();
 
     // Add to active map
     this.#activeNodes.set(sessionId, {
@@ -520,7 +693,135 @@ export class SessionNodeManager {
     // liveness. The session connection IS the authority for a direct session.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
+    // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
+    // Structure-2 witness (non-fatal — direct content still works without it).
+    if (relay) {
+      await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
+    }
+
+    // If we consumed this agent's standing receiver, spin up a replacement (async — do NOT await).
+    if (reuseStandingReceiver) {
+      void this.#ensureStandingReceiver(agentName, correlationId);
+    }
+
     return { ok: true, peerId, addrs };
+  }
+
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: connect a session node to the relay witness and
+   * store the client on the active entry. Best-effort: a connect/auth failure logs
+   * and leaves relayClient undefined — the session is NOT destroyed and the direct
+   * content path keeps working (the relay-park/recovery path is MSG-001-3b's domain).
+   */
+  async #connectSessionRelay(
+    sessionId: string,
+    node: CelloNode,
+    agentName: string,
+    relay: RelayConnectParams,
+    correlationId: string,
+  ): Promise<void> {
+    try {
+      // The session node's gater admits only the counterparty; the relay witness is a
+      // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
+      // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
+      this.#activeNodes.get(sessionId)?.gater.setAllowedOutboundPeer(relay.relayPeerId);
+
+      // One relay client per (AGENT, RELAY NODE). The relay keys by agent pubkey, so the
+      // collision H1 addresses is per relay; CELLO is federated, so a different session for
+      // the same agent may be assigned a DIFFERENT relay — that needs its own client.
+      const clientKey = `${agentName}::${relay.relayPeerId}`;
+      let client = this.#relayClients.get(clientKey);
+      if (!client) {
+        client = new AgentRelayClient({
+          relayPeerId: relay.relayPeerId,
+          relayAddrs: relay.relayAddrs,
+          keyProvider: relay.keyProvider,
+          senderPubkey: relay.senderPubkey,
+          logger: this.#logger,
+        });
+        this.#relayClients.set(clientKey, client);
+      }
+      const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
+      client.registerSession(sessionIdHexForRelay, node, (frame) => {
+        // The counterparty's witnessed leaf arrived with its canonical sequence. The
+        // plaintext is delivered separately over the direct content stream; this is the
+        // ordering/witness signal. Full canonical-sequence reconciliation against the
+        // local tree is MSG-001-3b (J-CONTENT).
+        this.#logger.info("session.relay.leaf.delivered", {
+          sessionId,
+          sequenceNumber: frame.sequence_number,
+          leafKind: frame.leaf_kind,
+          correlationId,
+        });
+        // M7-UPGRADE-002: auto-acknowledge close. When the COUNTERPARTY's SEAL ctrl leaf (0x02)
+        // arrives and B has verified the content, B's OWN node auto-co-signs the responder SEAL
+        // leaf — no agent prompt — so the bilateral seal completes promptly instead of degrading
+        // to unilateral on a slow/busy/crashed agent. Never auto-ack our OWN echoed ctrl leaf.
+        if (frame.leaf_kind === LEAF_KIND_CTRL && !frame.authored_by_us) {
+          this.#maybeAutoAcknowledgeSeal(sessionId, correlationId);
+        }
+      });
+
+      const entry = this.#activeNodes.get(sessionId);
+      if (entry) {
+        entry.relayClient = client;
+        entry.relaySessionIdBytes = relay.sessionIdBytes;
+        entry.relayClientKey = clientKey;
+        // 2b: remember the relay endpoint so the content-park backstop deposits to the SAME relay.
+        entry.relayPeerId = relay.relayPeerId;
+        entry.relayAddrs = relay.relayAddrs;
+        // MSG-2 startup-flush: also PERSIST it, so a restart's crash-backstop flush (which runs
+        // before the in-memory entry exists) can deposit un-acked content to the same relay.
+        try {
+          this.#db
+            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE session_id = ?")
+            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), sessionId);
+        } catch (err: unknown) {
+          this.#logger.warn("session.relay.endpoint.persist.failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } else {
+        // The session was torn down while we were wiring — undo the registration.
+        client.unregisterSession(sessionIdHexForRelay);
+        if (!client.hasSessions() && this.#relayClients.get(clientKey) === client) {
+          client.close();
+          this.#relayClients.delete(clientKey);
+        }
+        return;
+      }
+
+      // Proactively connect so the relay has this agent's stream to deliver leaves to
+      // (the RECEIVER must be connected before the counterparty submits). Best-effort.
+      await client.connect(node);
+    } catch (err: unknown) {
+      this.#logger.warn("session.relay.connect.error", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
+  }
+
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: detach a session from its (agent, relay) client and
+   * close the client when it has no remaining sessions. Idempotent and identity-guarded:
+   * the map delete only fires if the map still holds THIS client (a racing teardown of a
+   * sibling session must not close a freshly-created replacement client for the same key).
+   */
+  #detachSessionRelay(entry: ActiveSessionEntry): void {
+    const client = entry.relayClient;
+    const key = entry.relayClientKey;
+    if (!client || !entry.relaySessionIdBytes) return;
+    // Idempotent: clear the entry's reference so a second teardown of the same entry no-ops.
+    entry.relayClient = undefined;
+    const sidHex = Buffer.from(entry.relaySessionIdBytes).toString("hex");
+    client.unregisterSession(sidHex);
+    if (!client.hasSessions() && key && this.#relayClients.get(key) === client) {
+      client.close();
+      this.#relayClients.delete(key);
+    }
   }
 
   /**
@@ -591,8 +892,12 @@ export class SessionNodeManager {
     counterpartyPubkey: string,
     initiatorPeerId: string,
     correlationId: string,
+    relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
-    if (!this.#standingReceiverReady || this.#standingReceiver === null) {
+    const inboundSr = this.#standingReceivers.get(agentName);
+    if (!inboundSr) {
+      // DOD-LOOP-1: per-agent — kick off (idempotent) creation so a retry finds it.
+      void this.#ensureStandingReceiver(agentName, correlationId);
       return {
         ok: false,
         reason: "standing_receiver_unavailable",
@@ -618,7 +923,7 @@ export class SessionNodeManager {
       };
     }
 
-    const { node, gater, autoNat } = this.#standingReceiver;
+    const { node, gater, autoNat } = inboundSr;
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
     gater.setAllowedPeer(initiatorPeerId);
@@ -637,10 +942,9 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    // Remove from standing receiver slot and add to active map. The handed-off
+    // Remove this agent's standing receiver from the slot and add to active map. The handed-off
     // node keeps its AutoNAT service (it continues to surface dialability).
-    this.#standingReceiver = null;
-    this.#standingReceiverReady = false;
+    this.#standingReceivers.delete(agentName);
     this.#activeNodes.set(sessionId, {
       node,
       agentName,
@@ -656,8 +960,14 @@ export class SessionNodeManager {
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
     this.#wireSessionLiveness(sessionId, node, counterpartyPubkey, correlationId);
 
-    // Immediately spin up a replacement (async — do NOT await, AC-003)
-    this.#createStandingReceiverWithRetry(correlationId);
+    // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
+    // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
+    if (relay) {
+      await this.#connectSessionRelay(sessionId, node, agentName, relay, correlationId);
+    }
+
+    // Immediately spin up a replacement for THIS agent (async — do NOT await, AC-003)
+    void this.#ensureStandingReceiver(agentName, correlationId);
 
     return { ok: true, peerId, addrs };
   }
@@ -674,6 +984,8 @@ export class SessionNodeManager {
     if (!entry) return;
 
     entry.autoNat.stop();
+    // M7 DOD-SPINE-6 / MSG-001-3b: close the relay witness stream so we don't leak it.
+    this.#detachSessionRelay(entry);
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -721,6 +1033,7 @@ export class SessionNodeManager {
   async retireSessionNode(sessionId: string): Promise<void> {
     const entry = this.#activeNodes.get(sessionId);
     if (!entry) return;
+    this.#detachSessionRelay(entry);
     try {
       await entry.node.stop();
     } catch (err: unknown) {
@@ -751,6 +1064,9 @@ export class SessionNodeManager {
     // M7-SESSION-003: drop the direct-path liveness flag (the seal gate already read
     // its verdict) so a destroyed/retired session retains no stale alive/gone state.
     this.#sessionLiveness.delete(sessionId);
+    // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
+    this.#contentDesynced.delete(sessionId);
+    this.#responderSealSubmitted.delete(sessionId);
   }
 
   /**
@@ -799,6 +1115,9 @@ export class SessionNodeManager {
     const stopPromises: Promise<void>[] = [];
     for (const [sessionId, entry] of this.#activeNodes) {
       entry.autoNat.stop();
+      // M7 DOD-SPINE-6: detach from the agent relay client (closes it when its last
+      // session goes) — consistent with the other teardown paths.
+      this.#detachSessionRelay(entry);
       stopPromises.push(
         entry.node.stop().then(() => {
           this.#logger.info("session.node.destroyed", {
@@ -823,22 +1142,21 @@ export class SessionNodeManager {
     this.#trees.clear();
     this.#receivedContent.clear();
 
-    // Stop standing receiver
-    if (this.#standingReceiver) {
-      this.#standingReceiver.autoNat.stop();
+    // Stop ALL per-agent standing receivers (DOD-LOOP-1).
+    for (const [agentName, sr] of this.#standingReceivers) {
+      sr.autoNat.stop();
       try {
-        await this.#standingReceiver.node.stop();
+        await sr.node.stop();
       } catch (err: unknown) {
         this.#logger.error("session.node.stop.failed", {
           sessionId: "standing_receiver_shutdown",
-          agentName: STANDING_RECEIVER_AGENT_NAME,
+          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
           error: err instanceof Error ? err.message : String(err),
           correlationId: "n/a",
         });
       }
-      this.#standingReceiver = null;
-      this.#standingReceiverReady = false;
     }
+    this.#standingReceivers.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.
@@ -857,6 +1175,58 @@ export class SessionNodeManager {
     return this.#db
       .prepare("SELECT * FROM sessions WHERE status = ?")
       .all(status) as unknown as SessionRecord[];
+  }
+
+  /**
+   * M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
+   * sealed record. Stored as a JSON string (hex-encoded pubkeys) so it round-trips a
+   * daemon restart and is returned intact on the cert-read surface. The caller normalises
+   * the raw wire legibility (Uint8Array pubkeys) into a JSON-safe shape before storing.
+   * Best-effort: a session row may not yet exist (the seal arrived before the row was
+   * persisted); in that case we no-op rather than throw — the cert still flows through the
+   * live return path. The legibility content is identical regardless of delivery timing.
+   */
+  recordSealCertificate(sessionId: string, sealedRootHex: string, legibilityJson: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE session_id = ?")
+      .run(legibilityJson, sealedRootHex, Date.now(), sessionId);
+  }
+
+  /**
+   * M7 legibility-TBS-binding (responder verify): record the counterparty's FROST primary (group)
+   * pubkey from the FROST-signed SessionAssignment, so the responder can VERIFY the bilateral seal
+   * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
+   * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
+   */
+  recordCounterpartyPrimary(sessionId: string, primaryPubkeyHex: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE session_id = ?")
+      .run(primaryPubkeyHex, Date.now(), sessionId);
+  }
+
+  /**
+   * M7-SESSION-004 (AC-005/AC-006): read the persisted seal certificate for a session.
+   * Returns the sealed root and the parsed legibility object (JSON-safe, hex pubkeys), or
+   * null if the session is unknown or not yet sealed. This is the cert-read surface a
+   * reader (operator, agent, arbitrator) — possibly in a DIFFERENT process than the one
+   * that built the certificate — uses to determine receipt-not-assent, per-party frontiers,
+   * attestation modes, and whether the final message was answered.
+   */
+  getSealCertificate(sessionId: string): { sealed_root: string; legibility: unknown } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
+    if (!row || !row.seal_legibility || !row.sealed_root_hex) return null;
+    let legibility: unknown;
+    try {
+      legibility = JSON.parse(row.seal_legibility);
+    } catch {
+      return null;
+    }
+    return { sealed_root: row.sealed_root_hex, legibility };
   }
 
   /**
@@ -928,6 +1298,7 @@ export class SessionNodeManager {
     // Tear down the in-memory session node if it exists
     if (entry) {
       entry.autoNat.stop();
+      this.#detachSessionRelay(entry);
       try {
         await entry.node.stop();
       } catch (err: unknown) {
@@ -1075,6 +1446,26 @@ export class SessionNodeManager {
       .prepare("SELECT * FROM sessions WHERE session_id = ?")
       .get(sessionId) as unknown as SessionRecord | undefined;
     return row ?? null;
+  }
+
+  /**
+   * MSG-2 startup-flush: the persisted relay endpoint for a session, or null if none was
+   * recorded. Used by the crash-backstop flush, which runs at startup BEFORE the in-memory
+   * session entries exist, so it cannot use `entry.relayPeerId`.
+   */
+  getPersistedRelayEndpoint(sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE session_id = ?")
+      .get(sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
+    if (!row?.relay_peer_id || !row?.relay_addrs) return null;
+    try {
+      const addrs = JSON.parse(row.relay_addrs) as unknown;
+      if (!Array.isArray(addrs) || addrs.length === 0) return null;
+      return { relayPeerId: row.relay_peer_id, relayAddrs: addrs as string[] };
+    } catch {
+      return null;
+    }
   }
 
   // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
@@ -1225,6 +1616,43 @@ export class SessionNodeManager {
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
     }
+    // R1 (MSG-001-3b): witness the message-leaf HASH to the relay FIRST, INDEPENDENT of
+    // direct delivery. The relay is the ordering authority (Structure 2): it assigns the
+    // canonical sequence from the hash whether or not the counterparty is reachable for direct
+    // content. So an OFFLINE recipient still gets a sequence, and the parked content is later
+    // recovered AT that sequence (DOD-MSG-4 recovery-not-desync). The relay only ever sees the
+    // hash (INV-3). Best-effort: a relay miss degrades to local-only sequencing. Previously this
+    // ran AFTER a successful direct send, so an offline recipient's content got NO sequence — the
+    // gap R1 closes.
+    if (entry.relayClient && entry.relaySessionIdBytes) {
+      try {
+        const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash);
+        if (witnessed.ok) {
+          this.#logger.info("session.relay.hash.submitted", {
+            sessionId,
+            sequenceNumber: witnessed.sequence_number,
+            correlationId,
+          });
+        } else {
+          this.#logger.warn("session.relay.hash.submit.failed", {
+            sessionId,
+            reason: witnessed.reason,
+            correlationId,
+          });
+        }
+      } catch (relayErr: unknown) {
+        this.#logger.warn("session.relay.hash.submit.failed", {
+          sessionId,
+          reason: relayErr instanceof Error ? relayErr.message : String(relayErr),
+          correlationId,
+        });
+      }
+    }
+
+    // Attempt direct peer↔peer content delivery. On success the receiver's `persisted` ACK
+    // resolves the awaiting timer; on failure (counterparty offline) the hash is already
+    // witnessed above, so the caller / TTF path parks the SEALED content to the relay
+    // store-and-forward backstop and the recipient recovers it at the witnessed sequence (2b).
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
@@ -1233,8 +1661,8 @@ export class SessionNodeManager {
       // race ahead of it and be dropped — the timer would then spuriously fire. The
       // content is delivered to the wire but NOT yet confirmed persisted; the ACK
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
-      // backstop. Fire-and-forget is retired. The correlationId rides in the frame so
-      // the receiver's session.content.received shares ONE flow id with the sender.
+      // backstop. The correlationId rides in the frame so the receiver's
+      // session.content.received shares ONE flow id with the sender.
       this.#trackAwaitingAck(sessionId, content, contentHash, correlationId);
       const frame = CBOR_ENC.encode({
         type: "content_frame",
@@ -1250,13 +1678,177 @@ export class SessionNodeManager {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
       this.#untrackAwaitingAck(sessionId, contentHash);
-      // error.message extracted — never [object Object].
-      return {
-        ok: false,
-        reason: "session_stream_unavailable",
-        error: err instanceof Error ? err.message : String(err),
-      };
+      // 2b: direct delivery failed (counterparty offline). The hash is already witnessed (R1, the
+      // sequence is assigned), so deposit the content to the relay store-and-forward backstop now;
+      // the recipient pulls + recovers it on next online (DOD-MSG-3/4).
+      this.#parkContent(sessionId, Buffer.from(contentHash).toString("hex"), content);
+      // error.message extracted — never [object Object]. libp2p/cross-package errors are not
+      // always `instanceof Error` in this realm, so fall back to a message property / JSON.
+      const errMsg =
+        err instanceof Error
+          ? err.message
+          : err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string"
+            ? (err as { message: string }).message
+            : (() => {
+                try {
+                  return JSON.stringify(err);
+                } catch {
+                  return String(err);
+                }
+              })();
+      return { ok: false, reason: "session_stream_unavailable", error: errMsg };
     }
+  }
+
+  /**
+   * M7 DOD-SPINE-7: submit THIS party's SEAL ctrl leaf (0x02) to the relay witness.
+   * Structure: content_hash = SHA-256(0x02 || encodeSealPayload({session_id, final_root,
+   * close_timestamp, "PENDING"})), where final_root is the daemon's OWN tree root. Two
+   * distinct-sender SEAL leaves in the relay's log trigger the relay's #maybeProcessSeal
+   * → directory processSeal (rebuild + verify the signed chain) → FROST notarization →
+   * session_sealed. Requires an active relay client; the caller falls back to the
+   * directory-mediated path when this returns relay_unavailable.
+   */
+  async submitSealLeaf(
+    sessionId: string,
+    correlationId?: string,
+  ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | { ok: false; reason: string }> {
+    const entry = this.#activeNodes.get(sessionId);
+    if (!entry) return { ok: false, reason: "session_node_unavailable" };
+    if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
+
+    // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
+    // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
+    // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
+    // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
+    // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
+    if (this.#responderSealSubmitted.has(sessionId)) {
+      return { ok: false, reason: "responder_seal_already_submitted" };
+    }
+    this.#responderSealSubmitted.add(sessionId);
+
+    const finalRootHex = this.getSessionTreeRootHex(sessionId);
+    const sealPayload = encodeSealPayload({
+      session_id: entry.relaySessionIdBytes,
+      final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
+      close_timestamp: Date.now(),
+      attestation: "PENDING",
+    });
+    // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
+    const contentHash = new Uint8Array(
+      createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
+    );
+    const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
+    if (!result.ok) {
+      // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
+      this.#responderSealSubmitted.delete(sessionId);
+      this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
+      return { ok: false, reason: result.reason };
+    }
+    // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
+    // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
+    // rebuilds from the relay's content-hash chain (the relay records the identical
+    // content_hash for this ctrl leaf). Computed without mutating the durable tree /
+    // message_count, so the bilateral + interrupted seal paths are unaffected.
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+    const reportedRootHex = this.getSessionTree(sessionId).rootWithAppendedHex(contentHashHex);
+    this.#logger.info("session.seal.leaf.submitted", {
+      sessionId,
+      sequenceNumber: result.sequence_number,
+      correlationId,
+    });
+    // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
+    // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
+    return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
+  }
+
+  /**
+   * M7-UPGRADE-002: auto-acknowledge close (POSTMORTEM Workstream E / C-5). When B's daemon
+   * ingests the COUNTERPARTY's SEAL control leaf and B has verified the content, B's OWN node
+   * auto-co-signs + submits its responder SEAL leaf WITHOUT waiting for B's agent to call
+   * cello_close_session — so a bilateral seal completes promptly instead of degrading to
+   * unilateral on a slow/busy/crashed agent.
+   *
+   * SI-001 (non-negotiable): B's signature is ALWAYS produced by B's own node — submitSealLeaf
+   * signs the responder SEAL leaf with B's K_local. We remove the agent PROMPT, never the SIGNER;
+   * nothing here lets the directory or the peer synthesize B's acknowledgement.
+   *
+   * SI-002 (verifiability gate): auto-ack ONLY content B has verified. A session whose content
+   * cross-check failed (content_hash_mismatch = tamper, recorded in #contentDesynced) is NEVER
+   * auto-signed — it surfaces to the agent as a genuine decision point. DISAGREEMENT with the
+   * content is NOT a gate failure (C-6): the gate is "can I verify integrity?", never "do I agree?"
+   * — a verified-but-disliked tail is auto-sealed and the transcript speaks for B.
+   *
+   * Idempotent + non-throwing: marks #responderSealSubmitted BEFORE the async submit so a
+   * redelivered ctrl leaf cannot double-submit; clears the mark on submit failure so a later
+   * agent close / reconnect can still complete the seal (DB-001 — never a silent half-seal).
+   */
+  #maybeAutoAcknowledgeSeal(sessionId: string, correlationId: string): void {
+    // Idempotency: at most one responder seal per session (auto-ack or agent close).
+    if (this.#responderSealSubmitted.has(sessionId)) return;
+    const record = this.getSessionRecord(sessionId);
+    // Only an ACTIVE session auto-acks. A committed/sealing/sealed/interrupted session is out of
+    // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
+    if (!record || record.status !== "active") return;
+    // SI-002 verifiability gate: never auto-sign a session whose content we could not verify.
+    // Today the ONLY tracked unverifiable cause is a content_hash mismatch = TAMPER (#contentDesynced
+    // is set only there). Genuine tamper is a SECURITY event — log it at ERROR with the distinct
+    // reason `content_tamper` so the AC-008 tamper alarm can fire (it keys on that reason). The other
+    // two specced reasons — `desynced` (B's tree is behind the canonical sealed tail) and
+    // `content_unverifiable` (parked content unrecoverable) — require the MSG-001-3b canonical-
+    // sequence reconciliation that is deferred; they are reserved for that follow-on.
+    if (this.#contentDesynced.has(sessionId)) {
+      this.#logger.error("session.seal.autoack.skipped", {
+        sessionId,
+        reason: "content_tamper",
+        correlationId,
+      });
+      // AC-002: the verifiability gate refused — surface counterparty_closing to B's agent as a
+      // GENUINE decision point (the seal will not auto-complete; B must decide). Uses the existing
+      // session-state push to the live MCP clients; best-effort (never throws out of this gate).
+      try {
+        this.#onSessionStateChanged?.(record.agent_name, sessionId, "counterparty_closing", record.counterparty_pubkey);
+      } catch (err: unknown) {
+        this.#logger.debug("session.state.notify.failed", {
+          sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+    const entry = this.#activeNodes.get(sessionId);
+    const responderPubkey = entry?.relayClient?.senderPubkeyHex ?? "unknown";
+    // submitSealLeaf owns the #responderSealSubmitted idempotency mark (set synchronously at its
+    // top), so the auto-ack does not pre-mark — it just reacts to the result.
+    void this.submitSealLeaf(sessionId, correlationId)
+      .then((result) => {
+        if (result.ok) {
+          // SI-001: the responder SEAL leaf was signed by B's OWN node (K_local) in submitSealLeaf.
+          this.#logger.info("session.seal.autoacknowledged", {
+            sessionId,
+            responderPubkey,
+            correlationId,
+          });
+        } else if (result.reason === "responder_seal_already_submitted") {
+          // B's agent close already submitted the responder seal (it won the race) — nothing to do.
+          return;
+        } else {
+          // Submission failed (e.g. relay path down) — the agent close / reconnect can still
+          // complete the seal; never a silent half-seal (DB-001).
+          this.#logger.warn("session.seal.autoack.skipped", {
+            sessionId,
+            reason: result.reason,
+            correlationId,
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        this.#logger.warn("session.seal.autoack.skipped", {
+          sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
   }
 
   /**
@@ -1282,21 +1874,25 @@ export class SessionNodeManager {
     contentHash: Uint8Array,
     correlationId?: string,
   ): { ok: true; leafIndex: number; sequenceNumber: number } | { ok: false; reason: string } {
-    // round-2 finding #5: once a session leaves 'active' (the bilateral seal
-    // commitment advances it to 'seal_interrupted_pending', or it is 'sealed' /
-    // 'interrupted'), its transcript is FROZEN. A late inbound frame must NOT append
-    // a new leaf — doing so would diverge the local tree from the root that was just
-    // committed and signed (and that a later FROST notarization attests). We reject
-    // it here. (A session with no DB row at all is a test-only path and is allowed.)
+    // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
+    // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
+    // notarization attests that exact root; a late leaf would diverge from it.
+    //
+    // MSG-001-3b recovery: a merely 'interrupted' session is NOT yet committed. The
+    // counterparty's last message(s) may have been parked while this party was offline, so its
+    // local transcript is INCOMPLETE (not frozen-final). Recovering that parked content COMPLETES
+    // the local view to match the counterparty BEFORE the bilateral seal — it is not a resumption
+    // (no new activity, no re-accept) and its root was never committed. So allow 'active' AND
+    // 'interrupted'; reject only the two committed states. (No DB row = test-only path, allowed.)
     const record = this.getSessionRecord(sessionId);
-    if (record && record.status !== "active") {
+    if (record && (record.status === "sealed" || record.status === "seal_interrupted_pending")) {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
-        reason: "session_not_active",
+        reason: "session_committed",
         currentStatus: record.status,
         correlationId,
       });
-      return { ok: false, reason: "session_not_active" };
+      return { ok: false, reason: "session_committed" };
     }
 
     const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
@@ -1307,6 +1903,10 @@ export class SessionNodeManager {
         reason: "content_hash_mismatch",
         correlationId,
       });
+      // M7-UPGRADE-002 (SI-002): a tamper makes this session's content unverifiable — the
+      // auto-acknowledge gate must never auto-co-sign it. The session stays alive (DOD-MSG-7),
+      // but the responder seal now requires the agent's explicit decision, not an auto-ack.
+      this.#contentDesynced.add(sessionId);
       return { ok: false, reason: "content_hash_mismatch" };
     }
 
@@ -1314,6 +1914,22 @@ export class SessionNodeManager {
     const senderPubkey = entry?.counterpartyPubkey
       ?? this.getSessionRecord(sessionId)?.counterparty_pubkey
       ?? "unknown";
+
+    // DOD-MSG-5: a content_hash satisfies AT MOST ONE Merkle leaf, exactly once. If this hash is
+    // already a leaf in the tree — it arrived BOTH directly and via the relay-park backstop, or it
+    // is a replay — do NOT append a second leaf and do NOT double-count it. The recipient already
+    // holds this message at its assigned sequence. (In the normal single-delivery case this find is
+    // -1, so the live/recover append paths are unchanged.)
+    const existingIdx = this.getSessionTree(sessionId).leaves().findIndex((l) => l.hashHex === contentHashHex);
+    if (existingIdx >= 0) {
+      this.#logger.info("session.content.deduplicated", {
+        sessionId,
+        contentHashHex,
+        sequenceNumber: existingIdx,
+        correlationId,
+      });
+      return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx };
+    }
 
     const { leafIndex, newRootHex } = this.appendSessionLeaf(sessionId, "msg", contentHashHex, correlationId);
 
@@ -1413,6 +2029,10 @@ export class SessionNodeManager {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
       });
     }
+    // 2b: delivered to the wire but never confirmed `persisted` — deposit it to the relay
+    // store-and-forward so the recipient recovers it (at the witnessed sequence). The durable
+    // awaiting entry above remains the crash backstop.
+    this.#parkContent(sessionId, hashHex, entry.content);
   }
 
   /**
@@ -1645,60 +2265,101 @@ export class SessionNodeManager {
 
   // ─── Private helpers ──────────────────────────────────────────────────────
 
-  async #createStandingReceiver(): Promise<void> {
-    const sessionId = `standing_receiver_${randomUUID()}`;
-    // Mint a correlationId per creation attempt so log events are trackable
-    const correlationId = randomUUID();
-    const gater = new SessionConnectionGater({
-      sessionId,
-      allowedPeerId: null, // open — counterparty unknown at creation time
-      logger: this.#logger,
-    });
-
-    let node: CelloNode;
+  /**
+   * DOD-LOOP-1: ensure the given agent has a standing receiver node (idempotent). Created when an
+   * agent comes online (cello_start_agent) and replaced after it is handed off to a session. The
+   * `#standingReceiverCreating` guard prevents two concurrent ensure() calls (e.g. the
+   * cello_start_agent hook racing a consume-site retry) from building two nodes for one agent. A
+   * create failure logs + leaves no entry; the next consume-site ensure() call retries on demand.
+   */
+  async #ensureStandingReceiver(agentName: string, correlationId: string = randomUUID()): Promise<void> {
+    if (this.#standingReceivers.has(agentName) || this.#standingReceiverCreating.has(agentName)) return;
+    if (this.#shuttingDown) return;
+    // A fresh ensure request supersedes any pending removal (agent toggled offline→online).
+    this.#standingReceiverRemoving.delete(agentName);
+    this.#standingReceiverCreating.add(agentName);
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
-      await node.start();
-    } catch (err: unknown) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      this.#logger.error("session.node.create.failed", {
+      const sessionId = `standing_receiver_${randomUUID()}`;
+      const gater = new SessionConnectionGater({
         sessionId,
-        agentName: STANDING_RECEIVER_AGENT_NAME,
-        error: errorMessage,
+        allowedPeerId: null, // open — counterparty unknown at creation time
+        logger: this.#logger,
+      });
+
+      let node: CelloNode;
+      try {
+        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
+        await node.start();
+      } catch (err: unknown) {
+        this.#logger.error("session.node.create.failed", {
+          sessionId,
+          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+        return; // not ready — callers check getStandingReceiverReady / retry via ensure on demand
+      }
+
+      // M2: gracefulShutdown may have begun while this node was starting (ensure runs un-awaited).
+      // Don't install an orphan bound to a TCP port — stop it and bail.
+      if (this.#shuttingDown) {
+        try { await node.stop(); } catch { /* best-effort */ }
+        return;
+      }
+
+      // L1: the agent may have gone offline (cello_stop_agent → removeStandingReceiverForAgent)
+      // while this ensure was parked on start(). Removal found no map entry to delete, so the
+      // tombstone is how we learn of it — tear the fresh node down rather than install an SR for
+      // an offline agent.
+      if (this.#standingReceiverRemoving.has(agentName)) {
+        this.#standingReceiverRemoving.delete(agentName);
+        try { await node.stop(); } catch { /* best-effort */ }
+        return;
+      }
+
+      // CELLO-M7-TRANSPORT-001: wrap in a NodeAutoNatService so its dialability drives session-
+      // address advertisement and the transport.autonat.* events fire.
+      const autoNat = new NodeAutoNatService({
+        node,
+        logger: this.#logger,
+        nodeType: "standing_receiver",
+        probers: this.#autoNatProbers(),
+      });
+      autoNat.emitInitialResult();
+
+      this.#standingReceivers.set(agentName, { node, gater, autoNat });
+      this.#logger.info("session.node.created", {
+        sessionId,
+        agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+        sessionPeerId: node.getPeerId(),
         correlationId,
       });
-      return; // standing receiver not ready — callers check #standingReceiverReady
+    } finally {
+      this.#standingReceiverCreating.delete(agentName);
     }
+  }
 
-    // M2: gracefulShutdown may have begun while this node was starting (the
-    // replacement runs un-awaited). Don't install an orphan bound to a TCP port —
-    // stop it and bail. The just-completed shutdown already nulled #standingReceiver.
-    if (this.#shuttingDown) {
-      try { await node.stop(); } catch { /* best-effort */ }
+  /**
+   * DOD-LOOP-1: public hook for the composition root to create an agent's standing receiver when
+   * the agent comes online (cello_start_agent), and to tear it down when it goes offline.
+   */
+  async ensureStandingReceiverForAgent(agentName: string): Promise<void> {
+    await this.#ensureStandingReceiver(agentName);
+  }
+
+  async removeStandingReceiverForAgent(agentName: string): Promise<void> {
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) {
+      // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no
+      // map entry yet). Leave a tombstone — that ensure tears its fresh node down on completion
+      // instead of installing an SR for an agent that is now offline. Also drop any stale creating
+      // marker so a later start can re-ensure.
+      if (this.#standingReceiverCreating.has(agentName)) this.#standingReceiverRemoving.add(agentName);
       return;
     }
-
-    // CELLO-M7-TRANSPORT-001: wrap the standing receiver in a NodeAutoNatService so
-    // its dialability drives session-address advertisement and the
-    // transport.autonat.result / transport.autonat.unavailable events fire. With
-    // no probers (reconnecting) it emits the dual unavailable event (AC-004/DB-001).
-    const autoNat = new NodeAutoNatService({
-      node,
-      logger: this.#logger,
-      nodeType: "standing_receiver",
-      probers: this.#autoNatProbers(),
-    });
-    autoNat.emitInitialResult();
-
-    this.#standingReceiver = { node, gater, autoNat };
-    this.#standingReceiverReady = true;
-
-    this.#logger.info("session.node.created", {
-      sessionId,
-      agentName: STANDING_RECEIVER_AGENT_NAME,
-      sessionPeerId: node.getPeerId(),
-      correlationId,
-    });
+    this.#standingReceivers.delete(agentName);
+    sr.autoNat.stop();
+    try { await sr.node.stop(); } catch { /* best-effort */ }
   }
 
   #insertSessionRow(
@@ -1725,30 +2386,6 @@ export class SessionNodeManager {
       });
       return false;
     }
-  }
-
-  async #createStandingReceiverWithRetry(correlationId: string): Promise<void> {
-    const MAX_RETRIES = 3;
-    const BACKOFF_MS = [100, 500, 2000];
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        await this.#createStandingReceiver();
-        return;
-      } catch (err: unknown) {
-        this.#logger.error("session.node.create.failed", {
-          sessionId: "standing_receiver_replacement",
-          agentName: STANDING_RECEIVER_AGENT_NAME,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
-        if (attempt < MAX_RETRIES - 1) {
-          await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
-        }
-      }
-    }
-    this.#logger.error("session.standing_receiver.permanently_unavailable", {
-      correlationId,
-    });
   }
 
   #updateSessionStatus(
