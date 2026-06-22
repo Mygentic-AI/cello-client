@@ -192,7 +192,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(120); // async inbound handler (accept may wait on standing receiver)
 
     // (1) Session-core observable: bob now has an ACTIVE session row bound to alice.
-    const record = snm.getSessionRecord(SID_HEX);
+    const record = snm.getSessionRecord("bob", SID_HEX);
     expect(record).not.toBeNull();
     expect(record!.status).toBe("active");
     expect(record!.agent_name).toBe("bob");
@@ -283,7 +283,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       const second = await client.send("cello_await_session", { timeout_ms: 200 }) as Record<string, unknown>;
       expect(second.type).toBe("timeout"); // no second event
     } finally { client.close(); }
-    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).not.toBeNull();
+    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).not.toBeNull();
   });
 
   it("M2: a burst of two assignments for the same agent are both accepted (standing receiver rebuild not lost)", async () => {
@@ -334,7 +334,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: "cd".repeat(32), counterpartyPubkeyHex: bobPubkey })); // no peer id
     await wait(80);
 
-    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
     const malformed = events.find((e) => e.event === "session.inbound.assignment.malformed");
     expect(malformed).toBeDefined();
     expect(malformed!.context["reason"]).toBe("missing_initiator_peer_id");
@@ -356,7 +356,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     }));
     await wait(80);
 
-    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
     const refused = events.find((e) => e.event === "session.inbound.assignment.refused");
     expect(refused).toBeDefined();
     expect(refused!.context["reason"]).toBe("unsupported_signature_type");
@@ -415,7 +415,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     }));
     await wait(80);
 
-    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
     expect(events.find((e) => e.event === "session.inbound.not_local")).toBeDefined();
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
@@ -432,7 +432,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     injectRef.inject!({ type: "session_assignment" }); // no `assignment`
     await wait(50);
 
-    expect(h.getSessionNodeManager().getSessionRecord(SID_HEX)).toBeNull();
+    expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
     const malformed = events.find((e) => e.event === "session.inbound.assignment.malformed");
     expect(malformed).toBeDefined();
     expect(malformed!.context["reason"]).toBe("missing_assignment_or_ids");

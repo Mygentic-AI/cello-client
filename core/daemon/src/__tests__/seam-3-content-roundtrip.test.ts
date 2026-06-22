@@ -121,7 +121,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) return;
-    const connected = await A.manager.connectToCounterparty(SID, bInfo!.addrs);
+    const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
 
     // B: accept the inbound session (seam 2 core) — hands off the standing receiver gated
@@ -133,15 +133,15 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const text = "hello over real libp2p";
     const content = new TextEncoder().encode(text);
     const hash = msgLeafHash(content);
-    const sent = await A.manager.sendContent(SID, content, hash, "corr-A");
+    const sent = await A.manager.sendContent("alice", SID, content, hash, "corr-A");
     expect(sent.ok).toBe(true);
 
     // B: the content arrives, cross-checks, appends to B's daemon-owned tree, and buffers.
-    const received = await pollFor(() => B.manager.takeReceivedContent(SID));
+    const received = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
     expect(received).not.toBeNull();
     expect(Buffer.from(received!.contentHex, "hex").toString()).toBe(text);
     expect(received!.sequenceNumber).toBe(0);
-    expect(B.manager.getSessionTree(SID).size()).toBe(1);
+    expect(B.manager.getSessionTree("bob", SID).size()).toBe(1);
     expect(B.events.find((e) => e.event === "session.content.received")).toBeDefined();
 
     // A: the delivery-ACK round-trips back over the same muxed connection and resolves the
@@ -165,7 +165,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) return;
-    const connected = await A.manager.connectToCounterparty(SID, bInfo!.addrs);
+    const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
     expect(accepted.ok).toBe(true);
@@ -173,15 +173,15 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     // Send content under a hash that does NOT match it (wire tamper of a single frame).
     const content = new TextEncoder().encode("genuine content");
     const wrongHash = msgLeafHash(new TextEncoder().encode("different content"));
-    const sent = await A.manager.sendContent(SID, content, wrongHash, "corr-A");
+    const sent = await A.manager.sendContent("alice", SID, content, wrongHash, "corr-A");
     expect(sent.ok).toBe(true);
 
     // B rejects on cross-check: no buffered content, empty tree, and the cross-check warns.
     const rejected = await pollFor(() => B.events.find((e) => e.event === "session.content.cross_check.failed"));
     expect(rejected).not.toBeNull();
     expect(rejected!.context["reason"]).toBe("content_hash_mismatch");
-    expect(B.manager.takeReceivedContent(SID)).toBeNull();
-    expect(B.manager.getSessionTree(SID).size()).toBe(0);
+    expect(B.manager.takeReceivedContent("bob", SID)).toBeNull();
+    expect(B.manager.getSessionTree("bob", SID).size()).toBe(0);
 
     // And A never gets an ACK (no delivery for tampered content) — its awaiting-ACK stays
     // armed (it is the TTF/recovery path's job, not this seam's, to drain it).

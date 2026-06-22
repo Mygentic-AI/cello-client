@@ -354,55 +354,55 @@ describe("RetryQueue", () => {
       const sessionId = "sess-msg001";
       const contentHash = new Uint8Array(randomBytes(32));
       const contentBlob = new Uint8Array([7, 7, 7, 9]);
-      retryQueue.enqueueAwaitingContent(sessionId, contentHash, contentBlob);
-      expect(retryQueue.getAwaitingDepth(sessionId)).toBe(1);
+      retryQueue.enqueueAwaitingContent("alice", sessionId, contentHash, contentBlob);
+      expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(1);
       // The direct-resend queue is untouched (separate FIFO).
       expect(retryQueue.getSessionDepth(sessionId)).toBe(0);
 
       const parked: Uint8Array[] = [];
-      const count = await retryQueue.drainAwaitingToPark(sessionId, async (entry) => {
+      const count = await retryQueue.drainAwaitingToPark("alice", sessionId, async (entry) => {
         parked.push(entry.contentBlob);
         return { parked: true };
       });
       expect(count).toBe(1);
       expect(Buffer.from(parked[0]!)).toEqual(Buffer.from(contentBlob));
-      expect(retryQueue.getAwaitingDepth(sessionId)).toBe(0);
+      expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(0);
     });
 
     it("a park failure keeps the entry queued for the next reconnect / startup flush (AC-019)", async () => {
       const sessionId = "sess-fail";
       const ch = new Uint8Array(randomBytes(32));
-      retryQueue.enqueueAwaitingContent(sessionId, ch, new Uint8Array([1]));
-      const first = await retryQueue.drainAwaitingToPark(sessionId, async () => ({ parked: false, error: "relay_down" }));
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([1]));
+      const first = await retryQueue.drainAwaitingToPark("alice", sessionId, async () => ({ parked: false, error: "relay_down" }));
       expect(first).toBe(0);
-      expect(retryQueue.getAwaitingDepth(sessionId)).toBe(1);
+      expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(1);
       // A subsequent successful park drains it.
-      const second = await retryQueue.drainAwaitingToPark(sessionId, async () => ({ parked: true }));
+      const second = await retryQueue.drainAwaitingToPark("alice", sessionId, async () => ({ parked: true }));
       expect(second).toBe(1);
-      expect(retryQueue.getAwaitingDepth(sessionId)).toBe(0);
+      expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(0);
     });
 
     it("markContentAcked removes the un-acked entry (no park needed)", () => {
       const sessionId = "sess-ack";
       const ch = new Uint8Array(randomBytes(32));
-      retryQueue.enqueueAwaitingContent(sessionId, ch, new Uint8Array([2]));
-      retryQueue.markContentAcked(sessionId, ch);
-      expect(retryQueue.getAwaitingDepth(sessionId)).toBe(0);
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, new Uint8Array([2]));
+      retryQueue.markContentAcked("alice", sessionId, ch);
+      expect(retryQueue.getAwaitingDepth("alice", sessionId)).toBe(0);
     });
 
     it("AC-004: awaiting content survives a restart and is re-parkable via getAwaitingSessions", async () => {
       const sessionId = "sess-restart";
       const ch = new Uint8Array(randomBytes(32));
       const blob = new Uint8Array([3, 1, 4, 1, 5]);
-      retryQueue.enqueueAwaitingContent(sessionId, ch, blob);
+      retryQueue.enqueueAwaitingContent("alice", sessionId, ch, blob);
 
       // Simulate a daemon restart: a fresh RetryQueue over the same DB, loadFromDb first.
       const rq2 = new RetryQueue(db, logger);
       rq2.loadFromDb();
-      expect(rq2.getAwaitingSessions()).toContain(sessionId);
-      expect(rq2.getAwaitingDepth(sessionId)).toBe(1);
+      expect(rq2.getAwaitingSessions().map((s) => s.sessionId)).toContain(sessionId);
+      expect(rq2.getAwaitingDepth("alice", sessionId)).toBe(1);
       const drained: Uint8Array[] = [];
-      const n = await rq2.drainAwaitingToPark(sessionId, async (e) => { drained.push(e.contentBlob); return { parked: true }; });
+      const n = await rq2.drainAwaitingToPark("alice", sessionId, async (e) => { drained.push(e.contentBlob); return { parked: true }; });
       expect(n).toBe(1);
       expect(Buffer.from(drained[0]!)).toEqual(Buffer.from(blob)); // Uint8Array round-trips intact
     });

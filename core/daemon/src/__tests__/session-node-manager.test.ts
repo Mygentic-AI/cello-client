@@ -752,7 +752,7 @@ describe("SessionNodeManager — integration tests", () => {
 
       // Dial the counterparty THROUGH N_A — this is the reconciliation: the session
       // node, not a separate dialer, holds the connection.
-      const r = await manager.connectToCounterparty(sid, counterparty.listenAddresses());
+      const r = await manager.connectToCounterparty("alice", sid, counterparty.listenAddresses());
       expect(r.ok).toBe(true);
 
       // The counterparty sees an inbound connection FROM N_A's peer id — i.e. the
@@ -774,7 +774,7 @@ describe("SessionNodeManager — integration tests", () => {
     try {
       const sid = "1c".repeat(16);
       await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
-      const r = await manager.connectToCounterparty(sid, []);
+      const r = await manager.connectToCounterparty("alice", sid, []);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.reason).toBe("no_counterparty_addrs");
     } finally {
@@ -960,7 +960,7 @@ describe("SessionNodeManager — integration tests", () => {
       }
 
       // Destroy the session node
-      await manager.destroySessionNode("session-ac004", "sealed");
+      await manager.destroySessionNode("alice", "session-ac004", "sealed");
 
       // Check session.node.destroyed was logged
       const destroyedEvent = events.find(
@@ -1033,7 +1033,7 @@ describe("SessionNodeManager — integration tests", () => {
       }
 
       // Seal and destroy
-      await manager.destroySessionNode("si001-session", "sealed");
+      await manager.destroySessionNode("alice", "si001-session", "sealed");
 
       // Wait for port release
       await new Promise((r) => setTimeout(r, 300));
