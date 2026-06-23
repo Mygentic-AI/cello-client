@@ -9,6 +9,7 @@
  * cello_receive's security_context is M9-FEED-001 / the gate.
  */
 import { sanitizeInbound } from "../detect/sanitize.js";
+import { scanInjectionPatterns } from "../detect/injection-patterns.js";
 import type { GovernanceEvent } from "./outbound.js";
 
 export interface InboundVerdict {
@@ -51,6 +52,19 @@ export class InboundScreener {
       category: `sanitize:${n.step}`,
       reason: n.detail,
     }));
+
+    // Step-9: deterministic injection-pattern matching on the DECODED form (decode-then-rescan),
+    // via RE2 (ReDoS-safe). High-signal but reported as `observe` — the agent + the Layer-2 semantic
+    // scanner / policy decide; CELLO surfaces evidence, it does not police content (a block on a
+    // single pattern would brick legitimate discussion of prompt injection).
+    for (const id of scanInjectionPatterns(r.decodedForScan)) {
+      events.push({
+        stage: "injection_scan",
+        disposition: "observe",
+        category: `injection:${id}`,
+        reason: `matched known injection pattern '${id}' in the decoded content`,
+      });
+    }
 
     const mutated = r.notes.some((n) => MUTATING.has(n.step));
     return {

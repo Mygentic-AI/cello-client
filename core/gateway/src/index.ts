@@ -20,6 +20,11 @@ export { OutboundScreener } from "./screen/outbound.js";
 export type { OutboundVerdict, OutboundScreenerOptions, OutboundScreenContext } from "./screen/outbound.js";
 export { InboundScreener } from "./screen/inbound.js";
 export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js";
+
+// The RE2 linear-time regex engine (native re2 preferred, re2-wasm fallback) + the injection
+// pattern scanner (M9-IN-001 Step-9). initLinearRegex() must be awaited once before use.
+export { initLinearRegex, linearRegexEngine, LinearRegex } from "./detect/linear-regex.js";
+export { compileInjectionPatterns, scanInjectionPatterns, injectionPatternsReady } from "./detect/injection-patterns.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 

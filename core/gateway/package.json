@@ -29,7 +29,12 @@
     "typecheck": "tsc --build",
     "test": "vitest run"
   },
-  "dependencies": {},
+  "dependencies": {
+    "re2-wasm": "^1.0.2"
+  },
+  "optionalDependencies": {
+    "re2": "^1.25.0"
+  },
   "devDependencies": {
     "@types/node": "^25.6.2",
     "tsx": "^4.22.4"

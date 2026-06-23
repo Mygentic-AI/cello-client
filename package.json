@@ -27,6 +27,7 @@
       "esbuild",
       "hnswlib-node",
       "protobufjs",
+      "re2",
       "sharp"
     ]
   },

@@ -14,6 +14,8 @@ import { createGatewayServer } from "../server.js";
 import { GATEWAY_READY_TOKEN } from "../spawn.js";
 import { OutboundScreener } from "../screen/outbound.js";
 import { InboundScreener } from "../screen/inbound.js";
+import { initLinearRegex } from "../detect/linear-regex.js";
+import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import type { ScreenVerdict } from "../types.js";
 
 async function main(): Promise<void> {
@@ -28,6 +30,11 @@ async function main(): Promise<void> {
   // The real screen compositions. Config (PII whitelist, rate limit) is M9-CFG-001; defaults here
   // (no whitelist, no rate cap) until that lands. Secret detection (M9-OUT-001) slots into the
   // outbound screener once its RE2/gitleaks binding is chosen.
+  // Resolve the RE2 engine (native preferred, WASM fallback) and compile the injection-pattern set
+  // BEFORE accepting traffic — so the ReDoS-safe Step-9 scan is live from the first message.
+  const engine = await initLinearRegex();
+  compileInjectionPatterns();
+
   const piiWhitelist = (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const outbound = new OutboundScreener({ piiWhitelist });
   const inbound = new InboundScreener();
@@ -52,7 +59,7 @@ async function main(): Promise<void> {
   });
 
   // Signal readiness to the parent (spawnGatewaySidecar waits for this).
-  process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath}\n`);
+  process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine}\n`);
 
   let stopping = false;
   const shutdown = (signal: string) => {
