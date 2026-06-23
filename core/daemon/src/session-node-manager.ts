@@ -2094,9 +2094,9 @@ export class SessionNodeManager {
       sessionId,
       correlationId,
     });
-    if (inboundVerdict.disposition !== "allow") {
-      // M9-CORE-001 scope: the only inbound non-allow today is a fail-closed block from an
-      // unreachable gateway (gateway_unavailable) — a TRANSIENT condition. We deliberately do
+    if (inboundVerdict.disposition !== "allow" && inboundVerdict.disposition !== "redact") {
+      // block / warn HOLD (do not deliver, do not leaf). A fail-closed block from an unreachable
+      // gateway (gateway_unavailable) is a TRANSIENT condition. We deliberately do
       // NOT append a leaf or ack here: the message stays un-acked so the sender's TTF/park/retry
       // redelivers and re-screens it once the gateway recovers. (If we committed a leaf, dedup
       // would later swallow the redelivery and the agent would never receive it.)
@@ -2120,6 +2120,13 @@ export class SessionNodeManager {
       }
       return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
+
+    // M9-IN-001: a `redact` verdict (inbound sanitization) DELIVERS the sanitized text to the agent,
+    // while the Merkle leaf still binds the ORIGINAL content hash below — the transcript records what
+    // the peer actually sent; the agent sees the sanitized form. `allow` leaves the content unchanged.
+    const deliverContent = inboundVerdict.disposition === "redact" && inboundVerdict.content !== undefined
+      ? inboundVerdict.content
+      : content;
 
     // B1 (review): screenInbound above is the ONLY suspension point in this method. Before M9 the
     // dedup check (indexOfHash, above) and the leaf append (below) ran with no yield between them,
@@ -2154,7 +2161,7 @@ export class SessionNodeManager {
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-      held.set(canonicalSeq, { content, contentHashHex, correlationId });
+      held.set(canonicalSeq, { content: deliverContent, contentHashHex, correlationId });
       this.#logger.info("session.content.held", {
         sessionId,
         canonicalSeq,
@@ -2182,7 +2189,7 @@ export class SessionNodeManager {
       });
     }
 
-    const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);
+    const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId);
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).

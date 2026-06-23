@@ -432,5 +432,23 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
         await wait(25);
       }
     }, 40_000);
+
+    it("inbound redact: confusable lookalikes pass A's outbound screen but are DELIVERED to B sanitized", async () => {
+      const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      // Cyrillic 'ѕуѕтем' is not an exfil artifact / PII, so A's outbound screen passes it; B's inbound
+      // sanitizer normalizes the confusables → the agent receives the Latin form, not the lookalikes.
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "role ѕуѕтем ok" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(typeof recv?.content).toBe("string");
+      expect(recv!.content as string).toContain("system"); // normalized from the Cyrillic lookalikes
+    }, 40_000);
   });
 });
