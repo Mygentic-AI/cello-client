@@ -159,6 +159,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     alicePubkey: string;
     aEvents: LogEvent[];
     bEvents: LogEvent[];
+    bHandle: Awaited<ReturnType<typeof startDaemon>>;
   }> {
     const dirA = join(tempDir, "A");
     const dirB = join(tempDir, "B");
@@ -237,7 +238,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const awaited = await awaitP;
     expect(awaited.type).toBe("new_session");
 
-    return { clientA, clientB, alicePubkey, aEvents, bEvents };
+    return { clientA, clientB, alicePubkey, aEvents, bEvents, bHandle: B };
   }
 
   it("AC-001/AC-002 happy path: both gateways screen the real content; send + receive succeed", async () => {
@@ -455,6 +456,43 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
       expect(recv!.content as string).not.toContain("AKIAABCDEFGHIJKLMNOP"); // the secret never reached the peer
       expect(recv!.content as string).toContain("[REDACTED:"); // the typed placeholder did
+    }, 40_000);
+
+    it("inbound TERMINAL block (non-English): B records a leaf + acks, but delivers nothing — distinct from the transient gateway-down hold", async () => {
+      const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB, bHandle, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const bMgr = bHandle.getSessionNodeManager();
+      const before = bMgr.getSessionTree("bob", SID_HEX).size();
+
+      // A genuinely non-Latin (CJK) message: A's OUTBOUND screen (secrets/PII/exfil/rate) passes it,
+      // so it reaches B. B's gateway holds it as a confident non-allowlisted language → TERMINAL block.
+      const cjk = "这是一条中文消息需要被语言过滤器拦截下来用于测试目的不应交付给代理";
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: cjk }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true); // A sent it (outbound is not a language filter)
+
+      // TERMINAL — distinct from the gateway-down case: B records a leaf (the hash chain stays parity
+      // with A, who appended on send) even though the content is never delivered.
+      let grew = false;
+      for (let i = 0; i < 200; i++) {
+        if (bMgr.getSessionTree("bob", SID_HEX).size() > before) { grew = true; break; }
+        await wait(25);
+      }
+      expect(grew).toBe(true);
+      expect(bMgr.getSessionTree("bob", SID_HEX).size()).toBe(before + 1); // exactly one tamper-evident leaf
+
+      // B emitted the terminal-block event (a content rejection), NOT a transient unavailable/timeout.
+      expect(bEvents.find((e) =>
+        e.event === "security.gateway.inbound.terminal_block" && e.context["reason"] === "inbound_language_blocked",
+      )).toBeDefined();
+      expect(bEvents.find((e) => e.event === "security.gateway.unavailable")).toBeUndefined();
+
+      // The agent NEVER sees the content: cello_receive stays empty across the positive path's worst case.
+      for (let i = 0; i < 80; i++) {
+        const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        expect(recv.content == null).toBe(true);
+        await wait(25);
+      }
     }, 40_000);
 
     it("inbound redact: confusable lookalikes pass A's outbound screen but are DELIVERED to B sanitized", async () => {

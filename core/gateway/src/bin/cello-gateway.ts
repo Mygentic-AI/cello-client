@@ -44,7 +44,7 @@ async function main(): Promise<void> {
   const handle = await createGatewayServer({
     socketPath,
     ...(requestLogPath ? { requestLogPath } : {}),
-    screen: (req): ScreenVerdict => {
+    screen: async (req): Promise<ScreenVerdict> => {
       if (req.direction === "outbound") {
         const v = outbound.screen(req.content, { agentName: req.agentName, sessionId: req.sessionId });
         return {
@@ -55,8 +55,15 @@ async function main(): Promise<void> {
           ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
         };
       }
-      const v = inbound.screen(req.content);
-      return { disposition: v.disposition, content: v.content, events: v.events };
+      const v = await inbound.screen(req.content);
+      return {
+        disposition: v.disposition,
+        content: v.content,
+        events: v.events,
+        ...(v.terminal !== undefined ? { terminal: v.terminal } : {}),
+        ...(v.reason !== undefined ? { reason: v.reason } : {}),
+        ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
+      };
     },
   });
 

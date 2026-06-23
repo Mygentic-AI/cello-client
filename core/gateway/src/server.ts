@@ -144,6 +144,7 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
         ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
         ...(verdict.guidance !== undefined ? { guidance: verdict.guidance } : {}),
         ...(verdict.events !== undefined ? { events: verdict.events } : {}),
+        ...(verdict.terminal !== undefined ? { terminal: verdict.terminal } : {}),
       },
     };
     if (!socket.destroyed) socket.write(encodeFrame(response));

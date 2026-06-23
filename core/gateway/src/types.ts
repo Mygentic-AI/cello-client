@@ -71,6 +71,16 @@ export interface ScreenVerdict {
   guidance?: string;
   /** The governance findings behind this verdict (M9-FEED-001 renders them to the agent). */
   events?: GovernanceEvent[];
+  /**
+   * Set on a `block` whose cause is the CONTENT itself — a detector rejected these exact bytes
+   * (inbound: a confident non-allowlisted language, a high-score injection; outbound likewise).
+   * Such a block is TERMINAL: redelivering the identical bytes would be rejected identically, so the
+   * inbound daemon must record the leaf + acknowledge (the sender stops) while never delivering it,
+   * NOT leave it un-acked for redelivery. A fail-closed block (`gateway_unavailable` /
+   * `governance_timeout`) and an internal `screen_error` are TRANSIENT — `terminal` is left unset so
+   * the daemon holds the content un-acked and the sender redelivers once the gateway recovers.
+   */
+  terminal?: boolean;
 }
 
 /**

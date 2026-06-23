@@ -2021,7 +2021,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -2096,15 +2096,41 @@ export class SessionNodeManager {
       correlationId,
     });
     if (inboundVerdict.disposition !== "allow" && inboundVerdict.disposition !== "redact") {
-      // block / warn HOLD (do not deliver, do not leaf). A fail-closed block from an unreachable
-      // gateway (gateway_unavailable) is a TRANSIENT condition. We deliberately do
-      // NOT append a leaf or ack here: the message stays un-acked so the sender's TTF/park/retry
-      // redelivers and re-screens it once the gateway recovers. (If we committed a leaf, dedup
-      // would later swallow the redelivery and the agent would never receive it.)
-      // FORWARD (M9-IN-002 / M9-FEED-001): a TERMINAL block from a detector is different — that
-      // content WILL keep arriving, so it must be ack'd-as-received (sender stops) and a leaf
-      // recorded (tamper-evident proof the peer sent it), while still never reaching the agent
-      // buffer. That terminal-vs-transient split lands with the first real block verdict.
+      // M9 terminal-vs-transient split. A TERMINAL block (inboundVerdict.terminal) is a detector
+      // rejecting the CONTENT itself — a confident non-allowlisted language (IN-003), a high-score
+      // injection (IN-002), or an oversized payload (IN-001). The identical bytes would be rejected
+      // identically on redelivery, so holding them un-acked would loop the sender forever. Instead:
+      // record a leaf binding the ORIGINAL content hash and acknowledge it (the sender stops). The
+      // leaf is REQUIRED, not cosmetic: the sender appended this leaf when it sent, so without a
+      // matching leaf here the two parties' hash chains diverge by one and the bilateral seal count
+      // mismatches. The content is still NEVER buffered for the agent (cello_receive never sees it);
+      // the agent learns what happened via the governance feedback channel (M9-FEED-001), not the
+      // content buffer.
+      if (inboundVerdict.disposition === "block" && inboundVerdict.terminal === true) {
+        // Re-check dedup after the screen await (same window as the B1 fix below): a concurrent
+        // ingest of this same hash may have appended while we were screening.
+        const dedupTerminal = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
+        if (dedupTerminal >= 0) {
+          return { ok: true, leafIndex: dedupTerminal, sequenceNumber: dedupTerminal, appendedCount: 0, screenedOut: true };
+        }
+        // Record the tamper-evident leaf in arrival order (a terminal-blocked message is never
+        // delivered, so agent-facing ordering is moot; the leaf exists only for chain parity +
+        // tamper-evidence). NOT via #appendVerifiedContent — that would also buffer it for the agent.
+        const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+        this.#logger.warn("security.gateway.inbound.terminal_block", {
+          sessionId,
+          disposition: inboundVerdict.disposition,
+          reason: inboundVerdict.reason,
+          sequenceNumber: leafIndex,
+          correlationId,
+        });
+        return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1, screenedOut: true };
+      }
+      // TRANSIENT block / warn HOLD (do not deliver, do not leaf, do not ack). A fail-closed block
+      // from an unreachable gateway (gateway_unavailable) or an exceeded deadline (governance_timeout)
+      // is transient: the message stays un-acked so the sender's TTF/park/retry redelivers and
+      // re-screens it once the gateway recovers. (If we committed a leaf, dedup would later swallow
+      // the redelivery and the agent would never receive it.)
       if (inboundVerdict.reason === GOVERNANCE_TIMEOUT) {
         this.#logger.error("security.gateway.timeout", {
           sessionId,

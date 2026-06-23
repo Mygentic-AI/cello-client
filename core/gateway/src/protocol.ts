@@ -35,6 +35,8 @@ export interface WireScreenResponse {
     guidance?: string;
     /** Governance findings — plain JSON, carried verbatim (M9-FEED-001 renders them). */
     events?: GovernanceEvent[];
+    /** A content-rejection block (vs a transient fail-closed one). See ScreenVerdict.terminal. */
+    terminal?: boolean;
   };
 }
 
