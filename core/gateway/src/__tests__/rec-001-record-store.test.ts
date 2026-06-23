@@ -92,6 +92,32 @@ describe("M9-REC-001 GatewayRecordStore — every message recorded, hash-chained
     reopened.close();
   });
 
+  it("verifyChain CATCHES a swapped content hash — the record binds WHICH content was screened", () => {
+    store.record({ direction: "outbound", disposition: "block", contentHash: HASH_A, reason: "injection" });
+    store.record({ direction: "outbound", disposition: "clean", contentHash: HASH_B });
+    expect(store.verifyChain()).toBe(true);
+    store.close();
+    // Swap record 1's content_hash (rewrite history to claim a DIFFERENT message was blocked), leaving
+    // its stored fingerprint untouched. The recomputed fingerprint no longer matches → caught.
+    const raw = new DatabaseSync(join(dir, "records.db"));
+    raw.prepare(`UPDATE security_records SET content_hash = '${"c".repeat(64)}' WHERE seq = 1`).run();
+    raw.close();
+    const reopened = new GatewayRecordStore(join(dir, "records.db"));
+    expect(reopened.verifyChain()).toBe(false);
+    reopened.close();
+  });
+
+  it("verifyChain CATCHES a flipped disposition AND direction (both are in the fingerprint)", () => {
+    store.record({ direction: "inbound", disposition: "block", contentHash: HASH_A, reason: "lang" });
+    store.close();
+    const raw = new DatabaseSync(join(dir, "records.db"));
+    raw.prepare(`UPDATE security_records SET direction = 'outbound' WHERE seq = 1`).run(); // forge the direction
+    raw.close();
+    const reopened = new GatewayRecordStore(join(dir, "records.db"));
+    expect(reopened.verifyChain()).toBe(false);
+    reopened.close();
+  });
+
   it("the record log SURVIVES reopen (persisted to the gateway's own DB file)", () => {
     store.record({ direction: "outbound", disposition: "clean", contentHash: HASH_A });
     store.record({ direction: "inbound", disposition: "block", contentHash: HASH_B, reason: "lang" });

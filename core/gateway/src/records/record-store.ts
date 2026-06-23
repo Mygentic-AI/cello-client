@@ -67,26 +67,38 @@ export class GatewayRecordStore {
 
   constructor(dbPath: string) {
     this.#db = new DatabaseSync(dbPath);
+    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
     this.#db.exec(DDL);
   }
 
   /** Append a security-pass record for one screened message, hash-chained to the prior record. */
   record(input: RecordInput): SecurityRecord {
-    const latest = this.#latest();
-    const seq = (latest?.seq ?? 0) + 1;
-    const prevFingerprint = latest?.fingerprint ?? "";
     const reason = input.reason ?? "";
     const correlationId = input.correlationId ?? "";
     const recordedAt = Date.now();
-    const fingerprint = fingerprintOf(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, prevFingerprint);
-
-    this.#db
-      .prepare(
-        `INSERT INTO security_records
-           (seq, direction, disposition, content_hash, reason, correlation_id, fingerprint, prev_fingerprint, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, fingerprint, prevFingerprint, recordedAt);
+    // Read-latest-then-insert as one transaction so two processes on the same file cannot both write
+    // the same seq and collide on the PRIMARY KEY (matches CFG-001 L1).
+    this.#db.exec("BEGIN IMMEDIATE");
+    let seq: number;
+    let prevFingerprint: string;
+    let fingerprint: string;
+    try {
+      const latest = this.#latest();
+      seq = (latest?.seq ?? 0) + 1;
+      prevFingerprint = latest?.fingerprint ?? "";
+      fingerprint = fingerprintOf(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, prevFingerprint);
+      this.#db
+        .prepare(
+          `INSERT INTO security_records
+             (seq, direction, disposition, content_hash, reason, correlation_id, fingerprint, prev_fingerprint, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, fingerprint, prevFingerprint, recordedAt);
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
 
     return {
       seq,
