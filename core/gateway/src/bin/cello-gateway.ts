@@ -42,7 +42,15 @@ async function main(): Promise<void> {
   // lever over a PII warn is `redact`; allowing a value out is a human action. M9-CFG-001 will source
   // this from the gateway config DB; until then it is an explicit env opt-in.
   const autonomousOverride = process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1";
-  const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride });
+  // OUT-004 per-agent outbound rate cap (INV-4 config). Interim env opt-in until M9-CFG-001 sources it
+  // from the gateway config DB (same as the whitelist + override). Both vars must be positive to enable;
+  // absent/invalid → no cap (rate-limiting off).
+  const rateMax = Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"]);
+  const rateWindowMs = Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"]);
+  const rateLimit = Number.isFinite(rateMax) && rateMax > 0 && Number.isFinite(rateWindowMs) && rateWindowMs > 0
+    ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
+    : undefined;
+  const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });
   const inbound = new InboundScreener();
 
   const handle = await createGatewayServer({

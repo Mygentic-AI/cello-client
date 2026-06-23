@@ -478,6 +478,22 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
     }, 40_000);
 
+    it("OUT-004 rate limit: over-rate sends are throttled with a distinct rate_limited reason + guidance", async () => {
+      // A's gateway is seeded with a 2-per-window cap (INV-4 config via env). The first two clean sends
+      // go out; the third is throttled — a distinct top-level reason (not the generic block), with guidance.
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_RATE_MAX_PER_WINDOW: "2", CELLO_GATEWAY_RATE_WINDOW_MS: "60000" });
+      const b = await spawnGateway("gb");
+      const { clientA } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const s1 = await clientA.send("cello_send", { session_id: SID_HEX, content: "message one" }) as Record<string, unknown>;
+      const s2 = await clientA.send("cello_send", { session_id: SID_HEX, content: "message two" }) as Record<string, unknown>;
+      expect(s1.ok).toBe(true);
+      expect(s2.ok).toBe(true);
+      const s3 = await clientA.send("cello_send", { session_id: SID_HEX, content: "message three" }) as Record<string, unknown>;
+      expect(s3.ok).toBe(false);
+      expect(s3.reason).toBe("rate_limited"); // distinct reason, not blocked_by_governance
+      expect(typeof s3.guidance).toBe("string");
+    }, 40_000);
+
     it("FEED-001 inc4 re-send {flagId: redact}: the warned PII email is RE-SENT redacted and the peer gets the placeholder", async () => {
       const a = await spawnGateway("ga");
       const b = await spawnGateway("gb");
