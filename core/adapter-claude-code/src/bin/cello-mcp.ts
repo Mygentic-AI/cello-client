@@ -226,6 +226,13 @@ server.tool("cello_get_sealed_receipt", "Get the sealed receipt for a closed ses
   return jsonText(result);
 });
 
+server.tool("cello_get_transcript", "Get the durable, readable conversation transcript for a session (sent + received messages, in order) — recoverable after a daemon restart", {
+  session_id: z.string().describe("Session ID"),
+}, async ({ session_id }) => {
+  const result = await proxy.call("cello_get_transcript", { session_id });
+  return jsonText(result);
+});
+
 server.tool("cello_get_inclusion_proof", "Get inclusion proof for a message in a sealed session", {
   session_id: z.string().describe("Session ID"),
   content_hash: z.string().describe("Content hash to prove inclusion of"),

@@ -1950,6 +1950,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
   });
 
+  // DOD-LOG-1 (PERSIST-LOG-001): read the durable, decrypted conversation transcript for a session —
+  // the readable sent+received messages in canonical-sequence order, recovered AFTER a daemon restart
+  // (not just the opaque hash chain). The plaintext is decrypted from the encrypted-at-rest store here,
+  // in the daemon; the relay/directory never held it (INV-3).
+  handlers.set("cello_get_transcript", async (params, connectionId) => {
+    const sessionId = params?.["session_id"] as string | undefined;
+    if (!sessionId || typeof sessionId !== "string") {
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_list_sessions." };
+    }
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const messages = sessionNodeManager.readTranscript(connState.currentAgent, sessionId);
+    return { ok: true, session_id: sessionId, messages };
+  });
+
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
@@ -3367,6 +3384,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     // Delivered — append the message leaf to the daemon-owned tree (advances root).
     const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
+    // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
+    // canonical leaf sequence so it joins the committed hash chain (survives restart).
+    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", contentBytes, correlationId);
     logger.info("session.content.sent", {
       sessionId,
       recipientPubkey,

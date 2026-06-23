@@ -67,6 +67,7 @@
 // The engines field in package.json is set to ">=24" specifically because of this
 // dependency — do not lower the engine floor without replacing this import.
 import { DatabaseSync } from "node:sqlite";
+import { TranscriptCipher } from "./transcript-cipher.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -190,6 +191,8 @@ export class SessionNodeManager {
   readonly #logger: Logger;
   readonly #dbPath: string;
   #db: DatabaseSync | null = null;
+  // DOD-LOG-1: at-rest cipher for the durable transcript blobs (loaded in init()).
+  #transcriptCipher: TranscriptCipher | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
   // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
@@ -376,6 +379,8 @@ export class SessionNodeManager {
   async initialize(): Promise<void> {
     // Step 1: Open SQLite and create sessions table
     this.#db = new DatabaseSync(this.#dbPath);
+    // DOD-LOG-1: at-rest cipher for the durable transcript. Dedicated 0600 key beside the DB.
+    this.#transcriptCipher = TranscriptCipher.loadOrCreate(`${this.#dbPath}.transcript-key`);
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT NOT NULL,
@@ -464,6 +469,22 @@ export class SessionNodeManager {
       )
     `);
 
+    // DOD-LOG-1 (PERSIST-LOG-001): the durable, ENCRYPTED-at-rest readable transcript. Each row
+    // is keyed by the canonical leaf `sequence`, so it JOINS to session_tree_leaves(leaf_index) —
+    // a stored message is provably behind a committed hash-chain leaf, not a loose dump. `blob` is
+    // the AES-256-GCM envelope of the readable plaintext (relay/directory never see this — INV-3).
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS transcript (
+        agent_name TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        direction TEXT NOT NULL,        -- 'sent' | 'received'
+        blob BLOB NOT NULL,             -- AES-256-GCM(iv||ct||tag) of the plaintext
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_name, session_id, sequence, direction)
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -512,6 +533,72 @@ export class SessionNodeManager {
       throw new Error("SessionNodeManager not initialized — call initialize() first");
     }
     return this.#db;
+  }
+
+  /**
+   * DOD-LOG-1: append one readable message to the durable, encrypted-at-rest transcript, keyed by
+   * the canonical leaf `sequence` so it joins to the committed hash chain. Idempotent on replay
+   * (INSERT OR IGNORE — the same (session, sequence, direction) is written at most once). Never
+   * throws into the caller's content path: a transcript-write failure is logged, not fatal.
+   */
+  recordTranscriptMessage(
+    agentName: string,
+    sessionId: string,
+    sequence: number,
+    direction: "sent" | "received",
+    plaintext: Uint8Array,
+    correlationId?: string,
+  ): void {
+    if (!this.#db || !this.#transcriptCipher) return;
+    try {
+      const blob = this.#transcriptCipher.encrypt(plaintext);
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(agentName, sessionId, sequence, direction, blob, Date.now());
+      this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
+    } catch (err: unknown) {
+      this.#logger.warn("transcript.message.record.failed", {
+        sessionId, agentName, sequence, direction,
+        reason: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
+  }
+
+  /**
+   * DOD-LOG-1: read a session's durable transcript back (after a restart), decrypted and ordered by
+   * canonical sequence then direction. A blob that fails to decrypt (tamper/wrong key) is skipped
+   * with a loud log rather than crashing the read.
+   */
+  readTranscript(
+    agentName: string,
+    sessionId: string,
+  ): Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> {
+    if (!this.#db || !this.#transcriptCipher) return [];
+    const rows = this.#db
+      .prepare(
+        `SELECT sequence, direction, blob, created_at FROM transcript
+         WHERE agent_name = ? AND session_id = ? ORDER BY sequence ASC, direction ASC`,
+      )
+      .all(agentName, sessionId) as Array<{ sequence: number; direction: string; blob: Uint8Array; created_at: number }>;
+    const out: Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> = [];
+    for (const r of rows) {
+      const pt = this.#transcriptCipher.decrypt(r.blob instanceof Uint8Array ? r.blob : new Uint8Array(r.blob));
+      if (pt === null) {
+        this.#logger.warn("transcript.message.decrypt.failed", { sessionId, agentName, sequence: r.sequence, direction: r.direction });
+        continue;
+      }
+      out.push({
+        sequence: r.sequence,
+        direction: r.direction === "sent" ? "sent" : "received",
+        text: new TextDecoder().decode(pt),
+        createdAt: r.created_at,
+      });
+    }
+    return out;
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
@@ -2151,6 +2238,10 @@ export class SessionNodeManager {
     correlationId?: string,
   ): { leafIndex: number } {
     const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+    // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
+    // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
+    // relay/directory never see this plaintext, only the hash).
+    this.recordTranscriptMessage(agentName, sessionId, leafIndex, "received", content, correlationId);
     const recvKey = this.#k(agentName, sessionId);
     // Review finding #6: the witness for this hash has done its ordering job once the leaf is
     // appended — drop it so #witnessedSeq stays proportional to held/pending content, not the whole
