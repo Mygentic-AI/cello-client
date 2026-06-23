@@ -96,6 +96,51 @@ describe("M9-FEED-001 inc 4 — governance re-send", () => {
     expect(verdictText(v)).not.toContain("attacker@b.example");
   });
 
+  it("SI-002 all-or-nothing: a MIXED re-send (override OFF) with ONE rejected allow → the WHOLE send is NOT SENT", () => {
+    // {f1: redact, f2: allow_once} with override OFF: f2 is rejected. The send must re-warn as a WHOLE —
+    // NOT send with f1 redacted and f2 leaked. Nothing goes out half-decided.
+    const content = "emails keep@x.example and leak@y.example";
+    const warnIds = new OutboundScreener().screen(enc(content), ctx()).events
+      .filter((e) => e.disposition === "warn").map((e) => e.flagId as string);
+    expect(warnIds.length).toBe(2);
+    const s = new OutboundScreener(); // override OFF
+    const v = s.screen(enc(content), ctx({ governanceDecisions: { [warnIds[0]]: "redact", [warnIds[1]]: "allow_once" } }));
+    expect(v.disposition).toBe("warn"); // re-warned, NOT sent
+    // Neither value went out — not even the redactable sibling. Both originals survive in the unsent content.
+    expect(verdictText(v)).toContain("keep@x.example");
+    expect(verdictText(v)).toContain("leak@y.example");
+  });
+
+  it("no rate slot is consumed on a warn — repeated governance warns do NOT throttle a later legit send", () => {
+    let t = 1000;
+    const s = new OutboundScreener({ rateLimit: { maxPerWindow: 2, windowMs: 60_000 }, now: () => t });
+    for (let i = 0; i < 5; i++) {
+      expect(s.screen(enc("reach me at stranger@other.example"), ctx()).disposition).toBe("warn");
+    }
+    // The 5 warns consumed no slots: two clean sends still succeed, the third hits the cap. A
+    // warn-consumes-a-slot impl would have throttled long before here.
+    expect(s.screen(enc("hello one"), ctx()).disposition).toBe("allow");
+    expect(s.screen(enc("hello two"), ctx()).disposition).toBe("allow");
+    const third = s.screen(enc("hello three"), ctx());
+    expect(third.disposition).toBe("block");
+    expect(third.reason).toBe("rate_limited");
+  });
+
+  it("a warn → redact re-send consumes EXACTLY ONE rate slot (not two, not zero)", () => {
+    let t = 1000;
+    const s = new OutboundScreener({ rateLimit: { maxPerWindow: 1, windowMs: 60_000 }, now: () => t });
+    const content = "reach me at stranger@other.example";
+    const id = new OutboundScreener().screen(enc(content), ctx()).events.find((e) => e.disposition === "warn")!.flagId as string;
+    expect(s.screen(enc(content), ctx()).disposition).toBe("warn"); // warn: takes NO slot
+    // The redact re-send takes the single slot. If the warn had consumed it, this would be rate-limited
+    // (block) instead of redact — so a `redact` result proves the warn took none.
+    expect(s.screen(enc(content), ctx({ governanceDecisions: { [id]: "redact" } })).disposition).toBe("redact");
+    // The one slot is now used → a further send is rate-limited, proving the re-send took exactly one.
+    const next = s.screen(enc("another message"), ctx());
+    expect(next.disposition).toBe("block");
+    expect(next.reason).toBe("rate_limited");
+  });
+
   it("mixed: one allow_once (override ON) + one omitted → allowed value present, omitted value redacted", () => {
     const s = new OutboundScreener({ autonomousOverride: true });
     const content = "emails one@x.example and two@y.example";
