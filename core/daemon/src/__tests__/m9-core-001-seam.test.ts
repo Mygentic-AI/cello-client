@@ -306,10 +306,12 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }
   }, 40_000);
 
-  it("AC-002/DB-001 inbound: with B's gateway down, B's ingest is held — cello_receive delivers nothing ungated", async () => {
+  it("AC-002/DB-001 inbound: with B's gateway down, B's ingest is held TRANSIENTLY — no leaf, no ack, nothing delivered (so the sender redelivers)", async () => {
     const a = await spawnGateway("ga");
     const b = await spawnGateway("gb");
-    const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    const { clientA, clientB, bHandle, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    const bMgr = bHandle.getSessionNodeManager();
+    const before = bMgr.getSessionTree("bob", SID_HEX).size();
 
     // A keeps its gateway (so the SEND is allowed), but B's gateway dies before the content arrives.
     await b.gw.stop();
@@ -324,6 +326,13 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(recv.content == null).toBe(true);
       await wait(25);
     }
+
+    // The TRANSIENT half of the distinction (vs the terminal block above): a fail-closed hold records
+    // NO leaf — so after the gateway recovers, dedup will NOT swallow the sender's redelivery — and
+    // sends NO ack — so the sender keeps the content alive and redelivers. Both are load-bearing.
+    expect(bMgr.getSessionTree("bob", SID_HEX).size()).toBe(before); // no leaf committed
+    expect(bEvents.find((e) => e.event === "content.delivery.ack.sent")).toBeUndefined(); // un-acked
+    expect(bEvents.find((e) => e.event === "security.gateway.inbound.terminal_block")).toBeUndefined();
   }, 40_000);
 
   it("AC-003: core/daemon imports no gateway detection/server symbol — it holds only the client + interface", () => {
@@ -486,6 +495,15 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
         e.event === "security.gateway.inbound.terminal_block" && e.context["reason"] === "inbound_language_blocked",
       )).toBeDefined();
       expect(bEvents.find((e) => e.event === "security.gateway.unavailable")).toBeUndefined();
+
+      // The ACK is the load-bearing half of "terminal": B acknowledged the content `persisted`, so the
+      // SENDER STOPS — distinct from the transient hold (next test) where B sends no ack and A redelivers.
+      let acked = false;
+      for (let i = 0; i < 80; i++) {
+        if (bEvents.find((e) => e.event === "content.delivery.ack.sent")) { acked = true; break; }
+        await wait(25);
+      }
+      expect(acked).toBe(true);
 
       // The agent NEVER sees the content: cello_receive stays empty across the positive path's worst case.
       for (let i = 0; i < 80; i++) {

@@ -2055,6 +2055,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
         // distinctly so the tally reflects leaves actually written, not content still queued in memory.
         logger.info("content.recover.held", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, canonicalSeq: ingest.sequenceNumber });
+      } else if (ingest.ok && ingest.screenedOut) {
+        // M9 (code-review LOW-3): a terminal-screened recovered entry IS durably leafed (so it must be
+        // confirm-deleted, below) but was NEVER delivered to the agent — do not count it as a delivered
+        // recovery, and log it distinctly so observability separates "delivered" from "leafed-but-screened".
+        logger.info("content.recover.screened_out", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
+        try {
+          await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+        } catch (err: unknown) {
+          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
+        }
       } else if (ingest.ok) {
         // DOD-MSG-4 (review #3): count leaves ACTUALLY written — the directly-ingested leaf PLUS any
         // held out-of-order entries this ingest unblocked (appendedCount), not just 1.

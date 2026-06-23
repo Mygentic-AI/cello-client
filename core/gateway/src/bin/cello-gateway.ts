@@ -56,9 +56,12 @@ async function main(): Promise<void> {
         };
       }
       const v = await inbound.screen(req.content);
+      // On a block, nothing is delivered — omit the (original) content so a block doesn't ship the
+      // whole payload back over the socket (the daemon uses its own content hash). Only allow/redact
+      // carry content (redact's sanitized bytes; allow is reconstructed from the original by the client).
       return {
         disposition: v.disposition,
-        content: v.content,
+        ...(v.disposition !== "block" ? { content: v.content } : {}),
         events: v.events,
         ...(v.terminal !== undefined ? { terminal: v.terminal } : {}),
         ...(v.reason !== undefined ? { reason: v.reason } : {}),

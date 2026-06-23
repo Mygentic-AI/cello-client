@@ -18,8 +18,8 @@ import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 const enc = (s: string) => new TextEncoder().encode(s);
 
 /** A fake classifier: P(injection) keyed off a marker phrase, so the wiring is testable offline. */
-const fakeClassifier = (probFor: (text: string) => number): InjectionClassifier => ({
-  classify: async (text) => ({ injectionProbability: probFor(text) }),
+const fakeClassifier = (probFor: (text: string) => number, label?: string): InjectionClassifier => ({
+  classify: async (text) => ({ injectionProbability: probFor(text), ...(label ? { label } : {}) }),
 });
 
 describe("M9-IN-003 live wiring — language allowlist as a terminal block", () => {

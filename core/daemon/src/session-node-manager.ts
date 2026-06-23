@@ -255,7 +255,7 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; contentHashHex: string; correlationId?: string }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -2095,42 +2095,24 @@ export class SessionNodeManager {
       sessionId,
       correlationId,
     });
-    if (inboundVerdict.disposition !== "allow" && inboundVerdict.disposition !== "redact") {
-      // M9 terminal-vs-transient split. A TERMINAL block (inboundVerdict.terminal) is a detector
-      // rejecting the CONTENT itself — a confident non-allowlisted language (IN-003), a high-score
-      // injection (IN-002), or an oversized payload (IN-001). The identical bytes would be rejected
-      // identically on redelivery, so holding them un-acked would loop the sender forever. Instead:
-      // record a leaf binding the ORIGINAL content hash and acknowledge it (the sender stops). The
-      // leaf is REQUIRED, not cosmetic: the sender appended this leaf when it sent, so without a
-      // matching leaf here the two parties' hash chains diverge by one and the bilateral seal count
-      // mismatches. The content is still NEVER buffered for the agent (cello_receive never sees it);
-      // the agent learns what happened via the governance feedback channel (M9-FEED-001), not the
-      // content buffer.
-      if (inboundVerdict.disposition === "block" && inboundVerdict.terminal === true) {
-        // Re-check dedup after the screen await (same window as the B1 fix below): a concurrent
-        // ingest of this same hash may have appended while we were screening.
-        const dedupTerminal = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
-        if (dedupTerminal >= 0) {
-          return { ok: true, leafIndex: dedupTerminal, sequenceNumber: dedupTerminal, appendedCount: 0, screenedOut: true };
-        }
-        // Record the tamper-evident leaf in arrival order (a terminal-blocked message is never
-        // delivered, so agent-facing ordering is moot; the leaf exists only for chain parity +
-        // tamper-evidence). NOT via #appendVerifiedContent — that would also buffer it for the agent.
-        const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
-        this.#logger.warn("security.gateway.inbound.terminal_block", {
-          sessionId,
-          disposition: inboundVerdict.disposition,
-          reason: inboundVerdict.reason,
-          sequenceNumber: leafIndex,
-          correlationId,
-        });
-        return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1, screenedOut: true };
-      }
-      // TRANSIENT block / warn HOLD (do not deliver, do not leaf, do not ack). A fail-closed block
-      // from an unreachable gateway (gateway_unavailable) or an exceeded deadline (governance_timeout)
-      // is transient: the message stays un-acked so the sender's TTF/park/retry redelivers and
-      // re-screens it once the gateway recovers. (If we committed a leaf, dedup would later swallow
-      // the redelivery and the agent would never receive it.)
+    // M9 terminal-vs-transient split. A TERMINAL block (inboundVerdict.terminal) is a detector
+    // rejecting the CONTENT itself — a confident non-allowlisted language (IN-003), a high-score
+    // injection (IN-002), or an oversized payload (IN-001). The identical bytes would be rejected
+    // identically on redelivery, so holding them un-acked would loop the sender forever. Instead a
+    // terminal block is `screenedOut`: it records a leaf binding the ORIGINAL content hash and is
+    // acknowledged (the sender stops), but is NEVER buffered for the agent (cello_receive never sees
+    // it). The leaf is REQUIRED, not cosmetic: the sender appended this leaf at its CANONICAL position
+    // on send, so a terminal block must take the SAME strict-in-order path as a delivered message —
+    // record the leaf at its canonical index, not in arrival order — or the two parties' hash chains
+    // diverge by POSITION and the bilateral seal cross-check mismatches (code-review HIGH-1). The only
+    // difference from a normal message is that it leafs WITHOUT buffering. A TRANSIENT block (a
+    // fail-closed gateway_unavailable / governance_timeout) records nothing and is not acked.
+    const terminalBlock = inboundVerdict.disposition === "block" && inboundVerdict.terminal === true;
+    if (inboundVerdict.disposition !== "allow" && inboundVerdict.disposition !== "redact" && !terminalBlock) {
+      // TRANSIENT block / warn HOLD (do not deliver, do not leaf, do not ack). The message stays
+      // un-acked so the sender's TTF/park/retry redelivers and re-screens it once the gateway recovers.
+      // (If we committed a leaf, dedup would later swallow the redelivery and the agent would never
+      // receive it.)
       if (inboundVerdict.reason === GOVERNANCE_TIMEOUT) {
         this.#logger.error("security.gateway.timeout", {
           sessionId,
@@ -2153,10 +2135,20 @@ export class SessionNodeManager {
       }
       return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
+    if (terminalBlock) {
+      this.#logger.warn("security.gateway.inbound.terminal_block", {
+        sessionId,
+        disposition: inboundVerdict.disposition,
+        reason: inboundVerdict.reason,
+        correlationId,
+      });
+    }
 
     // M9-IN-001: a `redact` verdict (inbound sanitization) DELIVERS the sanitized text to the agent,
     // while the Merkle leaf still binds the ORIGINAL content hash below — the transcript records what
     // the peer actually sent; the agent sees the sanitized form. `allow` leaves the content unchanged.
+    // A terminal block carries the original bytes here only so its leaf binds the right hash; it is
+    // never delivered (the screenedOut flag below routes it to a leaf-without-buffer).
     const deliverContent = inboundVerdict.disposition === "redact" && inboundVerdict.content !== undefined
       ? inboundVerdict.content
       : content;
@@ -2177,7 +2169,7 @@ export class SessionNodeManager {
         sequenceNumber: dedupAfterScreen,
         correlationId,
       });
-      return { ok: true, leafIndex: dedupAfterScreen, sequenceNumber: dedupAfterScreen, appendedCount: 0 };
+      return { ok: true, leafIndex: dedupAfterScreen, sequenceNumber: dedupAfterScreen, appendedCount: 0, ...(terminalBlock ? { screenedOut: true } : {}) };
     }
 
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
@@ -2194,18 +2186,22 @@ export class SessionNodeManager {
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-      held.set(canonicalSeq, { content: deliverContent, contentHashHex, correlationId });
+      // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
+      // leafs it at its canonical index when the gap fills, but never buffers it for the agent. This
+      // keeps leafIndex === canonicalSeq for screened-out content too (code-review HIGH-1).
+      held.set(canonicalSeq, { content: deliverContent, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
       this.#logger.info("session.content.held", {
         sessionId,
         canonicalSeq,
         nextExpected,
         gap: canonicalSeq - nextExpected,
+        screenedOut: terminalBlock,
         correlationId,
       });
       // Held content is NOT yet a durable leaf, so it is deliberately NOT acknowledged `persisted`
       // (the caller checks `held`). The sender's TTF→park backstop and the recover/dedup path
       // guarantee eventual delivery; B never claims persisted for content it only holds in memory.
-      return { ok: true, leafIndex: canonicalSeq, sequenceNumber: canonicalSeq, held: true };
+      return { ok: true, leafIndex: canonicalSeq, sequenceNumber: canonicalSeq, held: true, ...(terminalBlock ? { screenedOut: true } : {}) };
     }
     if (canonicalSeq !== undefined && canonicalSeq < nextExpected) {
       // Contradiction (review finding #2): the witness says this hash belongs BEHIND the current
@@ -2222,12 +2218,16 @@ export class SessionNodeManager {
       });
     }
 
-    const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId);
+    // In-order append. A terminal block leafs the ORIGINAL content hash WITHOUT buffering it for the
+    // agent (screenedOut); a delivered message buffers + leafs via #appendVerifiedContent.
+    const leafIndex = terminalBlock
+      ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
+      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
     const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
-    return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released };
+    return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
   }
 
   /**
@@ -2301,11 +2301,18 @@ export class SessionNodeManager {
       const entry = held.get(nextExpected);
       if (!entry) break;
       held.delete(nextExpected);
-      this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId);
+      // A screened-out (terminal-blocked) held entry leafs at its canonical index but is NEVER
+      // buffered for the agent; a normal held entry buffers + leafs (code-review HIGH-1).
+      if (entry.screenedOut) {
+        this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
+      } else {
+        this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId);
+      }
       released++;
       this.#logger.info("session.content.released", {
         sessionId,
         sequenceNumber: nextExpected,
+        screenedOut: entry.screenedOut === true,
         correlationId: entry.correlationId,
       });
       if (held.size === 0) { this.#heldContent.delete(key); break; }
@@ -2425,6 +2432,15 @@ export class SessionNodeManager {
         correlation_id: correlationId,
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
+      // The receiver-side counterpart to the sender's content.delivery.acked: B has acknowledged
+      // this content `persisted`, so the sender stops retrying/parking. Emitted for BOTH a normally
+      // delivered message AND a terminal-screen block (the block is a definitive receipt — the leaf
+      // is recorded, so the sender must stop) — and deliberately NOT for a transient hold.
+      this.#logger.info("content.delivery.ack.sent", {
+        sessionId,
+        contentHash: Buffer.from(contentHash).toString("hex"),
+        correlationId,
+      });
       try { await stream.close(); } catch { /* best-effort close */ }
     } catch (err: unknown) {
       this.#logger.warn("content.delivery.ack.send.failed", {
