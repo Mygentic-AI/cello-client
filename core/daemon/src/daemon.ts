@@ -2971,6 +2971,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // primary agent closes over the keystone stream, so the directory routes its
     // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
     registerUnilateralConfirmedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
+    // DOD-UP-1: the keystone counterpart for the absent-party upgrade listener. The directory
+    // PUSHES the queued seal_unilateral_notification during the keystone's auth/reconnect drain —
+    // BEFORE any cello_start_agent runs — so the handler MUST be registered here at startup, not only
+    // in startAgent, or B (the returning absent party) would miss its own ratification trigger.
+    registerUnilateralUpgradeListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
   }
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
