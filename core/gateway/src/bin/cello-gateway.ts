@@ -18,6 +18,8 @@ import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
 import { GatewayConfigStore } from "../config/config-store.js";
+import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
+import { createHash } from "node:crypto";
 import type { ScreenVerdict } from "../types.js";
 
 async function main(): Promise<void> {
@@ -70,6 +72,26 @@ async function main(): Promise<void> {
   const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });
   const inbound = new InboundScreener();
 
+  // M9-REC-001 (INV-4): the gateway records what it did to EVERY message in its own local store,
+  // hash-chained for tamper-evidence. Enabled when CELLO_GATEWAY_RECORD_DB is set. The verdict's
+  // disposition maps to the record: allow → clean (a clean pass IS recorded — an absent record is
+  // itself evidence of suppression), redact/block/warn verbatim.
+  const recordDbPath = process.env["CELLO_GATEWAY_RECORD_DB"];
+  const records = recordDbPath ? new GatewayRecordStore(recordDbPath) : undefined;
+  const recordOutcome = (direction: "inbound" | "outbound", v: ScreenVerdict, content: Uint8Array): void => {
+    if (!records) return;
+    const disposition: RecordDisposition = v.disposition === "allow" ? "clean" : v.disposition;
+    const reason = v.reason
+      ?? v.events?.find((e) => e.disposition === v.disposition)?.category
+      ?? v.events?.[0]?.category;
+    records.record({
+      direction,
+      disposition,
+      contentHash: createHash("sha256").update(content).digest("hex"),
+      ...(reason !== undefined ? { reason } : {}),
+    });
+  };
+
   const handle = await createGatewayServer({
     socketPath,
     ...(requestLogPath ? { requestLogPath } : {}),
@@ -80,19 +102,21 @@ async function main(): Promise<void> {
           sessionId: req.sessionId,
           ...(req.governanceDecisions !== undefined ? { governanceDecisions: req.governanceDecisions } : {}),
         });
-        return {
+        const verdict: ScreenVerdict = {
           disposition: v.disposition,
           content: v.content,
           events: v.events,
           ...(v.reason !== undefined ? { reason: v.reason } : {}),
           ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
         };
+        recordOutcome("outbound", verdict, req.content);
+        return verdict;
       }
       const v = await inbound.screen(req.content);
       // On a block, nothing is delivered — omit the (original) content so a block doesn't ship the
       // whole payload back over the socket (the daemon uses its own content hash). Only allow/redact
       // carry content (redact's sanitized bytes; allow is reconstructed from the original by the client).
-      return {
+      const verdict: ScreenVerdict = {
         disposition: v.disposition,
         ...(v.disposition !== "block" ? { content: v.content } : {}),
         events: v.events,
@@ -100,6 +124,8 @@ async function main(): Promise<void> {
         ...(v.reason !== undefined ? { reason: v.reason } : {}),
         ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
       };
+      recordOutcome("inbound", verdict, req.content);
+      return verdict;
     },
   });
 
@@ -112,6 +138,7 @@ async function main(): Promise<void> {
     stopping = true;
     void handle.stop().then(() => {
       config?.close();
+      records?.close();
       process.stderr.write(`cello-gateway: stopped (${signal})\n`);
       process.exit(0);
     });

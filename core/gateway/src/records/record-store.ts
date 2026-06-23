@@ -1,0 +1,151 @@
+/**
+ * M9-REC-001 — local security-pass records.
+ *
+ * The gateway records what it did to EVERY message it screens — clean / redacted / blocked / warned —
+ * in its own local DB (node:sqlite, the gateway's file, INV-4). Each record is hash-chained to the
+ * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so an edited,
+ * deleted, reordered, or suppressed record breaks the chain and `verifyChain()` returns false. A CLEAN
+ * pass is recorded too: an ABSENT record for a delivered message is itself evidence of suppression.
+ *
+ * This is the cheap, local half of #5 (tamper-proof records). Sending each fingerprint to the directory
+ * for cross-node tamper detection is Phase-2 (M9-ATTEST-001); the fingerprint computed here is exactly
+ * what gets attested, so Phase 2 is an add, not a rework.
+ */
+import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
+
+export type RecordDisposition = "clean" | "redact" | "block" | "warn";
+export type RecordDirection = "inbound" | "outbound";
+
+export interface RecordInput {
+  direction: RecordDirection;
+  disposition: RecordDisposition;
+  /** Hex SHA-256 of the exact bytes the gateway screened — binds the record to the content. */
+  contentHash: string;
+  reason?: string;
+  correlationId?: string;
+}
+
+export interface SecurityRecord extends RecordInput {
+  seq: number;
+  fingerprint: string;
+  recordedAt: number;
+}
+
+const DDL = `
+CREATE TABLE IF NOT EXISTS security_records (
+  seq              INTEGER PRIMARY KEY,
+  direction        TEXT    NOT NULL,
+  disposition      TEXT    NOT NULL,
+  content_hash     TEXT    NOT NULL,
+  reason           TEXT    NOT NULL,
+  correlation_id   TEXT    NOT NULL,
+  fingerprint      TEXT    NOT NULL,
+  prev_fingerprint TEXT    NOT NULL,
+  recorded_at      INTEGER NOT NULL
+);
+`;
+
+/** The hash-chain fingerprint over a record's fields + the prior record's fingerprint. */
+function fingerprintOf(
+  seq: number,
+  direction: string,
+  disposition: string,
+  contentHash: string,
+  reason: string,
+  correlationId: string,
+  prevFingerprint: string,
+): string {
+  return createHash("sha256")
+    .update(`${seq}|${direction}|${disposition}|${contentHash}|${reason}|${correlationId}|${prevFingerprint}`)
+    .digest("hex");
+}
+
+export class GatewayRecordStore {
+  readonly #db: DatabaseSync;
+  #closed = false;
+
+  constructor(dbPath: string) {
+    this.#db = new DatabaseSync(dbPath);
+    this.#db.exec(DDL);
+  }
+
+  /** Append a security-pass record for one screened message, hash-chained to the prior record. */
+  record(input: RecordInput): SecurityRecord {
+    const latest = this.#latest();
+    const seq = (latest?.seq ?? 0) + 1;
+    const prevFingerprint = latest?.fingerprint ?? "";
+    const reason = input.reason ?? "";
+    const correlationId = input.correlationId ?? "";
+    const recordedAt = Date.now();
+    const fingerprint = fingerprintOf(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, prevFingerprint);
+
+    this.#db
+      .prepare(
+        `INSERT INTO security_records
+           (seq, direction, disposition, content_hash, reason, correlation_id, fingerprint, prev_fingerprint, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(seq, input.direction, input.disposition, input.contentHash, reason, correlationId, fingerprint, prevFingerprint, recordedAt);
+
+    return {
+      seq,
+      direction: input.direction,
+      disposition: input.disposition,
+      contentHash: input.contentHash,
+      ...(input.reason !== undefined ? { reason: input.reason } : {}),
+      ...(input.correlationId !== undefined ? { correlationId: input.correlationId } : {}),
+      fingerprint,
+      recordedAt,
+    };
+  }
+
+  /** Every record, oldest first. */
+  all(): SecurityRecord[] {
+    const rows = this.#db
+      .prepare(`SELECT seq, direction, disposition, content_hash, reason, correlation_id, fingerprint, recorded_at FROM security_records ORDER BY seq ASC`)
+      .all() as Array<{ seq: number; direction: string; disposition: string; content_hash: string; reason: string; correlation_id: string; fingerprint: string; recorded_at: number }>;
+    return rows.map((r) => ({
+      seq: r.seq,
+      direction: r.direction as RecordDirection,
+      disposition: r.disposition as RecordDisposition,
+      contentHash: r.content_hash,
+      ...(r.reason !== "" ? { reason: r.reason } : {}),
+      ...(r.correlation_id !== "" ? { correlationId: r.correlation_id } : {}),
+      fingerprint: r.fingerprint,
+      recordedAt: r.recorded_at,
+    }));
+  }
+
+  count(): number {
+    const row = this.#db.prepare(`SELECT COUNT(*) AS n FROM security_records`).get() as { n: number };
+    return row.n;
+  }
+
+  /** Recompute the whole chain and confirm every stored fingerprint + prev-link matches (tamper check). */
+  verifyChain(): boolean {
+    const rows = this.#db
+      .prepare(`SELECT seq, direction, disposition, content_hash, reason, correlation_id, fingerprint, prev_fingerprint FROM security_records ORDER BY seq ASC`)
+      .all() as Array<{ seq: number; direction: string; disposition: string; content_hash: string; reason: string; correlation_id: string; fingerprint: string; prev_fingerprint: string }>;
+    let prevFingerprint = "";
+    for (const r of rows) {
+      if (r.prev_fingerprint !== prevFingerprint) return false; // a deleted/reordered predecessor
+      const expected = fingerprintOf(r.seq, r.direction, r.disposition, r.content_hash, r.reason, r.correlation_id, prevFingerprint);
+      if (expected !== r.fingerprint) return false; // an edited field
+      prevFingerprint = r.fingerprint;
+    }
+    return true;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#db.close();
+  }
+
+  #latest(): { seq: number; fingerprint: string } | undefined {
+    return this.#db
+      .prepare(`SELECT seq, fingerprint FROM security_records ORDER BY seq DESC LIMIT 1`)
+      .get() as { seq: number; fingerprint: string } | undefined;
+  }
+}
