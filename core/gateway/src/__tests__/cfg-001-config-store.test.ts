@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { GatewayConfigStore } from "../config/config-store.js";
 
 describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-confirmed", () => {
@@ -105,6 +106,42 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     expect(v1.ok && v2.ok && v1.fingerprint).not.toBe(v2.ok && v2.fingerprint);
     // verifyChain walks the rows recomputing each fingerprint from its predecessor.
     expect(store.verifyChain("autonomous_override")).toBe(true);
+  });
+
+  it("verifyChain CATCHES tampering: editing a stored value directly in the DB breaks the chain", () => {
+    store.set("pii_whitelist", ["a@x.example"]); // v1
+    store.set("pii_whitelist", [] as string[]); // v2 (tighten — free)
+    expect(store.verifyChain("pii_whitelist")).toBe(true);
+    store.close();
+    // Tamper: silently widen v1's whitelist in the DB, leaving its stored fingerprint untouched. On
+    // reopen the recomputed fingerprint no longer matches the stored one → the chain must reject it.
+    const raw = new DatabaseSync(join(dir, "config.db"));
+    raw.prepare(`UPDATE config_versions SET value_json = '["a@x.example","evil@attacker.example"]' WHERE key = 'pii_whitelist' AND version = 1`).run();
+    raw.close();
+    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    expect(reopened.verifyChain("pii_whitelist")).toBe(false); // tamper detected
+    reopened.close();
+  });
+
+  it("verifyChain CATCHES deletion: removing a version row breaks the prev-link chain", () => {
+    store.set("autonomous_override", false); // v1
+    store.set("autonomous_override", true, { confirmed: true }); // v2
+    store.set("autonomous_override", false); // v3 (tighten)
+    expect(store.verifyChain("autonomous_override")).toBe(true);
+    store.close();
+    const raw = new DatabaseSync(join(dir, "config.db"));
+    raw.prepare(`DELETE FROM config_versions WHERE key = 'autonomous_override' AND version = 2`).run();
+    raw.close();
+    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    expect(reopened.verifyChain("autonomous_override")).toBe(false); // v3's prev_fingerprint no longer matches
+    reopened.close();
+  });
+
+  it("first-set of the LOOSEST value is still free (no prior guard exists to loosen)", () => {
+    const r = store.set("autonomous_override", true); // first set, loosest value, NO confirmation
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.direction).toBe("neutral");
+    expect(store.get("autonomous_override")).toBe(true);
   });
 
   it("the store SURVIVES reopen (persisted to the gateway's own DB file)", () => {
