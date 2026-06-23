@@ -24,6 +24,10 @@ export interface OutboundVerdict {
   /** The (possibly redacted) content to act on. For block, the original is returned (not sent). */
   content: Uint8Array;
   events: GovernanceEvent[];
+  /** A distinct top-level reason for a block (e.g. `rate_limited`), surfaced to the agent (L1). */
+  reason?: string;
+  /** Actionable guidance for a block/warn outcome. */
+  guidance?: string;
 }
 
 export interface OutboundScreenerOptions {
@@ -59,13 +63,16 @@ export class OutboundScreener {
   }
 
   screen(content: Uint8Array, ctx: OutboundScreenContext): OutboundVerdict {
-    // 1. Rate limit — cheapest, and a throttle short-circuits (don't screen what won't be sent).
+    // 1. Rate limit — a READ-ONLY gate (M2): a throttle short-circuits; a passing peek does NOT
+    //    consume a slot. We commit one only if the message actually goes out (allow/redact), below.
     if (this.#rateLimiter) {
-      const rl = this.#rateLimiter.check(ctx.agentName);
+      const rl = this.#rateLimiter.peek(ctx.agentName);
       if (rl.limited) {
         return {
           disposition: "block",
           content,
+          reason: rl.reason ?? "rate_limited", // distinct top-level reason (L1)
+          guidance: rl.guidance,
           events: [{ stage: "rate_limit", disposition: "block", category: "rate_limit", reason: rl.guidance ?? "rate limit reached" }],
         };
       }
@@ -76,13 +83,16 @@ export class OutboundScreener {
     // 2. Exfiltration — an injection artifact in output is a hard block (short-circuit).
     const ex = screenOutboundExfil(content);
     if (ex.disposition === "block") {
+      // No distinct top-level reason → the daemon uses the §6 standard `blocked_by_governance`; the
+      // specific cause (injection artifact) rides in blocks[].category. (Only rate-limit overrides the
+      // top-level reason, per OUT-004.) The guidance carries the human-readable cause.
       return {
         disposition: "block",
         content,
+        guidance: ex.events[0]?.reason,
         events: ex.events.map((e) => ({ stage: "exfil", disposition: "block" as const, category: e.category, reason: e.reason })),
       };
     }
-    let workingText = ex.text; // exfil redactions (invisible strip / image neutralize / blob redact) applied
     for (const e of ex.events) {
       events.push({ stage: "exfil", disposition: "redact", category: e.category, reason: e.reason });
     }
@@ -95,14 +105,20 @@ export class OutboundScreener {
 
     // (Secrets — M9-OUT-001 — slot in here as a redact stage once the RE2/gitleaks binding lands.)
 
-    const outContent = workingText === ex.text && ex.events.length === 0 ? content : TEXT_ENCODER.encode(workingText);
-    const disposition = events.some((e) => e.disposition === "block")
-      ? "block"
-      : events.some((e) => e.disposition === "warn")
-        ? "warn"
-        : events.some((e) => e.disposition === "redact")
-          ? "redact"
-          : "allow";
+    // Exfil is the only content transform; deliver its text iff it changed anything (L6 — block
+    // sources already short-circuited, so only warn / redact / allow remain).
+    const outContent = ex.events.length === 0 ? content : TEXT_ENCODER.encode(ex.text);
+    const disposition = events.some((e) => e.disposition === "warn")
+      ? "warn"
+      : events.some((e) => e.disposition === "redact")
+        ? "redact"
+        : "allow";
+
+    // M2: commit a rate slot ONLY when the message will actually reach the wire (allow/redact) —
+    // not for a block/warn that is held, and not twice across a warn → governance re-send.
+    if (this.#rateLimiter && (disposition === "allow" || disposition === "redact")) {
+      this.#rateLimiter.record(ctx.agentName);
+    }
     return { disposition, content: outContent, events };
   }
 }

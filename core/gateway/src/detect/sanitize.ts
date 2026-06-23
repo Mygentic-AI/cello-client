@@ -22,8 +22,14 @@ export interface SanitizationNote {
 }
 
 export interface SanitizeResult {
-  /** The sanitized text. Empty string when `blocked` is set. */
+  /** The DELIVERED text: invisible-strip + confusables + special-token strip. Empty on `blocked`. */
   text: string;
+  /**
+   * The delivered text with encodings additionally decoded — for DETECTION ONLY (the pattern
+   * matcher / entropy). Never delivered to the agent: decoding %XX / &#..; / \x.. in a legitimate
+   * URL or code snippet would corrupt content the receiver needs (M1 review / decode-then-rescan).
+   */
+  decodedForScan: string;
   /** Per-step detection notes (only steps that fired). */
   notes: SanitizationNote[];
   /** A suspicion signal for high-entropy (encoded-blob) content. 0 = nothing suspicious. */
@@ -174,6 +180,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   if (content.length > maxBytes) {
     return {
       text: "",
+      decodedForScan: "",
       notes: [],
       entropySuspicion: 0,
       blocked: {
@@ -194,16 +201,19 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   if (conf.changed) notes.push({ step: "confusables", detail: "normalized lookalike characters to their base form", count: conf.count });
   text = conf.text;
 
-  const dec = decodeEncoded(text);
-  if (dec.changed) notes.push({ step: "decode", detail: "decoded encoded payload(s)", count: dec.count });
-  text = dec.text;
-
-  const entropySuspicion = scoreEntropy(text);
-  if (entropySuspicion > 0) notes.push({ step: "entropy", detail: "high-entropy encoded-blob segment(s) detected", count: entropySuspicion });
-
   const tok = stripSpecialTokens(text);
   if (tok.removed > 0) notes.push({ step: "special_tokens", detail: "stripped chat-template / special-token markers", count: tok.removed });
   text = tok.text;
 
-  return { text, notes, entropySuspicion };
+  // Decode is DETECTION-ONLY (decode-then-rescan): it feeds the pattern matcher + entropy, and is
+  // NOT applied to the delivered `text` — decoding %XX / &#..; / \x.. / \u.. in a legitimate URL,
+  // code snippet, or quoted entity would silently corrupt content the receiver needs (M1 review).
+  const dec = decodeEncoded(text);
+  if (dec.changed) notes.push({ step: "decode", detail: "encoded payload detected (decoded for rescan; delivered form unchanged)", count: dec.count });
+  const decodedForScan = dec.text;
+
+  const entropySuspicion = scoreEntropy(decodedForScan);
+  if (entropySuspicion > 0) notes.push({ step: "entropy", detail: "high-entropy encoded-blob segment(s) detected", count: entropySuspicion });
+
+  return { text, decodedForScan, notes, entropySuspicion };
 }

@@ -136,13 +136,23 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
 
     this.#connecting = new Promise<Socket>((resolve, reject) => {
       const sock = connect(this.#socketPath);
+      // L2: bound the CONNECT too — a stalled connect must fail closed, not hang (INV-6 is
+      // unconditional). A UDS connect normally settles immediately; this guards the pathological case.
+      const connectTimer = setTimeout(() => {
+        sock.destroy();
+        this.#connecting = null;
+        reject(new Error(`gateway connect timed out after ${this.#deadlineMs}ms`));
+      }, this.#deadlineMs);
+      if (typeof (connectTimer as { unref?: () => void }).unref === "function") (connectTimer as { unref: () => void }).unref();
       const onError = (err: Error) => {
+        clearTimeout(connectTimer);
         sock.destroy();
         this.#connecting = null;
         reject(err);
       };
       sock.once("error", onError);
       sock.once("connect", () => {
+        clearTimeout(connectTimer);
         sock.off("error", onError);
         this.#connecting = null;
         this.#socket = sock;

@@ -42,16 +42,17 @@ export class InboundScreener {
       };
     }
 
+    // Only steps that change the DELIVERED text are `redact`; decode (detection-only) and entropy
+    // are advisory `observe` notes on otherwise-unchanged content (M1 review).
+    const MUTATING = new Set(["invisible_strip", "confusables", "special_tokens"]);
     const events: GovernanceEvent[] = r.notes.map((n) => ({
       stage: "sanitize",
-      // A pure entropy hit is advisory (the blob is delivered with a note); an actual text change
-      // (strip / normalize / decode / token strip) is a redact — the delivered text was sanitized.
-      disposition: n.step === "entropy" ? "observe" : "redact",
+      disposition: MUTATING.has(n.step) ? "redact" : "observe",
       category: `sanitize:${n.step}`,
       reason: n.detail,
     }));
 
-    const mutated = r.notes.some((n) => n.step !== "entropy");
+    const mutated = r.notes.some((n) => MUTATING.has(n.step));
     return {
       disposition: mutated ? "redact" : "allow",
       content: mutated ? TEXT_ENCODER.encode(r.text) : content,

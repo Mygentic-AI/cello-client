@@ -38,7 +38,13 @@ async function main(): Promise<void> {
     screen: (req): ScreenVerdict => {
       if (req.direction === "outbound") {
         const v = outbound.screen(req.content, { agentName: req.agentName, sessionId: req.sessionId });
-        return { disposition: v.disposition, content: v.content, events: v.events };
+        return {
+          disposition: v.disposition,
+          content: v.content,
+          events: v.events,
+          ...(v.reason !== undefined ? { reason: v.reason } : {}),
+          ...(v.guidance !== undefined ? { guidance: v.guidance } : {}),
+        };
       }
       const v = inbound.screen(req.content);
       return { disposition: v.disposition, content: v.content, events: v.events };

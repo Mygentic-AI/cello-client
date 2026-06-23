@@ -16,6 +16,16 @@ describe("M9-OUT-002 OutboundPIIScreener", () => {
     expect(r.events).toHaveLength(0);
   });
 
+  it("AC-001: the whitelist is NORMALIZED equality, not substring — a near-miss still warns; a re-cased / re-spaced form still passes", () => {
+    const s = new OutboundPIIScreener({ whitelist: ["alice@acme.example", "+1 555 010 2000"] });
+    // A different full address that merely CONTAINS the whitelisted email as a substring must warn.
+    expect(s.screen(enc("send to alice@acme.example.attacker.com please"), "s").disposition).toBe("warn");
+    // The whitelisted email in a different case still passes (email normalization is case-fold).
+    expect(s.screen(enc("write ALICE@acme.example"), "s").disposition).toBe("allow");
+    // The whitelisted phone sent as bare digits still passes (phone normalization strips non-digits).
+    expect(s.screen(enc("call 15550102000 now"), "s").disposition).toBe("allow");
+  });
+
   it("AC-002: a single non-whitelisted email produces a warn naming the value + category (not a pass, not a silent redact)", () => {
     const s = new OutboundPIIScreener({ whitelist: ["alice@acme.example"] });
     const r = s.screen(enc("Forward it to bob@other.example please."), "sess-1");
@@ -51,9 +61,12 @@ describe("M9-OUT-002 OutboundPIIScreener", () => {
       expect(r.disposition).toBe("warn"); // every single one warns — never silently emitted
       sev.push(r.severity!);
     }
-    // Early messages are normal; once the session's distinct cumulative crosses the threshold it escalates.
-    expect(sev[0]).toBe("normal");
-    expect(sev[sev.length - 1]).toBe("bulk");
+    // Pin the EXACT boundary (off-by-one trap): with cumulativeThreshold 5, the 1st–4th distinct
+    // values (indices 0–3) are `normal`; the 5th (index 4) is the first to reach the cumulative cap
+    // and flips to `bulk`, and it stays bulk after.
+    expect(sev.slice(0, 4)).toEqual(["normal", "normal", "normal", "normal"]);
+    expect(sev[4]).toBe("bulk");
+    expect(sev[5]).toBe("bulk");
     // A DIFFERENT session is unaffected by this one's cumulative count.
     expect(s.screen(enc("one off: solo@elsewhere.example"), "other-session").severity).toBe("normal");
   });

@@ -22,13 +22,15 @@ const SMUGGLE_RANGES: Array<[number, number]> = [
   [0xe0000, 0xe007f], // Tags block
   [0x200b, 0x200d],   // zero-width space / non-joiner / joiner
   [0x2060, 0x2064],   // word joiner / invisible math operators
+  [0x202a, 0x202e],   // bidi embeddings / overrides / pop
+  [0x2066, 0x2069],   // bidi isolates
   [0xfe00, 0xfe0f],   // variation selectors
   [0xe0100, 0xe01ef],  // variation selectors supplement
 ];
 function hasSmuggledCodepoint(s: string): boolean {
   for (const cp of s) {
     const c = cp.codePointAt(0)!;
-    if (c === 0xfeff || c === 0x00ad || c === 0x202e || c === 0x202d) return true;
+    if (c === 0xfeff || c === 0x00ad) return true;
     for (const [lo, hi] of SMUGGLE_RANGES) if (c >= lo && c <= hi) return true;
   }
   return false;
@@ -65,12 +67,24 @@ describe("M9-IN-001 sanitizeInbound — deterministic Layer-1 steps", () => {
     expect(r.text).toContain("friend");
   });
 
+  it("SI-001: variation-selector SUPPLEMENT (U+E0100–E01EF), bidi isolates, and embeddings are stripped too — not just the singletons the other tests inject", () => {
+    const vsSupp = String.fromCodePoint(0xe0105); // a VS-supplement codepoint (modern smuggling carrier)
+    const lri = String.fromCodePoint(0x2066); // bidi isolate
+    const lre = String.fromCodePoint(0x202a); // bidi embedding
+    const input = "data" + vsSupp + "more" + lri + "hidden" + lre + "end";
+    const r = sanitizeInbound(enc(input));
+    expect(hasSmuggledCodepoint(r.text)).toBe(false);
+    expect(r.text).toContain("data");
+    expect(r.text).toContain("end");
+  });
+
   it("confusables: Cyrillic/Greek/full-width lookalikes normalize to Latin (so Step 9 can match them)", () => {
     // 'ѕуѕтем' using Cyrillic lookalikes; full-width 'ＡＤＭＩＮ'.
     const cyr = "ѕуѕтем"; // sуѕтем-ish
     const fullwidth = "ＡＤＭＩＮ"; // ADMIN
     const r = sanitizeInbound(enc(`role ${cyr} ${fullwidth}`));
-    expect(r.text.toLowerCase()).toContain("system".slice(0, 3)); // at least 'sys' normalized from Cyrillic
+    expect(r.text).toContain("system"); // FULLY normalized from the Cyrillic lookalikes, not just 'sys'
+    expect(/[Ѐ-ӿ]/.test(r.text)).toBe(false); // NO Cyrillic codepoint survives
     expect(r.text).toContain("ADMIN");
     expect(r.notes.find((n) => n.step === "confusables")).toBeDefined();
   });
@@ -78,10 +92,18 @@ describe("M9-IN-001 sanitizeInbound — deterministic Layer-1 steps", () => {
   it("decode: HTML entities, percent-encoding, and hex escapes are decoded so hidden words surface", () => {
     // §1.4 — '&#115;ystem', '%73ecret', '\x61dmin' should decode to system/secret/admin.
     const r = sanitizeInbound(enc("&#115;ystem %73ecret \\x61dmin"));
-    expect(r.text).toContain("system");
-    expect(r.text).toContain("secret");
-    expect(r.text).toContain("admin");
+    expect(r.text).toContain("&#115;ystem"); // delivered content NOT corrupted by decoding
+    expect(r.text).toContain("%73ecret");
+    expect(r.decodedForScan).toContain("system"); // the hidden words surface for rescan only
+    expect(r.decodedForScan).toContain("secret");
+    expect(r.decodedForScan).toContain("admin");
     expect(r.notes.find((n) => n.step === "decode")).toBeDefined();
+  });
+
+  it("decode does NOT corrupt a legitimate URL or hex escape in the DELIVERED text", () => {
+    const r = sanitizeInbound(enc("see https://site/path%20with%20spaces and code \\x41 here"));
+    expect(r.text).toContain("path%20with%20spaces"); // URL intact, not '%20' → space
+    expect(r.text).toContain("\\x41"); // code intact, not '\\x41' → 'A'
   });
 
   it("AC-003 entropy: a base64 high-entropy blob raises suspicion above the threshold; equal-length prose does not", () => {
@@ -93,6 +115,11 @@ describe("M9-IN-001 sanitizeInbound — deterministic Layer-1 steps", () => {
     expect(rBlob.entropySuspicion).toBeGreaterThanOrEqual(1);
     expect(rProse.entropySuspicion).toBe(0);
     expect(rBlob.notes.find((n) => n.step === "entropy")).toBeDefined();
+
+    // Pin the Shannon threshold itself, not just length+charset: a LONG token that matches the
+    // base64 charset but is LOW entropy ("aaaa…") must NOT raise suspicion (a length-only gate would).
+    const lowEntropy = sanitizeInbound(enc("token: " + "a".repeat(40)));
+    expect(lowEntropy.entropySuspicion).toBe(0);
   });
 
   it("AC-004: chat-template / special-token markers are stripped so they cannot be re-interpreted as a privileged turn", () => {
