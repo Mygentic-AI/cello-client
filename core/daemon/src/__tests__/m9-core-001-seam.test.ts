@@ -114,11 +114,12 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     return Buffer.from(await kp.getPublicKey()).toString("hex");
   }
 
-  /** Spawn a gateway sidecar; return its handle + request-log path. */
-  async function spawnGateway(tag: string): Promise<{ gw: SpawnedGateway; sock: string; log: string }> {
+  /** Spawn a gateway sidecar; return its handle + request-log path. `env` seeds gateway config
+   *  (e.g. CELLO_GATEWAY_PII_WHITELIST, CELLO_GATEWAY_AUTONOMOUS_OVERRIDE) — INV-4 config. */
+  async function spawnGateway(tag: string, env?: Record<string, string>): Promise<{ gw: SpawnedGateway; sock: string; log: string }> {
     const sock = join(tempDir, `${tag}.sock`);
     const log = join(tempDir, `${tag}.log`);
-    const gw = await spawnGatewaySidecar({ socketPath: sock, requestLogPath: log });
+    const gw = await spawnGatewaySidecar({ socketPath: sock, requestLogPath: log, ...(env ? { env } : {}) });
     gateways.push(gw);
     return { gw, sock, log };
   }
@@ -432,6 +433,45 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(flags[0].flagId).toBeDefined(); // each flag carries the deterministic re-send handle
       expect(String(flags[0].category)).toMatch(/^pii:/);
       for (let i = 0; i < 160; i++) { // poll the ABSENCE for ≥ the positive path's worst case (4s)
+        const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        expect(recv.content == null).toBe(true);
+        await wait(25);
+      }
+    }, 40_000);
+
+    it("OUT-002 whitelist: a WHITELISTED own-email passes SILENTLY (no warn) and is delivered intact", async () => {
+      // A's gateway is seeded with the operator's own email (INV-4 config via env). Sharing it must be
+      // frictionless — passes silently, no governance round-trip — the done-condition's silent-pass.
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_PII_WHITELIST: "owner@self.example" });
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "contact me at owner@self.example anytime" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true); // silent pass — NOT a governance_warn
+      expect(sent.delivered).toBe(true);
+      expect(sent.modified).toBe(false); // the whitelisted value is not redacted
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(recv!.content as string).toContain("owner@self.example"); // delivered intact
+    }, 40_000);
+
+    it("OUT-002 bulk: a contact DUMP warns ONCE (one governance_warn covering all the flagged contacts), not sent", async () => {
+      const a = await spawnGateway("ga"); // empty whitelist — every contact is non-whitelisted
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      // 6 distinct non-whitelisted emails (≥ the bulk threshold of 5) — a CRM-dump shape.
+      const dump = "team: a1@x.example, b2@x.example, c3@x.example, d4@x.example, e5@x.example, f6@x.example";
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: dump }) as Record<string, unknown>;
+      // ONE terminal warn covering the whole dump (not six separate sends), NOT sent.
+      expect(sent.ok).toBe(false);
+      expect(sent.reason).toBe("governance_warn");
+      const flags = sent.flags as Array<Record<string, unknown>>;
+      expect(flags.length).toBeGreaterThanOrEqual(5); // all the contacts flagged in the single warn
+      expect(flags.every((f) => String(f.category).startsWith("pii:"))).toBe(true);
+      for (let i = 0; i < 80; i++) { // the dump never reaches the peer
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
         expect(recv.content == null).toBe(true);
         await wait(25);
