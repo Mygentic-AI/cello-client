@@ -51,7 +51,7 @@ import { DaemonRegistrationContext } from "./registration-context.js";
 import { FileRegistrationPersistence } from "./registration-persistence.js";
 import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { Encoder as CborEncoder } from "cbor-x";
+import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -69,15 +69,6 @@ import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHa
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
-
-/**
- * CELLO-M7-UPGRADE-001 (DOD-UP-1): the returning absent party signs CBOR([SEAL_UPGRADE_ACK_DOMAIN,
- * session_id, sealed_root]) with its K_local to ratify the unilateral seal. This MUST produce
- * byte-identical TBS to the directory's verification (directory-node.ts SEAL_UPGRADE_ACK_DOMAIN +
- * CBOR_ENC tagUint8Array:false) — same domain string, same encoder options.
- */
-const SEAL_UPGRADE_ACK_DOMAIN = "cello-seal-upgrade-ack-v1";
-const UPGRADE_CBOR_ENC = new CborEncoder({ tagUint8Array: false });
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -1554,6 +1545,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
    * (cross-check mismatch, AC-003); only then (3) sign the ack over R1 with B's OWN K_local and send
    * seal_upgrade_request. B never co-signs content it could not verify.
    */
+  // Thin wrapper over the extracted, unit-tested seal-upgrade.ts module (the KERNEL + AC-008 + H1/M1
+  // hardening live there so the refusal/reject bodies run under adversarial tests). This wrapper owns
+  // only the per-session in-flight guard and the real-dep injection.
   async function attemptSealUpgrade(
     signaling: SignalingManager,
     agentName: string,
@@ -1565,73 +1559,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (sealUpgradeInFlight.has(key)) return;
     sealUpgradeInFlight.add(key);
     try {
-      const toU8 = (v: unknown): Uint8Array | null =>
-        v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
-      const sessionId = toU8(frame["session_id"]);
-      const sealedRoot = toU8(frame["sealed_root"]);
-      const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
-      if (!sessionId || !sealedRoot || leafCount === null) {
-        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "malformed_notification" });
-        return;
-      }
-
-      // 0. NOTE on R1 authenticity. B (the responder / non-initiator) CANNOT channel-independently
-      //    verify the unilateral cert's signature: that signature is the INITIATOR's group key, which
-      //    B does not hold (documented asymmetry — session-ceremony.ts verifyBilateralSealCertificate).
-      //    B accepts R1 on the AUTHENTICATED daemon↔directory libp2p Noise channel (encrypted +
-      //    mutually authenticated — not MITM-tamperable), exactly as the responder accepts session_sealed.
-      //    B's real protection is the content cross-check below: B ratifies ONLY content it possesses
-      //    and integrity-verified. A worst-case wrong R1 from a malicious directory yields a B-ack over
-      //    a root that does NOT match A's real seal — no coherent bilateral seal forms, never a forgery.
-      //    The dual-attestation cert is independently verified by the party that HOLDS the keys (A, the
-      //    present party) when it receives seal_upgrade_confirmed (AC-008). B forwards leaf_count so A
-      //    can rebuild and verify the present-party attestation there.
-
-      // 1. Recover any parked content from the relay so B holds everything behind R1, then gate.
-      await autoRecoverForAgent(agentName).catch(() => { /* per-relay errors logged inside */ });
-      const ready = sessionNodeManager.getSealUpgradeReadiness(agentName, sidHex);
-      if (!ready.known) {
-        // KERNEL refusal: B has no local transcript for this session — it cannot ratify content it
-        // does not possess (AC-002 content_unrecoverable).
-        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "content_unrecoverable" });
-        return;
-      }
-      if (ready.tampered) {
-        // KERNEL refusal: the content cross-check flagged tamper — a genuine SECURITY event. B must
-        // NOT ratify (AC-003); surfaces for dispute, never auto-promoted.
-        logger.error("session.seal.upgrade.refused", { sessionId: sidHex, reason: "content_tamper" });
-        return;
-      }
-
-      // 2. KERNEL PASSED — sign the ack over R1 with B's OWN K_local and request the upgrade.
-      const keyProvider = keyProviders.get(agentName);
-      if (!keyProvider) {
-        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "no_key_provider" });
-        return;
-      }
-      const ackTbs = UPGRADE_CBOR_ENC.encode([SEAL_UPGRADE_ACK_DOMAIN, sessionId, sealedRoot]);
-      const ackSig = new Uint8Array(await keyProvider.sign(ackTbs));
-      const returningPubkey = new Uint8Array(Buffer.from(agentPubkeyHex, "hex"));
-      const sent = await signaling.sendRaw({
-        type: "seal_upgrade_request",
-        session_id: sessionId,
-        returning_pubkey: returningPubkey,
-        ack_signature: ackSig,
-        // leaf_count is forwarded (from the notification cert) so the directory can relay it on the
-        // confirmed frame — the present party rebuilds the seal TBS and verifies its own attestation.
-        leaf_count: leafCount,
-      });
-      if (!sent.ok) {
-        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "request_send_failed" });
-        return;
-      }
-      logger.info("session.seal.upgrade.requested", { sessionId: sidHex, agentName });
-      // The seal_upgrade_confirmed / _rejected response is handled by registerUnilateralUpgradeListener.
-    } catch (err: unknown) {
-      logger.warn("session.seal.upgrade.refused", {
-        sessionId: sidHex,
-        reason: err instanceof Error ? err.message : String(err),
-      });
+      await attemptSealUpgradeImpl(
+        {
+          logger, agentName, agentPubkeyHex,
+          getReadiness: (a, s) => sessionNodeManager.getSealUpgradeReadiness(a, s),
+          getContentLeafCount: (a, s) => sessionNodeManager.getSessionTree(a, s).size(),
+          recoverContent: (a) => autoRecoverForAgent(a),
+          getKeyProvider: (a) => keyProviders.get(a),
+          sendRaw: (f) => signaling.sendRaw(f),
+        },
+        sidHex,
+        frame,
+      );
     } finally {
       // Clear the guard so a later reconnect can retry if the request never reached the directory;
       // the directory dedups a repeat with already_bilateral.
@@ -1639,69 +1578,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
   }
 
-  /**
-   * DOD-UP-1 (AC-008): verify the dual-attestation seal_upgrade_confirmed cert channel-independently
-   * before accepting the seal as bilateral — never trust the directory's "bilateral" claim.
-   *
-   *  - ALWAYS verify the RETURNING attestation (B's ack) over R1. This is the load-bearing check: it
-   *    proves B genuinely ratified and catches a directory that fabricated or swapped B's signature.
-   *    Anyone can do it — B's pubkey is in the cert and the ack TBS needs only (session_id, R1).
-   *  - If THIS agent is the PRESENT party (A), it holds its own primary key, so it ALSO verifies the
-   *    present attestation over the rebuilt seal TBS (leaf_count-bound) — full both-sides verification.
-   *    The responder (B) cannot verify the initiator's group signature locally (documented asymmetry);
-   *    it relies on the returning check plus the authenticated channel R1 arrived on.
-   */
+  // Thin wrapper: verify the dual-attestation cert (module, AC-008 + H1), then APPLY — mark bilateral
+  // ONLY on ok. Never trust the directory's "bilateral" claim.
   async function verifyAndApplyUpgradeConfirmed(
     agentName: string,
     agentPubkeyHex: string,
     sidHex: string,
     frame: Record<string, unknown>,
   ): Promise<void> {
-    const toU8 = (v: unknown): Uint8Array | null =>
-      v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
-    const sessionId = toU8(frame["session_id"]);
-    const sealedRoot = toU8(frame["sealed_root"]);
-    const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
-    const tsRaw = frame["close_timestamp"];
-    const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
-    const presentPubkey = toU8(frame["present_pubkey"]);
-    const presentSig = toU8(frame["present_signature"]);
-    const presentSigType = frame["present_signature_type"];
-    const returningPubkey = toU8(frame["returning_pubkey"]);
-    const returningSig = toU8(frame["returning_signature"]);
-    if (!sessionId || !sealedRoot || leafCount === null || closeTs === null || !presentPubkey ||
-        !presentSig || !returningPubkey || !returningSig ||
-        (presentSigType !== "frost" && presentSigType !== "single")) {
-      logger.warn("session.seal.upgrade.cert.invalid", { sessionId: sidHex, reason: "malformed_confirmed" });
-      return;
-    }
-
-    // 1. Returning attestation (B's ack) over R1 — the AC-008 kernel.
-    const ackTbs = UPGRADE_CBOR_ENC.encode([SEAL_UPGRADE_ACK_DOMAIN, sessionId, sealedRoot]);
-    if (!ed25519Verify(returningPubkey, ackTbs, returningSig)) {
-      logger.warn("session.seal.upgrade.cert.invalid", { sessionId: sidHex, reason: "returning_signature_invalid" });
-      return;
-    }
-
-    // 2. Present attestation (A's seal sig) — only the present party holds the key to verify it.
-    const presentHex = Buffer.from(presentPubkey).toString("hex");
-    if (agentPubkeyHex === presentHex) {
-      const presentResult = await verifyUnilateralCertificate(
-        { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
-        { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: presentSig, signatureType: presentSigType },
-      );
-      if (!presentResult.ok) {
-        logger.warn("session.seal.upgrade.cert.invalid", { sessionId: sidHex, reason: `present_signature_invalid:${presentResult.reason}` });
-        return;
-      }
-    }
-
-    // 3. Verified to the extent this party can — accept the seal as bilateral.
-    logger.info("session.seal.upgraded", {
-      sessionId: sidHex,
-      agentName,
-      party: agentPubkeyHex === presentHex ? "present" : "returning",
-    });
+    const result = await verifyUpgradeConfirmedCert(
+      {
+        logger, agentName, agentPubkeyHex, celloDir,
+        getCounterpartyHex: (a, s) => sessionNodeManager.getSessionRecord(a, s)?.counterparty_pubkey ?? null,
+      },
+      sidHex,
+      frame,
+    );
+    if (!result.ok) return; // cert.invalid already logged inside; do NOT accept as bilateral.
+    logger.info("session.seal.upgraded", { sessionId: sidHex, agentName, party: result.party });
     void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
   }
 
