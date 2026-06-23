@@ -12,13 +12,15 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "../session-relay-client.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "../seal-frontier-verify.js";
 
+const SID = new Uint8Array(16).fill(7); // the session being sealed
+
 async function signedLeaf(
   kp: ReturnType<typeof generateKeypair>,
   lastSeenSeq: number,
-  opts: { corruptSig?: boolean } = {},
+  opts: { corruptSig?: boolean; sessionId?: Uint8Array } = {},
 ): Promise<SealFrontierLeaf> {
   const pubkey = await kp.getPublicKey();
-  const s1 = encodeStructure1(new Uint8Array(32), pubkey, new Uint8Array(16), lastSeenSeq, 1_700_000_000_000);
+  const s1 = encodeStructure1(new Uint8Array(32), pubkey, opts.sessionId ?? SID, lastSeenSeq, 1_700_000_000_000);
   let sig = await kp.sign(s1);
   if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
   return { structure1_cbor: s1, sender_pubkey: pubkey, sender_signature: sig };
@@ -35,7 +37,7 @@ describe("DOD-LEG-2: reDeriveFrontiers", () => {
       await signedLeaf(a, 1),
       await signedLeaf(a, 2), // A's max is 2
       await signedLeaf(b, 3), // B's max is 3
-    ]);
+    ], SID);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.frontiers.get(aHex)).toBe(2);
@@ -47,10 +49,23 @@ describe("DOD-LEG-2: reDeriveFrontiers", () => {
     const res = reDeriveFrontiers([
       await signedLeaf(a, 1),
       await signedLeaf(a, 9, { corruptSig: true }), // a fabricated high frontier the directory can't sign
-    ]);
+    ], SID);
     expect(res.ok).toBe(false);
     if (res.ok) return;
     expect(res.reason).toBe("leaf_signature_invalid");
+  });
+
+  it("rejects a leaf from a DIFFERENT session (cross-session replay)", async () => {
+    // A malicious directory holds a party's genuinely-signed leaf from another session (where it
+    // reached a high frontier) and replays it to inflate THIS session. The signature verifies, so
+    // session-binding is the only defense: a leaf whose signed session_id ≠ the sealed session is
+    // rejected. (Teeth: an impl that ignores structure1[3] would accept it and derive the inflated value.)
+    const a = generateKeypair();
+    const otherSession = new Uint8Array(16).fill(99);
+    const res = reDeriveFrontiers([await signedLeaf(a, 100, { sessionId: otherSession })], SID);
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toBe("leaf_session_mismatch");
   });
 });
 
@@ -60,7 +75,7 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
     const b = generateKeypair();
     const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
     const bHex = Buffer.from(await b.getPublicKey()).toString("hex").toLowerCase();
-    const res = reDeriveFrontiers([await signedLeaf(a, 2), await signedLeaf(b, 3)]);
+    const res = reDeriveFrontiers([await signedLeaf(a, 2), await signedLeaf(b, 3)], SID);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
 
@@ -74,7 +89,7 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
   it("flags a party whose published frontier exceeds its signed leaves (inflation)", async () => {
     const a = generateKeypair();
     const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
-    const res = reDeriveFrontiers([await signedLeaf(a, 2)]); // A really only reached 2
+    const res = reDeriveFrontiers([await signedLeaf(a, 2)], SID); // A really only reached 2
     expect(res.ok).toBe(true);
     if (!res.ok) return;
 
@@ -93,7 +108,7 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
     const b = generateKeypair();
     const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
     const bHex = Buffer.from(await b.getPublicKey()).toString("hex").toLowerCase();
-    const res = reDeriveFrontiers([await signedLeaf(a, 2), await signedLeaf(b, 3)]);
+    const res = reDeriveFrontiers([await signedLeaf(a, 2), await signedLeaf(b, 3)], SID);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
 
@@ -110,7 +125,7 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
   it("equal published == derived is honest (not flagged)", async () => {
     const a = generateKeypair();
     const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
-    const res = reDeriveFrontiers([await signedLeaf(a, 4)]);
+    const res = reDeriveFrontiers([await signedLeaf(a, 4)], SID);
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(findInflatedFrontier([{ pubkey: aHex, content_frontier_seq: 4 }], res.frontiers)).toBeNull();

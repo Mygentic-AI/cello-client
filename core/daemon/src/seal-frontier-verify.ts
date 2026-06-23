@@ -33,15 +33,23 @@ export interface SealFrontierLeaf {
 
 export type ReDeriveResult =
   | { ok: true; frontiers: Map<string, number> }
-  | { ok: false; reason: "leaf_signature_invalid" | "leaf_malformed" };
+  | { ok: false; reason: "leaf_signature_invalid" | "leaf_malformed" | "leaf_session_mismatch" };
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 /**
  * Re-derive each party's content_frontier_seq from the signed leaves. Verifies every leaf's
- * Ed25519 signature over its Structure 1 bytes first — an unverifiable leaf fails the whole
- * re-derivation (a directory shipping a forged leaf is itself a tamper signal). Returns a
- * map of lowercase-hex sender pubkey → max signed last_seen_seq.
+ * Ed25519 signature over its Structure 1 bytes AND that the leaf's SIGNED session_id matches
+ * the session being sealed — otherwise a malicious directory could replay a party's genuinely
+ * signed leaves from a DIFFERENT session (where it reached a higher frontier) to inflate this
+ * session's frontier. An unverifiable or wrong-session leaf fails the whole re-derivation.
+ * Returns a map of lowercase-hex sender pubkey → max signed last_seen_seq.
  */
-export function reDeriveFrontiers(leaves: SealFrontierLeaf[]): ReDeriveResult {
+export function reDeriveFrontiers(leaves: SealFrontierLeaf[], expectedSessionId: Uint8Array): ReDeriveResult {
   const frontiers = new Map<string, number>();
   for (const leaf of leaves) {
     if (!verify(leaf.sender_pubkey, leaf.structure1_cbor, leaf.sender_signature)) {
@@ -55,6 +63,10 @@ export function reDeriveFrontiers(leaves: SealFrontierLeaf[]): ReDeriveResult {
     }
     // Structure 1 = [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts]
     if (!Array.isArray(arr) || arr.length < 5) return { ok: false, reason: "leaf_malformed" };
+    const sid = arr[3];
+    if (!(sid instanceof Uint8Array) || !bytesEqual(sid, expectedSessionId)) {
+      return { ok: false, reason: "leaf_session_mismatch" };
+    }
     const raw = arr[4];
     const lss = typeof raw === "bigint" ? Number(raw) : raw;
     if (typeof lss !== "number" || !Number.isFinite(lss)) continue; // leaf carries no signed last_seen

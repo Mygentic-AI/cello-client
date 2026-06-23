@@ -1380,9 +1380,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // for the frontier VALUE — only for transporting signed bytes it re-checks itself. When no
         // frontier_leaves are present (a pre-LEG-2 directory), the guard is skipped (backward-compat).
         const frontierLeavesRaw = frame["frontier_leaves"];
-        if (legibility !== undefined && Array.isArray(frontierLeavesRaw) && frontierLeavesRaw.length > 0) {
+        if (legibility !== undefined) {
+          const rawParticipants =
+            (legibility as { participants?: Array<{ pubkey?: unknown; content_frontier_seq?: unknown }> }).participants ?? [];
+          // Any party claiming to have received content (frontier > 0) MUST be backed by signed leaves.
+          const anyClaimedFrontier = rawParticipants.some(
+            (p) => typeof p.content_frontier_seq === "number" && p.content_frontier_seq > 0,
+          );
+          const haveLeaves = Array.isArray(frontierLeavesRaw) && frontierLeavesRaw.length > 0;
+          // HIGH (fail-closed): a malicious directory must not bypass the guard by OMITTING the leaves
+          // while still publishing a frontier. No leaves + a claimed frontier → reject.
+          if (anyClaimedFrontier && !haveLeaves) {
+            logger.error("seal.certificate.frontier.unverifiable", { sessionId: sidHex, reason: "frontier_leaves_missing" });
+            return;
+          }
+          // LOW (robustness): a malformed/malicious legibility (null pubkey or non-numeric frontier)
+          // must be rejected, never crash the guard.
+          for (const p of rawParticipants) {
+            if (typeof p.pubkey !== "string" || typeof p.content_frontier_seq !== "number") {
+              logger.error("seal.certificate.frontier.unverifiable", { sessionId: sidHex, reason: "participant_malformed" });
+              return;
+            }
+          }
+          const participants = rawParticipants as Array<{ pubkey: string; content_frontier_seq: number }>;
+
+          if (haveLeaves) {
           const toU8 = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>));
-          const leaves: SealFrontierLeaf[] = frontierLeavesRaw.map((l) => {
+          const leaves: SealFrontierLeaf[] = (frontierLeavesRaw as unknown[]).map((l) => {
             const o = l as Record<string, unknown>;
             return {
               structure1_cbor: toU8(o["structure1_cbor"]),
@@ -1390,13 +1414,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
               sender_signature: toU8(o["sender_signature"]),
             };
           });
-          const rederived = reDeriveFrontiers(leaves);
+          // Session-bound re-derivation (BLOCKING fix): leaves must be from THIS session, so a
+          // malicious directory cannot replay a party's leaves from another session to inflate.
+          const rederived = reDeriveFrontiers(leaves, toU8(frame["session_id"]));
           if (!rederived.ok) {
             logger.error("seal.certificate.frontier.unverifiable", { sessionId: sidHex, reason: rederived.reason });
             return;
           }
-          const participants =
-            (legibility as { participants?: Array<{ pubkey: string; content_frontier_seq: number }> }).participants ?? [];
           const inflated = findInflatedFrontier(participants, rederived.frontiers);
           if (inflated) {
             // The directory published a frontier higher than the signed leaves support — refuse the
@@ -1413,6 +1437,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             sessionId: sidHex,
             parties: participants.length,
           });
+          }
         }
 
         if (legibility !== undefined) {
