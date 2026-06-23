@@ -85,6 +85,28 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
     expect(inflated!.derivedFrontier).toBe(2);
   });
 
+  it("flags a NON-FIRST party when only the second-listed party's frontier is inflated", async () => {
+    // SI-002: the guard must reject if ANY party's published frontier is inflated — not just the
+    // first. Here A (index 0) is honest and B (index 1) is inflated; an impl that only inspects
+    // participants[0] would wrongly return null. (Teeth: a participants[0]-only impl fails this.)
+    const a = generateKeypair();
+    const b = generateKeypair();
+    const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
+    const bHex = Buffer.from(await b.getPublicKey()).toString("hex").toLowerCase();
+    const res = reDeriveFrontiers([await signedLeaf(a, 2), await signedLeaf(b, 3)]);
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+
+    const inflated = findInflatedFrontier(
+      [{ pubkey: aHex, content_frontier_seq: 2 /* honest */ }, { pubkey: bHex, content_frontier_seq: 9 /* inflated */ }],
+      res.frontiers,
+    );
+    expect(inflated, "the inflated SECOND party must be flagged").not.toBeNull();
+    expect(inflated!.party.toLowerCase()).toBe(bHex);
+    expect(inflated!.publishedFrontier).toBe(9);
+    expect(inflated!.derivedFrontier).toBe(3);
+  });
+
   it("equal published == derived is honest (not flagged)", async () => {
     const a = generateKeypair();
     const aHex = Buffer.from(await a.getPublicKey()).toString("hex").toLowerCase();
