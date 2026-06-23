@@ -38,7 +38,11 @@ async function main(): Promise<void> {
   compileSecretRules();
 
   const piiWhitelist = (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  const outbound = new OutboundScreener({ piiWhitelist });
+  // INV-4: the gateway owns this config. autonomous_override defaults OFF — the agent's only autonomous
+  // lever over a PII warn is `redact`; allowing a value out is a human action. M9-CFG-001 will source
+  // this from the gateway config DB; until then it is an explicit env opt-in.
+  const autonomousOverride = process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1";
+  const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride });
   const inbound = new InboundScreener();
 
   const handle = await createGatewayServer({
@@ -46,7 +50,11 @@ async function main(): Promise<void> {
     ...(requestLogPath ? { requestLogPath } : {}),
     screen: async (req): Promise<ScreenVerdict> => {
       if (req.direction === "outbound") {
-        const v = outbound.screen(req.content, { agentName: req.agentName, sessionId: req.sessionId });
+        const v = outbound.screen(req.content, {
+          agentName: req.agentName,
+          sessionId: req.sessionId,
+          ...(req.governanceDecisions !== undefined ? { governanceDecisions: req.governanceDecisions } : {}),
+        });
         return {
           disposition: v.disposition,
           content: v.content,

@@ -34,6 +34,17 @@ export type ScreenDisposition = "allow" | "block" | "redact" | "warn";
 export type GovernanceDisposition = "observe" | "redact" | "block" | "warn";
 
 /**
+ * A governance decision the agent attaches to a re-send to resolve a warned item (M9-FEED-001 §6):
+ *   - `redact`       — send with a typed placeholder. Always available (the agent's autonomous lever).
+ *   - `allow_once`   — send the value verbatim THIS once. Honored ONLY when `autonomous_override` is
+ *                      ON; OFF (default) → rejected + re-warned (the operator must whitelist).
+ *   - `allow_always` — persist the value to the whitelist (a config loosening → a human action:
+ *                      WebAuthn-confirmed + attested). Autonomous mode degrades to `allow_once` for
+ *                      THIS send and raises an operator whitelist-add request; OFF → rejected.
+ */
+export type GovernanceDecision = "redact" | "allow_once" | "allow_always";
+
+/**
  * One governance finding published by a screen stage (§6). The verdict aggregates these; the daemon
  * renders them to the agent (M9-FEED-001) — as the transformations on a redact, the reasons on a
  * block, or the flagged items (with `flagId`) on a warn.
@@ -54,6 +65,14 @@ export interface ScreenContext {
   sessionId: string;
   /** The async-flow correlation id, threaded through every event in this send/receive (INV-7). */
   correlationId?: string;
+  /**
+   * The agent's per-item decisions on a governance RE-SEND (M9-FEED-001 §6), keyed by the `flagId`
+   * the prior `warn` verdict returned. Stateless: the gateway re-scans the (full) content, re-derives
+   * the same deterministic flagIds, and applies these decisions. A flagId that no longer matches
+   * (content changed) is ignored and that item re-warns/redacts — a decision can never mis-apply to
+   * different content (SI-002). Omitted flags default to `redact`. Outbound only.
+   */
+  governanceDecisions?: Record<string, GovernanceDecision>;
 }
 
 /**

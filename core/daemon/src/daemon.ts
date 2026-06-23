@@ -3257,6 +3257,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "session_not_active", guidance: `Session is '${record.status}', not active. Content can only be sent on an active session. If it is interrupted, call cello_close_session to seal it.` };
     }
 
+    // M9-FEED-001 §6: the agent's governance re-send decisions, keyed by the flagId a prior `warn`
+    // returned. Optional; validated shape only (the gateway re-scans + applies them, INV-4). A
+    // malformed map is ignored rather than failing the send (the gateway will just re-warn).
+    const rawDecisions = params?.governance_decisions;
+    let governanceDecisions: Record<string, "redact" | "allow_once" | "allow_always"> | undefined;
+    if (rawDecisions && typeof rawDecisions === "object" && !Array.isArray(rawDecisions)) {
+      const valid: Record<string, "redact" | "allow_once" | "allow_always"> = {};
+      for (const [k, v] of Object.entries(rawDecisions as Record<string, unknown>)) {
+        if (v === "redact" || v === "allow_once" || v === "allow_always") valid[k] = v;
+      }
+      if (Object.keys(valid).length > 0) governanceDecisions = valid;
+    }
+
     const correlationId = randomUUID();
     const contentBytes = new TextEncoder().encode(contentStr);
 
@@ -3290,6 +3303,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentName: record.agent_name,
       sessionId,
       correlationId,
+      ...(governanceDecisions !== undefined ? { governanceDecisions } : {}),
     });
     if (outboundVerdict.disposition === "block") {
       if (outboundVerdict.reason === GOVERNANCE_TIMEOUT) {

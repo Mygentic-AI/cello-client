@@ -6,7 +6,7 @@
  * transport (Unix domain socket); Phase 2 swaps the socket for mTLS but keeps these message
  * shapes, so the remote gateway is a transport change, not a protocol change.
  */
-import type { ScreenDirection, ScreenDisposition, GovernanceEvent } from "./types.js";
+import type { ScreenDirection, ScreenDisposition, GovernanceEvent, GovernanceDecision } from "./types.js";
 
 export const SCREEN_OUTBOUND = "screen_outbound";
 export const SCREEN_INBOUND = "screen_inbound";
@@ -22,6 +22,8 @@ export interface WireScreenRequest {
     agentName: string;
     sessionId: string;
     correlationId?: string;
+    /** The agent's governance re-send decisions, keyed by flagId (M9-FEED-001 §6). Outbound only. */
+    governanceDecisions?: Record<string, GovernanceDecision>;
   };
 }
 

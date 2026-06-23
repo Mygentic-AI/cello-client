@@ -433,6 +433,49 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
     }, 40_000);
 
+    it("FEED-001 inc4 re-send {flagId: redact}: the warned PII email is RE-SENT redacted and the peer gets the placeholder", async () => {
+      const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const content = "reach me at stranger@other.example";
+      // First call → warn, NOT sent, carries the deterministic flagId.
+      const warn = await clientA.send("cello_send", { session_id: SID_HEX, content }) as Record<string, unknown>;
+      expect(warn.ok).toBe(false);
+      expect(warn.reason).toBe("governance_warn");
+      const flagId = (warn.flags as Array<Record<string, unknown>>)[0].flagId as string;
+      // Re-send: the SAME content + a decision → resolved terminally, sent in redacted form.
+      const resend = await clientA.send("cello_send", { session_id: SID_HEX, content, governance_decisions: { [flagId]: "redact" } }) as Record<string, unknown>;
+      expect(resend.ok).toBe(true);
+      expect(resend.modified).toBe(true);
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(recv!.content as string).not.toContain("stranger@other.example"); // the email never reached the peer
+      expect(recv!.content as string).toContain("[REDACTED:pii:email]"); // the typed placeholder did
+    }, 40_000);
+
+    it("FEED-001 inc4 SI-002: re-send {flagId: allow_once} with autonomous_override OFF (default) → RE-WARNED, NOT sent", async () => {
+      const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const content = "reach me at stranger@other.example";
+      const warn = await clientA.send("cello_send", { session_id: SID_HEX, content }) as Record<string, unknown>;
+      const flagId = (warn.flags as Array<Record<string, unknown>>)[0].flagId as string;
+      // The agent CANNOT autonomously authorize sending the PII: override is OFF, so allow_once is refused.
+      const resend = await clientA.send("cello_send", { session_id: SID_HEX, content, governance_decisions: { [flagId]: "allow_once" } }) as Record<string, unknown>;
+      expect(resend.ok).toBe(false);
+      expect(resend.reason).toBe("governance_warn"); // re-warned, not sent
+      expect(String(resend.guidance)).toMatch(/autonomous_override is OFF/i);
+      for (let i = 0; i < 80; i++) { // the peer receives NOTHING
+        const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        expect(recv.content == null).toBe(true);
+        await wait(25);
+      }
+    }, 40_000);
+
     it("block (injection artifact in output) → NOT sent: blocked_by_governance + blocks; the peer receives nothing", async () => {
       const a = await spawnGateway("ga");
       const b = await spawnGateway("gb");

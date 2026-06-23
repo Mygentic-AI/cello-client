@@ -12,7 +12,7 @@ import { appendFile, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
-import type { ScreenDirection, ScreenVerdict } from "./types.js";
+import type { ScreenDirection, ScreenVerdict, GovernanceDecision } from "./types.js";
 
 /** The detection entry point. M9-CORE-001's default returns `allow`; the pipeline replaces it. */
 export interface GatewayScreenFn {
@@ -22,6 +22,8 @@ export interface GatewayScreenFn {
     agentName: string;
     sessionId: string;
     correlationId?: string;
+    /** The agent's governance re-send decisions, keyed by flagId (M9-FEED-001 §6). Outbound only. */
+    governanceDecisions?: Record<string, GovernanceDecision>;
   }): ScreenVerdict | Promise<ScreenVerdict>;
 }
 
@@ -119,6 +121,7 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
         agentName: req.ctx.agentName,
         sessionId: req.ctx.sessionId,
         correlationId: req.ctx.correlationId,
+        ...(req.ctx.governanceDecisions !== undefined ? { governanceDecisions: req.ctx.governanceDecisions } : {}),
       });
     } catch (err) {
       // A screen-function fault is fail-closed: block, never silently allow.
