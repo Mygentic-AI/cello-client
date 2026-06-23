@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
+import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -476,6 +476,32 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
         expect(recv.content == null).toBe(true);
         await wait(25);
       }
+    }, 40_000);
+
+    it("CFG-001: the live gateway sources its PII whitelist from the versioned config STORE (not just env)", async () => {
+      // Seed the gateway's own config store BEFORE spawning it: whitelisting a value is a LOOSEN, so it
+      // requires confirmation (the §7 governance gate). The spawned gateway then reads the store as its
+      // source of truth — proving the store, not just env, drives live behavior.
+      const cfgDb = join(tempDir, "gw-config.db");
+      const cstore = new GatewayConfigStore(cfgDb);
+      const r = cstore.set("pii_whitelist", ["owner@self.example"], { confirmed: true });
+      expect(r.ok).toBe(true);
+      expect(r.ok && r.direction).toBe("neutral"); // first value for the key
+      cstore.close();
+
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_CONFIG_DB: cfgDb });
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "contact me at owner@self.example" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true); // store-whitelisted → silent pass (no governance_warn)
+      expect(sent.modified).toBe(false);
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(recv!.content as string).toContain("owner@self.example"); // delivered intact
     }, 40_000);
 
     it("OUT-004 rate limit: over-rate sends are throttled with a distinct rate_limited reason + guidance", async () => {

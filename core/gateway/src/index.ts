@@ -34,6 +34,8 @@ export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect
 export { isModelInstalled, installModel, verifyModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
+export { GatewayConfigStore } from "./config/config-store.js";
+export type { ConfigDirection, SetResult, ConfigVersionRow } from "./config/config-store.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 

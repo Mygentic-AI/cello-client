@@ -17,6 +17,7 @@ import { InboundScreener } from "../screen/inbound.js";
 import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
+import { GatewayConfigStore } from "../config/config-store.js";
 import type { ScreenVerdict } from "../types.js";
 
 async function main(): Promise<void> {
@@ -37,16 +38,27 @@ async function main(): Promise<void> {
   compileInjectionPatterns();
   compileSecretRules();
 
-  const piiWhitelist = (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-  // INV-4: the gateway owns this config. autonomous_override defaults OFF — the agent's only autonomous
-  // lever over a PII warn is `redact`; allowing a value out is a human action. M9-CFG-001 will source
-  // this from the gateway config DB; until then it is an explicit env opt-in.
-  const autonomousOverride = process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1";
-  // OUT-004 per-agent outbound rate cap (INV-4 config). Interim env opt-in until M9-CFG-001 sources it
-  // from the gateway config DB (same as the whitelist + override). Both vars must be positive to enable;
-  // absent/invalid → no cap (rate-limiting off).
-  const rateMax = Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"]);
-  const rateWindowMs = Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"]);
+  // M9-CFG-001 (INV-4): the gateway owns its config. When CELLO_GATEWAY_CONFIG_DB is set, the versioned
+  // config store is the SOURCE OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars
+  // are the bootstrap fallback for any key the store has not set. Each setting defaults to its TIGHTEST
+  // value (empty whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
+  const configDbPath = process.env["CELLO_GATEWAY_CONFIG_DB"];
+  const config = configDbPath ? new GatewayConfigStore(configDbPath) : undefined;
+  const cfg = <T>(key: string, envFallback: T): T => {
+    const v = config?.get(key);
+    return v !== undefined ? (v as T) : envFallback;
+  };
+
+  const piiWhitelist = cfg<string[]>(
+    "pii_whitelist",
+    (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  );
+  // autonomous_override defaults OFF — the agent's only autonomous lever over a PII warn is `redact`;
+  // allowing a value out is a human action (loosening the store requires confirmation).
+  const autonomousOverride = cfg<boolean>("autonomous_override", process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1");
+  // OUT-004 per-agent outbound rate cap. Positive cap + window enables it; 0/absent → no cap.
+  const rateMax = Number(cfg<number>("rate_max_per_window", Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"])));
+  const rateWindowMs = Number(cfg<number>("rate_window_ms", Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"])));
   const rateLimit = Number.isFinite(rateMax) && rateMax > 0 && Number.isFinite(rateWindowMs) && rateWindowMs > 0
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
     : undefined;
@@ -94,6 +106,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     void handle.stop().then(() => {
+      config?.close();
       process.stderr.write(`cello-gateway: stopped (${signal})\n`);
       process.exit(0);
     });
