@@ -144,6 +144,12 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(1);
     expect(B.events.find((e) => e.event === "session.content.received")).toBeDefined();
 
+    // DOD-UP-1: content cross-checked cleanly → the session is verifiable, so B's upgrade gate is
+    // ready to ratify a unilateral seal (known, not tampered).
+    const readiness = B.manager.getSealUpgradeReadiness("bob", SID);
+    expect(readiness.tampered).toBe(false);
+    expect(readiness.known).toBe(true);
+
     // A: the delivery-ACK round-trips back over the same muxed connection and resolves the
     // awaiting-ACK (content.delivery.acked at level 'persisted'), so NO TTF park fires.
     const acked = await pollFor(() => A.events.find((e) => e.event === "content.delivery.acked"));
@@ -182,6 +188,10 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     expect(rejected!.context["reason"]).toBe("content_hash_mismatch");
     expect(B.manager.takeReceivedContent("bob", SID)).toBeNull();
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(0);
+
+    // DOD-UP-1 KERNEL: a tampered cross-check makes the session unverifiable — B must NOT ratify a
+    // unilateral seal for it (getSealUpgradeReadiness.tampered = true → the upgrade gate refuses).
+    expect(B.manager.getSealUpgradeReadiness("bob", SID).tampered).toBe(true);
 
     // And A never gets an ACK (no delivery for tampered content) — its awaiting-ACK stays
     // armed (it is the TTF/recovery path's job, not this seam's, to drain it).

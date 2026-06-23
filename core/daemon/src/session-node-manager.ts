@@ -1995,6 +1995,28 @@ export class SessionNodeManager {
   }
 
   /**
+   * CELLO-M7-UPGRADE-001 (DOD-UP-1): readiness of a session for B to RATIFY a unilateral seal
+   * (the returning absent party). This is the SAME verifiability bar as the UP-2 auto-ack gate:
+   *
+   *  - `known`: the session exists locally with its content (B has a transcript to ratify). After a
+   *    restart B reloads it from SQLite, and autoRecoverForAgent re-pulls any parked content first.
+   *  - `tampered`: the content cross-check flagged a content_hash mismatch (#contentDesynced) — B
+   *    must NEVER ratify content it could not integrity-verify (the KERNEL refusal, AC-003).
+   *
+   * The directory separately verifies B's ack signature is genuine; B separately verifies the
+   * unilateral cert signature (R1 is authentic). NOTE: a full "B's frontier covers R1's tail"
+   * completeness check (the `desynced` reason) requires the deferred MSG-001-3b canonical-sequence
+   * reconciliation — same documented limitation as the UP-2 gate above.
+   */
+  getSealUpgradeReadiness(agentName: string, sessionId: string): { known: boolean; tampered: boolean } {
+    const record = this.getSessionRecord(agentName, sessionId);
+    return {
+      known: !!record,
+      tampered: this.#contentDesynced.has(this.#k(agentName, sessionId)),
+    };
+  }
+
+  /**
    * M7-UPGRADE-002: auto-acknowledge close (POSTMORTEM Workstream E / C-5). When B's daemon
    * ingests the COUNTERPARTY's SEAL control leaf and B has verified the content, B's OWN node
    * auto-co-signs + submits its responder SEAL leaf WITHOUT waiting for B's agent to call

@@ -51,6 +51,7 @@ import { DaemonRegistrationContext } from "./registration-context.js";
 import { FileRegistrationPersistence } from "./registration-persistence.js";
 import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { Encoder as CborEncoder } from "cbor-x";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -68,6 +69,15 @@ import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHa
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
+
+/**
+ * CELLO-M7-UPGRADE-001 (DOD-UP-1): the returning absent party signs CBOR([SEAL_UPGRADE_ACK_DOMAIN,
+ * session_id, sealed_root]) with its K_local to ratify the unilateral seal. This MUST produce
+ * byte-identical TBS to the directory's verification (directory-node.ts SEAL_UPGRADE_ACK_DOMAIN +
+ * CBOR_ENC tagUint8Array:false) — same domain string, same encoder options.
+ */
+const SEAL_UPGRADE_ACK_DOMAIN = "cello-seal-upgrade-ack-v1";
+const UPGRADE_CBOR_ENC = new CborEncoder({ tagUint8Array: false });
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -605,6 +615,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
     // SESSION-002: resolve seal_unilateral_confirmed (verify the cert) on this agent's stream.
     registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
+    // DOD-UP-1: as the ABSENT party, react to seal_unilateral_notification on reconnect — recover +
+    // verify the content, then ratify the unilateral seal (upgrade to bilateral). Also handles the
+    // seal_upgrade_confirmed / seal_upgrade_rejected responses.
+    registerUnilateralUpgradeListener(mgr, agentName, agentPubkeyHex);
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
@@ -1522,6 +1536,142 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
         waiter({ ok: true, sealedRootHex: Buffer.from(sealedRoot).toString("hex") });
       })();
+    });
+  }
+
+  // ─── DOD-UP-1: returning-absent-party seal upgrade (unilateral → bilateral) ───
+  // Per-session idempotency guard so a notification burst (reconnect re-delivery) cannot launch
+  // concurrent upgrade attempts. Keyed `${agentName}:${sessionIdHex}`; cleared after each attempt.
+  const sealUpgradeInFlight = new Set<string>();
+
+  /**
+   * DOD-UP-1: B (the absent party) ratifies a unilateral seal it learns about on reconnect.
+   *
+   * THE KERNEL: B signs the ratification ONLY after it has recovered + integrity-verified the
+   * content behind the sealed root. We (0) verify the unilateral cert so R1 is provably authentic
+   * (SI-003 — a channel-swapped root fails); (1) recover any parked content from the relay; (2) gate
+   * on getSealUpgradeReadiness — refuse content_unrecoverable (session unknown) or content_tamper
+   * (cross-check mismatch, AC-003); only then (3) sign the ack over R1 with B's OWN K_local and send
+   * seal_upgrade_request. B never co-signs content it could not verify.
+   */
+  async function attemptSealUpgrade(
+    signaling: SignalingManager,
+    agentName: string,
+    agentPubkeyHex: string,
+    sidHex: string,
+    frame: Record<string, unknown>,
+  ): Promise<void> {
+    const key = `${agentName}:${sidHex}`;
+    if (sealUpgradeInFlight.has(key)) return;
+    sealUpgradeInFlight.add(key);
+    try {
+      const toU8 = (v: unknown): Uint8Array | null =>
+        v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
+      const sessionId = toU8(frame["session_id"]);
+      const sealedRoot = toU8(frame["sealed_root"]);
+      const frostSig = toU8(frame["frost_signature"]);
+      const leafCount = typeof frame["leaf_count"] === "number" ? frame["leaf_count"] : null;
+      const tsRaw = frame["close_timestamp"];
+      const closeTs = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
+      const sigType = frame["signature_type"];
+      if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null ||
+          (sigType !== "frost" && sigType !== "single")) {
+        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "malformed_notification" });
+        return;
+      }
+
+      // 0. Verify the unilateral cert — B must confirm R1 is authentically signed BEFORE ratifying
+      //    it (SI-003). This is the same channel-independent check the present party runs.
+      const certResult = await verifyUnilateralCertificate(
+        { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+        { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
+      );
+      if (!certResult.ok) {
+        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: `certificate_invalid:${certResult.reason}` });
+        return;
+      }
+
+      // 1. Recover any parked content from the relay so B holds everything behind R1, then gate.
+      await autoRecoverForAgent(agentName).catch(() => { /* per-relay errors logged inside */ });
+      const ready = sessionNodeManager.getSealUpgradeReadiness(agentName, sidHex);
+      if (!ready.known) {
+        // KERNEL refusal: B has no local transcript for this session — it cannot ratify content it
+        // does not possess (AC-002 content_unrecoverable).
+        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "content_unrecoverable" });
+        return;
+      }
+      if (ready.tampered) {
+        // KERNEL refusal: the content cross-check flagged tamper — a genuine SECURITY event. B must
+        // NOT ratify (AC-003); surfaces for dispute, never auto-promoted.
+        logger.error("session.seal.upgrade.refused", { sessionId: sidHex, reason: "content_tamper" });
+        return;
+      }
+
+      // 2. KERNEL PASSED — sign the ack over R1 with B's OWN K_local and request the upgrade.
+      const keyProvider = keyProviders.get(agentName);
+      if (!keyProvider) {
+        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "no_key_provider" });
+        return;
+      }
+      const ackTbs = UPGRADE_CBOR_ENC.encode([SEAL_UPGRADE_ACK_DOMAIN, sessionId, sealedRoot]);
+      const ackSig = new Uint8Array(await keyProvider.sign(ackTbs));
+      const returningPubkey = new Uint8Array(Buffer.from(agentPubkeyHex, "hex"));
+      const sent = await signaling.sendRaw({
+        type: "seal_upgrade_request",
+        session_id: sessionId,
+        returning_pubkey: returningPubkey,
+        ack_signature: ackSig,
+      });
+      if (!sent.ok) {
+        logger.warn("session.seal.upgrade.refused", { sessionId: sidHex, reason: "request_send_failed" });
+        return;
+      }
+      logger.info("session.seal.upgrade.requested", { sessionId: sidHex, agentName });
+      // The seal_upgrade_confirmed / _rejected response is handled by registerUnilateralUpgradeListener.
+    } catch (err: unknown) {
+      logger.warn("session.seal.upgrade.refused", {
+        sessionId: sidHex,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      // Clear the guard so a later reconnect can retry if the request never reached the directory;
+      // the directory dedups a repeat with already_bilateral.
+      sealUpgradeInFlight.delete(key);
+    }
+  }
+
+  /**
+   * DOD-UP-1: per-agent listener for the absent-party seal upgrade. On reconnect the directory
+   * delivers a queued seal_unilateral_notification to B (the absent party) — that triggers the
+   * ratification attempt. The directory's seal_upgrade_confirmed / seal_upgrade_rejected responses
+   * are observed here too (B marks the session bilaterally sealed / logs the refusal).
+   */
+  function registerUnilateralUpgradeListener(
+    signaling: SignalingManager,
+    agentName: string,
+    agentPubkeyHex: string,
+  ): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      const ftype = frame["type"];
+      if (ftype === "seal_upgrade_confirmed") {
+        const sidHex = frameValueToHex(frame["session_id"]);
+        if (!sidHex) return;
+        logger.info("session.seal.upgraded", { sessionId: sidHex, agentName, party: "returning" });
+        // The authoritative bilateral record is the directory's superseding row; locally mark sealed.
+        void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
+        return;
+      }
+      if (ftype === "seal_upgrade_rejected") {
+        const sidHex = frameValueToHex(frame["session_id"]);
+        if (!sidHex) return;
+        logger.warn("session.seal.upgrade.rejected", { sessionId: sidHex, agentName, reason: frame["reason"] });
+        return;
+      }
+      if (ftype !== "seal_unilateral_notification") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      if (!sidHex) return;
+      // Only the ABSENT party receives this frame — B reacts by attempting the ratification.
+      void attemptSealUpgrade(signaling, agentName, agentPubkeyHex, sidHex, frame);
     });
   }
 
