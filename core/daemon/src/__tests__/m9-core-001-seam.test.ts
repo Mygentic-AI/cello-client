@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway } from "@cello-protocol/gateway";
+import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -128,6 +128,8 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     signalingConnect: () => Promise<ConnectResult>;
     sessionNegotiator?: SessionNegotiator;
     gatewaySock?: string;
+    /** Inject a gateway client double directly (overrides gatewaySock) — for fault-injection tests. */
+    gatewayClient?: SecurityGatewayClient;
   }): Promise<{ h: Awaited<ReturnType<typeof startDaemon>>; events: LogEvent[] }> {
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
@@ -140,9 +142,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       sessionNodeFactory: new RealNodeFactory(),
       signalingConnect: opts.signalingConnect,
       sessionNegotiator: opts.sessionNegotiator,
-      ...(opts.gatewaySock
-        ? { securityGateway: new LocalSidecarGatewayClient({ socketPath: opts.gatewaySock, deadlineMs: 1_000 }) }
-        : {}),
+      ...(opts.gatewayClient
+        ? { securityGateway: opts.gatewayClient }
+        : opts.gatewaySock
+          ? { securityGateway: new LocalSidecarGatewayClient({ socketPath: opts.gatewaySock, deadlineMs: 1_000 }) }
+          : {}),
     };
     const h = await startDaemon(config);
     handles.push(h);
@@ -153,7 +157,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
    * Bring up a complete A→B session. Each side optionally gets a gateway sidecar (when its
    * `*Sock` is provided). Returns the live IPC clients + the agents + A's event log.
    */
-  async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string }): Promise<{
+  async function bringUpSession(opts: { aGatewaySock?: string; bGatewaySock?: string; aGatewayClient?: SecurityGatewayClient }): Promise<{
     clientA: Awaited<ReturnType<typeof connectToDaemon>>;
     clientB: Awaited<ReturnType<typeof connectToDaemon>>;
     alicePubkey: string;
@@ -199,6 +203,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       signalingConnect: makeInjectableSignaling({}),
       sessionNegotiator: negotiator,
       gatewaySock: opts.aGatewaySock,
+      ...(opts.aGatewayClient ? { gatewayClient: opts.aGatewayClient } : {}),
     });
 
     const clientB = await connectToDaemon(join(dirB, "daemon.sock"));
@@ -470,6 +475,28 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       expect(resend.reason).toBe("governance_warn"); // re-warned, not sent
       expect(String(resend.guidance)).toMatch(/autonomous_override is OFF/i);
       for (let i = 0; i < 80; i++) { // the peer receives NOTHING
+        const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        expect(recv.content == null).toBe(true);
+        await wait(25);
+      }
+    }, 40_000);
+
+    it("FEED-001 MED fail-closed: a redact verdict WITHOUT content → NOT sent (redact_without_content), never the original", async () => {
+      // Fault injection (code-review MED): if a gateway ever returns `redact` with no content, the daemon
+      // must NOT fall back to sending the original (pre-redaction) bytes — it must fail closed. A real
+      // gateway never does this; a double proves the daemon's defensive floor.
+      const b = await spawnGateway("gb");
+      const faultyA: SecurityGatewayClient = {
+        async screenOutbound(_c: Uint8Array, _ctx: ScreenContext): Promise<ScreenVerdict> {
+          return { disposition: "redact" }; // NO content — the dangerous case
+        },
+        async screenInbound(c: Uint8Array): Promise<ScreenVerdict> { return { disposition: "allow", content: c }; },
+      };
+      const { clientA, clientB } = await bringUpSession({ aGatewayClient: faultyA, bGatewaySock: b.sock });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "secret-draft must not leak" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(false);
+      expect(sent.reason).toBe("redact_without_content");
+      for (let i = 0; i < 60; i++) { // the original never reached B
         const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
         expect(recv.content == null).toBe(true);
         await wait(25);

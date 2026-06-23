@@ -3333,6 +3333,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
+    // FAIL-CLOSED (code-review MED): a `redact` verdict MUST carry the redacted content. If it ever
+    // arrives without it, sending the original `contentBytes` would leak the pre-redaction draft — the
+    // one place M9 could fail OPEN. Treat it as a block, never an allow-original. (Unreachable today:
+    // the gateway always includes content on redact; this is the defensive floor.)
+    if (outboundVerdict.disposition === "redact" && outboundVerdict.content === undefined) {
+      logger.error("security.verdict.redact_without_content", { sessionId, correlationId });
+      return {
+        ok: false,
+        reason: "redact_without_content",
+        guidance: "The security gateway returned a redact verdict without the redacted content. To avoid " +
+          "leaking the original, nothing was sent. This is a gateway fault — check the gateway logs and retry.",
+      };
+    }
+
     // allow or redact → send. On redact the ALTERED bytes are what go on the wire AND what the leaf
     // hash binds — the transcript records what was actually sent, not the pre-redaction draft.
     const modified = outboundVerdict.disposition === "redact" && outboundVerdict.content !== undefined;

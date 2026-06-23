@@ -123,7 +123,10 @@ export class OutboundScreener {
     //    (ctx.governanceDecisions present) the warn is RESOLVED here per the agent's per-flag decision,
     //    gated by autonomous_override (M9-FEED-001 §6 / SI-002). Stateless: flagIds are re-derived from
     //    the re-scanned content, so a decision only applies to the exact value it was computed for.
-    const pii = this.#pii.screen(content, ctx.sessionId);
+    //    Scan the WORKED text (after secrets/exfil), not the original (code-review LOW): so the flagId
+    //    basis matches the redaction target, and a value already redacted by secrets/exfil does not also
+    //    raise a PII warn whose redaction would be a no-op.
+    const pii = this.#pii.screen(TEXT_ENCODER.encode(workingText), ctx.sessionId);
     let piiTransformed = false;
     if (pii.events.length > 0) {
       const resolved = this.#resolvePII(pii.events, ctx.governanceDecisions);
