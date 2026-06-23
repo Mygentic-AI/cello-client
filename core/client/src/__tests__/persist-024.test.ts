@@ -851,7 +851,7 @@ describeWithSQLCipher("PERSIST-024 AC-013 — client.startup.state.loaded emitte
       connectionId: "c1", counterpartyPubkey: "cp1", establishedAt: Date.now(),
     });
 
-    const node = await createNode({});
+    const node = await createNode({ listenAddresses: [] });
     try {
       const kp = generateKeypair();
       const client = createClient(node, kp, {
@@ -1460,7 +1460,7 @@ describeWithSQLCipher("PERSIST-024 AC-008 — Pending hashes persisted and loade
     await persistence.persistPendingHash({ sessionId, hashHex: hash1, enqueuedAt: 1001 });
     await persistence.persistPendingHash({ sessionId, hashHex: hash2, enqueuedAt: 2002 });
 
-    const node = await createNode({});
+    const node = await createNode({ listenAddresses: [] });
     try {
       const kp = generateKeypair();
       const client = createClient(node, kp, { logger, persistence });
