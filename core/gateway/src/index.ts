@@ -20,7 +20,7 @@ export { OutboundScreener } from "./screen/outbound.js";
 export type { OutboundVerdict, OutboundScreenerOptions, OutboundScreenContext } from "./screen/outbound.js";
 export { InboundScreener } from "./screen/inbound.js";
 export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js";
-export { GATEWAY_UNAVAILABLE, failClosedVerdict } from "./types.js";
+export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 
 // Wire protocol (shared by the local sidecar; Phase 2's mTLS gateway reuses these shapes).

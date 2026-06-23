@@ -40,7 +40,7 @@ import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -3282,8 +3282,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       correlationId,
     });
     if (outboundVerdict.disposition === "block") {
-      const failClosed = outboundVerdict.reason === GATEWAY_UNAVAILABLE;
-      if (failClosed) {
+      if (outboundVerdict.reason === GOVERNANCE_TIMEOUT) {
+        logger.error("security.gateway.timeout", { sessionId, reason: outboundVerdict.reason, correlationId });
+      } else if (outboundVerdict.reason === GATEWAY_UNAVAILABLE) {
         logger.error("security.gateway.unavailable", { direction: "outbound", reason: outboundVerdict.reason, correlationId });
       } else {
         logger.info("security.verdict.returned", { disposition: "block", sessionId, reason: outboundVerdict.reason, correlationId });

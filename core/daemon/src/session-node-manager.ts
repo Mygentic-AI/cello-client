@@ -83,6 +83,7 @@ import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
 import {
   PassthroughGatewayClient,
   GATEWAY_UNAVAILABLE,
+  GOVERNANCE_TIMEOUT,
   type SecurityGatewayClient,
 } from "@cello-protocol/gateway";
 
@@ -2104,7 +2105,13 @@ export class SessionNodeManager {
       // content WILL keep arriving, so it must be ack'd-as-received (sender stops) and a leaf
       // recorded (tamper-evident proof the peer sent it), while still never reaching the agent
       // buffer. That terminal-vs-transient split lands with the first real block verdict.
-      if (inboundVerdict.reason === GATEWAY_UNAVAILABLE) {
+      if (inboundVerdict.reason === GOVERNANCE_TIMEOUT) {
+        this.#logger.error("security.gateway.timeout", {
+          sessionId,
+          reason: inboundVerdict.reason,
+          correlationId,
+        });
+      } else if (inboundVerdict.reason === GATEWAY_UNAVAILABLE) {
         this.#logger.error("security.gateway.unavailable", {
           direction: "inbound",
           reason: inboundVerdict.reason,

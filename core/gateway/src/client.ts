@@ -19,7 +19,7 @@ import {
   type WireScreenRequest,
   type WireScreenResponse,
 } from "./protocol.js";
-import { failClosedVerdict, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
+import { failClosedVerdict, GOVERNANCE_TIMEOUT, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
 import type { GatewayLogger } from "./server.js";
 
 const NOOP_LOGGER: GatewayLogger = { info() {}, warn() {}, error() {} };
@@ -108,7 +108,9 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
       const timer = setTimeout(() => {
         if (this.#pending.delete(id)) {
           this.#logger.warn("gateway.screen.timeout", { direction, deadlineMs: this.#deadlineMs });
-          resolve(failClosedVerdict(direction));
+          // Connected but no verdict within the deadline → governance_timeout (distinct from the
+          // unreachable case). A timeout is a verdict, not a hang (INV-6 / AC-005).
+          resolve(failClosedVerdict(direction, GOVERNANCE_TIMEOUT));
         }
       }, this.#deadlineMs);
       if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();

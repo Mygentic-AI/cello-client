@@ -148,7 +148,8 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     const v = await withTimeout(client.screenOutbound(new TextEncoder().encode("x"), ctx()), 2_000);
     const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
     expect(v.disposition).toBe("block");
-    expect(v.reason).toBe("gateway_unavailable");
+    // Connected but no verdict in time → governance_timeout (distinct from unreachable).
+    expect(v.reason).toBe("governance_timeout");
     // Settled near the deadline, not hung for the full 2s race ceiling.
     expect(elapsedMs).toBeLessThan(1_500);
   });

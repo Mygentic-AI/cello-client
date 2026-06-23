@@ -89,18 +89,27 @@ export interface SecurityGatewayClient {
 
 /** The reason code a fail-closed verdict carries when the gateway cannot be reached. */
 export const GATEWAY_UNAVAILABLE = "gateway_unavailable";
+/** The reason a fail-closed verdict carries when the gateway is reachable but the screening
+ *  deadline was exceeded — a timeout is a verdict, not a hang (INV-6 / FEED-001 AC-005). */
+export const GOVERNANCE_TIMEOUT = "governance_timeout";
 
-/** Build the fail-closed verdict (SI-001 / DB-001): never deliver/send ungated content. */
-export function failClosedVerdict(direction: ScreenDirection): ScreenVerdict {
+/**
+ * Build the fail-closed verdict (SI-001 / DB-001 / INV-6): never deliver/send ungated content, never
+ * hang. `reason` distinguishes "could not connect" (`gateway_unavailable`) from "connected but the
+ * screening deadline elapsed" (`governance_timeout`).
+ */
+export function failClosedVerdict(direction: ScreenDirection, reason: string = GATEWAY_UNAVAILABLE): ScreenVerdict {
+  const cause = reason === GOVERNANCE_TIMEOUT
+    ? "the security gateway did not return a verdict within the screening deadline"
+    : "the security gateway could not be reached";
   return {
     disposition: "block",
-    reason: GATEWAY_UNAVAILABLE,
+    reason,
     guidance:
       direction === "outbound"
-        ? "The security gateway could not be reached, so this message was NOT sent (fail-closed). " +
-          "Nothing left the machine. Check that the gateway sidecar is running, then retry."
-        : "The security gateway could not be reached, so inbound content was not delivered to the " +
-          "agent (fail-closed). It was left unacknowledged, so the sender redelivers it on a later " +
-          "attempt — and it will be screened then, once the gateway is reachable.",
+        ? `Fail-closed: ${cause}, so this message was NOT sent. Nothing left the machine. ` +
+          "Check that the gateway sidecar is running, then retry."
+        : `Fail-closed: ${cause}, so inbound content was not delivered to the agent. It was left ` +
+          "unacknowledged, so the sender redelivers it on a later attempt — screened once the gateway responds.",
   };
 }
