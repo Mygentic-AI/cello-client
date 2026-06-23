@@ -27,6 +27,8 @@ export { initLinearRegex, linearRegexEngine, LinearRegex } from "./detect/linear
 export { compileInjectionPatterns, scanInjectionPatterns, injectionPatternsReady } from "./detect/injection-patterns.js";
 export { compileSecretRules, redactSecrets, secretRulesReady } from "./detect/secrets.js";
 export type { SecretFinding, SecretScanResult } from "./detect/secrets.js";
+export { screenInboundLanguage } from "./detect/language.js";
+export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 
