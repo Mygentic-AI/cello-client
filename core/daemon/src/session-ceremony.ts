@@ -21,6 +21,7 @@
 import { decode } from "cbor-x";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
+import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { FrostThresholdSigner } from "@cello-protocol/crypto";
 import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { IThresholdSigner } from "@cello-protocol/crypto";
@@ -224,6 +225,55 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
       // → plain TBS (bindLegibilityToTbs is a no-op), matching the directory's unilateral TBS.
       const legibility = frame["legibility"];
       const legForHash = legibility && typeof legibility === "object" ? (legibility as LegibilityForHash) : null;
+
+      // DOD-LEG-2 (SI-002): the INITIATOR must not co-sign an inflated certificate — otherwise a
+      // validly-FROST-signed inflated cert would exist as a durable artifact. Re-derive each party's
+      // content_frontier_seq from the signed leaves the directory ships on seal_verified and ABORT
+      // the ceremony (no signature) if any published frontier is inflated. Same logic the receiver
+      // applies at session_sealed; doing it here means a lying directory gets NO signature at all.
+      const wireParts = legForHash && Array.isArray((legForHash as { participants?: unknown }).participants)
+        ? ((legForHash as { participants: Array<{ pubkey?: unknown; content_frontier_seq?: unknown }> }).participants)
+        : null;
+      if (wireParts) {
+        // Wire pubkeys are Uint8Array; normalise to hex for comparison with the re-derived map.
+        const parts = wireParts.map((p) => ({
+          pubkey: p.pubkey instanceof Uint8Array
+            ? Buffer.from(p.pubkey).toString("hex")
+            : (typeof p.pubkey === "string" ? p.pubkey : null),
+          content_frontier_seq: typeof p.content_frontier_seq === "number" ? p.content_frontier_seq : null,
+        }));
+        const malformed = parts.some((p) => p.pubkey === null || p.content_frontier_seq === null);
+        const anyClaimed = parts.some((p) => (p.content_frontier_seq ?? 0) > 0);
+        const flRaw = frame["frontier_leaves"];
+        const haveLeaves = Array.isArray(flRaw) && flRaw.length > 0;
+        if (malformed || (anyClaimed && !haveLeaves)) {
+          deps.logger.warn("session.seal.ceremony.abort", {
+            agentName: deps.agentName, sessionId: sidHex,
+            reason: malformed ? "frontier_participant_malformed" : "frontier_leaves_missing",
+          });
+          return;
+        }
+        if (haveLeaves) {
+          const toLeaf = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>));
+          const leaves: SealFrontierLeaf[] = (flRaw as unknown[]).map((l) => {
+            const o = l as Record<string, unknown>;
+            return { structure1_cbor: toLeaf(o["structure1_cbor"]), sender_pubkey: toLeaf(o["sender_pubkey"]), sender_signature: toLeaf(o["sender_signature"]) };
+          });
+          const rederived = reDeriveFrontiers(leaves, sessionId);
+          const inflated = rederived.ok
+            ? findInflatedFrontier(parts as Array<{ pubkey: string; content_frontier_seq: number }>, rederived.frontiers)
+            : null;
+          if (!rederived.ok || inflated) {
+            deps.logger.warn("session.seal.ceremony.abort", {
+              agentName: deps.agentName, sessionId: sidHex,
+              reason: rederived.ok ? "frontier_unverifiable" : rederived.reason,
+              ...(inflated ? { party: inflated.party, publishedFrontier: inflated.publishedFrontier, derivedFrontier: inflated.derivedFrontier } : {}),
+            });
+            return; // refuse to co-sign — the directory gets no signature for an inflated cert
+          }
+        }
+      }
+
       const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, timestamp), legForHash);
       let frostSignature: Uint8Array | null = null;
       try {
