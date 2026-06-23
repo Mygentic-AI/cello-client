@@ -56,10 +56,15 @@ async function main(): Promise<void> {
   // autonomous_override defaults OFF — the agent's only autonomous lever over a PII warn is `redact`;
   // allowing a value out is a human action (loosening the store requires confirmation).
   const autonomousOverride = cfg<boolean>("autonomous_override", process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1");
-  // OUT-004 per-agent outbound rate cap. Positive cap + window enables it; 0/absent → no cap.
+  // OUT-004 per-agent outbound rate cap. A positive cap enables it. NOTE: "no cap" is the LOOSEST state,
+  // not the tightest — so rate-limiting is OFF by default (the operator opts in to a cap). If a cap IS
+  // set but the window is missing/invalid, do NOT silently disable the cap (code-review M1) — fall back
+  // to a sane default window so a configured limit is never lost.
+  const DEFAULT_RATE_WINDOW_MS = 60_000;
   const rateMax = Number(cfg<number>("rate_max_per_window", Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"])));
-  const rateWindowMs = Number(cfg<number>("rate_window_ms", Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"])));
-  const rateLimit = Number.isFinite(rateMax) && rateMax > 0 && Number.isFinite(rateWindowMs) && rateWindowMs > 0
+  const rawWindow = Number(cfg<number>("rate_window_ms", Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"])));
+  const rateWindowMs = Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : DEFAULT_RATE_WINDOW_MS;
+  const rateLimit = Number.isFinite(rateMax) && rateMax > 0
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
     : undefined;
   const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });

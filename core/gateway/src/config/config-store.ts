@@ -66,10 +66,51 @@ const CLASSIFIERS: Record<string, Classifier> = {
     const p = looseness(prev), q = looseness(next);
     return q > p ? "loosen" : q < p ? "tighten" : "neutral";
   },
-  // The rate window pairs with the cap; a longer window over the same cap is looser (slower refill is
-  // tighter). Treat purely as neutral unless it changes — windowing nuance is not a guard on its own.
-  rate_window_ms: () => "neutral",
+  // The window pairs with the cap: a SHORTER window refills faster → strictly more throughput → looser
+  // (code-review H2 — shrinking the window must be gated like raising the cap). A longer window tightens.
+  rate_window_ms: (prev, next) => {
+    const p = Number(prev) || 0, q = Number(next) || 0;
+    return q < p ? "loosen" : q > p ? "tighten" : "neutral";
+  },
 };
+
+/**
+ * The TIGHTEST default for every guard (code-review B1). The §7 contract defines a baseline: each guard
+ * defaults to its most restrictive value, and LOOSENING from that default requires confirmation. The
+ * store ships empty, so the FIRST set of a key must be classified against THIS baseline — not treated as
+ * a free "neutral" — otherwise first-enabling autonomous_override (or seeding a whitelist) would be free,
+ * inverting the security model.
+ */
+const BASELINE: Record<string, unknown> = {
+  autonomous_override: false,      // the agent cannot self-authorize
+  pii_whitelist: [] as string[],   // nothing passes silently
+  language_allow: ["latin"],       // English only (the product default; allowing MORE languages loosens)
+  rate_max_per_window: 0,          // 0 = no cap is the loosest; SETTING a cap tightens (so it is free)
+  rate_window_ms: 60_000,          // a shorter window loosens; first-set of a shorter one is gated
+};
+
+/** Per-key value-type guard (code-review M2): a type-confused value must not silently disable a guard. */
+const VALIDATORS: Record<string, (v: unknown) => boolean> = {
+  autonomous_override: (v) => typeof v === "boolean",
+  pii_whitelist: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  language_allow: (v) => Array.isArray(v) && v.every((x) => typeof x === "string"),
+  rate_max_per_window: (v) => typeof v === "number" && Number.isFinite(v) && v >= 0,
+  rate_window_ms: (v) => typeof v === "number" && Number.isFinite(v) && v > 0,
+};
+
+/** The hash-chain fingerprint over a version's fields (incl. direction + confirmed, H1) + the prior fp. */
+function fingerprintOf(
+  key: string,
+  version: number,
+  valueJson: string,
+  direction: string,
+  confirmed: number,
+  prevFingerprint: string,
+): string {
+  return createHash("sha256")
+    .update(`${key}|${version}|${valueJson}|${direction}|${confirmed}|${prevFingerprint}`)
+    .digest("hex");
+}
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS config_versions (
@@ -91,18 +132,21 @@ export class GatewayConfigStore {
 
   constructor(dbPath: string) {
     this.#db = new DatabaseSync(dbPath);
+    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
     this.#db.exec(DDL);
   }
 
-  /** Set `key` to `value`. Loosening requires `opts.confirmed`; tightening/first-set/neutral is free. */
+  /** Set `key` to `value`. Loosening requires `opts.confirmed`; tightening/neutral is free. The FIRST
+   *  set of a key is classified against the per-key TIGHTEST baseline, not treated as free (B1). */
   set(key: string, value: unknown, opts: { confirmed?: boolean } = {}): SetResult {
     const classify = CLASSIFIERS[key];
     if (!classify) throw new Error(`unknown config key: ${key}`);
+    if (!VALIDATORS[key](value)) throw new Error(`invalid value for config key '${key}': ${JSON.stringify(value)}`);
 
     const latest = this.#latestRow(key);
-    const prevValue = latest ? (JSON.parse(latest.value_json) as unknown) : undefined;
-    // The first value for a key is neutral (there is no prior guard to loosen). After that, classify.
-    const direction: ConfigDirection = latest ? classify(prevValue, value) : "neutral";
+    // First set → compare against the tightest BASELINE so initial loosening is gated like any other (B1).
+    const prevValue = latest ? (JSON.parse(latest.value_json) as unknown) : BASELINE[key];
+    const direction: ConfigDirection = classify(prevValue, value);
 
     if (direction === "loosen" && !opts.confirmed) {
       return { ok: false, reason: "needs_confirmation", direction: "loosen" };
@@ -110,18 +154,29 @@ export class GatewayConfigStore {
 
     const version = (latest?.version ?? 0) + 1;
     const valueJson = JSON.stringify(value);
+    const confirmed = opts.confirmed ? 1 : 0;
     const prevFingerprint = latest?.fingerprint ?? "";
-    const fingerprint = createHash("sha256")
-      .update(`${key}|${version}|${valueJson}|${prevFingerprint}`)
-      .digest("hex");
+    // The fingerprint binds direction + confirmed too (code-review H1): the whole point of attesting the
+    // chain is to prove a loosening WAS confirmed by a human — so those fields must be inside the hash, or
+    // an editor could flip confirmed 0→1 / relabel a loosen as neutral and still pass verifyChain.
+    const fingerprint = fingerprintOf(key, version, valueJson, direction, confirmed, prevFingerprint);
 
-    this.#db
-      .prepare(
-        `INSERT INTO config_versions
-           (key, version, value_json, direction, confirmed, fingerprint, prev_fingerprint, changed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(key, version, valueJson, direction, opts.confirmed ? 1 : 0, fingerprint, prevFingerprint, Date.now());
+    // Read-modify-write as one transaction so two processes on the same file cannot both write the same
+    // version and collide on the PRIMARY KEY (code-review L1).
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#db
+        .prepare(
+          `INSERT INTO config_versions
+             (key, version, value_json, direction, confirmed, fingerprint, prev_fingerprint, changed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(key, version, valueJson, direction, confirmed, fingerprint, prevFingerprint, Date.now());
+      this.#db.exec("COMMIT");
+    } catch (err) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
 
     return { ok: true, version, direction, fingerprint };
   }
@@ -146,17 +201,21 @@ export class GatewayConfigStore {
     }));
   }
 
-  /** Recompute the hash chain for `key` and confirm every stored fingerprint matches (tamper check). */
+  /**
+   * Recompute the hash chain for `key` and confirm every stored fingerprint + prev-link matches
+   * (catches an edited value, a flipped `confirmed`, a relabelled `direction`, a deleted/reordered row).
+   * NOT resistant to a full consistent rewrite or tail truncation by an actor with DB write access +
+   * the (unkeyed) hash — that needs the Phase-2 attested head on the directory (M9-ATTEST-001); this is
+   * the local half (code-review M3, recorded).
+   */
   verifyChain(key: string): boolean {
     const rows = this.#db
-      .prepare(`SELECT version, value_json, fingerprint, prev_fingerprint FROM config_versions WHERE key = ? ORDER BY version ASC`)
-      .all(key) as Array<{ version: number; value_json: string; fingerprint: string; prev_fingerprint: string }>;
+      .prepare(`SELECT version, value_json, direction, confirmed, fingerprint, prev_fingerprint FROM config_versions WHERE key = ? ORDER BY version ASC`)
+      .all(key) as Array<{ version: number; value_json: string; direction: string; confirmed: number; fingerprint: string; prev_fingerprint: string }>;
     let prevFingerprint = "";
     for (const r of rows) {
       if (r.prev_fingerprint !== prevFingerprint) return false;
-      const expected = createHash("sha256")
-        .update(`${key}|${r.version}|${r.value_json}|${prevFingerprint}`)
-        .digest("hex");
+      const expected = fingerprintOf(key, r.version, r.value_json, r.direction, r.confirmed, prevFingerprint);
       if (expected !== r.fingerprint) return false;
       prevFingerprint = r.fingerprint;
     }

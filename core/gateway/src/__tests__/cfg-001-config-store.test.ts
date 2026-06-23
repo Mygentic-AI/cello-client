@@ -62,7 +62,8 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
   });
 
   it("PII whitelist: ADD a value is loosen (needs confirm); REMOVE is tighten (free)", () => {
-    store.set("pii_whitelist", ["a@x.example"]); // v1
+    // First set of a non-empty whitelist is itself a loosen from the [] baseline → needs confirmation (B1).
+    store.set("pii_whitelist", ["a@x.example"], { confirmed: true }); // v1 (loosen, confirmed)
     const add = store.set("pii_whitelist", ["a@x.example", "b@y.example"]); // loosen
     expect(add.ok).toBe(false);
     expect(!add.ok && add.direction).toBe("loosen");
@@ -109,7 +110,7 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
   });
 
   it("verifyChain CATCHES tampering: editing a stored value directly in the DB breaks the chain", () => {
-    store.set("pii_whitelist", ["a@x.example"]); // v1
+    store.set("pii_whitelist", ["a@x.example"], { confirmed: true }); // v1 (loosen from [] baseline)
     store.set("pii_whitelist", [] as string[]); // v2 (tighten — free)
     expect(store.verifyChain("pii_whitelist")).toBe(true);
     store.close();
@@ -137,11 +138,56 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     reopened.close();
   });
 
-  it("first-set of the LOOSEST value is still free (no prior guard exists to loosen)", () => {
+  it("B1: first-set of the LOOSEST value is GATED — classified against the tightest baseline, needs confirm", () => {
+    // The store ships empty; without the baseline, first-enabling autonomous_override would be free. It is
+    // a loosen from the tightest default (false) and must require confirmation.
     const r = store.set("autonomous_override", true); // first set, loosest value, NO confirmation
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.direction).toBe("loosen");
+    expect(store.get("autonomous_override")).toBeUndefined(); // nothing was written
+    // With confirmation it applies.
+    expect(store.set("autonomous_override", true, { confirmed: true }).ok).toBe(true);
+  });
+
+  it("B1: first-set of the TIGHTEST value is free (matches the baseline → neutral)", () => {
+    const r = store.set("autonomous_override", false); // baseline value, no confirm
     expect(r.ok).toBe(true);
     expect(r.ok && r.direction).toBe("neutral");
-    expect(store.get("autonomous_override")).toBe(true);
+  });
+
+  it("B1: first-set of a rate CAP is a tighten (free) — a cap is stricter than the no-cap baseline", () => {
+    const r = store.set("rate_max_per_window", 5); // 0(no cap) → 5 = tighten
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.direction).toBe("tighten");
+  });
+
+  it("H1: flipping `confirmed` directly in the DB breaks the chain (the governance bit is hashed)", () => {
+    store.set("autonomous_override", false); // v1
+    store.set("autonomous_override", true, { confirmed: true }); // v2 loosen, confirmed=1
+    expect(store.verifyChain("autonomous_override")).toBe(true);
+    store.close();
+    const raw = new DatabaseSync(join(dir, "config.db"));
+    raw.prepare(`UPDATE config_versions SET confirmed = 0 WHERE key = 'autonomous_override' AND version = 2`).run();
+    raw.close();
+    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    expect(reopened.verifyChain("autonomous_override")).toBe(false); // a forged "unconfirmed" loosen is caught
+    reopened.close();
+  });
+
+  it("H2: SHRINKING the rate window is a loosen (faster refill = more throughput) — needs confirm", () => {
+    store.set("rate_window_ms", 60_000); // v1 (baseline → neutral, free)
+    const shrink = store.set("rate_window_ms", 30_000); // shorter = loosen
+    expect(shrink.ok).toBe(false);
+    expect(!shrink.ok && shrink.direction).toBe("loosen");
+    const grow = store.set("rate_window_ms", 120_000); // longer = tighten, free
+    expect(grow.ok).toBe(true);
+    expect(grow.ok && grow.direction).toBe("tighten");
+  });
+
+  it("M2: a type-confused value is rejected (cannot silently disable a guard)", () => {
+    expect(() => store.set("rate_max_per_window", "off" as unknown as number)).toThrow(/invalid value/i);
+    expect(() => store.set("autonomous_override", "false" as unknown as boolean)).toThrow(/invalid value/i);
+    expect(() => store.set("pii_whitelist", "a@x.example" as unknown as string[])).toThrow(/invalid value/i);
   });
 
   it("the store SURVIVES reopen (persisted to the gateway's own DB file)", () => {

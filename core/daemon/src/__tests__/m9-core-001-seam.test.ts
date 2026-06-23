@@ -486,7 +486,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       const cstore = new GatewayConfigStore(cfgDb);
       const r = cstore.set("pii_whitelist", ["owner@self.example"], { confirmed: true });
       expect(r.ok).toBe(true);
-      expect(r.ok && r.direction).toBe("neutral"); // first value for the key
+      expect(r.ok && r.direction).toBe("loosen"); // adding to the [] baseline is a loosen — confirmed here
       cstore.close();
 
       const a = await spawnGateway("ga", { CELLO_GATEWAY_CONFIG_DB: cfgDb });
