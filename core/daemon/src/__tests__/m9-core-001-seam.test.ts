@@ -478,24 +478,45 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
     }, 40_000);
 
-    it("REC-001: the live gateway records EVERY screened message (clean + redacted) in a hash-chained log", async () => {
-      const recDb = join(tempDir, "gw-records.db");
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_RECORD_DB: recDb });
-      const b = await spawnGateway("gb");
-      const { clientA } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+    it("REC-001: BOTH gateways record every screened message (outbound clean+redact on A, inbound clean on B), hash-chained", async () => {
+      const recDbA = join(tempDir, "gw-records-a.db");
+      const recDbB = join(tempDir, "gw-records-b.db");
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_RECORD_DB: recDbA });
+      const b = await spawnGateway("gb", { CELLO_GATEWAY_RECORD_DB: recDbB });
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       // A clean send (recorded as clean — a clean pass IS recorded) and a secret send (recorded redact).
       expect(((await clientA.send("cello_send", { session_id: SID_HEX, content: "all clean here, talk soon" })) as Record<string, unknown>).ok).toBe(true);
       expect(((await clientA.send("cello_send", { session_id: SID_HEX, content: "deploy aws_key=AKIAABCDEFGHIJKLMNOP" })) as Record<string, unknown>).ok).toBe(true);
-      // Stop A's gateway so its record store flushes + closes, then read the tamper-evident log.
+      // Drain on B so its gateway has SCREENED the inbound content (the inbound producer) before we read.
+      for (let i = 0; i < 160; i++) {
+        const recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+
+      // Stop both gateways so their record stores flush + close, then read the tamper-evident logs.
       await a.gw.stop();
-      const store = new GatewayRecordStore(recDb);
-      const all = store.all();
-      const dispositions = all.filter((r) => r.direction === "outbound").map((r) => r.disposition);
-      expect(dispositions).toContain("clean"); // the clean pass was recorded, not just the redaction
-      expect(dispositions).toContain("redact");
-      expect(store.verifyChain()).toBe(true); // the local record chain is intact
-      expect(all.every((r) => r.fingerprint.length === 64)).toBe(true);
-      store.close();
+      await b.gw.stop();
+
+      const storeA = new GatewayRecordStore(recDbA);
+      const aRecords = storeA.all().filter((r) => r.direction === "outbound");
+      const aOut = aRecords.map((r) => r.disposition);
+      expect(aOut).toContain("clean"); // the clean pass was recorded, not just the redaction
+      expect(aOut).toContain("redact");
+      expect(storeA.verifyChain()).toBe(true);
+      expect(storeA.all().every((r) => r.fingerprint.length === 64)).toBe(true);
+      // INV-7 (code-review HIGH): the real flow correlationId is bound into each record, not "".
+      expect(aRecords.every((r) => typeof r.correlationId === "string" && r.correlationId!.length > 0)).toBe(true);
+      storeA.close();
+
+      // INBOUND producer (finding 2): B's gateway recorded the inbound screen — deleting the inbound
+      // recording wiring would leave B's log with no inbound record and fail this.
+      const storeB = new GatewayRecordStore(recDbB);
+      const bIn = storeB.all().filter((r) => r.direction === "inbound");
+      expect(bIn.length).toBeGreaterThanOrEqual(1);
+      expect(bIn.map((r) => r.disposition)).toContain("clean");
+      expect(storeB.verifyChain()).toBe(true);
+      storeB.close();
     }, 40_000);
 
     it("CFG-001: the live gateway sources its PII whitelist from the versioned config STORE (not just env)", async () => {

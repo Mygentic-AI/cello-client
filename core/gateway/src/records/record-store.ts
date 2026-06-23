@@ -3,9 +3,14 @@
  *
  * The gateway records what it did to EVERY message it screens — clean / redacted / blocked / warned —
  * in its own local DB (node:sqlite, the gateway's file, INV-4). Each record is hash-chained to the
- * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so an edited,
- * deleted, reordered, or suppressed record breaks the chain and `verifyChain()` returns false. A CLEAN
- * pass is recorded too: an ABSENT record for a delivered message is itself evidence of suppression.
+ * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so a NAIVELY
+ * edited, deleted (mid-chain), or reordered record breaks the chain and `verifyChain()` returns false.
+ * A CLEAN pass is recorded too: an ABSENT record for a delivered message is itself evidence of suppression.
+ *
+ * Local limit (the chain is an UNKEYED sha256): an actor with DB write access can still TAIL-TRUNCATE the
+ * most recent records or rewrite the WHOLE chain consistently and pass `verifyChain()`. Detecting that
+ * needs the Phase-2 attested head anchored on the directory (M9-ATTEST-001) — this store is the local
+ * half; the fingerprint computed here is exactly what that head attests.
  *
  * This is the cheap, local half of #5 (tamper-proof records). Sending each fingerprint to the directory
  * for cross-node tamper detection is Phase-2 (M9-ATTEST-001); the fingerprint computed here is exactly

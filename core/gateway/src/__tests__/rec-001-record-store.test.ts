@@ -118,6 +118,17 @@ describe("M9-REC-001 GatewayRecordStore — every message recorded, hash-chained
     reopened.close();
   });
 
+  it("verifyChain CATCHES a rewritten reason (the WHY is bound too)", () => {
+    store.record({ direction: "outbound", disposition: "block", contentHash: HASH_A, reason: "injection" });
+    store.close();
+    const raw = new DatabaseSync(join(dir, "records.db"));
+    raw.prepare(`UPDATE security_records SET reason = 'benign' WHERE seq = 1`).run(); // rewrite why it blocked
+    raw.close();
+    const reopened = new GatewayRecordStore(join(dir, "records.db"));
+    expect(reopened.verifyChain()).toBe(false);
+    reopened.close();
+  });
+
   it("the record log SURVIVES reopen (persisted to the gateway's own DB file)", () => {
     store.record({ direction: "outbound", disposition: "clean", contentHash: HASH_A });
     store.record({ direction: "inbound", disposition: "block", contentHash: HASH_B, reason: "lang" });
