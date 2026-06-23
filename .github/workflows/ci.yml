@@ -52,7 +52,7 @@ jobs:
       # Tarball check 1: no server files leaked across all five publishable packages.
       - name: Tarball check — no server files leaked
         run: |
-          for pkg in core/protocol-types core/crypto core/transport core/client core/adapter-claude-code; do
+          for pkg in core/protocol-types core/crypto core/transport core/client core/daemon core/cli core/adapter-claude-code; do
             echo "--- Checking $pkg ---"
             OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
             echo "$OUTPUT"
@@ -250,6 +250,8 @@ jobs:
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -257,7 +259,7 @@ jobs:
       - name: Verify all published versions match local
         run: |
           FAILED=0
-          for pkg in protocol-types crypto transport client; do
+          for pkg in protocol-types crypto transport client daemon cli; do
             local_ver=$(node -p "require('./core/$pkg/package.json').version")
             npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
             if [ "$local_ver" != "$npm_ver" ]; then
@@ -455,6 +457,8 @@ jobs:
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -462,7 +466,7 @@ jobs:
       - name: Verify all published versions match local
         run: |
           FAILED=0
-          for pkg in protocol-types crypto transport client; do
+          for pkg in protocol-types crypto transport client daemon cli; do
             local_ver=$(node -p "require('./core/$pkg/package.json').version")
             npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
             if [ "$local_ver" != "$npm_ver" ]; then
