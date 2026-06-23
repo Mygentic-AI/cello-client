@@ -830,7 +830,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
-  const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
+  const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger, sessionNodeManager.getTranscriptCipher());
   retryQueue.loadFromDb();
 
   // CELLO-M7-MSG-001 (AC-001/AC-003/AC-019): wire the awaiting-ACK lifecycle's durable
@@ -1963,8 +1963,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!connState || !connState.currentAgent) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const messages = sessionNodeManager.readTranscript(connState.currentAgent, sessionId);
-    return { ok: true, session_id: sessionId, messages };
+    const { messages, undecryptable } = sessionNodeManager.readTranscript(connState.currentAgent, sessionId);
+    // undecryptable > 0 means some rows failed GCM auth (tamper / wrong key) — surfaced, not hidden,
+    // so the reader can tell a real gap from an empty transcript.
+    return { ok: true, session_id: sessionId, messages, undecryptable };
   });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)

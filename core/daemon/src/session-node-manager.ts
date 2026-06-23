@@ -536,6 +536,17 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-LOG-1: the at-rest cipher, shared with the RetryQueue so its content_blob is encrypted with
+   * the SAME key as the transcript. Available after initialize().
+   */
+  getTranscriptCipher(): TranscriptCipher {
+    if (!this.#transcriptCipher) {
+      throw new Error("SessionNodeManager not initialized — call initialize() first");
+    }
+    return this.#transcriptCipher;
+  }
+
+  /**
    * DOD-LOG-1: append one readable message to the durable, encrypted-at-rest transcript, keyed by
    * the canonical leaf `sequence` so it joins to the committed hash chain. Idempotent on replay
    * (INSERT OR IGNORE — the same (session, sequence, direction) is written at most once). Never
@@ -576,29 +587,34 @@ export class SessionNodeManager {
   readTranscript(
     agentName: string,
     sessionId: string,
-  ): Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> {
-    if (!this.#db || !this.#transcriptCipher) return [];
+  ): { messages: Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }>; undecryptable: number } {
+    if (!this.#db || !this.#transcriptCipher) return { messages: [], undecryptable: 0 };
     const rows = this.#db
       .prepare(
         `SELECT sequence, direction, blob, created_at FROM transcript
          WHERE agent_name = ? AND session_id = ? ORDER BY sequence ASC, direction ASC`,
       )
       .all(agentName, sessionId) as Array<{ sequence: number; direction: string; blob: Uint8Array; created_at: number }>;
-    const out: Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> = [];
+    const messages: Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> = [];
+    let undecryptable = 0;
     for (const r of rows) {
       const pt = this.#transcriptCipher.decrypt(r.blob instanceof Uint8Array ? r.blob : new Uint8Array(r.blob));
       if (pt === null) {
+        // A row that fails GCM auth (tamper / wrong key) is REPORTED to the reader, not silently
+        // dropped — a gap in the transcript must be visible, not invisible (the reader needs to
+        // distinguish "never existed" from "tampered/unreadable").
+        undecryptable += 1;
         this.#logger.warn("transcript.message.decrypt.failed", { sessionId, agentName, sequence: r.sequence, direction: r.direction });
         continue;
       }
-      out.push({
+      messages.push({
         sequence: r.sequence,
         direction: r.direction === "sent" ? "sent" : "received",
         text: new TextDecoder().decode(pt),
         createdAt: r.created_at,
       });
     }
-    return out;
+    return { messages, undecryptable };
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */

@@ -54,6 +54,7 @@
 
 import type { DatabaseSync } from "node:sqlite";
 import type { Logger } from "./types.js";
+import type { TranscriptCipher } from "./transcript-cipher.js";
 
 /** Cap per outline.md Resource Caps. */
 export const RETRY_QUEUE_CAP = 1000;
@@ -96,6 +97,10 @@ export type ParkFn = (entry: AwaitingContentEntry) => Promise<ParkResult>;
 export class RetryQueue {
   readonly #db: DatabaseSync;
   readonly #logger: Logger;
+  // DOD-LOG-1: when provided, content_blob is AES-256-GCM encrypted at rest with the SAME key as
+  // the transcript — closing the gap where queued message plaintext sat in cleartext in the DB.
+  // Optional for backward-compat with direct-construction tests (they store plaintext, as before).
+  readonly #cipher: TranscriptCipher | undefined;
   /** Per-session FIFO arrays of DIRECT-resend entries, ordered by position ascending. */
   #queues = new Map<string, RetryQueueEntry[]>();
   /** Per-session position counter for monotonic increment. */
@@ -103,9 +108,10 @@ export class RetryQueue {
   /** CELLO-M7-MSG-001: per-session FIFO arrays of awaiting-ACK content (park target). */
   #awaiting = new Map<string, AwaitingContentEntry[]>();
 
-  constructor(db: DatabaseSync, logger: Logger) {
+  constructor(db: DatabaseSync, logger: Logger, cipher?: TranscriptCipher) {
     this.#db = db;
     this.#logger = logger;
+    this.#cipher = cipher;
 
     // Create table + index if not exists (inline migration — not Flyway)
     this.#db.exec(`
@@ -183,7 +189,7 @@ export class RetryQueue {
           agentName,
           sessionId: row.session_id,
           contentHashHex: row.content_hash_hex ?? row.nonce_hex,
-          contentBlob: Uint8Array.from(row.content_blob),
+          contentBlob: this.#openBlob(Uint8Array.from(row.content_blob)),
           queuedAt: row.queued_at,
           position: row.position,
         };
@@ -197,7 +203,7 @@ export class RetryQueue {
       const entry: RetryQueueEntry = {
         sessionId: row.session_id,
         nonceHex: row.nonce_hex,
-        contentBlob: Uint8Array.from(row.content_blob),
+        contentBlob: this.#openBlob(Uint8Array.from(row.content_blob)),
         queuedAt: row.queued_at,
         attempts: row.attempts,
         position: row.position,
@@ -216,6 +222,21 @@ export class RetryQueue {
    * Enqueue a failed message for later retry.
    * Evicts the oldest entry if cap is reached.
    */
+  /** DOD-LOG-1: encrypt the content blob at rest when a cipher is configured (else passthrough). */
+  #sealBlob(b: Uint8Array): Uint8Array {
+    return this.#cipher ? this.#cipher.encrypt(b) : b;
+  }
+
+  /**
+   * DOD-LOG-1: decrypt a stored content blob. If no cipher is configured, or the blob is a legacy
+   * PLAINTEXT row written before at-rest encryption (decrypt returns null), fall back to the raw
+   * bytes — so an upgrade reads old rows without crashing while new rows are encrypted.
+   */
+  #openBlob(b: Uint8Array): Uint8Array {
+    if (!this.#cipher) return b;
+    return this.#cipher.decrypt(b) ?? b;
+  }
+
   enqueue(sessionId: string, nonce: Uint8Array, contentBlob: Uint8Array): void {
     const nonceHex = Buffer.from(nonce).toString("hex");
 
@@ -272,7 +293,7 @@ export class RetryQueue {
           `INSERT INTO retry_queue (session_id, nonce_hex, content_blob, queued_at, attempts, position)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(sessionId, nonceHex, Buffer.from(contentBlob), queuedAt, 1, nextPosition);
+        .run(sessionId, nonceHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, nextPosition);
     } catch (err: unknown) {
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
@@ -409,7 +430,7 @@ export class RetryQueue {
           `INSERT INTO retry_queue (session_id, agent_name, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex)
            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         )
-        .run(sessionId, agentName, contentHashHex, Buffer.from(contentBlob), queuedAt, 1, position, contentHashHex);
+        .run(sessionId, agentName, contentHashHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, position, contentHashHex);
     } catch (err: unknown) {
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
