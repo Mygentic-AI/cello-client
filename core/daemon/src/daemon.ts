@@ -3269,58 +3269,60 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
-    const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
 
-    // M9-CORE-001: the outbound screening seam (INV-5/SI-001). Screen BEFORE sendContent — before
-    // anything reaches the wire. A non-allow verdict means nothing is transmitted: the handler
-    // returns the verdict's reason + guidance and the session stays usable. A configured-but-
-    // unreachable gateway fails closed (gateway_unavailable), so a screening outage can never let
-    // an unscreened message leave the machine. (redact/warn handling is M9-FEED-001; this story
-    // acts on allow vs. not-allow only.)
+    // M9 outbound screening seam (INV-5/SI-001). Screen BEFORE anything reaches the wire. The
+    // gateway verdict drives the four cello_send outcomes (M9-FEED-001): block / warn → NOT sent;
+    // allow → sent as-is; redact → sent in ALTERED form. A configured-but-unreachable gateway fails
+    // closed (block, gateway_unavailable), so a screening outage can never let content out ungated.
     const outboundVerdict = await securityGateway.screenOutbound(contentBytes, {
       direction: "outbound",
       agentName: record.agent_name,
       sessionId,
       correlationId,
     });
-    if (outboundVerdict.disposition !== "allow") {
-      // M9-CORE-001 scope: the only outbound non-allow today is a fail-closed block from an
-      // unreachable gateway. Emit the story's named event for that case; a real detector block /
-      // redact / warn (M9-OUT-* / M9-FEED-001) gets its own handling and events.
-      if (outboundVerdict.reason === GATEWAY_UNAVAILABLE) {
-        logger.error("security.gateway.unavailable", {
-          direction: "outbound",
-          reason: outboundVerdict.reason,
-          correlationId,
-        });
+    if (outboundVerdict.disposition === "block") {
+      const failClosed = outboundVerdict.reason === GATEWAY_UNAVAILABLE;
+      if (failClosed) {
+        logger.error("security.gateway.unavailable", { direction: "outbound", reason: outboundVerdict.reason, correlationId });
       } else {
-        logger.warn("security.gateway.outbound.blocked", {
-          sessionId,
-          recipientPubkey,
-          disposition: outboundVerdict.disposition,
-          reason: outboundVerdict.reason,
-          correlationId,
-        });
+        logger.info("security.verdict.returned", { disposition: "block", sessionId, reason: outboundVerdict.reason, correlationId });
       }
       return {
         ok: false,
-        reason: outboundVerdict.reason ?? "outbound_screen_blocked",
-        guidance:
-          outboundVerdict.guidance ??
-          "The security gateway did not allow this message to be sent. Nothing was sent and the session is still active.",
+        reason: outboundVerdict.reason ?? "blocked_by_governance",
+        guidance: outboundVerdict.guidance ??
+          "This message was blocked by the security gateway and was NOT sent. The session is still active.",
+        blocks: (outboundVerdict.events ?? []).filter((e) => e.disposition === "block"),
+      };
+    }
+    if (outboundVerdict.disposition === "warn") {
+      logger.info("security.verdict.returned", { disposition: "warn", sessionId, correlationId });
+      return {
+        ok: false,
+        reason: "governance_warn",
+        guidance: outboundVerdict.guidance ??
+          "This message was held for a governance decision and was NOT sent. Re-send the same content with a " +
+          "governance_decisions map ({flagId: redact | allow_once | allow_always}) to resolve each flagged item.",
+        flags: (outboundVerdict.events ?? []).filter((e) => e.disposition === "warn"),
       };
     }
 
-    const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
+    // allow or redact → send. On redact the ALTERED bytes are what go on the wire AND what the leaf
+    // hash binds — the transcript records what was actually sent, not the pre-redaction draft.
+    const modified = outboundVerdict.disposition === "redact" && outboundVerdict.content !== undefined;
+    const sendBytes = modified ? new Uint8Array(outboundVerdict.content as Uint8Array) : contentBytes;
+    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(sendBytes).digest();
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+
+    const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
       // surface a named, diagnosable failure.
       const nonce = randomUUID();
       try {
-        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), contentBytes);
+        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
       } catch (err: unknown) {
         logger.error("session.content.queue.failed", {
           sessionId,
@@ -3352,7 +3354,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       correlationId,
     });
     void newRootHex;
-    return { ok: true, sequence_number: leafIndex };
+    if (modified) {
+      logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
+    }
+    return {
+      ok: true,
+      sequence_number: leafIndex,
+      delivered: true,
+      modified,
+      // On a redact, tell the agent exactly what was transformed (the §6 sender-side surface).
+      ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+    };
   });
 
   // ─── CELLO-M7-DAEMON-004: cello_receive (returns from the daemon's own buffer) ──

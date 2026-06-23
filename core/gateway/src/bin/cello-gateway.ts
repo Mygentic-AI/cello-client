@@ -12,6 +12,9 @@
  */
 import { createGatewayServer } from "../server.js";
 import { GATEWAY_READY_TOKEN } from "../spawn.js";
+import { OutboundScreener } from "../screen/outbound.js";
+import { InboundScreener } from "../screen/inbound.js";
+import type { ScreenVerdict } from "../types.js";
 
 async function main(): Promise<void> {
   const socketPath = process.env["CELLO_GATEWAY_SOCKET"];
@@ -22,10 +25,24 @@ async function main(): Promise<void> {
   }
   const requestLogPath = process.env["CELLO_GATEWAY_REQUEST_LOG"];
 
+  // The real screen compositions. Config (PII whitelist, rate limit) is M9-CFG-001; defaults here
+  // (no whitelist, no rate cap) until that lands. Secret detection (M9-OUT-001) slots into the
+  // outbound screener once its RE2/gitleaks binding is chosen.
+  const piiWhitelist = (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const outbound = new OutboundScreener({ piiWhitelist });
+  const inbound = new InboundScreener();
+
   const handle = await createGatewayServer({
     socketPath,
     ...(requestLogPath ? { requestLogPath } : {}),
-    // M9-CORE-001: pass-through. Detection pipeline (M9-IN-* / M9-OUT-*) is injected here later.
+    screen: (req): ScreenVerdict => {
+      if (req.direction === "outbound") {
+        const v = outbound.screen(req.content, { agentName: req.agentName, sessionId: req.sessionId });
+        return { disposition: v.disposition, content: v.content, events: v.events };
+      }
+      const v = inbound.screen(req.content);
+      return { disposition: v.disposition, content: v.content, events: v.events };
+    },
   });
 
   // Signal readiness to the parent (spawnGatewaySidecar waits for this).
