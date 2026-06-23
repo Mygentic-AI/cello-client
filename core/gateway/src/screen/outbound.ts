@@ -14,6 +14,7 @@
 import { OutboundRateLimiter, type RateLimitConfig } from "../detect/rate-limit.js";
 import { OutboundPIIScreener } from "../detect/pii.js";
 import { screenOutboundExfil } from "../detect/exfil.js";
+import { redactSecrets } from "../detect/secrets.js";
 import type { GovernanceEvent } from "../types.js";
 
 export type { GovernanceEvent };
@@ -80,8 +81,18 @@ export class OutboundScreener {
 
     const events: GovernanceEvent[] = [];
 
-    // 2. Exfiltration — an injection artifact in output is a hard block (short-circuit).
-    const ex = screenOutboundExfil(content);
+    // 2. Secrets (M9-OUT-001) — redact-by-default, and FIRST: a known credential gets its TYPED
+    //    placeholder ([REDACTED:<rule>]) before exfil's generic high-entropy redactor would mask it
+    //    as an opaque blob, so the agent is told WHAT leaked.
+    let workingText = TEXT_DECODER.decode(content);
+    const sec = redactSecrets(workingText);
+    workingText = sec.text;
+    for (const f of sec.findings) {
+      events.push({ stage: "secrets", disposition: "redact", category: `secret:${f.ruleId}`, reason: "a credential was redacted before send" });
+    }
+
+    // 3. Exfiltration — on the secrets-redacted text. An injection artifact in output is a hard block.
+    const ex = screenOutboundExfil(TEXT_ENCODER.encode(workingText));
     if (ex.disposition === "block") {
       // No distinct top-level reason → the daemon uses the §6 standard `blocked_by_governance`; the
       // specific cause (injection artifact) rides in blocks[].category. (Only rate-limit overrides the
@@ -96,18 +107,18 @@ export class OutboundScreener {
     for (const e of ex.events) {
       events.push({ stage: "exfil", disposition: "redact", category: e.category, reason: e.reason });
     }
+    workingText = ex.text;
 
-    // 3. PII — non-whitelisted values warn (need a governance decision before send).
+    // 4. PII — non-whitelisted values warn (need a governance decision before send).
     const pii = this.#pii.screen(content, ctx.sessionId);
     for (const e of pii.events) {
       events.push({ stage: "pii", disposition: "warn", category: e.category, reason: `personal data (${e.category})`, flagId: e.flagId });
     }
 
-    // (Secrets — M9-OUT-001 — slot in here as a redact stage once the RE2/gitleaks binding lands.)
-
-    // Exfil is the only content transform; deliver its text iff it changed anything (L6 — block
-    // sources already short-circuited, so only warn / redact / allow remain).
-    const outContent = ex.events.length === 0 ? content : TEXT_ENCODER.encode(ex.text);
+    // Secrets + exfil are the content transforms; deliver the worked text iff anything changed (L6 —
+    // block sources already short-circuited, so only warn / redact / allow remain).
+    const transformed = sec.findings.length > 0 || ex.events.length > 0;
+    const outContent = transformed ? TEXT_ENCODER.encode(workingText) : content;
     const disposition = events.some((e) => e.disposition === "warn")
       ? "warn"
       : events.some((e) => e.disposition === "redact")

@@ -72,4 +72,9 @@ export class LinearRegex {
     const m = this.#re.exec(s);
     return m ? m[0] : null;
   }
+
+  /** The first match as a `RegExpExecArray` (with `.index` and capture groups), or null. */
+  exec(s: string): RegExpExecArray | null {
+    return this.#re.exec(s);
+  }
 }

@@ -25,6 +25,8 @@ export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js
 // pattern scanner (M9-IN-001 Step-9). initLinearRegex() must be awaited once before use.
 export { initLinearRegex, linearRegexEngine, LinearRegex } from "./detect/linear-regex.js";
 export { compileInjectionPatterns, scanInjectionPatterns, injectionPatternsReady } from "./detect/injection-patterns.js";
+export { compileSecretRules, redactSecrets, secretRulesReady } from "./detect/secrets.js";
+export type { SecretFinding, SecretScanResult } from "./detect/secrets.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 

@@ -16,6 +16,7 @@ import { OutboundScreener } from "../screen/outbound.js";
 import { InboundScreener } from "../screen/inbound.js";
 import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
+import { compileSecretRules } from "../detect/secrets.js";
 import type { ScreenVerdict } from "../types.js";
 
 async function main(): Promise<void> {
@@ -34,6 +35,7 @@ async function main(): Promise<void> {
   // BEFORE accepting traffic — so the ReDoS-safe Step-9 scan is live from the first message.
   const engine = await initLinearRegex();
   compileInjectionPatterns();
+  compileSecretRules();
 
   const piiWhitelist = (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   const outbound = new OutboundScreener({ piiWhitelist });

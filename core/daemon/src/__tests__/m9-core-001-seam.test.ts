@@ -440,6 +440,23 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       }
     }, 40_000);
 
+    it("OUT-001 secrets: a credential in cello_send is redacted; the peer receives the typed placeholder, not the secret", async () => {
+      const a = await spawnGateway("ga");
+      const b = await spawnGateway("gb");
+      const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
+      const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "deploy with aws_key=AKIAABCDEFGHIJKLMNOP please" }) as Record<string, unknown>;
+      expect(sent.ok).toBe(true);
+      expect(sent.modified).toBe(true); // sent in redacted form
+      let recv: Record<string, unknown> | null = null;
+      for (let i = 0; i < 160; i++) {
+        recv = await clientB.send("cello_receive", { session_id: SID_HEX }) as Record<string, unknown>;
+        if (recv && recv.content) break;
+        await wait(25);
+      }
+      expect(recv!.content as string).not.toContain("AKIAABCDEFGHIJKLMNOP"); // the secret never reached the peer
+      expect(recv!.content as string).toContain("[REDACTED:"); // the typed placeholder did
+    }, 40_000);
+
     it("inbound redact: confusable lookalikes pass A's outbound screen but are DELIVERED to B sanitized", async () => {
       const a = await spawnGateway("ga");
       const b = await spawnGateway("gb");
