@@ -66,6 +66,7 @@ import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
+import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 
 /**
@@ -1373,6 +1374,47 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
               ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
               : undefined,
         });
+        // DOD-LEG-2 (SI-002): independently re-derive each party's content_frontier_seq from the
+        // signed leaves the directory shipped, and REJECT the certificate if any published frontier
+        // is inflated beyond what the signed leaves support. The client does NOT trust the directory
+        // for the frontier VALUE — only for transporting signed bytes it re-checks itself. When no
+        // frontier_leaves are present (a pre-LEG-2 directory), the guard is skipped (backward-compat).
+        const frontierLeavesRaw = frame["frontier_leaves"];
+        if (legibility !== undefined && Array.isArray(frontierLeavesRaw) && frontierLeavesRaw.length > 0) {
+          const toU8 = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>));
+          const leaves: SealFrontierLeaf[] = frontierLeavesRaw.map((l) => {
+            const o = l as Record<string, unknown>;
+            return {
+              structure1_cbor: toU8(o["structure1_cbor"]),
+              sender_pubkey: toU8(o["sender_pubkey"]),
+              sender_signature: toU8(o["sender_signature"]),
+            };
+          });
+          const rederived = reDeriveFrontiers(leaves);
+          if (!rederived.ok) {
+            logger.error("seal.certificate.frontier.unverifiable", { sessionId: sidHex, reason: rederived.reason });
+            return;
+          }
+          const participants =
+            (legibility as { participants?: Array<{ pubkey: string; content_frontier_seq: number }> }).participants ?? [];
+          const inflated = findInflatedFrontier(participants, rederived.frontiers);
+          if (inflated) {
+            // The directory published a frontier higher than the signed leaves support — refuse the
+            // seal (do NOT persist, do NOT resolve the close as success), exactly like a bad signature.
+            logger.error("seal.certificate.frontier.unverifiable", {
+              sessionId: sidHex,
+              party: inflated.party,
+              publishedFrontier: inflated.publishedFrontier,
+              derivedFrontier: inflated.derivedFrontier,
+            });
+            return;
+          }
+          logger.info("seal.certificate.frontier.verified", {
+            sessionId: sidHex,
+            parties: participants.length,
+          });
+        }
+
         if (legibility !== undefined) {
           try {
             sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
