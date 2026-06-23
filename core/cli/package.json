@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/cli",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": false,
   "type": "module",
   "engines": {
@@ -20,7 +20,10 @@
   "bin": {
     "cello": "./dist/bin/cello.js"
   },
-  "files": ["dist/", "package.json"],
+  "files": [
+    "dist/",
+    "package.json"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
