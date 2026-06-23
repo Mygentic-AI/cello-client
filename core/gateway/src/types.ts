@@ -30,6 +30,23 @@ export type ScreenDirection = "outbound" | "inbound";
  */
 export type ScreenDisposition = "allow" | "block" | "redact" | "warn";
 
+/** The per-stage governance disposition (the §6 model: advisory, mutating, needs-decision, blocking). */
+export type GovernanceDisposition = "observe" | "redact" | "block" | "warn";
+
+/**
+ * One governance finding published by a screen stage (§6). The verdict aggregates these; the daemon
+ * renders them to the agent (M9-FEED-001) — as the transformations on a redact, the reasons on a
+ * block, or the flagged items (with `flagId`) on a warn.
+ */
+export interface GovernanceEvent {
+  stage: string;
+  disposition: GovernanceDisposition;
+  category: string;
+  reason: string;
+  /** Deterministic handle the agent passes on a governance re-send (warn items). */
+  flagId?: string;
+}
+
 /** Context the daemon passes with each screen request. Identity-scoped, never content-derived. */
 export interface ScreenContext {
   direction: ScreenDirection;
@@ -52,6 +69,8 @@ export interface ScreenVerdict {
   content?: Uint8Array;
   reason?: string;
   guidance?: string;
+  /** The governance findings behind this verdict (M9-FEED-001 renders them to the agent). */
+  events?: GovernanceEvent[];
 }
 
 /**

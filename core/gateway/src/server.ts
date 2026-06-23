@@ -143,6 +143,7 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
         ...(verdict.content !== undefined ? { content: Buffer.from(verdict.content).toString("base64") } : {}),
         ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}),
         ...(verdict.guidance !== undefined ? { guidance: verdict.guidance } : {}),
+        ...(verdict.events !== undefined ? { events: verdict.events } : {}),
       },
     };
     if (!socket.destroyed) socket.write(encodeFrame(response));

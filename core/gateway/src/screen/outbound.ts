@@ -14,17 +14,9 @@
 import { OutboundRateLimiter, type RateLimitConfig } from "../detect/rate-limit.js";
 import { OutboundPIIScreener } from "../detect/pii.js";
 import { screenOutboundExfil } from "../detect/exfil.js";
+import type { GovernanceEvent } from "../types.js";
 
-export type GovernanceDisposition = "observe" | "redact" | "block" | "warn";
-
-export interface GovernanceEvent {
-  stage: string;
-  disposition: GovernanceDisposition;
-  category: string;
-  reason: string;
-  /** Deterministic handle the agent passes on a governance re-send (warn items). */
-  flagId?: string;
-}
+export type { GovernanceEvent };
 
 export interface OutboundVerdict {
   /** The control-flow disposition for cello_send (M9-FEED-001 renders it to the agent). */

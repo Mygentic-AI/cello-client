@@ -187,6 +187,7 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
     }
     if (wire.reason !== undefined) verdict.reason = wire.reason;
     if (wire.guidance !== undefined) verdict.guidance = wire.guidance;
+    if (wire.events !== undefined) verdict.events = wire.events;
     pending.resolve(verdict);
   }
 }

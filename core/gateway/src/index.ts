@@ -8,10 +8,18 @@
 export type {
   ScreenDirection,
   ScreenDisposition,
+  GovernanceDisposition,
+  GovernanceEvent,
   ScreenContext,
   ScreenVerdict,
   SecurityGatewayClient,
 } from "./types.js";
+
+// The composed inbound/outbound screens (the gateway runs these; M9-FEED-001 renders the verdict).
+export { OutboundScreener } from "./screen/outbound.js";
+export type { OutboundVerdict, OutboundScreenerOptions, OutboundScreenContext } from "./screen/outbound.js";
+export { InboundScreener } from "./screen/inbound.js";
+export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js";
 export { GATEWAY_UNAVAILABLE, failClosedVerdict } from "./types.js";
 export { PassthroughGatewayClient } from "./passthrough.js";
 

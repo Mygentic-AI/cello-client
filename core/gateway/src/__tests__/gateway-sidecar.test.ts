@@ -120,6 +120,23 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(v.guidance).toBeDefined();
   });
 
+  it("governance events round-trip over the wire: a warn verdict's flagged items reach the client intact", async () => {
+    await startServer(() => ({
+      disposition: "warn",
+      reason: "governance_warn",
+      events: [
+        { stage: "pii", disposition: "warn", category: "pii:email", reason: "personal data", flagId: "abc123def456" },
+        { stage: "exfil", disposition: "redact", category: "exfil:invisible", reason: "stripped 1 codepoint" },
+      ],
+    }));
+    const client = makeClient();
+    const v = await client.screenOutbound(new TextEncoder().encode("hi"), ctx());
+    expect(v.disposition).toBe("warn");
+    expect(v.events).toHaveLength(2);
+    expect(v.events![0]).toMatchObject({ stage: "pii", disposition: "warn", category: "pii:email", flagId: "abc123def456" });
+    expect(v.events![1]).toMatchObject({ stage: "exfil", disposition: "redact" });
+  });
+
   it("FAIL-CLOSED on timeout — a gateway that accepts but never replies yields block within the deadline", async () => {
     // A raw server that accepts the connection and reads, but never writes a response frame.
     const blackhole = createServer((sock) => { sock.on("data", () => { /* swallow, never reply */ }); });
