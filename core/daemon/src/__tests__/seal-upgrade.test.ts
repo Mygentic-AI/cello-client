@@ -41,8 +41,8 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
 }
 
 type Kp = ReturnType<typeof generateKeypair>;
-let keyB: Kp, keyA: Kp, attacker: Kp;
-let bHex: string, aHex: string, attackerHex: string;
+let keyB: Kp, keyA: Kp;
+let bHex: string, aHex: string;
 const SID = new Uint8Array(randomBytes(16));
 const SID_HEX = Buffer.from(SID).toString("hex");
 const ROOT = new Uint8Array(randomBytes(32));
@@ -50,10 +50,8 @@ const ROOT = new Uint8Array(randomBytes(32));
 beforeAll(async () => {
   keyB = generateKeypair();
   keyA = generateKeypair();
-  attacker = generateKeypair();
   bHex = Buffer.from(await keyB.getPublicKey()).toString("hex");
   aHex = Buffer.from(await keyA.getPublicKey()).toString("hex");
-  attackerHex = Buffer.from(await attacker.getPublicKey()).toString("hex");
 });
 
 function attemptDeps(over: Partial<AttemptSealUpgradeDeps>): { deps: AttemptSealUpgradeDeps; sent: Record<string, unknown>[]; events: LogEvent[] } {
