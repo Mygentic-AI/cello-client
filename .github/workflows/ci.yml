@@ -76,6 +76,32 @@ jobs:
             exit 1
           fi
 
+      # Publish-completeness guard: every non-private core/* package MUST be wired into
+      # BOTH the root tsconfig references (so `tsc --build` compiles it → dist exists) AND
+      # the CI publish list (so it actually ships). A new core/* package added to neither
+      # publishes empty or not at all — exactly the daemon/cli gaps of 2026-06-23.
+      - name: Publish-completeness — every publishable core package is built + published
+        run: |
+          FAILED=0
+          for d in core/*/; do
+            pkg="${d%/}"
+            name=$(node -p "require('./$pkg/package.json').name")
+            priv=$(node -p "require('./$pkg/package.json').private === true")
+            [ "$priv" = "true" ] && { echo "SKIP (private): $name"; continue; }
+            # 1. in root tsconfig references?
+            if ! node -e "const r=require('./tsconfig.json').references||[]; process.exit(r.some(x=>x.path==='$pkg')?0:1)"; then
+              echo "FAIL: $name ($pkg) is NOT in root tsconfig.json references — it will compile to an empty dist and publish empty"
+              FAILED=1
+            fi
+            # 2. has a publish line in THIS workflow?
+            if ! grep -q "pnpm publish --filter $name " .github/workflows/ci.yml; then
+              echo "FAIL: $name has no 'pnpm publish --filter $name' line in ci.yml — it will never publish"
+              FAILED=1
+            fi
+            [ "$FAILED" = "0" ] && echo "OK: $name wired into tsconfig references + publish list"
+          done
+          exit $FAILED
+
   # ── M7-CICD-001: Cross-repo e2e gate ─────────────────────────────────────
   # Runs only on main branch pushes (not PRs, not tags).
   # Uploads the candidate connect tarball to S3, triggers the trustless-cello
@@ -487,3 +513,56 @@ jobs:
           exit $FAILED
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Published-artifact smoke test ────────────────────────────────────────────
+  # Installs the JUST-PUBLISHED packages from the registry in a clean dir and loads
+  # the daemon + client module graphs. Source-level tests pass on a broken publish
+  # (vitest runs TS source, not dist); only this — testing the real install path —
+  # catches the three failure classes seen 2026-06-23:
+  #   - missing package  → npm install fails
+  #   - empty package    → bin file empty / import fails (no dist compiled)
+  #   - version skew     → import throws "does not provide an export named ..."
+  #     (e.g. daemon pinning a stale crypto that lacked sealToRecipient)
+  smoke-tag:
+    name: Published-artifact smoke test (tag)
+    runs-on: ubuntu-latest
+    needs: publish-tag
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout cello-client
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve published versions
+        run: |
+          echo "CLI_VER=$(node -p "require('./core/cli/package.json').version")" >> "$GITHUB_ENV"
+          echo "CONNECT_VER=$(node -p "require('./core/adapter-claude-code/package.json').version")" >> "$GITHUB_ENV"
+
+      - name: Clean-install published packages and load the module graphs
+        run: |
+          set -e
+          WORK="$(mktemp -d)"; cd "$WORK"
+          npm init -y >/dev/null 2>&1
+          # cli pulls daemon (which pins crypto/transport/protocol-types); connect pulls client.
+          # Retry for registry propagation right after publish.
+          for i in $(seq 1 12); do
+            if npm install "@cello-protocol/cli@${CLI_VER}" "@cello-protocol/connect@${CONNECT_VER}"; then break; fi
+            echo "install attempt $i failed (propagation?) — retrying in 15s"; sleep 15
+            [ "$i" = "12" ] && { echo "FAIL: could not install published packages after retries"; exit 1; }
+          done
+          # Bin files must be non-trivial (an empty publish ships package.json only → no/0-byte bins)
+          for b in @cello-protocol/daemon/dist/bin/cello-daemon.js @cello-protocol/cli/dist/bin/cello.js @cello-protocol/connect/dist/bin/cello-mcp.js; do
+            test -s "node_modules/$b" || { echo "FAIL: node_modules/$b is missing or empty — package published without dist"; exit 1; }
+            echo "OK: node_modules/$b present"
+          done
+          # Load the module graphs — triggers every static import (the exact thing that threw
+          # on the stale-crypto skew). A skew or empty dist fails here.
+          node --input-type=module -e "await import('@cello-protocol/daemon'); console.log('OK: @cello-protocol/daemon module graph loads')"
+          node --input-type=module -e "await import('@cello-protocol/client'); console.log('OK: @cello-protocol/client module graph loads')"
+          echo "Published-artifact smoke test passed — install path is intact."
