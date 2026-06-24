@@ -292,25 +292,25 @@ jobs:
 
       - name: Verify all published versions match local
         run: |
+          # Each package is retried for up to ~60s because npm view can lag behind a
+          # just-completed publish (read-after-write propagation). Without the retry this
+          # step false-fails (local=0.0.6 beta=0.0.5) on a publish that actually succeeded.
+          check() {
+            name="$1"; local_ver="$2"
+            for attempt in $(seq 1 6); do
+              npm_ver=$(npm view "@cello-protocol/$name@beta" version 2>/dev/null || echo "missing")
+              if [ "$local_ver" = "$npm_ver" ]; then echo "OK: @cello-protocol/$name@$local_ver"; return 0; fi
+              echo "… @cello-protocol/$name beta=$npm_ver expected=$local_ver (attempt $attempt/6) — waiting for npm propagation"
+              sleep 10
+            done
+            echo "FAIL: @cello-protocol/$name local=$local_ver beta=$npm_ver after retries — bump the version before tagging"
+            return 1
+          }
           FAILED=0
           for pkg in protocol-types crypto transport client daemon cli; do
-            local_ver=$(node -p "require('./core/$pkg/package.json').version")
-            npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
-            if [ "$local_ver" != "$npm_ver" ]; then
-              echo "FAIL: @cello-protocol/$pkg local=$local_ver beta=$npm_ver — bump the version before tagging"
-              FAILED=1
-            else
-              echo "OK: @cello-protocol/$pkg@$local_ver"
-            fi
+            check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
-          local_ver=$(node -p "require('./core/adapter-claude-code/package.json').version")
-          npm_ver=$(npm view @cello-protocol/connect@beta version 2>/dev/null || echo "missing")
-          if [ "$local_ver" != "$npm_ver" ]; then
-            echo "FAIL: @cello-protocol/connect local=$local_ver beta=$npm_ver — bump the version before tagging"
-            FAILED=1
-          else
-            echo "OK: @cello-protocol/connect@$local_ver"
-          fi
+          check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
           exit $FAILED
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -499,25 +499,25 @@ jobs:
 
       - name: Verify all published versions match local
         run: |
+          # Each package is retried for up to ~60s because npm view can lag behind a
+          # just-completed publish (read-after-write propagation). Without the retry this
+          # step false-fails (local=0.0.6 beta=0.0.5) on a publish that actually succeeded.
+          check() {
+            name="$1"; local_ver="$2"
+            for attempt in $(seq 1 6); do
+              npm_ver=$(npm view "@cello-protocol/$name@beta" version 2>/dev/null || echo "missing")
+              if [ "$local_ver" = "$npm_ver" ]; then echo "OK: @cello-protocol/$name@$local_ver"; return 0; fi
+              echo "… @cello-protocol/$name beta=$npm_ver expected=$local_ver (attempt $attempt/6) — waiting for npm propagation"
+              sleep 10
+            done
+            echo "FAIL: @cello-protocol/$name local=$local_ver beta=$npm_ver after retries — bump the version before tagging"
+            return 1
+          }
           FAILED=0
           for pkg in protocol-types crypto transport client daemon cli; do
-            local_ver=$(node -p "require('./core/$pkg/package.json').version")
-            npm_ver=$(npm view @cello-protocol/$pkg@beta version 2>/dev/null || echo "missing")
-            if [ "$local_ver" != "$npm_ver" ]; then
-              echo "FAIL: @cello-protocol/$pkg local=$local_ver beta=$npm_ver — bump the version before tagging"
-              FAILED=1
-            else
-              echo "OK: @cello-protocol/$pkg@$local_ver"
-            fi
+            check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
-          local_ver=$(node -p "require('./core/adapter-claude-code/package.json').version")
-          npm_ver=$(npm view @cello-protocol/connect@beta version 2>/dev/null || echo "missing")
-          if [ "$local_ver" != "$npm_ver" ]; then
-            echo "FAIL: @cello-protocol/connect local=$local_ver beta=$npm_ver — bump the version before tagging"
-            FAILED=1
-          else
-            echo "OK: @cello-protocol/connect@$local_ver"
-          fi
+          check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
           exit $FAILED
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
