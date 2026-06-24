@@ -106,11 +106,19 @@ jobs:
   # Runs only on main branch pushes (not PRs, not tags).
   # Uploads the candidate connect tarball to S3, triggers the trustless-cello
   # e2e pipeline, and blocks publish if it fails.
+  #
+  # TEMPORARILY DISABLED (alpha) — same reason as e2e-gate-tag below: needs the
+  # AWS_OIDC_ROLE_ARN secret + OIDC provider/role (never created) and a green
+  # cello-e2e-tests-pipeline (red since 2026-06-12). While active it failed at the
+  # OIDC step on EVERY main push, painting main CI red. The `publish` job below
+  # needs this gate, so disabling it also keeps main-push publishing off (we publish
+  # via tags). Re-enable (restore `if: github.ref == 'refs/heads/main' && ...`) only
+  # once the OIDC role/secret exist and the e2e suite is reliably green.
   e2e-gate:
     name: Cross-repo E2E Gate
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: false
 
     steps:
       - name: Checkout cello-client
