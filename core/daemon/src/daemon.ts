@@ -243,9 +243,25 @@ const SESSION_NODE_KEY_STUB = {
 // Production session node factory — wraps createNode from @cello-protocol/transport
 class ProductionSessionNodeFactory implements ISessionNodeFactory {
   async createNode(config: SessionNodeConfig) {
+    // Stage-1 public reachability (M6 parity): a publicly-hosted agent (e.g. the demo
+    // agent on an EIP) needs its STANDING RECEIVER — the node that accepts inbound
+    // sessions from strangers — to listen on a routable interface and ANNOUNCE its
+    // public address, not loopback. CELLO_LISTEN_ADDR / CELLO_ANNOUNCE_ADDRS mirror the
+    // M6 env vars. Only the standing receiver picks these up; ephemeral session nodes
+    // (which dial OUT and need no inbound reachability) stay on loopback.
+    const isReceiver = config.nodeType === "standing_receiver";
+    const listenAddr =
+      isReceiver && process.env["CELLO_LISTEN_ADDR"]
+        ? process.env["CELLO_LISTEN_ADDR"]
+        : "/ip4/127.0.0.1/tcp/0";
+    const announce =
+      isReceiver && process.env["CELLO_ANNOUNCE_ADDRS"]
+        ? process.env["CELLO_ANNOUNCE_ADDRS"].split(",").map((s) => s.trim()).filter(Boolean)
+        : undefined;
     return createNode({
       keyProvider: SESSION_NODE_KEY_STUB,
-      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      listenAddresses: [listenAddr],
+      ...(announce ? { announceAddresses: announce } : {}),
       connectionGater: config.connectionGater,
       // CELLO-M7-TRANSPORT-001: forward the role so AutoNAT/dcutr are configured
       // correctly (session nodes get dcutr; standing receivers do not).
