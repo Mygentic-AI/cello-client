@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/crypto",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "private": false,
   "type": "module",
   "engines": {
@@ -29,7 +29,10 @@
       "types": "./dist/frost/types.d.ts"
     }
   },
-  "files": ["dist/", "package.json"],
+  "files": [
+    "dist/",
+    "package.json"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"

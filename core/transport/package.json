@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/transport",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "private": false,
   "type": "module",
   "engines": {
@@ -17,7 +17,10 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist/", "package.json"],
+  "files": [
+    "dist/",
+    "package.json"
+  ],
   "scripts": {
     "typecheck": "tsc --build",
     "test": "vitest run"
