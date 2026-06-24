@@ -41,7 +41,7 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
 }
 
 type Kp = ReturnType<typeof generateKeypair>;
-let keyB: Kp, keyA: Kp;
+let keyB: Kp, keyA: Kp, attacker: Kp;
 let bHex: string, aHex: string;
 const SID = new Uint8Array(randomBytes(16));
 const SID_HEX = Buffer.from(SID).toString("hex");
@@ -50,6 +50,8 @@ const ROOT = new Uint8Array(randomBytes(32));
 beforeAll(async () => {
   keyB = generateKeypair();
   keyA = generateKeypair();
+  // H1 attack key: a throwaway "returning" identity the malicious directory tries to substitute.
+  attacker = generateKeypair();
   bHex = Buffer.from(await keyB.getPublicKey()).toString("hex");
   aHex = Buffer.from(await keyA.getPublicKey()).toString("hex");
 });
