@@ -35,6 +35,7 @@ import type {
   AgentInfo,
   ConnectionInfo,
   InterruptedSessionInfo,
+  SessionListEntry,
 } from "./types.js";
 import { loadAgents } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
@@ -1670,7 +1671,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // no_current_agent guard.
   const SESSION_TOOLS_REQUIRING_AGENT = [
     "cello_receive_session",
-    "cello_list_sessions",
   ];
 
   const NO_CURRENT_AGENT_RESPONSE = {
@@ -2091,6 +2091,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // undecryptable > 0 means some rows failed GCM auth (tamper / wrong key) — surfaced, not hidden,
     // so the reader can tell a real gap from an empty transcript.
     return { ok: true, session_id: sessionId, messages, undecryptable };
+  });
+
+  // cello_list_sessions: the discovery surface — every persisted session for the
+  // current agent (active, interrupted, sealed, seal_interrupted_pending), newest
+  // updated first. This is where cello_get_transcript / cello_get_sealed_receipt
+  // get their session ids; without it those by-id reads have no starting point,
+  // and the guidance strings that point here ("See cello_list_sessions") dead-end.
+  // Read from the persisted SQLite store, so it works after a daemon restart and
+  // from a fresh MCP connection (no in-memory session-node required).
+  handlers.set("cello_list_sessions", async (_params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    if (!connState || !connState.currentAgent) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const agentName = connState.currentAgent;
+    const sessions: SessionListEntry[] = sessionNodeManager
+      .getSessionsForAgent(agentName)
+      .map((row) => ({
+        sessionId: row.session_id,
+        agentName: row.agent_name,
+        counterpartyPubkey: row.counterparty_pubkey,
+        status: row.status,
+        messageCount: row.message_count ?? 0,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+        // interrupted_at is the canonical ISO interruption stamp; null for any
+        // session that was never interrupted (active/sealed).
+        interruptedAt: row.interrupted_at ?? null,
+      }));
+    return { ok: true, sessions };
   });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)

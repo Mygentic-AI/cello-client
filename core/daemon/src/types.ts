@@ -313,6 +313,24 @@ export interface InterruptedSessionInfo {
   interruptedAt: string;
 }
 
+/**
+ * cello_list_sessions: one session in the discovery list for the current agent.
+ * Covers every status (active, sealed, interrupted, seal_interrupted_pending) so
+ * the by-id reads (cello_get_transcript / cello_get_sealed_receipt) have a source
+ * for their session ids. Timestamps are ISO 8601; interruptedAt is null unless the
+ * session is/was interrupted.
+ */
+export interface SessionListEntry {
+  sessionId: string;
+  agentName: string;
+  counterpartyPubkey: string;
+  status: SessionStatus;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+  interruptedAt: string | null;
+}
+
 // --- Error codes ---
 
 export const ErrorCodes = {

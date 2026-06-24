@@ -1367,6 +1367,21 @@ export class SessionNodeManager {
   }
 
   /**
+   * cello_list_sessions: every persisted session for one agent, regardless of
+   * status (active, interrupted, sealed, seal_interrupted_pending). Ordered most
+   * recently updated first so the live session surfaces at the top. This is the
+   * discovery surface that the by-id reads (cello_get_transcript /
+   * cello_get_sealed_receipt) depend on — without it an agent has no way to learn
+   * its own session ids after a restart or from a fresh MCP connection.
+   */
+  getSessionsForAgent(agentName: string): SessionRecord[] {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare("SELECT * FROM sessions WHERE agent_name = ? ORDER BY updated_at DESC")
+      .all(agentName) as unknown as SessionRecord[];
+  }
+
+  /**
    * M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
    * sealed record. Stored as a JSON string (hex-encoded pubkeys) so it round-trips a
    * daemon restart and is returned intact on the cert-read surface. The caller normalises
