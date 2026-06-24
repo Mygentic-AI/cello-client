@@ -17,6 +17,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { openSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { readLock, removeLock, isProcessAlive } from "./lock-file.js";
 import { connectToDaemon, type IpcClient } from "./ipc-client.js";
@@ -72,66 +74,56 @@ async function spawnDaemon(
   _lockFilePath: string,
   _logger: Logger,
 ): Promise<IpcClient> {
-  return new Promise<IpcClient>((resolve, reject) => {
-    const child = spawn(process.execPath, [daemonBin], {
-      detached: true,
-      stdio: ["ignore", "pipe", "ignore"],
-      env: {
-        ...process.env,
-        CELLO_DIR: celloDir,
-      },
-    });
+  const socketPath = join(celloDir, "daemon.sock");
+  const logPath = join(celloDir, "daemon.log");
 
-    let stdoutBuf = "";
-    const timeout = setTimeout(() => {
-      child.kill();
-      reject(new Error("Daemon failed to start within 10 seconds"));
-    }, 10_000);
-
-    child.stdout!.on("data", (chunk: Buffer) => {
-      stdoutBuf += chunk.toString("utf-8");
-      // Look for daemon.started event line
-      const lines = stdoutBuf.split("\n");
-      for (const line of lines) {
-        if (line.trim().length === 0) continue;
-        try {
-          const event = JSON.parse(line) as Record<string, unknown>;
-          if (event.event === "daemon.started") {
-            clearTimeout(timeout);
-            child.stdout!.removeAllListeners();
-            child.unref();
-            // Connect to the newly started daemon
-            const socketPath = event.ipcSocketPath as string;
-            connectToDaemon(socketPath).then(resolve).catch(reject);
-            return;
-          }
-          if (event.event === "daemon.startup.failed") {
-            clearTimeout(timeout);
-            child.stdout!.removeAllListeners();
-            const errorMsg = typeof event.error === "string"
-              ? event.error
-              : event.error instanceof Error
-                ? event.error.message
-                : String(event.error || "Daemon startup failed");
-            reject(new Error(errorMsg));
-            return;
-          }
-        } catch {
-          // Not JSON — ignore
-        }
-      }
-    });
-
-    child.on("error", (err: Error) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    child.on("exit", (code: number | null) => {
-      clearTimeout(timeout);
-      if (code !== 0) {
-        reject(new Error(`Daemon exited with code ${code}`));
-      }
-    });
+  // The daemon's stdout/stderr go to a LOG FILE, never a pipe to this process.
+  // A pipe (the previous design) breaks the moment the cli exits after reading the
+  // daemon.started line — the daemon's next log write (e.g. directory.signaling.connected)
+  // then hits a broken pipe and, with no stdout 'error' handler, EPIPE-crashes it. The
+  // daemon would "start" and die a second later → ECONNREFUSED on the socket. Writing to
+  // a file also gives operators a durable ~/.cello/daemon.log to debug from.
+  const out = openSync(logPath, "a");
+  const child = spawn(process.execPath, [daemonBin], {
+    detached: true,
+    stdio: ["ignore", out, out],
+    env: {
+      ...process.env,
+      CELLO_DIR: celloDir,
+    },
   });
+  child.unref();
+
+  // Readiness is detected by polling the IPC socket (deterministic path:
+  // celloDir/daemon.sock) until the daemon is accepting connections — not by reading
+  // stdout, which is now the log file. Track spawn/exit so we fail fast with context.
+  let spawnError: Error | null = null;
+  let exitCode: number | null | undefined;
+  child.on("error", (err: Error) => { spawnError = err; });
+  child.on("exit", (code: number | null) => { exitCode = code; });
+
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (spawnError) throw spawnError;
+    try {
+      return await connectToDaemon(socketPath);
+    } catch {
+      // Not accepting yet (ENOENT/ECONNREFUSED). If the child has already exited, it
+      // died during startup — surface the log tail rather than spinning to the deadline.
+      if (exitCode !== undefined) {
+        throw new Error(`Daemon exited (code ${exitCode}) during startup.\n${await daemonLogTail(logPath)}`);
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+  throw new Error(`Daemon failed to start within 10 seconds.\n${await daemonLogTail(logPath)}`);
+}
+
+async function daemonLogTail(logPath: string): Promise<string> {
+  try {
+    const lines = (await readFile(logPath, "utf-8")).split("\n").filter((l) => l.trim().length > 0);
+    return `--- daemon.log (last 15 lines) ---\n${lines.slice(-15).join("\n")}`;
+  } catch {
+    return `(no daemon.log at ${logPath})`;
+  }
 }

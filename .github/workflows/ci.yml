@@ -573,4 +573,21 @@ jobs:
           # on the stale-crypto skew). A skew or empty dist fails here.
           node --input-type=module -e "await import('@cello-protocol/daemon'); console.log('OK: @cello-protocol/daemon module graph loads')"
           node --input-type=module -e "await import('@cello-protocol/client'); console.log('OK: @cello-protocol/client module graph loads')"
-          echo "Published-artifact smoke test passed — install path is intact."
+
+          # Lifecycle regression guard (2026-06-24): the daemon must SURVIVE the cli exiting.
+          # The old spawn piped daemon stdout to the cli; when the cli exited the pipe broke
+          # and the daemon EPIPE-crashed → `cello login` "worked" but the daemon was dead a
+          # second later. Module-load can't catch this — only a real login+status can.
+          export CELLO_DIR="$WORK/.cello"; mkdir -p "$CELLO_DIR"
+          CELLO_ENV=local ./node_modules/.bin/cello login
+          sleep 6   # the window where a broken-pipe daemon dies (directory-connect logging)
+          OUT="$(CELLO_ENV=local ./node_modules/.bin/cello status || true)"
+          echo "$OUT"
+          if echo "$OUT" | grep -q 'unreachable'; then
+            echo "FAIL: daemon unreachable after the cli exited — it died (broken-pipe regression?)"
+            echo "--- daemon.log ---"; tail -20 "$CELLO_DIR/daemon.log" 2>/dev/null || true
+            exit 1
+          fi
+          echo "OK: daemon survived the cli exiting and is reachable"
+          CELLO_ENV=local ./node_modules/.bin/cello logout || true
+          echo "Published-artifact smoke test passed — install path + daemon lifecycle intact."
