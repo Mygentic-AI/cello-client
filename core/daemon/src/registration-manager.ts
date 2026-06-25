@@ -92,6 +92,25 @@ export class RegistrationManager {
   }
 
   /**
+   * PERSIST-002 (SI-003/AC-005/AC-012): AWAIT every identity persist (was fire-and-forget) and
+   * report whether all succeeded. A failure is logged as persist.identity.persist.failed and turns
+   * the registration into an identity_persist_failed error — registration never reports success with
+   * an uncommitted identity. SI-001: the error message carries no secret (the persist methods never
+   * receive the secret in a loggable form here).
+   */
+  async #persistAll(ops: Array<() => Promise<void>>): Promise<boolean> {
+    try {
+      for (const op of ops) await op();
+      return true;
+    } catch (err: unknown) {
+      this.#ctx.logger.error("persist.identity.persist.failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
    * Register this agent with the directory.
    * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
    */
@@ -170,20 +189,23 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
+        // SI-003: persist BEFORE caching the in-memory registered state, so a persist failure does
+        // not leave a phantom "registered" manager (which would short-circuit a retry).
+        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
+          const persistence = this.#ctx.persistence;
+          const ok = await this.#persistAll([
+            () => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }),
+            () => persistence.persistRegistrationState({
+              agentId: state.agent_id,
+              primaryPubkey: state.primary_pubkey,
+              mlDsaPubkey: state.ml_dsa_pubkey,
+              registeredAt: state.registered_at,
+            }),
+          ]);
+          if (!ok) return { error: "identity_persist_failed" };
+        }
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
-        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
-          void this.#ctx.persistence.persistMlDsaKeypair({
-            mlDsaPubkey: mlDsaPubkeyHex,
-            secretKeyBlob: mlDsaSecretKeyBlob,
-          });
-          void this.#ctx.persistence.persistRegistrationState({
-            agentId: state.agent_id,
-            primaryPubkey: state.primary_pubkey,
-            mlDsaPubkey: state.ml_dsa_pubkey,
-            registeredAt: state.registered_at,
-          });
-        }
         return state;
       }
       return { error: reason };
@@ -213,6 +235,9 @@ export class RegistrationManager {
     void epochId;
     const kLocalPubkeyBytes = Buffer.from(kLocalPubkeyHex, "hex");
     let dkgPrimaryPubkeyHex: string;
+    // The share to persist, captured inside the DKG try (a DKG error → dkg_failed) but persisted
+    // AFTER it, so a persist failure surfaces as identity_persist_failed, not dkg_failed.
+    let shareToPersist: Parameters<DaemonRegistrationPersistence["persistFrostKeyShare"]>[0] | null = null;
     try {
       const dkgResult = await runNetworkDkg(kLocalPubkeyBytes, {
         threshold,
@@ -224,22 +249,28 @@ export class RegistrationManager {
       this.#ctx.setThresholdSigner(dkgResult.signer);
       this.#ctx.setMyPrimaryPubkey(new Uint8Array(dkgResult.primaryPubkey));
       if (this.#ctx.persistence) {
-        const commitmentsCbor = CBOR_ENC.encode(dkgResult.commitments) as Uint8Array;
-        const verifyingSharesCbor = CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array;
-        void this.#ctx.persistence.persistFrostKeyShare({
+        shareToPersist = {
           epochId,
           primaryPubkey: dkgPrimaryPubkeyHex,
           identifier: dkgResult.identifier,
           signingShare: dkgResult.signingShare,
           threshold: dkgResult.threshold,
           participants: dkgResult.participants,
-          commitmentsCbor,
-          verifyingSharesCbor,
+          commitmentsCbor: CBOR_ENC.encode(dkgResult.commitments) as Uint8Array,
+          verifyingSharesCbor: CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array,
           dkgMethod: "network_dkg",
-        });
+        };
       }
     } catch {
       return { error: "dkg_failed" };
+    }
+    // SI-003/AC-005: AWAIT the share persist (was fire-and-forget) before register reports success —
+    // so a register-success guarantees the share is durably committed (no can't-sign zombie).
+    if (shareToPersist && this.#ctx.persistence) {
+      const persistence = this.#ctx.persistence;
+      const share = shareToPersist;
+      const ok = await this.#persistAll([() => persistence.persistFrostKeyShare(share)]);
+      if (!ok) return { error: "identity_persist_failed" };
     }
 
     // Step 5c: send dkg_complete (SignalingManager CBOR/lp-encodes the frame)
@@ -281,20 +312,22 @@ export class RegistrationManager {
           registered_at: Date.now(),
           status: "active",
         };
+        // SI-003: persist before caching the registered state (see the dkg_ready branch).
+        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
+          const persistence = this.#ctx.persistence;
+          const ok = await this.#persistAll([
+            () => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }),
+            () => persistence.persistRegistrationState({
+              agentId: state.agent_id,
+              primaryPubkey: state.primary_pubkey,
+              mlDsaPubkey: state.ml_dsa_pubkey,
+              registeredAt: state.registered_at,
+            }),
+          ]);
+          if (!ok) return { error: "identity_persist_failed" };
+        }
         this.#registrationState = state;
         this.#mlDsaProvider = mlDsaProvider;
-        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
-          void this.#ctx.persistence.persistMlDsaKeypair({
-            mlDsaPubkey: mlDsaPubkeyHex,
-            secretKeyBlob: mlDsaSecretKeyBlob,
-          });
-          void this.#ctx.persistence.persistRegistrationState({
-            agentId: state.agent_id,
-            primaryPubkey: state.primary_pubkey,
-            mlDsaPubkey: state.ml_dsa_pubkey,
-            registeredAt: state.registered_at,
-          });
-        }
         return state;
       }
       return { error: reason };
@@ -311,22 +344,25 @@ export class RegistrationManager {
       registered_at: Date.now(),
       status: "active",
     };
-    this.#registrationState = state;
-    this.#mlDsaProvider = mlDsaProvider;
-    if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
-      void this.#ctx.persistence.persistMlDsaKeypair({
-        mlDsaPubkey: mlDsaPubkeyHex,
-        secretKeyBlob: mlDsaSecretKeyBlob,
-      });
-    }
+    // SI-003: AWAIT the final identity persists before reporting success, and cache the registered
+    // state only after they commit — a register-success guarantees a durable identity row.
     if (this.#ctx.persistence) {
-      void this.#ctx.persistence.persistRegistrationState({
+      const persistence = this.#ctx.persistence;
+      const ops: Array<() => Promise<void>> = [];
+      if (mlDsaSecretKeyBlob) {
+        ops.push(() => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }));
+      }
+      ops.push(() => persistence.persistRegistrationState({
         agentId: state.agent_id,
         primaryPubkey: state.primary_pubkey,
         mlDsaPubkey: state.ml_dsa_pubkey,
         registeredAt: state.registered_at,
-      });
+      }));
+      const ok = await this.#persistAll(ops);
+      if (!ok) return { error: "identity_persist_failed" };
     }
+    this.#registrationState = state;
+    this.#mlDsaProvider = mlDsaProvider;
     return state;
   }
 }

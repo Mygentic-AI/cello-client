@@ -128,4 +128,31 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     expect(calls.reg).toHaveLength(1);
     expect(calls.reg[0]).toMatchObject({ agentId: "agent-77" });
   });
+
+  // PERSIST-002 Unit 3 (AC-005/AC-012/SI-003): the identity persist is AWAITED, not fire-and-forget.
+  // A persist failure must FAIL the registration with identity_persist_failed — never report success
+  // with an uncommitted identity (the can't-sign-zombie failure mode).
+  it("fails the registration with identity_persist_failed when a persist rejects (not fire-and-forget)", async () => {
+    const rejectingPersistence: DaemonRegistrationPersistence = {
+      async persistMlDsaKeypair() { throw new Error("disk full"); },
+      async persistRegistrationState() { /* unreached */ },
+      async persistFrostKeyShare() { /* unreached */ },
+      async loadRegistrationState() { return null; },
+      async loadMlDsaKeypair() { return null; },
+      async loadActiveFrostKeyShare() { return null; },
+    };
+    const h = makeFakeCtx({ persistence: rejectingPersistence });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({
+      type: "register_error",
+      reason: "already_registered",
+      agent_id: "agent-88",
+      primary_pubkey: "cc".repeat(32),
+      ml_dsa_pubkey: "dd".repeat(32),
+    });
+    // Must surface the persist failure as a registration failure — NOT return the state.
+    expect(await promise).toEqual({ error: "identity_persist_failed" });
+  });
 });
