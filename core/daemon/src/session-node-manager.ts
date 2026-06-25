@@ -385,7 +385,7 @@ export class SessionNodeManager {
     // existing DB, and openEncryptedDatabase throws db_encryption_key_mismatch on a wrong key — there
     // is no plaintext fallback. Whole-DB encryption supersedes the old per-column cipher (AC-010).
     const dbKey = resolveDbKey(this.#dbPath, dbKeyPathFor(this.#dbPath));
-    this.#db = openEncryptedDatabase(this.#dbPath, dbKey);
+    this.#db = openEncryptedDatabase(this.#dbPath, dbKey, this.#logger);
     this.#logger.info("persist.db.opened", { encrypted: true, migrated: false });
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -475,17 +475,18 @@ export class SessionNodeManager {
       )
     `);
 
-    // DOD-LOG-1 (PERSIST-LOG-001): the durable, ENCRYPTED-at-rest readable transcript. Each row
-    // is keyed by the canonical leaf `sequence`, so it JOINS to session_tree_leaves(leaf_index) —
-    // a stored message is provably behind a committed hash-chain leaf, not a loose dump. `blob` is
-    // the AES-256-GCM envelope of the readable plaintext (relay/directory never see this — INV-3).
+    // DOD-LOG-1 (PERSIST-LOG-001) / PERSIST-002 (AC-010): the durable, ENCRYPTED-at-rest readable
+    // transcript. Each row is keyed by the canonical leaf `sequence`, so it JOINS to
+    // session_tree_leaves(leaf_index) — a stored message is provably behind a committed hash-chain
+    // leaf, not a loose dump. `blob` holds the readable plaintext bytes; encryption at rest is now
+    // provided by whole-DB SQLCipher, not a per-column cipher (relay/directory never see it — INV-3).
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS transcript (
         agent_name TEXT NOT NULL,
         session_id TEXT NOT NULL,
         sequence INTEGER NOT NULL,
         direction TEXT NOT NULL,        -- 'sent' | 'received'
-        blob BLOB NOT NULL,             -- AES-256-GCM(iv||ct||tag) of the plaintext
+        blob BLOB NOT NULL,             -- readable plaintext bytes (whole-DB SQLCipher-encrypted at rest)
         created_at INTEGER NOT NULL,
         PRIMARY KEY (agent_name, session_id, sequence, direction)
       )
@@ -533,6 +534,11 @@ export class SessionNodeManager {
    * Get the underlying DatabaseSync handle.
    * Used by the composition root (daemon.ts) to pass to RetryQueue and
    * NonceDedupStore — they share the same SQLCipher DB file (DAEMON-003 AC-008).
+   */
+  /**
+   * Get the underlying DaemonDatabase handle (the SQLCipher-backed adapter). Used by the
+   * composition root (daemon.ts) to pass to RetryQueue and NonceDedupStore — they share the same
+   * encrypted DB file.
    */
   getDb(): DaemonDatabase {
     if (!this.#db) {

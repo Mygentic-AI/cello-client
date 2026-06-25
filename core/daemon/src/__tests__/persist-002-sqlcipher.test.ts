@@ -2,21 +2,23 @@
  * CELLO-M7-PERSIST-002 — Unit 1: SQLCipher engine swap + key custody + fail-closed.
  *
  * Specification (SPARC Phase S):
- *   AC-001  The daemon DB is opened via @signalapp/sqlcipher with a PRAGMA key; the raw file yields
- *           NO readable data — table contents, indexes, SQLite structure are all ciphertext. Opening
- *           without the key fails to yield plaintext; the daemon with the key reads every table.
+ *   AC-001  The daemon DB is opened via @signalapp/sqlcipher with a PRAGMA key; the raw file (and its
+ *           WAL) yield NO readable data — table contents, indexes, AND SQLite structure (schema
+ *           identifiers) are all ciphertext. It is genuinely SQLCipher (cipher_version present, high
+ *           entropy), not a reversible scramble. Opening without the key yields no plaintext; the
+ *           keyed handle reads every table.
  *   AC-010  The whole-DB SQLCipher supersedes the per-column transcript cipher; the transcript read
- *           surface still works (round-trip), but there is no separate column cipher / transcript-key.
+ *           surface still round-trips; no separate transcript-key file.
  *   AC-011  Missing key on a fresh DB → generate (0600) and proceed. Present-but-wrong key on an
- *           existing DB → fail closed with 'db_encryption_key_mismatch'; never a plaintext fallback.
+ *           EXISTING DB (driven through the real SessionNodeManager.initialize() path) → fail closed
+ *           with db_encryption_key_mismatch, and the operator's DB is left BYTE-IDENTICAL — never
+ *           recreated, truncated, or replaced with a plaintext store.
  *   SI-002  Fail closed on encryption — no plaintext store/fallback anywhere.
- *
- * These assertions are RED on the pre-story daemon (plain node:sqlite — session-row metadata sits in
- * cleartext in the file) and GREEN once the engine is SQLCipher.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -34,12 +36,7 @@ import {
 } from "../sqlcipher-db.js";
 
 function makeLogger(): Logger {
-  return {
-    debug() {},
-    info() {},
-    warn() {},
-    error() {},
-  };
+  return { debug() {}, info() {}, warn() {}, error() {} };
 }
 
 /** Minimal factory — never invoked by these DB-only tests. */
@@ -49,7 +46,26 @@ class StubNodeFactory implements ISessionNodeFactory {
   }
 }
 
-const SQLITE_MAGIC = "SQLite format 3";
+/** Shannon entropy in bits/byte (0..8). AES ciphertext ≈ 7.9+; an XOR/plaintext SQLite file is low. */
+function entropyBitsPerByte(buf: Buffer): number {
+  if (buf.length === 0) return 0;
+  const counts = new Array<number>(256).fill(0);
+  for (const b of buf) counts[b]++;
+  let h = 0;
+  for (const c of counts) {
+    if (c === 0) continue;
+    const p = c / buf.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/** All on-disk bytes for a DB path: the main file plus its WAL (where fresh writes may sit). */
+async function allDbBytes(dbPath: string): Promise<Buffer> {
+  const parts: Buffer[] = [await readFile(dbPath)];
+  if (existsSync(`${dbPath}-wal`)) parts.push(await readFile(`${dbPath}-wal`));
+  return Buffer.concat(parts);
+}
 
 let tempDir = "";
 beforeEach(async () => {
@@ -77,7 +93,7 @@ function insertSessionRow(mgr: SessionNodeManager, counterparty: string): void {
 }
 
 describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)", () => {
-  it("AC-001: session-row metadata and transcript are ciphertext in the raw DB file", async () => {
+  it("AC-001: the raw DB+WAL is genuinely-encrypted ciphertext — no metadata, no message, no SCHEMA, high entropy", async () => {
     const dbPath = join(tempDir, "sessions.db");
     const COUNTERPARTY_NEEDLE = "deadbeefcounterparty00000000000000000000000000000000000000000001";
     const TRANSCRIPT_NEEDLE = "TOP-SECRET-PLAINTEXT-NEEDLE-9f3a";
@@ -86,13 +102,28 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
     insertSessionRow(mgr, COUNTERPARTY_NEEDLE);
     mgr.recordTranscriptMessage("alice", "sess-needle-id", 0, "sent", new TextEncoder().encode(TRANSCRIPT_NEEDLE));
 
-    // The raw on-disk bytes must contain NO plaintext — not the metadata, not the message, not even
-    // the SQLite header magic (a SQLCipher DB encrypts the header).
-    const raw = await readFile(dbPath);
+    const raw = await allDbBytes(dbPath);
+
+    // (a) No row data in cleartext.
     expect(raw.includes(Buffer.from(COUNTERPARTY_NEEDLE, "latin1"))).toBe(false);
     expect(raw.includes(Buffer.from(TRANSCRIPT_NEEDLE, "latin1"))).toBe(false);
-    expect(raw.subarray(0, SQLITE_MAGIC.length).toString("latin1")).not.toBe(SQLITE_MAGIC);
+    // (b) No SQLite STRUCTURE in cleartext — schema identifiers must be encrypted too (kills a
+    // column-only cipher that leaves the schema readable, and the plaintext-header case).
+    for (const schemaToken of ["SQLite format 3", "CREATE TABLE", "sessions", "transcript", "counterparty_pubkey"]) {
+      expect(raw.includes(Buffer.from(schemaToken, "latin1"))).toBe(false);
+    }
     expect(isPlaintextSqliteFile(dbPath)).toBe(false);
+    // (c) High entropy — kills a reversible scramble (XOR/base64) that would preserve the sparse
+    // SQLite file's low entropy while passing the needle/structure checks above.
+    expect(entropyBitsPerByte(raw)).toBeGreaterThan(7.0);
+
+    // (d) It is genuinely SQLCipher, not a homegrown cipher: cipher_version is reported on the keyed
+    // handle (a plain SQLite/scramble DB cannot answer this pragma).
+    const keyed = openEncryptedDatabaseAtPath(dbPath);
+    const cipherVersion = keyed.pragma?.("cipher_version", { simple: true });
+    keyed.close();
+    expect(typeof cipherVersion).toBe("string");
+    expect(String(cipherVersion).length).toBeGreaterThan(0);
   });
 
   it("AC-001: plain node:sqlite cannot read the encrypted file; the keyed handle can", async () => {
@@ -100,8 +131,6 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
     const mgr = await initManager(dbPath);
     insertSessionRow(mgr, "cphex");
 
-    // Plain node:sqlite open of the encrypted file must NOT yield the row (it should throw or read
-    // nothing) — never plaintext.
     let plaintextLeak = false;
     try {
       const plain = new DatabaseSync(dbPath);
@@ -113,7 +142,6 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
     }
     expect(plaintextLeak).toBe(false);
 
-    // The keyed handle reads the row back.
     const keyed = openEncryptedDatabaseAtPath(dbPath);
     const got = keyed.prepare("SELECT counterparty_pubkey FROM sessions WHERE session_id = ?").get("sess-needle-id") as
       | { counterparty_pubkey: string }
@@ -131,27 +159,60 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
 
     const out = mgr.readTranscript("alice", "sess-needle-id");
     expect(out.messages.map((m) => m.text)).toEqual(["hello", "world"]);
-    expect(out.undecryptable).toBe(0);
-    // No separate transcript-key file is created (the column cipher is gone).
+    expect(out.messages.map((m) => m.direction)).toEqual(["sent", "received"]);
+    // No separate transcript-key file is created (the per-column cipher and its side key are gone).
     await expect(stat(`${dbPath}.transcript-key`)).rejects.toThrow();
   });
 
   it("AC-011/DEC-2: a 0600 32-byte key file is created beside a fresh DB", async () => {
     const dbPath = join(tempDir, "sessions.db");
     await initManager(dbPath);
-    const keyPath = dbKeyPathFor(dbPath);
-    const st = await stat(keyPath);
+    const st = await stat(dbKeyPathFor(dbPath));
     expect(st.size).toBe(32);
     expect(st.mode & 0o777).toBe(0o600);
   });
 
-  it("AC-011/SI-002: a wrong key on an existing DB fails closed with db_encryption_key_mismatch", async () => {
+  it("AC-011/SI-002: a WRONG key file on an existing DB fails closed THROUGH initialize() and leaves the DB byte-identical", async () => {
     const dbPath = join(tempDir, "sessions.db");
-    await initManager(dbPath);
 
-    const wrongKey = new Uint8Array(32).fill(7);
+    // Build a real encrypted DB with data, then release the handle so the file is final.
+    const mgr = await initManager(dbPath);
+    insertSessionRow(mgr, "cphex-intact");
+    mgr.recordTranscriptMessage("alice", "sess-needle-id", 0, "sent", new TextEncoder().encode("intact-data"));
+    mgr.getDb().close();
+
+    const before = await readFile(dbPath);
+
+    // Corrupt the key file with 32 wrong-but-valid-length bytes (the realistic "restored a mismatched
+    // key / DB from different backups" case). resolveDbKey only checks length, so this reaches the
+    // real open path inside initialize().
+    await writeFile(dbKeyPathFor(dbPath), Buffer.alloc(32, 0x07), { mode: 0o600 });
+
+    // The DAEMON path must fail closed — a regression that catches the mismatch and silently
+    // recreates a fresh (or plaintext) store would be caught here.
+    const mgr2 = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger(), dbPath });
+    let thrown: unknown;
     try {
-      openEncryptedDatabase(dbPath, wrongKey);
+      await mgr2.initialize();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(DbEncryptionError);
+    expect((thrown as DbEncryptionError).code).toBe("db_encryption_key_mismatch");
+
+    // The operator's encrypted DB is untouched: not recreated, not truncated, not turned plaintext.
+    const after = await readFile(dbPath);
+    expect(after.equals(before)).toBe(true);
+    expect(isPlaintextSqliteFile(dbPath)).toBe(false);
+  });
+
+  it("AC-011/SI-002: openEncryptedDatabase rejects a wrong key with the db_encryption_key_mismatch code", async () => {
+    const dbPath = join(tempDir, "sessions.db");
+    const mgr = await initManager(dbPath);
+    mgr.getDb().close();
+
+    try {
+      openEncryptedDatabase(dbPath, new Uint8Array(32).fill(7));
       throw new Error("expected open with wrong key to throw");
     } catch (err) {
       expect(err).toBeInstanceOf(DbEncryptionError);
@@ -159,12 +220,18 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
     }
   });
 
-  it("AC-011/SI-002: resolveDbKey fails closed when the DB exists but the key file is gone", async () => {
+  it("AC-011/SI-002: resolveDbKey fails closed (db_encryption_key_mismatch) when the DB exists but the key file is gone", async () => {
     const dbPath = join(tempDir, "sessions.db");
-    await initManager(dbPath);
-    // Remove the key file → an existing encrypted DB with no key must NOT be silently replaced.
+    const mgr = await initManager(dbPath);
+    mgr.getDb().close();
     await rm(dbKeyPathFor(dbPath));
-    expect(() => resolveDbKey(dbPath, dbKeyPathFor(dbPath))).toThrowError(/key file is missing/i);
+    try {
+      resolveDbKey(dbPath, dbKeyPathFor(dbPath));
+      throw new Error("expected resolveDbKey to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(DbEncryptionError);
+      expect((err as DbEncryptionError).code).toBe("db_encryption_key_mismatch");
+    }
   });
 
   it("AC-011: resolveDbKey generates a fresh key only when both DB and key are absent", () => {
