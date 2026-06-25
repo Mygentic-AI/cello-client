@@ -296,11 +296,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     selector: isProductionVariant(celloEnv) ? "real" : "stub",
   });
 
+  // ADV-006 + ADV-008 (hoisted — code-review MED): pure config validation runs BEFORE any disk side
+  // effect (lock, the irreversible one-time migration, DB open). A misconfigured daemon must fail
+  // before mutating state. If manifestProvider is set, manifestRootKeys + a positive threshold are
+  // required.
+  if (manifestProvider && (!manifestRootKeys || !manifestThreshold || manifestThreshold <= 0)) {
+    throw new Error(
+      "DaemonConfig: manifestProvider requires manifestRootKeys (non-empty) and manifestThreshold (positive integer >= 1)",
+    );
+  }
+
   // ── PERSIST-002: open the encrypted store FIRST (runs the one-time flat-file → SQLCipher migration
   // (AC-006) + creates the agents/manifest_state schema), under the single-instance lock. This must
   // precede the manifest verification below because the manifest version is now stored in the
-  // encrypted DB (AC-008), not a manifest-version.json file. Also makes the standing receiver +
-  // interrupted-session detection ready before the IPC socket opens (DAEMON-002 AC-011). ──
+  // encrypted DB (AC-008), not a manifest-version.json file. ──
   await mkdir(celloDir, { recursive: true });
   await mkdir(dirname(socketPath), { recursive: true });
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
@@ -334,15 +343,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Stays 0 when no manifestProvider is configured (the M6 backward-compat path).
   let verifiedManifestVersion = 0;
 
-  // ADV-006 + ADV-008: If manifestProvider is set, manifestRootKeys and a positive
-  // manifestThreshold are required. Fail loudly on misconfiguration rather than
-  // silently proceeding unverified.
-  if (manifestProvider && (!manifestRootKeys || !manifestThreshold || manifestThreshold <= 0)) {
-    throw new Error(
-      "DaemonConfig: manifestProvider requires manifestRootKeys (non-empty) and manifestThreshold (positive integer >= 1)",
-    );
-  }
-
   if (manifestProvider && manifestRootKeys && manifestThreshold !== undefined) {
     try {
       const manifest = await manifestProvider.loadAndVerify(manifestRootKeys, manifestThreshold);
@@ -363,24 +363,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           expiresAt: manifest.expires,
         });
       } else {
-        // Check version monotonicity if version store is provided
-        if (manifestVersionStore) {
-          const lastSeen = await manifestVersionStore.getLastSeenVersion();
-          if (lastSeen !== null && manifest.version < lastSeen) {
-            logger.error("directory.auth.manifest.version.rollback", {
-              manifestVersion: manifest.version,
-              lastSeenVersion: lastSeen,
-            });
-          } else {
-            await manifestVersionStore.persistVersion(manifest.version);
-            manifestVerified = true;
-            verifiedManifestVersion = manifest.version;
-            logger.info("directory.auth.manifest.verified", {
-              manifestVersion: manifest.version,
-              signerCount: manifest.signatures.length,
-            });
-          }
+        // Anti-rollback monotonicity (manifestVersionStore is always present now — DB-backed default).
+        const lastSeen = await manifestVersionStore.getLastSeenVersion();
+        if (lastSeen !== null && manifest.version < lastSeen) {
+          logger.error("directory.auth.manifest.version.rollback", {
+            manifestVersion: manifest.version,
+            lastSeenVersion: lastSeen,
+          });
         } else {
+          await manifestVersionStore.persistVersion(manifest.version);
           manifestVerified = true;
           verifiedManifestVersion = manifest.version;
           logger.info("directory.auth.manifest.verified", {
@@ -400,6 +391,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // failed, the daemon must refuse to proceed. Operators who configure
   // manifestProvider have opted into manifest enforcement.
   if (manifestProvider && !manifestVerified) {
+    // code-review MED: this refuse now runs AFTER the DB is open + the lock is held (the DB had to
+    // open for the anti-rollback check). Release both before rethrowing so an in-process caller does
+    // not leak the DB handle / lock (in production the process exits, but be tidy).
+    try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
+    await removeLock(lockFilePath, logger).catch(() => { /* best-effort */ });
     throw new Error(
       "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
       "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",

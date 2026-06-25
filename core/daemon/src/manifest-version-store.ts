@@ -6,7 +6,9 @@
  * number than the last-seen version is rejected as a potential rollback attack.
  *
  * InMemoryManifestVersionStore: stub for tests and initial deployments.
- * FileManifestVersionStore: file-backed bridge for cross-process persistence (AC-005).
+ * DbManifestVersionStore (manifest-version-store-db.ts): the production store — the version lives in
+ * the SQLCipher-encrypted manifest_state table (PERSIST-002 AC-008). The old file-backed store was
+ * removed.
  */
 
 import type { IManifestVersionStore } from "@cello-protocol/transport";

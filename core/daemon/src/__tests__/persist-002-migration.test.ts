@@ -21,6 +21,8 @@ import { FileKeyProvider, InMemoryKeyProvider } from "@cello-protocol/crypto";
 import { migrateToEncryptedIfNeeded } from "../identity-migration.js";
 import { openEncryptedDatabaseAtPath, isPlaintextSqliteFile } from "../sqlcipher-db.js";
 import { DbIdentityStore, DbRegistrationPersistence } from "../db-identity-store.js";
+import { DbManifestVersionStore } from "../manifest-version-store-db.js";
+import { openTestDb } from "./helpers/encrypted-db.js";
 import type { Logger } from "../types.js";
 
 function makeLogger(): Logger {
@@ -235,6 +237,40 @@ describe("PERSIST-002 Unit 4/6 — flat-file + plaintext-DB migration (AC-006/AC
       // The session row survived; the undecryptable transcript row was dropped (NOT stored as garbage).
       expect((db.prepare("SELECT COUNT(*) AS c FROM sessions").get() as { c: number }).c).toBe(1);
       expect((db.prepare("SELECT COUNT(*) AS c FROM transcript").get() as { c: number }).c).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("HIGH (fallback-finder): carries the legacy manifest-version.json anti-rollback floor into manifest_state (re-encrypt path)", async () => {
+    const old = new DatabaseSync(dbPath);
+    old.exec(`CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT)`);
+    old.prepare("INSERT INTO sessions VALUES (?,?)").run("s1", "sealed");
+    old.close();
+    await writeFile(join(tempDir, "manifest-version.json"), JSON.stringify({ lastSeenVersion: 42 }));
+
+    expect(migrateToEncryptedIfNeeded(dbPath, makeLogger()).migrated).toBe(true);
+    expect(existsSync(join(tempDir, "manifest-version.json"))).toBe(false); // file removed
+
+    const db = openEncryptedDatabaseAtPath(dbPath);
+    try {
+      // The floor is preserved — without this the anti-rollback check would reset to null on upgrade.
+      expect(await new DbManifestVersionStore(db, makeLogger()).getLastSeenVersion()).toBe(42);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("HIGH (fallback-finder): migrates manifest-version.json in-place when the DB is already encrypted (no flat identity)", async () => {
+    openTestDb(dbPath).close(); // create an encrypted DB + key, no flat identity
+    await writeFile(join(tempDir, "manifest-version.json"), JSON.stringify({ lastSeenVersion: 7 }));
+
+    expect(migrateToEncryptedIfNeeded(dbPath, makeLogger()).migrated).toBe(true);
+    expect(existsSync(join(tempDir, "manifest-version.json"))).toBe(false);
+
+    const db = openEncryptedDatabaseAtPath(dbPath);
+    try {
+      expect(await new DbManifestVersionStore(db, makeLogger()).getLastSeenVersion()).toBe(7);
     } finally {
       db.close();
     }

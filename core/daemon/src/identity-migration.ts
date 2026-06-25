@@ -42,6 +42,7 @@ import {
   type DaemonDatabase,
 } from "./sqlcipher-db.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
+import { ensureManifestSchema } from "./manifest-version-store-db.js";
 import type { Logger } from "./types.js";
 
 export interface MigrationResult {
@@ -116,6 +117,27 @@ function hasFlatIdentity(celloDir: string): boolean {
   return discoverFlatAgents(celloDir).length > 0;
 }
 
+const MANIFEST_FILE = "manifest-version.json";
+
+/**
+ * Carry the legacy anti-rollback floor (`manifest-version.json`) into the encrypted `manifest_state`
+ * table. CRITICAL (fallback-finder HIGH): without this, an upgraded operator's last-seen manifest
+ * version resets to null on first start, re-opening a manifest-DOWNGRADE window for one cycle. The
+ * upsert keeps the MAX of any existing floor, so it can never LOWER the floor. Returns true if a
+ * value was imported.
+ */
+function importManifestVersion(celloDir: string, db: DaemonDatabase, logger: Logger): boolean {
+  const obj = readJson(join(celloDir, MANIFEST_FILE));
+  if (!obj || typeof obj["lastSeenVersion"] !== "number") return false;
+  ensureManifestSchema(db);
+  db.prepare(
+    `INSERT INTO manifest_state (id, last_seen_version, updated_at) VALUES (1, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET last_seen_version = MAX(last_seen_version, excluded.last_seen_version), updated_at = excluded.updated_at`,
+  ).run(obj["lastSeenVersion"], Date.now());
+  logger.info("persist.manifest.version.migrated", { version: obj["lastSeenVersion"] });
+  return true;
+}
+
 /**
  * Run the one-time migration if needed. Returns { migrated:false } when there is nothing to do
  * (fresh install or an already-encrypted DB with no flat files).
@@ -147,8 +169,11 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
 
   const plaintextDb = isPlaintextSqliteFile(dbPath);
   const flatIdentity = hasFlatIdentity(celloDir);
+  // The legacy anti-rollback floor file ALSO requires a migration pass even when there is no flat
+  // identity / plaintext DB (an already-encrypted DB whose manifest floor still sits in a file).
+  const manifestFile = existsSync(join(celloDir, MANIFEST_FILE));
 
-  if (!plaintextDb && !flatIdentity) {
+  if (!plaintextDb && !flatIdentity && !manifestFile) {
     return { migrated: false, agentsMigrated: 0, rowsMigrated: 0 };
   }
 
@@ -172,6 +197,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       db = openEncryptedDatabase(dbPath, key, logger);
       ensureIdentitySchema(db);
       agentsMigrated = importFlatIdentity(celloDir, db, logger);
+      importManifestVersion(celloDir, db, logger); // carry the anti-rollback floor (HIGH)
       db.close();
       db = null;
     } catch (err) {
@@ -221,8 +247,9 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       rowsMigrated = copyPlaintextDb(dbPath, encDb, celloDir, logger);
     }
 
-    // (2) Import flat-file identity into `agents` rows.
+    // (2) Import flat-file identity into `agents` rows + the anti-rollback floor into manifest_state.
     agentsMigrated = importFlatIdentity(celloDir, encDb, logger);
+    importManifestVersion(celloDir, encDb, logger);
 
     encDb.close();
     encDb = null;
@@ -436,6 +463,11 @@ function deleteFlatIdentity(celloDir: string, logger: Logger): void {
     for (const f of [a.keyPath, ...Object.values(REG_FILES).map((n) => join(a.dir, n))]) {
       if (existsSync(f)) { try { unlinkSync(f); } catch (err) { logger.warn("persist.identity.migrate.cleanup.failed", { file: f, error: String(err) }); } }
     }
+  }
+  // The legacy anti-rollback floor file — its value now lives in manifest_state (importManifestVersion).
+  const manifestPath = join(celloDir, MANIFEST_FILE);
+  if (existsSync(manifestPath)) {
+    try { unlinkSync(manifestPath); } catch (err) { logger.warn("persist.identity.migrate.cleanup.failed", { file: manifestPath, error: String(err) }); }
   }
 }
 
