@@ -166,6 +166,9 @@ importers:
       '@libp2p/interface':
         specifier: 3.2.2
         version: 3.2.2
+      '@signalapp/sqlcipher':
+        specifier: ^3.3.5
+        version: 3.3.5
       cbor-x:
         specifier: ^1.6.0
         version: 1.6.4

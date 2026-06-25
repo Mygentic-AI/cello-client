@@ -55,7 +55,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openTestDb } from "./helpers/encrypted-db.js";
 import { SessionNodeManager } from "../session-node-manager.js";
 import {
   SessionConnectionGater,
@@ -971,7 +971,7 @@ describe("SessionNodeManager — integration tests", () => {
       expect(destroyedEvent!.context.reason).toBe("sealed");
 
       // Check SQLite row shows status: 'sealed'
-      const db = new DatabaseSync(dbPath);
+      const db = openTestDb(dbPath);
       const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get("session-ac004") as SessionRecord | undefined;
       db.close();
       expect(row).toBeDefined();
@@ -1195,7 +1195,7 @@ describe("SessionNodeManager — integration tests", () => {
     await manager.gracefulShutdown();
 
     // Check SQLite — both sessions must be 'interrupted'
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const rows = db.prepare("SELECT * FROM sessions WHERE status = 'interrupted'").all() as SessionRecord[];
     db.close();
 
@@ -1220,7 +1220,7 @@ describe("SessionNodeManager — integration tests", () => {
     const dbPath = join(tempDir, "sigkill-test.db");
 
     // Simulate SIGKILL: write 'active' rows directly to the DB
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
@@ -1257,7 +1257,7 @@ describe("SessionNodeManager — integration tests", () => {
     }
 
     // Verify rows are now 'interrupted' in SQLite
-    const db2 = new DatabaseSync(dbPath);
+    const db2 = openTestDb(dbPath);
     const rows = db2.prepare("SELECT * FROM sessions").all() as SessionRecord[];
     db2.close();
 
@@ -1346,10 +1346,9 @@ describe("SessionNodeManager — integration tests", () => {
 
     // Step (b): write 2 synthetic 'active' session rows directly so we have sessions to interrupt
     const dbPath = join(daemonDir, "sessions.db");
-    // The daemon may have created the DB; open it and insert our test rows
-    // (we simulate "2 sessions were created" by directly writing to the shared DB)
-    const { DatabaseSync: DbSync } = await import("node:sqlite");
-    const db = new DbSync(dbPath);
+    // The daemon may have created the DB; open it (keyed — it is SQLCipher-encrypted) and insert our
+    // test rows (we simulate "2 sessions were created" by directly writing to the shared DB).
+    const db = openTestDb(dbPath);
     const now = Date.now();
     // Use named columns to be schema-agnostic (works with both 6-col legacy schema
     // and the M7-SESSION-001 8-col schema that added message_count + interrupted_at).
@@ -1372,8 +1371,8 @@ describe("SessionNodeManager — integration tests", () => {
       });
     });
 
-    // Step (d)+(e): read SQLite directly — rows must be 'interrupted'
-    const db2 = new DbSync(dbPath);
+    // Step (d)+(e): read SQLite directly (keyed — SQLCipher) — rows must be 'interrupted'
+    const db2 = openTestDb(dbPath);
     const rows = db2.prepare("SELECT session_id, status FROM sessions WHERE session_id IN (?,?)").all("sigterm-s1","sigterm-s2") as Array<{session_id: string; status: string}>;
     db2.close();
     expect(rows.length).toBe(2);

@@ -43,7 +43,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openTestDb } from "./helpers/encrypted-db.js";
+import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { Encoder } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
@@ -118,7 +119,7 @@ async function makeSessionNodeManager(
 
 /** Insert a session row directly into the DB. */
 function insertSession(
-  db: DatabaseSync,
+  db: DaemonDatabase,
   opts: {
     sessionId: string;
     agentName: string;
@@ -333,7 +334,7 @@ describe("SESSION-001: SQLite schema extension", () => {
   it("adds message_count and interrupted_at columns to existing DB", async () => {
     // First: create a DB with the old schema (no new columns)
     const dbPath = join(tempDir, "old.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     db.exec(`
       CREATE TABLE sessions (
         session_id TEXT PRIMARY KEY,
@@ -479,7 +480,7 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
 
     // Pre-populate the DB with interrupted sessions before starting the daemon
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
@@ -583,7 +584,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
     messageCount: number = 0,
   ): void {
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare(
       "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -735,7 +736,7 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
     // Insert an interrupted session
     const sessionId = "ac0111122334455667788aabbcc001122334455667788aabbcc00112233445566";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare(
       "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -871,7 +872,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
     // Insert an interrupted session using the counterparty pubkey
     const sessionId = "si002aabb1122334455667788aabbcc001122334455667788aabbcc001122334455";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare(
       "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -894,7 +895,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
       expect(result.reason).toBe("seal_interrupted_leaf_signature_invalid");
 
       // Assert session status remains 'interrupted' in SQLite
-      const db2 = new DatabaseSync(join(tempDir, "sessions.db"));
+      const db2 = openTestDb(join(tempDir, "sessions.db"));
       const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
       db2.close();
       expect(row.status).toBe("interrupted");
@@ -1312,7 +1313,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const sessionId = "h1in00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
@@ -1328,7 +1329,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       expect(result.ok).toBe(true);
       expect(result.status).toBe("seal_interrupted_pending");
 
-      const db2 = new DatabaseSync(dbPath);
+      const db2 = openTestDb(dbPath);
       const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
       expect(row.status).toBe("seal_interrupted_pending");
       const art = db2.prepare("SELECT * FROM seal_interrupted_artifacts WHERE session_id = ?").get(sessionId) as {
@@ -1388,7 +1389,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const sessionId = "l2nonce00112233445566778899aabbccddeeff00112233445566778899aabb";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
@@ -1404,7 +1405,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
       expect(result.ok).not.toBe(true);
       expect(result.reason).toBe("seal_interrupted_nonce_mismatch");
 
-      const db2 = new DatabaseSync(dbPath);
+      const db2 = openTestDb(dbPath);
       const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
       db2.close();
       expect(row.status).toBe("interrupted");
@@ -1439,7 +1440,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     // bob's local view: session interrupted, counterparty is the initiator, 5 message leaves.
     const sessionId = "resp00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
@@ -1477,7 +1478,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     expect(sigOk).toBe(true);
 
     // Responder advanced the session to seal_interrupted_pending and persisted its artifacts.
-    const db2 = new DatabaseSync(dbPath);
+    const db2 = openTestDb(dbPath);
     const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
     const art = db2.prepare("SELECT role FROM seal_interrupted_artifacts WHERE session_id = ?").get(sessionId) as { role: string } | undefined;
     db2.close();
@@ -1509,7 +1510,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const sessionId = "resp2011223344556677889900aabbccddeeff00112233445566778899aabbc";
     const dbPath = join(tempDir, "sessions.db");
-    const db = new DatabaseSync(dbPath);
+    const db = openTestDb(dbPath);
     const now = Date.now();
     db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
       .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
@@ -1532,7 +1533,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     expect(rej!.initiatorPubkey).toBe(initiatorPubkeyHex);
     expect(sent.find((f) => f.type === "seal_interrupted_ack")).toBeUndefined();
 
-    const db2 = new DatabaseSync(dbPath);
+    const db2 = openTestDb(dbPath);
     const row = db2.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sessionId) as { status: string };
     db2.close();
     expect(row.status).toBe("interrupted"); // unchanged

@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openTestDb } from "./helpers/encrypted-db.js";
 import { randomBytes } from "node:crypto";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
@@ -104,7 +104,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
     it("pre-populated retry_queue is accessible immediately after daemon start", async () => {
       // Pre-populate the DB with retry_queue entries BEFORE starting daemon
       const dbPath = join(tempDir, "sessions.db");
-      const db = new DatabaseSync(dbPath);
+      const db = openTestDb(dbPath);
 
       // Create the sessions table (SessionNodeManager creates this)
       db.exec(`
@@ -269,7 +269,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
     it("retryQueueDepth equals total across sessions and returns 0 after drain", async () => {
       // Pre-populate DB with entries across 2 sessions
       const dbPath = join(tempDir, "sessions.db");
-      const db = new DatabaseSync(dbPath);
+      const db = openTestDb(dbPath);
       db.exec(`
         CREATE TABLE IF NOT EXISTS sessions (
           session_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL,
@@ -380,7 +380,7 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
     it("drain_session returns entries in ascending position order", async () => {
       // Pre-populate DB with 3 entries in specific FIFO order
       const dbPath = join(tempDir, "sessions.db");
-      const db = new DatabaseSync(dbPath);
+      const db = openTestDb(dbPath);
       db.exec(`
         CREATE TABLE IF NOT EXISTS sessions (
           session_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL,

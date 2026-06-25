@@ -31,7 +31,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openTestDb } from "./helpers/encrypted-db.js";
+import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -87,7 +88,7 @@ class StubNodeFactory implements ISessionNodeFactory {
  * message_count / interrupted_at columns (added by ALTER in production) are
  * inlined here for the test inserts; the daemon's idempotent ALTERs no-op on them.
  */
-function createSessionsTable(db: DatabaseSync): void {
+function createSessionsTable(db: DaemonDatabase): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS sessions (
       session_id TEXT NOT NULL,
@@ -104,7 +105,7 @@ function createSessionsTable(db: DatabaseSync): void {
 }
 
 function insertRow(
-  db: DatabaseSync,
+  db: DaemonDatabase,
   opts: {
     sessionId: string;
     agentName: string;
@@ -232,7 +233,7 @@ describe("cello_list_sessions: MCP handler", () => {
 
   it("LIST-3: lists the current agent's active/interrupted/sealed sessions, excludes other agents, newest first", async () => {
     // Pre-populate the sessions DB before the daemon opens it (matches SESSION-001 AC-006 pattern).
-    const db = new DatabaseSync(join(tempDir, "sessions.db"));
+    const db = openTestDb(join(tempDir, "sessions.db"));
     createSessionsTable(db);
     const t0 = Date.now() - 30_000;
     insertRow(db, { sessionId: "aa".padEnd(64, "1"), agentName: "alice", counterpartyPubkey: "cpActive", status: "active", messageCount: 2, createdAt: t0, updatedAt: t0 + 1000 });

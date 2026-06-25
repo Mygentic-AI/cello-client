@@ -21,7 +21,6 @@ import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { RetryQueue, RETRY_QUEUE_CAP } from "../retry-queue.js";
 import { NonceDedupStore } from "../nonce-dedup.js";
-import { TranscriptCipher } from "../transcript-cipher.js";
 import type { Logger } from "../types.js";
 import type { ResendResult } from "../retry-queue.js";
 
@@ -432,42 +431,8 @@ describe("RetryQueue", () => {
     });
   });
 
-  describe("DOD-LOG-1: content_blob is encrypted at rest when a cipher is configured", () => {
-    it("stores ciphertext on disk and decrypts it back on reload", () => {
-      const cipher = TranscriptCipher.fromKey();
-      const rq = new RetryQueue(db, logger, cipher);
-      const sessionId = "sess-enc";
-      const nonce = randomBytes(32);
-      const content = Buffer.from("RETRY-PLAINTEXT-NEEDLE the queued message");
-      rq.enqueue(sessionId, nonce, content);
-
-      // The raw on-disk content_blob is NOT the plaintext (it's the AES-GCM envelope).
-      const row = db
-        .prepare("SELECT content_blob FROM retry_queue WHERE session_id = ?")
-        .get(sessionId) as unknown as { content_blob: Uint8Array };
-      const rawBlob = Buffer.from(row.content_blob);
-      expect(rawBlob.toString("latin1")).not.toContain("RETRY-PLAINTEXT-NEEDLE");
-      expect(rawBlob.equals(Buffer.from(content))).toBe(false);
-
-      // A fresh queue with the SAME cipher loads + decrypts it back to the original plaintext.
-      const rq2 = new RetryQueue(db, logger, cipher);
-      rq2.loadFromDb();
-      const entries = rq2.getSessionEntries(sessionId);
-      expect(entries.length).toBe(1);
-      expect(Buffer.from(entries[0]!.contentBlob).equals(Buffer.from(content))).toBe(true);
-    });
-
-    it("without a cipher, the blob is stored plaintext (backward-compat) — proving the encryption is real", () => {
-      const rq = new RetryQueue(db, logger); // no cipher
-      const sessionId = "sess-plain";
-      const content = Buffer.from("RETRY-PLAINTEXT-NEEDLE the queued message");
-      rq.enqueue(sessionId, randomBytes(32), content);
-      const row = db
-        .prepare("SELECT content_blob FROM retry_queue WHERE session_id = ?")
-        .get(sessionId) as unknown as { content_blob: Uint8Array };
-      // Teeth: the SAME content, with no cipher, IS present in cleartext — so the cipher test above
-      // genuinely proves encryption (the difference is the cipher, not the assertion).
-      expect(Buffer.from(row.content_blob).toString("latin1")).toContain("RETRY-PLAINTEXT-NEEDLE");
-    });
-  });
+  // PERSIST-002 (AC-010): the per-column transcript/retry cipher is removed — encryption at rest is
+  // now provided by whole-DB SQLCipher (proven in persist-002-sqlcipher.test.ts). The RetryQueue
+  // stores its content_blob as plaintext bytes within the encrypted DB; these unit tests run against
+  // an in-memory node:sqlite handle and assert the queue logic, not at-rest encryption.
 });

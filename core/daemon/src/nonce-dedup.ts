@@ -41,7 +41,7 @@
  *    - Combined check-and-add for atomic dedup logic
  */
 
-import type { DatabaseSync } from "node:sqlite";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
 /** LRU cap per outline.md Resource Caps. */
@@ -54,7 +54,7 @@ interface NonceEntry {
 }
 
 export class NonceDedupStore {
-  readonly #db: DatabaseSync;
+  readonly #db: DaemonDatabase;
   readonly #logger: Logger;
   /**
    * Per-session ordered map: nonceHex → NonceEntry.
@@ -63,7 +63,7 @@ export class NonceDedupStore {
    */
   #sessions = new Map<string, Map<string, NonceEntry>>();
 
-  constructor(db: DatabaseSync, logger: Logger) {
+  constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
 

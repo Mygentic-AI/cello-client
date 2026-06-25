@@ -852,7 +852,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
-  const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger, sessionNodeManager.getTranscriptCipher());
+  const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
   retryQueue.loadFromDb();
 
   // CELLO-M7-MSG-001 (AC-001/AC-003/AC-019): wire the awaiting-ACK lifecycle's durable

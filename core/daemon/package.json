@@ -34,6 +34,7 @@
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
     "@libp2p/interface": "^3.0.0",
+    "@signalapp/sqlcipher": "^3.3.5",
     "cbor-x": "^1.6.0",
     "it-length-prefixed": "^10.0.1"
   },
