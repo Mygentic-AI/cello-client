@@ -49,7 +49,7 @@ import { createNode, SignalingManager, type ConnectResult, type CelloNode } from
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
-import { FileRegistrationPersistence } from "./registration-persistence.js";
+import { DbRegistrationPersistence } from "./db-identity-store.js";
 import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
@@ -387,8 +387,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Ensure the socket parent directory exists
   await mkdir(dirname(socketPath), { recursive: true });
 
-  // Load agent identities
-  const { loaded: loadedAgents, failed: failedAgents } = await loadAgents(celloDir, logger);
+  // PERSIST-002: open the encrypted store FIRST (it runs the one-time flat-file → SQLCipher
+  // migration, AC-006, and creates the agents/manifest_state schema), so agents load from the DB.
+  // (DAEMON-002 AC-011 / TRANSPORT-001: also makes the standing receiver + interrupted-session
+  // detection ready before the IPC socket opens.)
+  const sessionNodeManager = new SessionNodeManager({
+    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
+    logger,
+    dbPath: join(celloDir, "sessions.db"),
+    contentTtfMs: config.contentTtfMs,
+    autoNatProbers: () => [],
+  });
+  await sessionNodeManager.initialize();
+
+  // Load agent identities from the encrypted `agents` table (PERSIST-002 AC-007 — one path).
+  const { loaded: loadedAgents, failed: failedAgents } = await loadAgents(sessionNodeManager.getDb(), logger);
+
+  // PERSIST-002: per-agent DB-backed identity persistence. The registration handler and the
+  // ceremony/seal signer-reconstruction load the FROST share (and persist the identity) through this
+  // seam — the encrypted `agents` row, never a flat file.
+  const getPersistence = (agentName: string): DbRegistrationPersistence =>
+    new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName, logger });
 
   // Acquire lock file
   await acquireLock(lockFilePath, {
@@ -602,7 +621,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // registration routing). Unregistered implicitly when the manager is stopped.
     wireSessionCeremonyHandler({
       agentName,
-      agentDir: join(celloDir, "agents", agentName),
+      persistence: getPersistence(agentName),
       agentPubkeyHex,
       getNode: entry.getNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
@@ -612,7 +631,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // DOD-SPINE-7: coordinate the SEAL FROST ceremony on this agent's stream too.
     wireSealCeremonyHandler({
       agentName,
-      agentDir: join(celloDir, "agents", agentName),
+      persistence: getPersistence(agentName),
       agentPubkeyHex,
       getNode: entry.getNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
@@ -669,7 +688,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   if (primaryAgent) {
     wireSessionCeremonyHandler({
       agentName: primaryAgent.name,
-      agentDir: join(celloDir, "agents", primaryAgent.name),
+      persistence: getPersistence(primaryAgent.name),
       agentPubkeyHex: primaryAgent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
@@ -679,7 +698,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // DOD-SPINE-7: the primary agent also coordinates the SEAL FROST ceremony on the keystone.
     wireSealCeremonyHandler({
       agentName: primaryAgent.name,
-      agentDir: join(celloDir, "agents", primaryAgent.name),
+      persistence: getPersistence(primaryAgent.name),
       agentPubkeyHex: primaryAgent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
@@ -701,22 +720,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Set of agents currently in "online" state (transitioned via cello_start_agent)
   const onlineAgents = new Set<string>();
 
-  // Initialize SessionNodeManager (DAEMON-002: composition root — AC-011).
-  // This runs before the IPC socket opens so:
-  //   1. The standing receiver is ready before any cello_await_session call.
-  //   2. Interrupted session detection runs before any tool call can race.
-  const sessionNodeManager = new SessionNodeManager({
-    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
-    logger,
-    dbPath: join(celloDir, "sessions.db"),
-    contentTtfMs: config.contentTtfMs,
-    // CELLO-M7-TRANSPORT-001: directory-node AutoNAT probers (SI-002). The
-    // directory connection (SIGNAL-001) is not yet wired into the daemon, so the
-    // prober set is empty — AutoNAT cannot run and the standing receiver reports
-    // the conservative default + transport.autonat.unavailable (AC-004/DB-001).
-    autoNatProbers: () => [],
-  });
-  await sessionNodeManager.initialize();
+  // SessionNodeManager was constructed + initialized at the top of startDaemon (PERSIST-002 — the
+  // encrypted store must open before agents load from the `agents` table). Its standing receiver +
+  // interrupted-session detection are already ready here, before the IPC socket opens.
 
   // CELLO-M7-TRANSPORT-001: the daemon's runtime AutoNAT service is the one
   // wrapping the standing receiver node (it emits transport.autonat.result /
@@ -1256,7 +1262,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         };
       }
 
-      const persistence = new FileRegistrationPersistence({ agentDir: join(celloDir, "agents", name), logger });
+      const persistence = getPersistence(name);
       const ctx = new DaemonRegistrationContext({
         signaling: agentSignaling,
         getDirectoryNode: agentGetNode,
@@ -1359,7 +1365,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           }
           const record = sessionNodeManager.getSessionRecord(agentName, sidHex);
           const verdict = await verifyBilateralSealCertificate(
-            { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger, counterpartyPrimaryHex: record?.counterparty_primary_pubkey ?? null },
+            { persistence: getPersistence(agentName), agentPubkeyHex, logger, counterpartyPrimaryHex: record?.counterparty_primary_pubkey ?? null },
             {
               sessionId: sessionIdBytes,
               sealedRoot: sealedRootBytes,
@@ -1530,7 +1536,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           return;
         }
         const result = await verifyUnilateralCertificate(
-          { agentDir: join(celloDir, "agents", agentName), agentPubkeyHex, logger },
+          { persistence: getPersistence(agentName), agentPubkeyHex, logger },
           { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
         );
         pendingUnilateralWaiters.delete(sidHex);
@@ -1605,7 +1611,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   ): Promise<void> {
     const result = await verifyUpgradeConfirmedCert(
       {
-        logger, agentName, agentPubkeyHex, celloDir,
+        logger, agentName, agentPubkeyHex, persistence: getPersistence(agentName),
         getCounterpartyHex: (a, s) => sessionNodeManager.getSessionRecord(a, s)?.counterparty_pubkey ?? null,
       },
       sidHex,

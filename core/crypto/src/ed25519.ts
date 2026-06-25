@@ -140,6 +140,36 @@ export function generateKeypair(): InMemoryKeyProvider {
   return new InMemoryKeyProvider(randomBytes(SEED_BYTES));
 }
 
+/**
+ * CELLO-M7-PERSIST-002: generate a fresh 32-byte K_local Ed25519 seed for a new agent. The daemon
+ * stores the seed as a BLOB in the encrypted `agents` row (no more `agents/<name>/key` file) and
+ * builds an InMemoryKeyProvider from it.
+ */
+export function generateKLocalSeed(): Uint8Array {
+  return randomBytes(SEED_BYTES);
+}
+
+/**
+ * CELLO-M7-PERSIST-002 (migration only): decode a legacy 37-byte CELLO key file
+ * (magic ce110e01 + version 01 + 32-byte seed) into its raw seed, so a pre-story `agents/<name>/key`
+ * (or the legacy `~/.cello/key`) can be imported into the encrypted `agents` table. Throws
+ * `key_file_corrupt` on a malformed file — the migration must surface a bad key, never coerce it.
+ */
+export function decodeKeyFileSeed(raw: Uint8Array): Uint8Array {
+  if (raw.length !== KEY_FILE_SIZE) {
+    throw { reason: "key_file_corrupt", message: `key file has wrong length: expected ${KEY_FILE_SIZE}, got ${raw.length}` };
+  }
+  for (let i = 0; i < KEY_FILE_MAGIC.length; i++) {
+    if (raw[i] !== KEY_FILE_MAGIC[i]) {
+      throw { reason: "key_file_corrupt", message: "key file has invalid magic bytes" };
+    }
+  }
+  if (raw[KEY_FILE_MAGIC.length] !== KEY_FILE_VERSION) {
+    throw { reason: "key_file_corrupt", message: `key file has unsupported version: ${raw[KEY_FILE_MAGIC.length]}` };
+  }
+  return Uint8Array.prototype.slice.call(raw, KEY_FILE_MAGIC.length + 1, KEY_FILE_MAGIC.length + 1 + SEED_BYTES);
+}
+
 export function verify(publicKey: PublicKey, data: Uint8Array, signature: Signature): boolean {
   try {
     return ed25519.verify(signature, data, publicKey);

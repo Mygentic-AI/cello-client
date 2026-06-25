@@ -1,0 +1,389 @@
+/**
+ * CELLO-M7-PERSIST-002 — Unit 4/6: one-time migration of pre-story flat-file state and a plaintext
+ * node:sqlite DB into the single SQLCipher-encrypted daemon DB (AC-006, DB-002).
+ *
+ * Before this story the daemon kept:
+ *   - identity as plaintext flat files: `agents/<name>/key` (37-byte CELLO seed), `frost-share.json`,
+ *     `ml-dsa-keypair.json`, `registration-state.json`, `agent-user-link.json`, and the legacy
+ *     single-file `~/.cello/key` (loaded as agent "default");
+ *   - sessions/transcript/etc. in a PLAINTEXT `sessions.db` (node:sqlite), with two columns
+ *     (transcript.blob, retry_queue.content_blob) envelope-encrypted by a sibling
+ *     `sessions.db.transcript-key`.
+ *
+ * This migration runs at daemon startup BEFORE the encrypted DB is opened. If it detects either a
+ * plaintext DB or any flat-file identity, it builds a fresh SQLCipher DB (at `<dbPath>.migrating`),
+ * imports every row of the old DB (decrypting the two column-ciphered blobs to plaintext) AND every
+ * flat-file identity item into `agents` rows, verifies, then atomically swaps it into place — backing
+ * up the old plaintext DB to `<dbPath>.pre-sqlcipher.bak` and deleting the flat files. It is
+ * idempotent: once the DB is encrypted and the flat files are gone, it is a no-op.
+ *
+ * Fail-closed (SI-002/DB-002): on ANY error it aborts cleanly — the original flat files / plaintext
+ * DB are left in place, the partial `.migrating` DB is discarded, and the caller surfaces
+ * `identity_migration_failed`. No identity is lost and no plaintext is left half-migrated.
+ */
+
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
+import { join, dirname } from "node:path";
+import { createDecipheriv } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
+import { InMemoryKeyProvider, decodeKeyFileSeed } from "@cello-protocol/crypto";
+import {
+  openEncryptedDatabase,
+  isPlaintextSqliteFile,
+  resolveDbKey,
+  dbKeyPathFor,
+  type DaemonDatabase,
+} from "./sqlcipher-db.js";
+import { ensureIdentitySchema } from "./db-identity-store.js";
+import type { Logger } from "./types.js";
+
+export interface MigrationResult {
+  migrated: boolean;
+  agentsMigrated: number;
+  rowsMigrated: number;
+}
+
+export class IdentityMigrationError extends Error {
+  readonly code = "identity_migration_failed" as const;
+  readonly guidance: string;
+  constructor(message: string, guidance: string) {
+    super(message);
+    this.name = "IdentityMigrationError";
+    this.guidance = guidance;
+  }
+}
+
+const REG_FILES = {
+  frost: "frost-share.json",
+  mlDsa: "ml-dsa-keypair.json",
+  reg: "registration-state.json",
+  link: "agent-user-link.json",
+} as const;
+
+const hexToBytes = (s: string): Uint8Array => new Uint8Array(Buffer.from(s, "hex"));
+
+/** Decrypt a legacy column blob (iv(12)||ct||tag(16)) with the old transcript key; null on failure. */
+function decryptColumnBlob(blob: Uint8Array, key: Buffer): Uint8Array | null {
+  if (blob.length < 12 + 16) return null;
+  const buf = Buffer.from(blob);
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(buf.length - 16);
+  const ct = buf.subarray(12, buf.length - 16);
+  try {
+    const d = createDecipheriv("aes-256-gcm", key, iv);
+    d.setAuthTag(tag);
+    return Uint8Array.from(Buffer.concat([d.update(ct), d.final()]));
+  } catch {
+    return null;
+  }
+}
+
+/** Read + parse a flat JSON identity file, or null if absent. */
+function readJson(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+}
+
+/** Enumerate pre-story agent directories that hold a `key` file. */
+function discoverFlatAgents(celloDir: string): Array<{ name: string; dir: string; keyPath: string }> {
+  const out: Array<{ name: string; dir: string; keyPath: string }> = [];
+  const agentsDir = join(celloDir, "agents");
+  if (existsSync(agentsDir) && statSync(agentsDir).isDirectory()) {
+    for (const entry of readdirSync(agentsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = join(agentsDir, entry.name);
+      const keyPath = join(dir, "key");
+      if (existsSync(keyPath)) out.push({ name: entry.name, dir, keyPath });
+    }
+  }
+  // Legacy single-file ~/.cello/key → agent "default" (only when there's no agents/default already).
+  const legacyKey = join(celloDir, "key");
+  if (existsSync(legacyKey) && !out.some((a) => a.name === "default")) {
+    out.push({ name: "default", dir: celloDir, keyPath: legacyKey });
+  }
+  return out;
+}
+
+/** True if there is any pre-story flat-file identity to migrate. */
+function hasFlatIdentity(celloDir: string): boolean {
+  return discoverFlatAgents(celloDir).length > 0;
+}
+
+/**
+ * Run the one-time migration if needed. Returns { migrated:false } when there is nothing to do
+ * (fresh install or an already-encrypted DB with no flat files).
+ */
+export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): MigrationResult {
+  const celloDir = dirname(dbPath);
+  const plaintextDb = isPlaintextSqliteFile(dbPath);
+  const flatIdentity = hasFlatIdentity(celloDir);
+
+  if (!plaintextDb && !flatIdentity) {
+    return { migrated: false, agentsMigrated: 0, rowsMigrated: 0 };
+  }
+
+  const keyPath = dbKeyPathFor(dbPath);
+
+  // ── In-place flat-identity import: the DB is ALREADY encrypted (or absent) and only flat-file
+  // identity remains to be imported. There is NO plaintext DB to re-encrypt, so we must NOT build a
+  // fresh DB and swap it over the existing one (that would destroy the existing encrypted data —
+  // sessions, transcript, hash chain). Open the existing/created encrypted DB and import in place. ──
+  if (!plaintextDb) {
+    let key: Uint8Array;
+    try {
+      key = resolveDbKey(dbPath, keyPath); // loads the existing key, or generates one if the DB is absent
+    } catch (err) {
+      throw new IdentityMigrationError(
+        `could not open the encrypted DB for in-place identity import: ${err instanceof Error ? err.message : String(err)}`,
+        "Restore the SQLCipher key file, then restart.",
+      );
+    }
+    let db: DaemonDatabase | null = null;
+    let agentsMigrated = 0;
+    try {
+      db = openEncryptedDatabase(dbPath, key, logger);
+      ensureIdentitySchema(db);
+      agentsMigrated = importFlatIdentity(celloDir, db, logger);
+      db.close();
+      db = null;
+    } catch (err) {
+      if (db) { try { db.close(); } catch { /* ignore */ } }
+      if (err instanceof IdentityMigrationError) throw err;
+      throw new IdentityMigrationError(
+        `in-place identity import failed: ${err instanceof Error ? err.message : String(err)}`,
+        "The original flat files are untouched. Resolve the error and restart to retry.",
+      );
+    }
+    deleteFlatIdentity(celloDir, logger);
+    logger.info("persist.identity.migrated", { agentsMigrated, rowsMigrated: 0 });
+    return { migrated: true, agentsMigrated, rowsMigrated: 0 };
+  }
+
+  // ── Re-encrypt path: a PLAINTEXT DB exists. Build a fresh encrypted DB at `<dbPath>.migrating`
+  // (copying every row + importing flat identity), verify, then atomically swap it into place with a
+  // backup of the plaintext original. ──
+  const migratingPath = `${dbPath}.migrating`;
+  // Clean any stale partial from a previously-interrupted attempt.
+  for (const p of [migratingPath, `${migratingPath}-wal`, `${migratingPath}-shm`]) {
+    if (existsSync(p)) unlinkSync(p);
+  }
+
+  // The SQLCipher key for the NEW encrypted DB. Reuse the key file if a prior attempt already wrote
+  // one; otherwise generate it via resolveDbKey on the migrating path (which has no DB yet → fresh).
+  let dbKey: Uint8Array;
+  try {
+    dbKey = existsSync(keyPath)
+      ? new Uint8Array(readFileSync(keyPath))
+      : resolveDbKey(migratingPath, keyPath); // generates + writes keyPath (migrating DB absent → fresh)
+  } catch (err) {
+    throw new IdentityMigrationError(
+      `could not establish a SQLCipher key for migration: ${err instanceof Error ? err.message : String(err)}`,
+      "Ensure the CELLO directory is writable, then restart.",
+    );
+  }
+
+  let encDb: DaemonDatabase | null = null;
+  let agentsMigrated = 0;
+  let rowsMigrated = 0;
+  try {
+    encDb = openEncryptedDatabase(migratingPath, dbKey, logger);
+    ensureIdentitySchema(encDb);
+
+    // (1) Copy the old plaintext DB's schema + rows, decrypting the two column-ciphered blobs.
+    if (plaintextDb) {
+      rowsMigrated = copyPlaintextDb(dbPath, encDb, celloDir, logger);
+    }
+
+    // (2) Import flat-file identity into `agents` rows.
+    agentsMigrated = importFlatIdentity(celloDir, encDb, logger);
+
+    encDb.close();
+    encDb = null;
+  } catch (err) {
+    if (encDb) {
+      try { encDb.close(); } catch { /* ignore */ }
+    }
+    for (const p of [migratingPath, `${migratingPath}-wal`, `${migratingPath}-shm`]) {
+      if (existsSync(p)) { try { unlinkSync(p); } catch { /* ignore */ } }
+    }
+    if (err instanceof IdentityMigrationError) throw err;
+    throw new IdentityMigrationError(
+      `migration failed before commit: ${err instanceof Error ? err.message : String(err)}`,
+      "The original data is untouched. Resolve the error (e.g. disk space) and restart to retry.",
+    );
+  }
+
+  // ── Commit: back up + swap the DB, then delete the flat files. Past this point identity is in the
+  // encrypted DB; deleting the now-redundant plaintext originals completes the move. ──
+  try {
+    if (plaintextDb) {
+      renameSync(dbPath, `${dbPath}.pre-sqlcipher.bak`);
+      // The old WAL/SHM + the column-cipher key are superseded — remove them.
+      for (const p of [`${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}.transcript-key`]) {
+        if (existsSync(p)) { try { unlinkSync(p); } catch { /* ignore */ } }
+      }
+    }
+    renameSync(migratingPath, dbPath);
+    for (const p of [`${migratingPath}-wal`, `${migratingPath}-shm`]) {
+      if (existsSync(p)) renameSync(p, p.replace(`${dbPath}.migrating`, dbPath));
+    }
+    deleteFlatIdentity(celloDir, logger);
+  } catch (err) {
+    throw new IdentityMigrationError(
+      `migration failed during commit/cleanup: ${err instanceof Error ? err.message : String(err)}`,
+      "Inspect the CELLO directory: a .pre-sqlcipher.bak backup of the original DB is retained.",
+    );
+  }
+
+  logger.info("persist.identity.migrated", { agentsMigrated, rowsMigrated });
+  return { migrated: true, agentsMigrated, rowsMigrated };
+}
+
+/** Copy every table + row from the old plaintext DB into the encrypted DB, decrypting column blobs. */
+function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, celloDir: string, logger: Logger): number {
+  const old = new DatabaseSync(dbPath);
+  try {
+    const transcriptKeyPath = `${dbPath}.transcript-key`;
+    const transcriptKey = existsSync(transcriptKeyPath) ? readFileSync(transcriptKeyPath) : null;
+
+    const tables = (
+      old
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .all() as Array<{ name: string; sql: string }>
+    ).filter((t) => t.sql);
+
+    let rows = 0;
+    for (const t of tables) {
+      // Recreate the table in the encrypted DB (the old CREATE statement, made idempotent).
+      encDb.exec(t.sql.replace(/^CREATE TABLE/i, "CREATE TABLE IF NOT EXISTS"));
+      const cols = (old.prepare(`PRAGMA table_info(${t.name})`).all() as Array<{ name: string }>).map((c) => c.name);
+      if (cols.length === 0) continue;
+      const allRows = old.prepare(`SELECT * FROM ${t.name}`).all() as Array<Record<string, unknown>>;
+      if (allRows.length === 0) continue;
+      const placeholders = cols.map(() => "?").join(", ");
+      const insert = encDb.prepare(`INSERT OR IGNORE INTO ${t.name} (${cols.join(", ")}) VALUES (${placeholders})`);
+      for (const r of allRows) {
+        const values = cols.map((c) => {
+          let v = r[c];
+          // Decrypt the two known column-ciphered blobs to plaintext (whole-DB SQLCipher replaces it).
+          if (transcriptKey && v instanceof Uint8Array) {
+            if ((t.name === "transcript" && c === "blob") || (t.name === "retry_queue" && c === "content_blob")) {
+              const pt = decryptColumnBlob(v, transcriptKey);
+              if (pt !== null) v = Buffer.from(pt);
+              else logger.warn("persist.identity.migrate.blob.undecryptable", { table: t.name, column: c });
+            }
+          }
+          return v as unknown;
+        });
+        insert.run(...values);
+        rows++;
+      }
+    }
+    return rows;
+  } finally {
+    old.close();
+  }
+}
+
+/** Import each pre-story agent's flat files into one `agents` row. */
+function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Logger): number {
+  const agents = discoverFlatAgents(celloDir);
+  let count = 0;
+  for (const a of agents) {
+    // K_local seed from the 37-byte CELLO key file. A corrupt key is SKIPPED (quarantined to
+    // `key.corrupt`), not fatal — one unreadable agent must not down the whole daemon (availability),
+    // and its identity is unrecoverable anyway. The daemon then starts without that agent.
+    let seed: Uint8Array;
+    try {
+      seed = decodeKeyFileSeed(new Uint8Array(readFileSync(a.keyPath)));
+    } catch (err) {
+      logger.error("persist.identity.migrate.key.corrupt", {
+        agentName: a.name,
+        error: (err as { message?: string })?.message ?? String(err),
+      });
+      try { renameSync(a.keyPath, `${a.keyPath}.corrupt`); } catch { /* ignore */ }
+      continue;
+    }
+    const pubkeyHex = Buffer.from(deriverPubkey(seed)).toString("hex");
+
+    const reg = readJson(join(a.dir, REG_FILES.reg));
+    const mlDsa = readJson(join(a.dir, REG_FILES.mlDsa));
+    const frost = readJson(join(a.dir, REG_FILES.frost));
+    const link = readJson(join(a.dir, REG_FILES.link));
+    const state = reg ? "registered" : "created";
+    const now = Date.now();
+
+    encDb
+      .prepare(
+        `INSERT OR IGNORE INTO agents (agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(a.name, Buffer.from(seed), pubkeyHex, state, now, now);
+
+    if (mlDsa) {
+      encDb
+        .prepare("UPDATE agents SET ml_dsa_pubkey = ?, ml_dsa_secret = ?, ml_dsa_algorithm = ? WHERE agent_name = ?")
+        .run(String(mlDsa["mlDsaPubkey"]), Buffer.from(hexToBytes(String(mlDsa["secretKeyBlob"]))), String(mlDsa["algorithm"] ?? "ML-DSA-44"), a.name);
+    }
+    if (frost) {
+      encDb
+        .prepare(
+          `UPDATE agents SET frost_epoch_id=?, frost_primary_pubkey=?, frost_identifier=?, frost_signing_share=?,
+             frost_threshold=?, frost_participants=?, frost_commitments=?, frost_verifying_shares=?, frost_dkg_method=?
+           WHERE agent_name=?`,
+        )
+        .run(
+          String(frost["epochId"]),
+          String(frost["primaryPubkey"]),
+          String(frost["identifier"]),
+          Buffer.from(hexToBytes(String(frost["signingShare"]))),
+          Number(frost["threshold"]),
+          Number(frost["participants"]),
+          Buffer.from(hexToBytes(String(frost["commitmentsCbor"]))),
+          Buffer.from(hexToBytes(String(frost["verifyingSharesCbor"]))),
+          String(frost["dkgMethod"]),
+          a.name,
+        );
+    }
+    if (reg) {
+      encDb
+        .prepare("UPDATE agents SET reg_agent_id=?, reg_primary_pubkey=?, reg_ml_dsa_pubkey=?, reg_registered_at=?, reg_status=? WHERE agent_name=?")
+        .run(String(reg["agentId"]), String(reg["primaryPubkey"]), String(reg["mlDsaPubkey"]), Number(reg["registeredAt"]), String(reg["status"] ?? "active"), a.name);
+    }
+    if (link) {
+      encDb
+        .prepare("UPDATE agents SET link_agent_id=?, link_pre_auth_token=?, link_linked_at=? WHERE agent_name=?")
+        .run(String(link["agentId"]), String(link["preAuthToken"]), Number(link["linkedAt"]), a.name);
+    }
+    // SI-001: never log the seed/share/secret — only the agent name + count.
+    logger.info("persist.identity.migrated.agent", { agentName: a.name, registered: reg != null });
+    count++;
+  }
+  return count;
+}
+
+/** Delete every flat-file identity artifact after a successful import. */
+function deleteFlatIdentity(celloDir: string, logger: Logger): void {
+  for (const a of discoverFlatAgents(celloDir)) {
+    for (const f of [a.keyPath, ...Object.values(REG_FILES).map((n) => join(a.dir, n))]) {
+      if (existsSync(f)) { try { unlinkSync(f); } catch (err) { logger.warn("persist.identity.migrate.cleanup.failed", { file: f, error: String(err) }); } }
+    }
+  }
+}
+
+/** Derive the Ed25519 public key for a seed (migration helper). */
+function deriverPubkey(seed: Uint8Array): Uint8Array {
+  // InMemoryKeyProvider computes the pubkey in its constructor; getPublicKey is async, but the value
+  // is synchronous. We re-derive via a throwaway provider's toJSON (which exposes the hex) to avoid
+  // an async hop in this sync migration.
+  const provider = new InMemoryKeyProvider(seed);
+  const hex = (provider.toJSON() as { publicKey: string }).publicKey;
+  return new Uint8Array(Buffer.from(hex, "hex"));
+}

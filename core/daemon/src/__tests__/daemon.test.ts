@@ -198,12 +198,22 @@ describe("daemon", () => {
     expect(validationEvent!.context.goneCount).toBe(0);
   });
 
-  it("includes failed agents in status with state 'load_failed' and error (DB-002)", async () => {
-    const agentsDir = join(tempDir, "agents");
-    await mkdir(join(agentsDir, "bad-agent"), { recursive: true });
-    // Write invalid key data
-    const { writeFile } = await import("node:fs/promises");
-    await writeFile(join(agentsDir, "bad-agent", "key"), "invalid-key-data");
+  it("includes failed agents in status with state 'load_failed' and error (PERSIST-002 AC-007)", async () => {
+    // PERSIST-002: agents load from the encrypted `agents` table. A row whose K_local seed is
+    // unusable (corrupt/wrong length) surfaces as load_failed — the daemon starts with the rest
+    // (one bad agent never downs it). A corrupt pre-story key FILE is skipped/quarantined by the
+    // one-time migration instead (it never reaches the loader).
+    const { openTestDb } = await import("./helpers/encrypted-db.js");
+    const { ensureIdentitySchema } = await import("../db-identity-store.js");
+    const dbPath = join(tempDir, "sessions.db");
+    const db = openTestDb(dbPath);
+    ensureIdentitySchema(db);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO agents (agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
+       VALUES (?, ?, ?, 'created', ?, ?)`,
+    ).run("bad-agent", Buffer.alloc(8), "nopub", now, now);
+    db.close();
 
     handle = await startDaemon(makeConfig());
     const status = handle.getStatus();

@@ -73,6 +73,8 @@ import {
   resolveDbKey,
   dbKeyPathFor,
 } from "./sqlcipher-db.js";
+import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
+import { ensureIdentitySchema } from "./db-identity-store.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -384,9 +386,15 @@ export class SessionNodeManager {
     // the DB (DEC-2). Fail-closed (SI-002/AC-011): resolveDbKey refuses to mint a fresh key over an
     // existing DB, and openEncryptedDatabase throws db_encryption_key_mismatch on a wrong key — there
     // is no plaintext fallback. Whole-DB encryption supersedes the old per-column cipher (AC-010).
+    // PERSIST-002 (AC-006): one-time migration of pre-story flat-file identity / a plaintext DB into
+    // the encrypted store, BEFORE the key is resolved and the DB opened. A no-op on a fresh install
+    // or an already-encrypted DB. Throws identity_migration_failed on a failed migration (DB-002).
+    const migration = migrateToEncryptedIfNeeded(this.#dbPath, this.#logger);
     const dbKey = resolveDbKey(this.#dbPath, dbKeyPathFor(this.#dbPath));
     this.#db = openEncryptedDatabase(this.#dbPath, dbKey, this.#logger);
-    this.#logger.info("persist.db.opened", { encrypted: true, migrated: false });
+    this.#logger.info("persist.db.opened", { encrypted: true, migrated: migration.migrated });
+    // PERSIST-002: the identity store (agents + manifest_state) lives in the same encrypted DB.
+    ensureIdentitySchema(this.#db);
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT NOT NULL,

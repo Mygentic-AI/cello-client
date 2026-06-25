@@ -19,6 +19,9 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
+import { openTestDb } from "./helpers/encrypted-db.js";
+import { DbRegistrationPersistence, ensureIdentitySchema } from "../db-identity-store.js";
+import type { DaemonDatabase } from "../sqlcipher-db.js";
 import {
   attemptSealUpgrade,
   verifyUpgradeConfirmedCert,
@@ -127,7 +130,14 @@ describe("DOD-UP-1 KERNEL: attemptSealUpgrade refuses unless B genuinely possess
 
 describe("DOD-UP-1 AC-008 + H1: verifyUpgradeConfirmedCert never trusts the directory's bilateral claim", () => {
   let celloDir: string;
-  beforeAll(() => { celloDir = mkdtempSync(join(tmpdir(), "cello-upcert-")); });
+  let db: DaemonDatabase;
+  beforeAll(() => {
+    celloDir = mkdtempSync(join(tmpdir(), "cello-upcert-"));
+    // PERSIST-002: the FROST share is loaded from the encrypted DB. The agents table is empty here,
+    // so "agent" has no share → the present-attestation verify refuses (the test's intent).
+    db = openTestDb(join(celloDir, "sessions.db"));
+    ensureIdentitySchema(db);
+  });
 
   // A confirmed frame as the directory would build it: present=A, returning=B, B's ack over (SID,ROOT).
   async function confirmedFrame(over: Partial<Record<string, unknown>> = {}): Promise<Record<string, unknown>> {
@@ -146,7 +156,7 @@ describe("DOD-UP-1 AC-008 + H1: verifyUpgradeConfirmedCert never trusts the dire
 
   function verifyDeps(agentPubkeyHex: string, counterpartyHex: string | null): VerifyUpgradeConfirmedDeps & { events: LogEvent[] } {
     const { logger, events } = makeLogger();
-    return { logger, agentName: "agent", agentPubkeyHex, celloDir, getCounterpartyHex: () => counterpartyHex, events };
+    return { logger, agentName: "agent", agentPubkeyHex, persistence: new DbRegistrationPersistence({ db, agentName: "agent", logger }), getCounterpartyHex: () => counterpartyHex, events };
   }
 
   it("valid cert (B verifying its own ack over R1, A is counterparty) → ok, party=returning", async () => {

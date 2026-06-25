@@ -8,12 +8,12 @@
  * session_id, sealed_root]) with its K_local. The directory verifies it and writes a SUPERSEDING
  * bilateral notarization. Both parties verify the dual-attestation cert before accepting bilateral.
  */
-import { join } from "node:path";
 import { Encoder } from "cbor-x";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { verifyUnilateralCertificate } from "./session-ceremony.js";
+import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 
 /**
  * Domain separator for the upgrade-ack TBS. B's daemon and the directory MUST build byte-identical
@@ -154,7 +154,8 @@ export interface VerifyUpgradeConfirmedDeps {
   logger: Logger;
   agentName: string;
   agentPubkeyHex: string;
-  celloDir: string;
+  /** PERSIST-002: DB-backed identity persistence (the FROST share for cert verification). */
+  persistence: DaemonRegistrationPersistence;
   /**
    * H1: the counterparty pubkey (hex) of the LOCAL session record for sessionIdHex, or null if this
    * agent has no such session. Binds the cert's present/returning pubkeys to the REAL participants so
@@ -227,7 +228,7 @@ export async function verifyUpgradeConfirmedCert(
   const isPresent = selfHex === presentHex;
   if (isPresent) {
     const presentResult = await verifyUnilateralCertificate(
-      { agentDir: join(deps.celloDir, "agents", deps.agentName), agentPubkeyHex: deps.agentPubkeyHex, logger: deps.logger },
+      { persistence: deps.persistence, agentPubkeyHex: deps.agentPubkeyHex, logger: deps.logger },
       { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: presentSig, signatureType: presentSigType },
     );
     if (!presentResult.ok) {

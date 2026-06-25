@@ -28,7 +28,7 @@ import type { IThresholdSigner } from "@cello-protocol/crypto";
 import type { FrostContext } from "@cello-protocol/crypto/frost/types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { NetworkDirectoryNode } from "./network-directory-node.js";
-import { FileRegistrationPersistence } from "./registration-persistence.js";
+import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { SignalingSeam } from "./registration-context.js";
 import type { Logger } from "./types.js";
 
@@ -84,8 +84,11 @@ export function wireSessionOfferHandler(deps: {
 
 export interface CeremonyWiringDeps {
   agentName: string;
-  /** `${celloDir}/agents/<name>` — holds frost-share.json. */
-  agentDir: string;
+  /**
+   * PERSIST-002: the agent's identity persistence (DB-backed) — the FROST share is loaded from the
+   * encrypted `agents` row, not a `frost-share.json` file.
+   */
+  persistence: DaemonRegistrationPersistence;
   agentPubkeyHex: string;
   /** The agent's directory-connected libp2p node (the per-agent signaling node). */
   getNode: () => CelloNode | null;
@@ -102,8 +105,7 @@ export interface CeremonyWiringDeps {
  * Returns null when no share is persisted or the share is unreadable.
  */
 export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Promise<IThresholdSigner | null> {
-  const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
-  const share = await persistence.loadActiveFrostKeyShare();
+  const share = await deps.persistence.loadActiveFrostKeyShare();
   if (!share) return null;
 
   const frostSecret = { identifier: share.identifier, signingShare: new Uint8Array(share.signingShare) };
@@ -316,7 +318,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
  * surfaced honestly rather than accepted on faith.
  */
 export async function verifyUnilateralCertificate(
-  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger },
+  deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger },
   cert: {
     sessionId: Uint8Array;
     sealedRoot: Uint8Array;
@@ -333,8 +335,7 @@ export async function verifyUnilateralCertificate(
     return { ok: false, reason: "single_key_verification_unsupported" };
   }
 
-  const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
-  const share = await persistence.loadActiveFrostKeyShare();
+  const share = await deps.persistence.loadActiveFrostKeyShare();
   if (!share) return { ok: false, reason: "no_frost_share" };
 
   let primaryPubkey: Uint8Array | null = null;
@@ -381,7 +382,7 @@ export async function verifyUnilateralCertificate(
  * over the canonical hash of exactly what it sent.
  */
 export async function verifyBilateralSealCertificate(
-  deps: { agentDir: string; agentPubkeyHex: string; logger: Logger; counterpartyPrimaryHex?: string | null },
+  deps: { persistence: DaemonRegistrationPersistence; agentPubkeyHex: string; logger: Logger; counterpartyPrimaryHex?: string | null },
   cert: {
     sessionId: Uint8Array;
     sealedRoot: Uint8Array;
@@ -397,8 +398,7 @@ export async function verifyBilateralSealCertificate(
   if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
   const signerHex = Buffer.from(cert.signerPubkey).toString("hex");
 
-  const persistence = new FileRegistrationPersistence({ agentDir: deps.agentDir, logger: deps.logger });
-  const share = await persistence.loadActiveFrostKeyShare();
+  const share = await deps.persistence.loadActiveFrostKeyShare();
   if (!share) return { ok: true, verified: false }; // no share to verify with — accept (Noise-delivered)
 
   let ownPrimary: Uint8Array | null = null;
