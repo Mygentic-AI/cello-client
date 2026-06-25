@@ -49,8 +49,8 @@ import { createNode, SignalingManager, type ConnectResult, type CelloNode } from
 import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-connect.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
-import { DbRegistrationPersistence } from "./db-identity-store.js";
-import { verify as ed25519Verify, sealToRecipient } from "@cello-protocol/crypto";
+import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
+import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
@@ -1104,6 +1104,41 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { ok: true };
   });
 
+  // ─── PERSIST-002 (AC-004): cello_create_agent handler ───
+  // The explicit agent-creation path: generate a fresh K_local seed, write it as an `agents` row in
+  // the encrypted DB (NO key file), and wire the agent into the live daemon so it can be registered
+  // and used WITHOUT a restart. Creation is explicit — cello_start_agent never auto-creates on a typo.
+  handlers.set("cello_create_agent", async (params, _connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name || typeof name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+      return { ok: false, reason: "invalid_agent_name", guidance: "Provide a 'name' (1-64 chars: letters, digits, '-' or '_') for the new agent." };
+    }
+    const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
+    if (store.hasAgent(name) || agents.some((a) => a.name === name)) {
+      return { ok: false, reason: "agent_already_exists", guidance: `Agent '${name}' already exists. Choose a different name, or see cello_list_agents.` };
+    }
+    let pubkeyHex: string;
+    try {
+      const seed = generateKLocalSeed();
+      const keyProvider = new InMemoryKeyProvider(seed);
+      pubkeyHex = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
+      // SI-001: createAgent stores the seed in the encrypted DB and logs only the pubkey.
+      store.createAgent(name, seed, pubkeyHex);
+      // Runtime-add: make the agent immediately registrable/usable (the register handler resolves
+      // identity from keyProviders/loadedAgents; per-agent signaling is created lazily on register).
+      keyProviders.set(name, keyProvider);
+      loadedAgents.push({ name, pubkey: pubkeyHex, keyProvider });
+      agents.push({ name, state: "registered", pubkey: pubkeyHex });
+    } catch (err: unknown) {
+      logger.error("persist.identity.persist.failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
+      return { ok: false, reason: "agent_create_failed", guidance: "Could not create the agent. Check the daemon log and that the CELLO directory is writable, then retry." };
+    }
+    // Creation is not an online/offline transition — the agent appears (cello_list_agents) but is
+    // not online until cello_start_agent. Just record it.
+    logger.info("agent.created", { agentName: name, agentPubkey: pubkeyHex });
+    return { ok: true, name, pubkey: pubkeyHex };
+  });
+
   // ─── MCP-001: cello_stop_agent handler ───
   handlers.set("cello_stop_agent", async (params, _connectionId) => {
     const name = params?.name as string | undefined;
@@ -1213,7 +1248,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const keyProvider = keyProviders.get(name);
     if (!keyProvider) {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' has no local K_local key loaded. Its key must exist at ~/.cello/agents/${name}/key before registration — create it and restart the daemon, then retry cello_register.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with cello_create_agent('${name}') (or 'cello create-agent ${name}'), then retry cello_register.` };
     }
     if (!directoryEndpointResolver) {
       return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };

@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register } from "../commands.js";
+import { login, logout, status, register, createAgent } from "../commands.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -72,8 +72,14 @@ async function main(): Promise<void> {
       result = await register(celloDir, agent, preAuthToken, phoneStub);
       break;
     }
+    case "create-agent": {
+      // cello create-agent <name> — create a fresh local agent identity (PERSIST-002 AC-004).
+      const name = process.argv[3] ?? "";
+      result = await createAgent(celloDir, name);
+      break;
+    }
     default:
-      process.stdout.write("Usage: cello <login|logout|status|register>\n");
+      process.stdout.write("Usage: cello <login|logout|status|register|create-agent>\n");
       process.exit(command ? 1 : 0);
       return;
   }

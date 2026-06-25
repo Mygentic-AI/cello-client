@@ -132,6 +132,44 @@ export async function register(
   }
 }
 
+/**
+ * createAgent(celloDir, name):
+ *  - Connect to the daemon, send 'cello_create_agent' with { name }.
+ *  - The daemon generates a fresh K_local seed, writes it as an `agents` row in the encrypted DB
+ *    (PERSIST-002 — no key file), and wires the agent in so it can be registered immediately.
+ */
+export async function createAgent(celloDir: string, name: string): Promise<CommandResult> {
+  if (!name) {
+    return { exitCode: 1, output: "Usage: cello create-agent <name>  — creates a new local agent identity." };
+  }
+
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry create-agent." };
+  }
+
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const result = (await client.send("cello_create_agent", { name })) as {
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      name?: string;
+      pubkey?: string;
+    };
+    client.close();
+
+    if (!result.ok) {
+      return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+    }
+    return { exitCode: 0, output: JSON.stringify({ ok: true, name: result.name, pubkey: result.pubkey }, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: `Failed to create agent: ${message}` };
+  }
+}
+
 export async function status(celloDir: string): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
