@@ -387,6 +387,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Ensure the socket parent directory exists
   await mkdir(dirname(socketPath), { recursive: true });
 
+  // Acquire the lock file BEFORE opening/migrating the DB, so the one-time migration runs under the
+  // same single-instance guard as the rest of startup (code-review L3 — restores the pre-reorder
+  // ordering where the lock preceded the DB open).
+  await acquireLock(lockFilePath, {
+    pid: process.pid,
+    socketPath,
+    version,
+  });
+
   // PERSIST-002: open the encrypted store FIRST (it runs the one-time flat-file → SQLCipher
   // migration, AC-006, and creates the agents/manifest_state schema), so agents load from the DB.
   // (DAEMON-002 AC-011 / TRANSPORT-001: also makes the standing receiver + interrupted-session
@@ -408,13 +417,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // seam — the encrypted `agents` row, never a flat file.
   const getPersistence = (agentName: string): DbRegistrationPersistence =>
     new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName, logger });
-
-  // Acquire lock file
-  await acquireLock(lockFilePath, {
-    pid: process.pid,
-    socketPath,
-    version,
-  });
 
   // Build agent state (all start in 'registered' state — no auto-start)
   const agents: AgentInfo[] = [

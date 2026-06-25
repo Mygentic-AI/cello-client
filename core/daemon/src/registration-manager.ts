@@ -111,6 +111,31 @@ export class RegistrationManager {
   }
 
   /**
+   * The awaited identity-persist operations for a successful registration: the ML-DSA keypair (only
+   * when its secret blob is available) and ALWAYS the registration state. Registration state is never
+   * gated on the ml-dsa blob — so an agent is never left durably-unregistered when the blob is absent.
+   * Requires `this.#ctx.persistence` to be present (callers check).
+   */
+  #identityPersistOps(
+    state: RegistrationState,
+    mlDsaPubkeyHex: string,
+    mlDsaSecretKeyBlob: Uint8Array | null,
+  ): Array<() => Promise<void>> {
+    const persistence = this.#ctx.persistence!;
+    const ops: Array<() => Promise<void>> = [];
+    if (mlDsaSecretKeyBlob) {
+      ops.push(() => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }));
+    }
+    ops.push(() => persistence.persistRegistrationState({
+      agentId: state.agent_id,
+      primaryPubkey: state.primary_pubkey,
+      mlDsaPubkey: state.ml_dsa_pubkey,
+      registeredAt: state.registered_at,
+    }));
+    return ops;
+  }
+
+  /**
    * Register this agent with the directory.
    * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
    */
@@ -190,18 +215,11 @@ export class RegistrationManager {
           status: "active",
         };
         // SI-003: persist BEFORE caching the in-memory registered state, so a persist failure does
-        // not leave a phantom "registered" manager (which would short-circuit a retry).
-        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
-          const persistence = this.#ctx.persistence;
-          const ok = await this.#persistAll([
-            () => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }),
-            () => persistence.persistRegistrationState({
-              agentId: state.agent_id,
-              primaryPubkey: state.primary_pubkey,
-              mlDsaPubkey: state.ml_dsa_pubkey,
-              registeredAt: state.registered_at,
-            }),
-          ]);
+        // not leave a phantom "registered" manager (which would short-circuit a retry). Registration
+        // state is persisted whenever persistence is present — NOT gated on the ml-dsa blob (so an
+        // already_registered agent is never left durably-unregistered when the blob is absent).
+        if (this.#ctx.persistence) {
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -313,17 +331,8 @@ export class RegistrationManager {
           status: "active",
         };
         // SI-003: persist before caching the registered state (see the dkg_ready branch).
-        if (this.#ctx.persistence && mlDsaSecretKeyBlob) {
-          const persistence = this.#ctx.persistence;
-          const ok = await this.#persistAll([
-            () => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }),
-            () => persistence.persistRegistrationState({
-              agentId: state.agent_id,
-              primaryPubkey: state.primary_pubkey,
-              mlDsaPubkey: state.ml_dsa_pubkey,
-              registeredAt: state.registered_at,
-            }),
-          ]);
+        if (this.#ctx.persistence) {
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -347,18 +356,7 @@ export class RegistrationManager {
     // SI-003: AWAIT the final identity persists before reporting success, and cache the registered
     // state only after they commit — a register-success guarantees a durable identity row.
     if (this.#ctx.persistence) {
-      const persistence = this.#ctx.persistence;
-      const ops: Array<() => Promise<void>> = [];
-      if (mlDsaSecretKeyBlob) {
-        ops.push(() => persistence.persistMlDsaKeypair({ mlDsaPubkey: mlDsaPubkeyHex, secretKeyBlob: mlDsaSecretKeyBlob }));
-      }
-      ops.push(() => persistence.persistRegistrationState({
-        agentId: state.agent_id,
-        primaryPubkey: state.primary_pubkey,
-        mlDsaPubkey: state.ml_dsa_pubkey,
-        registeredAt: state.registered_at,
-      }));
-      const ok = await this.#persistAll(ops);
+      const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
       if (!ok) return { error: "identity_persist_failed" };
     }
     this.#registrationState = state;

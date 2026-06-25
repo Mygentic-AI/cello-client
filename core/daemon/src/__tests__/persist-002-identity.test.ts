@@ -25,6 +25,7 @@ import { randomBytes } from "node:crypto";
 import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { DbIdentityStore, DbRegistrationPersistence, ensureIdentitySchema } from "../db-identity-store.js";
+import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import { openTestDb } from "./helpers/encrypted-db.js";
 
 function makeLogger(): { logger: Logger; events: Array<{ level: string; event: string; ctx: Record<string, unknown> }> } {
@@ -56,28 +57,30 @@ function open(): DaemonDatabase {
 const SEED = (n: number): Uint8Array => new Uint8Array(randomBytes(32).map((_b, i) => (i + n) & 0xff));
 
 describe("PERSIST-002 Unit 2 — DbIdentityStore (AC-002/AC-004)", () => {
-  it("createAgent inserts a 'created' row with the K_local seed; listAgents and hasAgent reflect it", () => {
+  it("createAgent inserts a 'created' row with the K_local seed; listAgents and hasAgent reflect it", async () => {
     const db = open();
     const { logger, events } = makeLogger();
     const store = new DbIdentityStore(db, logger);
 
     const seed = SEED(1);
+    const realPub = Buffer.from(await new InMemoryKeyProvider(seed).getPublicKey()).toString("hex");
     expect(store.hasAgent("alice")).toBe(false);
-    store.createAgent("alice", seed, "alicepubhex");
+    store.createAgent("alice", seed, realPub);
     expect(store.hasAgent("alice")).toBe(true);
 
     const agents = store.listAgents();
     expect(agents).toHaveLength(1);
     expect(agents[0]!.agentName).toBe("alice");
     expect(agents[0]!.state).toBe("created");
-    expect(agents[0]!.kLocalPubkey).toBe("alicepubhex");
-    // SI-001: the seed round-trips byte-for-byte from the encrypted BLOB column.
+    expect(agents[0]!.kLocalPubkey).toBe(realPub);
+    // SI-001: the seed round-trips byte-for-byte from the encrypted BLOB column, and re-derives the pubkey.
     expect(Buffer.from(agents[0]!.kLocalSeed).equals(Buffer.from(seed))).toBe(true);
+    expect(Buffer.from(await new InMemoryKeyProvider(agents[0]!.kLocalSeed).getPublicKey()).toString("hex")).toBe(realPub);
 
     // persist.identity.created fires with the agent name + PUBLIC key only — never the seed.
     const created = events.find((e) => e.event === "persist.identity.created");
     expect(created).toBeDefined();
-    expect(created!.ctx).toMatchObject({ agentName: "alice", agentPubkey: "alicepubhex" });
+    expect(created!.ctx).toMatchObject({ agentName: "alice", agentPubkey: realPub });
     expect(JSON.stringify(created!.ctx)).not.toContain(Buffer.from(seed).toString("hex"));
   });
 

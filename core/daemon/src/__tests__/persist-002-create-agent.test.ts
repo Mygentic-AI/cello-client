@@ -15,6 +15,7 @@ import { startDaemon, type DaemonHandle, type DaemonConfig } from "../daemon.js"
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { openEncryptedDatabaseAtPath } from "../sqlcipher-db.js";
 import { DbIdentityStore } from "../db-identity-store.js";
+import { InMemoryKeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 
 function makeLogger(): Logger {
@@ -69,8 +70,13 @@ describe("PERSIST-002 Unit 4 — cello_create_agent (AC-004)", () => {
     const db = openEncryptedDatabaseAtPath(join(tempDir, "sessions.db"));
     try {
       const agents = new DbIdentityStore(db, makeLogger()).listAgents();
-      expect(agents.map((a) => a.agentName)).toContain("alice");
-      expect(agents.find((a) => a.agentName === "alice")!.kLocalPubkey).toBe(created.pubkey);
+      const alice = agents.find((a) => a.agentName === "alice")!;
+      expect(alice).toBeDefined();
+      expect(alice.kLocalPubkey).toBe(created.pubkey);
+      // TEETH (test-attacker #1): the STORED SEED must actually derive the returned pubkey — a hollow
+      // impl that stores an unrelated seed (and signs as a different identity after restart) fails here.
+      const derived = Buffer.from(await new InMemoryKeyProvider(alice.kLocalSeed).getPublicKey()).toString("hex");
+      expect(derived).toBe(created.pubkey);
     } finally {
       db.close();
     }

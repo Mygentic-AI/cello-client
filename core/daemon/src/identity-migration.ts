@@ -122,14 +122,35 @@ function hasFlatIdentity(celloDir: string): boolean {
  */
 export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): MigrationResult {
   const celloDir = dirname(dbPath);
+  const keyPath = dbKeyPathFor(dbPath);
+  const migratingPath = `${dbPath}.migrating`;
+
+  // Resume a crash in the tiny window between the backup-rename and the swap-rename: a COMPLETED
+  // `.migrating` exists but `dbPath` is gone. Promote it (instead of the in-place branch rebuilding a
+  // fresh EMPTY DB and orphaning the migrated session/transcript history — code-review M1). Only if it
+  // decrypts with the key; otherwise discard the partial and let the originals drive a fresh attempt.
+  if (!existsSync(dbPath) && existsSync(migratingPath) && existsSync(keyPath)) {
+    try {
+      const k = new Uint8Array(readFileSync(keyPath));
+      openEncryptedDatabase(migratingPath, k, logger).close(); // probe: decrypts?
+      renameSync(migratingPath, dbPath);
+      for (const ext of ["-wal", "-shm"]) {
+        if (existsSync(`${migratingPath}${ext}`)) renameSync(`${migratingPath}${ext}`, `${dbPath}${ext}`);
+      }
+      logger.warn("persist.identity.migrate.resumed", {});
+    } catch {
+      for (const p of [migratingPath, `${migratingPath}-wal`, `${migratingPath}-shm`]) {
+        if (existsSync(p)) { try { unlinkSync(p); } catch { /* ignore */ } }
+      }
+    }
+  }
+
   const plaintextDb = isPlaintextSqliteFile(dbPath);
   const flatIdentity = hasFlatIdentity(celloDir);
 
   if (!plaintextDb && !flatIdentity) {
     return { migrated: false, agentsMigrated: 0, rowsMigrated: 0 };
   }
-
-  const keyPath = dbKeyPathFor(dbPath);
 
   // ── In-place flat-identity import: the DB is ALREADY encrypted (or absent) and only flat-file
   // identity remains to be imported. There is NO plaintext DB to re-encrypt, so we must NOT build a
@@ -169,7 +190,6 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
   // ── Re-encrypt path: a PLAINTEXT DB exists. Build a fresh encrypted DB at `<dbPath>.migrating`
   // (copying every row + importing flat identity), verify, then atomically swap it into place with a
   // backup of the plaintext original. ──
-  const migratingPath = `${dbPath}.migrating`;
   // Clean any stale partial from a previously-interrupted attempt.
   for (const p of [migratingPath, `${migratingPath}-wal`, `${migratingPath}-shm`]) {
     if (existsSync(p)) unlinkSync(p);
@@ -246,8 +266,15 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
   return { migrated: true, agentsMigrated, rowsMigrated };
 }
 
-/** Copy every table + row from the old plaintext DB into the encrypted DB, decrypting column blobs. */
-function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, celloDir: string, logger: Logger): number {
+/**
+ * Copy every table + row from the old plaintext DB into the encrypted DB, decrypting the two
+ * column-ciphered blobs to plaintext. A row whose transcript/retry blob CANNOT be decrypted (the old
+ * transcript-key is missing or the blob fails GCM) is SKIPPED with a loud error — it is NEVER stored
+ * as ciphertext-masquerading-as-plaintext (which the rest of the daemon would TextDecode into garbage;
+ * fallback-finder HIGH). After each table, the copied count is VERIFIED against (old count − skipped);
+ * a mismatch means INSERT OR IGNORE silently dropped a row → abort (the docstring's "verify" is real).
+ */
+function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, _celloDir: string, logger: Logger): number {
   const old = new DatabaseSync(dbPath);
   try {
     const transcriptKeyPath = `${dbPath}.transcript-key`;
@@ -259,7 +286,7 @@ function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, celloDir: string
         .all() as Array<{ name: string; sql: string }>
     ).filter((t) => t.sql);
 
-    let rows = 0;
+    let totalCopied = 0;
     for (const t of tables) {
       // Recreate the table in the encrypted DB (the old CREATE statement, made idempotent).
       encDb.exec(t.sql.replace(/^CREATE TABLE/i, "CREATE TABLE IF NOT EXISTS"));
@@ -269,37 +296,71 @@ function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, celloDir: string
       if (allRows.length === 0) continue;
       const placeholders = cols.map(() => "?").join(", ");
       const insert = encDb.prepare(`INSERT OR IGNORE INTO ${t.name} (${cols.join(", ")}) VALUES (${placeholders})`);
+      let copied = 0;
+      let skipped = 0;
       for (const r of allRows) {
+        let undecryptable = false;
         const values = cols.map((c) => {
           let v = r[c];
-          // Decrypt the two known column-ciphered blobs to plaintext (whole-DB SQLCipher replaces it).
-          if (transcriptKey && v instanceof Uint8Array) {
-            if ((t.name === "transcript" && c === "blob") || (t.name === "retry_queue" && c === "content_blob")) {
-              const pt = decryptColumnBlob(v, transcriptKey);
-              if (pt !== null) v = Buffer.from(pt);
-              else logger.warn("persist.identity.migrate.blob.undecryptable", { table: t.name, column: c });
-            }
+          if (v instanceof Uint8Array && ((t.name === "transcript" && c === "blob") || (t.name === "retry_queue" && c === "content_blob"))) {
+            const pt = transcriptKey ? decryptColumnBlob(v, transcriptKey) : null;
+            if (pt !== null) v = Buffer.from(pt);
+            else undecryptable = true;
           }
           return v as unknown;
         });
+        if (undecryptable) {
+          // Drop the row rather than store ciphertext-as-plaintext (silent corruption). The session's
+          // authoritative hash chain (session_tree_leaves) is unaffected; only this readable copy is lost.
+          logger.error("persist.identity.migrate.blob.undecryptable", { table: t.name });
+          skipped++;
+          continue;
+        }
         insert.run(...values);
-        rows++;
+        copied++;
       }
+      // Verify: every old row was either copied or deliberately skipped — none silently dropped by IGNORE.
+      const newCount = Number((encDb.prepare(`SELECT COUNT(*) AS c FROM ${t.name}`).get() as { c: number }).c);
+      if (newCount !== copied) {
+        throw new IdentityMigrationError(
+          `row-count mismatch migrating table '${t.name}': expected ${copied}, found ${newCount}`,
+          "A row was unexpectedly dropped during migration. The original DB is untouched; restart to retry.",
+        );
+      }
+      if (skipped > 0) logger.warn("persist.identity.migrate.table.partial", { table: t.name, copied, skipped });
+      totalCopied += copied;
     }
-    return rows;
+    return totalCopied;
   } finally {
     old.close();
   }
 }
 
-/** Import each pre-story agent's flat files into one `agents` row. */
+/** Quarantine an agent's flat files (key + sibling secrets) to `*.corrupt`. */
+function quarantineFlatAgent(a: { name: string; dir: string; keyPath: string }, logger: Logger): void {
+  for (const f of [a.keyPath, ...Object.values(REG_FILES).map((n) => join(a.dir, n))]) {
+    if (existsSync(f)) {
+      try { renameSync(f, `${f}.corrupt`); } catch { /* ignore */ }
+    }
+  }
+  logger.warn("persist.identity.migrate.agent.quarantined", { agentName: a.name });
+}
+
+/** Import each pre-story agent's flat files into one `agents` row. Returns the count imported. */
 function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Logger): number {
   const agents = discoverFlatAgents(celloDir);
   let count = 0;
   for (const a of agents) {
-    // K_local seed from the 37-byte CELLO key file. A corrupt key is SKIPPED (quarantined to
-    // `key.corrupt`), not fatal — one unreadable agent must not down the whole daemon (availability),
-    // and its identity is unrecoverable anyway. The daemon then starts without that agent.
+    // Skip an agent that already exists in the encrypted DB (e.g. a prior in-place run imported it but
+    // a cleanup unlink failed) — never overwrite live DB identity with stale flat-file values
+    // (fallback-finder / code-review LOW). deleteFlatIdentity will remove the redundant files.
+    const exists = encDb.prepare("SELECT 1 AS one FROM agents WHERE agent_name = ?").get(a.name) as { one: number } | undefined;
+    if (exists) continue;
+
+    // K_local seed from the 37-byte CELLO key file. A corrupt key SKIPS the WHOLE agent — its key AND
+    // its sibling plaintext secrets (frost-share/ml-dsa/link) are quarantined to `*.corrupt` so no
+    // plaintext secret is left on disk (code-review HIGH). One unreadable agent must not down the
+    // daemon (availability); its identity is unrecoverable anyway, so the daemon starts without it.
     let seed: Uint8Array;
     try {
       seed = decodeKeyFileSeed(new Uint8Array(readFileSync(a.keyPath)));
@@ -308,7 +369,7 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
         agentName: a.name,
         error: (err as { message?: string })?.message ?? String(err),
       });
-      try { renameSync(a.keyPath, `${a.keyPath}.corrupt`); } catch { /* ignore */ }
+      quarantineFlatAgent(a, logger);
       continue;
     }
     const pubkeyHex = Buffer.from(deriverPubkey(seed)).toString("hex");
