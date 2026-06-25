@@ -50,6 +50,8 @@ import { createSignalingConnect, type SignalingAuthIdentity } from "./signaling-
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
+import { DbManifestVersionStore } from "./manifest-version-store-db.js";
+import type { IManifestVersionStore } from "@cello-protocol/transport";
 import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
@@ -275,7 +277,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
-    manifestVersionStore, manifestPollScheduler,
+    manifestVersionStore: injectedManifestVersionStore, manifestPollScheduler,
     signalingConnect, challengeVerifier, directoryEndpointResolver, sessionNodeFactory,
     sessionNegotiator, getRelayCircuitAddress,
   } = config;
@@ -293,6 +295,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     env: celloEnv,
     selector: isProductionVariant(celloEnv) ? "real" : "stub",
   });
+
+  // ── PERSIST-002: open the encrypted store FIRST (runs the one-time flat-file → SQLCipher migration
+  // (AC-006) + creates the agents/manifest_state schema), under the single-instance lock. This must
+  // precede the manifest verification below because the manifest version is now stored in the
+  // encrypted DB (AC-008), not a manifest-version.json file. Also makes the standing receiver +
+  // interrupted-session detection ready before the IPC socket opens (DAEMON-002 AC-011). ──
+  await mkdir(celloDir, { recursive: true });
+  await mkdir(dirname(socketPath), { recursive: true });
+  await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
+
+  const sessionNodeManager = new SessionNodeManager({
+    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
+    logger,
+    dbPath: join(celloDir, "sessions.db"),
+    contentTtfMs: config.contentTtfMs,
+    autoNatProbers: () => [],
+  });
+  await sessionNodeManager.initialize();
+
+  // AC-008: the manifest version store is DB-backed by default (encrypted manifest_state table). A
+  // test may inject an override (e.g. InMemoryManifestVersionStore) via config.
+  const manifestVersionStore: IManifestVersionStore =
+    injectedManifestVersionStore ?? new DbManifestVersionStore(sessionNodeManager.getDb(), logger);
 
   // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
   //
@@ -381,35 +406,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     );
   }
 
-  // Ensure the cello directory exists
-  await mkdir(celloDir, { recursive: true });
-
-  // Ensure the socket parent directory exists
-  await mkdir(dirname(socketPath), { recursive: true });
-
-  // Acquire the lock file BEFORE opening/migrating the DB, so the one-time migration runs under the
-  // same single-instance guard as the rest of startup (code-review L3 — restores the pre-reorder
-  // ordering where the lock preceded the DB open).
-  await acquireLock(lockFilePath, {
-    pid: process.pid,
-    socketPath,
-    version,
-  });
-
-  // PERSIST-002: open the encrypted store FIRST (it runs the one-time flat-file → SQLCipher
-  // migration, AC-006, and creates the agents/manifest_state schema), so agents load from the DB.
-  // (DAEMON-002 AC-011 / TRANSPORT-001: also makes the standing receiver + interrupted-session
-  // detection ready before the IPC socket opens.)
-  const sessionNodeManager = new SessionNodeManager({
-    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
-    logger,
-    dbPath: join(celloDir, "sessions.db"),
-    contentTtfMs: config.contentTtfMs,
-    autoNatProbers: () => [],
-  });
-  await sessionNodeManager.initialize();
-
   // Load agent identities from the encrypted `agents` table (PERSIST-002 AC-007 — one path).
+  // (The encrypted store + lock were established above, before manifest verification.)
   const { loaded: loadedAgents, failed: failedAgents } = await loadAgents(sessionNodeManager.getDb(), logger);
 
   // PERSIST-002: per-agent DB-backed identity persistence. The registration handler and the
@@ -1317,6 +1315,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           await dropAgentSignaling(name);
           return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
         }
+        // PERSIST-002 (AC-013): the identity row (K_local + share + ML-DSA + registration) is durably
+        // committed at this point (RegistrationManager awaits the persist before returning success).
+        // SI-001: never log a secret — only the agent name + PUBLIC key.
+        logger.info("persist.identity.persisted", { agentName: name, agentPubkey: agentPubkeyHex });
         // Capture-now-or-lose-it: persist the agent→user link (using it is future
         // trust-layer work). L1: the agent is already registered at this point —
         // a link-write failure must NOT be reported as a registration failure.

@@ -15,7 +15,6 @@ import { join } from "node:path";
 import { startDaemon } from "../daemon.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { FileManifestProvider } from "../file-manifest-provider.js";
-import { FileManifestVersionStore } from "../manifest-version-store-file.js";
 import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 import type { Logger } from "../types.js";
 import { ManifestDirectoryChallengeVerifier, type IManifestProvider, type IDirectoryChallengeVerifier, type IManifestVersionStore, type IManifestPollScheduler } from "@cello-protocol/transport";
@@ -81,11 +80,10 @@ function buildManifestDeps(logger: Logger): {
 
   const manifestProvider = new FileManifestProvider({ path: manifestPath });
   const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
-  // Anti-rollback (DOD-AUTH-2 / TUF): persist the last-verified manifest version under
-  // ~/.cello so the daemon refuses a manifest whose version regressed across restarts.
-  // The daemon (startDaemon) reads getLastSeenVersion() before accepting a manifest and
-  // persistVersion() on success; a version < trusted → directory.auth.manifest.version.rollback.
-  const manifestVersionStore = new FileManifestVersionStore(join(celloDir, "manifest-version.json"));
+  // Anti-rollback (DOD-AUTH-2 / TUF): the last-verified manifest version is persisted to refuse a
+  // manifest whose version regressed across restarts. PERSIST-002 (AC-008): this now lives in the
+  // encrypted manifest_state table (a manifest-version.json file is no longer written) — startDaemon
+  // constructs the DB-backed store itself after opening the DB, so the bin injects nothing here.
   // DOD-AUTH-2: background manifest poll. The directory is re-polled on a randomized
   // 6–12h interval (thundering-herd avoidance) and a newer signed manifest is adopted.
   // The interval is env-injectable so the live binary test can poll sub-second instead
@@ -113,7 +111,7 @@ function buildManifestDeps(logger: Logger): {
     pollMinMs: pollOpts?.minMs ?? null,
     pollMaxMs: pollOpts?.maxMs ?? null,
   });
-  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestVersionStore, manifestPollScheduler };
+  return { manifestProvider, manifestRootKeys, manifestThreshold, challengeVerifier, manifestPollScheduler };
 }
 
 async function main(): Promise<void> {

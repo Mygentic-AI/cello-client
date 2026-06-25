@@ -50,5 +50,5 @@ export type {
 export { FileManifestProvider } from "./manifest-loader.js";
 export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll-scheduler.js";
 export { InMemoryManifestVersionStore } from "./manifest-version-store.js";
-export { FileManifestVersionStore } from "./manifest-version-store-file.js";
+export { DbManifestVersionStore } from "./manifest-version-store-db.js";
 export { ManifestDirectoryChallengeVerifier, TestDirectoryChallengeVerifier } from "./challenge-verifier.js";
