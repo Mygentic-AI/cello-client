@@ -712,6 +712,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: signalingManager,
       logger,
     });
+    // The primary closes its OWN sessions over the keystone stream, so the directory routes its
+    // session_sealed / seal_unilateral_confirmed / seal_unilateral_notification frames there. These
+    // seal-completion listeners MUST be registered for the keystone primary (startup OR runtime
+    // election) — otherwise the close waiter never resolves and the seal silently never finalizes
+    // (review HIGH: previously these were a separate startup-only block, skipped on a fresh install).
+    // The register* functions are hoisted declarations within startDaemon, so callable here.
+    registerSessionSealedListener(signalingManager, agent.name, agent.pubkey);
+    registerUnilateralConfirmedListener(signalingManager, agent.name, agent.pubkey);
+    registerUnilateralUpgradeListener(signalingManager, agent.name, agent.pubkey);
   }
   if (primaryAgent) wireKeystonePrimary(primaryAgent);
 
@@ -1134,8 +1143,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agents.push({ name, state: "registered", pubkey: pubkeyHex });
       // CELLO-M7-ONBOARD-001: on a FRESH install the daemon started with no agents, so there was no
       // keystone identity and the directory door is stuck `reconnecting`. Elect this first agent as the
-      // keystone primary + wire its ceremony handlers; the running reconnect loop then authenticates
-      // with it (getAuthIdentity now returns it) and connects on its next attempt — no restart needed.
+      // keystone primary + wire its ceremony/seal handlers; the running reconnect loop then
+      // authenticates with it (getAuthIdentity now returns it) and connects on its next attempt — no
+      // restart needed. Only the FIRST agent is elected (loadedAgents is empty here, so it is also the
+      // name-sort min). NOTE (accepted LOW, review): if the operator then creates a lexicographically
+      // SMALLER second agent before any restart, the keystone primary stays this one until the next
+      // restart, where it re-derives to sort[0] — benign (each agent authenticates its own stream; the
+      // demoted agent gets fully wired via the per-agent path on restart), and not worth runtime
+      // re-election (un-wire/re-wire) churn.
       if (!primaryAgent) {
         primaryAgent = loaded;
         wireKeystonePrimary(loaded);
@@ -2955,25 +2970,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the SESSION-OWNING
-  // agent's signaling stream after the relay-mediated bilateral seal notarizes. Registered on the
-  // keystone (primary agent) here AND per-agent in getAgentSignaling — for a non-primary agent the
-  // directory routes session_sealed to its per-agent stream, so a keystone-only listener would
-  // leave that agent's close waiter unresolved (reviewer finding). Resolve the close waiter with
-  // the sealed_root and mark the session sealed. Guarded on primaryAgent: the keystone listener now
-  // needs the primary agent's name/pubkey to verify the seal signature (legibility-TBS-binding), and
-  // with no agents there are no keystone sessions to seal anyway.
-  if (primaryAgent) {
-    registerSessionSealedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
-    // SESSION-002: the keystone counterpart for the unilateral certificate listener — the
-    // primary agent closes over the keystone stream, so the directory routes its
-    // seal_unilateral_confirmed there (mirrors the session_sealed keystone listener above).
-    registerUnilateralConfirmedListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
-    // DOD-UP-1: the keystone counterpart for the absent-party upgrade listener. The directory
-    // PUSHES the queued seal_unilateral_notification during the keystone's auth/reconnect drain —
-    // BEFORE any cello_start_agent runs — so the handler MUST be registered here at startup, not only
-    // in startAgent, or B (the returning absent party) would miss its own ratification trigger.
-    registerUnilateralUpgradeListener(signalingManager, primaryAgent.name, primaryAgent.pubkey);
-  }
+  // CELLO-M7-ONBOARD-001: the keystone primary's seal-completion listeners (session_sealed /
+  // seal_unilateral_confirmed / seal_unilateral_notification) are now registered inside
+  // wireKeystonePrimary — at startup for a loaded primary AND at runtime when the first agent is
+  // elected (cello_create_agent on a fresh install). They must NOT be a separate startup-only block,
+  // or a fresh-install primary's seals would silently never finalize (review HIGH).
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
