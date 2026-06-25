@@ -37,7 +37,7 @@ import type {
   InterruptedSessionInfo,
   SessionListEntry,
 } from "./types.js";
-import { loadAgents } from "./agent-loader.js";
+import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
@@ -478,7 +478,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // L4: sort by name so the "primary" agent is STABLE across restarts — readdir
   // order (agent-loader) is platform-dependent and unsorted, which would otherwise
   // let the authenticating identity change between daemon restarts.
-  const primaryAgent = [...loadedAgents].sort((a, b) => a.name.localeCompare(b.name))[0];
+  // CELLO-M7-ONBOARD-001: `primaryAgent` is mutable so the FIRST agent created at runtime
+  // (cello_create_agent on a fresh install) can be elected as the keystone identity — otherwise the
+  // directory door stays `reconnecting` forever until a restart. getAuthIdentity reads it on every
+  // reconnect attempt, so electing it makes the already-running reconnect loop authenticate + connect.
+  let primaryAgent: LoadedAgent | undefined = [...loadedAgents].sort((a, b) => a.name.localeCompare(b.name))[0];
   const getAuthIdentity = (): SignalingAuthIdentity | null => {
     if (!primaryAgent) return null;
     return { keyProvider: primaryAgent.keyProvider, pubkeyHex: primaryAgent.pubkey };
@@ -678,36 +682,38 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger.info("agent.signaling.dropped", { agentName });
   }
 
-  // DOD-SPINE-5: the PRIMARY agent registers + initiates over the keystone signaling
-  // stream (not a per-agent one), so wire its ceremony_request handler on the keystone
-  // manager too — otherwise a primary-agent initiator's session ceremony would time out.
-  if (primaryAgent) {
+  // DOD-SPINE-5/7: the PRIMARY agent registers + initiates + coordinates the session/seal FROST
+  // ceremonies over the keystone signaling stream (not a per-agent one), so its ceremony/seal/offer
+  // handlers must be wired on the keystone manager — otherwise a primary-agent initiator's session
+  // ceremony would time out. CELLO-M7-ONBOARD-001: extracted into a function so it can also be wired
+  // when the first agent is elected at runtime (cello_create_agent), not only at startup.
+  function wireKeystonePrimary(agent: LoadedAgent): void {
     wireSessionCeremonyHandler({
-      agentName: primaryAgent.name,
-      persistence: getPersistence(primaryAgent.name),
-      agentPubkeyHex: primaryAgent.pubkey,
+      agentName: agent.name,
+      persistence: getPersistence(agent.name),
+      agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
       signaling: signalingManager,
       logger,
     });
-    // DOD-SPINE-7: the primary agent also coordinates the SEAL FROST ceremony on the keystone.
     wireSealCeremonyHandler({
-      agentName: primaryAgent.name,
-      persistence: getPersistence(primaryAgent.name),
-      agentPubkeyHex: primaryAgent.pubkey,
+      agentName: agent.name,
+      persistence: getPersistence(agent.name),
+      agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
       signaling: signalingManager,
       logger,
     });
     wireSessionOfferHandler({
-      agentName: primaryAgent.name,
-      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(primaryAgent.name),
+      agentName: agent.name,
+      getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       signaling: signalingManager,
       logger,
     });
   }
+  if (primaryAgent) wireKeystonePrimary(primaryAgent);
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
@@ -1123,8 +1129,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // Runtime-add: make the agent immediately registrable/usable (the register handler resolves
       // identity from keyProviders/loadedAgents; per-agent signaling is created lazily on register).
       keyProviders.set(name, keyProvider);
-      loadedAgents.push({ name, pubkey: pubkeyHex, keyProvider });
+      const loaded: LoadedAgent = { name, pubkey: pubkeyHex, keyProvider };
+      loadedAgents.push(loaded);
       agents.push({ name, state: "registered", pubkey: pubkeyHex });
+      // CELLO-M7-ONBOARD-001: on a FRESH install the daemon started with no agents, so there was no
+      // keystone identity and the directory door is stuck `reconnecting`. Elect this first agent as the
+      // keystone primary + wire its ceremony handlers; the running reconnect loop then authenticates
+      // with it (getAuthIdentity now returns it) and connects on its next attempt — no restart needed.
+      if (!primaryAgent) {
+        primaryAgent = loaded;
+        wireKeystonePrimary(loaded);
+        logger.info("directory.keystone.elected", { agentName: name, agentPubkey: pubkeyHex });
+      }
     } catch (err: unknown) {
       logger.error("persist.identity.persist.failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
       return { ok: false, reason: "agent_create_failed", guidance: "Could not create the agent. Check the daemon log and that the CELLO directory is writable, then retry." };
