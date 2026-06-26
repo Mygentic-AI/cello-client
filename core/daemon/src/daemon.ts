@@ -671,6 +671,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: mgr,
       logger,
     });
+    // CELLO-M7-CONN-001 (DOD-CONN-2): inbound session_assignment + seal_interrupted_request
+    // on THIS agent's own stream, so a non-primary agent receives inbound sessions (SPINE-5).
+    wirePerAgentSessionInbound(mgr);
     return entry;
   }
 
@@ -2789,12 +2792,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
   }
 
-  // Register the persistent responder. This is a REAL registered handler (not a
-  // test-only path): it fires for every inbound seal_interrupted_request.
-  signalingManager.registerInboundHandler((frame) => {
-    if (frame["type"] !== "seal_interrupted_request") return;
-    void handleInboundSealInterruptedRequest(frame);
-  });
+  // CELLO-M7-CONN-001 (DOD-CONN-2): the inbound seal_interrupted_request responder is now
+  // wired PER-AGENT (wirePerAgentSessionInbound, below) onto each agent's own signaling
+  // manager — not once on the keystone — so every agent (not just the primary) receives it
+  // on its own authenticated stream.
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
   //
@@ -3161,10 +3162,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       });
   }
 
-  signalingManager.registerInboundHandler((frame) => {
-    if (frame["type"] !== "session_assignment") return;
-    handleInboundSessionAssignment(frame);
-  });
+  // CELLO-M7-CONN-001 (DOD-CONN-2): wire the inbound session/seal responders onto a GIVEN
+  // signaling manager. Called for EVERY agent's own per-agent manager (via getAgentSignaling)
+  // so each agent receives inbound session_assignment + seal_interrupted_request on its OWN
+  // authenticated stream — closing the SPINE-5 gap where only the primary (whose stream WAS
+  // the keystone) received them. A frame arrives on exactly one agent's stream, so there is no
+  // double-dispatch; each handler resolves the local agent internally and that resolution
+  // matches the stream the directory routed the frame to.
+  function wirePerAgentSessionInbound(mgr: SignalingManager): void {
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "seal_interrupted_request") return;
+      void handleInboundSealInterruptedRequest(frame as Record<string, unknown>);
+    });
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_assignment") return;
+      handleInboundSessionAssignment(frame as Record<string, unknown>);
+    });
+  }
+  wirePerAgentSessionInbound(signalingManager);
 
   // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the SESSION-OWNING
   // CELLO-M7-ONBOARD-001: the keystone primary's seal-completion listeners (session_sealed /
