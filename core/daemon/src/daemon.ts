@@ -489,15 +489,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     throw new Error("directory_signaling_not_configured");
   };
 
-  // M7 Keystone (Part 1): resolve the agent identity that authenticates the
-  // directory signaling stream. The daemon's directory-facing node is one per
-  // daemon, so the keystone authenticates as the PRIMARY agent (first successfully
-  // loaded). Returns null when no agent is registered yet → connect() throws
-  // no_agent_identity and the SignalingManager stays reconnecting until one exists
-  // (registration, Action 2, brings the first identity).
-  //
-  // NOTE (multi-agent, Action 2+): per-agent directory operations under distinct
-  // identities are out of keystone scope. This establishes the directory door.
   // CELLO-M7-CONN-001 (DOD-CONN-1): the keystone is DELETED. There is no shared directory
   // connection borrowing the "primary" agent's identity. In PRODUCTION every agent operates its
   // OWN directory signaling connection authenticated as itself (getAgentSignaling / signalingFor);
@@ -647,9 +638,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
    * Stop and forget a dedicated per-agent signaling manager. Called when an agent's
    * registration fails terminally — otherwise the lazily-created manager (and its
    * libp2p node + effectively-unbounded reconnect loop) would keep reconnecting forever
-   * for an agent that is not registered/online. No-op for the primary (it reuses the
-   * keystone manager, which is never stored here) and for agents with no dedicated
-   * manager. On a later retry, getAgentSignaling re-creates it.
+   * for an agent that is not registered/online. No-op on the test path (the shared manager is not
+   * stored in perAgentSignaling) and for agents with no dedicated manager. On a later retry,
+   * getAgentSignaling re-creates it.
    */
   async function dropAgentSignaling(agentName: string): Promise<void> {
     const entry = perAgentSignaling.get(agentName);
@@ -719,9 +710,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   function directorySignalingStatus(): DirectorySignalingState {
     if (sharedSignaling) return sharedSignaling.status;
     const managers = [...perAgentSignaling.values()];
-    // No per-agent connection (no agents online, or none connected yet) → "reconnecting", matching the
-    // pre-CONN-001 fresh-install behavior (the keystone showed reconnecting with no primary identity).
-    return managers.some((m) => m.signaling.status === "connected") ? "connected" : "reconnecting";
+    // CONN-001 (fallback-finder MED): a single daemon-level field cannot fully represent N independent
+    // per-agent connections, but it must NOT show "connected" while any agent is severed (that would
+    // mask a partial directory outage — the severed agent silently never receives inbound). So report
+    // "connected" ONLY when every per-agent manager is connected; otherwise "reconnecting" (degraded or
+    // none). No managers (no agent online) → "reconnecting", matching pre-CONN-001 fresh-install
+    // behavior. (Per-agent connection state is the future faithful surface.)
+    if (managers.length === 0) return "reconnecting";
+    return managers.every((m) => m.signaling.status === "connected") ? "connected" : "reconnecting";
   }
 
   // CONN-001: stop every directory signaling connection on shutdown — the shared test manager AND
@@ -1108,6 +1104,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: true };
     }
     onlineAgents.add(name);
+    // CELLO-M7-CONN-001 (DOD-CONN-2, code-review HIGH): the "online" transition establishes THIS
+    // agent's OWN directory signaling connection (the documented getAgentSignaling "online" trigger),
+    // so the directory has a stream to push inbound session_assignment / seal_interrupted_request to.
+    // Without this, a started receiver agent sitting in cello_await_session (notably after a daemon
+    // restart, where login does NOT auto-start agents) would have no stream and never receive inbound —
+    // a regression of the pre-CONN-001 keystone, which connected the primary at startup. Lazy +
+    // idempotent (getAgentSignaling reuses an existing manager); the test path returns the shared one.
+    const startKp = keyProviders.get(name);
+    if (startKp && agent.pubkey) {
+      getAgentSignaling(name, startKp, agent.pubkey);
+      logger.info("agent.directory.connection.initiated", { agentName: name, agentPubkey: agent.pubkey });
+    }
     // DOD-LOOP-1: each online agent gets its OWN standing receiver, so two agents on one daemon
     // (loopback) never contend for a single one. Fire-and-forget (initiate/accept also ensure on
     // demand); never let it throw out of the handler. Once the SR is up, re-park any of THIS
@@ -1167,7 +1175,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // restart). There is no shared keystone to elect into. In the test path getAgentSignaling returns
       // the already-present shared manager (no-op).
       getAgentSignaling(name, keyProvider, pubkeyHex);
-      logger.info("agent.directory.connection.established", { agentName: name, agentPubkey: pubkeyHex });
+      // "initiated" not "established": getAgentSignaling starts the connection but does not await it
+      // (the SignalingManager emits directory.signaling.connected when it actually authenticates).
+      logger.info("agent.directory.connection.initiated", { agentName: name, agentPubkey: pubkeyHex });
     } catch (err: unknown) {
       logger.error("persist.identity.persist.failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
       return { ok: false, reason: "agent_create_failed", guidance: "Could not create the agent. Check the daemon log and that the CELLO directory is writable, then retry." };
@@ -1214,7 +1224,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       if (!connected) return { recorded: false, reason: "directory_unreachable" };
       let resolveFrame!: (f: Record<string, unknown>) => void;
       const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
-      // Match the reply by agent_id so a revocation on the shared keystone is never cross-wired.
+      // Match the reply by agent_id so a revocation on a shared signaling stream is never cross-wired.
       const unregister = signaling.registerInboundHandler((frame) => {
         const t = frame["type"];
         if ((t === "agent_revocation_ack" || t === "agent_revocation_error") && frame["agent_id"] === regAgentId) resolveFrame(frame);
@@ -1480,8 +1490,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
       // Multi-agent: register over THIS agent's own directory signaling stream (authed
       // as this agent), so the directory routes its dkg_complete/register_success back
-      // to it. The primary agent reuses the keystone stream; any other agent gets a
-      // dedicated one. The DKG's FROST streams open on this agent's directory node.
+      // to it. CONN-001: every agent has its own dedicated stream (no shared keystone). The
+      // DKG's FROST streams open on this agent's directory node.
       const agentRecord = loadedAgents.find((a) => a.name === name);
       const agentPubkeyHex = agentRecord?.pubkey ?? Buffer.from(await keyProvider.getPublicKey()).toString("hex");
       const { signaling: agentSignaling, getNode: agentGetNode } = getAgentSignaling(name, keyProvider, agentPubkeyHex);
@@ -1574,9 +1584,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   type SealCompletion = { rootHex: string; legibility?: unknown };
   const pendingSealWaiters = new Map<string, (completion: SealCompletion) => void>();
 
-  // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling seam (keystone
-  // for the primary agent, per-agent for the rest — the directory routes session_sealed to the
-  // session-owning agent's authenticated stream). Function declaration so getAgentSignaling
+  // M7 DOD-SPINE-7: register the session_sealed completion handler on a signaling manager — per-agent
+  // in production (the directory routes session_sealed to the session-owning agent's authenticated
+  // stream), or the shared manager on the test path. Function declaration so getAgentSignaling
   // (defined earlier, called at runtime) can wire it per-agent.
   function registerSessionSealedListener(signaling: SignalingManager, agentName: string, agentPubkeyHex: string): () => void {
     return signaling.registerInboundHandler((frame) => {
@@ -2677,13 +2687,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // CONN-001: send the rejection over the LOCAL responder agent's own stream (the agent whose
       // pubkey is counterpartyPubkey — the stream this request arrived on). If unresolved, sendOver
       // reports a send failure rather than throwing.
-      await sendOver(agents.find((a) => a.pubkey === counterpartyPubkey)?.name ?? "", {
+      const sent = await sendOver(agents.find((a) => a.pubkey === counterpartyPubkey)?.name ?? "", {
         type: "seal_interrupted_rejection",
         sessionId,
         initiatorPubkey,
         reason,
       });
-      logger.warn("session.interrupted.request.rejected", { sessionId, reason, correlationId });
+      // fallback-finder LOW: don't log the rejection as delivered when the send failed (e.g. no local
+      // agent for counterpartyPubkey, or a transient send error) — the counterparty would otherwise
+      // appear rejected but only ever see a timeout.
+      if (sent.ok) {
+        logger.warn("session.interrupted.request.rejected", { sessionId, reason, correlationId });
+      } else {
+        logger.warn("session.interrupted.request.rejection.send.failed", { sessionId, reason, sendReason: sent.reason, correlationId });
+      }
     };
 
     // DOD-LOOP-1: resolve the addressed local agent FIRST — the composite (agent, session_id) key
@@ -3164,12 +3181,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // wires them per-agent in getAgentSignaling (each agent receives on its own stream).
   if (sharedSignaling) wirePerAgentSessionInbound(sharedSignaling);
 
-  // M7 DOD-SPINE-7: session_sealed listener. The directory delivers this over the SESSION-OWNING
-  // CELLO-M7-ONBOARD-001: the keystone primary's seal-completion listeners (session_sealed /
-  // seal_unilateral_confirmed / seal_unilateral_notification) are now registered inside
-  // wireKeystonePrimary — at startup for a loaded primary AND at runtime when the first agent is
-  // elected (cello_create_agent on a fresh install). They must NOT be a separate startup-only block,
-  // or a fresh-install primary's seals would silently never finalize (review HIGH).
+  // M7 DOD-SPINE-7 / CELLO-M7-CONN-001: the seal-completion listeners (session_sealed /
+  // seal_unilateral_confirmed / seal_unilateral_notification) are registered PER-AGENT inside
+  // getAgentSignaling (the directory routes each over the session-owning agent's authenticated
+  // stream), and on the shared manager for the test path via wireSharedHandlers. No keystone, no
+  // runtime election — a fresh-install agent gets them when it comes online (create/start).
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
@@ -3936,13 +3952,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       manifestPollScheduler.cancel();
     }
     logger.info("daemon.stopped", { pid: process.pid, reason });
-    // Stop SignalingManager (flushes pending ops with shutdown error, cancels reconnect loop)
+    // CONN-001 (code-review LOW): stopAllSignaling() stops the shared manager AND every per-agent
+    // manager (best-effort). The previously-separate per-agent stop loop here was redundant and
+    // unguarded (would abort the rest of shutdown if stop() ever threw on a second call) — removed.
     await stopAllSignaling();
-    // Stop every per-agent signaling stream too (multi-agent), so no agent's directory
-    // node / reconnect loop is orphaned past shutdown.
-    for (const entry of perAgentSignaling.values()) {
-      await entry.signaling.stop();
-    }
     // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
     await sessionNodeManager.gracefulShutdown();
     await ipcServer.stop();

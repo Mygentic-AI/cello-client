@@ -44,7 +44,8 @@ export type ManifestPollFailureReason =
   | "manifest_signature_invalid"
   | "manifest_not_yet_valid"
   | "manifest_expired"
-  | "manifest_version_rollback";
+  | "manifest_version_rollback"
+  | "manifest_store_error";
 
 export type ManifestPollOutcome =
   | { ok: true; adopted: boolean; oldVersion: number | null; newVersion: number }
@@ -136,23 +137,29 @@ export async function pollManifestOverHttp(
     return { ok: false, reason: "manifest_expired" };
   }
 
-  // 6. Anti-rollback — never adopt a version older than the trusted floor.
-  const lastSeen = await manifestVersionStore.getLastSeenVersion();
-  if (lastSeen !== null && manifest.version < lastSeen) {
-    logger.warn("manifest.http.poll.failed", { reason: "manifest_version_rollback", manifestVersion: manifest.version, lastSeenVersion: lastSeen, correlationId });
-    return { ok: false, reason: "manifest_version_rollback" };
+  // 6-7. Anti-rollback + adopt. The version store / provider are I/O (the version store is
+  // DB-backed in production), so they can THROW — wrap them so a store error becomes a distinct,
+  // LOGGED failure (manifest_store_error) instead of an invisible throw that silently disables
+  // manifest adoption forever (fallback-finder MED).
+  try {
+    const lastSeen = await manifestVersionStore.getLastSeenVersion();
+    if (lastSeen !== null && manifest.version < lastSeen) {
+      logger.warn("manifest.http.poll.failed", { reason: "manifest_version_rollback", manifestVersion: manifest.version, lastSeenVersion: lastSeen, correlationId });
+      return { ok: false, reason: "manifest_version_rollback" };
+    }
+    if (lastSeen !== null && manifest.version === lastSeen) {
+      // Already current — nothing to adopt.
+      return { ok: true, adopted: false, oldVersion: lastSeen, newVersion: manifest.version };
+    }
+    const oldVersion = manifestProvider.getCurrentManifest()?.version ?? null;
+    manifestProvider.updateManifest(manifest);
+    await manifestVersionStore.persistVersion(manifest.version);
+    logger.info("manifest.http.poll.success", { oldVersion, newVersion: manifest.version, directoryUrl, correlationId });
+    return { ok: true, adopted: true, oldVersion, newVersion: manifest.version };
+  } catch (err: unknown) {
+    logger.error("manifest.http.poll.failed", { reason: "manifest_store_error", manifestVersion: manifest.version, directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    return { ok: false, reason: "manifest_store_error" };
   }
-  if (lastSeen !== null && manifest.version === lastSeen) {
-    // Already current — nothing to adopt.
-    return { ok: true, adopted: false, oldVersion: lastSeen, newVersion: manifest.version };
-  }
-
-  // 7. Adopt.
-  const oldVersion = manifestProvider.getCurrentManifest()?.version ?? null;
-  manifestProvider.updateManifest(manifest);
-  await manifestVersionStore.persistVersion(manifest.version);
-  logger.info("manifest.http.poll.success", { oldVersion, newVersion: manifest.version, directoryUrl, correlationId });
-  return { ok: true, adopted: true, oldVersion, newVersion: manifest.version };
 }
 
 /**
@@ -183,8 +190,11 @@ export function startHttpManifestPoll(
       rootKeys,
       threshold,
       logger,
-    }).catch(() => {
-      // pollManifestOverHttp never throws for poll failures; guard so the loop self-heals.
+    }).catch((err: unknown) => {
+      // pollManifestOverHttp is designed never to throw (all failures return a reason). If it ever
+      // does, LOG it (never swallow silently — that would hide a permanently-disabled poll) and let
+      // the loop self-heal by re-arming below.
+      logger.error("manifest.http.poll.failed", { reason: "manifest_poll_unexpected_error", directoryUrl, error: err instanceof Error ? err.message : String(err) });
     });
     if (!stopped) scheduler.scheduleNext(tick);
   };

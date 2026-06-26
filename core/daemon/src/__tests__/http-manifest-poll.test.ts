@@ -159,4 +159,62 @@ describe("CONN-001 HTTP manifest poll", () => {
     // The cached manifest is untouched — a poll failure never disturbs the daemon.
     expect(provider.getCurrentManifest()?.version).toBe(1);
   });
+
+  // Boundary precision (test-attacker LOW): pin the exact rollback / expiry / not_before ticks.
+  it("AC-005: rejects a manifest exactly one version below the trusted floor (adjacent rollback)", async () => {
+    const v4 = makeTestManifest(NODES, { version: 4 });
+    const { versionStore, deps } = makeDeps();
+    await versionStore.persistVersion(5);
+    const url = await serve(() => v4);
+
+    const out = await pollManifestOverHttp({ directoryUrl: url, ...deps });
+
+    expect(out).toEqual({ ok: false, reason: "manifest_version_rollback" });
+  });
+
+  it("treats expires === now as expired (boundary is <=, deterministic via the now param)", async () => {
+    const T = new Date("2026-06-01T00:00:00Z");
+    const m = makeTestManifest(NODES, { version: 2, notBefore: "2020-01-01T00:00:00Z", expires: "2026-06-01T00:00:00Z" });
+    const { provider, deps } = makeDeps();
+    const url = await serve(() => m);
+
+    const out = await pollManifestOverHttp({ directoryUrl: url, now: T, ...deps });
+
+    expect(out).toEqual({ ok: false, reason: "manifest_expired" });
+    expect(provider.getCurrentManifest()).toBeNull();
+  });
+
+  it("treats now === not_before as valid (not_before is inclusive)", async () => {
+    const T = new Date("2026-06-01T00:00:00Z");
+    const m = makeTestManifest(NODES, { version: 2, notBefore: "2026-06-01T00:00:00Z", expires: "2030-01-01T00:00:00Z" });
+    const { provider, deps } = makeDeps();
+    const url = await serve(() => m);
+
+    const out = await pollManifestOverHttp({ directoryUrl: url, now: T, ...deps });
+
+    expect(out).toMatchObject({ ok: true, adopted: true });
+    expect(provider.getCurrentManifest()?.version).toBe(2);
+  });
+
+  it("MED: a throwing version store yields manifest_store_error (the throw is NOT swallowed)", async () => {
+    const v2 = makeTestManifest(NODES, { version: 2 });
+    const provider = new TestManifestProvider();
+    const throwingStore = {
+      getLastSeenVersion: async () => { throw new Error("db boom"); },
+      persistVersion: async () => {},
+    };
+    const url = await serve(() => v2);
+
+    const out = await pollManifestOverHttp({
+      directoryUrl: url,
+      manifestProvider: provider,
+      manifestVersionStore: throwingStore as never,
+      rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+      threshold: TEST_CONSORTIUM_THRESHOLD,
+      logger: noopLogger,
+    });
+
+    expect(out).toEqual({ ok: false, reason: "manifest_store_error" });
+    expect(provider.getCurrentManifest()).toBeNull();
+  });
 });
