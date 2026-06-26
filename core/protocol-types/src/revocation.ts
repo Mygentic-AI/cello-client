@@ -89,4 +89,5 @@ export type AgentRevocationErrorReason =
   | "unknown_agent" // no agent_profiles row for agent_id
   | "not_self_authorized" // the authenticated stream key is not the agent's own registered K_local
   | "signature_invalid" // the signature does not verify against the registered K_local
-  | "malformed"; // missing/invalid fields in the request
+  | "malformed" // missing/invalid fields in the request
+  | "persist_failed"; // verified, but the durable write failed — caller should defer + retry

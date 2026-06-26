@@ -1233,7 +1233,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         unregister();
       }
     } finally {
-      if (createdSignaling) await dropAgentSignaling(agentName).catch(() => { /* best-effort */ });
+      if (createdSignaling) {
+        await dropAgentSignaling(agentName).catch((err) => {
+          logger.warn("agent.revocation.signaling_teardown_failed", { agentName, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
     }
   }
 
@@ -1277,6 +1281,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       } else {
         logger.info("agent.revocation.recorded", { agentId: target.regAgentId });
       }
+    } else if (target.state === "registered") {
+      // Anomaly (fallback-finder MEDIUM): the agent is locally marked registered but has no
+      // directory-known id, so the revocation cannot be pushed. Do NOT report the benign "never
+      // registered" — surface it loudly so a registered-but-unrevocable agent is visible.
+      revocationReason = "registered_without_directory_id";
+      logger.error("agent.removal.failed", { agentName: name, error: "registered_without_directory_id" });
     }
 
     // Local retire (one-way) + runtime purge — only for a fresh removal. An already-retired re-push does
@@ -1330,7 +1340,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         ? " A signed revocation was recorded at the directory — peers will see it as revoked."
         : directoryRevocation === "deferred"
           ? ` The directory could NOT be reached to record the revocation (${revocationReason ?? "directory_unreachable"}) — peers do not yet see it as revoked. Re-run 'cello remove-agent ${name}' when the directory is reachable to push it.`
-          : " It was never registered with a directory, so there is no directory revocation to record.";
+          : revocationReason === "registered_without_directory_id"
+            ? " WARNING: this agent appears registered but has no directory id recorded locally, so its revocation could NOT be pushed — peers may still see it as reachable. Check the daemon logs (agent.removal.failed)."
+            : " It was never registered with a directory, so there is no directory revocation to record.";
     return { ok: true, name, agentId, oneWay: true, directoryRevocation, guidance: baseLine + dirLine };
   });
 
