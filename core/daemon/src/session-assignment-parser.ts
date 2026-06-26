@@ -132,6 +132,7 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     "no_connection",
     "connection_id_required",
     "session_request_missing_peer_id",
+    "agent_revoked", // CELLO-M7-REMOVE-001 DOD-REMOVE-3: the target (or initiator) agent is revoked
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
 }
