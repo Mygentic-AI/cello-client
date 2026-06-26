@@ -83,6 +83,14 @@ export type {
   RegistrationState,
 } from "./registration.js";
 
+export { buildAgentRevocationTbs, AGENT_REVOCATION_DOMAIN } from "./revocation.js";
+export type {
+  RevokeAgentRequest,
+  AgentRevocationAck,
+  AgentRevocationError,
+  AgentRevocationErrorReason,
+} from "./revocation.js";
+
 export type {
   ConnectionRequest,
   ConnectionRequestInbound,

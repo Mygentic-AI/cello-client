@@ -229,6 +229,32 @@ export class DbIdentityStore {
   }
 
   /**
+   * Read the row to act on for a removal / directory-revocation re-push (REMOVE-001 DOD-REMOVE-2): the
+   * ACTIVE row for the name if one exists (a fresh removal), else the MOST-RECENTLY-retired row (a
+   * re-push of an already-retired agent whose directory revocation did not land — DB-001). Includes the
+   * K_local seed (to re-sign the revocation) and the DIRECTORY-known reg_agent_id (what the directory is
+   * asked to revoke; null if the agent was never registered). Returns null if no row with this name
+   * exists at all.
+   */
+  getAgentForRevocation(
+    agentName: string,
+  ): { localAgentId: string; regAgentId: string | null; kLocalSeed: Uint8Array; state: string } | null {
+    const r = this.#db
+      .prepare(
+        `SELECT agent_id, reg_agent_id, k_local_seed, state FROM agents WHERE agent_name = ?
+         ORDER BY (state != 'retired') DESC, updated_at DESC LIMIT 1`,
+      )
+      .get(agentName) as { agent_id: string; reg_agent_id: string | null; k_local_seed: unknown; state: string } | undefined;
+    if (!r) return null;
+    return {
+      localAgentId: r.agent_id,
+      regAgentId: r.reg_agent_id ?? null,
+      kLocalSeed: toBytes(r.k_local_seed),
+      state: r.state,
+    };
+  }
+
+  /**
    * Enumerate ACTIVE agents (agent_id + name + seed + pubkey + state) for the daemon's startup loader.
    * Retired rows are EXCLUDED — they must never be resurrected into the runtime — but remain in the DB
    * and are readable directly for accountability (SI-002).

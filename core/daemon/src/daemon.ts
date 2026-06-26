@@ -58,7 +58,7 @@ import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCer
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import {
   resolveCelloEnv,
@@ -1185,69 +1185,153 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // retired identity from the live runtime so it stops operating and the name is immediately available
   // to a NEW `cello_create_agent`. One-way. (DEC-4: the signed DIRECTORY revocation is DOD-REMOVE-2 —
   // not built here; this unit is the local record shape only.)
+  // CELLO-M7-REMOVE-001 (DOD-REMOVE-2): build + self-sign an agent revocation and submit it to the
+  // directory on the agent's K_local-authenticated signaling stream. Self-authorized — the directory
+  // verifies the signature against the agent's registered K_local before appending. Best-effort: returns
+  // { recorded:false, reason } if the directory is unreachable / rejects (DB-001 — the caller still
+  // applies the one-way local retire and surfaces a distinct status).
+  async function submitAgentRevocation(opts: {
+    agentName: string;
+    signer: import("@cello-protocol/crypto").KeyProvider;
+    kLocalPubkeyHex: string;
+    regAgentId: string;
+  }): Promise<{ recorded: boolean; reason?: string }> {
+    const { agentName, signer, kLocalPubkeyHex, regAgentId } = opts;
+    const epochId = "";
+    const reason = "voluntary";
+    const revokedAt = Date.now();
+    const tbs = buildAgentRevocationTbs(regAgentId, kLocalPubkeyHex, epochId, reason, revokedAt);
+    const sigHex = Buffer.from(await signer.sign(tbs)).toString("hex");
+
+    // If the agent has no live signaling (e.g. a re-push of an already-retired agent), getAgentSignaling
+    // lazily creates a dedicated manager — drop it again afterwards so we don't leak a reconnect loop.
+    const hadSignaling = perAgentSignaling.has(agentName) || primaryAgent?.name === agentName;
+    const { signaling } = getAgentSignaling(agentName, signer, kLocalPubkeyHex);
+    const createdSignaling = !hadSignaling && primaryAgent?.name !== agentName;
+    try {
+      const connected = await waitForSignalingConnected(signaling, 10_000);
+      if (!connected) return { recorded: false, reason: "directory_unreachable" };
+      let resolveFrame!: (f: Record<string, unknown>) => void;
+      const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+      // Match the reply by agent_id so a revocation on the shared keystone is never cross-wired.
+      const unregister = signaling.registerInboundHandler((frame) => {
+        const t = frame["type"];
+        if ((t === "agent_revocation_ack" || t === "agent_revocation_error") && frame["agent_id"] === regAgentId) resolveFrame(frame);
+      });
+      try {
+        const sent = await signaling.sendRaw({ type: "revoke_agent", agent_id: regAgentId, epoch_id: epochId, reason, revoked_at: revokedAt, signature: sigHex });
+        if (!sent.ok) return { recorded: false, reason: sent.reason ?? "directory_unreachable" };
+        let timer!: ReturnType<typeof setTimeout>;
+        const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), 15_000); });
+        const frame = await Promise.race([pending, timeoutP]);
+        clearTimeout(timer);
+        if (frame["type"] === "__timeout__") return { recorded: false, reason: "timeout" };
+        if (frame["type"] === "agent_revocation_error") return { recorded: false, reason: String(frame["reason"] ?? "rejected") };
+        logger.info("agent.revocation.submitted", { agentName, agentId: regAgentId });
+        return { recorded: true };
+      } finally {
+        unregister();
+      }
+    } finally {
+      if (createdSignaling) await dropAgentSignaling(agentName).catch(() => { /* best-effort */ });
+    }
+  }
+
   handlers.set("cello_remove_agent", async (params, _connectionId) => {
     const name = params?.name as string | undefined;
     if (!name || typeof name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
       return { ok: false, reason: "invalid_agent_name", guidance: "Provide the 'name' of the agent to remove (1-64 chars: letters, digits, '-' or '_')." };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
-    const agentId = store.retireAgent(name);
-    if (!agentId) {
-      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${name}'. Check cello_list_agents. Removal is one-way and a name can only be removed once.` };
+    // The active row (a fresh removal) OR the most-recent retired row (a DB-001 re-push). Captured BEFORE
+    // any retire — the active-only accessors filter retired rows out once state is flipped.
+    const target = store.getAgentForRevocation(name);
+    if (!target) {
+      return { ok: false, reason: "agent_not_found", guidance: `No agent named '${name}'. Check cello_list_agents.` };
     }
-    // Purge the retired identity from the live runtime: drop it from the loaded set, key providers, and
-    // online set; tear down its standing receiver if it was online. After this the in-memory
-    // create-collision check passes and the retired identity no longer signs or receives.
-    // Tear down the retired identity's live runtime so it can no longer receive or re-authenticate.
-    // These are AWAITED and any failure is LOGGED (never swallowed) — removal is a revocation-class
-    // action; a teardown that didn't happen must be visible (review HIGH-1 / fallback-finder MEDIUM).
-    if (onlineAgents.has(name)) {
-      onlineAgents.delete(name);
-      await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
-        logger.warn("agent.removal.receiver_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
-      });
+    const wasActive = target.state !== "retired";
+    const agentId = target.localAgentId;
+
+    // An already-retired agent that was never registered has nothing to do — no local retire (one-way,
+    // already done) and no directory revocation to push. Treat a repeat removal as agent_not_found (a
+    // tombstone is never re-retired). A retired agent WITH a directory id falls through to the DB-001
+    // re-push below.
+    if (!wasActive && !target.regAgentId) {
+      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${name}'. Removal is one-way; '${name}' is already retired.` };
     }
-    // Stop+forget the retired agent's dedicated per-agent signaling manager. A non-primary agent that
-    // registered or came online owns one with an effectively-unbounded reconnect loop — without this it
-    // keeps re-authenticating the directory door as the RETIRED identity (review HIGH-1). No-op for the
-    // primary (it reuses the keystone manager) and for agents with no dedicated manager.
-    await dropAgentSignaling(name).catch((err) => {
-      logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
-    });
-    keyProviders.delete(name);
-    const li = loadedAgents.findIndex((a) => a.name === name);
-    if (li >= 0) loadedAgents.splice(li, 1);
-    const ai = agents.findIndex((a) => a.name === name);
-    if (ai >= 0) agents.splice(ai, 1);
-    // If the retired agent was the directory keystone, UNWIRE its keystone listeners and clear it — so
-    // the shared signaling stream carries no stale/duplicate listeners and the door stops
-    // authenticating as the retired identity. A later create-agent re-elects + re-wires (ONBOARD-001); a
-    // restart re-derives from the active set. (review HIGH-2: the listeners were never unregistered.)
-    if (primaryAgent && primaryAgent.name === name) {
-      keystoneDispose?.();
-      keystoneDispose = undefined;
-      primaryAgent = undefined;
-      logger.info("directory.keystone.cleared", { agentName: name, agentId });
-    }
-    // Drop the retired agent as any connection's current agent.
-    for (const [connId, state] of perConnectionState) {
-      if (state.currentAgent === name) {
-        state.currentAgent = null;
-        notificationDispatcher.setCurrentAgent(connId, null);
-        notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
+
+    // DOD-REMOVE-2: build + self-sign + submit the directory revocation. Done for a fresh removal AND a
+    // re-push of an already-retired agent (DB-001). Skipped only if the agent was never registered (no
+    // directory-known id to revoke). The signer is re-derived from the kept K_local seed, so it works
+    // even for an already-retired agent whose runtime keyProvider was purged.
+    let directoryRevocation: "recorded" | "deferred" | "skipped" = "skipped";
+    let revocationReason: string | undefined;
+    if (target.regAgentId) {
+      const signer = new InMemoryKeyProvider(target.kLocalSeed);
+      const kLocalPubkeyHex = Buffer.from(await signer.getPublicKey()).toString("hex");
+      const res = await submitAgentRevocation({ agentName: name, signer, kLocalPubkeyHex, regAgentId: target.regAgentId });
+      directoryRevocation = res.recorded ? "recorded" : "deferred";
+      revocationReason = res.reason;
+      if (!res.recorded) {
+        logger.error("agent.removal.failed", { agentName: name, error: res.reason ?? "directory_unreachable" });
+      } else {
+        logger.info("agent.revocation.recorded", { agentId: target.regAgentId });
       }
     }
-    // agent.removal.retired (observability): never log key material — only the name + agent_id.
-    logger.info("agent.removal.retired", { agentName: name, agentId });
-    notificationDispatcher.dispatchAgentStateChanged(name, "offline", "removed");
-    return {
-      ok: true,
-      name,
-      agentId,
-      oneWay: true,
-      guidance:
-        "Agent retired. This is one-way: its identity and history are kept for accountability, but it can no longer connect. The name is now free to reuse with cello create-agent.",
-    };
+
+    // Local retire (one-way) + runtime purge — only for a fresh removal. An already-retired re-push does
+    // not re-retire (and has nothing loaded to purge).
+    if (wasActive) {
+      store.retireAgent(name);
+      // Tear down the retired identity's live runtime so it can no longer receive or re-authenticate.
+      // AWAITED + LOGGED on failure (review HIGH-1 / fallback-finder MEDIUM): a teardown that didn't
+      // happen must be visible.
+      if (onlineAgents.has(name)) {
+        onlineAgents.delete(name);
+        await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
+          logger.warn("agent.removal.receiver_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+        });
+      }
+      // Stop+forget the retired agent's dedicated per-agent signaling manager (review HIGH-1).
+      await dropAgentSignaling(name).catch((err) => {
+        logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+      });
+      keyProviders.delete(name);
+      const li = loadedAgents.findIndex((a) => a.name === name);
+      if (li >= 0) loadedAgents.splice(li, 1);
+      const ai = agents.findIndex((a) => a.name === name);
+      if (ai >= 0) agents.splice(ai, 1);
+      // If the retired agent was the directory keystone, UNWIRE its keystone listeners + clear it
+      // (review HIGH-2: the listeners were never unregistered → double-wire on re-election).
+      if (primaryAgent && primaryAgent.name === name) {
+        keystoneDispose?.();
+        keystoneDispose = undefined;
+        primaryAgent = undefined;
+        logger.info("directory.keystone.cleared", { agentName: name, agentId });
+      }
+      // Drop the retired agent as any connection's current agent.
+      for (const [connId, state] of perConnectionState) {
+        if (state.currentAgent === name) {
+          state.currentAgent = null;
+          notificationDispatcher.setCurrentAgent(connId, null);
+          notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
+        }
+      }
+      // agent.removal.retired (observability): never log key material — only the name + agent_id.
+      logger.info("agent.removal.retired", { agentName: name, agentId });
+      notificationDispatcher.dispatchAgentStateChanged(name, "offline", "removed");
+    }
+
+    const baseLine = wasActive
+      ? "Agent retired. This is one-way: its identity and history are kept for accountability, but it can no longer connect. The name is now free to reuse with cello create-agent."
+      : "Agent was already retired locally.";
+    const dirLine =
+      directoryRevocation === "recorded"
+        ? " A signed revocation was recorded at the directory — peers will see it as revoked."
+        : directoryRevocation === "deferred"
+          ? ` The directory could NOT be reached to record the revocation (${revocationReason ?? "directory_unreachable"}) — peers do not yet see it as revoked. Re-run 'cello remove-agent ${name}' when the directory is reachable to push it.`
+          : " It was never registered with a directory, so there is no directory revocation to record.";
+    return { ok: true, name, agentId, oneWay: true, directoryRevocation, guidance: baseLine + dirLine };
   });
 
   // ─── MCP-001: cello_stop_agent handler ───
