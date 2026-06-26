@@ -738,6 +738,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     wireSharedHandlers(first, sharedSignaling);
   }
 
+  // CELLO-M7-CONN-001 (DOD-CONN-1, code-review HIGH): in PRODUCTION, bring up EACH loaded agent's OWN
+  // directory connection at startup. A registered agent must have a directory presence whenever the
+  // daemon runs — so the directory can route inbound session_assignment/seal to it (notably after a
+  // restart, where login does NOT auto-start agents), and `cello status` reflects directory_signaling
+  // as soon as the daemon is up. This replaces the pre-CONN-001 keystone (which connected only the
+  // loaded PRIMARY at startup) with a per-agent connection for EVERY loaded agent. Idempotent with the
+  // create/register/start connect (getAgentSignaling caches per agent).
+  if (!sharedSignaling) {
+    for (const agent of loadedAgents) {
+      getAgentSignaling(agent.name, agent.keyProvider, agent.pubkey);
+    }
+  }
+
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
   const perConnectionState = new Map<string, { currentAgent: string | null; clientType: string }>();
