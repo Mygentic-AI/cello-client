@@ -2898,8 +2898,19 @@ export class SessionNodeManager {
       return;
     }
     this.#standingReceivers.delete(agentName);
-    sr.autoNat.stop();
-    try { await sr.node.stop(); } catch { /* best-effort */ }
+    // Best-effort teardown, but NOT silent: a standing receiver that failed to stop keeps a libp2p
+    // node live on the network. For a removal/retire (a revocation-class action) that must be visible,
+    // so the caller and the operator can see the leak rather than trust a false "torn down". autoNat is
+    // inside the try too — its stop() throwing must not skip node.stop() or escape unlogged.
+    try {
+      sr.autoNat.stop();
+      await sr.node.stop();
+    } catch (err) {
+      this.#logger.warn("session.standing_receiver.teardown.failed", {
+        agentName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   #insertSessionRow(

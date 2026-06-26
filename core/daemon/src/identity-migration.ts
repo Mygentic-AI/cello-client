@@ -378,10 +378,15 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
   const agents = discoverFlatAgents(celloDir);
   let count = 0;
   for (const a of agents) {
-    // Skip an agent that already exists in the encrypted DB (e.g. a prior in-place run imported it but
-    // a cleanup unlink failed) — never overwrite live DB identity with stale flat-file values
-    // (fallback-finder / code-review LOW). deleteFlatIdentity will remove the redundant files.
-    const exists = encDb.prepare("SELECT 1 AS one FROM agents WHERE agent_name = ?").get(a.name) as { one: number } | undefined;
+    // Skip an agent whose name is held by an ACTIVE row in the encrypted DB (e.g. a prior in-place run
+    // imported it but a cleanup unlink failed) — never overwrite live DB identity with stale flat-file
+    // values (fallback-finder / code-review LOW). REMOVE-001: a RETIRED tombstone does NOT occupy the
+    // name (it was freed for reuse), so qualify active-only — matching hasActiveAgent everywhere else —
+    // otherwise a genuinely different flat identity restored under a freed name would be silently
+    // skipped and then deleted. deleteFlatIdentity will remove the redundant files.
+    const exists = encDb
+      .prepare("SELECT 1 AS one FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(a.name) as { one: number } | undefined;
     if (exists) continue;
 
     // K_local seed from the 37-byte CELLO key file. A corrupt key SKIPS the WHOLE agent — its key AND

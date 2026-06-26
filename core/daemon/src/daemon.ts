@@ -687,8 +687,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // handlers must be wired on the keystone manager — otherwise a primary-agent initiator's session
   // ceremony would time out. CELLO-M7-ONBOARD-001: extracted into a function so it can also be wired
   // when the first agent is elected at runtime (cello_create_agent), not only at startup.
-  function wireKeystonePrimary(agent: LoadedAgent): void {
-    wireSessionCeremonyHandler({
+  // Returns a disposer that UNREGISTERS the six keystone listeners. Each wire*/register* helper returns
+  // its own unregister fn; the keystone manager is shared and never stopped, so (unlike the per-agent
+  // managers, which unregister implicitly on stop) these MUST be unregistered explicitly when the
+  // primary is cleared or re-elected — otherwise removing-then-recreating the primary STACKS a second
+  // full set of listeners on the shared stream, double-firing every ceremony/seal frame (review HIGH).
+  function wireKeystonePrimary(agent: LoadedAgent): () => void {
+    const unregister: Array<() => void> = [];
+    unregister.push(wireSessionCeremonyHandler({
       agentName: agent.name,
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
@@ -696,8 +702,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
       signaling: signalingManager,
       logger,
-    });
-    wireSealCeremonyHandler({
+    }));
+    unregister.push(wireSealCeremonyHandler({
       agentName: agent.name,
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
@@ -705,24 +711,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
       signaling: signalingManager,
       logger,
-    });
-    wireSessionOfferHandler({
+    }));
+    unregister.push(wireSessionOfferHandler({
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       signaling: signalingManager,
       logger,
-    });
+    }));
     // The primary closes its OWN sessions over the keystone stream, so the directory routes its
     // session_sealed / seal_unilateral_confirmed / seal_unilateral_notification frames there. These
     // seal-completion listeners MUST be registered for the keystone primary (startup OR runtime
     // election) — otherwise the close waiter never resolves and the seal silently never finalizes
     // (review HIGH: previously these were a separate startup-only block, skipped on a fresh install).
     // The register* functions are hoisted declarations within startDaemon, so callable here.
-    registerSessionSealedListener(signalingManager, agent.name, agent.pubkey);
-    registerUnilateralConfirmedListener(signalingManager, agent.name, agent.pubkey);
-    registerUnilateralUpgradeListener(signalingManager, agent.name, agent.pubkey);
+    unregister.push(registerSessionSealedListener(signalingManager, agent.name, agent.pubkey));
+    unregister.push(registerUnilateralConfirmedListener(signalingManager, agent.name, agent.pubkey));
+    unregister.push(registerUnilateralUpgradeListener(signalingManager, agent.name, agent.pubkey));
+    return () => { for (const u of unregister) { try { u(); } catch { /* unregister is best-effort */ } } };
   }
-  if (primaryAgent) wireKeystonePrimary(primaryAgent);
+  // Disposer for the currently-wired keystone primary listeners (CELLO-M7-REMOVE-001): call it before
+  // clearing or re-electing the primary so the shared stream never carries a stale/duplicate set.
+  let keystoneDispose: (() => void) | undefined;
+  if (primaryAgent) keystoneDispose = wireKeystonePrimary(primaryAgent);
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
@@ -1153,8 +1163,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // demoted agent gets fully wired via the per-agent path on restart), and not worth runtime
       // re-election (un-wire/re-wire) churn.
       if (!primaryAgent) {
+        // Dispose any prior keystone wiring before re-electing, so listeners never stack (REMOVE-001).
+        keystoneDispose?.();
         primaryAgent = loaded;
-        wireKeystonePrimary(loaded);
+        keystoneDispose = wireKeystonePrimary(loaded);
         logger.info("directory.keystone.elected", { agentName: name, agentPubkey: pubkeyHex });
       }
     } catch (err: unknown) {
@@ -1186,19 +1198,34 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // Purge the retired identity from the live runtime: drop it from the loaded set, key providers, and
     // online set; tear down its standing receiver if it was online. After this the in-memory
     // create-collision check passes and the retired identity no longer signs or receives.
+    // Tear down the retired identity's live runtime so it can no longer receive or re-authenticate.
+    // These are AWAITED and any failure is LOGGED (never swallowed) — removal is a revocation-class
+    // action; a teardown that didn't happen must be visible (review HIGH-1 / fallback-finder MEDIUM).
     if (onlineAgents.has(name)) {
       onlineAgents.delete(name);
-      void sessionNodeManager.removeStandingReceiverForAgent(name).catch(() => { /* best-effort */ });
+      await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
+        logger.warn("agent.removal.receiver_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+      });
     }
+    // Stop+forget the retired agent's dedicated per-agent signaling manager. A non-primary agent that
+    // registered or came online owns one with an effectively-unbounded reconnect loop — without this it
+    // keeps re-authenticating the directory door as the RETIRED identity (review HIGH-1). No-op for the
+    // primary (it reuses the keystone manager) and for agents with no dedicated manager.
+    await dropAgentSignaling(name).catch((err) => {
+      logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+    });
     keyProviders.delete(name);
     const li = loadedAgents.findIndex((a) => a.name === name);
     if (li >= 0) loadedAgents.splice(li, 1);
     const ai = agents.findIndex((a) => a.name === name);
     if (ai >= 0) agents.splice(ai, 1);
-    // If the retired agent was the directory keystone, clear it so the daemon stops authenticating the
-    // directory door as a retired identity. A subsequent create-agent re-elects (ONBOARD-001); a
-    // restart re-derives from the active set. (Self-correcting, mirroring the ONBOARD restart note.)
+    // If the retired agent was the directory keystone, UNWIRE its keystone listeners and clear it — so
+    // the shared signaling stream carries no stale/duplicate listeners and the door stops
+    // authenticating as the retired identity. A later create-agent re-elects + re-wires (ONBOARD-001); a
+    // restart re-derives from the active set. (review HIGH-2: the listeners were never unregistered.)
     if (primaryAgent && primaryAgent.name === name) {
+      keystoneDispose?.();
+      keystoneDispose = undefined;
       primaryAgent = undefined;
       logger.info("directory.keystone.cleared", { agentName: name, agentId });
     }

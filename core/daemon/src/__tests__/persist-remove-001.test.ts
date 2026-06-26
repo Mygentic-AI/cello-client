@@ -125,6 +125,42 @@ describe("REMOVE-001 DOD-REMOVE-1 — retire-and-keep + name reuse (local)", () 
     expect(((await client.send("cello_start_agent", { name: "ada" })) as { ok: boolean }).ok).toBe(true);
   });
 
+  it("tears down the ONLINE runtime on removal (not just the agents list): state+current notifications, re-election", async () => {
+    // Teeth for the online-teardown branch (test-attacker): a removal that only splices the in-memory
+    // `agents` array — leaving keyProviders / onlineAgents / the standing receiver / the keystone / the
+    // connection's current agent untouched — would still pass list/use/start (all gate on `agents[]`).
+    // So assert the OBSERVABLE side-effects of the real teardown that an agents-splice-only stub cannot
+    // produce: the agent.removal dispatches agent_state_changed(reason='removed') AND resets the
+    // connection's current agent (agent_current_changed→null). Neither fires under a splice-only stub.
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+
+    await client.send("cello_create_agent", { name: "nora" });
+    expect(((await client.send("cello_start_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+    expect(((await client.send("cello_use_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+
+    const notes: Array<{ notification: string; data: Record<string, unknown> }> = [];
+    client.onNotification((n) => notes.push(n as unknown as { notification: string; data: Record<string, unknown> }));
+
+    expect(((await client.send("cello_remove_agent", { name: "nora" })) as RemoveRes).ok).toBe(true);
+
+    // Let the pushed notification frames arrive.
+    for (let i = 0; i < 20 && notes.length < 2; i++) await new Promise((r) => setTimeout(r, 50));
+    const stateNote = notes.find((n) => n.notification === "agent_state_changed" && n.data["agentName"] === "nora");
+    expect(stateNote, `agent_state_changed must fire on removal: ${JSON.stringify(notes)}`).toBeDefined();
+    expect(stateNote!.data["reason"], "the retired agent is taken offline with reason 'removed'").toBe("removed");
+    const currentNote = notes.find((n) => n.notification === "agent_current_changed");
+    expect(currentNote, "the connection's current agent must be reset on removal").toBeDefined();
+    expect(currentNote!.data["toAgent"], "current agent resets to null (not left pointing at the retired agent)").toBeNull();
+
+    // Re-election path runs cleanly: recreate nora (the keystone disposer fires + re-wires, no stacking)
+    // and it is immediately usable.
+    expect(((await client.send("cello_create_agent", { name: "nora" })) as CreateRes).ok).toBe(true);
+    expect(((await client.send("cello_start_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+    expect(((await client.send("cello_use_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+  });
+
   it("rejects removing a name with no active agent (fail-loud agent_not_found)", async () => {
     const config = makeConfig();
     handle = await startDaemon(config);
