@@ -200,6 +200,7 @@ export async function removeAgent(celloDir: string, name: string): Promise<Comma
       name?: string;
       agentId?: string;
       oneWay?: boolean;
+      directoryRevocation?: string;
     };
     client.close();
 
@@ -214,7 +215,11 @@ export async function removeAgent(celloDir: string, name: string): Promise<Comma
           name: result.name,
           agentId: result.agentId,
           oneWay: result.oneWay,
-          message: "Agent retired (one-way). Its identity and history are kept; the name is free to reuse.",
+          // DOD-REMOVE-2: whether the signed revocation was recorded at the directory (recorded /
+          // deferred — directory unreachable / skipped — never registered). The daemon's guidance
+          // carries the actionable detail.
+          directoryRevocation: result.directoryRevocation,
+          message: result.guidance ?? "Agent retired (one-way). Its identity and history are kept; the name is free to reuse.",
         },
         null,
         2,
