@@ -125,40 +125,65 @@ describe("REMOVE-001 DOD-REMOVE-1 — retire-and-keep + name reuse (local)", () 
     expect(((await client.send("cello_start_agent", { name: "ada" })) as { ok: boolean }).ok).toBe(true);
   });
 
-  it("tears down the ONLINE runtime on removal (not just the agents list): state+current notifications, re-election", async () => {
-    // Teeth for the online-teardown branch (test-attacker): a removal that only splices the in-memory
-    // `agents` array — leaving keyProviders / onlineAgents / the standing receiver / the keystone / the
-    // connection's current agent untouched — would still pass list/use/start (all gate on `agents[]`).
-    // So assert the OBSERVABLE side-effects of the real teardown that an agents-splice-only stub cannot
-    // produce: the agent.removal dispatches agent_state_changed(reason='removed') AND resets the
-    // connection's current agent (agent_current_changed→null). Neither fires under a splice-only stub.
+  it("tears down the ONLINE runtime on removal (BEHAVIORAL: receiver gone, can't sign, fresh SR on recreate)", async () => {
+    // Teeth for the online-teardown branch (test-attacker). list/use/start all gate on `agents[]`, so a
+    // removal that only splices `agents` — leaving keyProviders / onlineAgents / the standing receiver /
+    // current-agent intact — passes them all. The notifications below are NECESSARY but not SUFFICIENT
+    // (a stub could dispatch them without tearing anything down), so we also assert the BEHAVIORAL state
+    // an agents-splice(+dropAgentSignaling+2-dispatch) stub cannot fake:
+    //   (1) the retired agent's standing receiver is actually gone (no longer RECEIVES),
+    //   (2) its key provider is gone — cello_register can no longer resolve it (no longer SIGNS),
+    //   (3) onlineAgents was truly cleared — the RECREATED agent gets a FRESH standing receiver (a stale
+    //       onlineAgents entry would make start an idempotent no-op and leave the new agent with no SR).
     const config = makeConfig();
     handle = await startDaemon(config);
+    const snm = handle.getSessionNodeManager();
     const client = await connect(config.socketPath);
 
     await client.send("cello_create_agent", { name: "nora" });
     expect(((await client.send("cello_start_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
     expect(((await client.send("cello_use_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+    // Baseline: an online agent HAS a standing receiver (it comes up asynchronously after start).
+    const srUp = async (name: string, want: boolean): Promise<boolean> => {
+      for (let i = 0; i < 60; i++) {
+        if ((snm.getStandingReceiverInfo(name) !== null) === want) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return (snm.getStandingReceiverInfo(name) !== null) === want;
+    };
+    expect(await srUp("nora", true), "online nora must have a standing receiver before removal").toBe(true);
 
     const notes: Array<{ notification: string; data: Record<string, unknown> }> = [];
     client.onNotification((n) => notes.push(n as unknown as { notification: string; data: Record<string, unknown> }));
 
     expect(((await client.send("cello_remove_agent", { name: "nora" })) as RemoveRes).ok).toBe(true);
 
-    // Let the pushed notification frames arrive.
+    // BEHAVIORAL (1): the standing receiver is torn down — the retired identity no longer receives.
+    // (The handler awaits removeStandingReceiverForAgent, so it is gone by the time remove returns.)
+    expect(snm.getStandingReceiverInfo("nora"), "the retired agent's standing receiver must be torn down").toBeNull();
+
+    // BEHAVIORAL (2): the key provider is gone — cello_register can no longer resolve nora (it checks
+    // keyProviders before anything else). A stub that left keyProviders intact would get past this check
+    // (to directory_unreachable here), so agent_not_found proves keyProviders.delete actually ran.
+    const regGone = (await client.send("cello_register", { agent: "nora", preAuthToken: "DEV-x" })) as { ok: boolean; reason?: string };
+    expect(regGone.ok).toBe(false);
+    expect(regGone.reason, "the retired identity's signing key must be gone (register can't resolve it)").toBe("agent_not_found");
+
+    // Notifications (necessary, not sufficient): removal is announced + the current agent is reset.
     for (let i = 0; i < 20 && notes.length < 2; i++) await new Promise((r) => setTimeout(r, 50));
     const stateNote = notes.find((n) => n.notification === "agent_state_changed" && n.data["agentName"] === "nora");
     expect(stateNote, `agent_state_changed must fire on removal: ${JSON.stringify(notes)}`).toBeDefined();
-    expect(stateNote!.data["reason"], "the retired agent is taken offline with reason 'removed'").toBe("removed");
+    expect(stateNote!.data["reason"]).toBe("removed");
     const currentNote = notes.find((n) => n.notification === "agent_current_changed");
     expect(currentNote, "the connection's current agent must be reset on removal").toBeDefined();
-    expect(currentNote!.data["toAgent"], "current agent resets to null (not left pointing at the retired agent)").toBeNull();
+    expect(currentNote!.data["toAgent"]).toBeNull();
 
-    // Re-election path runs cleanly: recreate nora (the keystone disposer fires + re-wires, no stacking)
-    // and it is immediately usable.
+    // BEHAVIORAL (3): name reuse + re-election run cleanly AND onlineAgents was truly cleared — the
+    // recreated nora gets its OWN fresh standing receiver (not blocked by a stale online entry).
     expect(((await client.send("cello_create_agent", { name: "nora" })) as CreateRes).ok).toBe(true);
     expect(((await client.send("cello_start_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
     expect(((await client.send("cello_use_agent", { name: "nora" })) as { ok: boolean }).ok).toBe(true);
+    expect(await srUp("nora", true), "the RECREATED nora must get a fresh standing receiver (onlineAgents was cleared)").toBe(true);
   });
 
   it("rejects removing a name with no active agent (fail-loud agent_not_found)", async () => {
