@@ -72,6 +72,8 @@ import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHa
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
+import { startHttpManifestPoll } from "./http-manifest-poll.js";
+import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -278,6 +280,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
     manifestVersionStore: injectedManifestVersionStore, manifestPollScheduler,
+    directoryHttpUrl,
     signalingConnect, challengeVerifier, directoryEndpointResolver, sessionNodeFactory,
     sessionNegotiator, getRelayCircuitAddress,
   } = config;
@@ -400,6 +403,25 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
       "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",
     );
+  }
+
+  // CELLO-M7-CONN-001 (DOD-CONN-3): start the daemon-level HTTP manifest poll. It fetches
+  // ${directoryHttpUrl}/manifest, verifies the threshold signature against the locally-pinned
+  // root keys, applies anti-rollback + expiry, and adopts a newer manifest — independent of any
+  // agent identity, running even with ZERO agents (the deleted keystone could not). Gated on the
+  // same manifest deps as the old signaling poll; off on the M6 backward-compat path (no scheduler).
+  let stopHttpManifestPoll: (() => void) | undefined;
+  if (manifestPollScheduler && manifestProvider && manifestRootKeys && manifestRootKeys.length > 0 && manifestThreshold && manifestThreshold >= 1) {
+    stopHttpManifestPoll = startHttpManifestPoll({
+      scheduler: manifestPollScheduler,
+      directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+      manifestProvider,
+      manifestVersionStore,
+      rootKeys: manifestRootKeys,
+      threshold: manifestThreshold,
+      logger,
+      mintCorrelationId: () => randomUUID(),
+    });
   }
 
   // Load agent identities from the encrypted `agents` table (PERSIST-002 AC-007 — one path).
@@ -532,16 +554,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger,
     maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
     maxBackoffMs: 30_000,
-    // DOD-AUTH-2: the keystone manager (primary agent's directory door) carries the
-    // manifest-poll deps so it re-polls the directory on its live stream and adopts a
-    // newer signed manifest. The SAME shared manifestProvider instance the startup load
-    // + challengeVerifier use, so an adopted manifest updates the cache step-6 reads from.
-    // All optional — undefined on the M6 backward-compat path → polling is simply off.
-    pollScheduler: manifestPollScheduler,
-    manifestProvider,
-    manifestVersionStore,
-    rootKeys: manifestRootKeys,
-    threshold: manifestThreshold,
+    // CELLO-M7-CONN-001 (DOD-CONN-3): the manifest poll no longer rides this signaling
+    // stream — it moved to the daemon-level HTTP poll (startHttpManifestPoll below), so it
+    // runs independent of any agent identity and even with zero agents. The shared
+    // manifestProvider / manifestVersionStore the HTTP poll adopts into are the SAME
+    // instances the startup load + challengeVerifier read.
   });
 
   // ─── Per-agent directory signaling (multi-agent: one signaling stream per agent) ──
@@ -3905,15 +3922,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     manifestVerified,
   });
 
-  // M7-MANIFEST-002 / DOD-AUTH-2: background manifest polling is now ACTIVE. The keystone
-  // SignalingManager (constructed above with the poll deps) calls startPolling() when its
-  // stream reaches connected — it re-polls the directory on the randomized 6–12h interval
-  // and adopts a newer signed manifest (handleManifestPollResponse). No separate wiring
-  // needed here; poll lifecycle = the keystone connection lifecycle.
+  // CELLO-M7-CONN-001 (DOD-CONN-3): background manifest polling runs daemon-level over
+  // unauthenticated HTTP (startHttpManifestPoll above), NOT over a signaling stream. Its
+  // lifecycle is the daemon's, not any agent connection's — so it polls even with zero agents.
 
   // Graceful shutdown
   async function stop(reason: string): Promise<void> {
-    // Cancel any pending manifest poll timer
+    // CELLO-M7-CONN-001: stop the HTTP manifest poll (sets the stopped flag so an in-flight
+    // tick cannot re-arm, and cancels the scheduler). Belt-and-suspenders cancel for the
+    // no-poll case (scheduler present but poll not started).
+    stopHttpManifestPoll?.();
     if (manifestPollScheduler) {
       manifestPollScheduler.cancel();
     }

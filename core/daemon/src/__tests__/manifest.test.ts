@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer, type Server } from "node:http";
 import {
   makeTestManifest,
   TEST_CONSORTIUM_ROOT_KEYS,
@@ -25,6 +26,7 @@ import {
 import {
   TestManifestProvider,
   InMemoryManifestVersionStore,
+  ImmediatePollScheduler,
 } from "@cello-protocol/transport";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { FileManifestProvider } from "../manifest-loader.js";
@@ -246,6 +248,56 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
     expect(logger.events.find((e) => e.event === "directory.auth.manifest.poll.deferred")).toBeUndefined();
     // The manifest still loads + verifies — activation didn't break the startup gate.
     expect(logger.events.find((e) => e.event === "directory.auth.manifest.verified")).toBeDefined();
+  });
+
+  it("CONN-001 AC-004: the HTTP manifest poll runs with ZERO agents and adopts a newer manifest", async () => {
+    // This daemon has NO agents (fresh tempDir, no agents configured) — the exact condition
+    // the keystone could not poll under (it borrowed the primary agent's identity). The poll
+    // moved to daemon-level HTTP (DOD-CONN-3): it must fire and adopt with zero agents.
+    const logger = makeLogger();
+    const v1 = makeValidManifest(1);
+    const v2 = makeValidManifest(2);
+    const manifestProvider = new TestManifestProvider(v1);
+    const versionStore = new InMemoryManifestVersionStore();
+
+    // In-process directory: serves the newer (v2) manifest at GET /manifest.
+    const server: Server = createServer((req, res) => {
+      if (req.method === "GET" && req.url === "/manifest") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(v2));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, r));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+
+    try {
+      handle = await startDaemon(makeBaseConfig(logger, {
+        manifestProvider,
+        manifestRootKeys: TEST_CONSORTIUM_ROOT_KEYS,
+        manifestThreshold: TEST_CONSORTIUM_THRESHOLD,
+        manifestVersionStore: versionStore,
+        manifestPollScheduler: new ImmediatePollScheduler(),
+        directoryHttpUrl: `http://127.0.0.1:${port}`,
+      }));
+
+      // The poll fires on a timer; wait for the adopt (no agents involved at all).
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && manifestProvider.getCurrentManifest()?.version !== 2) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      expect(manifestProvider.getCurrentManifest()?.version).toBe(2);
+      expect(await versionStore.getLastSeenVersion()).toBe(2);
+      const success = logger.events.find((e) => e.event === "manifest.http.poll.success");
+      expect(success).toBeDefined();
+      expect(success?.context.newVersion).toBe(2);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
   });
 
   it("equal version passes (same version as last-seen is not a rollback)", async () => {

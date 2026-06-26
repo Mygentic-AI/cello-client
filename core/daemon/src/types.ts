@@ -173,6 +173,13 @@ export interface DaemonConfig {
    */
   manifestPollScheduler?: IManifestPollScheduler;
   /**
+   * CELLO-M7-CONN-001 (DOD-CONN-3): base URL for the daemon-level HTTP manifest poll
+   * (`${directoryHttpUrl}/manifest`). The poll moved off the keystone signaling stream
+   * to unauthenticated HTTP and runs even with zero agents. Defaults to
+   * resolveDirectoryUrl(process.env). Tests inject an in-process server URL.
+   */
+  directoryHttpUrl?: string;
+  /**
    * M7-MANIFEST-002: challenge verifier for directory step-5 identity proof.
    * When absent, directory challenge verification is skipped.
    */
