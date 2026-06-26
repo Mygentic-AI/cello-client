@@ -17,6 +17,7 @@
  * are NEVER written to a flat file and NEVER logged (SI-001). The row is the only home.
  */
 
+import { randomUUID } from "node:crypto";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import type {
@@ -30,47 +31,125 @@ import type {
 const ML_DSA_ALGORITHM = "ML-DSA-44";
 
 /**
+ * The `agents` schema (CELLO-M7-REMOVE-001 DOD-REMOVE-1). The store is keyed by a STABLE `agent_id`,
+ * not by `agent_name` — guardrail #1: durable identity hangs off agent_id; the human name and the
+ * pubkey are mutable ATTRIBUTES. A partial unique index makes `agent_name` unique only among
+ * NON-retired rows, so removal (state='retired') frees the name for reuse while the retired identity
+ * survives for accountability (SI-002). `state`: 'created' | 'registered' | 'retired'.
+ */
+const CREATE_AGENTS_SQL = `
+  CREATE TABLE IF NOT EXISTS agents (
+    agent_id               TEXT PRIMARY KEY,
+    agent_name             TEXT NOT NULL,
+    -- K_local Ed25519 identity (PERSIST-002: seed moves from agents/<name>/key into this BLOB).
+    k_local_seed           BLOB NOT NULL,
+    k_local_pubkey         TEXT NOT NULL,
+    -- lifecycle: 'created' (K_local exists, not yet registered) | 'registered' | 'retired' (REMOVE-001).
+    state                  TEXT NOT NULL DEFAULT 'created',
+    -- ML-DSA keypair (was ml-dsa-keypair.json).
+    ml_dsa_pubkey          TEXT,
+    ml_dsa_secret          BLOB,
+    ml_dsa_algorithm       TEXT,
+    -- FROST signing share (was frost-share.json).
+    frost_epoch_id         TEXT,
+    frost_primary_pubkey   TEXT,
+    frost_identifier       TEXT,
+    frost_signing_share    BLOB,
+    frost_threshold        INTEGER,
+    frost_participants     INTEGER,
+    frost_commitments      BLOB,
+    frost_verifying_shares BLOB,
+    frost_dkg_method       TEXT,
+    -- registration record (was registration-state.json).
+    reg_agent_id           TEXT,
+    reg_primary_pubkey     TEXT,
+    reg_ml_dsa_pubkey      TEXT,
+    reg_registered_at      INTEGER,
+    reg_status             TEXT,
+    -- agent↔user link captured at registration (was agent-user-link.json).
+    link_agent_id          TEXT,
+    link_pre_auth_token    TEXT,
+    link_linked_at         INTEGER,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL
+  )
+`;
+
+// A name is unique only among NON-retired agents — the DB-level backstop for "free the name on removal".
+const CREATE_ACTIVE_NAME_INDEX_SQL =
+  "CREATE UNIQUE INDEX IF NOT EXISTS agents_active_name ON agents(agent_name) WHERE state != 'retired'";
+
+// The columns of the PRE-REMOVE-001 `agents` table (agent_name PK, no agent_id), in order. Used to
+// copy rows verbatim during the one-time re-key rebuild.
+const PRE_REKEY_COLUMNS = [
+  "agent_name",
+  "k_local_seed",
+  "k_local_pubkey",
+  "state",
+  "ml_dsa_pubkey",
+  "ml_dsa_secret",
+  "ml_dsa_algorithm",
+  "frost_epoch_id",
+  "frost_primary_pubkey",
+  "frost_identifier",
+  "frost_signing_share",
+  "frost_threshold",
+  "frost_participants",
+  "frost_commitments",
+  "frost_verifying_shares",
+  "frost_dkg_method",
+  "reg_agent_id",
+  "reg_primary_pubkey",
+  "reg_ml_dsa_pubkey",
+  "reg_registered_at",
+  "reg_status",
+  "link_agent_id",
+  "link_pre_auth_token",
+  "link_linked_at",
+  "created_at",
+  "updated_at",
+] as const;
+
+/**
+ * One-time re-key of a PRE-REMOVE-001 `agents` table (PRIMARY KEY agent_name, no agent_id) to the new
+ * stable-agent_id shape. Rebuilds the table, backfilling a fresh agent_id per existing row. Runs at
+ * most once — `ensureIdentitySchema` guards it behind a column-presence check — and is wrapped in a
+ * transaction so a crash mid-rebuild leaves the original table intact. Works on node:sqlite (in-memory
+ * test handles) and SQLCipher alike.
+ */
+function rebuildAgentsToAgentIdPk(db: DaemonDatabase): void {
+  const cols = PRE_REKEY_COLUMNS.join(", ");
+  db.exec("BEGIN");
+  try {
+    db.exec("ALTER TABLE agents RENAME TO agents_pre_rekey");
+    db.exec(CREATE_AGENTS_SQL);
+    db.exec(
+      `INSERT INTO agents (agent_id, ${cols})
+       SELECT lower(hex(randomblob(16))), ${cols} FROM agents_pre_rekey`,
+    );
+    db.exec("DROP TABLE agents_pre_rekey");
+    db.exec("COMMIT");
+  } catch (err) {
+    try { db.exec("ROLLBACK"); } catch { /* the failing statement may have already aborted the txn */ }
+    throw err;
+  }
+}
+
+/**
  * Idempotent schema for the identity store. Called once at daemon init AND defensively by each
- * DbRegistrationPersistence constructor (CREATE TABLE IF NOT EXISTS is idempotent), so the store
- * works whether or not the composition root has run its own ensure.
+ * DbRegistrationPersistence constructor, so the store works whether or not the composition root has
+ * run its own ensure. Creates the table on a fresh DB, re-keys a pre-REMOVE-001 table to the
+ * stable-agent_id shape once, and (always) ensures the active-name partial unique index.
  */
 export function ensureIdentitySchema(db: DaemonDatabase): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS agents (
-      agent_name             TEXT PRIMARY KEY,
-      -- K_local Ed25519 identity (PERSIST-002: seed moves from agents/<name>/key into this BLOB).
-      k_local_seed           BLOB NOT NULL,
-      k_local_pubkey         TEXT NOT NULL,
-      -- lifecycle: 'created' (K_local exists, not yet registered) | 'registered'.
-      state                  TEXT NOT NULL DEFAULT 'created',
-      -- ML-DSA keypair (was ml-dsa-keypair.json).
-      ml_dsa_pubkey          TEXT,
-      ml_dsa_secret          BLOB,
-      ml_dsa_algorithm       TEXT,
-      -- FROST signing share (was frost-share.json).
-      frost_epoch_id         TEXT,
-      frost_primary_pubkey   TEXT,
-      frost_identifier       TEXT,
-      frost_signing_share    BLOB,
-      frost_threshold        INTEGER,
-      frost_participants     INTEGER,
-      frost_commitments      BLOB,
-      frost_verifying_shares BLOB,
-      frost_dkg_method       TEXT,
-      -- registration record (was registration-state.json).
-      reg_agent_id           TEXT,
-      reg_primary_pubkey     TEXT,
-      reg_ml_dsa_pubkey      TEXT,
-      reg_registered_at      INTEGER,
-      reg_status             TEXT,
-      -- agent↔user link captured at registration (was agent-user-link.json).
-      link_agent_id          TEXT,
-      link_pre_auth_token    TEXT,
-      link_linked_at         INTEGER,
-      created_at             INTEGER NOT NULL,
-      updated_at             INTEGER NOT NULL
-    )
-  `);
+  const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
+  if (cols.length === 0) {
+    db.exec(CREATE_AGENTS_SQL);
+  } else if (!cols.some((c) => c.name === "agent_id")) {
+    // A pre-REMOVE-001 table exists (agent_name PK). Re-key it once to the stable-agent_id shape.
+    rebuildAgentsToAgentIdPk(db);
+  }
+  db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
@@ -83,6 +162,7 @@ const toBytes = (v: unknown): Uint8Array =>
  * seed/lifecycle, not the registration material.
  */
 export interface AgentRow {
+  agentId: string;
   agentName: string;
   kLocalSeed: Uint8Array;
   kLocalPubkey: string;
@@ -99,40 +179,68 @@ export class DbIdentityStore {
     ensureIdentitySchema(db);
   }
 
-  /** True if an agent row with this name already exists. */
-  hasAgent(agentName: string): boolean {
-    const row = this.#db.prepare("SELECT 1 AS one FROM agents WHERE agent_name = ?").get(agentName) as
-      | { one: number }
-      | undefined;
+  /** True if an ACTIVE (non-retired) agent row with this name exists — the create-collision check. */
+  hasActiveAgent(agentName: string): boolean {
+    const row = this.#db
+      .prepare("SELECT 1 AS one FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { one: number } | undefined;
     return row !== undefined;
   }
 
   /**
-   * Create a new agent row holding a fresh K_local seed (AC-004). Explicit only — callers generate
-   * the seed (crypto) and pass it in. Throws if the name already exists (no silent overwrite of an
-   * identity).
+   * Create a new agent row holding a fresh K_local seed (AC-004), keyed by a freshly-minted stable
+   * agent_id (REMOVE-001 DOD-REMOVE-1; guardrail #1). Explicit only — callers generate the seed
+   * (crypto) and pass it in. Throws if an ACTIVE agent already holds the name (no silent overwrite); a
+   * RETIRED row with the same name does NOT block — the name has been freed. Returns the new agent_id.
    */
-  createAgent(agentName: string, kLocalSeed: Uint8Array, kLocalPubkeyHex: string): void {
-    if (this.hasAgent(agentName)) {
+  createAgent(agentName: string, kLocalSeed: Uint8Array, kLocalPubkeyHex: string): string {
+    if (this.hasActiveAgent(agentName)) {
       throw new Error(`agent '${agentName}' already exists`);
     }
+    const agentId = randomUUID();
     const now = Date.now();
     this.#db
       .prepare(
-        `INSERT INTO agents (agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
-         VALUES (?, ?, ?, 'created', ?, ?)`,
+        `INSERT INTO agents (agent_id, agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'created', ?, ?)`,
       )
-      .run(agentName, toBuf(kLocalSeed), kLocalPubkeyHex, now, now);
-    // SI-001: the seed is NEVER logged — only the agent name and PUBLIC key.
-    this.#logger.info("persist.identity.created", { agentName, agentPubkey: kLocalPubkeyHex });
+      .run(agentId, agentName, toBuf(kLocalSeed), kLocalPubkeyHex, now, now);
+    // SI-001: the seed is NEVER logged — only the agent name, the agent_id, and the PUBLIC key.
+    this.#logger.info("persist.identity.created", { agentName, agentId, agentPubkey: kLocalPubkeyHex });
+    return agentId;
   }
 
-  /** Enumerate all agents (name + seed + pubkey + state) for the daemon's startup loader. */
+  /**
+   * Retire (REMOVE-001 DOD-REMOVE-1): flip the ACTIVE row for `agentName` to state='retired' WITHOUT
+   * deleting the row, its keys, or its history (SI-002 — accountability survives). One-way. The name
+   * is freed (the partial unique index excludes retired rows). Returns the retired agent_id, or null if
+   * there was no active agent with that name (fail-loud at the caller).
+   */
+  retireAgent(agentName: string): string | null {
+    const active = this.#db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { agent_id: string } | undefined;
+    if (!active) return null;
+    const res = this.#db
+      .prepare("UPDATE agents SET state = 'retired', updated_at = ? WHERE agent_id = ?")
+      .run(Date.now(), active.agent_id);
+    if (Number(res.changes) === 0) return null;
+    return active.agent_id;
+  }
+
+  /**
+   * Enumerate ACTIVE agents (agent_id + name + seed + pubkey + state) for the daemon's startup loader.
+   * Retired rows are EXCLUDED — they must never be resurrected into the runtime — but remain in the DB
+   * and are readable directly for accountability (SI-002).
+   */
   listAgents(): AgentRow[] {
     const rows = this.#db
-      .prepare("SELECT agent_name, k_local_seed, k_local_pubkey, state FROM agents ORDER BY agent_name ASC")
-      .all() as Array<{ agent_name: string; k_local_seed: unknown; k_local_pubkey: string; state: string }>;
+      .prepare(
+        "SELECT agent_id, agent_name, k_local_seed, k_local_pubkey, state FROM agents WHERE state != 'retired' ORDER BY agent_name ASC",
+      )
+      .all() as Array<{ agent_id: string; agent_name: string; k_local_seed: unknown; k_local_pubkey: string; state: string }>;
     return rows.map((r) => ({
+      agentId: r.agent_id,
       agentName: r.agent_name,
       kLocalSeed: toBytes(r.k_local_seed),
       kLocalPubkey: r.k_local_pubkey,
@@ -161,8 +269,11 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
 
   #updateRow(setClause: string, params: unknown[]): void {
     const now = Date.now();
+    // REMOVE-001: target the ACTIVE row for this name. After name reuse a retired row and a new active
+    // row can share a name; the partial unique index guarantees at most one active row, so this is
+    // unambiguous. A retired identity's registration material is never mutated.
     const res = this.#db
-      .prepare(`UPDATE agents SET ${setClause}, updated_at = ? WHERE agent_name = ?`)
+      .prepare(`UPDATE agents SET ${setClause}, updated_at = ? WHERE agent_name = ? AND state != 'retired'`)
       .run(...params, now, this.#agentName);
     if (Number(res.changes) === 0) {
       // The agent row must exist (created by the agent-creation path before registration). A missing
@@ -246,7 +357,8 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
   // ─── Load (restart rehydration) ──────────────────────────────────────────────
 
   #row(): Record<string, unknown> | undefined {
-    return this.#db.prepare("SELECT * FROM agents WHERE agent_name = ?").get(this.#agentName) as
+    // REMOVE-001: load the ACTIVE row for this name (never a retired tombstone).
+    return this.#db.prepare("SELECT * FROM agents WHERE agent_name = ? AND state != 'retired'").get(this.#agentName) as
       | Record<string, unknown>
       | undefined;
   }

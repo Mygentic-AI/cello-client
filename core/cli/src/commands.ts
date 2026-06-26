@@ -157,16 +157,72 @@ export async function createAgent(celloDir: string, name: string): Promise<Comma
       guidance?: string;
       name?: string;
       pubkey?: string;
+      agentId?: string;
     };
     client.close();
 
     if (!result.ok) {
       return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
     }
-    return { exitCode: 0, output: JSON.stringify({ ok: true, name: result.name, pubkey: result.pubkey }, null, 2) };
+    return {
+      exitCode: 0,
+      output: JSON.stringify({ ok: true, name: result.name, pubkey: result.pubkey, agentId: result.agentId }, null, 2),
+    };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to create agent: ${message}` };
+  }
+}
+
+/**
+ * removeAgent(celloDir, name) — CELLO-M7-REMOVE-001 (DOD-REMOVE-1):
+ *  - Connect to the daemon, send 'cello_remove_agent' with { name }.
+ *  - The daemon RETIRES the agent (state=retired; row, keys, and history KEPT for accountability) and
+ *    FREES the human name for reuse. One-way.
+ */
+export async function removeAgent(celloDir: string, name: string): Promise<CommandResult> {
+  if (!name) {
+    return { exitCode: 1, output: "Usage: cello remove-agent <name>  — retires a local agent (one-way) and frees its name." };
+  }
+
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry remove-agent." };
+  }
+
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const result = (await client.send("cello_remove_agent", { name })) as {
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      name?: string;
+      agentId?: string;
+      oneWay?: boolean;
+    };
+    client.close();
+
+    if (!result.ok) {
+      return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+    }
+    return {
+      exitCode: 0,
+      output: JSON.stringify(
+        {
+          ok: true,
+          name: result.name,
+          agentId: result.agentId,
+          oneWay: result.oneWay,
+          message: "Agent retired (one-way). Its identity and history are kept; the name is free to reuse.",
+        },
+        null,
+        2,
+      ),
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: `Failed to remove agent: ${message}` };
   }
 }
 

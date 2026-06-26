@@ -64,9 +64,9 @@ describe("PERSIST-002 Unit 2 — DbIdentityStore (AC-002/AC-004)", () => {
 
     const seed = SEED(1);
     const realPub = Buffer.from(await new InMemoryKeyProvider(seed).getPublicKey()).toString("hex");
-    expect(store.hasAgent("alice")).toBe(false);
+    expect(store.hasActiveAgent("alice")).toBe(false);
     store.createAgent("alice", seed, realPub);
-    expect(store.hasAgent("alice")).toBe(true);
+    expect(store.hasActiveAgent("alice")).toBe(true);
 
     const agents = store.listAgents();
     expect(agents).toHaveLength(1);
@@ -196,7 +196,7 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
       }),
     ).rejects.toThrow(/identity_persist_failed/);
     // Teeth: the share was NOT written somewhere else — no row exists for the ghost.
-    expect(new DbIdentityStore(db, makeLogger().logger).hasAgent("ghost")).toBe(false);
+    expect(new DbIdentityStore(db, makeLogger().logger).hasActiveAgent("ghost")).toBe(false);
   });
 
   it("SI-001: no secret (seed/share/ml-dsa secret) appears in any emitted log event", async () => {

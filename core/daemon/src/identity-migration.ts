@@ -31,7 +31,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
-import { createDecipheriv } from "node:crypto";
+import { createDecipheriv, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { InMemoryKeyProvider, decodeKeyFileSeed } from "@cello-protocol/crypto";
 import {
@@ -408,12 +408,13 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
     const state = reg ? "registered" : "created";
     const now = Date.now();
 
+    // REMOVE-001: the store is keyed by a stable agent_id — mint one for each imported flat agent.
     encDb
       .prepare(
-        `INSERT OR IGNORE INTO agents (agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO agents (agent_id, agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(a.name, Buffer.from(seed), pubkeyHex, state, now, now);
+      .run(randomUUID(), a.name, Buffer.from(seed), pubkeyHex, state, now, now);
 
     if (mlDsa) {
       encDb

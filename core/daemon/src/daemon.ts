@@ -1125,16 +1125,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "invalid_agent_name", guidance: "Provide a 'name' (1-64 chars: letters, digits, '-' or '_') for the new agent." };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
-    if (store.hasAgent(name) || agents.some((a) => a.name === name)) {
+    if (store.hasActiveAgent(name) || agents.some((a) => a.name === name)) {
       return { ok: false, reason: "agent_already_exists", guidance: `Agent '${name}' already exists. Choose a different name, or see cello_list_agents.` };
     }
     let pubkeyHex: string;
+    let agentId: string;
     try {
       const seed = generateKLocalSeed();
       const keyProvider = new InMemoryKeyProvider(seed);
       pubkeyHex = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
-      // SI-001: createAgent stores the seed in the encrypted DB and logs only the pubkey.
-      store.createAgent(name, seed, pubkeyHex);
+      // SI-001: createAgent stores the seed in the encrypted DB and logs only the pubkey + agent_id.
+      agentId = store.createAgent(name, seed, pubkeyHex);
       // Runtime-add: make the agent immediately registrable/usable (the register handler resolves
       // identity from keyProviders/loadedAgents; per-agent signaling is created lazily on register).
       keyProviders.set(name, keyProvider);
@@ -1162,8 +1163,64 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     // Creation is not an online/offline transition — the agent appears (cello_list_agents) but is
     // not online until cello_start_agent. Just record it.
-    logger.info("agent.created", { agentName: name, agentPubkey: pubkeyHex });
-    return { ok: true, name, pubkey: pubkeyHex };
+    logger.info("agent.created", { agentName: name, agentId, agentPubkey: pubkeyHex });
+    return { ok: true, name, pubkey: pubkeyHex, agentId };
+  });
+
+  // ─── CELLO-M7-REMOVE-001 (DOD-REMOVE-1): cello_remove_agent handler ───
+  // RETIRE-AND-KEEP: flip the agent's local row to state='retired' (its row, keys, and history are
+  // KEPT for accountability — never hard-deleted, SI-002) and FREE the human name for reuse. Purge the
+  // retired identity from the live runtime so it stops operating and the name is immediately available
+  // to a NEW `cello_create_agent`. One-way. (DEC-4: the signed DIRECTORY revocation is DOD-REMOVE-2 —
+  // not built here; this unit is the local record shape only.)
+  handlers.set("cello_remove_agent", async (params, _connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name || typeof name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+      return { ok: false, reason: "invalid_agent_name", guidance: "Provide the 'name' of the agent to remove (1-64 chars: letters, digits, '-' or '_')." };
+    }
+    const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
+    const agentId = store.retireAgent(name);
+    if (!agentId) {
+      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${name}'. Check cello_list_agents. Removal is one-way and a name can only be removed once.` };
+    }
+    // Purge the retired identity from the live runtime: drop it from the loaded set, key providers, and
+    // online set; tear down its standing receiver if it was online. After this the in-memory
+    // create-collision check passes and the retired identity no longer signs or receives.
+    if (onlineAgents.has(name)) {
+      onlineAgents.delete(name);
+      void sessionNodeManager.removeStandingReceiverForAgent(name).catch(() => { /* best-effort */ });
+    }
+    keyProviders.delete(name);
+    const li = loadedAgents.findIndex((a) => a.name === name);
+    if (li >= 0) loadedAgents.splice(li, 1);
+    const ai = agents.findIndex((a) => a.name === name);
+    if (ai >= 0) agents.splice(ai, 1);
+    // If the retired agent was the directory keystone, clear it so the daemon stops authenticating the
+    // directory door as a retired identity. A subsequent create-agent re-elects (ONBOARD-001); a
+    // restart re-derives from the active set. (Self-correcting, mirroring the ONBOARD restart note.)
+    if (primaryAgent && primaryAgent.name === name) {
+      primaryAgent = undefined;
+      logger.info("directory.keystone.cleared", { agentName: name, agentId });
+    }
+    // Drop the retired agent as any connection's current agent.
+    for (const [connId, state] of perConnectionState) {
+      if (state.currentAgent === name) {
+        state.currentAgent = null;
+        notificationDispatcher.setCurrentAgent(connId, null);
+        notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
+      }
+    }
+    // agent.removal.retired (observability): never log key material — only the name + agent_id.
+    logger.info("agent.removal.retired", { agentName: name, agentId });
+    notificationDispatcher.dispatchAgentStateChanged(name, "offline", "removed");
+    return {
+      ok: true,
+      name,
+      agentId,
+      oneWay: true,
+      guidance:
+        "Agent retired. This is one-way: its identity and history are kept for accountability, but it can no longer connect. The name is now free to reuse with cello create-agent.",
+    };
   });
 
   // ─── MCP-001: cello_stop_agent handler ───
