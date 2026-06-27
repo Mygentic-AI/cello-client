@@ -625,7 +625,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // ONLY party that can open the seal (SI-001); a hash mismatch is rejected without storing/ACKing.
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "trust_signal_pickup") return;
-      void handleTrustSignalPickup(frame as Record<string, unknown>, agentKeyProvider, mgr);
+      void handleTrustSignalPickup(frame as Record<string, unknown>, agentKeyProvider, mgr, agentName);
     });
     // CELLO-M7-CONN-001 (DOD-CONN-2): inbound session_assignment + seal_interrupted_request
     // on THIS agent's own stream, so a non-primary agent receives inbound sessions (SPINE-5).
@@ -3197,6 +3197,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     frame: Record<string, unknown>,
     keyProvider: import("@cello-protocol/crypto").KeyProvider,
     mgr: SignalingManager,
+    agentName: string,
   ): Promise<void> {
     const id = typeof frame["id"] === "string" ? frame["id"] : null;
     const signalKind = typeof frame["signal_kind"] === "string" ? frame["signal_kind"] : null;
@@ -3204,6 +3205,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const ciphertext = frame["ciphertext"];
     if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) return;
     if (!keyProvider.openContentSeal) return; // a session-node stub key cannot open content seals
+    // The pickup id correlates the directory's deliver/ack with the daemon's receive (TRUST-001 obs).
+    const correlationId = id;
 
     let recovered: Uint8Array | null;
     try {
@@ -3212,12 +3215,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       recovered = null;
     }
     if (!recovered) {
-      logger.warn("daemon.trust_signal.open_failed", { signalKind });
+      logger.warn("daemon.trust_signal.open_failed", { agentName, signalKind, correlationId });
       return;
     }
     const recomputed = Buffer.from(cryptoHash(recovered)).toString("hex");
     if (recomputed !== signalHash) {
-      logger.error("daemon.trust_signal.hash_mismatch", { signalKind });
+      logger.error("daemon.trust_signal.hash_mismatch", { agentName, signalKind, correlationId });
       return;
     }
     try {
@@ -3225,12 +3228,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       store.storeTrustSignal({ signalHash, agentId: null, signalKind, payload: recovered });
     } catch (err) {
       logger.error("daemon.trust_signal.store_failed", {
+        agentName,
         signalKind,
+        correlationId,
         error: err instanceof Error ? err.message : String(err),
       });
       return;
     }
-    logger.info("daemon.trust_signal.received", { signalKind, verified: true });
+    logger.info("daemon.trust_signal.received", { agentName, signalKind, verified: true, correlationId });
     await mgr.sendRaw({ type: "trust_signal_ack", id });
   }
 
