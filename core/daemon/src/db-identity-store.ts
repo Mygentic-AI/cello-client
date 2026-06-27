@@ -150,7 +150,25 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
     rebuildAgentsToAgentIdPk(db);
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
+  db.exec(CREATE_TRUST_SIGNALS_SQL);
 }
+
+/**
+ * CELLO-M8-TRUST-001: received trust signals — the daemon's local copy of a signal it pulled from the
+ * directory pickup queue, opened (k_local), and HASH-VERIFIED against the directory anchor. Keyed by
+ * signal_hash (the verification anchor) → storing the same signal twice is idempotent. The payload is
+ * the recovered plaintext JSON — the ONLY plaintext copy of the signal (the server side holds only
+ * the hash). In the encrypted SQLCipher DB.
+ */
+const CREATE_TRUST_SIGNALS_SQL = `
+  CREATE TABLE IF NOT EXISTS trust_signals (
+    signal_hash   TEXT PRIMARY KEY,
+    agent_id      TEXT,
+    signal_kind   TEXT NOT NULL,
+    payload       BLOB NOT NULL,
+    received_at   INTEGER NOT NULL
+  );
+`;
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
 const toBytes = (v: unknown): Uint8Array =>
@@ -177,6 +195,27 @@ export class DbIdentityStore {
     this.#db = db;
     this.#logger = logger;
     ensureIdentitySchema(db);
+  }
+
+  /**
+   * CELLO-M8-TRUST-001: store a received + verified trust signal. Idempotent on signal_hash (the same
+   * signal delivered/pulled twice stores once). `payload` is the recovered plaintext JSON.
+   */
+  storeTrustSignal(args: { signalHash: string; agentId: string | null; signalKind: string; payload: Uint8Array }): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO trust_signals (signal_hash, agent_id, signal_kind, payload, received_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(args.signalHash, args.agentId, args.signalKind, toBuf(args.payload), Date.now());
+  }
+
+  /** Read a stored trust signal back by its hash anchor (TRUST-001 — proves local storage). */
+  getTrustSignal(signalHash: string): { signalKind: string; payload: Uint8Array } | null {
+    const row = this.#db
+      .prepare("SELECT signal_kind, payload FROM trust_signals WHERE signal_hash = ?")
+      .get(signalHash) as { signal_kind: string; payload: unknown } | undefined;
+    return row ? { signalKind: row.signal_kind, payload: toBytes(row.payload) } : null;
   }
 
   /** True if an ACTIVE (non-retired) agent row with this name exists — the create-collision check. */

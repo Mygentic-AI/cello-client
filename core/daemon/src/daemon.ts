@@ -53,7 +53,7 @@ import { DaemonRegistrationContext } from "./registration-context.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
-import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto";
+import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider, hash as cryptoHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
@@ -618,6 +618,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       signaling: mgr,
       logger,
+    });
+    // CELLO-M8-TRUST-001: receive sealed trust signals pushed from the directory pickup queue on
+    // THIS agent's stream. Open with k_local, verify the recomputed hash against the directory
+    // anchor, store locally, then ACK (so the directory deletes the ciphertext). The daemon is the
+    // ONLY party that can open the seal (SI-001); a hash mismatch is rejected without storing/ACKing.
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "trust_signal_pickup") return;
+      void handleTrustSignalPickup(frame as Record<string, unknown>, agentKeyProvider, mgr);
     });
     // CELLO-M7-CONN-001 (DOD-CONN-2): inbound session_assignment + seal_interrupted_request
     // on THIS agent's own stream, so a non-primary agent receives inbound sessions (SPINE-5).
@@ -3180,6 +3188,52 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the keystone) received them. A frame arrives on exactly one agent's stream, so there is no
   // double-dispatch; each handler resolves the local agent internally and that resolution
   // matches the stream the directory routed the frame to.
+  // CELLO-M8-TRUST-001: open + verify + store + ACK a sealed trust signal pushed from the directory
+  // pickup queue. The daemon is the ONLY party that can open the seal (k_local — SI-001); it verifies
+  // the recomputed hash against the directory's anchor before storing, and ACKs only on success so the
+  // directory deletes the ciphertext (AC-001/AC-002). open-fail / hash-mismatch / store-fail → NO ACK
+  // (the directory keeps the pickup for a later retry; the signal is re-mintable).
+  async function handleTrustSignalPickup(
+    frame: Record<string, unknown>,
+    keyProvider: import("@cello-protocol/crypto").KeyProvider,
+    mgr: SignalingManager,
+  ): Promise<void> {
+    const id = typeof frame["id"] === "string" ? frame["id"] : null;
+    const signalKind = typeof frame["signal_kind"] === "string" ? frame["signal_kind"] : null;
+    const signalHash = typeof frame["signal_hash"] === "string" ? frame["signal_hash"] : null;
+    const ciphertext = frame["ciphertext"];
+    if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) return;
+    if (!keyProvider.openContentSeal) return; // a session-node stub key cannot open content seals
+
+    let recovered: Uint8Array | null;
+    try {
+      recovered = await keyProvider.openContentSeal(ciphertext);
+    } catch {
+      recovered = null;
+    }
+    if (!recovered) {
+      logger.warn("daemon.trust_signal.open_failed", { signalKind });
+      return;
+    }
+    const recomputed = Buffer.from(cryptoHash(recovered)).toString("hex");
+    if (recomputed !== signalHash) {
+      logger.error("daemon.trust_signal.hash_mismatch", { signalKind });
+      return;
+    }
+    try {
+      const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
+      store.storeTrustSignal({ signalHash, agentId: null, signalKind, payload: recovered });
+    } catch (err) {
+      logger.error("daemon.trust_signal.store_failed", {
+        signalKind,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    logger.info("daemon.trust_signal.received", { signalKind, verified: true });
+    await mgr.sendRaw({ type: "trust_signal_ack", id });
+  }
+
   function wirePerAgentSessionInbound(mgr: SignalingManager): void {
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "seal_interrupted_request") return;
