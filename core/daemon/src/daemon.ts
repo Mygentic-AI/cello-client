@@ -3203,8 +3203,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const signalKind = typeof frame["signal_kind"] === "string" ? frame["signal_kind"] : null;
     const signalHash = typeof frame["signal_hash"] === "string" ? frame["signal_hash"] : null;
     const ciphertext = frame["ciphertext"];
-    if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) return;
-    if (!keyProvider.openContentSeal) return; // a session-node stub key cannot open content seals
+    if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) {
+      // Neither stores nor ACKs → the directory retains the row and re-delivers. Log it: a PERMANENTLY
+      // malformed frame would otherwise be re-delivered forever with zero daemon-side signal (fallback-finder).
+      logger.warn("daemon.trust_signal.malformed", {
+        agentName,
+        hasId: !!id,
+        hasSignalKind: !!signalKind,
+        hasSignalHash: !!signalHash,
+        ciphertextOk: ciphertext instanceof Uint8Array,
+      });
+      return;
+    }
+    if (!keyProvider.openContentSeal) {
+      // A session-node stub key cannot open content seals. No ACK → the directory re-delivers; log so a
+      // pickup persistently routed to a stub-key agent is visible rather than a silent forever-retry.
+      logger.warn("daemon.trust_signal.no_content_key", { agentName, signalKind, correlationId: id });
+      return;
+    }
     // The pickup id correlates the directory's deliver/ack with the daemon's receive (TRUST-001 obs).
     const correlationId = id;
 
