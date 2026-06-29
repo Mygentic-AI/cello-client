@@ -15,6 +15,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
+import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -41,6 +42,7 @@ function makeFakeCtx(opts: Partial<{
   persistence: DaemonRegistrationPersistence | null;
   getNode: () => CelloNode | null;
   getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
+  getConsortiumEndpoints: () => ConsortiumEndpoint[];
   isSignalingConnected: () => boolean;
   sendSignalingFrame: (frame: Record<string, unknown>) => Promise<SignalingSendResult>;
 }> = {}) {
@@ -57,6 +59,7 @@ function makeFakeCtx(opts: Partial<{
     getMyPubkeyHex: () => pubkeyHex,
     setMyPubkeyHex: (h) => { pubkeyHex = h; },
     getDirectoryEndpoint: opts.getDirectoryEndpoint ?? (() => ({ peer_id: "dir", multiaddrs: ["/ip4/1.2.3.4/tcp/1/p2p/dir"] })),
+    getConsortiumEndpoints: opts.getConsortiumEndpoints ?? (() => []),
     getThresholdSigner: () => undefined,
     setThresholdSigner: () => {},
     getMyPrimaryPubkey: () => null,
@@ -154,5 +157,38 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     });
     // Must surface the persist failure as a registration failure — NOT return the state.
     expect(await promise).toEqual({ error: "identity_persist_failed" });
+  });
+
+  // DOD-DKG-1 — the threshold-REFUSAL gate. FROST DKG needs ALL N declared nodes present (a
+  // node absent during DKG receives no share, yielding a smaller/divergent consortium). When the
+  // client's resolved roster is below the directory's declared N (here 2 < 3), register MUST
+  // refuse with dkg_below_threshold rather than silently DKG a partial consortium — and must NOT
+  // reach runNetworkDkg. (Deterministic in-process — the live multi-node DKG is in J-TOFN-DKG.)
+  it("refuses with dkg_below_threshold when the resolved roster is below the directory's N", async () => {
+    const roster: ConsortiumEndpoint[] = [
+      { nodeId: "n0", pubkey: "00".repeat(32), peerId: "p0", multiaddr: "/ip4/127.0.0.1/tcp/1/p2p/p0" },
+      { nodeId: "n1", pubkey: "11".repeat(32), peerId: "p1", multiaddr: "/ip4/127.0.0.1/tcp/2/p2p/p1" },
+    ];
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => roster });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    // Directory advertises a 3-node consortium; the client only resolved 2.
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 3, threshold: 3 });
+    expect(await promise).toEqual({ error: "dkg_below_threshold" });
+  });
+
+  // Single-node back-compat: an EMPTY roster (no consortium manifest) falls back to the single
+  // primary endpoint and does NOT trip the gate — it proceeds to the DKG node-build (here we
+  // assert it gets PAST the gate by reaching the DKG with the single directory endpoint, then a
+  // getNode-null short-circuits to keep the test in-process without a live ceremony).
+  it("empty roster (no manifest) → single-node path, gate not tripped", async () => {
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => [], getNode: () => null });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
+    // getNode null is checked BEFORE the roster branch → directory_unreachable, NOT below_threshold.
+    expect(await promise).toEqual({ error: "directory_unreachable" });
   });
 });
