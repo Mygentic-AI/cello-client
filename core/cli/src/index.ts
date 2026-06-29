@@ -1,1 +1,1 @@
-export { login, logout, status, register, type CommandResult } from "./commands.js";
+export { login, logout, status, register, sessions, type CommandResult, type SessionFilter } from "./commands.js";

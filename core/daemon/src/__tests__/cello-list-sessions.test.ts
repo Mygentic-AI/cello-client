@@ -231,14 +231,20 @@ describe("cello_list_sessions: MCP handler", () => {
     expect(res.guidance.length).toBeGreaterThan(0);
   });
 
-  it("LIST-3: lists the current agent's active/interrupted/sealed sessions, excludes other agents, newest first", async () => {
+  it("LIST-3: filter (open default / closed / failed / all) + limit, scoped to the current agent", async () => {
     // Pre-populate the sessions DB before the daemon opens it (matches SESSION-001 AC-006 pattern).
     const db = openTestDb(join(tempDir, "sessions.db"));
     createSessionsTable(db);
     const t0 = Date.now() - 30_000;
+    // aa: active (reconciled to interrupted-with-messages at startup) → category OPEN
     insertRow(db, { sessionId: "aa".padEnd(64, "1"), agentName: "alice", counterpartyPubkey: "cpActive", status: "active", messageCount: 2, createdAt: t0, updatedAt: t0 + 1000 });
+    // bb: interrupted WITH messages → resumable → OPEN
     insertRow(db, { sessionId: "bb".padEnd(64, "2"), agentName: "alice", counterpartyPubkey: "cpIntr", status: "interrupted", messageCount: 5, createdAt: t0, updatedAt: t0 + 3000, interruptedAt: new Date(t0 + 3000).toISOString() });
+    // cc: sealed → CLOSED
     insertRow(db, { sessionId: "cc".padEnd(64, "3"), agentName: "alice", counterpartyPubkey: "cpSealed", status: "sealed", messageCount: 4, createdAt: t0, updatedAt: t0 + 2000 });
+    // ee: interrupted with ZERO messages → a failed init → FAILED (must not show by default)
+    insertRow(db, { sessionId: "ee".padEnd(64, "5"), agentName: "alice", counterpartyPubkey: "cpFailed", status: "interrupted", messageCount: 0, createdAt: t0, updatedAt: t0 + 500, interruptedAt: new Date(t0 + 500).toISOString() });
+    // dd: another agent's — always excluded from alice's per-agent list
     insertRow(db, { sessionId: "dd".padEnd(64, "4"), agentName: "bob", counterpartyPubkey: "cpBob", status: "active", messageCount: 9, createdAt: t0, updatedAt: t0 + 9000 });
     db.close();
 
@@ -249,50 +255,41 @@ describe("cello_list_sessions: MCP handler", () => {
     await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
-    const res = await client.send("cello_list_sessions") as {
-      ok: boolean;
-      sessions: Array<{
-        sessionId: string;
-        agentName: string;
-        counterpartyPubkey: string;
-        status: string;
-        messageCount: number;
-        createdAt: string;
-        updatedAt: string;
-        interruptedAt: string | null;
-      }>;
-    };
+    type Entry = { sessionId: string; counterpartyPubkey: string; status: string; category: string; messageCount: number; interruptedAt: string | null };
+    type Res = { ok: boolean; filter: string; limit: number; totalMatched: number; sessions: Entry[] };
+    const cp = (r: Res) => r.sessions.map((s) => s.counterpartyPubkey).sort();
 
-    expect(res.ok).toBe(true);
-    expect(Array.isArray(res.sessions)).toBe(true);
-    // alice's three sessions, bob's excluded.
-    expect(res.sessions.map((s) => s.sessionId).sort()).toEqual(
-      ["aa".padEnd(64, "1"), "bb".padEnd(64, "2"), "cc".padEnd(64, "3")].sort(),
-    );
-    expect(res.sessions.some((s) => s.counterpartyPubkey === "cpBob")).toBe(false);
+    // DEFAULT = open: the active(→resumable) + the interrupted-with-messages. NOT sealed, NOT the
+    // failed 0-message init, NOT bob's.
+    const def = await client.send("cello_list_sessions") as Res;
+    expect(def.ok).toBe(true);
+    expect(def.filter).toBe("open");
+    expect(cp(def)).toEqual(["cpActive", "cpIntr"].sort());
+    expect(def.sessions.every((s) => s.category === "open")).toBe(true);
+    // newest-updated first
+    const ms = def.sessions.map((s) => Date.parse(s.updatedAt as unknown as string));
+    expect(ms).toEqual([...ms].sort((a, b) => b - a));
 
-    // Ordered most-recently-updated first (ISO timestamps, descending). The
-    // pre-populated "active" row is reconciled to interrupted at daemon startup
-    // (a persisted active session from a prior process can't be live), which is
-    // why we order on updatedAt rather than asserting fixed status labels.
-    const updatedMs = res.sessions.map((s) => Date.parse(s.updatedAt));
-    expect(updatedMs).toEqual([...updatedMs].sort((a, b) => b - a));
+    // failed: ONLY the 0-message interrupted init.
+    const failed = await client.send("cello_list_sessions", { filter: "failed" }) as Res;
+    expect(cp(failed)).toEqual(["cpFailed"]);
+    expect(failed.sessions[0].category).toBe("failed");
 
-    // The pre-populated interrupted row carries its interruption stamp + shape.
-    const intr = res.sessions.find((s) => s.counterpartyPubkey === "cpIntr")!;
-    expect(intr.agentName).toBe("alice");
-    expect(intr.status).toBe("interrupted");
-    expect(intr.messageCount).toBe(5);
-    expect(intr.createdAt).toContain("T"); // ISO 8601
-    expect(typeof intr.updatedAt).toBe("string");
-    expect(typeof intr.interruptedAt).toBe("string");
+    // closed: ONLY the sealed one.
+    const closed = await client.send("cello_list_sessions", { filter: "closed" }) as Res;
+    expect(cp(closed)).toEqual(["cpSealed"]);
+    expect(closed.sessions[0].category).toBe("closed");
 
-    // The sealed row survives startup unchanged — interruptedAt is null for a
-    // session that was never interrupted.
-    const sealed = res.sessions.find((s) => s.counterpartyPubkey === "cpSealed")!;
-    expect(sealed.status).toBe("sealed");
-    expect(sealed.messageCount).toBe(4);
-    expect(sealed.interruptedAt).toBeNull();
+    // all: every one of alice's four, bob's still excluded.
+    const all = await client.send("cello_list_sessions", { filter: "all" }) as Res;
+    expect(cp(all)).toEqual(["cpActive", "cpFailed", "cpIntr", "cpSealed"].sort());
+    expect(all.sessions.some((s) => s.counterpartyPubkey === "cpBob")).toBe(false);
+    expect(all.totalMatched).toBe(4);
+
+    // limit: caps the returned rows but reports the true match count.
+    const limited = await client.send("cello_list_sessions", { filter: "all", limit: 2 }) as Res;
+    expect(limited.sessions.length).toBe(2);
+    expect(limited.totalMatched).toBe(4);
   });
 
   it("LIST-4: returns an empty sessions array for a current agent with no sessions", async () => {

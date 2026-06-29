@@ -332,10 +332,25 @@ export interface SessionListEntry {
   agentName: string;
   counterpartyPubkey: string;
   status: SessionStatus;
+  /** Operator-facing bucket derived from status + messageCount: open | closed | failed. */
+  category: "open" | "closed" | "failed";
   messageCount: number;
   createdAt: string;
   updatedAt: string;
   interruptedAt: string | null;
+}
+
+/**
+ * Result of a session listing (cello_list_sessions / the daemon-wide `list_sessions`). `sessions`
+ * is already filtered + capped at `limit`; `totalMatched` is how many matched the filter before the
+ * cap, so the caller can tell the operator "showing 50 of 312".
+ */
+export interface SessionListResponse {
+  ok: true;
+  filter: "open" | "closed" | "failed" | "all";
+  limit: number;
+  totalMatched: number;
+  sessions: SessionListEntry[];
 }
 
 // --- Error codes ---

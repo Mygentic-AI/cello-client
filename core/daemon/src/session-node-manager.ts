@@ -1386,6 +1386,18 @@ export class SessionNodeManager {
   }
 
   /**
+   * Every persisted session across ALL agents, most-recently-updated first. Backs the daemon-wide
+   * `cello sessions` CLI surface (which has no per-connection current agent, unlike the MCP
+   * cello_list_sessions). Classification + filtering + the count limit are applied by the caller.
+   */
+  getAllSessions(): SessionRecord[] {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare("SELECT * FROM sessions ORDER BY updated_at DESC")
+      .all() as unknown as SessionRecord[];
+  }
+
+  /**
    * M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
    * sealed record. Stored as a JSON string (hex-encoded pubkeys) so it round-trips a
    * daemon restart and is returned intact on the cert-read surface. The caller normalises

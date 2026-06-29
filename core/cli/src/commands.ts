@@ -255,3 +255,40 @@ export async function status(celloDir: string): Promise<CommandResult> {
     };
   }
 }
+
+export type SessionFilter = "open" | "closed" | "failed" | "all";
+
+/**
+ * `cello sessions [--open|--closed|--failed|--all] [--limit N]` — the full, queryable session
+ * history (the discovery surface `cello status` deliberately does NOT dump). Defaults to OPEN
+ * (live + resumable) so a long-lived agent's failed/closed history doesn't flood it, and caps the
+ * count at the daemon's default limit. Output reports `totalMatched` so the operator can tell when
+ * results were truncated.
+ */
+export async function sessions(
+  celloDir: string,
+  opts: { filter?: SessionFilter; limit?: number } = {},
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+
+  if (!lock) {
+    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
+  }
+
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const params: Record<string, unknown> = {};
+    if (opts.filter) params.filter = opts.filter;
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    const result = await client.send("list_sessions", params);
+    client.close();
+    return { exitCode: 0, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      exitCode: 1,
+      output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2),
+    };
+  }
+}

@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, sessions, type SessionFilter } from "../commands.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -84,8 +84,27 @@ async function main(): Promise<void> {
       result = await removeAgent(celloDir, name);
       break;
     }
+    case "sessions": {
+      // cello sessions [--open|--closed|--failed|--all] [--limit N] — the full session history.
+      // Defaults to open (live + resumable) so failed/closed don't flood it; the daemon caps the
+      // count. (`cello status` only ever shows live/resumable, never this full list.)
+      const args = process.argv.slice(3);
+      let filter: SessionFilter | undefined;
+      if (args.includes("--all")) filter = "all";
+      else if (args.includes("--closed")) filter = "closed";
+      else if (args.includes("--failed")) filter = "failed";
+      else if (args.includes("--open")) filter = "open";
+      const limitIdx = args.indexOf("--limit");
+      let limit: number | undefined;
+      if (limitIdx !== -1 && args[limitIdx + 1] !== undefined) {
+        const n = Number(args[limitIdx + 1]);
+        if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
+      }
+      result = await sessions(celloDir, { filter, limit });
+      break;
+    }
     default:
-      process.stdout.write("Usage: cello <login|logout|status|register|create-agent|remove-agent>\n");
+      process.stdout.write("Usage: cello <login|logout|status|register|create-agent|remove-agent|sessions>\n");
       process.exit(command ? 1 : 0);
       return;
   }

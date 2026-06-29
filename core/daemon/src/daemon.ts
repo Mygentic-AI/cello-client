@@ -36,12 +36,15 @@ import type {
   ConnectionInfo,
   InterruptedSessionInfo,
   SessionListEntry,
+  SessionListResponse,
+  SessionRecord,
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
+import { classifySession, type SessionCategory } from "./session-category.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -1064,15 +1067,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // array from SQLite. Shared by both getStatus() (daemon-wide) and the
   // cello_status MCP handler (per-connection) so live MCP clients see the same
   // interrupted sessions a CLI `cello status` would.
+  // `cello status` is a health snapshot, not a session archive. It surfaces ONLY genuinely
+  // RESUMABLE sessions (interrupted with messages exchanged) — never failed inits (interrupted,
+  // 0 messages — a dead handshake), which classify as "failed" and would otherwise accumulate
+  // unbounded and confuse. The list is also capped; the full, queryable history is `cello sessions`
+  // / cello_list_sessions (with filter + limit flags).
+  const STATUS_RESUMABLE_CAP = 10;
   function buildInterruptedSessions(): InterruptedSessionInfo[] {
-    const interruptedRows = sessionNodeManager.getSessionsByStatus("interrupted");
-    return interruptedRows.map((row) => ({
-      sessionId: row.session_id,
-      agentName: row.agent_name,
-      counterpartyPubkey: row.counterparty_pubkey,
-      messageCount: row.message_count ?? 0,
-      interruptedAt: row.interrupted_at ?? new Date(row.updated_at).toISOString(),
-    }));
+    return sessionNodeManager
+      .getSessionsByStatus("interrupted")
+      .filter((row) => (row.message_count ?? 0) > 0) // resumable only — drop failed 0-message inits
+      .slice(0, STATUS_RESUMABLE_CAP)
+      .map((row) => ({
+        sessionId: row.session_id,
+        agentName: row.agent_name,
+        counterpartyPubkey: row.counterparty_pubkey,
+        messageCount: row.message_count ?? 0,
+        interruptedAt: row.interrupted_at ?? new Date(row.updated_at).toISOString(),
+      }));
   }
 
   // Build status response factory
@@ -2381,27 +2393,69 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // and the guidance strings that point here ("See cello_list_sessions") dead-end.
   // Read from the persisted SQLite store, so it works after a daemon restart and
   // from a fresh MCP connection (no in-memory session-node required).
-  handlers.set("cello_list_sessions", async (_params, connectionId) => {
+  // Classify → filter → cap a set of session rows into a SessionListResponse. Shared by the
+  // per-agent MCP surface (cello_list_sessions) and the daemon-wide CLI surface (list_sessions),
+  // so the operator-facing categories (open/closed/failed) and the default cap never drift.
+  // Default filter = "open" (live/resumable only — the common case); default limit bounds the
+  // response so a long-lived agent's history can't balloon it. `all` includes failed/closed.
+  const DEFAULT_LIST_LIMIT = 50;
+  const MAX_LIST_LIMIT = 500;
+  function selectSessions(
+    rows: SessionRecord[],
+    params: Record<string, unknown> | undefined,
+  ): SessionListResponse {
+    const rawFilter = typeof params?.filter === "string" ? params.filter : "open";
+    const filter: SessionListResponse["filter"] =
+      rawFilter === "closed" || rawFilter === "failed" || rawFilter === "all" ? rawFilter : "open";
+    let limit = Number(params?.limit);
+    if (!Number.isFinite(limit) || limit < 1) limit = DEFAULT_LIST_LIMIT;
+    limit = Math.min(Math.floor(limit), MAX_LIST_LIMIT);
+
+    const classified = rows.map((row) => {
+      const messageCount = row.message_count ?? 0;
+      const category: SessionCategory = classifySession(row.status, messageCount);
+      return { row, messageCount, category };
+    });
+    const matched =
+      filter === "all" ? classified : classified.filter((c) => c.category === filter);
+    const sessions: SessionListEntry[] = matched.slice(0, limit).map(({ row, messageCount, category }) => ({
+      sessionId: row.session_id,
+      agentName: row.agent_name,
+      counterpartyPubkey: row.counterparty_pubkey,
+      status: row.status,
+      category,
+      messageCount,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      // interrupted_at is the canonical ISO interruption stamp; null for any
+      // session that was never interrupted (active/sealed).
+      interruptedAt: row.interrupted_at ?? null,
+    }));
+    return { ok: true, filter, limit, totalMatched: matched.length, sessions };
+  }
+
+  // cello_list_sessions (MCP, per current agent): the discovery surface for the by-id reads
+  // (cello_get_transcript / cello_get_sealed_receipt). Accepts { filter?: open|closed|failed|all,
+  // limit?: number } — defaults to open + DEFAULT_LIST_LIMIT so failed/dead handshakes don't drown
+  // the live ones. Read from persisted SQLite, so it survives a daemon restart / fresh connection.
+  handlers.set("cello_list_sessions", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
     if (!connState || !connState.currentAgent) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const agentName = connState.currentAgent;
-    const sessions: SessionListEntry[] = sessionNodeManager
-      .getSessionsForAgent(agentName)
-      .map((row) => ({
-        sessionId: row.session_id,
-        agentName: row.agent_name,
-        counterpartyPubkey: row.counterparty_pubkey,
-        status: row.status,
-        messageCount: row.message_count ?? 0,
-        createdAt: new Date(row.created_at).toISOString(),
-        updatedAt: new Date(row.updated_at).toISOString(),
-        // interrupted_at is the canonical ISO interruption stamp; null for any
-        // session that was never interrupted (active/sealed).
-        interruptedAt: row.interrupted_at ?? null,
-      }));
-    return { ok: true, sessions };
+    return selectSessions(
+      sessionNodeManager.getSessionsForAgent(connState.currentAgent),
+      params as Record<string, unknown> | undefined,
+    );
+  });
+
+  // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same
+  // filter/limit semantics, across ALL agents.
+  handlers.set("list_sessions", async (params) => {
+    return selectSessions(
+      sessionNodeManager.getAllSessions(),
+      params as Record<string, unknown> | undefined,
+    );
   });
 
   // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)

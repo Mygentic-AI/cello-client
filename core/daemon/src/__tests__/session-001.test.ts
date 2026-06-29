@@ -517,7 +517,10 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     handle = h as typeof handle;
     const status = h.getStatus() as DaemonStatusResponse;
 
-    expect(status.interrupted_sessions).toHaveLength(2);
+    // `cello status` surfaces ONLY genuinely-resumable interrupted sessions (messages exchanged).
+    // sid2 is interrupted with 0 messages — a failed handshake — and must NOT appear here (it would
+    // otherwise accumulate unbounded and mislead); it's reachable only via `cello sessions --failed`.
+    expect(status.interrupted_sessions).toHaveLength(1);
 
     const entry1 = status.interrupted_sessions.find((e) => e.sessionId === sid1);
     expect(entry1).toBeDefined();
@@ -527,9 +530,8 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     expect(typeof entry1!.interruptedAt).toBe("string");
     expect(entry1!.interruptedAt).not.toBe("");
 
-    const entry2 = status.interrupted_sessions.find((e) => e.sessionId === sid2);
-    expect(entry2).toBeDefined();
-    expect(entry2!.messageCount).toBe(0);
+    // The 0-message (failed) interrupted session is excluded from status.
+    expect(status.interrupted_sessions.find((e) => e.sessionId === sid2)).toBeUndefined();
   });
 });
 
