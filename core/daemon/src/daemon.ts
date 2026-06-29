@@ -399,12 +399,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           // re-checks the threshold against this roster and never silently falls back
           // to the single hardcoded endpoint for a missing/forged node.
           consortiumEndpoints = await manifestNodesToEndpoints(manifest.nodes, { logger });
-          logger.info("directory.consortium.resolved", {
+          const declaredNodes = manifest.nodes.length;
+          const resolvedNodes = consortiumEndpoints.length;
+          // Carry the nodeId↔peerId pairing (not just peerIds) so a consumer/test can verify
+          // each manifest identity bound to the right live directory, not merely the set.
+          const consortiumLog = {
             manifestVersion: manifest.version,
-            declaredNodes: manifest.nodes.length,
-            resolvedNodes: consortiumEndpoints.length,
-            peerIds: consortiumEndpoints.map((e) => e.peerId),
-          });
+            declaredNodes,
+            resolvedNodes,
+            nodes: consortiumEndpoints.map((e) => ({ nodeId: e.nodeId, peerId: e.peerId })),
+          };
+          // Degraded ≠ healthy: a verified manifest whose nodes don't all resolve must NOT
+          // log at the same severity as a full roster. Threshold-REFUSAL (refusing to run a
+          // ceremony below T) is DOD-DKG-1's gate; here we make the health signal loud so a
+          // shrunken/empty roster is visible and never buried at info.
+          if (resolvedNodes === 0) {
+            logger.error("directory.consortium.none", consortiumLog);
+          } else if (resolvedNodes < declaredNodes) {
+            logger.warn("directory.consortium.partial", consortiumLog);
+          } else {
+            logger.info("directory.consortium.resolved", consortiumLog);
+          }
         }
       }
     } catch (err: unknown) {

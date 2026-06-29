@@ -84,19 +84,24 @@ export interface ConsortiumEndpoint {
 }
 
 /**
- * Map a manifest node `endpoint` to the HTTP base used for its `/bootstrap` probe.
- * The manifest endpoint is the node's public address (e.g. `wss://host:443`, with the
- * ALB terminating TLS), but `/bootstrap` is served over plain HTTP behind that ALB
- * (matching PRODUCTION_DIRECTORY_URL, which is `http://`). So `http(s)://` is used as
- * is; `ws://`/`wss://` map to `http://`. A trailing slash is stripped because
- * fetchBootstrapMultiaddr appends `/bootstrap`. (M8B-DECISIONS: reuse `endpoint` as the
- * node's reachable HTTP base rather than adding a separate bootstrapUrl field.)
+ * Validate + normalise a manifest node `endpoint` to the HTTP(S) base used for its
+ * `/bootstrap` probe, or return `null` if it is not a usable bootstrap base.
+ *
+ * CONTRACT (M8B-DECISIONS): a manifest `endpoint` is the node's HTTP(S) `/bootstrap`
+ * base — production directories serve `/bootstrap` over plaintext HTTP behind the ALB
+ * (matching PRODUCTION_DIRECTORY_URL, which is `http://…:80`). The wss libp2p DIAL
+ * address is returned BY `/bootstrap`; it is NOT the endpoint. So we deliberately do
+ * NOT accept (or port-guess) a `wss://host:443` value — mapping that to
+ * `http://host:443` would speak plaintext to the TLS port and silently fail. Anything
+ * that is not `http(s)://` (a bare multiaddr, a wss dial address, a typo) is a config
+ * error in officer-SIGNED data: return null so the caller logs it DISTINCTLY from a
+ * transient outage and never dials a wrong port. A single trailing slash is stripped
+ * (fetchBootstrapMultiaddr appends `/bootstrap`).
  */
-export function mapEndpointToBootstrapBase(endpoint: string): string {
+export function mapEndpointToBootstrapBase(endpoint: string): string | null {
   const noSlash = endpoint.replace(/\/$/, "");
-  if (noSlash.startsWith("wss://")) return "http://" + noSlash.slice("wss://".length);
-  if (noSlash.startsWith("ws://")) return "http://" + noSlash.slice("ws://".length);
-  return noSlash;
+  if (noSlash.startsWith("http://") || noSlash.startsWith("https://")) return noSlash;
+  return null;
 }
 
 export interface ManifestResolveOptions {
@@ -124,6 +129,16 @@ export async function manifestNodesToEndpoints(
   const resolved = await Promise.all(
     nodes.map(async (node): Promise<ConsortiumEndpoint | null> => {
       const base = mapEndpointToBootstrapBase(node.endpoint);
+      if (base === null) {
+        // PERMANENT config error in SIGNED manifest data — logged distinctly from a
+        // transient `unresolved` so a bad endpoint is never mistaken for a node that's
+        // merely down (fail loud, don't silently skip-as-if-outage).
+        opts.logger.error("directory.consortium.node.endpoint_invalid", {
+          nodeId: node.nodeId,
+          endpoint: node.endpoint,
+        });
+        return null;
+      }
       const multiaddr = await fetchBootstrapMultiaddr(base, fetchFn);
       if (!multiaddr) {
         opts.logger.warn("directory.consortium.node.unresolved", {

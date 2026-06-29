@@ -154,22 +154,28 @@ describe("createDirectoryEndpointResolver", () => {
 
 // ─── DOD-MANIFEST-1: manifest node set → N directory endpoints ─────────────────
 describe("mapEndpointToBootstrapBase", () => {
-  it("maps a wss:// endpoint to its http:// bootstrap base (ALB terminates TLS)", () => {
-    expect(mapEndpointToBootstrapBase("wss://directory-us1.cello.mygentic.ai:443")).toBe(
-      "http://directory-us1.cello.mygentic.ai:443",
-    );
-  });
-
-  it("maps ws:// to http://", () => {
-    expect(mapEndpointToBootstrapBase("ws://host:8080")).toBe("http://host:8080");
-  });
-
-  it("passes an http:// endpoint through unchanged (the harness/dev form)", () => {
+  it("passes an http:// endpoint through unchanged (the contract: endpoint IS the http base)", () => {
     expect(mapEndpointToBootstrapBase("http://127.0.0.1:5001")).toBe("http://127.0.0.1:5001");
+  });
+
+  it("passes an https:// endpoint through", () => {
+    expect(mapEndpointToBootstrapBase("https://directory-us1.cello.mygentic.ai")).toBe(
+      "https://directory-us1.cello.mygentic.ai",
+    );
   });
 
   it("strips a trailing slash", () => {
     expect(mapEndpointToBootstrapBase("http://127.0.0.1:5001/")).toBe("http://127.0.0.1:5001");
+  });
+
+  it("returns null for a wss:// dial address — NOT port-guessed to plaintext:443", () => {
+    // The wss address is what /bootstrap RETURNS, not the bootstrap base. Mapping it to
+    // http://host:443 would speak plaintext to the TLS port and silently fail — refuse it.
+    expect(mapEndpointToBootstrapBase("wss://directory-us1.cello.mygentic.ai:443")).toBeNull();
+  });
+
+  it("returns null for a bare multiaddr (a config error in signed data, not a base)", () => {
+    expect(mapEndpointToBootstrapBase("/ip4/127.0.0.1/tcp/0")).toBeNull();
   });
 });
 
@@ -211,5 +217,17 @@ describe("manifestNodesToEndpoints", () => {
       logger: silentLogger,
     });
     expect(eps).toEqual([]);
+  });
+
+  it("skips a node with a non-http(s) endpoint (signed config error) and resolves the rest", async () => {
+    // A bare multiaddr in signed manifest data is a PERMANENT config error, distinct from a
+    // transient outage. It must be dropped (never dialed at a guessed port), the others resolve.
+    const badNodes = [
+      NODES[0],
+      { ...NODES[1], endpoint: "/ip4/127.0.0.1/tcp/0" }, // invalid: not an http(s) base
+      NODES[2],
+    ];
+    const eps = await manifestNodesToEndpoints(badNodes, { fetchFn: portKeyedFetch(), logger: silentLogger });
+    expect(eps.map((e) => e.nodeId)).toEqual(["node-0", "node-2"]);
   });
 });
