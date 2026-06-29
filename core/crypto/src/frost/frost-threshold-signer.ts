@@ -407,21 +407,39 @@ export class FrostThresholdSigner implements IThresholdSigner {
         };
       }
 
-      // Round 1: generate fresh nonces + commitment list
+      // Round 1: generate fresh nonces + commitment list. Gather per-stub (NOT Promise.all) so a stub
+      // that FAILS or REFUSES its commitment — e.g. a SUSPENDED directory sending {ok:false} — is added
+      // to ceremonyExcluded and the attempt retried with the survivors, mirroring the sign round's
+      // exclusion (Round 2 below). Without this, a refusing stub stays in `selected` every attempt
+      // (selection is the first threshold-1 of `available`), so a SUB-threshold suspension exhausts
+      // maxRetries instead of routing to the healthy directories — violating DOD-SUSPEND-1
+      // (threshold-refusal ≠ single-node-refusal: < N−T+1 suspensions must still sign).
       process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: Round1 calling ed25519_FROST.commit\n`);
       const localNonce = ed25519_FROST.commit(localShare.secret);
       process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: Round1 calling generateCommitment on ${selected.length} stubs\n`);
-      let stubCommits: Awaited<ReturnType<typeof selected[0]["generateCommitment"]>>[];
-      try {
-        stubCommits = await Promise.all(selected.map(async (s) => {
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment stub=${s.id?.slice(0,16)}\n`);
-          const r = await s.generateCommitment();
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment stub=${s.id?.slice(0,16)} nodeId=${r.nodeId?.slice(0,16)}\n`);
-          return r;
-        }));
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment THREW: ${msg}\n`);
+      type StubCommit = Awaited<ReturnType<(typeof selected)[0]["generateCommitment"]>>;
+      const stubCommits: StubCommit[] = [];
+      let commitFailedThisRound = false;
+      for (const s of selected) {
+        let r: StubCommit | null;
+        try {
+          r = await s.generateCommitment();
+          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment stub=${s.id?.slice(0,16)} nodeId=${r?.nodeId?.slice(0,16)}\n`);
+        } catch (err: unknown) {
+          const m = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment THREW stub=${s.id?.slice(0,16)}: ${m}\n`);
+          r = null;
+        }
+        if (!r || !r.nonceCommitment) {
+          // Refused (suspended) or failed → EXCLUDE and retry with survivors (same as Round 2).
+          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: excluding stub=${s.id?.slice(0,16)} (commit refused/failed)\n`);
+          ceremonyExcluded.add(s.id);
+          commitFailedThisRound = true;
+          continue;
+        }
+        stubCommits.push(r);
+      }
+      if (commitFailedThisRound) {
         continue;
       }
       const commitmentList = [
