@@ -444,6 +444,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     );
   }
 
+  // DOD-SIGN-1: resolve the consortium roster for a session/seal FROST ceremony (same source as
+  // registration's DOD-DKG-1 path — the verified manifest, re-resolved at ceremony time). NULL when
+  // no consortium manifest is configured → single-node ceremony (M6/M7 back-compat). Shared by all
+  // wireSessionCeremonyHandler / wireSealCeremonyHandler call sites below.
+  const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {
+    const m = manifestProvider?.getCurrentManifest();
+    return m ? await manifestNodesToEndpoints(m.nodes, { logger }) : null;
+  };
+
   // CELLO-M7-CONN-001 (DOD-CONN-3): start the daemon-level HTTP manifest poll. It fetches
   // ${directoryHttpUrl}/manifest, verifies the threshold signature against the locally-pinned
   // root keys, applies anti-rollback + expiry, and adopts a newer manifest — independent of any
@@ -628,6 +637,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentPubkeyHex,
       getNode: entry.getNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
     });
@@ -638,6 +648,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentPubkeyHex,
       getNode: entry.getNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
     });
@@ -705,6 +716,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
     });
@@ -714,6 +726,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
       getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
     });

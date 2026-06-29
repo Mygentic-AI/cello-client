@@ -28,6 +28,7 @@ import type { IThresholdSigner } from "@cello-protocol/crypto";
 import type { FrostContext } from "@cello-protocol/crypto/frost/types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { NetworkDirectoryNode } from "./network-directory-node.js";
+import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { SignalingSeam } from "./registration-context.js";
 import type { Logger } from "./types.js";
@@ -92,8 +93,15 @@ export interface CeremonyWiringDeps {
   agentPubkeyHex: string;
   /** The agent's directory-connected libp2p node (the per-agent signaling node). */
   getNode: () => CelloNode | null;
-  /** Resolve the directory endpoint to open FROST streams on. */
+  /** Resolve the directory endpoint to open FROST streams on (single-node / primary). */
   getDirectoryEndpoint: () => Promise<{ peerId: string; multiaddr?: string } | null>;
+  /**
+   * DOD-SIGN-1: resolve the FULL consortium directory-node roster from the verified manifest at
+   * ceremony time, or NULL when no consortium manifest is configured. A non-null roster ⇒ the
+   * threshold signer coordinates the FROST ceremony across ALL these nodes (T-of-N — it excludes
+   * a node that's down and reaches any T). Null ⇒ single-node (M6/M7 back-compat).
+   */
+  getConsortiumEndpoints: () => Promise<ConsortiumEndpoint[] | null>;
   /** The agent's per-agent signaling seam (where ceremony_request arrives + result is sent). */
   signaling: SignalingSeam;
   logger: Logger;
@@ -151,19 +159,36 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
     return null;
   }
 
+  // DOD-SIGN-1: build a directory-node stub PER consortium node so the FROST threshold signer
+  // can run the signing ceremony across ALL N nodes (it reaches any T and excludes a node that's
+  // down — "kill a node, still signs"). With no consortium manifest configured the roster is null
+  // → the single primary endpoint (M6/M7 single-node back-compat). NOTE: the share's threshold T
+  // (from the multi-node DKG) is FIXED — a degraded roster (fewer than T reachable) makes signing
+  // FAIL, it can never forge a lower-threshold signature, so a single-stub fallback is safe.
   let directoryNodeStubs: NetworkDirectoryNode[] | undefined;
-  const ep = await deps.getDirectoryEndpoint();
   const node = deps.getNode();
-  if (ep && ep.multiaddr && node) {
+  const roster = await deps.getConsortiumEndpoints();
+  const epochId = `${deps.agentPubkeyHex}:epoch:1`;
+  const mkStub = (peerId: string, multiaddr: string): NetworkDirectoryNode => {
     const stub = new NetworkDirectoryNode({
-      id: ep.peerId,
-      node,
-      directoryPeerId: ep.peerId,
-      directoryMultiaddrs: [ep.multiaddr],
+      id: peerId,
+      node: node!,
+      directoryPeerId: peerId,
+      directoryMultiaddrs: [multiaddr],
       logger: deps.logger,
     });
-    stub.setBootstrapContext(deps.agentPubkeyHex, `${deps.agentPubkeyHex}:epoch:1`);
-    directoryNodeStubs = [stub];
+    stub.setBootstrapContext(deps.agentPubkeyHex, epochId);
+    return stub;
+  };
+  if (node && roster !== null && roster.length > 0) {
+    // Consortium configured → one stub per resolved directory node (T-of-N signing).
+    directoryNodeStubs = roster.map((ep) => mkStub(ep.peerId, ep.multiaddr));
+  } else if (node) {
+    // No consortium manifest (roster null) or none resolved → the single primary endpoint.
+    const ep = await deps.getDirectoryEndpoint();
+    if (ep && ep.multiaddr) {
+      directoryNodeStubs = [mkStub(ep.peerId, ep.multiaddr)];
+    }
   }
   return new FrostThresholdSigner(
     { threshold: share.threshold, participants: share.participants, directoryNodeStubs },
