@@ -184,7 +184,15 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
     // Consortium configured → one stub per resolved directory node (T-of-N signing).
     directoryNodeStubs = roster.map((ep) => mkStub(ep.peerId, ep.multiaddr));
   } else if (node) {
-    // No consortium manifest (roster null) or none resolved → the single primary endpoint.
+    // No consortium manifest (roster null) or a configured manifest that resolved EMPTY → the single
+    // primary endpoint. INTENTIONAL asymmetry with DKG-1 (which REFUSES a configured-but-empty roster
+    // because DKG needs all N): for SIGNING the share's threshold T is FIXED, so a degraded/single
+    // stub makes participateInCeremony fail the `reachable < T-1` pre-check rather than forge a weaker
+    // seal — safe. WARN distinctly on the configured-but-unreachable case so the operator sees "your
+    // consortium was unreachable" rather than a generic below-threshold error (fallback-finder F3).
+    if (roster !== null && roster.length === 0) {
+      deps.logger.warn("session.ceremony.consortium_unreachable", { agentName: deps.agentName });
+    }
     const ep = await deps.getDirectoryEndpoint();
     if (ep && ep.multiaddr) {
       directoryNodeStubs = [mkStub(ep.peerId, ep.multiaddr)];
