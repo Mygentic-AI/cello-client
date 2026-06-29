@@ -1581,10 +1581,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
 
       const persistence = getPersistence(name);
+      // DOD-DKG-1: resolve the full consortium roster from the VERIFIED manifest so the DKG
+      // fans across all N directory nodes. Re-resolved here (ceremony time) for fresh failover
+      // coordinates. Empty when no manifest is configured → single-node DKG (M6/M7 back-compat).
+      const currentManifest = manifestProvider?.getCurrentManifest();
+      const consortiumRoster = currentManifest
+        ? await manifestNodesToEndpoints(currentManifest.nodes, { logger })
+        : [];
       const ctx = new DaemonRegistrationContext({
         signaling: agentSignaling,
         getDirectoryNode: agentGetNode,
         getDirectoryEndpoint: () => directoryEndpoint,
+        getConsortiumEndpoints: () => consortiumRoster,
         keyProvider,
         persistence,
         logger,

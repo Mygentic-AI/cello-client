@@ -17,6 +17,7 @@ import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider } from "@cello-
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
+import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
 // CBOR encoder for serializing FROST commitments/verifyingShares before
 // persistence (not signaling frames — those go through SignalingManager).
@@ -50,6 +51,13 @@ export interface RegistrationContext {
   getMyPubkeyHex(): string | null;
   setMyPubkeyHex(hex: string): void;
   getDirectoryEndpoint(): { peer_id: string; multiaddrs: string[] } | null;
+  /**
+   * DOD-MANIFEST-1/DKG-1: the full consortium directory-node roster resolved from the
+   * verified manifest (one entry per node). EMPTY when no manifest is configured — the
+   * caller falls back to the single getDirectoryEndpoint() (single-node DKG, M6/M7
+   * back-compat). When non-empty, the DKG fans across ALL of these nodes (T-of-N).
+   */
+  getConsortiumEndpoints(): ConsortiumEndpoint[];
   getThresholdSigner(): IThresholdSigner | undefined;
   setThresholdSigner(signer: IThresholdSigner): void;
   getMyPrimaryPubkey(): Uint8Array | null;
@@ -233,23 +241,58 @@ export class RegistrationManager {
     const epochId = dkgReadyFrame["epochId"] as string;
     const participants = dkgReadyFrame["participants"] as number;
     const threshold = dkgReadyFrame["threshold"] as number;
-    const directoryEndpoint = this.#ctx.getDirectoryEndpoint();
-    if (!directoryEndpoint) {
-      return { error: "directory_unreachable" };
-    }
     // getNode() may be null even when signaling reads connected (brief
     // stream-death window) — null-check before FROST DKG opens streams on it.
     const dkgNode = this.#ctx.getNode();
     if (!dkgNode) {
       return { error: "directory_unreachable" };
     }
-    const dirNode = new NetworkDirectoryNode({
-      id: directoryEndpoint.peer_id,
-      node: dkgNode,
-      directoryPeerId: directoryEndpoint.peer_id,
-      directoryMultiaddrs: directoryEndpoint.multiaddrs,
-      logger: this.#ctx.logger,
-    });
+    // DOD-DKG-1: build the directory-node set the DKG fans across. With a verified consortium
+    // manifest the client resolved the full N-node roster (getConsortiumEndpoints) and the DKG
+    // runs across ALL of them (the generated key is T-of-N). Without a manifest the roster is
+    // empty → the single primary endpoint (single-node DKG, M6/M7 back-compat).
+    const roster = this.#ctx.getConsortiumEndpoints();
+    let directoryNodes: NetworkDirectoryNode[];
+    if (roster.length > 0) {
+      // FROST DKG (key generation) needs ALL N declared nodes present — a node absent DURING
+      // DKG receives no share, yielding a smaller/different consortium. `participants` is the N
+      // the directory derived from its OWN verified manifest (topology consensus); the resolved
+      // roster must match it exactly. Fewer resolved (a node is down) or a disagreeing manifest
+      // ⇒ REFUSE rather than silently DKG a partial/divergent consortium (the threshold-refusal
+      // gate; cello-fallback-finder MANIFEST-1 #1). The kill-a-node tolerance is a SIGNING
+      // property (DOD-SIGN-1), not a DKG one.
+      if (roster.length !== participants) {
+        this.#ctx.logger.warn("registration.dkg.below_threshold", {
+          resolvedNodes: roster.length,
+          declaredParticipants: participants,
+        });
+        return { error: "dkg_below_threshold" };
+      }
+      directoryNodes = roster.map(
+        (ep) =>
+          new NetworkDirectoryNode({
+            id: ep.peerId,
+            node: dkgNode,
+            directoryPeerId: ep.peerId,
+            directoryMultiaddrs: [ep.multiaddr],
+            logger: this.#ctx.logger,
+          }),
+      );
+    } else {
+      const directoryEndpoint = this.#ctx.getDirectoryEndpoint();
+      if (!directoryEndpoint) {
+        return { error: "directory_unreachable" };
+      }
+      directoryNodes = [
+        new NetworkDirectoryNode({
+          id: directoryEndpoint.peer_id,
+          node: dkgNode,
+          directoryPeerId: directoryEndpoint.peer_id,
+          directoryMultiaddrs: directoryEndpoint.multiaddrs,
+          logger: this.#ctx.logger,
+        }),
+      ];
+    }
     void epochId;
     const kLocalPubkeyBytes = Buffer.from(kLocalPubkeyHex, "hex");
     let dkgPrimaryPubkeyHex: string;
@@ -260,7 +303,7 @@ export class RegistrationManager {
       const dkgResult = await runNetworkDkg(kLocalPubkeyBytes, {
         threshold,
         participants,
-        directoryNodes: [dirNode],
+        directoryNodes,
         preAuthToken,
       });
       dkgPrimaryPubkeyHex = Buffer.from(dkgResult.primaryPubkey).toString("hex");

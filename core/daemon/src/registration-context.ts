@@ -20,6 +20,7 @@ import type { IThresholdSigner, KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { RegistrationContext, SignalingSendResult } from "./registration-manager.js";
+import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
 /**
  * Structural slice of SignalingManager this context needs. The real
@@ -44,6 +45,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
   readonly #signaling: SignalingSeam;
   readonly #getDirectoryNode: () => CelloNode | null;
   readonly #getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
+  readonly #getConsortiumEndpoints: () => ConsortiumEndpoint[];
   readonly #unregisterInbound: () => void;
 
   #myPubkeyHex: string | null = null;
@@ -56,6 +58,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
     signaling: SignalingSeam;
     getDirectoryNode: () => CelloNode | null;
     getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
+    getConsortiumEndpoints?: () => ConsortiumEndpoint[];
     keyProvider: KeyProvider;
     persistence: DaemonRegistrationPersistence | null;
     logger: Logger;
@@ -64,6 +67,9 @@ export class DaemonRegistrationContext implements RegistrationContext {
     this.#signaling = opts.signaling;
     this.#getDirectoryNode = opts.getDirectoryNode;
     this.#getDirectoryEndpoint = opts.getDirectoryEndpoint;
+    // Default to an empty roster → single-node DKG (back-compat for callers/tests that
+    // don't supply a consortium roster).
+    this.#getConsortiumEndpoints = opts.getConsortiumEndpoints ?? (() => []);
     this.keyProvider = opts.keyProvider;
     this.persistence = opts.persistence;
     this.logger = opts.logger;
@@ -87,6 +93,10 @@ export class DaemonRegistrationContext implements RegistrationContext {
 
   getDirectoryEndpoint(): { peer_id: string; multiaddrs: string[] } | null {
     return this.#getDirectoryEndpoint();
+  }
+
+  getConsortiumEndpoints(): ConsortiumEndpoint[] {
+    return this.#getConsortiumEndpoints();
   }
 
   getThresholdSigner(): IThresholdSigner | undefined {
