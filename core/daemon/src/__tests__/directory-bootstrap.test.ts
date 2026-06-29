@@ -12,6 +12,8 @@ import {
   fetchBootstrapMultiaddr,
   parsePeerIdFromMultiaddr,
   createDirectoryEndpointResolver,
+  mapEndpointToBootstrapBase,
+  manifestNodesToEndpoints,
 } from "../directory-bootstrap.js";
 import type { Logger } from "../types.js";
 
@@ -147,5 +149,67 @@ describe("createDirectoryEndpointResolver", () => {
     expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── DOD-MANIFEST-1: manifest node set → N directory endpoints ─────────────────
+describe("mapEndpointToBootstrapBase", () => {
+  it("maps a wss:// endpoint to its http:// bootstrap base (ALB terminates TLS)", () => {
+    expect(mapEndpointToBootstrapBase("wss://directory-us1.cello.mygentic.ai:443")).toBe(
+      "http://directory-us1.cello.mygentic.ai:443",
+    );
+  });
+
+  it("maps ws:// to http://", () => {
+    expect(mapEndpointToBootstrapBase("ws://host:8080")).toBe("http://host:8080");
+  });
+
+  it("passes an http:// endpoint through unchanged (the harness/dev form)", () => {
+    expect(mapEndpointToBootstrapBase("http://127.0.0.1:5001")).toBe("http://127.0.0.1:5001");
+  });
+
+  it("strips a trailing slash", () => {
+    expect(mapEndpointToBootstrapBase("http://127.0.0.1:5001/")).toBe("http://127.0.0.1:5001");
+  });
+});
+
+describe("manifestNodesToEndpoints", () => {
+  const NODES = [
+    { nodeId: "node-0", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "http://127.0.0.1:5001" },
+    { nodeId: "node-1", pubkey: "b".repeat(64), region: "eu-central-1", provider: "gcp", endpoint: "http://127.0.0.1:5002" },
+    { nodeId: "node-2", pubkey: "c".repeat(64), region: "ap-northeast-1", provider: "azure", endpoint: "http://127.0.0.1:5003" },
+  ];
+
+  /** A fetch that returns a distinct, port-keyed multiaddr for each node's /bootstrap. */
+  function portKeyedFetch(failPorts: string[] = []): typeof fetch {
+    return vi.fn(async (url: string | URL) => {
+      const port = String(url).match(/:(\d+)\/bootstrap/)?.[1] ?? "0";
+      if (failPorts.includes(port)) return jsonResponse({}, false);
+      return jsonResponse({ multiaddr: `/ip4/127.0.0.1/tcp/${port}/p2p/PEER${port}` });
+    }) as unknown as typeof fetch;
+  }
+
+  it("resolves ALL N nodes to {nodeId, pubkey, peerId, multiaddr}", async () => {
+    const eps = await manifestNodesToEndpoints(NODES, { fetchFn: portKeyedFetch(), logger: silentLogger });
+    expect(eps).toHaveLength(3);
+    expect(eps).toEqual([
+      { nodeId: "node-0", pubkey: "a".repeat(64), peerId: "PEER5001", multiaddr: "/ip4/127.0.0.1/tcp/5001/p2p/PEER5001" },
+      { nodeId: "node-1", pubkey: "b".repeat(64), peerId: "PEER5002", multiaddr: "/ip4/127.0.0.1/tcp/5002/p2p/PEER5002" },
+      { nodeId: "node-2", pubkey: "c".repeat(64), peerId: "PEER5003", multiaddr: "/ip4/127.0.0.1/tcp/5003/p2p/PEER5003" },
+    ]);
+  });
+
+  it("is availability-aware: a node whose /bootstrap fails is SKIPPED, the rest still resolve", async () => {
+    // Redundancy invariant (CLAUDE.md): one node down must not strand the others.
+    const eps = await manifestNodesToEndpoints(NODES, { fetchFn: portKeyedFetch(["5002"]), logger: silentLogger });
+    expect(eps.map((e) => e.nodeId)).toEqual(["node-0", "node-2"]);
+  });
+
+  it("returns an empty array when NO node resolves (caller decides — never a silent single-endpoint fallback)", async () => {
+    const eps = await manifestNodesToEndpoints(NODES, {
+      fetchFn: portKeyedFetch(["5001", "5002", "5003"]),
+      logger: silentLogger,
+    });
+    expect(eps).toEqual([]);
   });
 });

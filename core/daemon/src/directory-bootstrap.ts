@@ -17,6 +17,7 @@
  * SignalingManager retries connect()).
  */
 
+import type { ConsortiumNode } from "@cello-protocol/protocol-types";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { Logger } from "./types.js";
 
@@ -66,6 +67,80 @@ export function parsePeerIdFromMultiaddr(multiaddr: string): string | null {
   if (idx === -1) return null;
   const peerId = multiaddr.slice(idx + "/p2p/".length).split("/")[0];
   return peerId && peerId.length > 0 ? peerId : null;
+}
+
+// ─── DOD-MANIFEST-1: consortium manifest node set → N directory endpoints ──────
+
+/** A resolved consortium directory node: its manifest identity + live dial coordinate. */
+export interface ConsortiumEndpoint {
+  /** The node's stable consortium identifier (from the manifest). */
+  nodeId: string;
+  /** The node's Ed25519 pubkey (from the manifest) — used for step-6 identity + addressing. */
+  pubkey: string;
+  /** The libp2p peer ID resolved from the node's live /bootstrap. */
+  peerId: string;
+  /** The libp2p multiaddr resolved from the node's live /bootstrap. */
+  multiaddr: string;
+}
+
+/**
+ * Map a manifest node `endpoint` to the HTTP base used for its `/bootstrap` probe.
+ * The manifest endpoint is the node's public address (e.g. `wss://host:443`, with the
+ * ALB terminating TLS), but `/bootstrap` is served over plain HTTP behind that ALB
+ * (matching PRODUCTION_DIRECTORY_URL, which is `http://`). So `http(s)://` is used as
+ * is; `ws://`/`wss://` map to `http://`. A trailing slash is stripped because
+ * fetchBootstrapMultiaddr appends `/bootstrap`. (M8B-DECISIONS: reuse `endpoint` as the
+ * node's reachable HTTP base rather than adding a separate bootstrapUrl field.)
+ */
+export function mapEndpointToBootstrapBase(endpoint: string): string {
+  const noSlash = endpoint.replace(/\/$/, "");
+  if (noSlash.startsWith("wss://")) return "http://" + noSlash.slice("wss://".length);
+  if (noSlash.startsWith("ws://")) return "http://" + noSlash.slice("ws://".length);
+  return noSlash;
+}
+
+export interface ManifestResolveOptions {
+  logger: Logger;
+  /** Injectable fetch for testing. */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Resolve every consortium node in the manifest's node set to a live directory
+ * endpoint by probing each node's `/bootstrap` (in parallel, order preserved).
+ *
+ * AVAILABILITY-AWARE (CLAUDE.md redundancy invariant): a node whose bootstrap is
+ * unreachable is SKIPPED with a warning — one node down must never strand the others,
+ * because a T-of-N ceremony only needs T of the N. Returns the resolved subset
+ * (possibly empty). The CALLER decides whether the resolved count meets the threshold;
+ * this function NEVER silently substitutes the single hardcoded endpoint for a missing
+ * node — that would defeat sovereignty by masking a down/forged node as healthy.
+ */
+export async function manifestNodesToEndpoints(
+  nodes: readonly ConsortiumNode[],
+  opts: ManifestResolveOptions,
+): Promise<ConsortiumEndpoint[]> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const resolved = await Promise.all(
+    nodes.map(async (node): Promise<ConsortiumEndpoint | null> => {
+      const base = mapEndpointToBootstrapBase(node.endpoint);
+      const multiaddr = await fetchBootstrapMultiaddr(base, fetchFn);
+      if (!multiaddr) {
+        opts.logger.warn("directory.consortium.node.unresolved", {
+          nodeId: node.nodeId,
+          endpoint: node.endpoint,
+        });
+        return null;
+      }
+      const peerId = parsePeerIdFromMultiaddr(multiaddr);
+      if (!peerId) {
+        opts.logger.error("directory.consortium.node.no_peer_id", { nodeId: node.nodeId, multiaddr });
+        return null;
+      }
+      return { nodeId: node.nodeId, pubkey: node.pubkey, peerId, multiaddr };
+    }),
+  );
+  return resolved.filter((e): e is ConsortiumEndpoint => e !== null);
 }
 
 export interface DirectoryEndpointResolverOptions {
