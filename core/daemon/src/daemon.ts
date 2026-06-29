@@ -77,7 +77,7 @@ import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
-import { resolveDirectoryUrl } from "./directory-bootstrap.js";
+import { resolveDirectoryUrl, manifestNodesToEndpoints, type ConsortiumEndpoint } from "./directory-bootstrap.js";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -349,6 +349,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // M7 Keystone: the version of the verified manifest, surfaced in ConnectResult.
   // Stays 0 when no manifestProvider is configured (the M6 backward-compat path).
   let verifiedManifestVersion = 0;
+  // DOD-MANIFEST-1: the consortium node set resolved to live directory endpoints from
+  // the VERIFIED manifest — the N-node roster a T-of-N ceremony (DOD-DKG-1) fans out to.
+  // Empty in the M6 backward-compat path (no manifest) or if no node resolves.
+  let consortiumEndpoints: ConsortiumEndpoint[] = [];
 
   if (manifestProvider && manifestRootKeys && manifestThreshold !== undefined) {
     try {
@@ -384,6 +388,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           logger.info("directory.auth.manifest.verified", {
             manifestVersion: manifest.version,
             signerCount: manifest.signatures.length,
+          });
+
+          // DOD-MANIFEST-1: resolve the FULL verified node set to live directory
+          // endpoints (replaces the implicit single-endpoint assumption). This is the
+          // roster T-of-N ceremonies fan out to. Availability-aware — a node that is
+          // down is skipped, the rest still resolve (redundancy invariant: a ceremony
+          // needs only T of N). The resolved count is logged so an operator sees the
+          // real reachable consortium at startup; the ceremony layer (DOD-DKG-1)
+          // re-checks the threshold against this roster and never silently falls back
+          // to the single hardcoded endpoint for a missing/forged node.
+          consortiumEndpoints = await manifestNodesToEndpoints(manifest.nodes, { logger });
+          logger.info("directory.consortium.resolved", {
+            manifestVersion: manifest.version,
+            declaredNodes: manifest.nodes.length,
+            resolvedNodes: consortiumEndpoints.length,
+            peerIds: consortiumEndpoints.map((e) => e.peerId),
           });
         }
       }
