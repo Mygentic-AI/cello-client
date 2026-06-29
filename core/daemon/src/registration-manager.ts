@@ -52,12 +52,15 @@ export interface RegistrationContext {
   setMyPubkeyHex(hex: string): void;
   getDirectoryEndpoint(): { peer_id: string; multiaddrs: string[] } | null;
   /**
-   * DOD-MANIFEST-1/DKG-1: the full consortium directory-node roster resolved from the
-   * verified manifest (one entry per node). EMPTY when no manifest is configured — the
-   * caller falls back to the single getDirectoryEndpoint() (single-node DKG, M6/M7
-   * back-compat). When non-empty, the DKG fans across ALL of these nodes (T-of-N).
+   * DOD-MANIFEST-1/DKG-1: the consortium directory-node roster resolved from the verified
+   * manifest (one entry per resolved node), or NULL when NO consortium manifest is configured.
+   * `null` ⇒ single-node DKG against getDirectoryEndpoint() (M6/M7 back-compat). A non-null
+   * array ⇒ a consortium IS configured and the DKG must fan across exactly these nodes
+   * (T-of-N); an EMPTY array (manifest configured but the whole consortium unresolved) is NOT
+   * a fallback to single-node — it must REFUSE (the threshold gate). This null-vs-empty
+   * distinction is load-bearing (code-reviewer B1 / fallback-finder).
    */
-  getConsortiumEndpoints(): ConsortiumEndpoint[];
+  getConsortiumEndpoints(): ConsortiumEndpoint[] | null;
   getThresholdSigner(): IThresholdSigner | undefined;
   setThresholdSigner(signer: IThresholdSigner): void;
   getMyPrimaryPubkey(): Uint8Array | null;
@@ -251,16 +254,25 @@ export class RegistrationManager {
     // manifest the client resolved the full N-node roster (getConsortiumEndpoints) and the DKG
     // runs across ALL of them (the generated key is T-of-N). Without a manifest the roster is
     // empty → the single primary endpoint (single-node DKG, M6/M7 back-compat).
+    // getConsortiumEndpoints() returns the resolved roster when a consortium manifest IS
+    // configured, or NULL when none is (the M6/M7 single-node back-compat path). Branching on
+    // "manifest configured" (roster !== null) — NOT "roster non-empty" — is the load-bearing
+    // distinction (code-reviewer B1 / cello-fallback-finder HIGH): an EMPTY roster with a
+    // manifest configured (the whole consortium momentarily unreachable) must REFUSE, never
+    // silently fall back to a 2-of-2 DKG against an unverified single directory.
     const roster = this.#ctx.getConsortiumEndpoints();
     let directoryNodes: NetworkDirectoryNode[];
-    if (roster.length > 0) {
-      // FROST DKG (key generation) needs ALL N declared nodes present — a node absent DURING
-      // DKG receives no share, yielding a smaller/different consortium. `participants` is the N
-      // the directory derived from its OWN verified manifest (topology consensus); the resolved
-      // roster must match it exactly. Fewer resolved (a node is down) or a disagreeing manifest
-      // ⇒ REFUSE rather than silently DKG a partial/divergent consortium (the threshold-refusal
-      // gate; cello-fallback-finder MANIFEST-1 #1). The kill-a-node tolerance is a SIGNING
-      // property (DOD-SIGN-1), not a DKG one.
+    if (roster !== null) {
+      // A consortium manifest is configured → multi-node DKG. FROST DKG (key generation) needs
+      // ALL N declared nodes present — a node absent DURING DKG receives no share, yielding a
+      // smaller/different consortium. `participants` is the N the directory derived from its OWN
+      // verified manifest (topology consensus); the resolved roster must match it EXACTLY. Fewer
+      // resolved (a node down, OR the whole consortium unreachable → roster empty) or more (a
+      // divergent/forward-skewed manifest) ⇒ REFUSE rather than silently DKG a partial/divergent
+      // consortium or downgrade to single-node. The empty case (0 !== N) is exactly what B1 fixes.
+      // NOTE (MEDIUM, parked — M8B-DECISIONS): this is a COUNT check; a same-count, different-
+      // identity manifest version skew is not caught here — closing it needs manifest-version
+      // agreement in dkg_ready. The kill-a-node tolerance is a SIGNING property (DOD-SIGN-1).
       if (roster.length !== participants) {
         this.#ctx.logger.warn("registration.dkg.below_threshold", {
           resolvedNodes: roster.length,
@@ -279,6 +291,7 @@ export class RegistrationManager {
           }),
       );
     } else {
+      // No consortium manifest configured → single-node DKG (M6/M7 back-compat).
       const directoryEndpoint = this.#ctx.getDirectoryEndpoint();
       if (!directoryEndpoint) {
         return { error: "directory_unreachable" };

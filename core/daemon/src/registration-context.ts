@@ -45,7 +45,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
   readonly #signaling: SignalingSeam;
   readonly #getDirectoryNode: () => CelloNode | null;
   readonly #getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
-  readonly #getConsortiumEndpoints: () => ConsortiumEndpoint[];
+  readonly #getConsortiumEndpoints: () => ConsortiumEndpoint[] | null;
   readonly #unregisterInbound: () => void;
 
   #myPubkeyHex: string | null = null;
@@ -58,7 +58,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
     signaling: SignalingSeam;
     getDirectoryNode: () => CelloNode | null;
     getDirectoryEndpoint: () => { peer_id: string; multiaddrs: string[] } | null;
-    getConsortiumEndpoints?: () => ConsortiumEndpoint[];
+    getConsortiumEndpoints?: () => ConsortiumEndpoint[] | null;
     keyProvider: KeyProvider;
     persistence: DaemonRegistrationPersistence | null;
     logger: Logger;
@@ -67,9 +67,10 @@ export class DaemonRegistrationContext implements RegistrationContext {
     this.#signaling = opts.signaling;
     this.#getDirectoryNode = opts.getDirectoryNode;
     this.#getDirectoryEndpoint = opts.getDirectoryEndpoint;
-    // Default to an empty roster → single-node DKG (back-compat for callers/tests that
-    // don't supply a consortium roster).
-    this.#getConsortiumEndpoints = opts.getConsortiumEndpoints ?? (() => []);
+    // Default to null → "no consortium manifest configured" → single-node DKG (back-compat for
+    // callers/tests that don't supply a roster). null (no manifest) is distinct from [] (manifest
+    // configured but unresolved → refuse) — see RegistrationContext.getConsortiumEndpoints.
+    this.#getConsortiumEndpoints = opts.getConsortiumEndpoints ?? (() => null);
     this.keyProvider = opts.keyProvider;
     this.persistence = opts.persistence;
     this.logger = opts.logger;
@@ -95,7 +96,7 @@ export class DaemonRegistrationContext implements RegistrationContext {
     return this.#getDirectoryEndpoint();
   }
 
-  getConsortiumEndpoints(): ConsortiumEndpoint[] {
+  getConsortiumEndpoints(): ConsortiumEndpoint[] | null {
     return this.#getConsortiumEndpoints();
   }
 

@@ -178,17 +178,46 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     expect(await promise).toEqual({ error: "dkg_below_threshold" });
   });
 
-  // Single-node back-compat: an EMPTY roster (no consortium manifest) falls back to the single
-  // primary endpoint and does NOT trip the gate — it proceeds to the DKG node-build (here we
-  // assert it gets PAST the gate by reaching the DKG with the single directory endpoint, then a
-  // getNode-null short-circuits to keep the test in-process without a live ceremony).
-  it("empty roster (no manifest) → single-node path, gate not tripped", async () => {
-    const h = makeFakeCtx({ getConsortiumEndpoints: () => [], getNode: () => null });
+  // DOD-DKG-1 B1 (code-reviewer / fallback-finder, BLOCKING) — an EMPTY roster while a consortium
+  // manifest IS configured (the whole consortium momentarily unreachable) must REFUSE, NOT silently
+  // downgrade to a 2-of-2 DKG against an unverified directory. The null-vs-empty distinction makes
+  // the gate (0 !== N) fire here. (getNode is a real stub so we reach the roster branch.)
+  it("refuses (dkg_below_threshold) when a manifest is configured but the roster resolves EMPTY", async () => {
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => [] });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 3, threshold: 3 });
+    expect(await promise).toEqual({ error: "dkg_below_threshold" });
+  });
+
+  // DOD-DKG-1 (cello-test-attacker note) — the gate fires in BOTH directions: a roster LARGER than
+  // the directory's declared N (a divergent/forward-skewed manifest) is also refused.
+  it("refuses (dkg_below_threshold) when the resolved roster EXCEEDS the directory's N", async () => {
+    const roster: ConsortiumEndpoint[] = [0, 1, 2, 3].map((i) => ({
+      nodeId: `n${i}`,
+      pubkey: String(i).repeat(64).slice(0, 64),
+      peerId: `p${i}`,
+      multiaddr: `/ip4/127.0.0.1/tcp/${i + 1}/p2p/p${i}`,
+    }));
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => roster });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 3, threshold: 3 });
+    expect(await promise).toEqual({ error: "dkg_below_threshold" });
+  });
+
+  // Single-node back-compat: NULL roster (no consortium manifest configured) takes the single-node
+  // path — it does NOT refuse with dkg_below_threshold. Proven by reaching runNetworkDkg against the
+  // single primary endpoint (the stub node makes the live ceremony throw → dkg_failed, which only
+  // happens PAST the gate on the single-node branch — distinct from the below_threshold refusal).
+  it("null roster (no manifest) → single-node path, NOT a below-threshold refusal", async () => {
+    const h = makeFakeCtx({ getConsortiumEndpoints: () => null });
     const mgr = new RegistrationManager(h.ctx);
     const promise = mgr.register("", "token");
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
-    // getNode null is checked BEFORE the roster branch → directory_unreachable, NOT below_threshold.
-    expect(await promise).toEqual({ error: "directory_unreachable" });
+    expect(await promise).toEqual({ error: "dkg_failed" });
   });
 });

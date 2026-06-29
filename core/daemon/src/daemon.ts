@@ -1581,13 +1581,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
 
       const persistence = getPersistence(name);
-      // DOD-DKG-1: resolve the full consortium roster from the VERIFIED manifest so the DKG
-      // fans across all N directory nodes. Re-resolved here (ceremony time) for fresh failover
-      // coordinates. Empty when no manifest is configured → single-node DKG (M6/M7 back-compat).
+      // DOD-DKG-1: resolve the full consortium roster from the VERIFIED manifest so the DKG fans
+      // across all N directory nodes. Re-resolved here (ceremony time) for fresh failover
+      // coordinates. NULL when NO manifest is configured (→ single-node DKG, M6/M7 back-compat);
+      // a (possibly EMPTY) array when a manifest IS configured. The null-vs-empty distinction is
+      // load-bearing: an empty roster (consortium configured but unreachable) must REFUSE in
+      // registration-manager, NOT downgrade to single-node (code-reviewer B1 / fallback-finder).
       const currentManifest = manifestProvider?.getCurrentManifest();
       const consortiumRoster = currentManifest
         ? await manifestNodesToEndpoints(currentManifest.nodes, { logger })
-        : [];
+        : null;
       const ctx = new DaemonRegistrationContext({
         signaling: agentSignaling,
         getDirectoryNode: agentGetNode,
