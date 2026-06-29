@@ -326,12 +326,9 @@ export class FrostThresholdSigner implements IThresholdSigner {
     onProgress?: import("./types.js").CeremonyProgressCallback,
   ): Promise<ThresholdSignature> {
     const agentHex = toHex(this.#agentPubkey);
-    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner.participateInCeremony: enter agent=${agentHex.slice(0,16)} ceremony=${ceremonyId.slice(0,16)}\n`);
 
     const localShare = _localShares.get(agentHex);
-    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: localShare=${localShare ? "FOUND" : "NOT FOUND"} agentHex=${agentHex.slice(0,16)}\n`);
     if (!localShare) {
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: all keys in _localShares: (cannot iterate module-private map)\n`);
       throw new Error(
         "Not bootstrapped: call bootstrapKeyShares before using FrostThresholdSigner",
       );
@@ -340,14 +337,11 @@ export class FrostThresholdSigner implements IThresholdSigner {
     const stubs = this.#config.directoryNodeStubs ?? [];
     const { threshold, roundTimeoutMs, ceremonyTimeoutMs, maxRetries } =
       this.#config;
-    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: stubs=${stubs.length} threshold=${threshold} maxRetries=${maxRetries} roundTimeoutMs=${roundTimeoutMs}\n`);
-    stubs.forEach((s, i) => process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: stub[${i}] id=${s.id?.slice(0,16)} isReachable=${s.isReachable()}\n`));
 
     // Frame message for domain separation: context\0tbs
     const msg = frameMessage(context, tbs);
 
     const { pub } = localShare;
-    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: pub.signers=${JSON.stringify((pub as unknown as { signers: unknown }).signers)} pub.commitments.length=${(pub as unknown as { commitments: unknown[] }).commitments?.length}\n`);
     const clientId = ed25519_FROST.Identifier.derive(
       `client:${toHex(this.#agentPubkey)}`,
     );
@@ -360,9 +354,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
     // reachable, fail immediately — the ceremony cannot possibly succeed.
     // (threshold - 1 because the client itself is one of the threshold signers)
     const reachableAtInitiation = stubs.filter((s) => s.isReachable());
-    process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: reachableAtInitiation=${reachableAtInitiation.length} need=${threshold - 1}\n`);
     if (reachableAtInitiation.length < threshold - 1) {
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: FAIL pre-check DIRECTORY_BELOW_THRESHOLD\n`);
       return {
         ok: false,
         error: { reason: "DIRECTORY_BELOW_THRESHOLD" },
@@ -376,9 +368,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
     const ceremonyExcluded = new Set<string>();
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: attempt ${attempt + 1}/${maxRetries} excluded=${[...ceremonyExcluded].length}\n`);
       if (Date.now() >= ceremonyDeadline) {
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: FAIL CEREMONY_TIMEOUT at attempt ${attempt + 1}\n`);
         return {
           ok: false,
           error: { reason: "CEREMONY_TIMEOUT" },
@@ -388,7 +378,6 @@ export class FrostThresholdSigner implements IThresholdSigner {
       const available = reachableAtInitiation.filter(
         (s) => !ceremonyExcluded.has(s.id),
       );
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: available stubs=${available.length} need=${threshold - 1}\n`);
 
       // Select (threshold - 1) stubs for this round (client counts as one signer)
       const selected = available.slice(0, threshold - 1);
@@ -414,25 +403,34 @@ export class FrostThresholdSigner implements IThresholdSigner {
       // (selection is the first threshold-1 of `available`), so a SUB-threshold suspension exhausts
       // maxRetries instead of routing to the healthy directories — violating DOD-SUSPEND-1
       // (threshold-refusal ≠ single-node-refusal: < N−T+1 suspensions must still sign).
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: Round1 calling ed25519_FROST.commit\n`);
       const localNonce = ed25519_FROST.commit(localShare.secret);
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: Round1 calling generateCommitment on ${selected.length} stubs\n`);
       type StubCommit = Awaited<ReturnType<(typeof selected)[0]["generateCommitment"]>>;
       const stubCommits: StubCommit[] = [];
       let commitFailedThisRound = false;
       for (const s of selected) {
+        // Mirror the sign round (below): check the ceremony deadline before each node and RACE the
+        // network-blocking generateCommitment against a per-node timeout. A directory that accepts the
+        // stream but never responds (silent drop / hung TCP) must be routed around (excluded), not
+        // allowed to stall participateInCeremony indefinitely — CELLO's availability invariant. Without
+        // this the commit round — now the load-bearing route-around path for a sub-threshold suspension
+        // — could hang forever, the exact failure mode the sovereign-node redundancy rule forbids.
+        if (Date.now() >= ceremonyDeadline) {
+          return { ok: false, error: { reason: "CEREMONY_TIMEOUT" } };
+        }
+        const commitTimeout = new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), roundTimeoutMs),
+        );
         let r: StubCommit | null;
         try {
-          r = await s.generateCommitment();
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment stub=${s.id?.slice(0,16)} nodeId=${r?.nodeId?.slice(0,16)}\n`);
-        } catch (err: unknown) {
-          const m = err instanceof Error ? err.message : String(err);
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: generateCommitment THREW stub=${s.id?.slice(0,16)}: ${m}\n`);
+          r = await Promise.race([s.generateCommitment(), commitTimeout]);
+        } catch {
           r = null;
         }
         if (!r || !r.nonceCommitment) {
-          // Refused (suspended) or failed → EXCLUDE and retry with survivors (same as Round 2).
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: excluding stub=${s.id?.slice(0,16)} (commit refused/failed)\n`);
+          // Refused (suspended), failed, or timed out → EXCLUDE and retry with survivors (same as Round 2).
+          // The refusing node's distinct reason (AGENT_SUSPENDED vs AGENT_NOT_BOOTSTRAPPED vs EPOCH_EXPIRED)
+          // is surfaced structurally by the directory ITSELF (frost.debug.frost_stream.commit_response /
+          // frost.share.refused.suspended) — the coordinator only needs the route-around decision here.
           ceremonyExcluded.add(s.id);
           commitFailedThisRound = true;
           continue;
@@ -475,20 +473,16 @@ export class FrostThresholdSigner implements IThresholdSigner {
 
         let partialSig: Uint8Array | null;
         try {
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: calling signRound stub=${stub.id?.slice(0,16)}\n`);
           partialSig = await Promise.race([
             stub.signRound({ pub, commitmentList, msg, ceremonyId }),
             timeoutPromise,
           ]);
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: signRound stub=${stub.id?.slice(0,16)} result=${partialSig === null ? "TIMEOUT" : `Uint8Array(${partialSig.length})`}\n`);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: signRound THREW stub=${stub.id?.slice(0,16)}: ${msg}\n`);
           partialSig = null;
         }
 
         if (partialSig === null) {
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: excluding stub=${stub.id?.slice(0,16)} (null/timeout)\n`);
           ceremonyExcluded.add(stub.id);
           anyFailedThisRound = true;
           continue;
@@ -498,15 +492,12 @@ export class FrostThresholdSigner implements IThresholdSigner {
         try {
           const stubId = ed25519_FROST.Identifier.derive(stub.id);
           isValid = ed25519_FROST.verifyShare(pub, commitmentList, msg, stubId, partialSig);
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: verifyShare stub=${stub.id?.slice(0,16)} isValid=${isValid}\n`);
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: verifyShare THREW stub=${stub.id?.slice(0,16)}: ${msg}\n`);
           isValid = false;
         }
 
         if (!isValid) {
-          process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: excluding stub=${stub.id?.slice(0,16)} (invalid sig)\n`);
           ceremonyExcluded.add(stub.id);
           anyFailedThisRound = true;
           continue;
@@ -535,20 +526,9 @@ export class FrostThresholdSigner implements IThresholdSigner {
         // Log everything before signShare so a throw gives full context
         const pubRec = pub as unknown as Record<string, unknown>;
         const secretRec = localShare.secret as unknown as Record<string, unknown>;
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: PRE-signShare attempt=${attempt + 1}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   pub.signers=${JSON.stringify(pubRec.signers)}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   pub.commitments.length=${Array.isArray(pubRec.commitments) ? pubRec.commitments.length : "NOT_ARRAY"}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   pub.commitments[0] type=${Array.isArray(pubRec.commitments) ? typeof pubRec.commitments[0] : "N/A"} isUint8Array=${Array.isArray(pubRec.commitments) ? pubRec.commitments[0] instanceof Uint8Array : "N/A"}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   secret.identifier=${String(secretRec.identifier)} type=${typeof secretRec.identifier}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   secret.signingShare type=${typeof secretRec.signingShare} isUint8Array=${secretRec.signingShare instanceof Uint8Array}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   localNonce.nonces type=${typeof localNonce.nonces} keys=${typeof localNonce.nonces === "object" && localNonce.nonces ? Object.keys(localNonce.nonces as object).join(",") : "N/A"}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   commitmentList.length=${commitmentList.length}\n`);
         commitmentList.forEach((c, i) => {
           const cr = c as unknown as Record<string, unknown>;
-          process.stderr.write(`[CLIENT-DEBUG]   commitmentList[${i}]: identifier=${String(cr.identifier)} hiding.isUint8Array=${cr.hiding instanceof Uint8Array} binding.isUint8Array=${cr.binding instanceof Uint8Array}\n`);
         });
-        process.stderr.write(`[CLIENT-DEBUG]   msg.length=${msg.length} isUint8Array=${msg instanceof Uint8Array}\n`);
-        process.stderr.write(`[CLIENT-DEBUG]   clientId type=${typeof clientId} value=${String(clientId).slice(0,20)}\n`);
 
         clientSig = ed25519_FROST.signShare(
           localShare.secret,
@@ -557,31 +537,24 @@ export class FrostThresholdSigner implements IThresholdSigner {
           commitmentList,
           msg,
         );
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: client signShare OK sigLength=${clientSig.length}\n`);
         sigShares[String(clientId)] = clientSig;
         partialSigCount++;
         onProgress?.({ type: "partial_sig_collected", index: partialSigCount, total: totalParticipants });
       } catch (err: unknown) {
         const msg2 = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: client signShare THREW: ${msg2}\n`);
         continue;
       }
 
-      process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: sigShares count=${Object.keys(sigShares).length} threshold=${threshold}\n`);
       if (Object.keys(sigShares).length < threshold) {
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: not enough sigShares, continuing\n`);
         continue;
       }
 
       // Aggregate
       let signature: Uint8Array;
       try {
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: calling aggregate sigShareKeys=${Object.keys(sigShares).map(k=>k.slice(0,8)).join(",")}\n`);
         signature = ed25519_FROST.aggregate(pub, commitmentList, msg, sigShares);
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: aggregate OK sigLength=${signature.length}\n`);
       } catch (err: unknown) {
         const msg2 = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[CLIENT-DEBUG] FrostThresholdSigner: aggregate THREW: ${msg2}\n`);
         continue;
       }
 
