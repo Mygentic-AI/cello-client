@@ -477,8 +477,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
             stub.signRound({ pub, commitmentList, msg, ceremonyId }),
             timeoutPromise,
           ]);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
+        } catch {
           partialSig = null;
         }
 
@@ -492,8 +491,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
         try {
           const stubId = ed25519_FROST.Identifier.derive(stub.id);
           isValid = ed25519_FROST.verifyShare(pub, commitmentList, msg, stubId, partialSig);
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
+        } catch {
           isValid = false;
         }
 
@@ -523,13 +521,6 @@ export class FrostThresholdSigner implements IThresholdSigner {
       // All selected stubs provided valid partial sigs. Compute client's partial sig.
       let clientSig: Uint8Array;
       try {
-        // Log everything before signShare so a throw gives full context
-        const pubRec = pub as unknown as Record<string, unknown>;
-        const secretRec = localShare.secret as unknown as Record<string, unknown>;
-        commitmentList.forEach((c, i) => {
-          const cr = c as unknown as Record<string, unknown>;
-        });
-
         clientSig = ed25519_FROST.signShare(
           localShare.secret,
           pub,
@@ -540,8 +531,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
         sigShares[String(clientId)] = clientSig;
         partialSigCount++;
         onProgress?.({ type: "partial_sig_collected", index: partialSigCount, total: totalParticipants });
-      } catch (err: unknown) {
-        const msg2 = err instanceof Error ? err.message : String(err);
+      } catch {
         continue;
       }
 
@@ -553,8 +543,7 @@ export class FrostThresholdSigner implements IThresholdSigner {
       let signature: Uint8Array;
       try {
         signature = ed25519_FROST.aggregate(pub, commitmentList, msg, sigShares);
-      } catch (err: unknown) {
-        const msg2 = err instanceof Error ? err.message : String(err);
+      } catch {
         continue;
       }
 
