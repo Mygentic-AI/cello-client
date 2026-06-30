@@ -42,6 +42,28 @@ export interface RelayReceipt {
   timestamp: number;
   /** Hex of the 64-byte Ed25519 signature over the ACK TBS. */
   signatureHex: string;
+  // FED-OPTIONB-SEAL-001 — the per-leaf bytes a UNILATERAL seal carries so the directory rebuilds the
+  // tree OFFLINE (no directory→relay getSealLeaves dial). Optional: pre-OPTIONB-SEAL receipts (and rows
+  // written before the migration) have none; getSealLeaves omits those. When present, structure2Cbor is
+  // the relay's committed Structure2 (from the DOD-MSG-4 ack), structure1Cbor the sender-signed leaf, and
+  // leafKind the leaf kind (0x00 msg / 0x02 ctrl).
+  /** The relay's committed Structure2 (CBOR) for this leaf (DOD-MSG-4 hash_submit_ack). */
+  structure2Cbor?: Uint8Array;
+  /** The sender-signed Structure1 (CBOR) for this leaf. */
+  structure1Cbor?: Uint8Array;
+  /** Leaf kind: 0x00 message, 0x02 control (SEAL). */
+  leafKind?: number;
+}
+
+/**
+ * FED-OPTIONB-SEAL-001: a fully-carried leaf for the unilateral-seal offline rebuild — a receipt that has
+ * its Structure2/Structure1 carry bytes. `getSealLeaves` returns these (the chain the directory can rebuild
+ * + verify offline), narrowing the optional carry fields to required.
+ */
+export interface SealLeaf extends RelayReceipt {
+  structure2Cbor: Uint8Array;
+  structure1Cbor: Uint8Array;
+  leafKind: number;
 }
 
 /**
@@ -118,6 +140,10 @@ const CREATE_RELAY_RECEIPTS_SQL = `
     relay_timestamp  INTEGER NOT NULL,
     signature_hex    TEXT    NOT NULL,
     stored_at        INTEGER NOT NULL,
+    -- FED-OPTIONB-SEAL-001: per-leaf carry bytes for the unilateral-seal offline rebuild (nullable).
+    structure2_cbor  BLOB,
+    structure1_cbor  BLOB,
+    leaf_kind        INTEGER,
     PRIMARY KEY (agent_pubkey, session_id, sequence_number)
   );
 `;
@@ -130,6 +156,29 @@ export class RelayReceiptStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_RELAY_RECEIPTS_SQL);
+    this.#migrateSealCarryColumns();
+  }
+
+  /**
+   * FED-OPTIONB-SEAL-001: add the per-leaf carry columns to a relay_ack_receipts table created before the
+   * seal-carry feature (CREATE TABLE IF NOT EXISTS leaves an existing table untouched). Idempotent + safe:
+   * each column is added only if absent (checked via PRAGMA table_info), and all three are NULLABLE so the
+   * ALTER never rewrites or invalidates existing rows. Pre-migration receipts simply have no carry bytes
+   * (getSealLeaves omits them). No data is read/destroyed — pure additive schema evolution.
+   */
+  #migrateSealCarryColumns(): void {
+    const cols = new Set(
+      (this.#db.prepare(`PRAGMA table_info(relay_ack_receipts)`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    for (const [name, decl] of [
+      ["structure2_cbor", "BLOB"],
+      ["structure1_cbor", "BLOB"],
+      ["leaf_kind", "INTEGER"],
+    ] as const) {
+      if (!cols.has(name)) {
+        this.#db.exec(`ALTER TABLE relay_ack_receipts ADD COLUMN ${name} ${decl}`);
+      }
+    }
   }
 
   /**
@@ -143,8 +192,8 @@ export class RelayReceiptStore {
     const info = this.#db
       .prepare(
         `INSERT OR IGNORE INTO relay_ack_receipts
-           (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, stored_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, stored_at, structure2_cbor, structure1_cbor, leaf_kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         receipt.agentPubkeyHex,
@@ -156,6 +205,10 @@ export class RelayReceiptStore {
         receipt.timestamp,
         receipt.signatureHex,
         storedAtMs,
+        // FED-OPTIONB-SEAL-001: carry bytes (null when absent — receipt-only rows).
+        receipt.structure2Cbor ? Buffer.from(receipt.structure2Cbor) : null,
+        receipt.structure1Cbor ? Buffer.from(receipt.structure1Cbor) : null,
+        receipt.leafKind ?? null,
       );
     const wrote = Number(info.changes) > 0;
     if (!wrote && existing && existing.hashHex !== receipt.hashHex) {
@@ -201,6 +254,29 @@ export class RelayReceiptStore {
     return (rows as Array<Record<string, unknown>>).map((r) => this.#rowToReceipt(r));
   }
 
+  /**
+   * FED-OPTIONB-SEAL-001: the complete carried leaf chain for a session's UNILATERAL seal — every receipt
+   * that has its Structure2/Structure1 carry bytes, ordered by canonical sequence. The directory rebuilds +
+   * verifies this tree OFFLINE (no directory→relay getSealLeaves dial). Rows without carry bytes
+   * (pre-migration / receipt-only) are omitted: the caller carries only what the directory can rebuild.
+   */
+  getSealLeaves(agentPubkeyHex: string, sessionIdHex: string): SealLeaf[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT agent_pubkey, session_id, sequence_number, hash_hex, relay_id, relay_pubkey_hex, relay_timestamp, signature_hex, structure2_cbor, structure1_cbor, leaf_kind
+           FROM relay_ack_receipts
+          WHERE agent_pubkey = ? AND session_id = ? AND structure2_cbor IS NOT NULL AND structure1_cbor IS NOT NULL AND leaf_kind IS NOT NULL
+          ORDER BY sequence_number ASC`,
+      )
+      .all(agentPubkeyHex, sessionIdHex) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      ...this.#rowToReceipt(r),
+      structure2Cbor: toU8(r.structure2_cbor),
+      structure1Cbor: toU8(r.structure1_cbor),
+      leafKind: r.leaf_kind as number,
+    }));
+  }
+
   #rowToReceipt(row: Record<string, unknown>): RelayReceipt {
     return {
       hashHex: row.hash_hex as string,
@@ -213,4 +289,12 @@ export class RelayReceiptStore {
       signatureHex: row.signature_hex as string,
     };
   }
+}
+
+/** Normalize a SQLite BLOB column (Buffer/Uint8Array/ArrayBuffer) to a Uint8Array. */
+function toU8(v: unknown): Uint8Array {
+  if (v instanceof Uint8Array) return v;
+  if (Buffer.isBuffer(v)) return new Uint8Array(v as Buffer);
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  return new Uint8Array();
 }

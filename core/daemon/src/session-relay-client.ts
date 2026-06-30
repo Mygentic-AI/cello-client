@@ -210,6 +210,9 @@ export class AgentRelayClient {
   // DOD-MSG-4: the sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
   // SubmitResult can carry it (the ack itself only returns the relay's structure2_cbor).
   #pendingStructure1: Uint8Array | null = null;
+  // FED-OPTIONB-SEAL-001: the in-flight submit's leaf kind (0x00 msg / 0x02 ctrl), paired with its ack so
+  // #captureReceipt can persist it alongside the Structure2/Structure1 carry bytes for the unilateral seal.
+  #pendingLeafKind: number | null = null;
   /** The session_id hex of the in-flight submit, so its ack updates the right #lastSeen. */
   #pendingAckSessionHex: string | null = null;
   /**
@@ -369,6 +372,7 @@ export class AgentRelayClient {
     this.#pendingAck = null;
     this.#pendingAckSessionHex = null;
     this.#pendingStructure1 = null;
+    this.#pendingLeafKind = null;
     if (resolve) resolve(r);
   }
 
@@ -455,7 +459,15 @@ export class AgentRelayClient {
       case "store": {
         if (!this.#receiptStore) return false;
         try {
-          const wrote = this.#receiptStore.store(ev.receipt, Date.now());
+          // FED-OPTIONB-SEAL-001: persist the per-leaf carry bytes alongside the receipt so a UNILATERAL
+          // seal can present the full chain (Structure2 from the relay's ack + the sender-signed Structure1
+          // + the leaf kind) and the directory rebuilds the tree OFFLINE. structure2_cbor rides the same
+          // ack we're verifying; structure1Cbor + the leaf kind are this submit's paired in-flight values.
+          const structure2Cbor = frame["structure2_cbor"] instanceof Uint8Array ? (frame["structure2_cbor"] as Uint8Array) : undefined;
+          const wrote = this.#receiptStore.store(
+            { ...ev.receipt, structure2Cbor, structure1Cbor, leafKind: this.#pendingLeafKind ?? undefined },
+            Date.now(),
+          );
           if (wrote) {
             this.#logger.info("relay.receipt.stored", { seq, hashShort: ev.receipt.hashHex.slice(0, 16), relayShort: ev.receipt.relayId.slice(0, 16) });
           }
@@ -750,10 +762,11 @@ export class AgentRelayClient {
     // DOD-MSG-4: remember this submit's sender-signed structure1_cbor so its ack can return the full
     // ordering record (the ack itself carries only the relay's structure2_cbor).
     this.#pendingStructure1 = structure1;
+    this.#pendingLeafKind = leafKind;
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingLeafKind = null; }
       this.#logger.warn("session.relay.submit.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
       return { ok: false, reason: "relay_submit_send_failed" };
     }
@@ -768,7 +781,7 @@ export class AgentRelayClient {
       return result;
     } finally {
       clearTimeout(timer);
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingLeafKind = null; }
     }
   }
 

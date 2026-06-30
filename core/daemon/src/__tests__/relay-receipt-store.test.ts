@@ -114,3 +114,59 @@ describe("RelayReceiptStore (DOD-RELAYSIG-1) — durable, positioned, immutable"
     expect(store.getAll(agent).length).toBe(3);
   });
 });
+
+describe("RelayReceiptStore — Option B seal carry (DOD-OPTIONB-SEAL-1)", () => {
+  // For a UNILATERAL seal under Option B the client carries the per-leaf Structure2 + Structure1 (so the
+  // directory rebuilds the tree OFFLINE) alongside the relay receipt (so the directory verifies the relay
+  // witnessed each leaf at its sequence). The store persists those leaf bytes at the same attestation
+  // position and getSealLeaves returns the complete ordered chain for a session.
+  const agent = "aa".repeat(32);
+  const sess = "cc".repeat(16);
+  const mkLeaf = (seq: number, hashHex: string, s2: Uint8Array, s1: Uint8Array, kind: number): RelayReceipt => ({
+    hashHex,
+    agentPubkeyHex: agent,
+    sessionIdHex: sess,
+    relayId: "dd".repeat(32),
+    relayPubkeyHex: "dd".repeat(32),
+    sequenceNumber: seq,
+    timestamp: seq * 10,
+    signatureHex: "ee".repeat(64),
+    structure2Cbor: s2,
+    structure1Cbor: s1,
+    leafKind: kind,
+  });
+
+  it("persists + returns per-leaf structure2/structure1/kind ordered by sequence (the unilateral carry)", () => {
+    const db = new DatabaseSync(":memory:");
+    const store = new RelayReceiptStore(db, NOOP_LOGGER);
+    store.store(mkLeaf(2, "22".repeat(32), new Uint8Array([0xa2]), new Uint8Array([0xb2]), 0), 1);
+    store.store(mkLeaf(1, "11".repeat(32), new Uint8Array([0xa1]), new Uint8Array([0xb1]), 0), 1);
+    store.store(mkLeaf(3, "33".repeat(32), new Uint8Array([0xa3]), new Uint8Array([0xb3]), 2), 1); // ctrl SEAL leaf
+
+    const leaves = store.getSealLeaves(agent, sess);
+    expect(leaves.map((l) => l.sequenceNumber)).toEqual([1, 2, 3]);
+    expect(leaves[0].leafKind).toBe(0);
+    expect(leaves[2].leafKind).toBe(2);
+    expect(Buffer.from(leaves[0].structure2Cbor).equals(Buffer.from([0xa1]))).toBe(true);
+    expect(Buffer.from(leaves[1].structure1Cbor).equals(Buffer.from([0xb2]))).toBe(true);
+    // The relay receipt fields ride along for the directory's per-leaf witness verification.
+    expect(leaves[2].hashHex).toBe("33".repeat(32));
+    expect(leaves[2].signatureHex).toBe("ee".repeat(64));
+    expect(leaves[2].timestamp).toBe(30);
+  });
+
+  it("getSealLeaves omits leaves whose carry bytes were never recorded (pre-M8B / receipt-only rows)", () => {
+    const db = new DatabaseSync(":memory:");
+    const store = new RelayReceiptStore(db, NOOP_LOGGER);
+    // A receipt-only row (no structure2/structure1) — e.g. a pre-OPTIONB-SEAL receipt.
+    store.store({
+      hashHex: "11".repeat(32), agentPubkeyHex: agent, sessionIdHex: sess, relayId: "dd".repeat(32),
+      relayPubkeyHex: "dd".repeat(32), sequenceNumber: 1, timestamp: 10, signatureHex: "ee".repeat(64),
+    }, 1);
+    store.store(mkLeaf(2, "22".repeat(32), new Uint8Array([0xa2]), new Uint8Array([0xb2]), 0), 1);
+    // getSealLeaves returns only leaves that have the full carry bytes (the chain it can rebuild offline).
+    expect(store.getSealLeaves(agent, sess).map((l) => l.sequenceNumber)).toEqual([2]);
+    // getAll still returns ALL receipts (the witness query is unchanged).
+    expect(store.getAll(agent, sess).length).toBe(2);
+  });
+});
