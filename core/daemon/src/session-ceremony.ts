@@ -18,7 +18,7 @@
  * the registration-time signer was on the disposed RegistrationContext).
  */
 
-import { decode } from "cbor-x";
+import { decode, encode } from "cbor-x";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
@@ -27,7 +27,8 @@ import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-sig
 import type { IThresholdSigner } from "@cello-protocol/crypto";
 import type { FrostContext } from "@cello-protocol/crypto/frost/types.js";
 import type { CelloNode } from "@cello-protocol/transport";
-import { NetworkDirectoryNode } from "./network-directory-node.js";
+import { NetworkDirectoryNode, runNetworkRefresh } from "./network-directory-node.js";
+import type { FrostKeyShareRecord } from "./registration-persistence.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { SignalingSeam } from "./registration-context.js";
@@ -112,7 +113,9 @@ export interface CeremonyWiringDeps {
  * drive the ceremony's `/cello/frost/1.0.0` round-trips on the agent's directory node.
  * Returns null when no share is persisted or the share is unreadable.
  */
-export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Promise<IThresholdSigner | null> {
+async function hydrateShareAndStubs(
+  deps: CeremonyWiringDeps,
+): Promise<{ share: FrostKeyShareRecord; stubs: NetworkDirectoryNode[] | undefined } | null> {
   const share = await deps.persistence.loadActiveFrostKeyShare();
   if (!share) return null;
 
@@ -168,7 +171,10 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
   let directoryNodeStubs: NetworkDirectoryNode[] | undefined;
   const node = deps.getNode();
   const roster = await deps.getConsortiumEndpoints();
-  const epochId = `${deps.agentPubkeyHex}:epoch:1`;
+  // Use the share's CURRENT epoch (advances after a proactive refresh) — NOT a hardcoded epoch:1, else
+  // post-refresh signing would target the now-EXPIRED epoch and fail (DOD-REFRESH-1). For an un-refreshed
+  // agent share.epochId IS "…:epoch:1", so this is identical to the prior behavior.
+  const epochId = share.epochId;
   const mkStub = (peerId: string, multiaddr: string): NetworkDirectoryNode => {
     const stub = new NetworkDirectoryNode({
       id: peerId,
@@ -198,10 +204,65 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
       directoryNodeStubs = [mkStub(ep.peerId, ep.multiaddr)];
     }
   }
+  return { share, stubs: directoryNodeStubs };
+}
+
+export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Promise<IThresholdSigner | null> {
+  const h = await hydrateShareAndStubs(deps);
+  if (!h) return null;
   return new FrostThresholdSigner(
-    { threshold: share.threshold, participants: share.participants, directoryNodeStubs },
+    { threshold: h.share.threshold, participants: h.share.participants, directoryNodeStubs: h.stubs },
     Buffer.from(deps.agentPubkeyHex, "hex"),
   );
+}
+
+/**
+ * M8B DOD-REFRESH-1: run a proactive share refresh for an already-registered agent. Rotates the client's
+ * + every directory node's share to the next epoch (group public key unchanged), then persists the
+ * client's new share as the active one so subsequent signing uses the new epoch and old-epoch shares die.
+ */
+export async function runAgentRefresh(
+  deps: CeremonyWiringDeps,
+): Promise<{ ok: true; toEpochN: number; primaryPubkey: string } | { ok: false; reason: string }> {
+  const h = await hydrateShareAndStubs(deps);
+  if (!h) return { ok: false, reason: "no_active_share" };
+  if (!h.stubs || h.stubs.length === 0) return { ok: false, reason: "no_directory_nodes" };
+  const fromEpochN = Number(/:epoch:(\d+)$/.exec(h.share.epochId)?.[1] ?? "1");
+  let result: Awaited<ReturnType<typeof runNetworkRefresh>>;
+  try {
+    result = await runNetworkRefresh(Buffer.from(deps.agentPubkeyHex, "hex"), {
+      threshold: h.share.threshold,
+      participants: h.share.participants,
+      directoryNodes: h.stubs,
+      fromEpochN,
+    });
+  } catch (err: unknown) {
+    deps.logger.error("refresh.ceremony.failed", {
+      agentName: deps.agentName,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    return { ok: false, reason: "ceremony_failed" };
+  }
+  const primaryPubkeyHex = Buffer.from(result.primaryPubkey).toString("hex");
+  // Persist the rotated client share as the ACTIVE one (UPDATE overwrites the frost_* columns), so the
+  // next signing ceremony loads the new epoch. The directory nodes already advanced their own epoch.
+  await deps.persistence.persistFrostKeyShare({
+    epochId: `${deps.agentPubkeyHex}:epoch:${result.toEpochN}`,
+    primaryPubkey: primaryPubkeyHex,
+    identifier: result.identifier,
+    signingShare: result.signingShare,
+    threshold: h.share.threshold,
+    participants: h.share.participants,
+    commitmentsCbor: encode(result.commitments),
+    verifyingSharesCbor: encode(result.verifyingShares),
+    dkgMethod: "network_dkg",
+  });
+  deps.logger.info("refresh.ceremony.complete", {
+    agentName: deps.agentName,
+    toEpoch: result.toEpochN,
+    primaryPubkey: primaryPubkeyHex.slice(0, 16),
+  });
+  return { ok: true, toEpochN: result.toEpochN, primaryPubkey: primaryPubkeyHex };
 }
 
 /**
