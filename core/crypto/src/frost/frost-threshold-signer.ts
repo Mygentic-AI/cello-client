@@ -88,7 +88,13 @@ import { ed25519_FROST } from "@noble/curves/ed25519.js";
 import type {
   FrostPublic,
   FrostSecret,
+  Signers,
 } from "@noble/curves/abstract/frost.js";
+import {
+  generateRefreshContribution,
+  applyRefresh,
+  type RefreshContribution,
+} from "./frost-resharing.js";
 import type {
   IThresholdSigner,
   ThresholdSignature,
@@ -145,6 +151,61 @@ export function storeDkgResult(
 ): void {
   ed25519_FROST.validateSecret(secret, pub);
   _localShares.set(agentPubkeyHex, { secret, pub });
+}
+
+// ─── M8B DOD-REFRESH-1: client-side proactive share refresh ───────────────────
+// The client is a FROST shareholder; a proactive refresh rotates its share too. These helpers keep the
+// client's signing share inside the crypto package boundary (the daemon never handles raw share bytes).
+
+/** The client's FROST identifier for the agent (the evaluation point its share lives at). */
+export function getClientFrostIdentifier(agentPubkeyHex: string): string {
+  const ls = _localShares.get(agentPubkeyHex);
+  if (!ls) throw new Error("FrostThresholdSigner: no local share to refresh");
+  return ls.secret.identifier;
+}
+
+/** Generate the client's own zero-constant refresh contribution for the agreed participant roster. */
+export function generateClientRefreshContribution(
+  agentPubkeyHex: string,
+  signers: Signers,
+  participantIds: string[],
+): RefreshContribution {
+  return generateRefreshContribution(signers, getClientFrostIdentifier(agentPubkeyHex), participantIds);
+}
+
+/**
+ * Apply the agreed contribution set to the client's local share, rotating it (secret + public) in place,
+ * and return the serializable new share data for DB persistence (PERSIST-024 shape; SI-001: never log the
+ * signingShare). The group public key (primaryPubkey) is unchanged.
+ */
+export function applyRefreshToLocalShare(
+  agentPubkeyHex: string,
+  contributions: RefreshContribution[],
+  signers: Signers,
+  participantIds: string[],
+): {
+  primaryPubkey: Uint8Array;
+  signingShare: Uint8Array;
+  identifier: string;
+  commitments: Uint8Array[];
+  verifyingShares: Record<string, Uint8Array>;
+} {
+  const ls = _localShares.get(agentPubkeyHex);
+  if (!ls) throw new Error("FrostThresholdSigner: no local share to refresh");
+  const newKey = applyRefresh({ secret: ls.secret, public: ls.pub }, contributions, signers, participantIds);
+  ed25519_FROST.validateSecret(newKey.secret, newKey.public);
+  _localShares.set(agentPubkeyHex, { secret: newKey.secret, pub: newKey.public });
+  const pub = newKey.public as unknown as { commitments: Uint8Array[]; verifyingShares: Record<string, Uint8Array> };
+  const sec = newKey.secret as unknown as { identifier: string; signingShare: Uint8Array };
+  return {
+    primaryPubkey: new Uint8Array(pub.commitments[0]),
+    signingShare: new Uint8Array(sec.signingShare),
+    identifier: sec.identifier,
+    commitments: pub.commitments.map((c) => new Uint8Array(c)),
+    verifyingShares: Object.fromEntries(
+      Object.entries(pub.verifyingShares).map(([k, v]) => [k, new Uint8Array(v)]),
+    ),
+  };
 }
 
 // ─── Message framing for domain separation ────────────────────────────────────

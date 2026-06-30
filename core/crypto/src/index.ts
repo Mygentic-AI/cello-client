@@ -32,6 +32,21 @@ export {
 // SESSION-004: standalone FROST verify (no signer instance needed — used by counterparty client)
 export { verifyFrostSignature } from "./frost/frost-threshold-signer.js";
 
+// M8B DOD-REFRESH-1: FROST proactive share resharing (PSS) — used by the directory (its own share) and
+// the daemon coordinator (the client's share). Group key unchanged; old-epoch shares die.
+export {
+  generateRefreshContribution,
+  verifyRefreshContribution,
+  applyRefresh,
+} from "./frost/frost-resharing.js";
+export type { RefreshContribution } from "./frost/frost-resharing.js";
+// Client-side refresh helpers (daemon coordinator): rotate the client's own share in-package.
+export {
+  getClientFrostIdentifier,
+  generateClientRefreshContribution,
+  applyRefreshToLocalShare,
+} from "./frost/frost-threshold-signer.js";
+
 // REG-001: re-export ed25519_FROST for DKG coordinator in @cello-protocol/client
 export { ed25519_FROST } from "@noble/curves/ed25519.js";
 

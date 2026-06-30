@@ -20,7 +20,7 @@
  * scalar (e.g. "0100…00" === 1). All field arithmetic is mod L via `ed25519_FROST.utils.Fn`.
  */
 import { ed25519_FROST, ed25519 } from "@noble/curves/ed25519.js";
-import type { FrostSecret, Signers } from "@noble/curves/abstract/frost.js";
+import type { FrostSecret, FrostPublic, Key, Signers } from "@noble/curves/abstract/frost.js";
 
 const Fn = ed25519_FROST.utils.Fn;
 const Point = ed25519.Point;
@@ -130,11 +130,13 @@ export function verifyRefreshContribution(commitment: Uint8Array[], signers: Sig
 }
 
 /**
- * Apply the refresh to one party's share. For this party's identifier j: enforce the full-roster
- * completeness gate, verify every contribution (zero constant term + non-trivial + well-formed) and
- * Feldman-check each sub-share δ_i(j)·G == Σ_k j^k·C_i[k] before trusting it, then return the rotated share
- * s'_j = s_j + Σ_i δ_i(j) (mod L). The group public key is unchanged; old-epoch shares no longer combine
- * with the result.
+ * Apply the refresh to one party's Key (secret share + shared public). For this party's identifier j:
+ * enforce the full-roster completeness gate, verify every contribution (zero constant term + non-trivial +
+ * well-formed) and Feldman-check each sub-share δ_i(j)·G == Σ_k j^k·C_i[k] before trusting it, then return
+ * the rotated Key — secret s'_j = s_j + Σ_i δ_i(j) (mod L) AND the homomorphically-updated FrostPublic (see
+ * refreshPublic; commitments[1..] and verifyingShares move, commitments[0]=group key is invariant). The
+ * returned (secret, public) pair is signing-ready: a post-refresh FROST ceremony verifies against the same
+ * group key. Old-epoch shares no longer combine with the result.
  *
  * PRECONDITION — broadcast agreement (NOT enforceable by this local primitive): every honest party MUST
  * receive the IDENTICAL `commitment` (and the matching sub-share) from each contributor i. This primitive
@@ -151,12 +153,12 @@ export function verifyRefreshContribution(commitment: Uint8Array[], signers: Sig
  * corrupt party cannot silently shift the secret or hand a victim an unusable share.
  */
 export function applyRefresh(
-  oldShare: FrostSecret,
+  oldKey: Key,
   contributions: RefreshContribution[],
   signers: Signers,
   expectedParticipantIds: string[],
-): FrostSecret {
-  const j = oldShare.identifier;
+): Key {
+  const j = oldKey.secret.identifier;
   const xj = identifierScalar(j);
 
   // COMPLETENESS GATE (fallback HIGH): a proactive refresh — like DKG — requires EVERY current shareholder
@@ -185,7 +187,7 @@ export function applyRefresh(
     throw new Error(`frost-resharing: incomplete refresh — missing contributions from ${missing.length} party/parties (a partial refresh would diverge the joint key)`);
   }
 
-  let acc = Fn.fromBytes(oldShare.signingShare);
+  let acc = Fn.fromBytes(oldKey.secret.signingShare);
   for (const contribution of contributions) {
     verifyRefreshContribution(contribution.commitment, signers);
 
@@ -210,5 +212,55 @@ export function applyRefresh(
 
   // new Uint8Array(...) gives an ArrayBuffer-backed copy (FrostSecret.signingShare is the stricter
   // Uint8Array<ArrayBuffer>, not Fn.toBytes's Uint8Array<ArrayBufferLike>).
-  return { identifier: j, signingShare: new Uint8Array(Fn.toBytes(acc)) };
+  const newSecret: FrostSecret = { identifier: j, signingShare: new Uint8Array(Fn.toBytes(acc)) };
+
+  return { secret: newSecret, public: refreshPublic(oldKey.public, contributions) };
+}
+
+/**
+ * Homomorphically update the shared FrostPublic for the refreshed sharing. PSS rotates the shares, so the
+ * group VSS commitments and every verifying share change — only commitments[0] (the group public key) is
+ * invariant. Without this, post-refresh signing fails: `verifyShare` checks a partial signature against the
+ * participant's verifyingShare, which moved when the share rotated.
+ *
+ *   newCommitments[k] = oldCommitments[k] + Σ_i C_i[k]        (the joint polynomial f' = f + Σ δ_i)
+ *   newVerifyingShares[id] = Σ_m newCommitments[m]·id^m       (VSS evaluation of f' at each participant)
+ *
+ * Every honest party computes the IDENTICAL new public from the same agreed contribution set, so the
+ * resulting (secret, public) pairs are mutually consistent. commitments[0] is asserted unchanged: Σ_i C_i[0]
+ * is the identity (every contribution's zero-constant proof, already checked), so the group key is preserved
+ * by construction — the assertion is a belt-and-suspenders guard against a bug upstream.
+ */
+function refreshPublic(oldPublic: FrostPublic, contributions: RefreshContribution[]): FrostPublic {
+  const oldCommitments = oldPublic.commitments as Uint8Array[];
+  const degree = oldCommitments.length;
+
+  const newCommitments: Uint8Array[] = [];
+  for (let k = 0; k < degree; k++) {
+    let acc = Point.fromBytes(oldCommitments[k]);
+    for (const c of contributions) {
+      acc = acc.add(Point.fromBytes(c.commitment[k]));
+    }
+    newCommitments.push(new Uint8Array(acc.toBytes()));
+  }
+  if (Buffer.from(newCommitments[0]).toString("hex") !== Buffer.from(oldCommitments[0]).toString("hex")) {
+    throw new Error("frost-resharing: group public key changed — refresh is not secret-preserving");
+  }
+
+  const oldVerifying = oldPublic.verifyingShares as Record<string, Uint8Array>;
+  const newVerifyingShares: Record<string, Uint8Array> = {};
+  for (const id of Object.keys(oldVerifying)) {
+    const x = identifierScalar(id);
+    let acc = Point.ZERO;
+    for (let m = newCommitments.length - 1; m >= 0; m--) {
+      acc = pointMul(acc, x).add(Point.fromBytes(newCommitments[m]));
+    }
+    newVerifyingShares[id] = new Uint8Array(acc.toBytes());
+  }
+
+  return {
+    signers: oldPublic.signers,
+    commitments: newCommitments,
+    verifyingShares: newVerifyingShares,
+  } as FrostPublic;
 }
