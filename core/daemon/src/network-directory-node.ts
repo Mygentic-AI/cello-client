@@ -13,7 +13,14 @@
 import { Encoder, decode as cborDecode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { ed25519_FROST, FrostThresholdSigner } from "@cello-protocol/crypto";
-import { bootstrapKeyShares, storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
+import {
+  bootstrapKeyShares,
+  storeDkgResult,
+  getClientFrostIdentifier,
+  getClientRefreshRoster,
+  generateClientRefreshContribution,
+  applyRefreshToLocalShare,
+} from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "./types.js";
 import type {
@@ -35,6 +42,9 @@ import type {
   FrostDkgRound1Response,
   FrostDkgRound2Response,
   FrostDkgRound3Response,
+  FrostRefreshContribution,
+  FrostRefreshRound1Response,
+  FrostRefreshRound2Response,
 } from "@cello-protocol/protocol-types";
 
 const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
@@ -747,5 +757,158 @@ export async function runNetworkDkg(
     ),
     threshold: opts.threshold,
     participants: opts.participants,
+  };
+}
+
+// ─── M8B DOD-REFRESH-1: proactive share resharing (PSS) orchestration ─────────
+// A client-coordinated 2-round refresh that rotates every shareholder's share to a new epoch while keeping
+// the group public key unchanged (frost-resharing.ts). The client is the UNIFORM RELAY: it collects one
+// contribution per node (round 1) and distributes the agreed set — narrowed to each node's own sub-share
+// (round 2) — so a directory cannot equivocate and a node never sees another party's sub-shares.
+
+async function refreshRound1WithNode(
+  node: NetworkDirectoryNode,
+  agentPubkeyHex: string,
+  fromEpochId: string,
+  toEpochId: string,
+  signers: { min: number; max: number },
+  participantIds: string[],
+): Promise<FrostRefreshContribution> {
+  const frame = CBOR_ENC.encode({
+    type: "frost_refresh_round1_request",
+    agentPubkey: agentPubkeyHex,
+    fromEpochId,
+    toEpochId,
+    signers,
+    participantIds,
+  });
+  const stream = await node.openStream();
+  try {
+    stream.send(lp.encode.single(frame));
+    for await (const chunk of lp.decode(stream)) {
+      const bytes = chunk instanceof Uint8Array ? chunk : (chunk as unknown as { slice(): Uint8Array }).slice();
+      const resp = cborDecode(bytes) as FrostRefreshRound1Response;
+      if (resp.type !== "frost_refresh_round1_response") throw new Error("refreshRound1: invalid response");
+      if (!resp.ok) throw new Error(`refreshRound1 failed: ${resp.reason}`);
+      return resp.contribution;
+    }
+  } finally {
+    stream.close().catch(() => {});
+  }
+  throw new Error("refreshRound1: no response received");
+}
+
+async function refreshRound2WithNode(
+  node: NetworkDirectoryNode,
+  agentPubkeyHex: string,
+  fromEpochId: string,
+  toEpochId: string,
+  signers: { min: number; max: number },
+  participantIds: string[],
+  contributions: FrostRefreshContribution[],
+): Promise<Uint8Array> {
+  const frame = CBOR_ENC.encode({
+    type: "frost_refresh_round2_request",
+    agentPubkey: agentPubkeyHex,
+    fromEpochId,
+    toEpochId,
+    signers,
+    participantIds,
+    contributions,
+  });
+  const stream = await node.openStream();
+  try {
+    stream.send(lp.encode.single(frame));
+    for await (const chunk of lp.decode(stream)) {
+      const bytes = chunk instanceof Uint8Array ? chunk : (chunk as unknown as { slice(): Uint8Array }).slice();
+      const resp = cborDecode(bytes) as FrostRefreshRound2Response;
+      if (resp.type !== "frost_refresh_round2_response") throw new Error("refreshRound2: invalid response");
+      if (!resp.ok) throw new Error(`refreshRound2 failed: ${resp.reason}`);
+      return new Uint8Array(resp.shareCommitment);
+    }
+  } finally {
+    stream.close().catch(() => {});
+  }
+  throw new Error("refreshRound2: no response received");
+}
+
+/**
+ * Run a proactive share refresh across the consortium. Rotates the client's + every directory node's share
+ * from epoch `fromEpochN` to `fromEpochN + 1`, leaving the group public key byte-identical. Verifies every
+ * party reports the same (unchanged) group key before returning the client's serializable new-epoch share.
+ */
+export async function runNetworkRefresh(
+  agentPubkey: Uint8Array,
+  opts: {
+    threshold: number;
+    participants: number;
+    directoryNodes: NetworkDirectoryNode[];
+    fromEpochN: number;
+  },
+): Promise<{
+  toEpochN: number;
+  primaryPubkey: Uint8Array;
+  signingShare: Uint8Array;
+  identifier: string;
+  commitments: Uint8Array[];
+  verifyingShares: Record<string, Uint8Array>;
+}> {
+  const agentPubkeyHex = Buffer.from(agentPubkey).toString("hex");
+  const fromEpochId = `${agentPubkeyHex}:epoch:${opts.fromEpochN}`;
+  const toEpochN = opts.fromEpochN + 1;
+  const toEpochId = `${agentPubkeyHex}:epoch:${toEpochN}`;
+  const signers = { min: opts.threshold, max: opts.participants + 1 };
+  const participantIds = getClientRefreshRoster(agentPubkeyHex);
+
+  // ─── Round 1: collect one contribution per participant ───
+  const nodeContributions = await Promise.all(
+    opts.directoryNodes.map((node) =>
+      refreshRound1WithNode(node, agentPubkeyHex, fromEpochId, toEpochId, signers, participantIds),
+    ),
+  );
+  const clientContribution = generateClientRefreshContribution(agentPubkeyHex, signers, participantIds);
+  const allContributions: FrostRefreshContribution[] = [clientContribution, ...nodeContributions];
+
+  // ─── Round 2: each node applies; narrow each contribution's subShares to that node's own entry ───
+  const clientId = getClientFrostIdentifier(agentPubkeyHex);
+  const narrowFor = (recipientId: string): FrostRefreshContribution[] =>
+    allContributions.map((c) => ({
+      fromId: c.fromId,
+      commitment: c.commitment,
+      subShares: { [recipientId]: c.subShares[recipientId] },
+    }));
+
+  const nodeCommitments = await Promise.all(
+    opts.directoryNodes.map((node, idx) =>
+      refreshRound2WithNode(
+        node, agentPubkeyHex, fromEpochId, toEpochId, signers, participantIds,
+        narrowFor(nodeContributions[idx].fromId),
+      ),
+    ),
+  );
+
+  // Client applies its own refresh (rotates _localShares in-package).
+  const clientResult = applyRefreshToLocalShare(agentPubkeyHex, narrowFor(clientId), signers, participantIds);
+
+  // ─── Verify all parties agree on the (unchanged) group key ───
+  const primaryPubkeyHex = Buffer.from(clientResult.primaryPubkey).toString("hex");
+  for (const nc of nodeCommitments) {
+    if (Buffer.from(nc).toString("hex") !== primaryPubkeyHex) {
+      throw new Error("Refresh failed: a directory node's post-refresh group key does not match the client's");
+    }
+  }
+
+  // Advance every node's signing context to the new epoch.
+  for (const node of opts.directoryNodes) {
+    node.setBootstrapContext(agentPubkeyHex, toEpochId);
+  }
+
+  return {
+    toEpochN,
+    primaryPubkey: clientResult.primaryPubkey,
+    signingShare: clientResult.signingShare,
+    identifier: clientResult.identifier,
+    commitments: clientResult.commitments,
+    verifyingShares: clientResult.verifyingShares,
   };
 }
