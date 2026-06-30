@@ -433,6 +433,7 @@ export type SealRejectionReason =
   | "leaf_signature_invalid"
   | "prev_root_chain_broken"
   | "causal_chain_violated"
+  | "content_hash_mismatch"
   | "seal_leaves_invalid"
   | "seal_signature_invalid";
 
