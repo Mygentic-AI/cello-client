@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/connect",
-  "version": "0.0.51",
+  "version": "0.0.52",
   "private": false,
   "type": "module",
   "engines": {
