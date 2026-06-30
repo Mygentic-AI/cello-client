@@ -197,6 +197,7 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
       guidance?: string;
       epoch?: number;
       primary_pubkey?: string;
+      verifying_shares_digest?: string;
     };
     client.close();
     if (!result.ok) {
@@ -204,7 +205,7 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
     }
     return {
       exitCode: 0,
-      output: JSON.stringify({ ok: true, epoch: result.epoch, primary_pubkey: result.primary_pubkey }, null, 2),
+      output: JSON.stringify({ ok: true, epoch: result.epoch, primary_pubkey: result.primary_pubkey, verifying_shares_digest: result.verifying_shares_digest }, null, 2),
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);

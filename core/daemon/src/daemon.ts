@@ -2032,7 +2032,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!result.ok) {
       return { ok: false, reason: result.reason, guidance: "Share refresh did not complete — see the daemon log (refresh.ceremony.*) for the cause." };
     }
-    return { ok: true, epoch: result.toEpochN, primary_pubkey: result.primaryPubkey };
+    return { ok: true, epoch: result.toEpochN, primary_pubkey: result.primaryPubkey, verifying_shares_digest: result.verifyingSharesDigest };
   });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───

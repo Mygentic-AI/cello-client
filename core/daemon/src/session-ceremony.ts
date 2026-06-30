@@ -19,6 +19,7 @@
  */
 
 import { decode, encode } from "cbor-x";
+import { createHash } from "node:crypto";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
@@ -223,7 +224,7 @@ export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Prom
  */
 export async function runAgentRefresh(
   deps: CeremonyWiringDeps,
-): Promise<{ ok: true; toEpochN: number; primaryPubkey: string } | { ok: false; reason: string }> {
+): Promise<{ ok: true; toEpochN: number; primaryPubkey: string; verifyingSharesDigest: string } | { ok: false; reason: string }> {
   const h = await hydrateShareAndStubs(deps);
   if (!h) return { ok: false, reason: "no_active_share" };
   if (!h.stubs || h.stubs.length === 0) return { ok: false, reason: "no_directory_nodes" };
@@ -244,25 +245,57 @@ export async function runAgentRefresh(
     return { ok: false, reason: "ceremony_failed" };
   }
   const primaryPubkeyHex = Buffer.from(result.primaryPubkey).toString("hex");
-  // Persist the rotated client share as the ACTIVE one (UPDATE overwrites the frost_* columns), so the
-  // next signing ceremony loads the new epoch. The directory nodes already advanced their own epoch.
-  await deps.persistence.persistFrostKeyShare({
-    epochId: `${deps.agentPubkeyHex}:epoch:${result.toEpochN}`,
-    primaryPubkey: primaryPubkeyHex,
-    identifier: result.identifier,
-    signingShare: result.signingShare,
-    threshold: h.share.threshold,
-    participants: h.share.participants,
-    commitmentsCbor: encode(result.commitments),
-    verifyingSharesCbor: encode(result.verifyingShares),
-    dkgMethod: "network_dkg",
-  });
+  // M2 (defense-in-depth): the group public key MUST be byte-identical to the PRE-refresh key. The
+  // cross-node check inside runNetworkRefresh only proves all parties AGREE post-refresh — a uniform
+  // secret-shift (a crypto-core regression) would move the key on every party identically and pass it,
+  // while silently diverging from the registered key counterparties verify seals against. Assert against
+  // the KNOWN pre-refresh key (h.share.primaryPubkey) and abort WITHOUT persisting on mismatch.
+  if (primaryPubkeyHex !== h.share.primaryPubkey) {
+    deps.logger.error("refresh.ceremony.group_key_changed", {
+      agentName: deps.agentName,
+      expected: h.share.primaryPubkey.slice(0, 16),
+      got: primaryPubkeyHex.slice(0, 16),
+    });
+    return { ok: false, reason: "group_key_changed" };
+  }
+  // verifyingShares are PUBLIC (s_j·G per participant) and MOVE on a real refresh while commitments[0]
+  // (the group key) does not — so their digest is the one observable that distinguishes a genuine
+  // rotation from a no-op "relabel" (the spine asserts it changes across two refreshes). SI-001-safe.
+  const verifyingSharesDigest = createHash("sha256")
+    .update(
+      Object.keys(result.verifyingShares)
+        .sort()
+        .map((k) => `${k}:${Buffer.from(result.verifyingShares[k]).toString("hex")}`)
+        .join("|"),
+    )
+    .digest("hex");
+  // L7: a persist failure here is the most dangerous point (directories already advanced) — surface it
+  // as a STRUCTURED reason rather than letting a raw throw escape the handler.
+  try {
+    await deps.persistence.persistFrostKeyShare({
+      epochId: `${deps.agentPubkeyHex}:epoch:${result.toEpochN}`,
+      primaryPubkey: primaryPubkeyHex,
+      identifier: result.identifier,
+      signingShare: result.signingShare,
+      threshold: h.share.threshold,
+      participants: h.share.participants,
+      commitmentsCbor: encode(result.commitments),
+      verifyingSharesCbor: encode(result.verifyingShares),
+      dkgMethod: "network_dkg",
+    });
+  } catch (err: unknown) {
+    deps.logger.error("refresh.ceremony.persist_failed", {
+      agentName: deps.agentName,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    return { ok: false, reason: "persist_failed" };
+  }
   deps.logger.info("refresh.ceremony.complete", {
     agentName: deps.agentName,
     toEpoch: result.toEpochN,
     primaryPubkey: primaryPubkeyHex.slice(0, 16),
   });
-  return { ok: true, toEpochN: result.toEpochN, primaryPubkey: primaryPubkeyHex };
+  return { ok: true, toEpochN: result.toEpochN, primaryPubkey: primaryPubkeyHex, verifyingSharesDigest };
 }
 
 /**
