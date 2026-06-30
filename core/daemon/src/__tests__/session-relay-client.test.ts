@@ -8,15 +8,18 @@
  */
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { generateKeypair, verify } from "@cello-protocol/crypto";
+import { generateKeypair, verify, buildRelayAckTbs } from "@cello-protocol/crypto";
 import {
   AgentRelayClient,
   buildRelayAuthPayload,
   encodeStructure1,
   RELAY_AUTH_DOMAIN,
 } from "../session-relay-client.js";
+import { RelayReceiptStore } from "../relay-receipt-store.js";
+import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import type { Logger } from "../types.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -343,6 +346,202 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
     // The client DID present the assignment, and the rejection is surfaced LOUD (not a silent success).
     expect(relay.sentFrames.some((f) => f["type"] === "client_record_assignment")).toBe(true);
     expect(logs.includes("session.relay.assignment.invalid")).toBe(true);
+    client.close();
+  });
+});
+
+describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)", () => {
+  // F1 blocking: the daemon capture path is the PRODUCER of the seal carry. These prove that
+  // the sealLeafStore receives the correct data from both own-leaf acks and counterparty leaf_delivers.
+  const makeStores = () => {
+    const db = new DatabaseSync(":memory:");
+    return {
+      sealLeafStore: new SessionSealLeafStore(db, noopLogger),
+      receiptStore: new RelayReceiptStore(db, noopLogger),
+    };
+  };
+
+  it("own-leaf hash_submit_ack → store has relay receipt fields (relay_id, relay_timestamp, relay_signature)", async () => {
+    const { sealLeafStore, receiptStore } = makeStores();
+    const relayKp = generateKeypair();
+    const relayPub = await relayKp.getPublicKey();
+    const relayIdHex = Buffer.from(relayPub).toString("hex");
+    const kp = generateKeypair();
+    const pub = await kp.getPublicKey();
+    const pubHex = Buffer.from(pub).toString("hex");
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: pub,
+      logger: noopLogger,
+      receiptStore,
+      sealLeafStore,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0xf1);
+    const sidHex = Buffer.from(sid).toString("hex");
+    client.registerSession(sidHex, relay.node);
+
+    // The content hash that will be inside Structure1 (the submit produces it from this).
+    const contentHash = new Uint8Array(32).fill(1);
+    const submit = client.submitMessageHash(relay.node, sid, contentHash);
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+
+    // Build a REAL relay signature over the ACK TBS (so evaluateRelayAck returns "store").
+    const ts = 12345;
+    const seq = 1;
+    const tbs = buildRelayAckTbs(contentHash, seq, ts);
+    const relaySig = await relayKp.sign(tbs);
+    const fakeS2 = new Uint8Array([0x01, 0x02, 0x03]);
+    relay.push({
+      type: "hash_submit_ack",
+      sequence_number: seq,
+      structure2_cbor: fakeS2,
+      relay_id: relayIdHex,
+      timestamp: ts,
+      relay_signature: relaySig,
+    });
+    const res = await submit;
+    expect(res.ok).toBe(true);
+
+    // The sealLeafStore must have an entry for this leaf WITH receipt fields.
+    const carry = sealLeafStore.getCarry(pubHex, sidHex);
+    expect(carry.length).toBe(1);
+    expect(carry[0].sequenceNumber).toBe(seq);
+    expect(carry[0].senderPubkeyHex).toBe(pubHex);
+    expect(carry[0].relayId).toBe(relayIdHex);
+    expect(carry[0].relayTimestamp).toBe(ts);
+    expect(carry[0].relaySignatureHex).toBe(Buffer.from(relaySig).toString("hex"));
+    expect(carry[0].structure2Cbor).toBeTruthy();
+    expect(carry[0].structure1Cbor).toBeTruthy();
+    client.close();
+  });
+
+  it("counterparty leaf_deliver → store has no relay receipt fields", async () => {
+    const { sealLeafStore } = makeStores();
+    const kp = generateKeypair();
+    const pub = await kp.getPublicKey();
+    const pubHex = Buffer.from(pub).toString("hex");
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: pub,
+      logger: noopLogger,
+      sealLeafStore,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0xf2);
+    const sidHex = Buffer.from(sid).toString("hex");
+    let leafDelivered = false;
+    client.registerSession(sidHex, relay.node, (frame) => { leafDelivered = true; });
+
+    // Authenticate the stream (leaf_deliver requires an active stream).
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await submit;
+
+    // Now simulate a counterparty leaf_deliver (authored by someone else).
+    const counterpartyPub = new Uint8Array(32).fill(0xcc);
+    const s1Cbor = CBOR_ENC.encode([1, new Uint8Array(32).fill(0xdd), counterpartyPub, sid, 0, 1_750_000_000_000]);
+    const s2Cbor = new Uint8Array([0x04, 0x05, 0x06]);
+    relay.push({
+      type: "leaf_deliver",
+      session_id: sid,
+      sequence_number: 2,
+      leaf_kind: 0,
+      structure1_cbor: s1Cbor,
+      structure2_cbor: s2Cbor,
+    });
+    await tick();
+
+    expect(leafDelivered).toBe(true);
+    // The counterparty leaf is stored WITHOUT receipt fields.
+    const carry = sealLeafStore.getCarry(pubHex, sidHex);
+    const counterpartyLeaf = carry.find((l) => l.sequenceNumber === 2);
+    expect(counterpartyLeaf).toBeDefined();
+    expect(counterpartyLeaf!.senderPubkeyHex).toBe(Buffer.from(counterpartyPub).toString("hex"));
+    expect(counterpartyLeaf!.relayId).toBeUndefined();
+    expect(counterpartyLeaf!.relayTimestamp).toBeUndefined();
+    expect(counterpartyLeaf!.relaySignatureHex).toBeUndefined();
+    expect(counterpartyLeaf!.structure2Cbor).toBeTruthy();
+    expect(counterpartyLeaf!.structure1Cbor).toBeTruthy();
+    client.close();
+  });
+
+  it("own-echoed leaf_deliver → no duplicate receiptless row (immutability)", async () => {
+    const { sealLeafStore, receiptStore } = makeStores();
+    const relayKp = generateKeypair();
+    const relayPub = await relayKp.getPublicKey();
+    const relayIdHex = Buffer.from(relayPub).toString("hex");
+    const kp = generateKeypair();
+    const pub = await kp.getPublicKey();
+    const pubHex = Buffer.from(pub).toString("hex");
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: pub,
+      logger: noopLogger,
+      receiptStore,
+      sealLeafStore,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0xf3);
+    const sidHex = Buffer.from(sid).toString("hex");
+    client.registerSession(sidHex, relay.node);
+
+    // Submit own leaf → ack captures it WITH receipt.
+    const contentHash = new Uint8Array(32).fill(3);
+    const submit = client.submitMessageHash(relay.node, sid, contentHash);
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    const ts = 999;
+    const seq = 1;
+    const tbs = buildRelayAckTbs(contentHash, seq, ts);
+    const relaySig = await relayKp.sign(tbs);
+    relay.push({
+      type: "hash_submit_ack",
+      sequence_number: seq,
+      structure2_cbor: new Uint8Array([0x07, 0x08]),
+      relay_id: relayIdHex,
+      timestamp: ts,
+      relay_signature: relaySig,
+    });
+    await submit;
+
+    // The relay echoes our OWN leaf back as leaf_deliver (this happens in the protocol).
+    // Build a Structure1 authored by US so #isOwnLeaf detects it.
+    const s1Cbor = CBOR_ENC.encode([1, contentHash, pub, sid, 0, 1_750_000_000_000]);
+    relay.push({
+      type: "leaf_deliver",
+      session_id: sid,
+      sequence_number: seq,
+      leaf_kind: 0,
+      structure1_cbor: s1Cbor,
+      structure2_cbor: new Uint8Array([0x07, 0x08]),
+    });
+    await tick();
+
+    // MUST still have exactly ONE record at seq 1 — the FIRST (with receipt), not a receiptless duplicate.
+    const carry = sealLeafStore.getCarry(pubHex, sidHex);
+    const atSeq1 = carry.filter((l) => l.sequenceNumber === 1);
+    expect(atSeq1.length).toBe(1);
+    expect(atSeq1[0].relayId).toBe(relayIdHex);
+    expect(atSeq1[0].relaySignatureHex).toBe(Buffer.from(relaySig).toString("hex"));
     client.close();
   });
 });
