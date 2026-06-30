@@ -27,6 +27,10 @@ const Point = ed25519.Point;
 
 /** A party's zero-constant refresh contribution: Feldman commitments + the sub-share for each participant. */
 export interface RefreshContribution {
+  /** The contributing party's FROST identifier (32-byte LE scalar hex). Binds the contribution to a sender
+   *  so the applying party can verify the set is complete (one per participant), deduplicated, and matches
+   *  the agreed epoch roster — a partial/empty/divergent set must NOT silently produce a share. */
+  readonly fromId: string;
   /** Feldman VSS commitments C[k] = a_k·G, length T. C[0] is the curve identity (zero constant term). */
   readonly commitment: Uint8Array[];
   /** δ(j) for every participant identifier j, as a 32-byte LE scalar. */
@@ -37,9 +41,15 @@ function hexToBytes(hex: string): Uint8Array {
   return Uint8Array.from(Buffer.from(hex, "hex"));
 }
 
-/** Identifier (32-byte LE scalar hex) → field scalar bigint. */
+/** Identifier (32-byte LE scalar hex) → field scalar bigint. `Fn.fromBytes` already rejects a non-canonical
+ *  (≥ L) or non-32-byte identifier; FROST identifiers must additionally be non-zero (0 is not a valid
+ *  evaluation point), so reject it explicitly — mirrors noble's `validateIdentifier`. */
 function identifierScalar(identifier: string): bigint {
-  return Fn.fromBytes(hexToBytes(identifier));
+  const x = Fn.fromBytes(hexToBytes(identifier));
+  if (x === 0n) {
+    throw new Error("frost-resharing: identifier 0 is not a valid FROST evaluation point");
+  }
+  return x;
 }
 
 /** Evaluate Σ_k coeffs[k]·x^k (mod L) via Horner, in the scalar field. */
@@ -71,7 +81,7 @@ function pointMul(p: InstanceType<typeof Point>, s: bigint): InstanceType<typeof
  * the same threshold. The non-constant coefficients are uniformly random scalars; the contribution leaks
  * nothing about the holder's existing share.
  */
-export function generateRefreshContribution(signers: Signers, allIds: string[]): RefreshContribution {
+export function generateRefreshContribution(signers: Signers, myId: string, allIds: string[]): RefreshContribution {
   const threshold = signers.min;
   // coefficients[0] === 0 (zero constant term); coefficients[1..T-1] uniformly random.
   const coefficients: bigint[] = [0n];
@@ -86,7 +96,7 @@ export function generateRefreshContribution(signers: Signers, allIds: string[]):
     const share = evalPolynomial(coefficients, identifierScalar(id));
     subShares[id] = Fn.toBytes(share);
   }
-  return { commitment, subShares };
+  return { fromId: myId, commitment, subShares };
 }
 
 /**
@@ -107,13 +117,35 @@ export function verifyRefreshContribution(commitment: Uint8Array[], signers: Sig
   for (const c of commitment) {
     Point.fromBytes(c);
   }
+  // Non-triviality: the polynomial must NOT be identically zero (all coefficients 0 → every commitment is
+  // the identity). A zero-polynomial contribution passes the zero-constant check yet adds NO fresh
+  // randomness — a free-rider that contributes nothing to Δ. Require at least one non-constant commitment
+  // (commitment[1..T-1]) to be non-identity so every contributor actually masks the shares.
+  const nonConstantNonIdentity = commitment
+    .slice(1)
+    .some((c) => Buffer.from(c).toString("hex") !== identityHex);
+  if (!nonConstantNonIdentity) {
+    throw new Error("frost-resharing: contribution is the zero polynomial (no fresh randomness) — rejected");
+  }
 }
 
 /**
- * Apply the refresh to one party's share. For this party's identifier j: verify every contribution
- * (zero constant term + well-formed) and Feldman-check each sub-share δ_i(j)·G == Σ_k j^k·C_i[k] before
- * trusting it, then return the rotated share s'_j = s_j + Σ_i δ_i(j) (mod L). The group public key is
- * unchanged; old-epoch shares no longer combine with the result.
+ * Apply the refresh to one party's share. For this party's identifier j: enforce the full-roster
+ * completeness gate, verify every contribution (zero constant term + non-trivial + well-formed) and
+ * Feldman-check each sub-share δ_i(j)·G == Σ_k j^k·C_i[k] before trusting it, then return the rotated share
+ * s'_j = s_j + Σ_i δ_i(j) (mod L). The group public key is unchanged; old-epoch shares no longer combine
+ * with the result.
+ *
+ * PRECONDITION — broadcast agreement (NOT enforceable by this local primitive): every honest party MUST
+ * receive the IDENTICAL `commitment` (and the matching sub-share) from each contributor i. This primitive
+ * verifies each sub-share only against the commitment in ITS OWN list, so a malicious contributor that
+ * EQUIVOCATES — handing party A `(C, δ_A)` and party B a different but internally-consistent `(C', δ_B)`,
+ * both with commitment[0]=identity — passes every local check, yet A and B then land on DIFFERENT
+ * polynomials (Δ_A ≠ Δ_B): no secret shift, but the quorum can no longer reconstruct/sign. Detecting
+ * equivocation requires an echo/agreement round (every party broadcasts H(commitment_i) it received and
+ * aborts on any mismatch). The daemon orchestration layer (runNetworkRefresh) owns that echo round; this
+ * function assumes the contribution set it is handed is already agreement-checked. A corrupt party cannot
+ * silently SHIFT THE SECRET here, but the unusable-share (equivocation) attack is out of local scope.
  *
  * Throws if any contribution is malformed or any sub-share is inconsistent with its commitment — a
  * corrupt party cannot silently shift the secret or hand a victim an unusable share.
@@ -122,9 +154,36 @@ export function applyRefresh(
   oldShare: FrostSecret,
   contributions: RefreshContribution[],
   signers: Signers,
+  expectedParticipantIds: string[],
 ): FrostSecret {
   const j = oldShare.identifier;
   const xj = identifierScalar(j);
+
+  // COMPLETENESS GATE (fallback HIGH): a proactive refresh — like DKG — requires EVERY current shareholder
+  // to contribute exactly one δ. The applying party MUST verify the contribution set is the full agreed
+  // roster: no missing party (a partial set lands every party on a DIFFERENT polynomial Δ and silently
+  // destroys the joint key), no extra/duplicate sender (double-counts a δ), and not empty (a no-op refresh
+  // that returns the OLD share while reporting success — leaving a captured epoch-e share alive). This also
+  // enforces the joint-randomness requirement: Δ = Σ δ_i is only safe when summed across all independent
+  // parties, never a single contributor. Fail LOUD here rather than return a share that looks rotated.
+  const expected = new Set(expectedParticipantIds);
+  if (expected.size !== expectedParticipantIds.length) {
+    throw new Error("frost-resharing: expectedParticipantIds contains duplicates");
+  }
+  const seen = new Set<string>();
+  for (const c of contributions) {
+    if (!expected.has(c.fromId)) {
+      throw new Error(`frost-resharing: contribution from unexpected party ${c.fromId} (not in the agreed roster)`);
+    }
+    if (seen.has(c.fromId)) {
+      throw new Error(`frost-resharing: duplicate contribution from party ${c.fromId}`);
+    }
+    seen.add(c.fromId);
+  }
+  if (seen.size !== expected.size) {
+    const missing = expectedParticipantIds.filter((id) => !seen.has(id));
+    throw new Error(`frost-resharing: incomplete refresh — missing contributions from ${missing.length} party/parties (a partial refresh would diverge the joint key)`);
+  }
 
   let acc = Fn.fromBytes(oldShare.signingShare);
   for (const contribution of contributions) {
