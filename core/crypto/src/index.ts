@@ -43,6 +43,7 @@ export type { RefreshContribution } from "./frost/frost-resharing.js";
 // Client-side refresh helpers (daemon coordinator): rotate the client's own share in-package.
 export {
   getClientFrostIdentifier,
+  getClientRefreshRoster,
   generateClientRefreshContribution,
   applyRefreshToLocalShare,
 } from "./frost/frost-threshold-signer.js";

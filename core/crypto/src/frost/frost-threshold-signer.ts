@@ -164,6 +164,19 @@ export function getClientFrostIdentifier(agentPubkeyHex: string): string {
   return ls.secret.identifier;
 }
 
+/**
+ * The full participant roster for a refresh — every shareholder's FROST identifier (client + all directory
+ * nodes). These are the KEYS of the shared FrostPublic.verifyingShares (ground truth from DKG), so the
+ * client knows the complete roster with no extra round trip. The coordinator passes this to every node so
+ * each evaluates its δ at the same set; nodes verify the contribution set covers it exactly.
+ */
+export function getClientRefreshRoster(agentPubkeyHex: string): string[] {
+  const ls = _localShares.get(agentPubkeyHex);
+  if (!ls) throw new Error("FrostThresholdSigner: no local share to refresh");
+  const pub = ls.pub as unknown as { verifyingShares: Record<string, Uint8Array> };
+  return Object.keys(pub.verifyingShares);
+}
+
 /** Generate the client's own zero-constant refresh contribution for the agreed participant roster. */
 export function generateClientRefreshContribution(
   agentPubkeyHex: string,
