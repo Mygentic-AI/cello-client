@@ -64,6 +64,7 @@ import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // at the send point here (the receive point lives in the transport content decode).
 import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
+import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
   resolveCelloEnv,
   createTransportSelector,
@@ -519,12 +520,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!kp || !endpoint || !endpoint.peer_id || !endpoint.multiaddrs || endpoint.multiaddrs.length === 0) {
       return undefined;
     }
+    // FED-OPTIONB-SETUP-001 (Option B): when the directory included the per-node relay-assignment
+    // signature, carry the assignment so the client presents it to its chosen relay (replacing the
+    // directory→relay dial). Built only for relay-mode assignments that carry relay_directory_signature;
+    // absent ⇒ the client skips client_record_assignment (direct/legacy/pre-M8B).
+    const relayDirSig = assignment.relay_directory_signature;
+    const carry: RelayAssignmentCarry | undefined = relayDirSig
+      ? {
+          participantA: assignment.participant_a.pubkey,
+          participantB: assignment.participant_b.pubkey,
+          sessionTimestamp: assignment.session_timestamp,
+          initiatorSessionPeerId: assignment.initiator_session_peer_id,
+          counterpartySessionPeerId: assignment.counterparty_session_peer_id,
+          assignmentSignature: relayDirSig,
+        }
+      : undefined;
     return {
       relayPeerId: endpoint.peer_id,
       relayAddrs: endpoint.multiaddrs,
       keyProvider: kp,
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: assignment.session_id,
+      assignment: carry,
     };
   };
 

@@ -59,6 +59,13 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
   const dirSig = toU8Safe(raw["directory_signature"]);
   if (!dirSig || dirSig.length !== 64) return null;
 
+  // FED-OPTIONB-SETUP-001: the per-node directory signature over the relay TBS (Option B). Optional —
+  // absent on pre-M8B assignments and direct-mode sessions. When present it must be a valid 64-byte sig;
+  // a malformed value is dropped to undefined (the session then has no relay assignment to present, which
+  // surfaces as a relay-witness gap, not a hard failure).
+  const relayDirSigRaw = toU8Safe(raw["relay_directory_signature"]);
+  const relayDirSig = relayDirSigRaw && relayDirSigRaw.length === 64 ? relayDirSigRaw : undefined;
+
   const tsRaw = raw["session_timestamp"];
   const sessionTimestamp = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
   if (sessionTimestamp === null) return null;
@@ -98,6 +105,7 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
     session_timestamp: sessionTimestamp,
     directory_pubkey: dirPubkey,
     directory_signature: dirSig,
+    relay_directory_signature: relayDirSig,
     initiator_session_peer_id: initiatorSessionPeerId,
     initiator_session_addrs: initiatorSessionAddrs,
     counterparty_session_peer_id: counterpartySessionPeerId,

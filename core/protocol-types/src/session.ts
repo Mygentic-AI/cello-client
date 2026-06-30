@@ -105,6 +105,14 @@ interface SessionAssignmentCommon {
   session_timestamp: number;        // Unix ms
   directory_pubkey: Uint8Array;     // 32-byte directory identity pubkey
   directory_signature: Uint8Array;  // 64-byte threshold/single signature over TBS
+  // FED-OPTIONB-SETUP-001 (Option B, any-relay/any-directory): the per-node directory signature over
+  // the relay TBS ([session_id, participant_a, participant_b, session_timestamp, (initiator_peer_id,
+  // counterparty_peer_id)]). Distinct from `directory_signature` (the FROST session-establishment sig
+  // authorizing the peer↔peer session): this authorizes the RELAY ASSIGNMENT. The client carries it to
+  // its chosen relay (a `client_record_assignment` frame), which verifies it against any consortium
+  // directory pubkey — replacing the old directory→relay `recordAssignment` dial. Optional for pre-M8B
+  // assignments and direct-mode sessions (no relay).
+  relay_directory_signature?: Uint8Array; // 64-byte per-node directory sig over the relay TBS
   // M7 WIRE-001: session-layer transport peer IDs and mode (optional for pre-M7 backward compat)
   initiator_session_peer_id?: string;       // libp2p session node Peer ID of initiator
   initiator_session_addrs?: string[];       // multiaddrs of initiator's session node

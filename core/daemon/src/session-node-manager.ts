@@ -87,7 +87,7 @@ import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAu
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
-import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -105,6 +105,13 @@ export interface RelayConnectParams {
   keyProvider: KeyProvider;
   senderPubkey: Uint8Array;
   sessionIdBytes: Uint8Array;
+  /**
+   * FED-OPTIONB-SETUP-001 (Option B): the directory-signed relay assignment the client presents to its
+   * chosen relay (replaces the directory→relay dial). Absent for direct-mode and on the restart/persisted
+   * reconnect path (the relay already recorded the session at first establishment) — the client then just
+   * reconnects without re-recording.
+   */
+  assignment?: RelayAssignmentCarry;
 }
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
@@ -963,7 +970,7 @@ export class SessionNodeManager {
         if (frame.leaf_kind === LEAF_KIND_CTRL && !frame.authored_by_us) {
           this.#maybeAutoAcknowledgeSeal(agentName, sessionId, correlationId);
         }
-      });
+      }, relay.assignment);
 
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {

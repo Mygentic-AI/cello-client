@@ -122,6 +122,22 @@ export interface AgentRelayClientOpts {
 }
 
 /**
+ * FED-OPTIONB-SETUP-001 (Option B): the directory-signed relay assignment a client presents to its
+ * chosen relay (a `client_record_assignment` frame), replacing the old directory→relay dial. The relay
+ * reconstructs the relay TBS from these fields and verifies `assignmentSignature` (the directory's
+ * per-node relayDirSig) against any consortium directory pubkey. Field order/presence MUST match the
+ * directory producer (directory-node.ts) and the relay verifier (relay-node.ts recordAssignment).
+ */
+export interface RelayAssignmentCarry {
+  participantA: Uint8Array;            // 32-byte initiator pubkey
+  participantB: Uint8Array;            // 32-byte counterparty pubkey
+  sessionTimestamp: number;            // Unix ms
+  initiatorSessionPeerId?: string;     // present for relay-mode sessions (covered by the sig when both present)
+  counterpartySessionPeerId?: string;
+  assignmentSignature: Uint8Array;     // 64-byte per-node directory sig over the relay TBS (relay_directory_signature)
+}
+
+/**
  * Extract a real message from a thrown value. libp2p / cross-package errors are not
  * always `instanceof Error` in this realm (multi-version split), so fall back to a
  * `message` property or JSON — never the useless "[object Object]".
@@ -196,10 +212,23 @@ export class AgentRelayClient {
   #pendingStructure1: Uint8Array | null = null;
   /** The session_id hex of the in-flight submit, so its ack updates the right #lastSeen. */
   #pendingAckSessionHex: string | null = null;
+  /**
+   * FED-OPTIONB-SETUP-001: resolver for the in-flight `client_record_assignment` ack. The ack carries
+   * no session_id (like hash_submit_ack), so at most one record is in flight; records are serialized on
+   * the same `#submitChain` as submits, guaranteeing no overlap.
+   */
+  #pendingRecord: ((ok: boolean) => void) | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
-  /** session_id hex → { the live node to (re)dial from, inbound leaf handler }. */
-  readonly #sessions = new Map<string, { node: CelloNode; onLeafDeliver: (frame: LeafDeliverFrame) => void }>();
+  /** session_id hex → { the live node to (re)dial from, inbound leaf handler, Option-B assignment to present }. */
+  readonly #sessions = new Map<string, {
+    node: CelloNode;
+    onLeafDeliver: (frame: LeafDeliverFrame) => void;
+    /** FED-OPTIONB-SETUP-001: the directory-signed relay assignment to present (absent for direct/legacy). */
+    assignment?: RelayAssignmentCarry;
+    /** FED-OPTIONB-SETUP-001: true once the relay has acked this session's client_record_assignment. */
+    recorded: boolean;
+  }>();
 
   constructor(opts: AgentRelayClientOpts) {
     this.#relayPeerId = opts.relayPeerId;
@@ -220,8 +249,82 @@ export class AgentRelayClient {
    * (idempotent). Storing the node per session lets a pure-receiver session re-establish
    * the shared stream if the node that originally dialed is torn down (L5).
    */
-  registerSession(sessionIdHex: string, node: CelloNode, onLeafDeliver?: (frame: LeafDeliverFrame) => void): void {
-    this.#sessions.set(sessionIdHex, { node, onLeafDeliver: onLeafDeliver ?? (() => {}) });
+  registerSession(
+    sessionIdHex: string,
+    node: CelloNode,
+    onLeafDeliver?: (frame: LeafDeliverFrame) => void,
+    assignment?: RelayAssignmentCarry,
+  ): void {
+    const existing = this.#sessions.get(sessionIdHex);
+    this.#sessions.set(sessionIdHex, {
+      node,
+      onLeafDeliver: onLeafDeliver ?? (() => {}),
+      // Carry the assignment forward across re-registration; never lose a recorded flag on re-register.
+      assignment: assignment ?? existing?.assignment,
+      recorded: existing?.recorded ?? false,
+    });
+    // FED-OPTIONB-SETUP-001 (Option B): eagerly present the assignment so the relay records the session
+    // (binds peer IDs, creates the session entry) BEFORE the first hash_submit or the counterparty's
+    // leaves arrive — matching the timing the old directory→relay recordAssignment dial provided.
+    // Best-effort + serialized on the submit chain (the ack carries no session_id, so no overlap).
+    if (assignment) {
+      this.#submitChain = this.#submitChain
+        .then(() => this.#doRecord(node, sessionIdHex))
+        .then(() => undefined, () => undefined);
+    }
+  }
+
+  /**
+   * FED-OPTIONB-SETUP-001: present the directory-signed assignment to the relay (Option B). Idempotent
+   * (no-op once `recorded`, or when the session has no assignment — direct/persisted/legacy sessions).
+   * The relay reconstructs the TBS and verifies the per-node directory signature against any consortium
+   * key. On success the session is recorded; the send/ack is single-in-flight (mirrors #doSubmit).
+   */
+  async #doRecord(node: CelloNode, sessionIdHex: string): Promise<boolean> {
+    if (this.#closed) return false;
+    const sess = this.#sessions.get(sessionIdHex);
+    if (!sess || !sess.assignment || sess.recorded) return true;
+    if (!(await this.#ensureConnected(node))) return false;
+    const stream = this.#stream;
+    if (!stream) return false;
+    const a = sess.assignment;
+    const frame = CBOR_ENC.encode({
+      type: "client_record_assignment",
+      session_id: new Uint8Array(Buffer.from(sessionIdHex, "hex")),
+      participant_a: a.participantA,
+      participant_b: a.participantB,
+      session_timestamp: a.sessionTimestamp,
+      initiator_session_peer_id: a.initiatorSessionPeerId,
+      counterparty_session_peer_id: a.counterpartySessionPeerId,
+      assignment_signature: a.assignmentSignature,
+    }) as Uint8Array;
+    let resolveRec!: (ok: boolean) => void;
+    const ackPromise = new Promise<boolean>((r) => { resolveRec = r; });
+    this.#pendingRecord = resolveRec;
+    try {
+      stream.send(lp.encode.single(frame));
+    } catch (err: unknown) {
+      if (this.#pendingRecord === resolveRec) this.#pendingRecord = null;
+      this.#logger.warn("session.relay.record.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
+      return false;
+    }
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<boolean>((r) => { timer = setTimeout(() => r(false), HASH_SUBMIT_TIMEOUT_MS); });
+    try {
+      const ok = await Promise.race([ackPromise, timeout]);
+      if (ok) {
+        sess.recorded = true;
+        this.#logger.info("session.relay.assignment.recorded", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
+      } else {
+        // Reset the stream so a late assignment ack can't desync a subsequent submit's FIFO ack matching.
+        this.#resetStream();
+        this.#logger.warn("session.relay.assignment.record.failed", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
+      }
+      return ok;
+    } finally {
+      clearTimeout(timer);
+      if (this.#pendingRecord === resolveRec) this.#pendingRecord = null;
+    }
   }
 
   /** Remove a session; caller closes the client when no sessions remain. */
@@ -369,6 +472,14 @@ export class AgentRelayClient {
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
       this.#settlePending({ ok: false, reason });
+    } else if (type === "assignment_ok") {
+      // FED-OPTIONB-SETUP-001: the relay verified + recorded our client-presented assignment.
+      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r(true);
+    } else if (type === "assignment_invalid") {
+      // The relay rejected the assignment (e.g. directory_signature_invalid — not signed by any
+      // consortium directory). Fail LOUD: the session has no relay witness until this is resolved.
+      this.#logger.warn("session.relay.assignment.invalid", { relayPeerId: this.#relayPeerId, reason: typeof frame["reason"] === "string" ? frame["reason"] : "unknown" });
+      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r(false);
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
@@ -576,10 +687,17 @@ export class AgentRelayClient {
   async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
+
+    const sessionIdHex = Buffer.from(sessionId).toString("hex");
+    // FED-OPTIONB-SETUP-001 (Option B): the relay records the session from the CLIENT-presented
+    // assignment (the directory no longer dials the relay). Ensure it is recorded BEFORE the first
+    // hash_submit — the relay rejects a submit for an unknown session. Idempotent + no-op when there is
+    // no assignment to present (direct/persisted/legacy). Runs inline on the submit chain (no re-chaining
+    // — #doSubmit is already a chain link), and may reset the stream on failure, so capture #stream after.
+    await this.#doRecord(node, sessionIdHex);
     const stream = this.#stream;
     if (!stream) return { ok: false, reason: "relay_unavailable" };
 
-    const sessionIdHex = Buffer.from(sessionId).toString("hex");
     // This session's OWN high-water mark (NOT an agent-global one) — the relay's seq_counter
     // is per session and rejects last_seen_seq > seq_counter.
     const lastSeenForSession = this.#lastSeen.get(sessionIdHex) ?? 0;
