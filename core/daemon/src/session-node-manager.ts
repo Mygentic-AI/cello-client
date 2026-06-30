@@ -89,6 +89,7 @@ import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
+import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -208,6 +209,8 @@ export class SessionNodeManager {
   #db: DaemonDatabase | null = null;
   /** RELAYSIG-1: shared immutable store of the relay's signed ordering-record receipts (keyed by agent). */
   #relayReceiptStore: RelayReceiptStore | null = null;
+  /** FED-OPTIONB-SEAL-001: the per-session leaf log (both parties) carried at a unilateral seal. */
+  #sealLeafStore: SessionSealLeafStore | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
   // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
@@ -577,6 +580,18 @@ export class SessionNodeManager {
   }
 
   /**
+   * FED-OPTIONB-SEAL-001: the complete ordered leaf chain (both parties) a UNILATERAL seal carries to the
+   * directory for the OFFLINE tree rebuild. Empty when no leaves were logged (e.g. a direct-only session
+   * with no relay witness) — the caller then has nothing to carry and the seal stays bilateral/pending.
+   */
+  getSealCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {
+    if (!this.#sealLeafStore && this.#db) {
+      this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+    }
+    return this.#sealLeafStore?.getCarry(agentPubkeyHex, sessionIdHex) ?? [];
+  }
+
+  /**
    * DOD-LOG-1 / PERSIST-002 (AC-010): append one readable message to the durable transcript, keyed
    * by the canonical leaf `sequence` so it joins to the committed hash chain. The blob is stored as
    * plaintext bytes — the whole DB is SQLCipher-encrypted at rest, so the per-column cipher is gone.
@@ -915,6 +930,10 @@ export class SessionNodeManager {
         if (!this.#relayReceiptStore && this.#db) {
           this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
         }
+        // FED-OPTIONB-SEAL-001: one shared seal-leaf log (keyed by agent_pubkey), same lazy lifecycle.
+        if (!this.#sealLeafStore && this.#db) {
+          this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+        }
         client = new AgentRelayClient({
           relayPeerId: relay.relayPeerId,
           relayAddrs: relay.relayAddrs,
@@ -922,6 +941,7 @@ export class SessionNodeManager {
           senderPubkey: relay.senderPubkey,
           logger: this.#logger,
           receiptStore: this.#relayReceiptStore ?? undefined,
+          sealLeafStore: this.#sealLeafStore ?? undefined,
         });
         this.#relayClients.set(clientKey, client);
       }

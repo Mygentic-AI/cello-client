@@ -15,8 +15,8 @@
  *
  * Immutable at a position (agent, session, sequence): INSERT OR IGNORE keeps the first record for a seq.
  */
-import type { DatabaseSync as DaemonDatabase } from "node:sqlite";
-import type { Logger } from "@cello-protocol/interfaces";
+import type { DaemonDatabase } from "./sqlcipher-db.js";
+import type { Logger } from "./types.js";
 
 /** A carried leaf for the unilateral-seal offline rebuild. Relay-receipt fields present only for own leaves. */
 export interface SealCarryLeaf {

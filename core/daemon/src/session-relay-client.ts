@@ -36,6 +36,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
+import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -119,6 +120,13 @@ export interface AgentRelayClientOpts {
    * attestation, carried to the directory at seal time). Optional — when absent, ACKs are not recorded.
    */
   receiptStore?: RelayReceiptStore;
+  /**
+   * FED-OPTIONB-SEAL-001: the per-session leaf log a unilateral seal carries to the directory. When
+   * present, every leaf this client sees — its OWN submits (with the relay receipt) and the COUNTERPARTY's
+   * delivered leaves (no receipt) — is recorded so a later unilateral seal presents the full chain for the
+   * directory's OFFLINE tree rebuild. Optional — when absent, no leaf log is kept.
+   */
+  sealLeafStore?: SessionSealLeafStore;
 }
 
 /**
@@ -194,6 +202,7 @@ export class AgentRelayClient {
   readonly #senderPubkey: Uint8Array;
   readonly #logger: Logger;
   readonly #receiptStore: RelayReceiptStore | undefined;
+  readonly #sealLeafStore: SessionSealLeafStore | undefined;
 
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
@@ -246,6 +255,7 @@ export class AgentRelayClient {
     this.#senderPubkey = opts.senderPubkey;
     this.#logger = opts.logger;
     this.#receiptStore = opts.receiptStore;
+    this.#sealLeafStore = opts.sealLeafStore;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge (UPGRADE-002). */
@@ -459,17 +469,26 @@ export class AgentRelayClient {
       case "store": {
         if (!this.#receiptStore) return false;
         try {
-          // FED-OPTIONB-SEAL-001: persist the per-leaf carry bytes alongside the receipt so a UNILATERAL
-          // seal can present the full chain (Structure2 from the relay's ack + the sender-signed Structure1
-          // + the leaf kind) and the directory rebuilds the tree OFFLINE. structure2_cbor rides the same
-          // ack we're verifying; structure1Cbor + the leaf kind are this submit's paired in-flight values.
-          const structure2Cbor = frame["structure2_cbor"] instanceof Uint8Array ? (frame["structure2_cbor"] as Uint8Array) : undefined;
-          const wrote = this.#receiptStore.store(
-            { ...ev.receipt, structure2Cbor, structure1Cbor, leafKind: this.#pendingLeafKind ?? undefined },
-            Date.now(),
-          );
+          const wrote = this.#receiptStore.store(ev.receipt, Date.now());
           if (wrote) {
             this.#logger.info("relay.receipt.stored", { seq, hashShort: ev.receipt.hashHex.slice(0, 16), relayShort: ev.receipt.relayId.slice(0, 16) });
+          }
+          // FED-OPTIONB-SEAL-001: record this OWN leaf in the seal-leaf log WITH its relay receipt (the
+          // relay's signature pins content_hash→seq — the teeth that stop a supplier reordering its own
+          // leaves). structure2_cbor rides the ack we just verified; structure1Cbor + the leaf kind are this
+          // submit's paired in-flight values. Best-effort + separate from the receipt write.
+          const structure2Cbor = frame["structure2_cbor"] instanceof Uint8Array ? (frame["structure2_cbor"] as Uint8Array) : undefined;
+          if (this.#sealLeafStore && structure2Cbor && structure1Cbor && this.#pendingLeafKind !== null) {
+            this.#sealLeafStore.store(this.senderPubkeyHex, ev.receipt.sessionIdHex, {
+              sequenceNumber: seq,
+              leafKind: this.#pendingLeafKind,
+              senderPubkeyHex: this.senderPubkeyHex,
+              structure2Cbor,
+              structure1Cbor,
+              relayId: ev.receipt.relayId,
+              relayTimestamp: ev.receipt.timestamp,
+              relaySignatureHex: ev.receipt.signatureHex,
+            }, Date.now());
           }
         } catch (err) {
           // A durable-evidence write failure must be LOUD — the relay will not re-emit this ack, so a
@@ -526,6 +545,25 @@ export class AgentRelayClient {
       // leaf back as a leaf_deliver — that must NOT advance it (same reason as the ack above).
       const authoredByUs = this.#isOwnLeaf(s1);
       if (seq >= 0 && !authoredByUs) this.#bumpLastSeen(sidHex, seq);
+      // FED-OPTIONB-SEAL-001: record the COUNTERPARTY's delivered leaf in the seal-leaf log (no relay
+      // receipt — the relay does not ack-sign a delivery to the recipient). It is pinned at seal by the
+      // absent party's sender_signature (unforgeable) + sequence contiguity against our receipt-pinned own
+      // leaves. Our OWN echoed leaf is skipped here (it is recorded WITH its receipt on the ack path).
+      if (this.#sealLeafStore && seq >= 0 && !authoredByUs) {
+        const s2 = frame["structure2_cbor"];
+        const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
+        let senderHex: string | undefined;
+        try { senderHex = Buffer.from(toU8((decode(s1) as unknown[])[2])).toString("hex"); } catch { senderHex = undefined; }
+        if (structure2Cbor && s1.length > 0 && senderHex) {
+          this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
+            sequenceNumber: seq,
+            leafKind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
+            senderPubkeyHex: senderHex,
+            structure2Cbor,
+            structure1Cbor: s1,
+          }, Date.now());
+        }
+      }
       const session = this.#sessions.get(sidHex);
       if (session && seq >= 0) {
         session.onLeafDeliver({
