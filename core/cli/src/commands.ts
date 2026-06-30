@@ -214,6 +214,39 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
 }
 
 /**
+ * relayReceipts(celloDir, name): M8B DOD-RELAYSIG-1.
+ *  - Connect to the daemon, send 'cello_get_relay_receipts' with { name }.
+ *  - Returns the agent's durably-stored, signature-verified relay ordering-record receipts.
+ */
+export async function relayReceipts(celloDir: string, name: string): Promise<CommandResult> {
+  if (!name) {
+    return { exitCode: 1, output: "Usage: cello receipts <name>  — list the agent's stored relay ordering receipts." };
+  }
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry receipts." };
+  }
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const result = (await client.send("cello_get_relay_receipts", { name })) as {
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      receipts?: unknown[];
+    };
+    client.close();
+    if (!result.ok) {
+      return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+    }
+    return { exitCode: 0, output: JSON.stringify({ ok: true, receipts: result.receipts ?? [] }, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: `Failed to get relay receipts: ${message}` };
+  }
+}
+
+/**
  * removeAgent(celloDir, name) — CELLO-M7-REMOVE-001 (DOD-REMOVE-1):
  *  - Connect to the daemon, send 'cello_remove_agent' with { name }.
  *  - The daemon RETIRES the agent (state=retired; row, keys, and history KEPT for accountability) and

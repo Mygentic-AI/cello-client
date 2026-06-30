@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, sessions, type SessionFilter } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter } from "../commands.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -88,6 +88,12 @@ async function main(): Promise<void> {
       // cello refresh <name> — proactive share refresh / epoch rollover (M8B DOD-REFRESH-1).
       const name = process.argv[3] ?? "";
       result = await refreshShares(celloDir, name);
+      break;
+    }
+    case "receipts": {
+      // cello receipts <name> — list the agent's stored relay ordering receipts (M8B DOD-RELAYSIG-1).
+      const name = process.argv[3] ?? "";
+      result = await relayReceipts(celloDir, name);
       break;
     }
     case "sessions": {
