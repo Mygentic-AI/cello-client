@@ -35,6 +35,7 @@ import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
+import { verifyRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -112,6 +113,12 @@ export interface AgentRelayClientOpts {
   /** The agent's K_local public key (32 bytes) — relay routes delivery by this. */
   senderPubkey: Uint8Array;
   logger: Logger;
+  /**
+   * DOD-RELAYSIG-1: durable store for the relay's signed ordering-record receipts. When present, each
+   * verified `hash_submit_ack` is recorded immutably (the client's evidence of the relay's sequence
+   * attestation, carried to the directory at seal time). Optional — when absent, ACKs are not recorded.
+   */
+  receiptStore?: RelayReceiptStore;
 }
 
 /**
@@ -170,6 +177,7 @@ export class AgentRelayClient {
   readonly #keyProvider: KeyProvider;
   readonly #senderPubkey: Uint8Array;
   readonly #logger: Logger;
+  readonly #receiptStore: RelayReceiptStore | undefined;
 
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
@@ -199,6 +207,7 @@ export class AgentRelayClient {
     this.#keyProvider = opts.keyProvider;
     this.#senderPubkey = opts.senderPubkey;
     this.#logger = opts.logger;
+    this.#receiptStore = opts.receiptStore;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge (UPGRADE-002). */
@@ -268,6 +277,60 @@ export class AgentRelayClient {
     }
   }
 
+  /**
+   * RELAYSIG-1: verify a relay `hash_submit_ack`'s signed ordering record and durably store the receipt.
+   * The relay signs TBS = SHA-256(content_hash || seq_BE4 || ts_BE8) with its ack-signing key, whose hex is
+   * `relay_id`. We verify SELF-CONSISTENCY (the signature binds the sequence ⇒ a FORGED sequence fails) and
+   * record the immutable receipt. The authoritative registered-relay check is the directory's at seal
+   * (OPTIONB-SEAL). No-op when there is no receipt store, no pending leaf, or the ACK is unsigned.
+   */
+  #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): void {
+    if (!this.#receiptStore || seq < 0 || !structure1Cbor) return;
+    const relayId = typeof frame["relay_id"] === "string" ? frame["relay_id"] : undefined;
+    const relaySig = frame["relay_signature"];
+    const ts = typeof frame["timestamp"] === "number" ? frame["timestamp"] : undefined;
+    // Unsigned ACK (relay has no ack-signing key) → nothing to attest; not an error.
+    if (!relayId || !(relaySig instanceof Uint8Array) || ts === undefined) return;
+    if (!/^[0-9a-fA-F]{64}$/.test(relayId)) {
+      this.#logger.warn("relay.receipt.bad_relay_id", { relayIdLen: relayId.length });
+      return;
+    }
+    let contentHash: Uint8Array;
+    let sessionId: Uint8Array;
+    try {
+      // Structure 1 = [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts].
+      const arr = decode(structure1Cbor) as unknown[];
+      contentHash = toU8(arr[1]);
+      sessionId = toU8(arr[3]);
+    } catch {
+      return;
+    }
+    const relayPubkey = new Uint8Array(Buffer.from(relayId, "hex"));
+    if (!verifyRelayAck(contentHash, seq, ts, relaySig, relayPubkey)) {
+      // FORGED / corrupt ACK: the relay's signature does not bind this (hash, seq, ts). Reject — do NOT
+      // store. (DoD: "a forged sequence is rejected".)
+      this.#logger.warn("relay.receipt.signature_invalid", { relayShort: relayId.slice(0, 16), seq });
+      return;
+    }
+    const hashHex = Buffer.from(contentHash).toString("hex");
+    const wrote = this.#receiptStore.store(
+      {
+        hashHex,
+        agentPubkeyHex: this.senderPubkeyHex,
+        sessionIdHex: Buffer.from(sessionId).toString("hex"),
+        relayId,
+        relayPubkeyHex: relayId,
+        sequenceNumber: seq,
+        timestamp: ts,
+        signatureHex: Buffer.from(relaySig).toString("hex"),
+      },
+      Date.now(),
+    );
+    if (wrote) {
+      this.#logger.info("relay.receipt.stored", { seq, hashShort: hashHex.slice(0, 16), relayShort: relayId.slice(0, 16) });
+    }
+  }
+
   #dispatch(frame: Record<string, unknown>): void {
     const type = frame["type"];
     if (type === "hash_submit_ack") {
@@ -283,6 +346,9 @@ export class AgentRelayClient {
       const s2 = frame["structure2_cbor"];
       const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
       const structure1Cbor = this.#pendingStructure1 ?? undefined;
+      // RELAYSIG-1: verify the relay's signed ordering record and durably store the receipt BEFORE
+      // settling (which clears #pendingStructure1, the source of the content hash + session id).
+      this.#captureReceipt(frame, structure1Cbor, seq);
       this.#settlePending(
         seq >= 0
           ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor }

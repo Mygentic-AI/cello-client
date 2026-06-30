@@ -2035,6 +2035,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { ok: true, epoch: result.toEpochN, primary_pubkey: result.primaryPubkey, verifying_shares_digest: result.verifyingSharesDigest };
   });
 
+  // ─── M8B DOD-RELAYSIG-1: cello_get_relay_receipts — the agent's stored relay ordering receipts ───
+  handlers.set("cello_get_relay_receipts", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    const agentName = (params?.name as string | undefined) ?? connState?.currentAgent;
+    if (!agentName) {
+      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
+    }
+    const loaded = loadedAgents.find((a) => a.name === agentName);
+    if (!loaded) {
+      return { ok: false, reason: "agent_not_found", guidance: `No agent named '${agentName}'.` };
+    }
+    const sessionIdHex = typeof params?.session_id === "string" ? (params.session_id as string) : undefined;
+    const receipts = sessionNodeManager.getRelayReceipts(loaded.pubkey, sessionIdHex).map((r) => ({
+      hash_hex: r.hashHex,
+      session_id: r.sessionIdHex,
+      relay_id: r.relayId,
+      sequence_number: r.sequenceNumber,
+      timestamp: r.timestamp,
+      signature_hex: r.signatureHex,
+    }));
+    return { ok: true, receipts };
+  });
+
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {
     return {

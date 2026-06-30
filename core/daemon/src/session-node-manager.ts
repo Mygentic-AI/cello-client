@@ -88,6 +88,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL } from "./session-relay-client.js";
+import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -198,6 +199,8 @@ export class SessionNodeManager {
   readonly #logger: Logger;
   readonly #dbPath: string;
   #db: DaemonDatabase | null = null;
+  /** RELAYSIG-1: shared immutable store of the relay's signed ordering-record receipts (keyed by agent). */
+  #relayReceiptStore: RelayReceiptStore | null = null;
   #activeNodes = new Map<string, ActiveSessionEntry>();
   // M7 DOD-SPINE-6 / MSG-001-3b: ONE relay witness client per AGENT (keyed by agent name).
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
@@ -556,6 +559,17 @@ export class SessionNodeManager {
   }
 
   /**
+   * RELAYSIG-1: the durably-stored, signature-verified relay ordering-record receipts for an agent
+   * (optionally a single session). Empty when no receipts have been recorded yet. Read-only.
+   */
+  getRelayReceipts(agentPubkeyHex: string, sessionIdHex?: string): RelayReceipt[] {
+    if (!this.#relayReceiptStore && this.#db) {
+      this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+    }
+    return this.#relayReceiptStore?.getAll(agentPubkeyHex, sessionIdHex) ?? [];
+  }
+
+  /**
    * DOD-LOG-1 / PERSIST-002 (AC-010): append one readable message to the durable transcript, keyed
    * by the canonical leaf `sequence` so it joins to the committed hash chain. The blob is stored as
    * plaintext bytes — the whole DB is SQLCipher-encrypted at rest, so the per-column cipher is gone.
@@ -889,12 +903,18 @@ export class SessionNodeManager {
       const clientKey = `${agentName}::${relay.relayPeerId}`;
       let client = this.#relayClients.get(clientKey);
       if (!client) {
+        // RELAYSIG-1: one shared receipt store (keyed by agent_pubkey, so a single instance serves all
+        // agents + relays). Lazy — the encrypted DB is open by the time sessions are active.
+        if (!this.#relayReceiptStore && this.#db) {
+          this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+        }
         client = new AgentRelayClient({
           relayPeerId: relay.relayPeerId,
           relayAddrs: relay.relayAddrs,
           keyProvider: relay.keyProvider,
           senderPubkey: relay.senderPubkey,
           logger: this.#logger,
+          receiptStore: this.#relayReceiptStore ?? undefined,
         });
         this.#relayClients.set(clientKey, client);
       }
