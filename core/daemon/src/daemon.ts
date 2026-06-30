@@ -2425,11 +2425,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         let resolveUni!: (r: UnilateralResult) => void;
         const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
         pendingUnilateralWaiters.set(sessionId, resolveUni);
+        // FED-OPTIONB-SEAL-001 (Option B): carry the full leaf chain (both parties) + the relay receipts so
+        // the directory rebuilds + verifies the tree OFFLINE — no directory→relay getSealLeaves dial. The
+        // store is keyed by the agent's K_local pubkey (the same key the relay client recorded under).
+        const sealAgentKp = keyProviders.get(record.agent_name);
+        const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
+        const sealCarry = sealAgentPubkeyHex ? sessionNodeManager.getSealCarry(sealAgentPubkeyHex, sessionId) : [];
+        const seal_leaves = sealCarry.map((l) => ({
+          sequence_number: l.sequenceNumber,
+          leaf_kind: l.leafKind,
+          structure2_cbor: l.structure2Cbor,
+          structure1_cbor: l.structure1Cbor,
+          // Relay receipt (present only for the present party's OWN leaves — the seq-pinning teeth).
+          relay_id: l.relayId,
+          relay_timestamp: l.relayTimestamp,
+          relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
+        }));
         const sent = await sendOver(record.agent_name, {
           type: "seal_unilateral",
           session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
           reported_root: new Uint8Array(Buffer.from(submit.reportedRootHex, "hex")),
           reported_seq: submit.sequenceNumber,
+          seal_leaves,
         });
         if (!sent.ok) {
           pendingUnilateralWaiters.delete(sessionId);
