@@ -72,7 +72,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
-import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate } from "./session-ceremony.js";
+import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
@@ -2001,6 +2001,39 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       void attemptSealUpgrade(signaling, agentName, agentPubkeyHex, sidHex, frame);
     });
   }
+
+  // ─── M8B DOD-REFRESH-1: cello_refresh_shares — proactive share refresh / epoch rollover ───
+  handlers.set("cello_refresh_shares", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    const agentName = (params?.name as string | undefined) ?? connState?.currentAgent;
+    if (!agentName) {
+      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
+    }
+    const loaded = loadedAgents.find((a) => a.name === agentName);
+    if (!loaded) {
+      return { ok: false, reason: "agent_not_found", guidance: `No agent named '${agentName}'. Create + register it first.` };
+    }
+    // The refresh ceremony reaches the consortium over the agent's signaling node — ensure it is up.
+    const entry = getAgentSignaling(agentName, loaded.keyProvider, loaded.pubkey);
+    const connected = await waitForSignalingConnected(entry.signaling, 15_000);
+    if (!connected) {
+      return { ok: false, reason: "directory_unreachable", guidance: "The agent's directory signaling is not connected; start the agent and retry." };
+    }
+    const result = await runAgentRefresh({
+      agentName,
+      persistence: getPersistence(agentName),
+      agentPubkeyHex: loaded.pubkey,
+      getNode: entry.getNode,
+      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getConsortiumEndpoints: resolveConsortiumRoster,
+      signaling: entry.signaling,
+      logger,
+    });
+    if (!result.ok) {
+      return { ok: false, reason: result.reason, guidance: "Share refresh did not complete — see the daemon log (refresh.ceremony.*) for the cause." };
+    }
+    return { ok: true, epoch: result.toEpochN, primary_pubkey: result.primaryPubkey };
+  });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
   handlers.set("cello_status", async (_params, connectionId) => {

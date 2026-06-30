@@ -175,6 +175,44 @@ export async function createAgent(celloDir: string, name: string): Promise<Comma
 }
 
 /**
+ * refreshShares(celloDir, name): M8B DOD-REFRESH-1.
+ *  - Connect to the daemon, send 'cello_refresh_shares' with { name }.
+ *  - The daemon runs a proactive share refresh across the consortium: every shareholder rotates its
+ *    share to a new epoch, the group public key is unchanged, and old-epoch shares no longer sign.
+ */
+export async function refreshShares(celloDir: string, name: string): Promise<CommandResult> {
+  if (!name) {
+    return { exitCode: 1, output: "Usage: cello refresh <name>  — proactively refresh the agent's threshold shares (new epoch)." };
+  }
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry refresh." };
+  }
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    const result = (await client.send("cello_refresh_shares", { name })) as {
+      ok: boolean;
+      reason?: string;
+      guidance?: string;
+      epoch?: number;
+      primary_pubkey?: string;
+    };
+    client.close();
+    if (!result.ok) {
+      return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+    }
+    return {
+      exitCode: 0,
+      output: JSON.stringify({ ok: true, epoch: result.epoch, primary_pubkey: result.primary_pubkey }, null, 2),
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: `Failed to refresh shares: ${message}` };
+  }
+}
+
+/**
  * removeAgent(celloDir, name) — CELLO-M7-REMOVE-001 (DOD-REMOVE-1):
  *  - Connect to the daemon, send 'cello_remove_agent' with { name }.
  *  - The daemon RETIRES the agent (state=retired; row, keys, and history KEPT for accountability) and
