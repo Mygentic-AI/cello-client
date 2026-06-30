@@ -1,14 +1,17 @@
 /**
- * RelayReceiptStore + verifyRelayAck — M8B DOD-RELAYSIG-1 (daemon port of the dead core/client receipt
- * logic). Proves: a genuine relay ACK signature verifies; a FORGED sequence (or timestamp / wrong key /
- * bad-length sig) is rejected; and the receipt store is IMMUTABLE (a re-attestation of a different sequence
- * for the same hash does NOT overwrite the first recorded receipt — SI-003).
+ * RelayReceiptStore + verifyRelayAck + evaluateRelayAck — M8B DOD-RELAYSIG-1 (daemon port).
+ *
+ * Proves: a genuine relay ACK verifies; a FORGED sequence (or timestamp / wrong key / bad-length sig) is
+ * rejected by the predicate AND by evaluateRelayAck (the verify-gates-store DECISION — a forged ACK yields
+ * `invalid_signature`, never a stored receipt); the store is keyed on the attestation POSITION
+ * (agent, session, sequence) so repeated content is NOT dropped, and is IMMUTABLE at a position (a relay
+ * cannot rewrite the hash it already attested at a (session, sequence)).
  */
 import { describe, it, expect, beforeEach } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { generateKeypair, buildRelayAckTbs } from "@cello-protocol/crypto";
-import { RelayReceiptStore, verifyRelayAck, type RelayReceipt } from "../relay-receipt-store.js";
+import { RelayReceiptStore, verifyRelayAck, evaluateRelayAck, type RelayReceipt } from "../relay-receipt-store.js";
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
 
@@ -21,11 +24,8 @@ describe("verifyRelayAck (DOD-RELAYSIG-1) — a forged sequence is rejected", ()
     const ts = 1_719_800_000_000;
     const sig = await relay.sign(buildRelayAckTbs(contentHash, seq, ts));
 
-    // Genuine ACK verifies.
     expect(verifyRelayAck(contentHash, seq, ts, sig, relayPubkey)).toBe(true);
-    // FORGED sequence → different TBS → signature fails (the DoD's "a forged sequence is rejected").
     expect(verifyRelayAck(contentHash, seq + 1, ts, sig, relayPubkey)).toBe(false);
-    // Tampered timestamp / content / wrong pubkey / bad-length sig all rejected.
     expect(verifyRelayAck(contentHash, seq, ts + 1, sig, relayPubkey)).toBe(false);
     expect(verifyRelayAck(new Uint8Array(randomBytes(32)), seq, ts, sig, relayPubkey)).toBe(false);
     const otherPubkey = await generateKeypair().getPublicKey();
@@ -34,14 +34,44 @@ describe("verifyRelayAck (DOD-RELAYSIG-1) — a forged sequence is rejected", ()
   });
 });
 
-describe("RelayReceiptStore (DOD-RELAYSIG-1) — durable + immutable", () => {
+describe("evaluateRelayAck (DOD-RELAYSIG-1) — the verify-gates-store DECISION", () => {
+  it("a genuine ACK yields a storable receipt; a FORGED sequence yields invalid_signature (never store)", async () => {
+    const relay = generateKeypair();
+    const relayId = Buffer.from(await relay.getPublicKey()).toString("hex");
+    const contentHash = new Uint8Array(randomBytes(32));
+    const ts = 1_719_800_000_000;
+    const seq = 7;
+    const goodSig = await relay.sign(buildRelayAckTbs(contentHash, seq, ts));
+    const base = { contentHash, sessionIdHex: "cc".repeat(16), agentPubkeyHex: "aa".repeat(32), timestamp: ts };
+
+    // Genuine ACK → store, with the right receipt fields.
+    const good = evaluateRelayAck({ ...base, relayId, relaySignature: goodSig, sequenceNumber: seq });
+    expect(good.kind).toBe("store");
+    if (good.kind === "store") {
+      expect(good.receipt.sequenceNumber).toBe(seq);
+      expect(good.receipt.relayId).toBe(relayId);
+      expect(good.receipt.hashHex).toBe(Buffer.from(contentHash).toString("hex"));
+    }
+
+    // FORGED sequence: the signature is over seq=7 but the frame claims seq=8 → must NOT store.
+    expect(evaluateRelayAck({ ...base, relayId, relaySignature: goodSig, sequenceNumber: seq + 1 }).kind).toBe("invalid_signature");
+    // Random (non-binding) signature → must NOT store.
+    expect(evaluateRelayAck({ ...base, relayId, relaySignature: new Uint8Array(randomBytes(64)), sequenceNumber: seq }).kind).toBe("invalid_signature");
+    // Unsigned ACK (no signature) → unsigned, not stored, not rejected.
+    expect(evaluateRelayAck({ ...base, relayId, relaySignature: undefined, timestamp: undefined, sequenceNumber: seq }).kind).toBe("unsigned");
+    // Malformed relay_id → bad_relay_id.
+    expect(evaluateRelayAck({ ...base, relayId: "xyz", relaySignature: goodSig, sequenceNumber: seq }).kind).toBe("bad_relay_id");
+  });
+});
+
+describe("RelayReceiptStore (DOD-RELAYSIG-1) — durable, positioned, immutable", () => {
   let db: DatabaseSync;
   beforeEach(() => {
     db = new DatabaseSync(":memory:");
   });
 
   const agent = "aa".repeat(32);
-  const mk = (hashHex: string, seq: number, sessionIdHex: string | null): RelayReceipt => ({
+  const mk = (sessionIdHex: string, seq: number, hashHex: string): RelayReceipt => ({
     hashHex,
     agentPubkeyHex: agent,
     sessionIdHex,
@@ -52,26 +82,35 @@ describe("RelayReceiptStore (DOD-RELAYSIG-1) — durable + immutable", () => {
     signatureHex: "ee".repeat(64),
   });
 
-  it("stores a receipt and is IMMUTABLE — a second ACK for the same hash does not overwrite", () => {
+  it("does NOT drop repeated content — the SAME hash at DIFFERENT positions is stored (code-review HIGH)", () => {
     const store = new RelayReceiptStore(db, NOOP_LOGGER);
-    const hashHex = "bb".repeat(32);
-    expect(store.store(mk(hashHex, 5, "cc".repeat(16)), 1000)).toBe(true);
-    // A relay re-attesting a DIFFERENT sequence for the same hash must be ignored.
-    const reattest: RelayReceipt = { ...mk(hashHex, 99, "cc".repeat(16)), signatureHex: "ff".repeat(64) };
-    expect(store.store(reattest, 2000)).toBe(false);
-    const got = store.get(hashHex, agent);
-    expect(got?.sequenceNumber).toBe(5); // the FIRST receipt survives
-    expect(got?.signatureHex).toBe("ee".repeat(64));
+    const sess = "cc".repeat(16);
+    const sameHash = "bb".repeat(32);
+    // Identical plaintext ("ok") → identical content hash, but different relay sequences — both legit.
+    expect(store.store(mk(sess, 5, sameHash), 1)).toBe(true);
+    expect(store.store(mk(sess, 8, sameHash), 1)).toBe(true); // same hash, different position → STORED
+    const other = "ab".repeat(16);
+    expect(store.store(mk(other, 2, sameHash), 1)).toBe(true); // same hash, different session → STORED
+    expect(store.getAll(agent).length).toBe(3);
   });
 
-  it("getAll returns an agent's receipts (sequence DESC), scoped by session when asked", () => {
+  it("is IMMUTABLE at a position — a relay re-attesting a DIFFERENT hash at the same (session, seq) is ignored", () => {
+    const store = new RelayReceiptStore(db, NOOP_LOGGER);
+    const sess = "cc".repeat(16);
+    expect(store.store(mk(sess, 5, "11".repeat(32)), 1)).toBe(true);
+    // Equivocation: same position, DIFFERENT hash → ignored, the first verified receipt stands.
+    expect(store.store(mk(sess, 5, "22".repeat(32)), 2)).toBe(false);
+    expect(store.get(agent, sess, 5)?.hashHex).toBe("11".repeat(32));
+  });
+
+  it("getAll returns an agent's receipts in canonical sequence order, scoped by session when asked", () => {
     const store = new RelayReceiptStore(db, NOOP_LOGGER);
     const sess = "cc".repeat(16);
     const other = "ab".repeat(16);
-    store.store(mk("11".repeat(32), 1, sess), 1);
-    store.store(mk("22".repeat(32), 3, sess), 1);
-    store.store(mk("33".repeat(32), 2, other), 1);
-    expect(store.getAll(agent).map((r) => r.sequenceNumber)).toEqual([3, 2, 1]);
-    expect(store.getAll(agent, sess).map((r) => r.sequenceNumber)).toEqual([3, 1]);
+    store.store(mk(sess, 3, "33".repeat(32)), 1);
+    store.store(mk(sess, 1, "11".repeat(32)), 1);
+    store.store(mk(other, 2, "22".repeat(32)), 1);
+    expect(store.getAll(agent, sess).map((r) => r.sequenceNumber)).toEqual([1, 3]);
+    expect(store.getAll(agent).length).toBe(3);
   });
 });

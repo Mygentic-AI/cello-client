@@ -35,7 +35,7 @@ import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
-import { verifyRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
+import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -284,17 +284,8 @@ export class AgentRelayClient {
    * record the immutable receipt. The authoritative registered-relay check is the directory's at seal
    * (OPTIONB-SEAL). No-op when there is no receipt store, no pending leaf, or the ACK is unsigned.
    */
-  #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): void {
-    if (!this.#receiptStore || seq < 0 || !structure1Cbor) return;
-    const relayId = typeof frame["relay_id"] === "string" ? frame["relay_id"] : undefined;
-    const relaySig = frame["relay_signature"];
-    const ts = typeof frame["timestamp"] === "number" ? frame["timestamp"] : undefined;
-    // Unsigned ACK (relay has no ack-signing key) → nothing to attest; not an error.
-    if (!relayId || !(relaySig instanceof Uint8Array) || ts === undefined) return;
-    if (!/^[0-9a-fA-F]{64}$/.test(relayId)) {
-      this.#logger.warn("relay.receipt.bad_relay_id", { relayIdLen: relayId.length });
-      return;
-    }
+  #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): boolean {
+    if (seq < 0 || !structure1Cbor) return false;
     let contentHash: Uint8Array;
     let sessionId: Uint8Array;
     try {
@@ -303,31 +294,49 @@ export class AgentRelayClient {
       contentHash = toU8(arr[1]);
       sessionId = toU8(arr[3]);
     } catch {
-      return;
+      // Our OWN just-signed bytes — near-impossible to fail; surface it rather than drop silently.
+      this.#logger.warn("relay.receipt.undecodable_leaf", { seq });
+      return false;
     }
-    const relayPubkey = new Uint8Array(Buffer.from(relayId, "hex"));
-    if (!verifyRelayAck(contentHash, seq, ts, relaySig, relayPubkey)) {
-      // FORGED / corrupt ACK: the relay's signature does not bind this (hash, seq, ts). Reject — do NOT
-      // store. (DoD: "a forged sequence is rejected".)
-      this.#logger.warn("relay.receipt.signature_invalid", { relayShort: relayId.slice(0, 16), seq });
-      return;
-    }
-    const hashHex = Buffer.from(contentHash).toString("hex");
-    const wrote = this.#receiptStore.store(
-      {
-        hashHex,
-        agentPubkeyHex: this.senderPubkeyHex,
-        sessionIdHex: Buffer.from(sessionId).toString("hex"),
-        relayId,
-        relayPubkeyHex: relayId,
-        sequenceNumber: seq,
-        timestamp: ts,
-        signatureHex: Buffer.from(relaySig).toString("hex"),
-      },
-      Date.now(),
-    );
-    if (wrote) {
-      this.#logger.info("relay.receipt.stored", { seq, hashShort: hashHex.slice(0, 16), relayShort: relayId.slice(0, 16) });
+    const ev = evaluateRelayAck({
+      contentHash,
+      sessionIdHex: Buffer.from(sessionId).toString("hex"),
+      agentPubkeyHex: this.senderPubkeyHex,
+      relayId: typeof frame["relay_id"] === "string" ? frame["relay_id"] : undefined,
+      relaySignature: frame["relay_signature"] instanceof Uint8Array ? (frame["relay_signature"] as Uint8Array) : undefined,
+      timestamp: typeof frame["timestamp"] === "number" ? frame["timestamp"] : undefined,
+      sequenceNumber: seq,
+    });
+    switch (ev.kind) {
+      case "unsigned":
+        // A relay that SHOULD sign (PERSIST-012) but didn't → no durable witness for this message. Not an
+        // error per the DoD (unsigned ACKs are optional), but make it diagnosable instead of invisible.
+        this.#logger.debug("relay.receipt.unsigned", { seq, hashShort: Buffer.from(contentHash).toString("hex").slice(0, 16) });
+        return false;
+      case "bad_relay_id":
+        this.#logger.warn("relay.receipt.bad_relay_id", { seq });
+        return false;
+      case "invalid_signature":
+        // FORGED / corrupt ACK — the signature does not bind (hash, seq, ts). REJECT the submit so the send
+        // does NOT settle ok on an unverified sequence (a forged ordering record must not drive ordering),
+        // and store nothing (DoD: "a forged sequence is rejected"). The send still completes via the direct
+        // content path — the relay witness simply degrades to absent for this leaf.
+        this.#logger.warn("relay.receipt.signature_invalid", { seq });
+        return true;
+      case "store": {
+        if (!this.#receiptStore) return false;
+        try {
+          const wrote = this.#receiptStore.store(ev.receipt, Date.now());
+          if (wrote) {
+            this.#logger.info("relay.receipt.stored", { seq, hashShort: ev.receipt.hashHex.slice(0, 16), relayShort: ev.receipt.relayId.slice(0, 16) });
+          }
+        } catch (err) {
+          // A durable-evidence write failure must be LOUD — the relay will not re-emit this ack, so a
+          // swallowed write permanently loses a verified receipt (fallback #4).
+          this.#logger.error("relay.receipt.store_failed", { seq, error: err instanceof Error ? err.message : String(err) });
+        }
+        return false;
+      }
     }
   }
 
@@ -347,12 +356,15 @@ export class AgentRelayClient {
       const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
       const structure1Cbor = this.#pendingStructure1 ?? undefined;
       // RELAYSIG-1: verify the relay's signed ordering record and durably store the receipt BEFORE
-      // settling (which clears #pendingStructure1, the source of the content hash + session id).
-      this.#captureReceipt(frame, structure1Cbor, seq);
+      // settling (which clears #pendingStructure1, the source of the content hash + session id). A
+      // signed-but-INVALID ACK rejects the submit so the send does not settle ok on an unverified sequence.
+      const rejectSubmit = this.#captureReceipt(frame, structure1Cbor, seq);
       this.#settlePending(
-        seq >= 0
-          ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor }
-          : { ok: false, reason: "relay_ack_malformed" },
+        rejectSubmit
+          ? { ok: false, reason: "relay_ack_signature_invalid" }
+          : seq >= 0
+            ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor }
+            : { ok: false, reason: "relay_ack_malformed" },
       );
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
