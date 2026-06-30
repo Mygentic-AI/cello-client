@@ -555,13 +555,19 @@ export class AgentRelayClient {
         let senderHex: string | undefined;
         try { senderHex = Buffer.from(toU8((decode(s1) as unknown[])[2])).toString("hex"); } catch { senderHex = undefined; }
         if (structure2Cbor && s1.length > 0 && senderHex) {
-          this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
-            sequenceNumber: seq,
-            leafKind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
-            senderPubkeyHex: senderHex,
-            structure2Cbor,
-            structure1Cbor: s1,
-          }, Date.now());
+          try {
+            this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
+              sequenceNumber: seq,
+              leafKind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
+              senderPubkeyHex: senderHex,
+              structure2Cbor,
+              structure1Cbor: s1,
+            }, Date.now());
+          } catch (err) {
+            this.#logger.error("relay.seal_leaf.counterparty.store_failed", { seq, session: sidHex, error: err instanceof Error ? err.message : String(err) });
+          }
+        } else {
+          this.#logger.warn("relay.seal_leaf.counterparty.capture_skipped", { seq, session: sidHex, hasS2: !!structure2Cbor, hasS1: s1.length > 0, hasSender: !!senderHex });
         }
       }
       const session = this.#sessions.get(sidHex);
