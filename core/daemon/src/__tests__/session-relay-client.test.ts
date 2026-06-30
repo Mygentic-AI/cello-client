@@ -439,7 +439,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const sid = new Uint8Array(16).fill(0xf2);
     const sidHex = Buffer.from(sid).toString("hex");
     let leafDelivered = false;
-    client.registerSession(sidHex, relay.node, (frame) => { leafDelivered = true; });
+    client.registerSession(sidHex, relay.node, (_frame) => { leafDelivered = true; });
 
     // Authenticate the stream (leaf_deliver requires an active stream).
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
