@@ -217,7 +217,7 @@ export class AgentRelayClient {
    * no session_id (like hash_submit_ack), so at most one record is in flight; records are serialized on
    * the same `#submitChain` as submits, guaranteeing no overlap.
    */
-  #pendingRecord: ((ok: boolean) => void) | null = null;
+  #pendingRecord: ((result: "ok" | "rejected" | "closed") => void) | null = null;
   /** Serializes submits so only one is in flight at a time across all sessions. */
   #submitChain: Promise<unknown> = Promise.resolve();
   /** session_id hex → { the live node to (re)dial from, inbound leaf handler, Option-B assignment to present }. */
@@ -228,6 +228,12 @@ export class AgentRelayClient {
     assignment?: RelayAssignmentCarry;
     /** FED-OPTIONB-SETUP-001: true once the relay has acked this session's client_record_assignment. */
     recorded: boolean;
+    /**
+     * FED-OPTIONB-SETUP-001 (code-review M1): the relay cleanly REJECTED this assignment
+     * (assignment_invalid — e.g. not signed by any consortium directory). Terminal: stop re-presenting
+     * it, so a misconfigured relay can't trigger a reconnect/re-present storm across sibling sessions.
+     */
+    recordRejected: boolean;
   }>();
 
   constructor(opts: AgentRelayClientOpts) {
@@ -262,6 +268,7 @@ export class AgentRelayClient {
       // Carry the assignment forward across re-registration; never lose a recorded flag on re-register.
       assignment: assignment ?? existing?.assignment,
       recorded: existing?.recorded ?? false,
+      recordRejected: existing?.recordRejected ?? false,
     });
     // FED-OPTIONB-SETUP-001 (Option B): eagerly present the assignment so the relay records the session
     // (binds peer IDs, creates the session entry) BEFORE the first hash_submit or the counterparty's
@@ -283,7 +290,11 @@ export class AgentRelayClient {
   async #doRecord(node: CelloNode, sessionIdHex: string): Promise<boolean> {
     if (this.#closed) return false;
     const sess = this.#sessions.get(sessionIdHex);
-    if (!sess || !sess.assignment || sess.recorded) return true;
+    if (!sess || !sess.assignment) return true;
+    if (sess.recorded) return true;
+    // Terminal rejection (code-review M1): a relay that cleanly rejected this assignment will reject it
+    // again — stop re-presenting so a misconfigured/forged case can't storm the shared stream.
+    if (sess.recordRejected) return false;
     if (!(await this.#ensureConnected(node))) return false;
     const stream = this.#stream;
     if (!stream) return false;
@@ -298,8 +309,8 @@ export class AgentRelayClient {
       counterparty_session_peer_id: a.counterpartySessionPeerId,
       assignment_signature: a.assignmentSignature,
     }) as Uint8Array;
-    let resolveRec!: (ok: boolean) => void;
-    const ackPromise = new Promise<boolean>((r) => { resolveRec = r; });
+    let resolveRec!: (result: "ok" | "rejected" | "closed") => void;
+    const ackPromise = new Promise<"ok" | "rejected" | "closed">((r) => { resolveRec = r; });
     this.#pendingRecord = resolveRec;
     try {
       stream.send(lp.encode.single(frame));
@@ -309,18 +320,33 @@ export class AgentRelayClient {
       return false;
     }
     let timer!: ReturnType<typeof setTimeout>;
-    const timeout = new Promise<boolean>((r) => { timer = setTimeout(() => r(false), HASH_SUBMIT_TIMEOUT_MS); });
+    const timeout = new Promise<"timeout">((r) => { timer = setTimeout(() => r("timeout"), HASH_SUBMIT_TIMEOUT_MS); });
     try {
-      const ok = await Promise.race([ackPromise, timeout]);
-      if (ok) {
+      const result = await Promise.race([ackPromise, timeout]);
+      if (result === "ok") {
         sess.recorded = true;
         this.#logger.info("session.relay.assignment.recorded", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
-      } else {
-        // Reset the stream so a late assignment ack can't desync a subsequent submit's FIFO ack matching.
-        this.#resetStream();
-        this.#logger.warn("session.relay.assignment.record.failed", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
+        return true;
       }
-      return ok;
+      if (result === "timeout") {
+        // ONLY here reset the stream: a late ack on this superseded stream would settle a LATER submit's
+        // resolver (FIFO desync). recorded stays false ⇒ a transient timeout is retried on reconnect.
+        this.#resetStream();
+        this.#logger.warn("session.relay.assignment.record.timeout", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
+        return false;
+      }
+      if (result === "rejected") {
+        // The relay cleanly rejected (assignment_invalid) — the ack already arrived, the stream is HEALTHY.
+        // Do NOT reset (that would tear down sibling sessions' in-flight submits). Mark terminal so we stop
+        // re-presenting. The session has no relay witness; sends still complete via the direct path
+        // (sovereign-node redundancy) and a hash_submit will fail loud (session_not_found) — diagnosable.
+        sess.recordRejected = true;
+        this.#logger.warn("session.relay.assignment.record.rejected", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
+        return false;
+      }
+      // "closed": the stream dropped while the record was in flight (settled by the reader/close path).
+      // Transient — no reset needed (already gone); recorded stays false ⇒ retried on reconnect.
+      return false;
     } finally {
       clearTimeout(timer);
       if (this.#pendingRecord === resolveRec) this.#pendingRecord = null;
@@ -474,12 +500,12 @@ export class AgentRelayClient {
       this.#settlePending({ ok: false, reason });
     } else if (type === "assignment_ok") {
       // FED-OPTIONB-SETUP-001: the relay verified + recorded our client-presented assignment.
-      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r(true);
+      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
     } else if (type === "assignment_invalid") {
       // The relay rejected the assignment (e.g. directory_signature_invalid — not signed by any
       // consortium directory). Fail LOUD: the session has no relay witness until this is resolved.
       this.#logger.warn("session.relay.assignment.invalid", { relayPeerId: this.#relayPeerId, reason: typeof frame["reason"] === "string" ? frame["reason"] : "unknown" });
-      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r(false);
+      const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("rejected");
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
@@ -643,6 +669,10 @@ export class AgentRelayClient {
         // Stream gone — clear it so the next submit re-dials, and fail any in-flight submit.
         if (this.#stream === stream) this.#stream = null;
         this.#settlePending({ ok: false, reason: "relay_stream_closed" });
+        // FED-OPTIONB-SETUP-001 (code-review L4): settle an in-flight record too, so #doRecord doesn't
+        // wait the full timeout on a dropped stream. "closed" is transient (not a directory rejection) ⇒
+        // recorded stays false and it is retried after reconnect.
+        { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
         // L5: a pure-receiver session issues no submit, so it would never trigger a re-dial
         // after the node that owned the stream is torn down. If sessions remain, proactively
         // re-establish from any still-live registered session node so queued leaf_delivers
@@ -750,6 +780,8 @@ export class AgentRelayClient {
   close(): void {
     this.#closed = true;
     this.#settlePending({ ok: false, reason: "relay_client_closed" });
+    // FED-OPTIONB-SETUP-001 (code-review L4): settle any in-flight record so #doRecord resolves promptly.
+    { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
     const stream = this.#stream;
     this.#stream = null;
     if (stream) {

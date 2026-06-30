@@ -525,6 +525,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // directory→relay dial). Built only for relay-mode assignments that carry relay_directory_signature;
     // absent ⇒ the client skips client_record_assignment (direct/legacy/pre-M8B).
     const relayDirSig = assignment.relay_directory_signature;
+    // FED-OPTIONB-SETUP-001 (fallback-finder #1/#5): a relay-mode assignment MUST carry a
+    // relay_directory_signature — the directory always signs one. If it is absent or malformed (the
+    // parser dropped it to undefined) for a relay-mode session, the session silently degrades to "no
+    // relay witness" and looks indistinguishable from a legitimate direct-mode session. Warn LOUD so the
+    // missing/corrupt witness has a named cause (this is the only diagnosable signal on a PURE RECEIVER,
+    // which never submits and so never surfaces relay_unavailable). Unwitnessed is an allowed sovereign-
+    // redundancy state, but it must not be invisible.
+    if (assignment.transport_mode === "relay" && !relayDirSig) {
+      logger.warn("session.relay.assignment.signature.missing", {
+        agentName,
+        sessionId: Buffer.from(assignment.session_id).toString("hex").slice(0, 16),
+        reason: "relay_mode_assignment_without_directory_signature",
+      });
+    }
     const carry: RelayAssignmentCarry | undefined = relayDirSig
       ? {
           participantA: assignment.participant_a.pubkey,

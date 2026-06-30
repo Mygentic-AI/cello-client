@@ -261,3 +261,88 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     client.close();
   });
 });
+
+describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", () => {
+  // Under Option B the directory no longer dials the relay; the CLIENT presents the directory-signed
+  // assignment via a client_record_assignment frame. These pin #doRecord's edge logic (idempotency,
+  // submit-gating, named-failure-on-reject) that the live spine only exercises on the happy path.
+  const carry = () => ({
+    participantA: new Uint8Array(32).fill(0xa1),
+    participantB: new Uint8Array(32).fill(0xb2),
+    sessionTimestamp: 1_750_000_000_000,
+    assignmentSignature: new Uint8Array(64).fill(0xc3),
+  });
+
+  it("presents the assignment exactly ONCE (idempotent) and gates the first hash_submit on it", async () => {
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x0d);
+    // registerSession with an assignment → eager #doRecord fires on the submit chain.
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_ok" });
+    await tick();
+
+    // A submit now — the session is already recorded, so #doSubmit's #doRecord is a no-op (no 2nd frame).
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1));
+    await tick();
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    expect((await submit).ok).toBe(true);
+
+    const records = relay.sentFrames.filter((f) => f["type"] === "client_record_assignment");
+    expect(records.length).toBe(1); // idempotent: eager record only; submit-gate saw recorded=true
+    expect(Buffer.from(records[0]!["session_id"] as Uint8Array).equals(Buffer.from(sid))).toBe(true);
+    expect((records[0]!["assignment_signature"] as Uint8Array).length).toBe(64);
+    expect(Buffer.from(records[0]!["participant_a"] as Uint8Array).equals(Buffer.from(carry().participantA))).toBe(true);
+    // The submit was gated AFTER the record (record frame precedes the hash_submit on the wire).
+    const recordIdx = relay.sentFrames.findIndex((f) => f["type"] === "client_record_assignment");
+    const submitIdx = relay.sentFrames.findIndex((f) => f["type"] === "hash_submit");
+    expect(recordIdx).toBeGreaterThanOrEqual(0);
+    expect(submitIdx).toBeGreaterThan(recordIdx);
+    client.close();
+  });
+
+  it("surfaces assignment_invalid as a NAMED warn (never silently treats the session as recorded)", async () => {
+    const logs: string[] = [];
+    const capLogger = {
+      debug() {}, info() {},
+      warn(event: string) { logs.push(event); },
+      error() {},
+    } as unknown as Logger;
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: capLogger,
+    });
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x0e);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    // The relay rejects the assignment (e.g. forged/non-consortium signature).
+    relay.push({ type: "assignment_invalid", reason: "directory_signature_invalid" });
+    await tick();
+
+    // The client DID present the assignment, and the rejection is surfaced LOUD (not a silent success).
+    expect(relay.sentFrames.some((f) => f["type"] === "client_record_assignment")).toBe(true);
+    expect(logs.includes("session.relay.assignment.invalid")).toBe(true);
+    client.close();
+  });
+});
