@@ -126,6 +126,16 @@ export type {
   FrostDkgResponse,
 } from "./frost-dkg.js";
 
+export type {
+  FrostRefreshContribution,
+  FrostRefreshRound1Request,
+  FrostRefreshRound1Response,
+  FrostRefreshRound2Request,
+  FrostRefreshRound2Response,
+  FrostRefreshRequest,
+  FrostRefreshResponse,
+} from "./frost-refresh.js";
+
 // M7-MANIFEST-001: Consortium manifest types
 export type {
   ConsortiumManifest,
