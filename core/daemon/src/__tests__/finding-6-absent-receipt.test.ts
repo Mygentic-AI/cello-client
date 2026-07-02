@@ -17,7 +17,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionNodeManager, type ISessionNodeFactory } from "../session-node-manager.js";
-import { upgradeAbsentToRecovered } from "../seal-receipt-upgrade.js";
+import { upgradeAbsentToRecovered, hasAbsentParticipant } from "../seal-receipt-upgrade.js";
 import type { Logger } from "../types.js";
 
 const silentLogger: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
@@ -94,5 +94,20 @@ describe("FINDING-6: upgradeAbsentToRecovered (client-side bilateral upgrade of 
   it("tolerates a malformed legibility (returns it unchanged rather than throwing)", () => {
     expect(upgradeAbsentToRecovered(undefined)).toBeUndefined();
     expect(upgradeAbsentToRecovered({ nope: 1 })).toEqual({ nope: 1 });
+  });
+});
+
+describe("FINDING-6: hasAbsentParticipant (one-way-ratchet guard for 3b re-delivery)", () => {
+  it("true for a fresh unilateral cert (has an 'absent' party), false once upgraded to 'recovered'", () => {
+    const fresh = { participants: [{ pubkey: "aa", attestation_mode: "live" }, { pubkey: "bb", attestation_mode: "absent" }] };
+    expect(hasAbsentParticipant(fresh)).toBe(true);
+    const upgraded = upgradeAbsentToRecovered({ participants: [{ pubkey: "aa", attestation_mode: "live" }, { pubkey: "bb", attestation_mode: "absent" }] });
+    expect(hasAbsentParticipant(upgraded)).toBe(false); // ratchet: a re-delivered notification must NOT re-persist over this
+  });
+
+  it("false for malformed/empty legibility (nothing to protect)", () => {
+    expect(hasAbsentParticipant(undefined)).toBe(false);
+    expect(hasAbsentParticipant({ nope: 1 })).toBe(false);
+    expect(hasAbsentParticipant({ participants: [] })).toBe(false);
   });
 });

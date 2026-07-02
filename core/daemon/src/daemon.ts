@@ -60,7 +60,7 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider, hash as cryptoHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
-import { upgradeAbsentToRecovered } from "./seal-receipt-upgrade.js";
+import { upgradeAbsentToRecovered, hasAbsentParticipant } from "./seal-receipt-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -2181,14 +2181,25 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // directory_attested path; B trusts its own KERNEL-verified content, not a re-derivation.
       if (result.sent) {
         try {
-          const legibility = normalizeLegibility(frame["legibility"]);
-          const rootHex = frameValueToHex(frame["sealed_root"]);
-          const counterpartyHex = frameValueToHex(frame["present_pubkey"]); // A — the present party
-          if (legibility !== undefined && rootHex && counterpartyHex) {
-            sessionNodeManager.recordSealCertificateEnsuringRow(agentName, sidHex, counterpartyHex, rootHex, JSON.stringify(legibility));
-            logger.info("session.unilateral.receipt.persisted", { sessionId: sidHex, sealedRoot: rootHex, party: "absent" });
-          } else if (legibility === undefined) {
-            logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_notification" });
+          // ONE-WAY RATCHET (cascade-2 FINDING-6 review): a re-delivered seal_unilateral_notification
+          // (reconnect burst) re-runs this path and would re-persist the notification's ORIGINAL
+          // legibility (counterparty 'absent'). If a prior upgrade already flipped the stored receipt
+          // to 'recovered' (no 'absent' participant), re-persisting would REGRESS it — and no later
+          // event restores 'recovered' (the directory dedups the duplicate as already_bilateral →
+          // seal_upgrade_rejected, which only logs). So skip the re-persist once the cert is upgraded.
+          const existing = sessionNodeManager.getSealCertificate(agentName, sidHex);
+          if (existing && !hasAbsentParticipant(existing.legibility)) {
+            logger.debug("session.unilateral.receipt.persist.skipped", { sessionId: sidHex, reason: "already_upgraded" });
+          } else {
+            const legibility = normalizeLegibility(frame["legibility"]);
+            const rootHex = frameValueToHex(frame["sealed_root"]);
+            const counterpartyHex = frameValueToHex(frame["present_pubkey"]); // A — the present party
+            if (legibility !== undefined && rootHex && counterpartyHex) {
+              sessionNodeManager.recordSealCertificateEnsuringRow(agentName, sidHex, counterpartyHex, rootHex, JSON.stringify(legibility));
+              logger.info("session.unilateral.receipt.persisted", { sessionId: sidHex, sealedRoot: rootHex, party: "absent" });
+            } else if (legibility === undefined) {
+              logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_notification" });
+            }
           }
         } catch (error) {
           logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });

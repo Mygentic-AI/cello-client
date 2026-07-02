@@ -30,3 +30,19 @@ export function upgradeAbsentToRecovered(legibility: unknown): unknown {
   }
   return legibility;
 }
+
+/**
+ * True if the legibility still has any 'absent' participant — i.e. it has NOT yet been upgraded to
+ * bilateral (upgradeAbsentToRecovered flips the sole absent party to 'recovered'). The absent-party
+ * 3b persist uses this as a ONE-WAY RATCHET: a re-delivered seal_unilateral_notification (reconnect
+ * burst) must not overwrite an already-'recovered' stored receipt back to the stale 'absent' snapshot.
+ * A malformed/missing legibility returns false (nothing to protect; let the caller persist).
+ */
+export function hasAbsentParticipant(legibility: unknown): boolean {
+  if (!legibility || typeof legibility !== "object") return false;
+  const participants = (legibility as { participants?: unknown }).participants;
+  if (!Array.isArray(participants)) return false;
+  return participants.some(
+    (p) => p && typeof p === "object" && (p as { attestation_mode?: unknown }).attestation_mode === "absent",
+  );
+}
