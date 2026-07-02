@@ -2023,11 +2023,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const legibility = normalizeLegibility(frame["legibility"]);
 
         // M8B FINDING-5 (SI-002): before persisting, INDEPENDENTLY re-derive each CLIENT-VERIFIABLE
-        // ('live', i.e. the present party) frontier from the signed frontier_leaves and REJECT an
-        // inflated directory-published value. The absent party's frontier stays directory-attested
-        // (its received-frontier remainder is not the present party's to re-derive). When the
-        // directory ships no frontier_leaves (pre-FINDING-5), the cert stays directory-attested
-        // (FINDING-3 behavior) — never rejected. Never persist a cert with an unverifiable frontier.
+        // ('live', the present party) frontier from the signed frontier_leaves and OVERRIDE an inflated
+        // directory-published value DOWN to the provable one (the directory cannot forge signed leaves,
+        // so the re-derived value is truth). We OVERRIDE, never reject — the unilateral seal has a
+        // directory-side dedup guard that makes a client rejection unrecoverable (a retry close is
+        // silently ignored → no receipt ever, worse than FINDING-3; cascade-2 reviewer Critical 2). The
+        // absent party's frontier stays directory-attested (its remainder is not re-derivable here). No
+        // frontier_leaves (pre-FINDING-5 directory) → the cert stays directory-attested (FINDING-3).
+        // A receipt is ALWAYS persisted; the close never dead-ends here.
         if (legibility !== undefined) {
           const rawParticipants =
             (legibility as { participants?: Array<{ pubkey?: unknown; content_frontier_seq?: unknown; attestation_mode?: unknown }> }).participants ?? [];
@@ -2052,31 +2055,38 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
                   };
                 })
               : undefined;
-          const verdict = checkUnilateralFrontier(guardParticipants, parsedFrontierLeaves, sessionId);
-          if (verdict.status === "unverifiable") {
-            // A client-verifiable party's frontier is inflated beyond its signed leaves (or the leaves
-            // are forged/cross-session). Refuse the cert exactly like a bad signature — do NOT persist,
-            // resolve the close as failure. (The FROST signature over the sealed_root verified, but the
-            // unsigned legibility frontier did not — a tamper signal on the receipt-of-last-resort.)
-            logger.error("seal.certificate.frontier.unverifiable", {
+          const check = checkUnilateralFrontier(guardParticipants, parsedFrontierLeaves, sessionId);
+          if (check.status === "corrected") {
+            // Override the inflated 'live' frontier(s) DOWN to the re-derived value in the object we
+            // persist, so the stored receipt never claims more than the signed leaves support.
+            for (const p of rawParticipants) {
+              if (typeof p.pubkey === "string" && check.corrections.has(p.pubkey.toLowerCase())) {
+                (p as { content_frontier_seq?: unknown }).content_frontier_seq = check.corrections.get(p.pubkey.toLowerCase());
+              }
+            }
+            logger.error("seal.certificate.frontier.overridden", {
               sessionId: sidHex,
-              reason: verdict.reason,
-              ...(verdict.party ? { party: verdict.party } : {}),
+              corrections: [...check.corrections.entries()].map(([party, seq]) => ({ party, correctedTo: seq })),
               path: "unilateral",
             });
-            waiter({ ok: false, reason: "certificate_frontier_unverifiable" });
-            return;
-          }
-          if (verdict.status === "verified") {
+          } else if (check.status === "verified") {
             logger.info("seal.certificate.frontier.verified", {
               sessionId: sidHex,
               parties: guardParticipants.filter((p) => p.attestation_mode === "live").length,
               path: "unilateral",
             });
+          } else if (check.status === "leaves_invalid") {
+            // Forged / cross-session leaves — a tamper signal. Persist the directory-attested frontiers
+            // (never reject → never dead-end); surfaced loudly for audit.
+            logger.error("seal.certificate.frontier.leaves_invalid", {
+              sessionId: sidHex,
+              reason: check.reason,
+              path: "unilateral",
+            });
           } else {
-            // directory_attested: no frontier_leaves shipped (pre-FINDING-5 directory). The cert's
-            // frontiers stay DIRECTORY-attested (already marked per-participant via attestation_mode) —
-            // surfaced so the degraded provenance is visible/auditable, never silently client-verified.
+            // directory_attested: no frontier_leaves shipped (pre-FINDING-5 directory). Frontiers stay
+            // DIRECTORY-attested (already marked per-participant) — visible/auditable, never silently
+            // presented as client-verified.
             logger.warn("seal.certificate.frontier.directory_attested", {
               sessionId: sidHex,
               reason: "no_frontier_leaves",

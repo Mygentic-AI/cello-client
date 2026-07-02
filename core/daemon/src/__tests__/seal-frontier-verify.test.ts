@@ -139,14 +139,15 @@ describe("DOD-LEG-2: findInflatedFrontier", () => {
 
 // ─── FINDING-5 (SI-002): attestation-aware unilateral frontier check ────────────
 //
-// On the UNILATERAL receipt, the present party (attestation_mode 'live') carries all its own signed
-// leaves, so its frontier is CLIENT-VERIFIABLE — an inflated value must be rejected. The absent party
-// (attestation_mode 'absent') is DIRECTORY-ATTESTED: its received-frontier remainder lives with the
-// absent party (never provided), so a published value exceeding what the present party can derive is
-// NOT inflation and must NOT be rejected — it stays directory-attested (already marked per-participant).
-// When the directory ships NO frontier_leaves (a pre-FINDING-5 directory), the whole cert stays
-// directory-attested (FINDING-3 behavior) — never rejected, so the fix never regresses FINDING-3.
-describe("FINDING-5: checkUnilateralFrontier (attestation-aware)", () => {
+// OVERRIDE, never reject. The unilateral seal has a directory-side dedup guard (#unilateralSeals)
+// that makes a client REJECTION unrecoverable — a retry close is silently ignored and no receipt is
+// ever produced (worse than FINDING-3). So the client CORRECTS rather than rejects: the present party
+// (attestation_mode 'live') carries all its own signed leaves, so an inflated 'live' frontier is
+// overridden DOWN to the re-derived (provable) value. The absent party ('absent') is directory-attested
+// — its received-frontier remainder isn't the present party's to re-derive, so it is never corrected.
+// No frontier_leaves (a pre-FINDING-5 directory) → the cert stays directory-attested (FINDING-3
+// behavior), never rejected, so the fix never regresses FINDING-3. A receipt is ALWAYS persisted.
+describe("FINDING-5: checkUnilateralFrontier (attestation-aware, override-not-reject)", () => {
   async function liveAbsent(): Promise<{
     a: ReturnType<typeof generateKeypair>;
     b: ReturnType<typeof generateKeypair>;
@@ -160,10 +161,10 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware)", () => {
     return { a, b, aHex, bHex };
   }
 
-  it("leaves present + honest live frontier → verified", async () => {
+  it("leaves present + honest live frontier → verified, no corrections", async () => {
     const { a, b, aHex, bHex } = await liveAbsent();
     const leaves = [await signedLeaf(a, 2), await signedLeaf(b, 1)];
-    const verdict = checkUnilateralFrontier(
+    const check = checkUnilateralFrontier(
       [
         { pubkey: aHex, content_frontier_seq: 2, attestation_mode: "live" },
         { pubkey: bHex, content_frontier_seq: 1, attestation_mode: "absent" },
@@ -171,26 +172,28 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware)", () => {
       leaves,
       SID,
     );
-    expect(verdict.status).toBe("verified");
+    expect(check.status).toBe("verified");
+    expect(check.corrections.size).toBe(0);
   });
 
-  it("leaves present + INFLATED live frontier → unverifiable (rejected)", async () => {
+  it("leaves present + INFLATED live frontier → corrected DOWN to the re-derived value (not rejected)", async () => {
     const { a, aHex } = await liveAbsent();
     const leaves = [await signedLeaf(a, 2)]; // A really only reached 2
-    const verdict = checkUnilateralFrontier(
+    const check = checkUnilateralFrontier(
       [{ pubkey: aHex, content_frontier_seq: 15, attestation_mode: "live" }],
       leaves,
       SID,
     );
-    expect(verdict.status).toBe("unverifiable");
+    expect(check.status).toBe("corrected");
+    expect(check.corrections.get(aHex)).toBe(2); // overridden 15 → 2 (the provable value)
   });
 
-  it("an inflated ABSENT (directory-attested) frontier is TOLERATED — not the present party's to re-derive", async () => {
+  it("an inflated ABSENT (directory-attested) frontier is left untouched — not the present party's to re-derive", async () => {
     const { a, b, aHex, bHex } = await liveAbsent();
     // A (live) honest at 2; B (absent) published 9 though B signed only up to 1 — the un-derivable
-    // received-frontier remainder. The present party cannot re-derive it → stays directory-attested.
+    // received-frontier remainder. Never corrected; stays directory-attested (marked per-participant).
     const leaves = [await signedLeaf(a, 2), await signedLeaf(b, 1)];
-    const verdict = checkUnilateralFrontier(
+    const check = checkUnilateralFrontier(
       [
         { pubkey: aHex, content_frontier_seq: 2, attestation_mode: "live" },
         { pubkey: bHex, content_frontier_seq: 9, attestation_mode: "absent" },
@@ -198,12 +201,13 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware)", () => {
       leaves,
       SID,
     );
-    expect(verdict.status).toBe("verified");
+    expect(check.status).toBe("verified");
+    expect(check.corrections.has(bHex)).toBe(false);
   });
 
-  it("NO frontier_leaves → directory_attested (FINDING-3 back-compat, never rejected)", async () => {
+  it("NO frontier_leaves → directory_attested (FINDING-3 back-compat, never rejected, no corrections)", async () => {
     const { aHex, bHex } = await liveAbsent();
-    const verdict = checkUnilateralFrontier(
+    const check = checkUnilateralFrontier(
       [
         { pubkey: aHex, content_frontier_seq: 2, attestation_mode: "live" },
         { pubkey: bHex, content_frontier_seq: 0, attestation_mode: "absent" },
@@ -211,17 +215,19 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware)", () => {
       undefined,
       SID,
     );
-    expect(verdict.status).toBe("directory_attested");
+    expect(check.status).toBe("directory_attested");
+    expect(check.corrections.size).toBe(0);
   });
 
-  it("leaves present but a leaf signature is forged → unverifiable", async () => {
+  it("leaves present but a leaf signature is forged → leaves_invalid (persist directory-attested, never dead-end)", async () => {
     const { a, aHex } = await liveAbsent();
     const leaves = [await signedLeaf(a, 2), await signedLeaf(a, 9, { corruptSig: true })];
-    const verdict = checkUnilateralFrontier(
+    const check = checkUnilateralFrontier(
       [{ pubkey: aHex, content_frontier_seq: 2, attestation_mode: "live" }],
       leaves,
       SID,
     );
-    expect(verdict.status).toBe("unverifiable");
+    expect(check.status).toBe("leaves_invalid");
+    expect(check.corrections.size).toBe(0);
   });
 });

@@ -103,55 +103,71 @@ export interface UnilateralFrontierParticipant {
   attestation_mode: string;
 }
 
-export type UnilateralFrontierVerdict =
-  /** frontier_leaves present; every CLIENT-VERIFIABLE ('live') party's frontier is leaf-backed. */
-  | { status: "verified" }
+export interface UnilateralFrontierCheck {
   /**
-   * No frontier_leaves shipped (a pre-FINDING-5 directory). The cert stays DIRECTORY-attested — the
-   * same provenance FINDING-3 shipped (each participant already carries attestation_mode). NEVER a
-   * rejection, so FINDING-5 never regresses FINDING-3's "you always get a receipt".
+   *  - verified:           leaves present, no CLIENT-VERIFIABLE ('live') frontier exceeded its leaves.
+   *  - corrected:          leaves present, one or more 'live' frontiers were inflated and overridden
+   *                        DOWN to the re-derived value (see `corrections`).
+   *  - directory_attested: no frontier_leaves shipped (a pre-FINDING-5 directory) — the cert stays
+   *                        directory-attested (FINDING-3 behavior). No correction possible.
+   *  - leaves_invalid:     frontier_leaves are forged / cross-session (reDeriveFrontiers failed) — a
+   *                        tamper signal; persist the directory-attested frontiers, log loudly. NEVER
+   *                        rejected (the unilateral dedup guard makes rejection an unrecoverable
+   *                        dead-end — cascade-2 reviewer Critical 2).
    */
-  | { status: "directory_attested" }
-  /** A client-verifiable party's published frontier exceeds its signed leaves, or the leaves are bad. */
-  | { status: "unverifiable"; reason: string; party?: string };
+  status: "verified" | "corrected" | "directory_attested" | "leaves_invalid";
+  /** lowercased pubkey → corrected content_frontier_seq, for inflated 'live' parties. The caller
+   *  lowers the persisted frontier to this before recording the receipt. Empty unless status is 'corrected'. */
+  corrections: Map<string, number>;
+  reason?: string;
+}
 
 /**
- * FINDING-5 — the present party independently re-verifies the UNILATERAL receipt's frontiers.
+ * FINDING-5 — the present party independently re-verifies (and CORRECTS) the UNILATERAL receipt's
+ * frontiers. OVERRIDE, never reject.
  *
- * The unilateral legibility is FROST-notarized by the directory but the frontier VALUES are NOT
- * bound into the seal signature (unlike the bilateral seal, whose signer binds the legibility hash),
- * so the client must not trust them blindly. The asymmetry (why this is not a plain reuse of the
- * bilateral guard):
+ * The unilateral legibility is FROST-notarized by the directory but the frontier VALUES are NOT bound
+ * into the seal signature (unlike the bilateral seal, whose signer binds the legibility hash), so the
+ * client must not trust them blindly. Because the directory-side dedup guard makes a client REJECTION
+ * of a unilateral cert unrecoverable (a retry close is silently ignored — no receipt ever produced,
+ * worse than FINDING-3), the client CORRECTS rather than rejects:
  *   - CLIENT-VERIFIABLE ('live') party: the present (submitting) party carries all its own signed
- *     leaves, so its content_frontier_seq is fully re-derivable → reject any inflation.
+ *     leaves, so its content_frontier_seq is fully re-derivable. The directory cannot forge signed
+ *     leaves, so the re-derived value is the provable truth → an inflated published value is OVERRIDDEN
+ *     DOWN to it (inflation neutralized, receipt still persisted).
  *   - DIRECTORY-ATTESTED ('absent' / anything not 'live') party: its received-frontier remainder
  *     (acks of the present party's content) lives with the absent party and was never provided, so a
- *     published value ABOVE what the present party can derive is not provably inflation — it stays
- *     directory-attested (already marked per-participant) and is NEVER rejected here.
+ *     published value ABOVE what the present party can derive is not provably inflation — left
+ *     untouched, directory-attested (already marked per-participant).
  *
- * Returns a verdict; the caller logs + (on 'unverifiable') refuses to persist the cert, and (on
- * 'directory_attested') persists with the provenance already marked on each participant.
+ * The caller applies `corrections` to the persisted legibility and logs per `status`; it ALWAYS
+ * persists a receipt (never dead-ends the close).
  */
 export function checkUnilateralFrontier(
   participants: ReadonlyArray<UnilateralFrontierParticipant>,
   frontierLeaves: SealFrontierLeaf[] | undefined,
   sessionId: Uint8Array,
-): UnilateralFrontierVerdict {
+): UnilateralFrontierCheck {
+  const corrections = new Map<string, number>();
   const haveLeaves = Array.isArray(frontierLeaves) && frontierLeaves.length > 0;
-  // Pre-FINDING-5 directory (no leaves): keep FINDING-3's directory-attested behavior. Do NOT reject —
-  // rejecting a claimed-but-unbacked frontier here would regress the shipped FINDING-3 receipt and
-  // break unilateral seals against a not-yet-upgraded directory during rollout.
-  if (!haveLeaves) return { status: "directory_attested" };
+  // Pre-FINDING-5 directory (no leaves): keep FINDING-3's directory-attested behavior. Never reject —
+  // rejecting would regress the shipped FINDING-3 receipt and break unilateral seals against a
+  // not-yet-upgraded directory during rollout.
+  if (!haveLeaves) return { status: "directory_attested", corrections };
 
-  // Only the CLIENT-VERIFIABLE ('live') parties are subject to the inflation reject.
-  const verifiable = participants.filter((p) => p.attestation_mode === "live");
   const rederived = reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId);
-  if (!rederived.ok) return { status: "unverifiable", reason: rederived.reason };
+  if (!rederived.ok) {
+    // Forged / cross-session leaves — a tamper signal, but do NOT reject (unrecoverable dead-end).
+    // Persist the directory-attested frontiers as-is; the caller logs this loudly.
+    return { status: "leaves_invalid", corrections, reason: rederived.reason };
+  }
 
-  const inflated = findInflatedFrontier(
-    verifiable.map((p) => ({ pubkey: p.pubkey, content_frontier_seq: p.content_frontier_seq })),
-    rederived.frontiers,
-  );
-  if (inflated) return { status: "unverifiable", reason: "frontier_inflated", party: inflated.party };
-  return { status: "verified" };
+  // Only CLIENT-VERIFIABLE ('live') parties are re-derivable; override any inflated value down to the
+  // provable one. The absent party is directory-attested (its remainder is not re-derivable here).
+  for (const p of participants) {
+    if (p.attestation_mode !== "live") continue;
+    const derived = rederived.frontiers.get(p.pubkey.toLowerCase()) ?? 0;
+    if (p.content_frontier_seq > derived) corrections.set(p.pubkey.toLowerCase(), derived);
+  }
+  return { status: corrections.size > 0 ? "corrected" : "verified", corrections };
 }
