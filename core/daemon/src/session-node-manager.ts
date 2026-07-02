@@ -240,6 +240,14 @@ export class SessionNodeManager {
   // DAEMON-004: per-session FIFO buffer of verified received content awaiting
   // cello_receive. Populated by ingestReceivedContent / the content stream handler.
   #receivedContent = new Map<string, ReceivedContentEntry[]>();
+  // F1-b: a terminal answer for a sealed session, set at seal teardown BEFORE the
+  // received-content buffer is evicted. A blocking cello_receive waiting when the seal
+  // fires returns this instead of hanging or 404ing; `unreadCount` tells the caller how
+  // many buffered messages were dropped (still durable — read via cello_get_transcript).
+  // This map is deliberately NOT cleared by #evictSessionCaches (it must outlive teardown);
+  // it holds one tiny entry per sealed session for the daemon's lifetime and is cleared on
+  // restart. Idempotent: a sealed session always answers "sealed" to a receive.
+  #sessionTerminal = new Map<string, { type: "sealed"; unreadCount: number }>();
   // CELLO-M7-TRANSPORT-001: the directory-node multiaddrs serving as AutoNAT
   // probers (SI-002). Empty () => [] when the directory is in 'reconnecting'
   // state — AutoNAT cannot run and dialability stays the conservative default.
@@ -1214,6 +1222,18 @@ export class SessionNodeManager {
     sessionId: string,
     reason: "sealed" | "interrupted" | "error",
   ): Promise<void> {
+    // F1-b: record the terminal answer BEFORE the caches are evicted (and before the
+    // early-return below), so a blocking cello_receive that was waiting when the seal fired
+    // returns "session_sealed" (with how many buffered messages it never read) instead of
+    // hanging to timeout or 404ing. Set even if the node was already retired — a late receive
+    // on a sealed session should always learn it is sealed. The receiver (the party that races
+    // the seal on cello_receive) is torn down through THIS path; the closer goes through
+    // retireSessionNode and is not blocking on receive.
+    if (reason === "sealed") {
+      const tkey = this.#k(agentName, sessionId);
+      const unreadCount = this.#receivedContent.get(tkey)?.length ?? 0;
+      this.#sessionTerminal.set(tkey, { type: "sealed", unreadCount });
+    }
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
 
@@ -1291,6 +1311,13 @@ export class SessionNodeManager {
   /** Drop the in-memory tree + received-content caches for a torn-down session (DOD-LOOP-1: per (agent, session)). */
   #evictSessionCaches(agentName: string, sessionId: string): void {
     const key = this.#k(agentName, sessionId);
+    // F1-c: dropping a NON-empty received-content buffer means deliverable plaintext the app
+    // never read live is being discarded (still durable in the transcript). Make that silent
+    // drop diagnosable — it fires on both the destroy (sealed) and retire (sealing) paths.
+    const unreadCount = this.#receivedContent.get(key)?.length ?? 0;
+    if (unreadCount > 0) {
+      this.#logger.info("session.receive.buffer.evicted", { sessionId, agentName, unreadCount });
+    }
     this.#trees.delete(key);
     this.#receivedContent.delete(key);
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
@@ -2409,6 +2436,27 @@ export class SessionNodeManager {
     const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
     if (!buf || buf.length === 0) return null;
     return buf.shift() ?? null;
+  }
+
+  /**
+   * F1-b: the terminal answer for a session that sealed while a blocking receive was (or could be)
+   * waiting. Idempotent — a sealed session always answers "sealed" to a receive. Null while active.
+   */
+  peekTerminalMarker(agentName: string, sessionId: string): { type: "sealed"; unreadCount: number } | null {
+    return this.#sessionTerminal.get(this.#k(agentName, sessionId)) ?? null;
+  }
+
+  /**
+   * F1-b: the durable sealed root hex for a session (written by recordSealCertificate on the
+   * bilateral path), or null if not recorded. Lets cello_receive echo the sealed root in its
+   * terminal answer without threading it through destroySessionNode.
+   */
+  getSealedRootHex(agentName: string, sessionId: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT sealed_root_hex FROM sessions WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as { sealed_root_hex?: string | null } | undefined;
+    return row?.sealed_root_hex ?? null;
   }
 
   // ─── CELLO-M7-MSG-001: delivery ACK / TTF tracking (send side) ──────────────

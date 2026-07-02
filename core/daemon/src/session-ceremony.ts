@@ -490,20 +490,32 @@ export async function verifyUnilateralCertificate(
  * M7 legibility-TBS-binding: verify a BILATERAL session_sealed certificate's signature over the
  * legibility-bound TBS, channel-independently.
  *
- * KEY STRUCTURE (why this is asymmetric): the seal's FROST signature is produced by the
- * INITIATOR's group key (commitments[0] of the initiator's DKG share) + the directory's K_server
- * shares. So only the INITIATOR holds the verification key locally — it loads its OWN primary from
- * its share and checks `signer_pubkey === own primary`, then verifies the FROST signature over
- * `buildSealTbs ‖ legibilityHash`. A tampered legibility (answered / content_frontier_seq /
- * attestation_mode — carried unsigned on the frame) changes the hash → the signature fails → REJECT.
+ * KEY STRUCTURE (why verifiability is asymmetric TODAY): the seal's FROST signature is produced by
+ * the group key (commitments[0] of the DKG share) of whichever party CLOSED THE SESSION FIRST — the
+ * directory designates the sender of the first SEAL ctrl leaf as the "seal initiator" and signs
+ * against that party's primary (directory-node.ts). This is NOT a fixed initiator/responder role:
+ * either the session initiator or the responder can be the first closer.
  *
- * The NON-INITIATOR (the responder B) does NOT hold the initiator's group key, so it cannot
- * channel-independently verify here — it ACCEPTS (`verified:false`). This is sound for the LIVE
- * path: session_sealed arrives over the daemon↔directory libp2p Noise channel (authenticated +
- * encrypted), so it is not MITM-tamperable in transit. The binding's primary value is OUT-OF-BAND:
- * any holder of the initiator's primary (an arbitrator) can verify an exported cert's legibility.
- * Giving the responder the initiator's primary via the FROST-signed session establishment (so it,
- * too, can verify locally) is a follow-on.
+ * A party can channel-independently verify here only against a group primary it HOLDS locally:
+ *  - its OWN primary — loaded from its own DKG share (`signer_pubkey === own primary`); or
+ *  - the counterparty's primary — recorded via recordCounterpartyPrimary (see below).
+ * It then verifies the FROST signature over `buildSealTbs ‖ legibilityHash`. A tampered legibility
+ * (answered / content_frontier_seq / attestation_mode — carried unsigned on the frame) changes the
+ * hash → the signature fails → REJECT.
+ *
+ * When the signer's key is NOT held locally, the party ACCEPTS (`verified:false`, with a `reason`).
+ * This is sound for the LIVE path: session_sealed arrives over the daemon↔directory libp2p Noise
+ * channel (authenticated + encrypted), so it is not MITM-tamperable in transit; the binding's
+ * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
+ * an exported cert's legibility).
+ *
+ * SYMMETRY STATUS: the counterparty-primary branch (below) IS built — the RESPONDER records the
+ * session initiator's primary from the FROST-signed SessionAssignment at accept time
+ * (recordCounterpartyPrimary, daemon.ts). The missing half is the INITIATOR-records-RESPONDER
+ * direction: an initiator never learns the responder's primary, so when the responder closes first,
+ * the initiator cannot verify locally and accepts with reason `signer_key_not_held`. Making the
+ * directory hand EACH party the other's primary (so both closing orders verify) is F2-b — a
+ * cross-repo protocol addition, not done here.
  *
  * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
  * over the canonical hash of exactly what it sent.
@@ -520,13 +532,18 @@ export async function verifyBilateralSealCertificate(
     signatureType: "frost" | "single";
     legibility: LegibilityForHash | null;
   },
-): Promise<{ ok: true; verified: boolean } | { ok: false; reason: string }> {
-  if (cert.signatureType !== "frost") return { ok: true, verified: false };
+): Promise<{ ok: true; verified: boolean; reason?: string } | { ok: false; reason: string }> {
+  // F2-a: every verified:false branch carries a `reason` so the daemon's
+  // session.sealed.signature.checked log can never read as a silently-tolerated FAILED check.
+  // A genuinely failed check takes the { ok:false, reason:"signature_invalid" } path, which the
+  // caller REJECTS (never marks sealed). verified:false is always "no key held to verify → accepted
+  // on the authenticated Noise channel", never "a check ran and failed".
+  if (cert.signatureType !== "frost") return { ok: true, verified: false, reason: "non_frost_certificate" };
   if (cert.signerPubkey.length !== 32) return { ok: false, reason: "no_signer_pubkey" };
   const signerHex = Buffer.from(cert.signerPubkey).toString("hex");
 
   const share = await deps.persistence.loadActiveFrostKeyShare();
-  if (!share) return { ok: true, verified: false }; // no share to verify with — accept (Noise-delivered)
+  if (!share) return { ok: true, verified: false, reason: "no_frost_share" }; // no share to verify with — accept (Noise-delivered)
 
   let ownPrimary: Uint8Array | null = null;
   try {
@@ -536,9 +553,9 @@ export async function verifyBilateralSealCertificate(
       ownPrimary = c0 instanceof Uint8Array ? c0 : Buffer.isBuffer(c0) ? new Uint8Array(c0 as Buffer) : null;
     }
   } catch {
-    return { ok: true, verified: false };
+    return { ok: true, verified: false, reason: "commitments_decode_failed" };
   }
-  if (!ownPrimary || ownPrimary.length !== 32) return { ok: true, verified: false };
+  if (!ownPrimary || ownPrimary.length !== 32) return { ok: true, verified: false, reason: "own_primary_unavailable" };
 
   // The seal is signed by the INITIATOR's primary (group) key. This party can verify against a
   // key it holds independently: its OWN primary (when it is the initiator) or the counterparty's
@@ -555,7 +572,8 @@ export async function verifyBilateralSealCertificate(
   } else {
     // We do not hold the signer's key (no counterparty primary recorded) → cannot verify; accept
     // (the live frame arrived over the authenticated Noise channel; the binding aids out-of-band).
-    return { ok: true, verified: false };
+    // This is the initiator-when-responder-closed-first case F2-b would close.
+    return { ok: true, verified: false, reason: "signer_key_not_held" };
   }
 
   const tbs = bindLegibilityToTbs(buildSealTbs(cert.sessionId, cert.sealedRoot, cert.leafCount, cert.closeTimestamp), cert.legibility);

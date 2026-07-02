@@ -1762,7 +1762,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: verdict.reason });
             return;
           }
-          logger.info("session.sealed.signature.checked", { sessionId: sidHex, verified: verdict.verified });
+          // F2-a: on verified:false, surface WHY (signer_key_not_held / no_frost_share / …) so this
+          // event can never be mistaken for a tolerated failed check. A real failure took the early
+          // return above (session.sealed.signature.invalid) and never reaches here.
+          logger.info("session.sealed.signature.checked", {
+            sessionId: sidHex,
+            verified: verdict.verified,
+            ...(verdict.verified ? {} : { reason: verdict.reason }),
+          });
         }
 
         // M7-SESSION-004 (AC-005): normalise the wire legibility (Uint8Array pubkeys → hex) into a
@@ -2108,9 +2115,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // NOTE: cello_await_session is NOT in this stub list — Seam 2 registers a real
   // handler for it below (inbound session establishment), with its own inline
   // no_current_agent guard.
-  const SESSION_TOOLS_REQUIRING_AGENT = [
-    "cello_receive_session",
-  ];
+  // F1-a2: cello_receive_session is NO LONGER stubbed here — it is registered below as a true
+  // alias of the real (blocking) cello_receive handler. Kept as an (empty) extension point for
+  // future tools that need the plain no_current_agent guard without their own handler.
+  const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
 
   const NO_CURRENT_AGENT_RESPONSE = {
     ok: false,
@@ -4135,36 +4143,77 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { ok: true, sequence_number: leafIndex };
   });
 
-  // ─── CELLO-M7-DAEMON-004: cello_receive (returns from the daemon's own buffer) ──
-  handlers.set("cello_receive", async (params, connectionId) => {
+  // ─── CELLO-M7-DAEMON-004 / F1-a: cello_receive (BLOCKING, session-scoped) ────────
+  // F1-a fix: the daemon port had dropped the blocking receive (the handler was a
+  // non-blocking buf.shift and cello_receive_session was a not_implemented stub). It now
+  // BLOCKS up to timeout_ms, polling the received-content buffer — resolved by the next
+  // arrival, a terminal seal answer (F1-b), or timeout. This is the "blocking receive
+  // variant" the guidance names. Registered under both cello_receive and cello_receive_session
+  // (F1-a2: one implementation, both names — the redundant tools are collapsed).
+  const RECEIVE_DEFAULT_TIMEOUT_MS = 30000; // matches the cello-mcp shim's documented default
+  const handleReceive: IpcHandler = async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
     if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
+    const agentName = connState.currentAgent;
 
-    // round-2 BLOCKING: read the snake_case public field cello-mcp.ts actually sends.
+    // Read the snake_case public field cello-mcp.ts actually sends.
     const sessionId = params?.session_id as string | undefined;
     if (!sessionId) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) to receive content for a specific session." };
     }
-    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
     }
-    if (record.agent_name !== connState.currentAgent) {
+    if (record.agent_name !== agentName) {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
 
-    const entry = sessionNodeManager.takeReceivedContent(connState.currentAgent, sessionId);
-    if (!entry) {
-      return { ok: true, content: null, guidance: "No content is currently buffered for this session. Call cello_receive again after the counterparty sends, or use the blocking receive variant." };
+    const rawTimeout = params?.timeout_ms;
+    const timeoutMs = typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout >= 0
+      ? rawTimeout
+      : RECEIVE_DEFAULT_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+
+    for (;;) {
+      // 1) Deliverable content wins — drain one buffered message per call (FIFO).
+      const entry = sessionNodeManager.takeReceivedContent(agentName, sessionId);
+      if (entry) {
+        return {
+          ok: true,
+          content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
+          sessionId,
+          sequence_number: entry.sequenceNumber,
+          senderPubkey: entry.senderPubkey,
+        };
+      }
+      // 2) F1-b: the session sealed while we were (or before we started) waiting — return the
+      //    terminal answer instead of hanging to timeout. unread_count reports messages that
+      //    were evicted unread (still durable — recoverable via cello_get_transcript).
+      const terminal = sessionNodeManager.peekTerminalMarker(agentName, sessionId);
+      if (terminal) {
+        const sealedRoot = sessionNodeManager.getSealedRootHex(agentName, sessionId);
+        return {
+          ok: true,
+          type: "session_sealed",
+          session_id: sessionId,
+          ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
+          unread_count: terminal.unreadCount,
+          guidance: terminal.unreadCount > 0
+            ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_get_transcript to retrieve the full sealed history. No further actions are required on this session.`
+            : "The session has been sealed by both parties. The full history is available via cello_get_transcript. No further actions are required on this session.",
+        };
+      }
+      // 3) Out of time — non-blocking-equivalent empty answer.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting, or read cello_get_transcript for the full session history." };
+      }
+      await new Promise((r) => setTimeout(r, Math.min(20, remaining)));
     }
-    return {
-      ok: true,
-      content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
-      sessionId,
-      sequence_number: entry.sequenceNumber,
-      senderPubkey: entry.senderPubkey,
-    };
-  });
+  };
+  handlers.set("cello_receive", handleReceive);
+  handlers.set("cello_receive_session", handleReceive);
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {

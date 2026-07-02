@@ -632,4 +632,107 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     // No partial seal initiated.
     expect(events.find((e) => e.event === "session.seal.initiated")).toBeUndefined();
   });
+
+  // ─── F1-a/a2/b/c — blocking receive + seal terminal answer ──────────────────
+
+  it("F1-a: cello_receive BLOCKS up to timeout_ms and returns content that arrives AFTER the call begins", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start({ logger, node });
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      // Buffer is empty when the receive begins; content lands ~40ms later.
+      const content = new TextEncoder().encode("delayed-hello");
+      const recvPromise = client.send("cello_receive", { session_id: SID, timeout_ms: 2000 }) as Promise<Record<string, unknown>>;
+      setTimeout(() => snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content)), 40);
+
+      const res = await recvPromise;
+      expect(res.ok).toBe(true);
+      expect(res.content).toBe("delayed-hello");
+    } finally { client.close(); }
+  });
+
+  it("F1-a: cello_receive returns { ok:true, content:null } on timeout when nothing arrives", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start({ logger, node });
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 60 }) as Record<string, unknown>;
+      expect(res.ok).toBe(true);
+      expect(res.content).toBeNull();
+    } finally { client.close(); }
+  });
+
+  it("F1-a2: cello_receive_session is a LIVE alias (not the not_implemented stub) — returns buffered content", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start({ logger, node });
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    const content = new TextEncoder().encode("via-alias");
+    snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const res = await client.send("cello_receive_session", { session_id: SID, timeout_ms: 500 }) as Record<string, unknown>;
+      expect(res.reason).not.toBe("not_implemented");
+      expect(res.ok).toBe(true);
+      expect(res.content).toBe("via-alias");
+    } finally { client.close(); }
+  });
+
+  it("F1-b/c: a seal that evicts UNREAD content sets a session_sealed terminal marker (with unread_count) and logs session.receive.buffer.evicted", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start({ logger, node });
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    // One inbound message is buffered but NEVER read (mirrors the live final-message race).
+    const inbound = new TextEncoder().encode("unread-final-message");
+    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+
+    // Seal teardown evicts the unread buffer.
+    await snm.destroySessionNode("alice", SID, "sealed");
+
+    // F1-c: the silent drop is now diagnosable.
+    const evicted = events.find((e) => e.event === "session.receive.buffer.evicted");
+    expect(evicted).toBeDefined();
+    expect(evicted!.context.unreadCount).toBe(1);
+    expect(evicted!.context.sessionId).toBe(SID);
+
+    // F1-b: a receive after seal returns the terminal answer instead of hanging or 404ing.
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 500 }) as Record<string, unknown>;
+      expect(res.ok).toBe(true);
+      expect(res.type).toBe("session_sealed");
+      expect(res.unread_count).toBe(1);
+      expect(typeof res.guidance).toBe("string");
+    } finally { client.close(); }
+  });
 });
