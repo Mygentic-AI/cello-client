@@ -1527,6 +1527,35 @@ export class SessionNodeManager {
   }
 
   /**
+   * M8B FINDING-6 (cascade-2): persist a seal certificate for a session that may have NO local
+   * `sessions` row. recordSealCertificate above is an `UPDATE ... WHERE` — a SILENT no-op when the
+   * row is absent (the exact trap the cascade-2 reviewer flagged). The ABSENT party (B), learning of
+   * a seal on reconnect via seal_unilateral_notification, may never have persisted a row for this
+   * session. This ensures a minimal stub row first (INSERT OR IGNORE — a no-op if a row already
+   * exists, e.g. an 'interrupted' row after a restart) so B's receipt is actually durable + retrievable
+   * via cello_get_sealed_receipt. The counterparty pubkey is required by the schema (NOT NULL); B
+   * derives it from the notification's present_pubkey.
+   */
+  recordSealCertificateEnsuringRow(
+    agentName: string,
+    sessionId: string,
+    counterpartyPubkeyHex: string,
+    sealedRootHex: string,
+    legibilityJson: string,
+  ): void {
+    if (!this.#db) return;
+    const now = Date.now();
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO sessions
+           (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(sessionId, agentName, counterpartyPubkeyHex, "sealed", now, now);
+    this.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson);
+  }
+
+  /**
    * M7 legibility-TBS-binding (responder verify): record the counterparty's FROST primary (group)
    * pubkey from the FROST-signed SessionAssignment, so the responder can VERIFY the bilateral seal
    * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to

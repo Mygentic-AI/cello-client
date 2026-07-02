@@ -219,15 +219,18 @@ describe("FINDING-5: checkUnilateralFrontier (attestation-aware, override-not-re
     expect(check.corrections.size).toBe(0);
   });
 
-  it("leaves present but a leaf signature is forged → leaves_invalid (persist directory-attested, never dead-end)", async () => {
+  it("forged leaves + an INFLATED live value → leaves_invalid AND corrected to 0 (strongest tamper → strongest correction)", async () => {
+    // The dangerous case: a directory ships an unverifiable leaf alongside an inflated published value.
+    // Forged leaves are zero trustworthy evidence, so the 'live' frontier is corrected DOWN to 0 — NOT
+    // left at the inflated value (which would make malformed leaves an easier bypass than shipping none).
     const { a, aHex } = await liveAbsent();
     const leaves = [await signedLeaf(a, 2), await signedLeaf(a, 9, { corruptSig: true })];
     const check = checkUnilateralFrontier(
-      [{ pubkey: aHex, content_frontier_seq: 2, attestation_mode: "live" }],
+      [{ pubkey: aHex, content_frontier_seq: 9, attestation_mode: "live" }],
       leaves,
       SID,
     );
     expect(check.status).toBe("leaves_invalid");
-    expect(check.corrections.size).toBe(0);
+    expect(check.corrections.get(aHex)).toBe(0);
   });
 });

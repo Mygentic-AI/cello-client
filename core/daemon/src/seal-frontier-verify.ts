@@ -156,18 +156,20 @@ export function checkUnilateralFrontier(
   if (!haveLeaves) return { status: "directory_attested", corrections };
 
   const rederived = reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId);
-  if (!rederived.ok) {
-    // Forged / cross-session leaves — a tamper signal, but do NOT reject (unrecoverable dead-end).
-    // Persist the directory-attested frontiers as-is; the caller logs this loudly.
-    return { status: "leaves_invalid", corrections, reason: rederived.reason };
-  }
+  // Forged / cross-session leaves are the STRONGEST tamper evidence, so they get the strongest
+  // correction — treat them as ZERO trustworthy evidence (an empty derived map), which drives any
+  // 'live' frontier > 0 down to 0. (Leaving the published value untouched would make malformed leaves
+  // an EASIER inflation bypass than shipping none — cascade-2 re-review.) We still never REJECT
+  // (the directory dedup guard makes rejection an unrecoverable dead-end); the caller logs loudly.
+  const derived = rederived.ok ? rederived.frontiers : new Map<string, number>();
 
-  // Only CLIENT-VERIFIABLE ('live') parties are re-derivable; override any inflated value down to the
-  // provable one. The absent party is directory-attested (its remainder is not re-derivable here).
+  // Only CLIENT-VERIFIABLE ('live') parties are re-derivable; override any value above the provable
+  // one DOWN to it. The absent party is directory-attested (its remainder is not re-derivable here).
   for (const p of participants) {
     if (p.attestation_mode !== "live") continue;
-    const derived = rederived.frontiers.get(p.pubkey.toLowerCase()) ?? 0;
-    if (p.content_frontier_seq > derived) corrections.set(p.pubkey.toLowerCase(), derived);
+    const d = derived.get(p.pubkey.toLowerCase()) ?? 0;
+    if (p.content_frontier_seq > d) corrections.set(p.pubkey.toLowerCase(), d);
   }
+  if (!rederived.ok) return { status: "leaves_invalid", corrections, reason: rederived.reason };
   return { status: corrections.size > 0 ? "corrected" : "verified", corrections };
 }

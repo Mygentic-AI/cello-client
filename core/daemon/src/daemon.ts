@@ -60,6 +60,7 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider, hash as cryptoHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
+import { upgradeAbsentToRecovered } from "./seal-receipt-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -2056,14 +2057,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
                 })
               : undefined;
           const check = checkUnilateralFrontier(guardParticipants, parsedFrontierLeaves, sessionId);
-          if (check.status === "corrected") {
-            // Override the inflated 'live' frontier(s) DOWN to the re-derived value in the object we
-            // persist, so the stored receipt never claims more than the signed leaves support.
+          // Apply any frontier corrections to the object we persist — override inflated 'live'
+          // frontier(s) DOWN to the provable value, so the stored receipt never claims more than the
+          // signed leaves support. Runs for both 'corrected' (valid leaves) and 'leaves_invalid'
+          // (forged leaves → corrected to 0). Never rejects → the close never dead-ends.
+          if (check.corrections.size > 0) {
             for (const p of rawParticipants) {
               if (typeof p.pubkey === "string" && check.corrections.has(p.pubkey.toLowerCase())) {
                 (p as { content_frontier_seq?: unknown }).content_frontier_seq = check.corrections.get(p.pubkey.toLowerCase());
               }
             }
+          }
+          if (check.status === "corrected") {
             logger.error("seal.certificate.frontier.overridden", {
               sessionId: sidHex,
               corrections: [...check.corrections.entries()].map(([party, seq]) => ({ party, correctedTo: seq })),
@@ -2076,11 +2081,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
               path: "unilateral",
             });
           } else if (check.status === "leaves_invalid") {
-            // Forged / cross-session leaves — a tamper signal. Persist the directory-attested frontiers
-            // (never reject → never dead-end); surfaced loudly for audit.
+            // Forged / cross-session leaves — a tamper signal. The 'live' frontier(s) have been
+            // corrected to 0 above (zero trustworthy evidence); persist that (never reject → never
+            // dead-end). Surfaced loudly for audit.
             logger.error("seal.certificate.frontier.leaves_invalid", {
               sessionId: sidHex,
               reason: check.reason,
+              corrections: [...check.corrections.entries()].map(([party, seq]) => ({ party, correctedTo: seq })),
               path: "unilateral",
             });
           } else {
@@ -2151,7 +2158,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (sealUpgradeInFlight.has(key)) return;
     sealUpgradeInFlight.add(key);
     try {
-      await attemptSealUpgradeImpl(
+      const result = await attemptSealUpgradeImpl(
         {
           logger, agentName, agentPubkeyHex,
           getReadiness: (a, s) => sessionNodeManager.getSealUpgradeReadiness(a, s),
@@ -2163,6 +2170,30 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         sidHex,
         frame,
       );
+      // M8B FINDING-6 (3b): the ABSENT party (B) persists its UNILATERAL receipt from the
+      // notification's legibility — but ONLY after the KERNEL content-recovery/verify gate passed.
+      // `result.sent` is true iff attemptSealUpgradeImpl recovered + integrity-verified the content
+      // behind R1 and sent the ratification request; a tampered/unrecoverable/incomplete case returns
+      // sent:false → NO receipt (never a receipt for content B could not verify). B may hold no local
+      // `sessions` row (recordSealCertificateEnsuringRow inserts a stub, counterparty = A's pubkey).
+      // The notification carries no frontier_leaves (FINDING-5 ships those only on the present party's
+      // confirm frame), so B's legibility is directory-attested — consistent with FINDING-5's
+      // directory_attested path; B trusts its own KERNEL-verified content, not a re-derivation.
+      if (result.sent) {
+        try {
+          const legibility = normalizeLegibility(frame["legibility"]);
+          const rootHex = frameValueToHex(frame["sealed_root"]);
+          const counterpartyHex = frameValueToHex(frame["present_pubkey"]); // A — the present party
+          if (legibility !== undefined && rootHex && counterpartyHex) {
+            sessionNodeManager.recordSealCertificateEnsuringRow(agentName, sidHex, counterpartyHex, rootHex, JSON.stringify(legibility));
+            logger.info("session.unilateral.receipt.persisted", { sessionId: sidHex, sealedRoot: rootHex, party: "absent" });
+          } else if (legibility === undefined) {
+            logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_notification" });
+          }
+        } catch (error) {
+          logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });
+        }
+      }
     } finally {
       // Clear the guard so a later reconnect can retry if the request never reached the directory;
       // the directory dedups a repeat with already_bilateral.
@@ -2188,6 +2219,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     );
     if (!result.ok) return; // cert.invalid already logged inside; do NOT accept as bilateral.
     logger.info("session.seal.upgraded", { sessionId: sidHex, agentName, party: result.party });
+    // M8B FINDING-6 (3a): the seal is now BILATERAL (verified) — upgrade THIS party's own stored
+    // receipt so the counterparty recorded 'absent' becomes 'recovered'. Client-side: the directory
+    // ships no bilateral legibility at upgrade time (the seal leaves aren't persisted there), so each
+    // party rebuilds from the cert it already holds — the present party's from its unilateral close
+    // (FINDING-3), the returning party's from the notification it persisted after the KERNEL gate
+    // (3b). The seal signatures do not bind the (unsigned) legibility, so mutating it is sound; only
+    // the attestation flips (frontiers unchanged — never overstated). No-op if no cert is stored yet.
+    const stored = sessionNodeManager.getSealCertificate(agentName, sidHex);
+    if (stored) {
+      try {
+        const upgraded = upgradeAbsentToRecovered(stored.legibility);
+        sessionNodeManager.recordSealCertificate(agentName, sidHex, stored.sealed_root, JSON.stringify(upgraded));
+        logger.info("session.seal.receipt.upgraded", { sessionId: sidHex, agentName, party: result.party });
+      } catch (error) {
+        logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });
+      }
+    }
     void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
   }
 
