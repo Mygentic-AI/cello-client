@@ -13,6 +13,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter } from "../commands.js";
+import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -44,6 +45,24 @@ const daemonBin = join(dirname(daemonPkgPath), "dist/bin/cello-daemon.js");
 
 async function main(): Promise<void> {
   let result: { exitCode: number; output: string };
+
+  // M8B F2: answer --help/-h on every subcommand and REJECT unknown flags before
+  // dispatch, so a flag can never be coerced into a positional argument (previously
+  // `cello register --help` tried to register an agent literally named "--help").
+  if (command && KNOWN_COMMANDS.has(command as never)) {
+    const check = checkArgs(command, process.argv.slice(3));
+    if (check.kind === "help") {
+      process.stdout.write(helpForCommand(command) + "\n");
+      process.exit(0);
+      return;
+    }
+    if (check.kind === "unknown_flag") {
+      process.stderr.write(`Unknown flag '${check.flag}' for 'cello ${command}'.\n`);
+      process.stdout.write(helpForCommand(command) + "\n");
+      process.exit(1);
+      return;
+    }
+  }
 
   switch (command) {
     case "login":
@@ -116,7 +135,8 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      process.stdout.write("Usage: cello <login|logout|status|register|create-agent|remove-agent|sessions>\n");
+      // M8B F1: the usage string lists EVERY command (refresh/receipts were missing).
+      process.stdout.write(USAGE + "\n");
       process.exit(command ? 1 : 0);
       return;
   }
