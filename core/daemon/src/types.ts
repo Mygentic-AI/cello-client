@@ -137,6 +137,21 @@ export interface DaemonStatusResponse {
    * Always present (empty array if none). Never undefined or omitted.
    */
   interrupted_sessions: InterruptedSessionInfo[];
+  /**
+   * M8B F16: ACTIVE sessions with their direct-path counterparty liveness, so a
+   * counterparty-gone session is visible to the operator instead of looking identical
+   * to a quiet-but-healthy one. Always present (empty array if none).
+   */
+  active_sessions: ActiveSessionInfo[];
+}
+
+/** M8B F16: one active session's status row (see DaemonStatusResponse.active_sessions). */
+export interface ActiveSessionInfo {
+  sessionId: string;
+  agentName: string;
+  counterpartyPubkey: string;
+  /** Direct-path counterparty liveness; 'unknown' before any session-node observation. */
+  liveness: "alive" | "gone" | "unknown";
 }
 
 // --- Daemon configuration ---

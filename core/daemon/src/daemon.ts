@@ -35,6 +35,7 @@ import type {
   AgentInfo,
   ConnectionInfo,
   InterruptedSessionInfo,
+  ActiveSessionInfo,
   SessionListEntry,
   SessionListResponse,
   SessionRecord,
@@ -1173,6 +1174,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }));
   }
 
+  // M8B F16: per-session liveness for ACTIVE sessions, shared by both status surfaces
+  // ("status" for the CLI, "cello_status" for MCP). The signal (session.liveness.changed,
+  // tracked in the node manager) existed but nothing consumed it — a dead counterparty
+  // was invisible to the operator.
+  function buildActiveSessions(): ActiveSessionInfo[] {
+    return sessionNodeManager.getSessionsByStatus("active").map((row) => ({
+      sessionId: row.session_id,
+      agentName: row.agent_name,
+      counterpartyPubkey: row.counterparty_pubkey,
+      liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
+    }));
+  }
+
   // Build status response factory
   function getStatus(): DaemonStatusResponse {
     // M7-SESSION-001 AC-006/AC-007: surface interrupted sessions
@@ -1192,6 +1206,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,
+      // M8B F16: per-session liveness so a counterparty-gone session is visible.
+      active_sessions: buildActiveSessions(),
     };
   }
 
@@ -2128,6 +2144,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.
       interrupted_sessions: buildInterruptedSessions(),
+      // M8B F16: per-session liveness on the MCP surface too.
+      active_sessions: buildActiveSessions(),
     };
   });
 
@@ -2203,6 +2221,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // SI-001: the selector consumes the assignment's signed transport_mode as the
     // sole dial authority — never inferred from address format.
     const assignment = negotiation.assignment;
+
+    // M8B F13: validate-what-you-receive at the trust boundary. When the responder cannot
+    // proceed it aborts SILENTLY (session-ceremony.ts wireSessionOfferHandler sends nothing)
+    // and the directory folds an EMPTY counterparty endpoint into the FROST-signed
+    // assignment. Accepting that assignment produced a false ok:true + a phantom session
+    // whose failure only surfaced on the first cello_send. Reject it HERE — before any
+    // local session state exists — covering every cause of a missing accept (abort,
+    // offline, crash, timeout) without needing a directory change.
+    if (!assignment.counterparty_session_peer_id) {
+      logger.warn("session.initiate.counterparty_unavailable", {
+        sessionId: Buffer.from(assignment.session_id).toString("hex"),
+        agentName,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "counterparty_unavailable",
+        guidance: "The counterparty did not accept the session offer (it may be offline or unable to receive). No session was established. Verify the counterparty agent is online (its operator can check cello_status), then retry cello_initiate_session.",
+      };
+    }
+
     const result = await transportSelector.dial(assignment, { correlationId });
     const sessionId = Buffer.from(assignment.session_id).toString("hex");
 
@@ -3430,11 +3469,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // is NOT yet verified here. The old client's receiveSessionAssignment performed that
     // check; it must be re-homed natively before this path faces a real (untrusted)
     // directory. Until then we accept directory-pushed assignments on trust — the in-process
-    // seam tests inject trusted frames. This is logged loudly, never silent.
-    logger.warn("session.inbound.assignment.unverified", {
+    // seam tests inject trusted frames.
+    // M8B F15: logged at DEBUG with an "expected" note — it fires on EVERY healthy inbound
+    // session, and at WARN it read as a failure and actively misled live diagnosis. The
+    // deferred-verification state is a known, tracked gap (SESSION-004), not a per-session
+    // anomaly.
+    logger.debug("session.inbound.assignment.unverified", {
       sessionId: parsed.sessionIdHex,
       agentName: localAgent.name,
-      note: "FROST assignment signature verification deferred to SESSION-004 re-home",
+      note: "FROST assignment signature verification deferred to SESSION-004 re-home (expected on every inbound session until SESSION-004)",
       correlationId,
     });
 
@@ -4256,6 +4299,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // 3) Out of time — non-blocking-equivalent empty answer.
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
+        // M8B F16: a dead session must not return the SAME null timeout as a
+        // quiet-but-healthy one. The liveness signal (session.liveness.changed → gone,
+        // tracked per session by the node manager) finally reaches the MCP surface here.
+        if (sessionNodeManager.getSessionLiveness(agentName, sessionId) === "gone") {
+          return {
+            ok: true,
+            content: null,
+            reason: "counterparty_gone",
+            liveness: "gone",
+            guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
+          };
+        }
         return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting, or read cello_get_transcript for the full session history." };
       }
       await new Promise((r) => setTimeout(r, Math.min(20, remaining)));
