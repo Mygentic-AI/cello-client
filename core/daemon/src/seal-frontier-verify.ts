@@ -94,3 +94,64 @@ export function findInflatedFrontier(
   }
   return null;
 }
+
+// ─── M8B FINDING-5 (SI-002): attestation-aware UNILATERAL frontier check ────────
+
+export interface UnilateralFrontierParticipant {
+  pubkey: string;
+  content_frontier_seq: number;
+  attestation_mode: string;
+}
+
+export type UnilateralFrontierVerdict =
+  /** frontier_leaves present; every CLIENT-VERIFIABLE ('live') party's frontier is leaf-backed. */
+  | { status: "verified" }
+  /**
+   * No frontier_leaves shipped (a pre-FINDING-5 directory). The cert stays DIRECTORY-attested — the
+   * same provenance FINDING-3 shipped (each participant already carries attestation_mode). NEVER a
+   * rejection, so FINDING-5 never regresses FINDING-3's "you always get a receipt".
+   */
+  | { status: "directory_attested" }
+  /** A client-verifiable party's published frontier exceeds its signed leaves, or the leaves are bad. */
+  | { status: "unverifiable"; reason: string; party?: string };
+
+/**
+ * FINDING-5 — the present party independently re-verifies the UNILATERAL receipt's frontiers.
+ *
+ * The unilateral legibility is FROST-notarized by the directory but the frontier VALUES are NOT
+ * bound into the seal signature (unlike the bilateral seal, whose signer binds the legibility hash),
+ * so the client must not trust them blindly. The asymmetry (why this is not a plain reuse of the
+ * bilateral guard):
+ *   - CLIENT-VERIFIABLE ('live') party: the present (submitting) party carries all its own signed
+ *     leaves, so its content_frontier_seq is fully re-derivable → reject any inflation.
+ *   - DIRECTORY-ATTESTED ('absent' / anything not 'live') party: its received-frontier remainder
+ *     (acks of the present party's content) lives with the absent party and was never provided, so a
+ *     published value ABOVE what the present party can derive is not provably inflation — it stays
+ *     directory-attested (already marked per-participant) and is NEVER rejected here.
+ *
+ * Returns a verdict; the caller logs + (on 'unverifiable') refuses to persist the cert, and (on
+ * 'directory_attested') persists with the provenance already marked on each participant.
+ */
+export function checkUnilateralFrontier(
+  participants: ReadonlyArray<UnilateralFrontierParticipant>,
+  frontierLeaves: SealFrontierLeaf[] | undefined,
+  sessionId: Uint8Array,
+): UnilateralFrontierVerdict {
+  const haveLeaves = Array.isArray(frontierLeaves) && frontierLeaves.length > 0;
+  // Pre-FINDING-5 directory (no leaves): keep FINDING-3's directory-attested behavior. Do NOT reject —
+  // rejecting a claimed-but-unbacked frontier here would regress the shipped FINDING-3 receipt and
+  // break unilateral seals against a not-yet-upgraded directory during rollout.
+  if (!haveLeaves) return { status: "directory_attested" };
+
+  // Only the CLIENT-VERIFIABLE ('live') parties are subject to the inflation reject.
+  const verifiable = participants.filter((p) => p.attestation_mode === "live");
+  const rederived = reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId);
+  if (!rederived.ok) return { status: "unverifiable", reason: rederived.reason };
+
+  const inflated = findInflatedFrontier(
+    verifiable.map((p) => ({ pubkey: p.pubkey, content_frontier_seq: p.content_frontier_seq })),
+    rederived.frontiers,
+  );
+  if (inflated) return { status: "unverifiable", reason: "frontier_inflated", party: inflated.party };
+  return { status: "verified" };
+}

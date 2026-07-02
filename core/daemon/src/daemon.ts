@@ -76,7 +76,7 @@ import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
-import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
+import { reDeriveFrontiers, findInflatedFrontier, checkUnilateralFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
 import {
@@ -2021,6 +2021,70 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // seal still completes — surfaced loudly so this can never masquerade as a produced receipt.
         const rootHex = Buffer.from(sealedRoot).toString("hex");
         const legibility = normalizeLegibility(frame["legibility"]);
+
+        // M8B FINDING-5 (SI-002): before persisting, INDEPENDENTLY re-derive each CLIENT-VERIFIABLE
+        // ('live', i.e. the present party) frontier from the signed frontier_leaves and REJECT an
+        // inflated directory-published value. The absent party's frontier stays directory-attested
+        // (its received-frontier remainder is not the present party's to re-derive). When the
+        // directory ships no frontier_leaves (pre-FINDING-5), the cert stays directory-attested
+        // (FINDING-3 behavior) — never rejected. Never persist a cert with an unverifiable frontier.
+        if (legibility !== undefined) {
+          const rawParticipants =
+            (legibility as { participants?: Array<{ pubkey?: unknown; content_frontier_seq?: unknown; attestation_mode?: unknown }> }).participants ?? [];
+          const guardParticipants = rawParticipants
+            .filter((p): p is { pubkey: string; content_frontier_seq: unknown; attestation_mode: string } =>
+              typeof p.pubkey === "string" && typeof p.attestation_mode === "string")
+            .map((p) => ({
+              pubkey: p.pubkey,
+              content_frontier_seq: typeof p.content_frontier_seq === "number" ? p.content_frontier_seq : 0,
+              attestation_mode: p.attestation_mode,
+            }));
+          const frontierLeavesRaw = frame["frontier_leaves"];
+          const toU8f = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>));
+          const parsedFrontierLeaves: SealFrontierLeaf[] | undefined =
+            Array.isArray(frontierLeavesRaw) && frontierLeavesRaw.length > 0
+              ? (frontierLeavesRaw as unknown[]).map((l) => {
+                  const o = l as Record<string, unknown>;
+                  return {
+                    structure1_cbor: toU8f(o["structure1_cbor"]),
+                    sender_pubkey: toU8f(o["sender_pubkey"]),
+                    sender_signature: toU8f(o["sender_signature"]),
+                  };
+                })
+              : undefined;
+          const verdict = checkUnilateralFrontier(guardParticipants, parsedFrontierLeaves, sessionId);
+          if (verdict.status === "unverifiable") {
+            // A client-verifiable party's frontier is inflated beyond its signed leaves (or the leaves
+            // are forged/cross-session). Refuse the cert exactly like a bad signature — do NOT persist,
+            // resolve the close as failure. (The FROST signature over the sealed_root verified, but the
+            // unsigned legibility frontier did not — a tamper signal on the receipt-of-last-resort.)
+            logger.error("seal.certificate.frontier.unverifiable", {
+              sessionId: sidHex,
+              reason: verdict.reason,
+              ...(verdict.party ? { party: verdict.party } : {}),
+              path: "unilateral",
+            });
+            waiter({ ok: false, reason: "certificate_frontier_unverifiable" });
+            return;
+          }
+          if (verdict.status === "verified") {
+            logger.info("seal.certificate.frontier.verified", {
+              sessionId: sidHex,
+              parties: guardParticipants.filter((p) => p.attestation_mode === "live").length,
+              path: "unilateral",
+            });
+          } else {
+            // directory_attested: no frontier_leaves shipped (pre-FINDING-5 directory). The cert's
+            // frontiers stay DIRECTORY-attested (already marked per-participant via attestation_mode) —
+            // surfaced so the degraded provenance is visible/auditable, never silently client-verified.
+            logger.warn("seal.certificate.frontier.directory_attested", {
+              sessionId: sidHex,
+              reason: "no_frontier_leaves",
+              path: "unilateral",
+            });
+          }
+        }
+
         if (legibility !== undefined) {
           try {
             sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
