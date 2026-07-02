@@ -32,6 +32,16 @@ describe("F2: --help/-h on subcommands", () => {
     expect(checkArgs("sessions", ["--help"])).toEqual({ kind: "help" });
   });
 
+  it("--help anywhere wins, even after an unknown flag (the doc-comment contract)", () => {
+    expect(checkArgs("register", ["--bogus", "--help"])).toEqual({ kind: "help" });
+    expect(checkArgs("sessions", ["--bogus", "-h"])).toEqual({ kind: "help" });
+  });
+
+  it("--help/-h is never swallowed as --limit's value", () => {
+    expect(checkArgs("sessions", ["--limit", "-h"])).toEqual({ kind: "help" });
+    expect(checkArgs("sessions", ["--limit", "--help"])).toEqual({ kind: "help" });
+  });
+
   it("helpForCommand returns a usage line for every command", () => {
     for (const cmd of KNOWN_COMMANDS) {
       const help = helpForCommand(cmd);

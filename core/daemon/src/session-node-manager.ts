@@ -1645,6 +1645,13 @@ export class SessionNodeManager {
         agentName,
         reason: "interrupted",
       });
+      // DELIBERATELY NOT #evictSessionCaches here (unlike destroySessionNode/retireSessionNode):
+      // an interrupted session is not terminal. (1) #receivedContent must stay drainable — the
+      // record survives, and cello_receive legitimately reads buffered unread messages after a
+      // transient relay blip; evicting would silently discard deliverable plaintext. (2) Evict
+      // also cancels armed TTF timers (#clearAwaitingForSession) — on a dying session the TTF
+      // park backstop is exactly what must fire for un-acked content (MSG-001). The caches are
+      // reclaimed when the session later seals (destroy/retire paths) or at daemon restart.
       // M8B F14 (fix 1): the relay-detected interruption is the THIRD teardown path that
       // frees the fixed port — it must re-arm too, or a session ending on a network blip
       // leaves the agent deaf again (review finding on the F14 fix).

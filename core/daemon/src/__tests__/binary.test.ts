@@ -45,6 +45,9 @@ describe("daemon binary (AC-011)", () => {
       process.execPath,
       ["--import", "tsx", daemonBin],
       {
+        // tsx is a devDep of THIS package (pnpm isolated layout) — pin the child's cwd to
+        // the package root so `--import tsx` resolves under a workspace-root vitest run too.
+        cwd: join(import.meta.dirname, "../.."),
         env: {
           ...process.env,
           CELLO_DIR: tempDir,

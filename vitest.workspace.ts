@@ -7,4 +7,9 @@ export default defineWorkspace([
   "core/test-fixtures",
   "core/client",
   "core/adapter-claude-code",
+  // daemon + cli were missing since REPOSPLIT-002 — the root `pnpm run test` (and therefore
+  // CI's Test step) silently skipped both suites. Their tests are self-contained
+  // (127.0.0.1 libp2p, tmpdir SQLite) and must gate every publish.
+  "core/daemon",
+  "core/cli",
 ]);

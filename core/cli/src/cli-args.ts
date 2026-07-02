@@ -57,15 +57,17 @@ export type ArgsCheck =
 
 /**
  * F2: validate a subcommand's arguments BEFORE dispatch.
- *  - --help / -h anywhere → help.
+ *  - --help / -h ANYWHERE → help. This is a dedicated pre-scan so help wins even when it
+ *    follows an unknown flag or sits where --limit would consume its value — asking for
+ *    help must never be masked by another argument error.
  *  - any other dash-prefixed token the command does not recognize → unknown_flag
  *    (never silently coerced into a positional).
  */
 export function checkArgs(command: string, args: string[]): ArgsCheck {
+  if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const known = COMMAND_FLAGS[command] ?? new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === "--help" || arg === "-h") return { kind: "help" };
     if (arg.startsWith("-")) {
       if (!known.has(arg)) return { kind: "unknown_flag", flag: arg };
       if (arg === "--limit") i++; // consumes its value
