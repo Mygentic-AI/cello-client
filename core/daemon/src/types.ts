@@ -95,6 +95,12 @@ export interface AgentInfo {
   state: AgentState;
   pubkey?: string;
   error?: string;
+  /**
+   * M8B F14: whether THIS agent currently has an armed standing receiver. Populated on the
+   * cello_status surface (getStatus) so a deaf agent — online but unable to accept inbound
+   * sessions — is visible per-agent, not hidden behind the daemon-level ANY-agent aggregate.
+   */
+  standing_receiver_ready?: boolean;
 }
 
 // --- Connection state ---

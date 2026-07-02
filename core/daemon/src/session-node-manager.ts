@@ -223,6 +223,13 @@ export class SessionNodeManager {
   // prevents two concurrent ensure() calls from building two nodes for the same agent.
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService }>();
   #standingReceiverCreating = new Set<string>();
+  // M8B F14: agents that SHOULD have a standing receiver — marked by
+  // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
+  // unmarked by removeStandingReceiverForAgent (cello_stop_agent). Consulted by the
+  // teardown re-arm so a session-node teardown never re-arms an offline agent.
+  #agentsWantingReceiver = new Set<string>();
+  // M8B F14: standing-receiver create retry schedule (see constructor opts).
+  #srRetryDelaysMs: number[];
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -339,6 +346,13 @@ export class SessionNodeManager {
      * dialability the conservative default and fires transport.autonat.unavailable.
      */
     autoNatProbers?: () => string[];
+    /**
+     * M8B F14: backoff schedule for standing-receiver create retries. Attempt 1 runs
+     * immediately; each entry is the delay before the next attempt. Default covers the
+     * fixed-port race where a teardown and a re-arm interleave (EADDRINUSE clears once
+     * the old node's port is released). Tests inject short delays or [] (no retries).
+     */
+    standingReceiverRetryDelaysMs?: number[];
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
@@ -347,6 +361,7 @@ export class SessionNodeManager {
       this.#contentTtfMs = opts.contentTtfMs;
     }
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
+    this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
   }
 
   /**
@@ -1276,6 +1291,25 @@ export class SessionNodeManager {
       agentName: entry.agentName,
       reason,
     });
+
+    // M8B F14 (fix 1): the torn-down node has just released its port — on a fixed-port
+    // deployment this is the FIRST moment a previously-failed re-arm can succeed. Re-arm
+    // the standing receiver for an online agent that has none (async, never awaited).
+    this.#rearmAfterTeardown(agentName);
+  }
+
+  /**
+   * M8B F14: re-arm an online agent's standing receiver after a session-node teardown
+   * freed resources (notably the fixed port). No-op when the agent is offline, already
+   * has a receiver, or one is being created. The re-arm is a NEW async flow — it mints
+   * its own correlationId (via the ensure default) rather than inheriting the torn-down
+   * session's.
+   */
+  #rearmAfterTeardown(agentName: string): void {
+    if (this.#shuttingDown) return;
+    if (!this.#agentsWantingReceiver.has(agentName)) return;
+    if (this.#standingReceivers.has(agentName) || this.#standingReceiverCreating.has(agentName)) return;
+    void this.#ensureStandingReceiver(agentName);
   }
 
   /**
@@ -1309,6 +1343,8 @@ export class SessionNodeManager {
       agentName: entry.agentName,
       reason: "sealing",
     });
+    // M8B F14 (fix 1): same re-arm point as destroySessionNode — the retired node freed its port.
+    this.#rearmAfterTeardown(agentName);
   }
 
   /** Drop the in-memory tree + received-content caches for a torn-down session (DOD-LOOP-1: per (agent, session)). */
@@ -1609,6 +1645,10 @@ export class SessionNodeManager {
         agentName,
         reason: "interrupted",
       });
+      // M8B F14 (fix 1): the relay-detected interruption is the THIRD teardown path that
+      // frees the fixed port — it must re-arm too, or a session ending on a network blip
+      // leaves the agent deaf again (review finding on the F14 fix).
+      this.#rearmAfterTeardown(agentName);
     }
 
     this.#logger.warn("session.interrupted.detected", {
@@ -2944,8 +2984,15 @@ export class SessionNodeManager {
    * DOD-LOOP-1: ensure the given agent has a standing receiver node (idempotent). Created when an
    * agent comes online (cello_start_agent) and replaced after it is handed off to a session. The
    * `#standingReceiverCreating` guard prevents two concurrent ensure() calls (e.g. the
-   * cello_start_agent hook racing a consume-site retry) from building two nodes for one agent. A
-   * create failure logs + leaves no entry; the next consume-site ensure() call retries on demand.
+   * cello_start_agent hook racing a consume-site retry) from building two nodes for one agent.
+   *
+   * M8B F14: a create failure no longer strands the agent deaf. Each ensure runs a BOUNDED
+   * retry loop (`standingReceiverRetryDelaysMs`, default 1s/5s/15s) — covering the fixed-port
+   * race where the consumed receiver still holds the port until its session node is torn down —
+   * and when every attempt fails, fires the alarm-worthy `session.standing_receiver.dead`
+   * (error level), distinct from the per-attempt `session.node.create.failed`. Re-arm is also
+   * kicked from destroySessionNode/retireSessionNode (the moment the port frees) and from the
+   * inbound accept path (ensure on demand), so one failure can never leave the agent deaf forever.
    */
   async #ensureStandingReceiver(agentName: string, correlationId: string = randomUUID()): Promise<void> {
     if (this.#standingReceivers.has(agentName) || this.#standingReceiverCreating.has(agentName)) return;
@@ -2954,59 +3001,27 @@ export class SessionNodeManager {
     this.#standingReceiverRemoving.delete(agentName);
     this.#standingReceiverCreating.add(agentName);
     try {
-      const sessionId = `standing_receiver_${randomUUID()}`;
-      const gater = new SessionConnectionGater({
-        sessionId,
-        allowedPeerId: null, // open — counterparty unknown at creation time
-        logger: this.#logger,
-      });
-
-      let node: CelloNode;
-      try {
-        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
-        await node.start();
-      } catch (err: unknown) {
-        this.#logger.error("session.node.create.failed", {
-          sessionId,
-          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
-        return; // not ready — callers check getStandingReceiverReady / retry via ensure on demand
+      let lastError = "";
+      for (let attempt = 0; attempt <= this.#srRetryDelaysMs.length; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, this.#srRetryDelaysMs[attempt - 1]));
+        }
+        if (this.#shuttingDown) return;
+        // L1 tombstone: the agent went offline while we were creating / backing off.
+        if (this.#standingReceiverRemoving.has(agentName)) {
+          this.#standingReceiverRemoving.delete(agentName);
+          return;
+        }
+        const result = await this.#tryCreateStandingReceiver(agentName, correlationId);
+        if (result.outcome !== "failed") return; // installed, or cleanly aborted (shutdown/offline)
+        lastError = result.error;
       }
-
-      // M2: gracefulShutdown may have begun while this node was starting (ensure runs un-awaited).
-      // Don't install an orphan bound to a TCP port — stop it and bail.
-      if (this.#shuttingDown) {
-        try { await node.stop(); } catch { /* best-effort */ }
-        return;
-      }
-
-      // L1: the agent may have gone offline (cello_stop_agent → removeStandingReceiverForAgent)
-      // while this ensure was parked on start(). Removal found no map entry to delete, so the
-      // tombstone is how we learn of it — tear the fresh node down rather than install an SR for
-      // an offline agent.
-      if (this.#standingReceiverRemoving.has(agentName)) {
-        this.#standingReceiverRemoving.delete(agentName);
-        try { await node.stop(); } catch { /* best-effort */ }
-        return;
-      }
-
-      // CELLO-M7-TRANSPORT-001: wrap in a NodeAutoNatService so its dialability drives session-
-      // address advertisement and the transport.autonat.* events fire.
-      const autoNat = new NodeAutoNatService({
-        node,
-        logger: this.#logger,
-        nodeType: "standing_receiver",
-        probers: this.#autoNatProbers(),
-      });
-      autoNat.emitInitialResult();
-
-      this.#standingReceivers.set(agentName, { node, gater, autoNat });
-      this.#logger.info("session.node.created", {
-        sessionId,
-        agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
-        sessionPeerId: node.getPeerId(),
+      // M8B F14 (fix 4): an agent that WANTS a receiver has none after every attempt — the
+      // deaf-agent state. Fail LOUD so it is alarm-visible instead of a quiet degradation.
+      this.#logger.error("session.standing_receiver.dead", {
+        agentName,
+        reason: lastError,
+        attempts: this.#srRetryDelaysMs.length + 1,
         correlationId,
       });
     } finally {
@@ -3014,15 +3029,84 @@ export class SessionNodeManager {
     }
   }
 
+  /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
+  async #tryCreateStandingReceiver(
+    agentName: string,
+    correlationId: string,
+  ): Promise<{ outcome: "installed" | "aborted" } | { outcome: "failed"; error: string }> {
+    const sessionId = `standing_receiver_${randomUUID()}`;
+    const gater = new SessionConnectionGater({
+      sessionId,
+      allowedPeerId: null, // open — counterparty unknown at creation time
+      logger: this.#logger,
+    });
+
+    let node: CelloNode;
+    try {
+      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
+      await node.start();
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.#logger.error("session.node.create.failed", {
+        sessionId,
+        agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+        error,
+        correlationId,
+      });
+      return { outcome: "failed", error };
+    }
+
+    // M2: gracefulShutdown may have begun while this node was starting (ensure runs un-awaited).
+    // Don't install an orphan bound to a TCP port — stop it and bail.
+    if (this.#shuttingDown) {
+      try { await node.stop(); } catch { /* best-effort */ }
+      return { outcome: "aborted" };
+    }
+
+    // L1: the agent may have gone offline (cello_stop_agent → removeStandingReceiverForAgent)
+    // while this ensure was parked on start(). Removal found no map entry to delete, so the
+    // tombstone is how we learn of it — tear the fresh node down rather than install an SR for
+    // an offline agent.
+    if (this.#standingReceiverRemoving.has(agentName)) {
+      this.#standingReceiverRemoving.delete(agentName);
+      try { await node.stop(); } catch { /* best-effort */ }
+      return { outcome: "aborted" };
+    }
+
+    // CELLO-M7-TRANSPORT-001: wrap in a NodeAutoNatService so its dialability drives session-
+    // address advertisement and the transport.autonat.* events fire.
+    const autoNat = new NodeAutoNatService({
+      node,
+      logger: this.#logger,
+      nodeType: "standing_receiver",
+      probers: this.#autoNatProbers(),
+    });
+    autoNat.emitInitialResult();
+
+    this.#standingReceivers.set(agentName, { node, gater, autoNat });
+    this.#logger.info("session.node.created", {
+      sessionId,
+      agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+      sessionPeerId: node.getPeerId(),
+      correlationId,
+    });
+    return { outcome: "installed" };
+  }
+
   /**
    * DOD-LOOP-1: public hook for the composition root to create an agent's standing receiver when
    * the agent comes online (cello_start_agent), and to tear it down when it goes offline.
+   * M8B F14: also called from the inbound accept path (ensure on demand). Marks the agent as
+   * WANTING a receiver, which arms the teardown re-arm in destroySessionNode/retireSessionNode.
    */
   async ensureStandingReceiverForAgent(agentName: string): Promise<void> {
+    this.#agentsWantingReceiver.add(agentName);
     await this.#ensureStandingReceiver(agentName);
   }
 
   async removeStandingReceiverForAgent(agentName: string): Promise<void> {
+    // M8B F14: the agent no longer wants a receiver — disarm the teardown re-arm.
+    this.#agentsWantingReceiver.delete(agentName);
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) {
       // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no

@@ -1138,7 +1138,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         } else {
           state = "registered";
         }
-        return { name: a.name, state, pubkey: a.pubkey };
+        return {
+          name: a.name,
+          state,
+          pubkey: a.pubkey,
+          // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
+          // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
+          standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+        };
       });
   }
 
@@ -1174,7 +1181,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return {
       daemon: "running",
       directory_signaling: directorySignalingStatus(),
-      agents,
+      // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
+      // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
+      // aggregate below (kept for backward compatibility).
+      agents: agents.map((a) => ({
+        ...a,
+        standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+      })),
       connections,
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
@@ -3258,6 +3271,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     correlationId: string,
   ): Promise<void> {
     try {
+      // M8B F14 (fix 2): KICK creation before polling — an inbound offer arriving while no
+      // receiver exists and none is being created must trigger the ensure itself (the doc
+      // comment's "retries on demand" made true), instead of polling a creation nobody
+      // started and dropping the offer. Fire-and-forget: the poll below observes readiness.
+      void sessionNodeManager.ensureStandingReceiverForAgent(agentName).catch((err: unknown) => {
+        logger.warn("session.standing_receiver.ensure.failed", {
+          agentName,
+          reason: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
       // M2: do not drop the session if this agent's standing receiver is mid-rebuild.
       const ready = await waitForStandingReceiver(agentName);
       if (!ready) {
