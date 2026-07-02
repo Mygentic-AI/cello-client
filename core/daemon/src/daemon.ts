@@ -51,7 +51,7 @@ import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
-import { createSignalingConnect } from "./signaling-connect.js";
+import { createSignalingConnect, type DirectoryEndpoint } from "./signaling-connect.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
@@ -79,7 +79,12 @@ import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
-import { resolveDirectoryUrl, manifestNodesToEndpoints, type ConsortiumEndpoint } from "./directory-bootstrap.js";
+import {
+  resolveDirectoryUrl,
+  manifestNodesToEndpoints,
+  createRosterAwareEndpointResolver,
+  type ConsortiumEndpoint,
+} from "./directory-bootstrap.js";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -455,6 +460,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return m ? await manifestNodesToEndpoints(m.nodes, { logger }) : null;
   };
 
+  // FINDING-4: roster-aware directory failover (bootstrap SPOF fix). The injected
+  // directoryEndpointResolver only ever probes the single configured node (CELLO_DIRECTORY_URL),
+  // so a down primary stranded the client at startup even though it held the other nodes'
+  // addresses. Wrap it with the consortium roster so the signaling dialer — and the ceremony
+  // endpoint that shares this same instance — route AROUND a down primary (primary-first,
+  // sticky-until-fail, randomized fallback), honoring the sovereign-node REDUNDANCY invariant.
+  // ONE instance → shared sticky state so signaling + ceremonies stay on the SAME directory node
+  // and fail over together. Undefined on the in-process test path (no directoryEndpointResolver),
+  // where the shared manager uses an injected signalingConnect instead.
+  const failoverEndpointResolver = directoryEndpointResolver
+    ? createRosterAwareEndpointResolver({
+        primaryResolver: directoryEndpointResolver,
+        getConsortiumRoster: resolveConsortiumRoster,
+        logger,
+      })
+    : undefined;
+  // Null-safe accessor for the ceremony/handler getDirectoryEndpoint sites (mirrors the old
+  // `directoryEndpointResolver ? ... : null` wrapper, now routed through the failover resolver).
+  const getFailoverEndpoint = async (): Promise<DirectoryEndpoint | null> =>
+    failoverEndpointResolver ? await failoverEndpointResolver() : null;
+
   // CELLO-M7-CONN-001 (DOD-CONN-3): start the daemon-level HTTP manifest poll. It fetches
   // ${directoryHttpUrl}/manifest, verifies the threshold signature against the locally-pinned
   // root keys, applies anti-rollback + expiry, and adopts a newer manifest — independent of any
@@ -639,7 +665,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!directoryEndpointResolver) {
       throw new Error("getAgentSignaling: no directory endpoint resolver configured (and no shared manager)");
     }
-    const resolver = directoryEndpointResolver;
+    // FINDING-4: dial through the roster-aware failover resolver so this agent's signaling
+    // stream routes around a down primary node. (failoverEndpointResolver is defined here
+    // because it is built iff directoryEndpointResolver is — guarded non-null just above.)
+    const resolver = failoverEndpointResolver ?? directoryEndpointResolver;
     let nodeRef: CelloNode | null = null;
     const connect = createSignalingConnect({
       getDirectoryEndpoint: resolver,
@@ -668,7 +697,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       persistence: getPersistence(agentName),
       agentPubkeyHex,
       getNode: entry.getNode,
-      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
@@ -679,7 +708,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       persistence: getPersistence(agentName),
       agentPubkeyHex,
       getNode: entry.getNode,
-      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
@@ -747,7 +776,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
-      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
@@ -757,7 +786,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       getNode: getDirectoryNode,
-      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
@@ -1617,9 +1646,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     registrationInProgress = true;
     try {
       // Resolve the directory endpoint once for this registration (the context's
-      // getDirectoryEndpoint is synchronous; the daemon's resolver is async with a
-      // last-known-good fallback). The endpoint is stable for the duration of one
-      // registration — if it changed mid-flow the DKG streams would break anyway.
+      // getDirectoryEndpoint is synchronous; the daemon's resolver is async).
+      // FINDING-4 scope note: this uses the PRIMARY resolver directly (not the roster-aware
+      // failover resolver — registration is deliberately out of FINDING-4's "signaling +
+      // ceremony" scope). Because that primary is now built with staleFallback:false (so the
+      // failover wrapper sees a dead primary as null), a transient /bootstrap blip here resolves
+      // to null → directory_unreachable rather than riding through on a stale last-known-good;
+      // registration is a rare, manual, retryable op, so failing fast (retry) is acceptable. With
+      // a manifest configured the DKG fans out over the independently-probed roster regardless of
+      // this endpoint. The endpoint is stable for one registration — if it changed mid-flow the
+      // DKG streams would break anyway.
       const ep = await directoryEndpointResolver();
       if (!ep || !ep.multiaddr) {
         // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
@@ -2137,7 +2173,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       persistence: getPersistence(agentName),
       agentPubkeyHex: loaded.pubkey,
       getNode: entry.getNode,
-      getDirectoryEndpoint: async () => (directoryEndpointResolver ? (await directoryEndpointResolver()) ?? null : null),
+      getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: entry.signaling,
       logger,

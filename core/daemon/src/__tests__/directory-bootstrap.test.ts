@@ -12,9 +12,12 @@ import {
   fetchBootstrapMultiaddr,
   parsePeerIdFromMultiaddr,
   createDirectoryEndpointResolver,
+  createRosterAwareEndpointResolver,
   mapEndpointToBootstrapBase,
   manifestNodesToEndpoints,
+  type ConsortiumEndpoint,
 } from "../directory-bootstrap.js";
+import type { DirectoryEndpoint } from "../signaling-connect.js";
 import type { Logger } from "../types.js";
 
 const silentLogger: Logger = {
@@ -149,6 +152,181 @@ describe("createDirectoryEndpointResolver", () => {
     expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  // FINDING-4: when this resolver is the roster-aware failover wrapper's PRIMARY probe, the
+  // stale-last-known-good fallback is HARMFUL — it hides a dead primary (a fresh fetch failure
+  // returns the cached dead endpoint, so the wrapper never sees the primary as "down" and never
+  // fails over). staleFallback:false makes a fresh failure return null, so the roster takes over.
+  it("staleFallback:false returns null on a fresh failure (does NOT reuse last-known-good)", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ multiaddr: MULTIADDR })) // succeeds once
+      .mockResolvedValueOnce(jsonResponse({}, false)); // then dies → must report null, not stale
+    const resolver = createDirectoryEndpointResolver({
+      logger: silentLogger,
+      directoryUrl: "http://dir.example",
+      fetchFn: fetchFn as unknown as typeof fetch,
+      staleFallback: false,
+    });
+    expect(await resolver()).toEqual({ peerId: PEER, multiaddr: MULTIADDR });
+    expect(await resolver()).toBeNull();
+  });
+});
+
+// ─── FINDING-4: roster-aware directory failover (bootstrap SPOF fix) ────────────
+//
+// The signaling dialer must route around a down PRIMARY directory node using the
+// consortium roster it already holds — instead of retrying the single primary URL
+// forever. createRosterAwareEndpointResolver wraps the primary (single-URL) resolver
+// with the resolved roster: primary-first, randomized fallback on primary failure,
+// sticky-until-fail (no flapping back to a recovered primary), null only when NOTHING
+// resolves. Each roster member returned by getConsortiumRoster is already reachable
+// (its /bootstrap resolved), so a member's presence in the roster IS its reachability.
+describe("createRosterAwareEndpointResolver (FINDING-4 failover)", () => {
+  const US1: DirectoryEndpoint = { peerId: "PEERus1", multiaddr: "/ip4/127.0.0.1/tcp/5001/p2p/PEERus1" };
+  const US1_C: ConsortiumEndpoint = { nodeId: "us1", pubkey: "a".repeat(64), peerId: "PEERus1", multiaddr: US1.multiaddr! };
+  const EU1_C: ConsortiumEndpoint = { nodeId: "eu1", pubkey: "b".repeat(64), peerId: "PEEReu1", multiaddr: "/ip4/127.0.0.1/tcp/5002/p2p/PEEReu1" };
+  const AP1_C: ConsortiumEndpoint = { nodeId: "ap1", pubkey: "c".repeat(64), peerId: "PEERap1", multiaddr: "/ip4/127.0.0.1/tcp/5003/p2p/PEERap1" };
+
+  // Deterministic "shuffle" for tests that assert order: identity (no reordering).
+  const identityShuffle = <T,>(items: T[]): T[] => items;
+
+  it("1. primary unreachable + roster has a reachable member → returns that member", async () => {
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver: async () => null, // us1 down
+      getConsortiumRoster: async () => [EU1_C], // us1 not in roster (it's down), eu1 reachable
+      logger: silentLogger,
+      shuffle: identityShuffle,
+    });
+    expect(await resolver()).toEqual({ peerId: "PEEReu1", multiaddr: EU1_C.multiaddr });
+  });
+
+  it("2. sticky: once on a fallback, keeps it while reachable (primary not re-probed)", async () => {
+    const primaryResolver = vi.fn(async () => null); // us1 stays down
+    const getConsortiumRoster = vi.fn(async () => [EU1_C, AP1_C]);
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver,
+      getConsortiumRoster,
+      logger: silentLogger,
+      shuffle: identityShuffle, // → eu1 chosen first
+    });
+    const first = await resolver();
+    expect(first?.peerId).toBe("PEEReu1");
+    const second = await resolver();
+    expect(second?.peerId).toBe("PEEReu1"); // same node — no flapping
+    // The sticky path returns before re-probing the primary → primary consulted only on the first call.
+    expect(primaryResolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("3. sticky-until-fail: primary recovers while on a fallback → does NOT churn back to primary", async () => {
+    let primaryUp = false;
+    const primaryResolver = vi.fn(async () => (primaryUp ? US1 : null));
+    const getConsortiumRoster = vi.fn(async () => (primaryUp ? [US1_C, EU1_C, AP1_C] : [EU1_C, AP1_C]));
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver,
+      getConsortiumRoster,
+      logger: silentLogger,
+      shuffle: identityShuffle,
+    });
+    const first = await resolver();
+    expect(first?.peerId).toBe("PEEReu1"); // failed over to eu1
+    primaryUp = true; // us1 comes back
+    const second = await resolver();
+    expect(second?.peerId).toBe("PEEReu1"); // stays on eu1 — sticky-until-fail
+  });
+
+  it("4. all nodes down → null (empty roster AND null roster / back-compat)", async () => {
+    const emptyRoster = createRosterAwareEndpointResolver({
+      primaryResolver: async () => null,
+      getConsortiumRoster: async () => [],
+      logger: silentLogger,
+    });
+    expect(await emptyRoster()).toBeNull();
+
+    const noManifest = createRosterAwareEndpointResolver({
+      primaryResolver: async () => null,
+      getConsortiumRoster: async () => null, // no consortium manifest configured
+      logger: silentLogger,
+    });
+    expect(await noManifest()).toBeNull();
+  });
+
+  it("5. regression: primary reachable → primary selected, roster never probed (healthy path)", async () => {
+    const primaryResolver = vi.fn(async () => US1);
+    const getConsortiumRoster = vi.fn(async () => [US1_C, EU1_C, AP1_C]);
+    const resolver = createRosterAwareEndpointResolver({ primaryResolver, getConsortiumRoster, logger: silentLogger });
+    expect(await resolver()).toEqual(US1);
+    expect(await resolver()).toEqual(US1);
+    expect(getConsortiumRoster).not.toHaveBeenCalled(); // no roster cost while the primary is healthy
+  });
+
+  it("6. on primary failure it fails over to a DIFFERENT node and emits directory.bootstrap.failover", async () => {
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger: Logger = { ...silentLogger, warn: (event, ctx) => events.push({ event, ctx: ctx ?? {} }) };
+    let primaryUp = true;
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver: async () => (primaryUp ? US1 : null),
+      getConsortiumRoster: async () => (primaryUp ? [US1_C, EU1_C] : [EU1_C]),
+      logger,
+      shuffle: identityShuffle,
+    });
+    expect((await resolver())?.peerId).toBe("PEERus1"); // primary healthy
+    primaryUp = false; // us1 dies
+    const failed = await resolver();
+    expect(failed?.peerId).toBe("PEEReu1"); // routed around the dead primary
+    const failover = events.find((e) => e.event === "directory.bootstrap.failover");
+    expect(failover).toBeDefined();
+    expect(failover?.ctx["to"]).toBe("PEEReu1");
+  });
+
+  it("7. COMPOSITION: a REAL primary resolver that dies after a success fails over to the roster (not the stale dead primary)", async () => {
+    // The bug the isolated tests missed: createDirectoryEndpointResolver caches last-known-good and,
+    // without staleFallback:false, returns the STALE dead primary on every later fetch failure — so the
+    // wrapper's branch-2 ("primary healthy") wins forever and the roster fallback is never reached. This
+    // composes the real resolver (as production does) and asserts the live kill-primary path works.
+    const US1_MA = US1.multiaddr!;
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ multiaddr: US1_MA })) // startup: us1 healthy
+      .mockResolvedValue(jsonResponse({}, false)); // us1 dead thereafter (fresh failures)
+    const primaryResolver = createDirectoryEndpointResolver({
+      logger: silentLogger,
+      directoryUrl: "http://us1",
+      fetchFn: fetchFn as unknown as typeof fetch,
+      staleFallback: false, // as the failover wrapper's primary: report the dead node as null
+    });
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver,
+      getConsortiumRoster: async () => [EU1_C], // us1 down → not in roster; eu1 reachable
+      logger: silentLogger,
+      shuffle: identityShuffle,
+    });
+    expect((await resolver())?.peerId).toBe("PEERus1"); // startup on the healthy primary
+    expect((await resolver())?.peerId).toBe("PEEReu1"); // primary died → routed to eu1, NOT stale us1
+  });
+
+  it("8. after failing over, a flapping primary that reappears in the roster is NOT re-selected", async () => {
+    // Hardening (reviewer #5): the fallback must exclude the PRIMARY's identity, not only the current
+    // pointer — otherwise a flapping primary whose independent roster probe still lists it could be
+    // re-picked as its own fallback.
+    let primaryHealthy = true;
+    const primaryResolver = async () => (primaryHealthy ? US1 : null);
+    // Explicit roster sequence: eu1-only failover, then eu1 drops out while the primary flaps back in.
+    const rosterQueue: ConsortiumEndpoint[][] = [[EU1_C], [US1_C, AP1_C]];
+    const getConsortiumRoster = async () => rosterQueue.shift() ?? [US1_C, AP1_C];
+    const resolver = createRosterAwareEndpointResolver({
+      primaryResolver,
+      getConsortiumRoster,
+      logger: silentLogger,
+      shuffle: identityShuffle, // identity → head of the list, so US1_C would be picked unless excluded
+    });
+    expect((await resolver())?.peerId).toBe("PEERus1"); // healthy → primary (records primary identity)
+    primaryHealthy = false;
+    expect((await resolver())?.peerId).toBe("PEEReu1"); // consumes [EU1_C] → eu1 (current, sticky)
+    // 3rd call: sticky check consumes [US1_C,AP1_C] (eu1 gone) → branch3 default [US1_C,AP1_C];
+    // us1 is the flapping primary → excluded → ap1 (NOT the dead primary).
+    expect((await resolver())?.peerId).toBe("PEERap1");
   });
 });
 

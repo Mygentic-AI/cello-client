@@ -164,6 +164,17 @@ export interface DirectoryEndpointResolverOptions {
   directoryUrl?: string;
   /** Injectable fetch for testing. */
   fetchFn?: typeof fetch;
+  /**
+   * Whether a fresh /bootstrap failure falls back to the last known-good endpoint (default true).
+   *
+   * FINDING-4: set FALSE when this resolver is used as the PRIMARY probe inside
+   * createRosterAwareEndpointResolver. There, the stale-last-known-good fallback is HARMFUL — it
+   * masks a dead primary (a fresh failure returns the cached dead endpoint, so the wrapper never
+   * observes the primary as "down" and never fails over to the roster). With staleFallback:false a
+   * fresh failure returns null, and the roster becomes the real (and only) fallback. The default
+   * (true) preserves the M6/single-node backward-compat behavior for callers that are NOT wrapped.
+   */
+  staleFallback?: boolean;
 }
 
 /**
@@ -180,6 +191,7 @@ export function createDirectoryEndpointResolver(
 ): () => Promise<DirectoryEndpoint | null> {
   const directoryUrl = opts.directoryUrl ?? resolveDirectoryUrl();
   const fetchFn = opts.fetchFn ?? fetch;
+  const staleFallback = opts.staleFallback ?? true;
   let lastGood: DirectoryEndpoint | null = null;
 
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
@@ -198,11 +210,145 @@ export function createDirectoryEndpointResolver(
     } else {
       opts.logger.warn("directory.bootstrap.unavailable", { directoryUrl });
     }
-    // Fresh resolution failed — reuse the last known-good endpoint if we have one.
-    if (lastGood) {
+    // Fresh resolution failed — reuse the last known-good endpoint if we have one AND stale fallback
+    // is enabled. When disabled (the failover-wrapper's primary probe), a fresh failure is reported
+    // as null so the roster can take over instead of the caller looping on a dead endpoint.
+    if (staleFallback && lastGood) {
       opts.logger.warn("directory.bootstrap.using_last_known", { directoryUrl, peerId: lastGood.peerId });
       return lastGood;
     }
+    return null;
+  };
+}
+
+// ─── FINDING-4: roster-aware directory failover (bootstrap SPOF fix) ────────────
+
+export interface RosterAwareResolverOptions {
+  /**
+   * Resolve the PRIMARY (configured) directory endpoint — typically the result of
+   * createDirectoryEndpointResolver (probes CELLO_DIRECTORY_URL's /bootstrap).
+   */
+  primaryResolver: () => Promise<DirectoryEndpoint | null>;
+  /**
+   * Resolve the CURRENTLY-REACHABLE consortium roster. Each member returned has already
+   * had its /bootstrap probed (manifestNodesToEndpoints skips unreachable nodes), so a
+   * member's presence in the returned array IS its reachability. NULL on the M6/M7
+   * back-compat path (no consortium manifest configured) → no failover, primary-only.
+   */
+  getConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
+  logger: Logger;
+  /**
+   * Test seam: order the fallback candidates. Production defaults to a Fisher-Yates
+   * shuffle so clients don't stampede one node when the primary goes down (CLAUDE.md
+   * redundancy invariant). Tests inject an identity shuffle for deterministic ordering.
+   */
+  shuffle?: <T>(items: T[]) => T[];
+}
+
+/** In-place-safe Fisher-Yates shuffle returning a NEW array (never mutates the input). */
+function fisherYatesShuffle<T>(items: T[]): T[] {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/**
+ * Wrap a single-node primary resolver with the consortium roster so the signaling
+ * dialer (and the ceremony endpoint that shares this instance) route AROUND a down
+ * primary directory node instead of retrying the single primary URL forever — the
+ * FINDING-4 bootstrap SPOF fix, honoring the sovereign-node REDUNDANCY invariant.
+ *
+ * Selection policy, per getDirectoryEndpoint() call:
+ *   1. Sticky-until-fail — while riding a non-primary fallback, KEEP it as long as it's
+ *      still in the reachable roster. Do NOT churn back to the primary when it recovers
+ *      (no flapping / reconnect storm). The fallback's multiaddr is refreshed from the
+ *      fresh roster match each call.
+ *   2. Primary-first — otherwise try the configured node. This is also the healthy
+ *      steady state: when the primary resolves, we return WITHOUT probing the roster
+ *      (no per-connect roster cost while everything is nominal).
+ *   3. Fallback — if the primary is down, fail over to a reachable roster member. The
+ *      order is randomized (across the members other than the dead primary) so clients
+ *      spread across the survivors. Emits directory.bootstrap.failover on a change so an
+ *      operator sees the client is now running on a non-home node.
+ *   4. Return null only when NOTHING resolves (primary down AND roster empty/absent) —
+ *      the unchanged all-nodes-down failure mode, no crash.
+ *
+ * ONE instance is shared across the daemon's signaling connect and its ceremony
+ * getDirectoryEndpoint so signaling + ceremonies stay on the SAME directory node and
+ * fail over together (a coherent per-daemon directory selection).
+ *
+ * Scope note (FINDING-4 sufficiency, unproven): stickiness here is by ROSTER
+ * REACHABILITY, not by observed connect success — the resolver is not told whether a
+ * dial/auth against the returned endpoint actually succeeded. A node whose /bootstrap
+ * resolves is served by that same node, so resolvable ≈ connectable in practice; the
+ * live kill-primary failover test is the real proof that presence resolution, relay
+ * assignment, and the FROST ceremony all work against a non-home directory.
+ */
+export function createRosterAwareEndpointResolver(
+  opts: RosterAwareResolverOptions,
+): () => Promise<DirectoryEndpoint | null> {
+  const shuffle = opts.shuffle ?? fisherYatesShuffle;
+  // The endpoint we last returned, and whether it is a non-primary fallback we're riding.
+  let current: DirectoryEndpoint | null = null;
+  let stuckToFallback = false;
+  // The primary's own identity, learned whenever the primary last resolved. Used to EXCLUDE the
+  // primary from the fallback set even when `current` no longer points at it — a flapping primary
+  // whose independent roster probe still lists it must never be re-picked as its own fallback.
+  let primaryPeerId: string | null = null;
+
+  return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
+    // 1. Sticky-until-fail: keep the current fallback while it is still reachable.
+    if (stuckToFallback && current) {
+      const roster = await opts.getConsortiumRoster();
+      const match = roster?.find((e) => e.peerId === current!.peerId);
+      if (match) {
+        // Refresh the multiaddr from the fresh roster resolution; identity is unchanged.
+        current = { peerId: match.peerId, multiaddr: match.multiaddr };
+        return current;
+      }
+      // The fallback fell out of the reachable roster → re-select below.
+      opts.logger.warn("directory.bootstrap.failover.lost", { peerId: current.peerId });
+    }
+
+    // 2. Primary-first (and the healthy steady state — no roster probe when it resolves).
+    const primary = await opts.primaryResolver();
+    if (primary) {
+      if (stuckToFallback) {
+        opts.logger.info("directory.bootstrap.failover", { to: primary.peerId, restored: true });
+      }
+      current = primary;
+      primaryPeerId = primary.peerId;
+      stuckToFallback = false;
+      return primary;
+    }
+
+    // 3. Primary is down → fail over to a reachable roster member (randomized order).
+    const roster = await opts.getConsortiumRoster();
+    if (roster && roster.length > 0) {
+      // Exclude the (now-dead/flapping) primary and the current pointer; any OTHER reachable member
+      // is valid. Falls back to the full roster only if excluding leaves nothing (all members are
+      // the excluded ones — e.g. the roster is just the primary itself).
+      const excluded = new Set([current?.peerId, primaryPeerId].filter((p): p is string => !!p));
+      const others = roster.filter((e) => !excluded.has(e.peerId));
+      const ordered = shuffle(others.length > 0 ? others : roster);
+      const chosen = ordered[0];
+      const next: DirectoryEndpoint = { peerId: chosen.peerId, multiaddr: chosen.multiaddr };
+      if (!current || current.peerId !== chosen.peerId) {
+        opts.logger.warn("directory.bootstrap.failover", {
+          from: current?.peerId ?? null,
+          to: chosen.peerId,
+          nodeId: chosen.nodeId,
+        });
+      }
+      current = next;
+      stuckToFallback = true;
+      return next;
+    }
+
+    // 4. Nothing resolves.
     return null;
   };
 }

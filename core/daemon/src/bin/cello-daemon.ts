@@ -119,7 +119,11 @@ async function main(): Promise<void> {
   // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
   // proven M6 path); startDaemon builds the real signalingConnect from it + the
   // primary agent identity.
-  const directoryEndpointResolver = createDirectoryEndpointResolver({ logger });
+  // FINDING-4: this resolver is wrapped by the daemon's roster-aware failover resolver, which owns
+  // ALL fallback semantics (roster + sticky). staleFallback:false makes it report a dead primary as
+  // null on a fresh /bootstrap failure — WITHOUT it, the wrapper would keep receiving the stale dead
+  // endpoint and never fail over (the exact live kill-primary bug). The roster is the real fallback.
+  const directoryEndpointResolver = createDirectoryEndpointResolver({ logger, staleFallback: false });
 
   // M7 J-AUTH (DOD-AUTH-1/2): the consortium-manifest hardening is OPT-IN. When the
   // operator (or the live harness) configures a manifest, the daemon loads + verifies
