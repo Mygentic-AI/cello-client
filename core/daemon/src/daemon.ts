@@ -1877,7 +1877,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // counterparty never co-closes. The waiter is resolved by the seal_unilateral_confirmed
   // listener AFTER it verifies the certificate signature (channel-independent), or by
   // seal_unilateral_too_early (grace not elapsed). Keyed by session_id hex.
-  type UnilateralResult = { ok: true; sealedRootHex: string } | { ok: false; reason: string };
+  // F20: `remainingSeconds` carries the directory's seal_unilateral_too_early countdown so the
+  // close result can tell the operator WHEN a unilateral seal becomes available.
+  type UnilateralResult = { ok: true; sealedRootHex: string } | { ok: false; reason: string; remainingSeconds?: number };
   const pendingUnilateralWaiters = new Map<string, (r: UnilateralResult) => void>();
 
   // SESSION-002: per-agent listener for the unilateral certificate. Verifies the FROST
@@ -1898,7 +1900,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
       if (ftype === "seal_unilateral_too_early") {
         pendingUnilateralWaiters.delete(sidHex);
-        waiter({ ok: false, reason: "seal_unilateral_too_early" });
+        // F20: thread the directory's remaining_seconds through so the close guidance can
+        // say when the unilateral seal becomes available.
+        const rs = frame["remaining_seconds"];
+        waiter({
+          ok: false,
+          reason: "seal_unilateral_too_early",
+          ...(typeof rs === "number" ? { remainingSeconds: rs } : {}),
+        });
         return;
       }
 
@@ -2413,12 +2422,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
         }
 
-        // M7-UPGRADE-002: if THIS close fell through via the auto-ack 'already submitted' path, we
-        // hold no local reported_root to escalate with — and we should not need to: the
-        // counterparty's SEAL ctrl leaf is what triggered our auto-ack, so its seal is already on
-        // the relay and the bilateral seal should finalize. A timeout here is unexpected; report it
-        // as pending rather than escalating to a unilateral seal with no root.
-        if (!submit.ok) {
+        // M8B FINDING-1: `responder_seal_already_submitted` has two producers — (a) the auto-ack
+        // path submitted our leaf because the COUNTERPARTY's SEAL arrived, or (b) our OWN earlier
+        // close submitted it and the counterparty never co-closed. The result now carries the
+        // first submit's reportedRootHex/sequenceNumber, so a retry close can still escalate to a
+        // unilateral seal (case b — the live-deadlock path). We deliberately do NOT distinguish
+        // (a) from (b) client-side: the bilateral wait above already gave case (a) its window, and
+        // the directory's grace/already-sealed gates arbitrate a redundant seal_unilateral — that
+        // is the sovereign-node-correct shape. Only when the not-ok result carries NO root (the
+        // first submit is still in flight) is "pending" the honest terminal answer here.
+        const escalation = submit.ok
+          ? { reportedRootHex: submit.reportedRootHex, sequenceNumber: submit.sequenceNumber }
+          : submit.reason === "responder_seal_already_submitted" &&
+              typeof submit.reportedRootHex === "string" &&
+              typeof submit.sequenceNumber === "number"
+            ? { reportedRootHex: submit.reportedRootHex, sequenceNumber: submit.sequenceNumber }
+            : null;
+        if (!escalation) {
           return {
             ok: false,
             reason: "seal_pending_bilateral",
@@ -2452,8 +2472,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const sent = await sendOver(record.agent_name, {
           type: "seal_unilateral",
           session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
-          reported_root: new Uint8Array(Buffer.from(submit.reportedRootHex, "hex")),
-          reported_seq: submit.sequenceNumber,
+          reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
+          reported_seq: escalation.sequenceNumber,
           seal_leaves,
         });
         if (!sent.ok) {
@@ -2476,10 +2496,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           return { ok: true, sealed_root: uniResult.sealedRootHex, seal_type: "unilateral" };
         }
         if (uniResult.reason === "seal_unilateral_too_early") {
+          // F20: tell the operator WHEN the unilateral seal becomes available, not just "later".
+          const when =
+            typeof uniResult.remainingSeconds === "number"
+              ? `A unilateral seal becomes available in ~${uniResult.remainingSeconds}s. `
+              : "";
           return {
             ok: false,
             reason: "seal_counterparty_pending",
-            guidance: "Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. Retry cello_close_session after the grace period, or once the counterparty closes.",
+            guidance: `Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. ${when}Retry cello_close_session after the grace period, or once the counterparty closes.`,
           };
         }
         return {

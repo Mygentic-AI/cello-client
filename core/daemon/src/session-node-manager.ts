@@ -283,7 +283,10 @@ export class SessionNodeManager {
   // M7-UPGRADE-002: sessions for which B has already submitted its responder SEAL leaf (via
   // auto-ack OR cello_close_session). Idempotency guard — A's SEAL ctrl leaf may be delivered
   // more than once (and the relay echoes leaves), so auto-ack fires AT MOST ONCE per session.
-  #responderSealSubmitted = new Set<string>();
+  // M8B FINDING-1: the value carries the first successful submit's reportedRootHex/sequenceNumber
+  // (null while the submit is still in flight), so a RETRY close can escalate to a unilateral
+  // seal with the original reported root instead of deadlocking on seal_pending_bilateral.
+  #responderSealSubmitted = new Map<string, { reportedRootHex: string; sequenceNumber: number } | null>();
   // M7-SESSION-001 (M-1 PUSH): optional callback fired when a session changes
   // state, so the composition root can dispatch a session_state_changed
   // notification to live MCP clients. Injected via a setter AFTER construction
@@ -2048,7 +2051,10 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     correlationId?: string,
-  ): Promise<{ ok: true; sequenceNumber: number; reportedRootHex: string } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; sequenceNumber: number; reportedRootHex: string }
+    | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
+  > {
     const sealKey = this.#k(agentName, sessionId);
     const entry = this.#activeNodes.get(sealKey);
     if (!entry) return { ok: false, reason: "session_node_unavailable" };
@@ -2060,43 +2066,65 @@ export class SessionNodeManager {
     // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
     // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
     if (this.#responderSealSubmitted.has(sealKey)) {
-      return { ok: false, reason: "responder_seal_already_submitted" };
+      // M8B FINDING-1: carry the FIRST submit's reported root/sequence so a retry close can
+      // still escalate to a unilateral seal. A null value means that submit is still in
+      // flight — return the bare reason and let the caller fall back to the pending path.
+      const prior = this.#responderSealSubmitted.get(sealKey);
+      return prior
+        ? {
+            ok: false,
+            reason: "responder_seal_already_submitted",
+            reportedRootHex: prior.reportedRootHex,
+            sequenceNumber: prior.sequenceNumber,
+          }
+        : { ok: false, reason: "responder_seal_already_submitted" };
     }
-    this.#responderSealSubmitted.add(sealKey);
+    this.#responderSealSubmitted.set(sealKey, null);
 
-    const finalRootHex = this.getSessionTreeRootHex(agentName, sessionId);
-    const sealPayload = encodeSealPayload({
-      session_id: entry.relaySessionIdBytes,
-      final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
-      close_timestamp: Date.now(),
-      attestation: "PENDING",
-    });
-    // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
-    const contentHash = new Uint8Array(
-      createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
-    );
-    const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
-    if (!result.ok) {
-      // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
+    // A throw anywhere before the mark is finalized would strand the null in-flight marker
+    // and lock every future close out of escalation (a FINDING-1-shaped deadlock via a
+    // different trigger) — clear the mark on any unexpected exception.
+    try {
+      const finalRootHex = this.getSessionTreeRootHex(agentName, sessionId);
+      const sealPayload = encodeSealPayload({
+        session_id: entry.relaySessionIdBytes,
+        final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
+        close_timestamp: Date.now(),
+        attestation: "PENDING",
+      });
+      // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
+      const contentHash = new Uint8Array(
+        createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
+      );
+      const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
+      if (!result.ok) {
+        // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
+        this.#responderSealSubmitted.delete(sealKey);
+        this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
+        return { ok: false, reason: result.reason };
+      }
+      // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
+      // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
+      // rebuilds from the relay's content-hash chain (the relay records the identical
+      // content_hash for this ctrl leaf). Computed without mutating the durable tree /
+      // message_count, so the bilateral + interrupted seal paths are unaffected.
+      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      const reportedRootHex = this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex);
+      // M8B FINDING-1: durably associate the submit's escalation values with the idempotency
+      // mark, so any LATER close call can retrieve them via the already-submitted result.
+      this.#responderSealSubmitted.set(sealKey, { reportedRootHex, sequenceNumber: result.sequence_number });
+      this.#logger.info("session.seal.leaf.submitted", {
+        sessionId,
+        sequenceNumber: result.sequence_number,
+        correlationId,
+      });
+      // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
+      // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
+      return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
+    } catch (err: unknown) {
       this.#responderSealSubmitted.delete(sealKey);
-      this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
-      return { ok: false, reason: result.reason };
+      throw err;
     }
-    // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
-    // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
-    // rebuilds from the relay's content-hash chain (the relay records the identical
-    // content_hash for this ctrl leaf). Computed without mutating the durable tree /
-    // message_count, so the bilateral + interrupted seal paths are unaffected.
-    const contentHashHex = Buffer.from(contentHash).toString("hex");
-    const reportedRootHex = this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex);
-    this.#logger.info("session.seal.leaf.submitted", {
-      sessionId,
-      sequenceNumber: result.sequence_number,
-      correlationId,
-    });
-    // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
-    // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
-    return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
   }
 
   /**
