@@ -1908,7 +1908,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // seal_unilateral_too_early (grace not elapsed). Keyed by session_id hex.
   // F20: `remainingSeconds` carries the directory's seal_unilateral_too_early countdown so the
   // close result can tell the operator WHEN a unilateral seal becomes available.
-  type UnilateralResult = { ok: true; sealedRootHex: string } | { ok: false; reason: string; remainingSeconds?: number };
+  // M8B FINDING-3 (cascade-2): a successful unilateral seal now carries the legibility certificate
+  // (normalized, JSON-safe) so cello_close_session returns it inline — the same RESPONSE SHAPE as the
+  // bilateral close (not cryptographic parity: this cert is directory-attested, see FINDING-5). undefined
+  // when the directory shipped none (a pre-cascade-2 directory): the seal still completes, but no
+  // retrievable receipt is produced (the pre-fix behavior).
+  type UnilateralResult = { ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number };
   const pendingUnilateralWaiters = new Map<string, (r: UnilateralResult) => void>();
 
   // SESSION-002: per-agent listener for the unilateral certificate. Verifies the FROST
@@ -1969,8 +1974,40 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           return;
         }
         logger.info("session.unilateral.certificate.verified", { sessionId: sidHex, signatureType: sigType, party: "present" });
+
+        // M8B FINDING-3 (cascade-2): normalise + PERSIST the legibility certificate the directory
+        // now ships on this frame — the SAME store the bilateral session_sealed handler writes
+        // (recordSealCertificate → read back by cello_get_sealed_receipt). Without this a unilateral
+        // close returned ok+root but sealed_receipt_not_found forever: the whole point of sealing
+        // when your counterparty vanished is walking away with a DURABLE, RETRIEVABLE receipt.
+        // Persist BEFORE destroying the node (bilateral ordering) so the sessions row still exists
+        // for the UPDATE. undefined legibility (a pre-cascade-2 directory) → nothing persisted; the
+        // seal still completes — surfaced loudly so this can never masquerade as a produced receipt.
+        const rootHex = Buffer.from(sealedRoot).toString("hex");
+        const legibility = normalizeLegibility(frame["legibility"]);
+        if (legibility !== undefined) {
+          try {
+            sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
+            logger.info("session.unilateral.receipt.persisted", {
+              sessionId: sidHex,
+              sealedRoot: rootHex,
+              finalMessageAnswered:
+                legibility && typeof legibility === "object" && "final_message" in legibility
+                  ? (legibility as { final_message?: { answered?: boolean } }).final_message?.answered
+                  : undefined,
+            });
+          } catch (error) {
+            logger.warn("seal.certificate.persist.failed", {
+              sessionId: sidHex,
+              reason: error instanceof Error ? error.message : String(error),
+            });
+          }
+        } else {
+          // The seal is valid, but no receipt is retrievable — a directory that predates cascade-2.
+          logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
+        }
         void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
-        waiter({ ok: true, sealedRootHex: Buffer.from(sealedRoot).toString("hex") });
+        waiter({ ok: true, sealedRootHex: rootHex, legibility });
       })();
     });
   }
@@ -2545,7 +2582,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         pendingUnilateralWaiters.delete(sessionId);
         if (uniResult.ok) {
           logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
-          return { ok: true, sealed_root: uniResult.sealedRootHex, seal_type: "unilateral" };
+          // M8B FINDING-3 (cascade-2): return the legibility certificate inline — same shape as the
+          // bilateral close (AC-006) — so the operator gets the receipt on the surface that proves
+          // the seal, not just a bare root. It is also persisted (above) for cello_get_sealed_receipt.
+          return {
+            ok: true,
+            sealed_root: uniResult.sealedRootHex,
+            seal_type: "unilateral",
+            ...(uniResult.legibility !== undefined ? { legibility: uniResult.legibility } : {}),
+          };
         }
         if (uniResult.reason === "seal_unilateral_too_early") {
           // F20: tell the operator WHEN the unilateral seal becomes available, not just "later".
