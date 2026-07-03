@@ -63,6 +63,9 @@ export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./cont
 // M7-MANIFEST-001: consortium manifest verification and root key constants
 export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
 export { canonicalManifestBody, verifyManifest } from "./manifest.js";
+// M8B-PREAUTH-CAP: signed pre-authorization capability (replaces the opaque single-use token).
+export type { PreAuthCapability, PreAuthCapabilityBody, CapabilityVerifyResult, CapabilityVerifyReason } from "./preauth-capability.js";
+export { canonicalCapabilityBody, signCapability, verifyCapability } from "./preauth-capability.js";
 export {
   CONSORTIUM_ROOT_KEYS,
   CONSORTIUM_THRESHOLD,
