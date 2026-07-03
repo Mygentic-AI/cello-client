@@ -83,3 +83,40 @@ export class FileManifestProvider implements IManifestProvider {
     this.#manifest = manifest;
   }
 }
+
+/**
+ * EmbeddedManifestProvider — the production provider for the COMPILED-IN consortium roster
+ * (FINDING-4). Identical trust gate to FileManifestProvider (threshold officer-signature
+ * verification via `verifyManifest`, rejects an empty node set) but the manifest is an in-memory
+ * constant compiled into the client rather than a file on disk. This is what the daemon wires by
+ * default (no CELLO_CONSORTIUM_MANIFEST override), so the roster and step-6 directory-auth anchor
+ * are always present — they cannot be lost by a missing package file or a skipped build-copy step,
+ * and a corrupt/mis-signed embedded manifest fails CLOSED at load (ADV-002) rather than silently
+ * degrading. Expiry / version monotonicity remain the daemon's policy layer, exactly as for
+ * FileManifestProvider (see that class's note) — this provider does structure + signatures only.
+ */
+export class EmbeddedManifestProvider implements IManifestProvider {
+  readonly #input: ConsortiumManifestInput;
+  #manifest: ConsortiumManifest | null = null;
+
+  constructor(input: ConsortiumManifestInput) {
+    this.#input = input;
+  }
+
+  loadAndVerify(rootKeys: readonly string[], threshold: number): Promise<ConsortiumManifest> {
+    const result = verifyManifest(this.#input, rootKeys, threshold);
+    if (!result.ok) {
+      return Promise.reject(new ManifestLoadError("manifest_signature_invalid", result.detail));
+    }
+    this.#manifest = this.#input as unknown as ConsortiumManifest;
+    return Promise.resolve(this.#manifest);
+  }
+
+  getCurrentManifest(): ConsortiumManifest | null {
+    return this.#manifest;
+  }
+
+  updateManifest(manifest: ConsortiumManifest): void {
+    this.#manifest = manifest;
+  }
+}
