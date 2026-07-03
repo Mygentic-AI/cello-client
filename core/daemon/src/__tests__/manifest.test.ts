@@ -292,7 +292,7 @@ describe("AC-004: startDaemon manifest loading at startup", () => {
 
       expect(manifestProvider.getCurrentManifest()?.version).toBe(2);
       expect(await versionStore.getLastSeenVersion()).toBe(2);
-      const success = logger.events.find((e) => e.event === "manifest.http.poll.success");
+      const success = logger.events.find((e) => e.event === "directory.auth.manifest.poll.success");
       expect(success).toBeDefined();
       expect(success?.context.newVersion).toBe(2);
     } finally {

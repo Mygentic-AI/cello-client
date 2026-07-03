@@ -79,6 +79,11 @@ export async function pollManifestOverHttp(
   } = opts;
   const manifestUrl = `${directoryUrl.replace(/\/$/, "")}/manifest`;
 
+  // DOD-AUTH-2 observability: announce each poll dispatch (domain.noun.verb taxonomy, matching the
+  // manifest LOAD events `directory.auth.manifest.*`). Lets an operator/alarm see the daemon is
+  // actively polling even when every poll is a no-op (already-current) or a transient failure.
+  logger.info("directory.auth.manifest.poll.dispatched", { directoryUrl, correlationId });
+
   // 1. Fetch. Any network error / non-200 / timeout → unreachable. DB-001: the caller
   //    keeps the cached manifest; a poll failure never disturbs agent connections.
   let raw: unknown;
@@ -92,12 +97,12 @@ export async function pollManifestOverHttp(
       clearTimeout(timer);
     }
     if (!resp.ok) {
-      logger.warn("manifest.http.poll.failed", { reason: "manifest_http_unreachable", status: resp.status, directoryUrl, correlationId });
+      logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_http_unreachable", status: resp.status, directoryUrl, correlationId });
       return { ok: false, reason: "manifest_http_unreachable" };
     }
     raw = await resp.json();
   } catch (err: unknown) {
-    logger.warn("manifest.http.poll.failed", { reason: "manifest_http_unreachable", directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_http_unreachable", directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
     return { ok: false, reason: "manifest_http_unreachable" };
   }
 
@@ -108,7 +113,7 @@ export async function pollManifestOverHttp(
     !Array.isArray((manifest as { nodes?: unknown })?.nodes) ||
     !Array.isArray((manifest as { signatures?: unknown })?.signatures)
   ) {
-    logger.warn("manifest.http.poll.failed", { reason: "manifest_malformed", directoryUrl, correlationId });
+    logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_malformed", directoryUrl, correlationId });
     return { ok: false, reason: "manifest_malformed" };
   }
 
@@ -116,24 +121,26 @@ export async function pollManifestOverHttp(
   //    accept an unsigned manifest at threshold 0). The composition root rejects
   //    threshold < 1 before wiring, but guard the policy directly too.
   if (threshold < 1) {
-    logger.error("manifest.http.poll.failed", { reason: "manifest_threshold_invalid", threshold, correlationId });
+    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_threshold_invalid", threshold, correlationId });
     return { ok: false, reason: "manifest_threshold_invalid" };
   }
 
   // 4. Threshold signature (RFC 8032) against locally-pinned root keys.
   const verifyResult = verifyManifest(manifest as unknown as ConsortiumManifestInput, rootKeys, threshold);
   if (!verifyResult.ok) {
-    logger.warn("manifest.http.poll.failed", { reason: "manifest_signature_invalid", manifestVersion: manifest.version, detail: verifyResult.reason, correlationId });
+    // Distinct security event (a rogue/compromised directory served a forged manifest) — kept as its
+    // own name so alarms can key on it separately from ordinary poll failures. DOD-AUTH-2.
+    logger.warn("directory.auth.manifest.signature.invalid", { reason: "manifest_signature_invalid", manifestVersion: manifest.version, detail: verifyResult.reason, correlationId });
     return { ok: false, reason: "manifest_signature_invalid" };
   }
 
   // 5. Validity window.
   if (now < new Date(manifest.not_before)) {
-    logger.warn("manifest.http.poll.failed", { reason: "manifest_not_yet_valid", manifestVersion: manifest.version, notBefore: manifest.not_before, correlationId });
+    logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_not_yet_valid", manifestVersion: manifest.version, notBefore: manifest.not_before, correlationId });
     return { ok: false, reason: "manifest_not_yet_valid" };
   }
   if (new Date(manifest.expires) <= now) {
-    logger.error("manifest.http.poll.failed", { reason: "manifest_expired", manifestVersion: manifest.version, expiresAt: manifest.expires, correlationId });
+    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_expired", manifestVersion: manifest.version, expiresAt: manifest.expires, correlationId });
     return { ok: false, reason: "manifest_expired" };
   }
 
@@ -144,7 +151,7 @@ export async function pollManifestOverHttp(
   try {
     const lastSeen = await manifestVersionStore.getLastSeenVersion();
     if (lastSeen !== null && manifest.version < lastSeen) {
-      logger.warn("manifest.http.poll.failed", { reason: "manifest_version_rollback", manifestVersion: manifest.version, lastSeenVersion: lastSeen, correlationId });
+      logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_version_rollback", manifestVersion: manifest.version, lastSeenVersion: lastSeen, correlationId });
       return { ok: false, reason: "manifest_version_rollback" };
     }
     if (lastSeen !== null && manifest.version === lastSeen) {
@@ -154,10 +161,10 @@ export async function pollManifestOverHttp(
     const oldVersion = manifestProvider.getCurrentManifest()?.version ?? null;
     manifestProvider.updateManifest(manifest);
     await manifestVersionStore.persistVersion(manifest.version);
-    logger.info("manifest.http.poll.success", { oldVersion, newVersion: manifest.version, directoryUrl, correlationId });
+    logger.info("directory.auth.manifest.poll.success", { oldVersion, newVersion: manifest.version, directoryUrl, correlationId });
     return { ok: true, adopted: true, oldVersion, newVersion: manifest.version };
   } catch (err: unknown) {
-    logger.error("manifest.http.poll.failed", { reason: "manifest_store_error", manifestVersion: manifest.version, directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_store_error", manifestVersion: manifest.version, directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
     return { ok: false, reason: "manifest_store_error" };
   }
 }
@@ -194,7 +201,7 @@ export function startHttpManifestPoll(
       // pollManifestOverHttp is designed never to throw (all failures return a reason). If it ever
       // does, LOG it (never swallow silently — that would hide a permanently-disabled poll) and let
       // the loop self-heal by re-arming below.
-      logger.error("manifest.http.poll.failed", { reason: "manifest_poll_unexpected_error", directoryUrl, error: err instanceof Error ? err.message : String(err) });
+      logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_poll_unexpected_error", directoryUrl, error: err instanceof Error ? err.message : String(err) });
     });
     if (!stopped) scheduler.scheduleNext(tick);
   };
