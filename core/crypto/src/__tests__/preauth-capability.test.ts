@@ -13,6 +13,8 @@ import {
   canonicalCapabilityBody,
   signCapability,
   verifyCapability,
+  encodeCapability,
+  decodeCapability,
   type PreAuthCapabilityBody,
 } from "../preauth-capability.js";
 
@@ -116,5 +118,23 @@ describe("signCapability / verifyCapability", () => {
     const { kp } = await issuer();
     const cap = await signCapability(BASE_BODY, kp);
     expect(verifyCapability(cap, "nothex", WITHIN).ok).toBe(false);
+  });
+});
+
+describe("encodeCapability / decodeCapability", () => {
+  it("round-trips a capability and the decoded copy still verifies", async () => {
+    const { kp, pub } = await issuer();
+    const cap = await signCapability(BASE_BODY, kp);
+    const blob = encodeCapability(cap);
+    expect(blob).toMatch(/^[A-Za-z0-9_-]+$/); // base64url, CLI/URL-safe
+    const decoded = decodeCapability(blob);
+    expect(decoded).toEqual(cap);
+    expect(verifyCapability(decoded!, pub, WITHIN)).toEqual({ ok: true });
+  });
+
+  it("returns null for a non-base64url / non-JSON blob without throwing", () => {
+    expect(decodeCapability("!!!not-base64!!!")).toBeNull();
+    expect(decodeCapability(Buffer.from("not json", "utf8").toString("base64url"))).toBeNull();
+    expect(decodeCapability(Buffer.from("42", "utf8").toString("base64url"))).toBeNull();
   });
 });

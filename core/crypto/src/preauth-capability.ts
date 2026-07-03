@@ -80,6 +80,25 @@ function sortedReplacer(_key: string, value: unknown): unknown {
   return value;
 }
 
+/**
+ * Serialize a capability for transport and CLI: base64url of its JSON. Carried in the existing
+ * round-1 `preAuthToken` string field (no wire-schema change) and pasted into `cello register`.
+ */
+export function encodeCapability(cap: PreAuthCapability): string {
+  return Buffer.from(JSON.stringify(cap), "utf8").toString("base64url");
+}
+
+/** Parse a serialized capability blob; null if it is not valid base64url JSON (verify validates shape). */
+export function decodeCapability(blob: string): PreAuthCapability | null {
+  try {
+    const obj: unknown = JSON.parse(Buffer.from(blob, "base64url").toString("utf8"));
+    if (obj === null || typeof obj !== "object") return null;
+    return obj as PreAuthCapability;
+  } catch {
+    return null;
+  }
+}
+
 /** Sign a capability body with the issuer's Ed25519 key, returning the full capability with `sig` (hex). */
 export async function signCapability(
   body: PreAuthCapabilityBody,
