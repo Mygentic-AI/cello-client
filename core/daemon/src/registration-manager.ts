@@ -269,27 +269,19 @@ export class RegistrationManager {
     const roster = this.#ctx.getConsortiumEndpoints();
     let directoryNodes: NetworkDirectoryNode[];
     if (roster !== null) {
-      // M8B quorum: the directory picked the DKG quorum Q (dkg_ready.quorum_node_ids) from the nodeIds
-      // we reported reachable, requiring |Q| ≥ T = majority(N). We fan the DKG to EXACTLY Q — filter our
-      // roster to those nodeIds. `participants` (from dkg_ready) == |Q|. The directory already excluded
-      // nodes we can't reach from Q, so our resolved quorum must match `participants` exactly — a
-      // mismatch (a node the directory put in Q that we can no longer reach, or a version skew) ⇒ REFUSE
-      // rather than DKG a partial/divergent set. Back-compat: an older directory sends no
-      // quorum_node_ids → fall back to the full-roster == participants (all-N) check.
-      const quorumNodeIds = dkgReadyFrame["quorum_node_ids"] as string[] | undefined;
-      const quorumRoster =
-        quorumNodeIds !== undefined
-          ? roster.filter((ep) => quorumNodeIds.includes(ep.nodeId))
-          : roster;
-      if (quorumRoster.length !== participants) {
+      // M8B quorum: the directory set `participants` = |Q| = |R ∩ manifest| from the reachable_node_ids
+      // we reported. Our resolved roster IS Q (Q = R ∩ manifest, and R = our roster), so we fan the DKG
+      // to it directly. The count must still agree: roster.length !== participants ⇒ a node we reported
+      // is now unreachable, or a manifest version skew ⇒ REFUSE rather than DKG a divergent set.
+      // (Replaces the old all-N check — `participants` is now the quorum size, not the full manifest N.)
+      if (roster.length !== participants) {
         this.#ctx.logger.warn("registration.dkg.quorum_mismatch", {
-          resolvedQuorum: quorumRoster.length,
+          resolvedRoster: roster.length,
           declaredParticipants: participants,
-          quorumProvided: quorumNodeIds !== undefined,
         });
         return { error: "dkg_below_threshold" };
       }
-      directoryNodes = quorumRoster.map(
+      directoryNodes = roster.map(
         (ep) =>
           new NetworkDirectoryNode({
             id: ep.peerId,

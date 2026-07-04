@@ -98,17 +98,16 @@ export interface DkgReady {
   type: "dkg_ready";
   /** Epoch ID for this DKG instance: "${k_local_pubkey}:epoch:1" */
   epochId: string;
-  /** Total number of participants in this DKG instance (directory nodes = Q; total = Q + 1 client) */
-  participants: number;
-  /** Minimum threshold for signing */
-  threshold: number;
   /**
-   * M8B quorum registration: the directory-selected quorum Q — the nodeIds the client must fan the DKG
-   * to (subset of the client's reachable_node_ids ∩ the directory's manifest, |Q| == `participants`,
-   * |Q| ≥ threshold). The client filters its roster to entries whose nodeId ∈ Q and dials them by their
-   * local peerId/multiaddr. Absent on the single-node back-compat path (client uses its full roster).
+   * M8B quorum: the size of the DKG quorum Q the directory picked (directory nodes = |Q|; total FROST
+   * participants = |Q| + 1 client). The directory sets this to |R ∩ manifest| from the client's
+   * `reachable_node_ids`. The client already knows Q's identities (Q == its resolved roster), so only the
+   * count crosses the wire — the client validates `roster.length === participants` (which also catches
+   * manifest version skew) before fanning the DKG.
    */
-  quorum_node_ids?: string[];
+  participants: number;
+  /** Minimum threshold for signing (T = majority(N) = floor(N/2)+1, counts the client). */
+  threshold: number;
 }
 
 /**
