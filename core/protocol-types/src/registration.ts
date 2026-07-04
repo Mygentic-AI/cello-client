@@ -66,6 +66,13 @@ export interface RegisterRequest {
   k_local_pubkey: string;
   /** Hex-encoded ML-DSA-44 public key (1312 bytes, NIST FIPS 204) */
   ml_dsa_pubkey: string;
+  /**
+   * M8B quorum registration: nodeIds (stable manifest labels, e.g. "us-east-1") of the consortium
+   * directory nodes the client resolved / can reach right now (its live roster). The directory picks the
+   * DKG quorum Q from this set ∩ its own signed manifest, requiring |Q| ≥ T = majority(N) = floor(N/2)+1.
+   * Absent on the single-node back-compat path (no manifest).
+   */
+  reachable_node_ids?: string[];
 }
 
 /**
@@ -91,10 +98,17 @@ export interface DkgReady {
   type: "dkg_ready";
   /** Epoch ID for this DKG instance: "${k_local_pubkey}:epoch:1" */
   epochId: string;
-  /** Total number of participants in this DKG instance */
+  /** Total number of participants in this DKG instance (directory nodes = Q; total = Q + 1 client) */
   participants: number;
   /** Minimum threshold for signing */
   threshold: number;
+  /**
+   * M8B quorum registration: the directory-selected quorum Q — the nodeIds the client must fan the DKG
+   * to (subset of the client's reachable_node_ids ∩ the directory's manifest, |Q| == `participants`,
+   * |Q| ≥ threshold). The client filters its roster to entries whose nodeId ∈ Q and dials them by their
+   * local peerId/multiaddr. Absent on the single-node back-compat path (client uses its full roster).
+   */
+  quorum_node_ids?: string[];
 }
 
 /**
