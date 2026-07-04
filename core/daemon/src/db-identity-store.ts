@@ -60,6 +60,9 @@ const CREATE_AGENTS_SQL = `
     frost_commitments      BLOB,
     frost_verifying_shares BLOB,
     frost_dkg_method       TEXT,
+    -- M8B quorum: JSON array of the directory nodeIds (Q) the DKG ran among, so a restored signer
+    -- targets the actual share-holders (not the full live roster). NULL for pre-quorum agents.
+    frost_directory_node_ids TEXT,
     -- registration record (was registration-state.json).
     reg_agent_id           TEXT,
     reg_primary_pubkey     TEXT,
@@ -148,6 +151,10 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
   } else if (!cols.some((c) => c.name === "agent_id")) {
     // A pre-REMOVE-001 table exists (agent_name PK). Re-key it once to the stable-agent_id shape.
     rebuildAgentsToAgentIdPk(db);
+  } else if (!cols.some((c) => c.name === "frost_directory_node_ids")) {
+    // M8B quorum: additive column on an existing agent_id table (fresh/rebuilt tables already have it
+    // via CREATE_AGENTS_SQL). Nullable → pre-quorum agents keep the full-roster fallback; no data touched.
+    db.exec("ALTER TABLE agents ADD COLUMN frost_directory_node_ids TEXT");
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
   db.exec(CREATE_TRUST_SIGNALS_SQL);
@@ -383,12 +390,14 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     commitmentsCbor: Uint8Array;
     verifyingSharesCbor: Uint8Array;
     dkgMethod: "trusted_dealer" | "network_dkg";
+    /** M8B quorum: the directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
+    directoryNodeIds?: string[];
   }): Promise<void> {
     // SI-001: signingShare is written to the encrypted DB only — never logged.
     this.#updateRow(
       `frost_epoch_id = ?, frost_primary_pubkey = ?, frost_identifier = ?, frost_signing_share = ?,
        frost_threshold = ?, frost_participants = ?, frost_commitments = ?, frost_verifying_shares = ?,
-       frost_dkg_method = ?`,
+       frost_dkg_method = ?, frost_directory_node_ids = ?`,
       [
         opts.epochId,
         opts.primaryPubkey,
@@ -399,6 +408,7 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
         toBuf(opts.commitmentsCbor),
         toBuf(opts.verifyingSharesCbor),
         opts.dkgMethod,
+        opts.directoryNodeIds ? JSON.stringify(opts.directoryNodeIds) : null,
       ],
     );
     this.#logger.info("registration.frost.share.persisted", {
@@ -453,6 +463,18 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
   async loadActiveFrostKeyShare(): Promise<FrostKeyShareRecord | null> {
     const r = this.#row();
     if (!r || r["frost_signing_share"] == null) return null;
+    // M8B quorum: the DKG's quorum Q (nodeIds). NULL for pre-quorum agents → undefined → seal falls
+    // back to the full roster. Defensive parse: malformed data must not break share loading.
+    let directoryNodeIds: string[] | undefined;
+    const rawIds = r["frost_directory_node_ids"];
+    if (rawIds != null) {
+      try {
+        const parsed = JSON.parse(String(rawIds)) as unknown;
+        if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+          directoryNodeIds = parsed as string[];
+        }
+      } catch { /* malformed → full-roster fallback */ }
+    }
     return {
       epochId: String(r["frost_epoch_id"]),
       primaryPubkey: String(r["frost_primary_pubkey"]),
@@ -463,6 +485,7 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       commitmentsCbor: toBytes(r["frost_commitments"]),
       verifyingSharesCbor: toBytes(r["frost_verifying_shares"]),
       dkgMethod: String(r["frost_dkg_method"]),
+      directoryNodeIds,
     };
   }
 

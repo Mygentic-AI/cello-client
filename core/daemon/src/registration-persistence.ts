@@ -47,6 +47,8 @@ export interface FrostKeyShareRecord {
   commitmentsCbor: Uint8Array;
   verifyingSharesCbor: Uint8Array;
   dkgMethod: string;
+  /** M8B quorum: the directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
+  directoryNodeIds?: string[];
 }
 
 /**
@@ -84,6 +86,8 @@ export interface DaemonRegistrationPersistence {
     commitmentsCbor: Uint8Array;
     verifyingSharesCbor: Uint8Array;
     dkgMethod: "trusted_dealer" | "network_dkg";
+    /** M8B quorum: the directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
+    directoryNodeIds?: string[];
   }): Promise<void>;
 
   loadRegistrationState(): Promise<RegistrationStateRecord | null>;
@@ -180,6 +184,8 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     commitmentsCbor: Uint8Array;
     verifyingSharesCbor: Uint8Array;
     dkgMethod: "trusted_dealer" | "network_dkg";
+    /** M8B quorum: the directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
+    directoryNodeIds?: string[];
   }): Promise<void> {
     // A daemon agent holds exactly one active FROST share; a new DKG replaces it.
     await this.#writeJsonAtomic(FILE_FROST_SHARE, {
@@ -192,6 +198,7 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       commitmentsCbor: hex(opts.commitmentsCbor),
       verifyingSharesCbor: hex(opts.verifyingSharesCbor),
       dkgMethod: opts.dkgMethod,
+      directoryNodeIds: opts.directoryNodeIds,
     });
     // SI-001: signingShare MUST NOT appear in this event.
     this.#logger.info("registration.frost.share.persisted", {

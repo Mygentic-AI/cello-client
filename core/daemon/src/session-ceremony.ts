@@ -188,8 +188,16 @@ async function hydrateShareAndStubs(
     return stub;
   };
   if (node && roster !== null && roster.length > 0) {
-    // Consortium configured → one stub per resolved directory node (T-of-N signing).
-    directoryNodeStubs = roster.map((ep) => mkStub(ep.peerId, ep.multiaddr));
+    // M8B quorum: filter the live roster to the SHARE-HOLDER quorum Q the agent registered with
+    // (share.directoryNodeIds), so the seal targets holders — not nodes that came back online after a
+    // quorum registration but hold NO share for this agent (they'd pad the count via isReachable()===true
+    // and burn the retry budget). Absent Q (pre-quorum agent / single-node) → full roster (unchanged
+    // DOD-SIGN-1). Defensive: if every Q node has vanished from the roster, fall back to the full roster
+    // rather than an empty signer set (the ceremony's own below-threshold pre-check then applies).
+    const q = share.directoryNodeIds;
+    const filtered = q && q.length > 0 ? roster.filter((ep) => q.includes(ep.nodeId)) : roster;
+    const holders = filtered.length > 0 ? filtered : roster;
+    directoryNodeStubs = holders.map((ep) => mkStub(ep.peerId, ep.multiaddr));
   } else if (node) {
     // No consortium manifest (roster null) or a configured manifest that resolved EMPTY → the single
     // primary endpoint. INTENTIONAL asymmetry with DKG-1 (which REFUSES a configured-but-empty roster

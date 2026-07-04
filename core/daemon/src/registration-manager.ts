@@ -334,6 +334,9 @@ export class RegistrationManager {
           commitmentsCbor: CBOR_ENC.encode(dkgResult.commitments) as Uint8Array,
           verifyingSharesCbor: CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array,
           dkgMethod: "network_dkg",
+          // M8B quorum: persist the quorum Q (nodeIds the DKG ran among) so a restored signer targets the
+          // actual share-holders, not the full live roster. null on the single-node back-compat path.
+          directoryNodeIds: roster ? roster.map((e) => e.nodeId) : undefined,
         };
       }
     } catch {
