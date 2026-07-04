@@ -185,11 +185,17 @@ export class RegistrationManager {
     const kLocalPubkeyHex = this.#ctx.getMyPubkeyHex()!;
 
     // Step 5: send register_request (SignalingManager CBOR/lp-encodes the frame)
+    // M8B quorum: include the nodeIds we can reach right now (our resolved roster) so the directory can
+    // pick the DKG quorum Q = these ∩ its manifest, |Q| ≥ T=majority(N). getConsortiumEndpoints() is
+    // null on the single-node back-compat path (no consortium manifest) → omit the field.
+    const reachableRoster = this.#ctx.getConsortiumEndpoints();
+    const reachableNodeIds = reachableRoster?.map((e) => e.nodeId);
     const regSent = await this.#ctx.sendSignalingFrame({
       type: "register_request",
       phone_stub: phoneStub,
       k_local_pubkey: kLocalPubkeyHex,
       ml_dsa_pubkey: mlDsaPubkeyHex,
+      ...(reachableNodeIds ? { reachable_node_ids: reachableNodeIds } : {}),
     });
     if (!regSent.ok) {
       return { error: regSent.reason ?? "directory_unreachable" };
@@ -263,24 +269,27 @@ export class RegistrationManager {
     const roster = this.#ctx.getConsortiumEndpoints();
     let directoryNodes: NetworkDirectoryNode[];
     if (roster !== null) {
-      // A consortium manifest is configured → multi-node DKG. FROST DKG (key generation) needs
-      // ALL N declared nodes present — a node absent DURING DKG receives no share, yielding a
-      // smaller/different consortium. `participants` is the N the directory derived from its OWN
-      // verified manifest (topology consensus); the resolved roster must match it EXACTLY. Fewer
-      // resolved (a node down, OR the whole consortium unreachable → roster empty) or more (a
-      // divergent/forward-skewed manifest) ⇒ REFUSE rather than silently DKG a partial/divergent
-      // consortium or downgrade to single-node. The empty case (0 !== N) is exactly what B1 fixes.
-      // NOTE (MEDIUM, parked — M8B-DECISIONS): this is a COUNT check; a same-count, different-
-      // identity manifest version skew is not caught here — closing it needs manifest-version
-      // agreement in dkg_ready. The kill-a-node tolerance is a SIGNING property (DOD-SIGN-1).
-      if (roster.length !== participants) {
-        this.#ctx.logger.warn("registration.dkg.below_threshold", {
-          resolvedNodes: roster.length,
+      // M8B quorum: the directory picked the DKG quorum Q (dkg_ready.quorum_node_ids) from the nodeIds
+      // we reported reachable, requiring |Q| ≥ T = majority(N). We fan the DKG to EXACTLY Q — filter our
+      // roster to those nodeIds. `participants` (from dkg_ready) == |Q|. The directory already excluded
+      // nodes we can't reach from Q, so our resolved quorum must match `participants` exactly — a
+      // mismatch (a node the directory put in Q that we can no longer reach, or a version skew) ⇒ REFUSE
+      // rather than DKG a partial/divergent set. Back-compat: an older directory sends no
+      // quorum_node_ids → fall back to the full-roster == participants (all-N) check.
+      const quorumNodeIds = dkgReadyFrame["quorum_node_ids"] as string[] | undefined;
+      const quorumRoster =
+        quorumNodeIds !== undefined
+          ? roster.filter((ep) => quorumNodeIds.includes(ep.nodeId))
+          : roster;
+      if (quorumRoster.length !== participants) {
+        this.#ctx.logger.warn("registration.dkg.quorum_mismatch", {
+          resolvedQuorum: quorumRoster.length,
           declaredParticipants: participants,
+          quorumProvided: quorumNodeIds !== undefined,
         });
         return { error: "dkg_below_threshold" };
       }
-      directoryNodes = roster.map(
+      directoryNodes = quorumRoster.map(
         (ep) =>
           new NetworkDirectoryNode({
             id: ep.peerId,
