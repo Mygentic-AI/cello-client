@@ -290,6 +290,10 @@ export async function runAgentRefresh(
       commitmentsCbor: encode(result.commitments),
       verifyingSharesCbor: encode(result.verifyingShares),
       dkgMethod: "network_dkg",
+      // M8B quorum: a proactive refresh re-randomizes shares among the SAME membership — carry the
+      // quorum Q forward, else this UPDATE wipes frost_directory_node_ids to NULL and the next restart's
+      // seal falls back to the full roster (reintroducing the padding/retry-budget bug the persist fixed).
+      directoryNodeIds: h.share.directoryNodeIds,
     });
   } catch (err: unknown) {
     deps.logger.error("refresh.ceremony.persist_failed", {
