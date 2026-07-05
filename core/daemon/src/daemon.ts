@@ -74,7 +74,8 @@ import {
 } from "./transport-composition.js";
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
-import { parseSessionAssignment, sessionRequestErrorReason } from "./session-assignment-parser.js";
+import { parseSessionAssignment, sessionRequestErrorReason, parseDiscoveryLookupResult, discoveryLookupErrorReason } from "./session-assignment-parser.js";
+import { classifyDiscoveryOutcome, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, checkUnilateralFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
@@ -911,6 +912,181 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // agent concurrency is unaffected (separate streams). A directory-side echoed request id
   // would allow true concurrency later; this is the correct minimum.
   const negotiationInProgress = new Set<string>();
+
+  // ─── Cross-node session establishment (Story B, item 2) ──────────────────────
+  // Helpers the negotiator composes: discover the target's home from replicated presence, then run
+  // the session_request over the RIGHT connection — the existing home stream when same-node, or a
+  // transient VISITING connection into the target's home node when cross-node. Directories never talk
+  // to each other; the client spans nodes on demand.
+
+  const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+  /** Issue a discovery_lookup on `signaling` and await the 3-state answer (bounded). */
+  async function runDiscoveryLookup(
+    signaling: SignalingManager,
+    targetHex: string,
+    timeoutMs: number,
+  ): Promise<DiscoveryOutcome> {
+    let resolveFrame!: (f: Record<string, unknown>) => void;
+    const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+    const unregister = signaling.registerInboundHandler((frame) => {
+      const t = frame["type"];
+      if (t === "discovery_lookup_result" || t === "discovery_lookup_error") resolveFrame(frame);
+    });
+    try {
+      const sent = await signaling.sendRaw({
+        type: "discovery_lookup",
+        target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
+      });
+      if (!sent.ok) return { kind: "unsupported" };
+      let timer!: ReturnType<typeof setTimeout>;
+      const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs); });
+      const frame = await Promise.race([pending, timeoutP]);
+      clearTimeout(timer);
+      // Old directory: never answers a discovery_lookup it doesn't understand → treat as unavailable
+      // and fall back to today's local-only behavior (rollout compat, per the design's sequencing).
+      if (frame["type"] === "__timeout__") return { kind: "unsupported" };
+      if (frame["type"] === "discovery_lookup_error") {
+        discoveryLookupErrorReason(frame); // stable code; a DB hiccup is retryable, not authoritative
+        return { kind: "error" };
+      }
+      const parsed = parseDiscoveryLookupResult(frame);
+      if (!parsed) return { kind: "error" };
+      return { kind: "result", state: parsed.state, owningNodeIds: parsed.owningNodeIds };
+    } finally {
+      unregister();
+    }
+  }
+
+  /** Send a session_request over `signaling` and await the assignment / error (the extracted core). */
+  async function runSessionRequestOverSignaling(
+    signaling: SignalingManager,
+    targetHex: string,
+    sr: { peerId: string; addrs: string[] },
+    correlationId: string,
+    agentName: string,
+  ): Promise<SessionNegotiationResult> {
+    let resolveFrame!: (f: Record<string, unknown>) => void;
+    const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+    const unregister = signaling.registerInboundHandler((frame) => {
+      const t = frame["type"];
+      if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
+    });
+    try {
+      const sent = await signaling.sendRaw({
+        type: "session_request",
+        target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
+        initiator_session_peer_id: sr.peerId,
+        initiator_session_addrs: sr.addrs,
+        wants_session_offer: true,
+      });
+      if (!sent.ok) {
+        return { ok: false, reason: sent.reason ?? "directory_unreachable", guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream." };
+      }
+      let timer!: ReturnType<typeof setTimeout>;
+      const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), 30_000); });
+      const frame = await Promise.race([pending, timeoutP]);
+      clearTimeout(timer);
+      if (frame["type"] === "__timeout__") {
+        return { ok: false, reason: "timeout", guidance: "The directory did not return a session assignment within 30s. Retry once cello status shows directory_signaling connected." };
+      }
+      if (frame["type"] === "session_request_error") {
+        const reason = sessionRequestErrorReason(frame);
+        return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
+      }
+      const raw = frame["assignment"] as Record<string, unknown> | undefined;
+      const assignment = raw ? parseSessionAssignment(raw) : null;
+      if (!assignment) {
+        return { ok: false, reason: "assignment_parse_failed", guidance: "The directory's session_assignment was missing or malformed." };
+      }
+      logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type });
+      return { ok: true, assignment };
+    } finally {
+      unregister();
+    }
+  }
+
+  /**
+   * Open a transient VISITING signaling connection into a specific directory node (the target's home)
+   * and wire ONLY what a cross-node initiator needs there: the delegated-signer ceremony handler (the
+   * broker asks the initiator to co-sign the assignment over THIS connection). Seal + inbound handlers
+   * are NOT wired — the seal is client-coordinated over the agent's own roster, and this connection is
+   * initiator-only and transient. Caller MUST stop() it after the assignment arrives.
+   */
+  function openVisitingConnection(
+    agentName: string,
+    agentKeyProvider: import("@cello-protocol/crypto").KeyProvider,
+    agentPubkeyHex: string,
+    endpoint: DirectoryEndpoint,
+    correlationId: string,
+    nodeId: string,
+  ): { mgr: SignalingManager; stop: (reason: string) => Promise<void> } {
+    let nodeRef: CelloNode | null = null;
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => endpoint,
+      getAuthIdentity: () => ({ keyProvider: agentKeyProvider, pubkeyHex: agentPubkeyHex }),
+      logger,
+      challengeVerifier,
+      getManifestVersion: () => verifiedManifestVersion,
+      visiting: true, // cross-node item 3: the directory must NOT write presence for this connection
+      publishNode: (n) => { nodeRef = n; },
+    });
+    // maxReconnectAttempts: 1 — a transient connection should fail fast, not reconnect-loop forever.
+    const mgr = new SignalingManager({ connect, logger, maxReconnectAttempts: 1, maxBackoffMs: 3_000 });
+    wireSessionCeremonyHandler({
+      agentName,
+      persistence: getPersistence(agentName),
+      agentPubkeyHex,
+      getNode: () => nodeRef,
+      getDirectoryEndpoint: getFailoverEndpoint,
+      getConsortiumEndpoints: resolveConsortiumRoster,
+      signaling: mgr,
+      logger,
+    });
+    logger.info("signaling.visiting.connected", { agentName, node: nodeId, correlationId });
+    return {
+      mgr,
+      stop: async (reason: string) => {
+        logger.info("signaling.visiting.released", { agentName, node: nodeId, reason, correlationId });
+        await mgr.stop();
+      },
+    };
+  }
+
+  /**
+   * Resolve `owningNodeId` through the signed manifest and run the session_request over a transient
+   * visiting connection there. A node id that doesn't resolve in the roster is a hard error
+   * (discovery_node_unresolvable) — never a dial to an unvalidated endpoint.
+   */
+  async function runCrossNodeSetup(
+    agentName: string,
+    agentKeyProvider: import("@cello-protocol/crypto").KeyProvider,
+    agentPubkeyHex: string,
+    owningNodeId: string,
+    targetHex: string,
+    sr: { peerId: string; addrs: string[] },
+    correlationId: string,
+  ): Promise<SessionNegotiationResult> {
+    const roster = await resolveConsortiumRoster();
+    const target = roster?.find((e) => e.nodeId === owningNodeId) ?? null;
+    if (!target) {
+      logger.warn("session.crossnode.node_unresolvable", { agentName, owningNodeId, correlationId });
+      return { ok: false, reason: "discovery_node_unresolvable", guidance: `The counterparty's home node (${owningNodeId}) could not be resolved in the signed consortium manifest. It may have left the consortium; retry.` };
+    }
+    logger.info("session.crossnode.initiated", { agentName, brokerNode: owningNodeId, correlationId });
+    const visiting = openVisitingConnection(agentName, agentKeyProvider, agentPubkeyHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, owningNodeId);
+    try {
+      if (!(await waitForSignalingConnected(visiting.mgr, 10_000))) {
+        return { ok: false, reason: "discovery_node_unresolvable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
+      }
+      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName);
+      if (result.ok) logger.info("session.crossnode.established", { agentName, brokerNode: owningNodeId, correlationId });
+      return result;
+    } finally {
+      await visiting.stop("handoff-complete");
+    }
+  }
+
   const resolvedSessionNegotiator: SessionNegotiator = sessionNegotiator ?? {
     negotiate: async (ctx): Promise<SessionNegotiationResult> => {
       const kp = keyProviders.get(ctx.agentName);
@@ -955,60 +1131,62 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         };
       }
 
-      // Single-flight claimed (above) → safe to register one inbound handler for this
-      // agent's reply; unregistered + slot released in finally.
+      // Single-flight claimed → the discover-first flow (one discovery + up to 3 session_request
+      // attempts, possibly over a transient visiting connection) runs under ONE slot; released in
+      // finally. A single directory-side echoed request id would allow true concurrency later.
       negotiationInProgress.add(ctx.agentName);
-      let resolveFrame!: (f: Record<string, unknown>) => void;
-      const pending = new Promise<Record<string, unknown>>((r) => {
-        resolveFrame = r;
-      });
-      const unregister = signaling.registerInboundHandler((frame) => {
-        const t = frame["type"];
-        if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
-      });
       try {
-        const sent = await signaling.sendRaw({
-          type: "session_request",
-          target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
-          initiator_session_peer_id: sr.peerId,
-          initiator_session_addrs: sr.addrs,
-          // WIRE-002 opt-in: ask the directory to run the session_offer→accept round-trip so
-          // the assignment carries the counterparty's reachable session endpoint.
-          wants_session_offer: true,
-        });
-        if (!sent.ok) {
-          return {
-            ok: false,
-            reason: sent.reason ?? "directory_unreachable",
-            guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream.",
-          };
+        // DISCOVER FIRST. Because identity + presence are fully replicated, the agent's OWN home
+        // stream answers "where is the target?" authoritatively-enough (advisory — the target node's
+        // live #streams check stays the authority; a stale answer just triggers the retry below).
+        const homeNodeId = signaling.currentDirectoryNodeId;
+        const backoffs = [1_000, 3_000]; // between attempts — covers re-home + replication lag
+        const MAX_ATTEMPTS = 3;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          const disc: DiscoveryOutcome = await runDiscoveryLookup(signaling, targetHex, 5_000);
+          const action = classifyDiscoveryOutcome(disc, homeNodeId);
+
+          // Old directory (unknown frame / no reply): fall back to today's local-only behavior on the
+          // home stream — the rollout-compat path (directories deploy before clients).
+          if (action.kind === "fallback") {
+            logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
+            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName);
+          }
+          // State 3: no such agent — a bad address, not a transient outage. NO retry (distinct code).
+          if (action.kind === "unknown_agent") {
+            return { ok: false, reason: "unknown_agent", guidance: "No agent is registered under that public key — the counterparty address is unknown. Verify the pubkey with the counterparty's operator." };
+          }
+          // State 2: known but offline. Definitive — NO retry storm.
+          if (action.kind === "offline") {
+            return { ok: false, reason: "counterparty_offline", guidance: "The counterparty exists but is not currently online. Have its operator bring it online (cello_status), then retry." };
+          }
+          // Transient: directory DB error during the lookup, or online-with-no-owner. RETRYABLE —
+          // never collapsed into an authoritative offline/unknown.
+          if (action.kind === "retry") {
+            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
+            if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
+            return { ok: false, reason: "counterparty_offline", guidance: "The directory could not resolve the counterparty's location after several attempts. Retry shortly." };
+          }
+
+          const result =
+            action.kind === "same_node"
+              // SAME-NODE: the target is on the node we're already connected to. The existing path runs
+              // unchanged — ZERO visiting connections, ZERO new frames beyond the one discovery_lookup.
+              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName)
+              // CROSS-NODE: reach into the target's home over a transient visiting connection.
+              : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId);
+
+          // Discovery said online but the broker reported target_offline (stale replicated presence, or
+          // a re-home between discovery and the request) → re-discover and retry, bounded.
+          if (!result.ok && result.reason === "target_offline") {
+            logger.info("session.crossnode.stale_discovery_retry", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
+            if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
+            return { ok: false, reason: "counterparty_offline", guidance: "The counterparty was online at discovery but not reachable at its home node after several attempts (it may be re-homing). Retry shortly." };
+          }
+          return result;
         }
-        let timer!: ReturnType<typeof setTimeout>;
-        const timeoutP = new Promise<Record<string, unknown>>((r) => {
-          timer = setTimeout(() => r({ type: "__timeout__" }), 30_000);
-        });
-        const frame = await Promise.race([pending, timeoutP]);
-        clearTimeout(timer);
-        if (frame["type"] === "__timeout__") {
-          return { ok: false, reason: "timeout", guidance: "The directory did not return a session assignment within 30s. Retry once cello status shows directory_signaling connected." };
-        }
-        if (frame["type"] === "session_request_error") {
-          const reason = sessionRequestErrorReason(frame);
-          return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
-        }
-        const raw = frame["assignment"] as Record<string, unknown> | undefined;
-        const assignment = raw ? parseSessionAssignment(raw) : null;
-        if (!assignment) {
-          return { ok: false, reason: "assignment_parse_failed", guidance: "The directory's session_assignment was missing or malformed." };
-        }
-        logger.info("session.negotiate.assignment.received", {
-          agentName: ctx.agentName,
-          correlationId: ctx.correlationId,
-          signatureType: assignment.signature_type,
-        });
-        return { ok: true, assignment };
+        return { ok: false, reason: "counterparty_offline", guidance: "Session establishment did not succeed after several attempts. Retry shortly." };
       } finally {
-        unregister();
         negotiationInProgress.delete(ctx.agentName);
       }
     },

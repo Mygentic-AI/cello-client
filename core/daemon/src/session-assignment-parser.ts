@@ -125,6 +125,37 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
  * Map a raw `session_request_error` frame's reason to a stable negotiator reason code.
  * Distinct cause → distinct code (M7 error discipline); unknown → directory_unreachable.
  */
+// ─── Cross-node discovery (Story B, item 1 client mirror) ────────────────────
+
+export interface DiscoveryLookupResultParsed {
+  state: "online" | "offline" | "unknown_agent";
+  /** Non-empty only when state = "online" (length 1 until the k>1 homing knob lands). */
+  owningNodeIds: string[];
+}
+
+/**
+ * Decode a `discovery_lookup_result` frame. Shape-validates the 3-state answer; returns null on an
+ * unrecognized state (never fabricates one). A malformed/missing owning_node_ids defaults to [] — the
+ * negotiator treats online-with-no-owner as not-actionable (retry), never dials a fabricated node.
+ */
+export function parseDiscoveryLookupResult(frame: Record<string, unknown>): DiscoveryLookupResultParsed | null {
+  const state = frame["state"];
+  if (state !== "online" && state !== "offline" && state !== "unknown_agent") return null;
+  const owningNodeIds = parseStringArray(frame["owning_node_ids"]) ?? [];
+  return { state, owningNodeIds };
+}
+
+/**
+ * Map a `discovery_lookup_error` frame's reason to a stable code. The directory returns this on a DB
+ * error during the lookup — a RETRYABLE condition, never a fabricated authoritative offline/unknown.
+ * Unknown reasons collapse to the same retryable "lookup_failed".
+ */
+export function discoveryLookupErrorReason(_frame: Record<string, unknown>): string {
+  // Only one reason today; any discovery_lookup_error is the same retryable condition. Kept as a
+  // function (not a constant) so a future reason set slots in without touching call sites.
+  return "lookup_failed";
+}
+
 export function sessionRequestErrorReason(frame: Record<string, unknown>): string {
   const reason = frame["reason"];
   const known = new Set([

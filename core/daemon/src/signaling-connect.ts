@@ -121,6 +121,15 @@ export interface SignalingConnectDeps {
    * latest reference and gates use on the signaling status being `connected`.
    */
   publishNode?: (node: CelloNode | null) => void;
+  /**
+   * Cross-node topology (item 3): mark this a VISITING connection. Set true ONLY for the transient
+   * connection a client opens into a node that is NOT its home, to broker a cross-node session. The
+   * flag rides in signaling_auth_response; the directory then gives this stream a #streams entry (so
+   * the same-node session flow sees the agent) but writes NO presence — so the transient connection
+   * never re-homes the agent or falsely marks it offline. Home connections omit it. Not signature-
+   * bound (the auth TBS is unchanged) — the flag rides the encrypted libp2p channel.
+   */
+  visiting?: boolean;
 }
 
 /**
@@ -193,6 +202,8 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
         type: "signaling_auth_response",
         pubkey: myPubkey,
         signature: sig,
+        // Cross-node item 3: only the transient visiting connection sets this; home connections omit it.
+        ...(deps.visiting ? { visiting: true } : {}),
       }) as Uint8Array;
       sigStream.send(lp.encode.single(authResponse));
 

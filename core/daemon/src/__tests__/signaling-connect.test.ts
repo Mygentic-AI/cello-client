@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { Encoder } from "cbor-x";
+import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { createSignalingConnect, type SignalingAuthIdentity } from "../signaling-connect.js";
 import type { Logger } from "../types.js";
@@ -128,6 +128,37 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
     // No step-6 verifier → directoryNodeId falls back to the endpoint peer ID.
     expect(result.directoryNodeId).toBe(PEER);
     expect(result.manifestVersion).toBe(0);
+  });
+
+  // Cross-node item 3: the visiting flag rides the auth response ONLY when deps.visiting is set.
+  it("sets visiting:true in signaling_auth_response iff deps.visiting is set", async () => {
+    async function firstSentFrame(stream: { send: { mock: { calls: unknown[][] } } }): Promise<Record<string, unknown>> {
+      const sent = stream.send.mock.calls[0][0] as { subarray?: () => Uint8Array } | Uint8Array;
+      const bytes = (sent as { subarray?: () => Uint8Array }).subarray ? (sent as { subarray: () => Uint8Array }).subarray() : (sent as Uint8Array);
+      const src = (async function* () { yield bytes; })();
+      for await (const framed of lp.decode(src)) {
+        const u = (framed as { subarray?: () => Uint8Array }).subarray ? (framed as { subarray: () => Uint8Array }).subarray() : (framed as unknown as Uint8Array);
+        return decode(u) as Record<string, unknown>;
+      }
+      throw new Error("no frame captured");
+    }
+
+    // Visiting connection → flag present.
+    {
+      const { node, stream } = makeFakeNode([encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(3) }), encodeFrame({ type: "signaling_auth_ok" })]);
+      await createSignalingConnect({ getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }), getAuthIdentity: validIdentity, logger: silentLogger, createDirectoryNode: async () => node as never, visiting: true })();
+      const authResp = await firstSentFrame(stream);
+      expect(authResp["type"]).toBe("signaling_auth_response");
+      expect(authResp["visiting"]).toBe(true);
+    }
+    // Home connection → flag omitted (backward compatible).
+    {
+      const { node, stream } = makeFakeNode([encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(4) }), encodeFrame({ type: "signaling_auth_ok" })]);
+      await createSignalingConnect({ getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }), getAuthIdentity: validIdentity, logger: silentLogger, createDirectoryNode: async () => node as never })();
+      const authResp = await firstSentFrame(stream);
+      expect(authResp["type"]).toBe("signaling_auth_response");
+      expect(authResp["visiting"]).toBeUndefined();
+    }
   });
 
   it("rejects when the first frame is not an auth challenge", async () => {

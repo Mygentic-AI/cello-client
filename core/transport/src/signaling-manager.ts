@@ -299,6 +299,17 @@ export class SignalingManager {
   }
 
   /**
+   * Cross-node topology: the directory node id this manager is currently connected to (the manifest
+   * nodeId from the step-6 signaling_auth_ok, e.g. "aws-eu-central-1"; falls back to the endpoint peer
+   * id when step-6 is not configured). null when not connected. Used for the same-node shortcut: if a
+   * discovery lookup's owning node equals this, negotiate on the existing home stream and open NO
+   * visiting connection.
+   */
+  get currentDirectoryNodeId(): string | null {
+    return this._currentDirectoryNodeId;
+  }
+
+  /**
    * M7-SESSION-001: Send a frame directly on the active signaling stream.
    * Returns ok:true when connected and send succeeded.
    * Returns ok:false with reason when not connected or send failed.
