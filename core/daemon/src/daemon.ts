@@ -75,7 +75,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason, parseDiscoveryLookupResult, discoveryLookupErrorReason } from "./session-assignment-parser.js";
-import { classifyDiscoveryOutcome, type DiscoveryOutcome } from "./cross-node-negotiation.js";
+import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, checkUnilateralFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
@@ -921,11 +921,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-  /** Issue a discovery_lookup on `signaling` and await the 3-state answer (bounded). */
+  /**
+   * Issue a discovery_lookup on `signaling` and await the 3-state answer (bounded). Distinguishes,
+   * for the caller's retry logic and truthful error surface:
+   *  - send_failed (home stream down — TRANSPORT, never "old directory"),
+   *  - timeout (no reply — old directory OR a slow/dropped reply on a new one; retry, fall back last),
+   *  - error (directory DB fault — retryable, a DIRECTORY fault, not the counterparty being offline),
+   *  - malformed (a reply that didn't parse — protocol anomaly, retryable, surfaced distinctly),
+   *  - result (the 3-state answer).
+   * Emits the mandated observability events: directory.discovery.lookup on a result,
+   * directory.discovery.lookup.failed on a directory error / malformed reply.
+   */
   async function runDiscoveryLookup(
     signaling: SignalingManager,
     targetHex: string,
     timeoutMs: number,
+    correlationId: string,
   ): Promise<DiscoveryOutcome> {
     let resolveFrame!: (f: Record<string, unknown>) => void;
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
@@ -938,20 +949,34 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         type: "discovery_lookup",
         target_pubkey: new Uint8Array(Buffer.from(targetHex, "hex")),
       });
-      if (!sent.ok) return { kind: "unsupported" };
+      if (!sent.ok) {
+        // The home stream is down — cannot look up (and today's local-only fallback would fail the
+        // same way). Surface the real transport reason, not an "old directory" misdiagnosis.
+        return { kind: "send_failed", reason: sent.reason ?? "signaling_unavailable" };
+      }
       let timer!: ReturnType<typeof setTimeout>;
       const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs); });
       const frame = await Promise.race([pending, timeoutP]);
       clearTimeout(timer);
-      // Old directory: never answers a discovery_lookup it doesn't understand → treat as unavailable
-      // and fall back to today's local-only behavior (rollout compat, per the design's sequencing).
-      if (frame["type"] === "__timeout__") return { kind: "unsupported" };
+      if (frame["type"] === "__timeout__") return { kind: "timeout" };
       if (frame["type"] === "discovery_lookup_error") {
-        discoveryLookupErrorReason(frame); // stable code; a DB hiccup is retryable, not authoritative
-        return { kind: "error" };
+        const reason = discoveryLookupErrorReason(frame);
+        logger.warn("directory.discovery.lookup.failed", { target: targetHex.slice(0, 16), reason, correlationId });
+        return { kind: "error", reason };
       }
       const parsed = parseDiscoveryLookupResult(frame);
-      if (!parsed) return { kind: "error" };
+      if (!parsed) {
+        // A reply came back but did not parse — a protocol/version anomaly on a directory that DID
+        // respond. Surface it distinctly from a clean directory DB error, and never as availability.
+        logger.warn("directory.discovery.lookup.failed", { target: targetHex.slice(0, 16), reason: "malformed_reply", correlationId });
+        return { kind: "malformed" };
+      }
+      logger.info("directory.discovery.lookup", {
+        target: targetHex.slice(0, 16),
+        state: parsed.state,
+        owningNode: parsed.owningNodeIds[0] ?? null,
+        correlationId,
+      });
       return { kind: "result", state: parsed.state, owningNodeIds: parsed.owningNodeIds };
     } finally {
       unregister();
@@ -1070,20 +1095,33 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const roster = await resolveConsortiumRoster();
     const target = roster?.find((e) => e.nodeId === owningNodeId) ?? null;
     if (!target) {
-      logger.warn("session.crossnode.node_unresolvable", { agentName, owningNodeId, correlationId });
-      return { ok: false, reason: "discovery_node_unresolvable", guidance: `The counterparty's home node (${owningNodeId}) could not be resolved in the signed consortium manifest. It may have left the consortium; retry.` };
+      // Manifest MISS — the node genuinely isn't in the signed roster. A hard, non-retryable cause
+      // (distinct from a reachable-but-unconnectable node below).
+      logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "discovery_node_unresolvable", correlationId });
+      return { ok: false, reason: "discovery_node_unresolvable", guidance: `The counterparty's home node (${owningNodeId}) is not in the signed consortium manifest. It may have left the consortium.` };
     }
     logger.info("session.crossnode.initiated", { agentName, brokerNode: owningNodeId, correlationId });
     const visiting = openVisitingConnection(agentName, agentKeyProvider, agentPubkeyHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, owningNodeId);
+    // Track the release reason across the finally (result is block-scoped in the try).
+    let releaseReason = "failure";
     try {
       if (!(await waitForSignalingConnected(visiting.mgr, 10_000))) {
-        return { ok: false, reason: "discovery_node_unresolvable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
+        // The node RESOLVED but the visiting dial/auth didn't complete in time — a TRANSIENT
+        // cross-region condition (latency, blip, cold handshake), NOT a manifest miss. Distinct
+        // reason, and the caller's retry loop treats it as retryable (re-discover → retry).
+        logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "visiting_connection_unreachable", correlationId });
+        return { ok: false, reason: "visiting_connection_unreachable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
       }
       const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName);
-      if (result.ok) logger.info("session.crossnode.established", { agentName, brokerNode: owningNodeId, correlationId });
+      if (result.ok) {
+        releaseReason = "handoff-complete";
+        logger.info("session.crossnode.established", { agentName, brokerNode: owningNodeId, correlationId });
+      } else {
+        logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: result.reason, correlationId });
+      }
       return result;
     } finally {
-      await visiting.stop("handoff-complete");
+      await visiting.stop(releaseReason);
     }
   }
 
@@ -1143,15 +1181,34 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const backoffs = [1_000, 3_000]; // between attempts — covers re-home + replication lag
         const MAX_ATTEMPTS = 3;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-          const disc: DiscoveryOutcome = await runDiscoveryLookup(signaling, targetHex, 5_000);
-          const action = classifyDiscoveryOutcome(disc, homeNodeId);
+          const disc: DiscoveryOutcome = await runDiscoveryLookup(signaling, targetHex, 5_000, ctx.correlationId);
 
-          // Old directory (unknown frame / no reply): fall back to today's local-only behavior on the
-          // home stream — the rollout-compat path (directories deploy before clients).
-          if (action.kind === "fallback") {
+          // TRANSPORT: the home stream is down — retry (it may reconnect); local-only fallback would
+          // fail the same way. Exhausted → the TRUTHFUL transport reason, never a false "offline".
+          if (disc.kind === "send_failed") {
+            logger.warn("session.discovery.send_failed", { agentName: ctx.agentName, attempt, reason: disc.reason, correlationId: ctx.correlationId });
+            if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
+            return { ok: false, reason: "directory_unreachable", guidance: "The home directory stream is not connected, so the counterparty's location could not be looked up. Check cello status (directory_signaling), then retry." };
+          }
+          // NO REPLY: an old directory (predates discovery) OR a slow/dropped reply on a new one. Retry;
+          // fall back to today's local-only behavior ONLY as a last resort (after the retries), so a
+          // single dropped reply no longer misroutes a reachable cross-node peer to the home node.
+          if (disc.kind === "timeout") {
+            logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
+            if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
             return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName);
           }
+          // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
+          // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.
+          if (disc.kind === "error" || disc.kind === "malformed") {
+            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: disc.kind, correlationId: ctx.correlationId });
+            if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
+            return { ok: false, reason: "directory_unreachable", guidance: "The directory could not resolve the counterparty's location (a directory-side lookup error) after several attempts. Retry shortly." };
+          }
+
+          // A 3-state RESULT. Route it (pure classifier).
+          const action = classifyOnlineResult(disc.state, disc.owningNodeIds, homeNodeId);
           // State 3: no such agent — a bad address, not a transient outage. NO retry (distinct code).
           if (action.kind === "unknown_agent") {
             return { ok: false, reason: "unknown_agent", guidance: "No agent is registered under that public key — the counterparty address is unknown. Verify the pubkey with the counterparty's operator." };
@@ -1160,12 +1217,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           if (action.kind === "offline") {
             return { ok: false, reason: "counterparty_offline", guidance: "The counterparty exists but is not currently online. Have its operator bring it online (cello_status), then retry." };
           }
-          // Transient: directory DB error during the lookup, or online-with-no-owner. RETRYABLE —
-          // never collapsed into an authoritative offline/unknown.
+          // Online but no owner named — transient, re-discover.
           if (action.kind === "retry") {
-            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
+            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: "online_no_owner", correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            return { ok: false, reason: "counterparty_offline", guidance: "The directory could not resolve the counterparty's location after several attempts. Retry shortly." };
+            return { ok: false, reason: "counterparty_offline", guidance: "The directory reported the counterparty online but named no home node. Retry shortly." };
           }
 
           const result =
@@ -1176,12 +1232,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
               // CROSS-NODE: reach into the target's home over a transient visiting connection.
               : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId);
 
-          // Discovery said online but the broker reported target_offline (stale replicated presence, or
-          // a re-home between discovery and the request) → re-discover and retry, bounded.
-          if (!result.ok && result.reason === "target_offline") {
-            logger.info("session.crossnode.stale_discovery_retry", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
+          // RETRY triggers: (a) the broker reported target_offline (stale replicated presence or a
+          // re-home between discovery and the request); (b) a transient visiting-connection failure
+          // (cross-region blip). Both re-discover → retry, bounded.
+          if (!result.ok && (result.reason === "target_offline" || result.reason === "visiting_connection_unreachable")) {
+            logger.info("session.crossnode.stale_discovery_retry", { agentName: ctx.agentName, attempt, reason: result.reason, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            return { ok: false, reason: "counterparty_offline", guidance: "The counterparty was online at discovery but not reachable at its home node after several attempts (it may be re-homing). Retry shortly." };
+            // Exhausted: keep the truthful transient-connection reason; a stale target_offline surfaces
+            // as counterparty_offline (state 2).
+            return result.reason === "visiting_connection_unreachable"
+              ? { ok: false, reason: "visiting_connection_unreachable", guidance: "The counterparty's home node was reachable at discovery but its visiting connection could not be established after several attempts. Retry shortly." }
+              : { ok: false, reason: "counterparty_offline", guidance: "The counterparty was online at discovery but not reachable at its home node after several attempts (it may be re-homing). Retry shortly." };
           }
           return result;
         }

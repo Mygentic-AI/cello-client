@@ -1,41 +1,51 @@
 /**
- * Cross-node session establishment — the pure per-attempt decision (Story B, item 2).
+ * Cross-node session establishment — discovery outcome types + the pure online-result classifier
+ * (Story B, item 2).
  *
- * Given a discovery outcome and which node we're already connected to (home), decide what the
- * negotiator does next. Kept out of the daemon's async retry loop so the branch/error-code mapping is
- * unit-testable in isolation (mirrors the directory-side resolveDiscoveryState).
+ * The daemon's discovery step produces a DiscoveryOutcome; the retry loop handles the transport /
+ * directory-fault / no-reply variants attempt-aware (each with its own log + terminal reason), and
+ * defers the actual 3-state routing decision to classifyOnlineResult — kept pure so the branch and
+ * error-code mapping are unit-testable in isolation (mirrors the directory-side resolveDiscoveryState).
  *
  * Design: docs/planning/discussion_logs/2026-07-04_1730_cross-node-session-topology.md §"Item 2".
  */
 
 export type DiscoveryOutcome =
+  // The directory answered with a 3-state result.
   | { kind: "result"; state: "online" | "offline" | "unknown_agent"; owningNodeIds: string[] }
-  | { kind: "error" } // directory DB error during lookup — retryable, never authoritative
-  | { kind: "unsupported" }; // old directory (unknown frame / no reply) — fall back to today's behavior
+  // The directory answered with discovery_lookup_error (a DB fault during the lookup) — retryable, and
+  // a DIRECTORY-side fault (must NOT be reported to the caller as the counterparty being offline).
+  | { kind: "error"; reason: string }
+  // A reply arrived but did not parse (protocol/version anomaly) — retryable, surfaced distinctly.
+  | { kind: "malformed" }
+  // No reply within the window. Could be an old directory (predates discovery) OR a slow/dropped reply
+  // on a new one — so it is RETRIED, and only falls back to today's local-only behavior as a last resort.
+  | { kind: "timeout" }
+  // Could not even send the lookup — the home signaling stream is down (reconnecting/lost). A TRANSPORT
+  // failure, never an "old directory" — and the local-only fallback would fail the same way.
+  | { kind: "send_failed"; reason: string };
 
-export type NegotiationAction =
-  | { kind: "fallback" } // old directory → run the session_request on the home stream (today's path)
+export type ResultAction =
   | { kind: "same_node" } // target is on the node we're already connected to → home path, ZERO visiting
   | { kind: "cross_node"; owningNodeId: string } // reach into the target's home over a visiting connection
   | { kind: "unknown_agent" } // state 3 — a bad address, distinct code, NO retry
   | { kind: "offline" } // state 2 — known but offline, NO retry storm
-  | { kind: "retry" }; // transient (DB error, or online-with-no-owner) → re-discover and retry
+  | { kind: "retry" }; // online but no owner named — transient, re-discover
 
 /**
- * Classify one discovery result into the next negotiator action. Pure. The retry counting, backoff,
- * and the actual I/O (open visiting connection, send session_request) live in the daemon loop.
+ * Route a 3-state discovery RESULT into the next action. Pure. Retry counting, backoff, transport /
+ * directory-fault / timeout handling, and the actual I/O live in the daemon loop.
  */
-export function classifyDiscoveryOutcome(disc: DiscoveryOutcome, homeNodeId: string | null): NegotiationAction {
-  // Old directory that doesn't understand discovery_lookup → today's local-only behavior on home.
-  if (disc.kind === "unsupported") return { kind: "fallback" };
-  // A directory DB error is retryable — NEVER collapsed into an authoritative offline/unknown.
-  if (disc.kind === "error") return { kind: "retry" };
-
-  if (disc.state === "unknown_agent") return { kind: "unknown_agent" };
-  if (disc.state === "offline") return { kind: "offline" };
+export function classifyOnlineResult(
+  state: "online" | "offline" | "unknown_agent",
+  owningNodeIds: string[],
+  homeNodeId: string | null,
+): ResultAction {
+  if (state === "unknown_agent") return { kind: "unknown_agent" };
+  if (state === "offline") return { kind: "offline" };
 
   // state === "online": pick the owning node (list-valued; length 1 until the k>1 homing knob).
-  const owningNodeId = disc.owningNodeIds[0];
+  const owningNodeId = owningNodeIds[0];
   // Online but no owner named is malformed — treat as transiently unresolved, retry (never dial a
   // fabricated node).
   if (!owningNodeId) return { kind: "retry" };

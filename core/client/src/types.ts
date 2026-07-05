@@ -230,11 +230,14 @@ export interface ReceivedEnvelope {
  *   unknown_agent        — cross-node: no agent is registered under that pubkey (discovery state 3).
  *                          A bad address, not a transient outage — do NOT retry-storm.
  *   discovery_node_unresolvable — cross-node: the counterparty's discovered home node did not resolve
- *                          in the signed consortium manifest (it may have left the consortium).
+ *                          in the signed consortium manifest (it may have left the consortium). Hard.
+ *   visiting_connection_unreachable — cross-node: the home node RESOLVED but the transient visiting
+ *                          connection to it could not be established (a transient cross-region blip).
+ *                          Distinct from the manifest miss; retried, then surfaced. Retry later.
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" | "session_request_missing_peer_id" | "counterparty_offline" | "unknown_agent" | "discovery_node_unresolvable" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" | "session_request_missing_peer_id" | "counterparty_offline" | "unknown_agent" | "discovery_node_unresolvable" | "visiting_connection_unreachable" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 
