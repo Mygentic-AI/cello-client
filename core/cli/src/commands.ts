@@ -28,8 +28,34 @@ import {
   connectToDaemon,
   readLock,
   type DaemonStatusResponse,
+  type IpcClient,
   type Logger,
 } from "@cello-protocol/daemon";
+
+/**
+ * M8C-LOGINSTART-1 CORE: bring every loaded agent online. Called by `cello login` after the daemon
+ * is up. login ALWAYS completes — a per-agent start failure is COLLECTED, never thrown (design-review
+ * #8), so one bad agent can't abort login. `cello_start_agent` is idempotent, so re-login is safe.
+ * The per-agent `autoStart: false` opt-out is PARKED until the M9 config store lands (D14).
+ * Extracted (not inline in login) so it is unit-testable against an in-process daemon.
+ */
+export async function autoStartAllAgents(
+  client: IpcClient,
+): Promise<{ started: string[]; failed: Array<{ name: string; reason: string }> }> {
+  const started: string[] = [];
+  const failed: Array<{ name: string; reason: string }> = [];
+  const listRes = (await client.send("cello_list_agents")) as { agents?: Array<{ name: string }> };
+  for (const a of listRes.agents ?? []) {
+    try {
+      const r = (await client.send("cello_start_agent", { name: a.name })) as { ok?: boolean; reason?: string };
+      if (r.ok) started.push(a.name);
+      else failed.push({ name: a.name, reason: r.reason ?? "unknown" });
+    } catch (err: unknown) {
+      failed.push({ name: a.name, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { started, failed };
+}
 
 export interface CommandResult {
   exitCode: number;
@@ -43,12 +69,30 @@ export async function login(
 ): Promise<CommandResult> {
   try {
     const result = await connectOrStart(celloDir, logger, daemonBin);
-    result.client.close();
-
-    if (result.alreadyRunning) {
-      return { exitCode: 0, output: "Daemon already running." };
+    // M8C-LOGINSTART-1: bring every registered agent online, then report. Never let this abort login.
+    let summary = "";
+    try {
+      await result.client.send("ipc.connect", { clientType: "cli" });
+      const { started, failed } = await autoStartAllAgents(result.client);
+      const parts: string[] = [];
+      if (started.length > 0) parts.push(`Started ${started.length} agent(s): ${started.join(", ")}.`);
+      if (failed.length > 0) {
+        parts.push(
+          `${failed.length} agent(s) failed to start: ${failed.map((f) => `${f.name} (${f.reason})`).join(", ")}. ` +
+          "Run 'cello status' to check; a failed agent stays offline and can be retried with cello_use_agent.",
+        );
+      }
+      if (started.length === 0 && failed.length === 0) parts.push("No registered agents to start.");
+      summary = "\n" + parts.join("\n");
+    } catch (err: unknown) {
+      // Auto-start is best-effort — the daemon IS up. Surface the reason but complete login.
+      summary = `\nAgents were not auto-started (${err instanceof Error ? err.message : String(err)}); run 'cello status' and start them with cello_use_agent.`;
+    } finally {
+      result.client.close();
     }
-    return { exitCode: 0, output: "Daemon started." };
+
+    const head = result.alreadyRunning ? "Daemon already running." : "Daemon started.";
+    return { exitCode: 0, output: head + summary };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to start daemon: ${message}` };
