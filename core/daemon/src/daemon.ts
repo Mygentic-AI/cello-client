@@ -5325,7 +5325,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    // Delivered — append the message leaf to the daemon-owned tree (advances root).
+    // Delivered directly OR dispatched to relay (DOD-LEAVEMSG-1) — either way the content is now
+    // part of the daemon-owned tree: the relay witness (R1) already assigned it a sequence before
+    // direct delivery was even attempted, so a parked message occupies the SAME leaf position it
+    // would have taken if delivered live. Append once, for both outcomes.
     const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
@@ -5336,6 +5339,32 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
+    void newRootHex;
+    if (modified) {
+      logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
+    }
+    if (!sendResult.delivered) {
+      // DOD-LEAVEMSG-1 (sender half): direct delivery failed but the sealed, hashed content was
+      // successfully deposited at the relay (pickup_queue) — this is a SUCCESS outcome, not a
+      // failure. The recipient's daemon pulls it via RELAYWAKE on next reconnect. Reporting this
+      // as ok:false (the pre-LEAVEMSG-1 behavior) misrepresented an in-flight message as lost.
+      logger.info("session.content.dispatched_to_relay", {
+        sessionId,
+        recipientPubkey,
+        contentHashHex,
+        sequenceNumber: leafIndex,
+        correlationId,
+      });
+      return {
+        ok: true,
+        sequence_number: leafIndex,
+        delivered: false,
+        reason: "dispatched_to_relay",
+        modified,
+        guidance: "The counterparty is not directly reachable right now, so this message was sealed and dispatched to relay store-and-forward. It will be delivered the next time the counterparty's daemon reconnects — no further action is needed.",
+        ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+      };
+    }
     logger.info("session.content.sent", {
       sessionId,
       recipientPubkey,
@@ -5343,10 +5372,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       sequenceNumber: leafIndex,
       correlationId,
     });
-    void newRootHex;
-    if (modified) {
-      logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
-    }
     return {
       ok: true,
       sequence_number: leafIndex,

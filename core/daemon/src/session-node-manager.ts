@@ -429,29 +429,38 @@ export class SessionNodeManager {
    * MSG-001-3b (2b): deposit un-confirmed content to the relay store-and-forward backstop — keyed
    * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
    * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
+   * DOD-LEAVEMSG-1: returns whether the deposit actually succeeded (false if no hook/relay is
+   * configured, or the hook rejects) so a caller with a live response to shape (sendContent) can
+   * distinguish "genuinely parked" from "nothing recoverable" instead of guessing. Callers that
+   * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
+   * result — the deposit itself and its logging are unchanged either way.
    */
-  #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): void {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<boolean> {
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return;
-    void hook({
-      sessionId,
-      recipientPubkeyHex: entry.counterpartyPubkey,
-      relayPeerId: entry.relayPeerId,
-      relayAddrs: entry.relayAddrs,
-      contentHashHex,
-      content,
-      // DOD-MSG-4 (2b): carry the relay's signed ordering record so the parked entry is self-ordering
-      // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
-      structure1Cbor,
-      structure2Cbor,
-    }).catch((err: unknown) => {
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return false;
+    try {
+      await hook({
+        sessionId,
+        recipientPubkeyHex: entry.counterpartyPubkey,
+        relayPeerId: entry.relayPeerId,
+        relayAddrs: entry.relayAddrs,
+        contentHashHex,
+        content,
+        // DOD-MSG-4 (2b): carry the relay's signed ordering record so the parked entry is self-ordering
+        // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
+        structure1Cbor,
+        structure2Cbor,
+      });
+      return true;
+    } catch (err: unknown) {
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
         contentHash: contentHashHex,
         error: err instanceof Error ? err.message : String(err),
       });
-    });
+      return false;
+    }
   }
 
   // ─── Initialization ──────────────────────────────────────────────────────
@@ -2275,7 +2284,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true } | { ok: false; reason: string; error: string }> {
+  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string }> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
@@ -2351,7 +2360,7 @@ export class SessionNodeManager {
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
-      return { ok: true };
+      return { ok: true, delivered: true };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
@@ -2359,7 +2368,13 @@ export class SessionNodeManager {
       // 2b: direct delivery failed (counterparty offline). The hash is already witnessed (R1, the
       // sequence is assigned), so deposit the content to the relay store-and-forward backstop now;
       // the recipient pulls + recovers it on next online (DOD-MSG-3/4).
-      this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content, orderingS1, orderingS2);
+      // DOD-LEAVEMSG-1: the deposit is now AWAITED (was fire-and-forget) so a genuine park success
+      // can be reported as "dispatched to relay" instead of a raw stream failure — the operator/
+      // agent sees the truth (the message IS in flight, just not direct), not a false negative.
+      const parked = await this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content, orderingS1, orderingS2);
+      if (parked) {
+        return { ok: true, delivered: false, parked: true };
+      }
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
       const errMsg =
@@ -2788,6 +2803,34 @@ export class SessionNodeManager {
       return { ok: true, leafIndex: dedupAfterScreen, sequenceNumber: dedupAfterScreen, appendedCount: 0, ...(terminalBlock ? { screenedOut: true } : {}) };
     }
 
+    // M8C-ABUSE-1 (cello-unit-reviewer HIGH fix, post-M9INT-1 merge): re-check the size cap here,
+    // in the SAME synchronous window as the dedup re-check above. The original check (before the
+    // screenInbound await) used totals that can go stale: two concurrent ingests for the same
+    // non-contact session — e.g. a live direct arrival racing a recoverParkedFromRelay pull —
+    // could each independently pass the pre-await check using the SAME stale totals, then both
+    // append/hold, jointly exceeding the cap. Symmetric to the dedup fix: everything from here to
+    // the append/hold branch is synchronous, so whichever call resumes first appends/holds before
+    // the second's re-check runs, and the second's freshly-recomputed totals correctly include the
+    // first's contribution.
+    if (!this.isContact(agentName, senderPubkey)) {
+      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
+      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      if (priorTotal + heldTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
+        this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
+          sessionId,
+          agentName,
+          senderPubkey,
+          priorTotal,
+          heldTotal,
+          incoming: content.length,
+          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
+          correlationId,
+          recheck: true,
+        });
+        return { ok: false, reason: "session_size_limit_exceeded" };
+      }
+    }
+
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
     // canonical sequence for this hash (witnessed via leaf_deliver) and it is AHEAD of the next
     // expected leaf, HOLD the content rather than append it out of order. The missing in-between
@@ -3075,7 +3118,10 @@ export class SessionNodeManager {
     // store-and-forward so the recipient recovers it (at the witnessed sequence). The durable
     // awaiting entry above remains the crash backstop. Carry the retained ordering record (review #1)
     // so a TTF-parked entry self-orders on recover, exactly like the direct-dial-fail park.
-    this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
+    // Fire-and-forget: unlike sendContent's live caller, nothing here is awaiting an IPC response
+    // to shape (the TTF timer fires long after cello_send already returned) — the deposit's own
+    // success/failure logging inside #parkContent is the only observability this path needs.
+    void this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
   }
 
   /**

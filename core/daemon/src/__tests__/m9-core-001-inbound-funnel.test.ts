@@ -18,7 +18,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { SessionNodeManager } from "../session-node-manager.js";
+import { SessionNodeManager, ABUSE_MAX_SESSION_RECEIVED_BYTES } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -180,5 +180,29 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const deduped = [r1, r2].filter((r) => r.ok && r.appendedCount === 0).length;
     expect(appended).toBe(1);
     expect(deduped).toBe(1);
+  });
+
+  it("M8C-ABUSE-1 (cello-unit-reviewer HIGH fix, post-M9INT-1): two concurrent DIFFERENT-content ingests from a non-contact cannot jointly exceed the per-session size cap", async () => {
+    // Same B1 race window (the screen await), different failure mode: the size cap's pre-await
+    // check used totals that go stale across the suspension. Two concurrent ingests of DIFFERENT
+    // content, each individually under the cap but summing over it, must not both be accepted —
+    // exactly the drip-feed ABUSE-1 exists to stop, just via two racing arrivals instead of many
+    // sequential ones.
+    const mgr = await setup(new SlowAllowGateway());
+    const half = new Uint8Array(Math.floor(ABUSE_MAX_SESSION_RECEIVED_BYTES / 2) + 1024); // > half each, < cap each
+    const contentA = half;
+    const contentB = new Uint8Array(half); // distinct Uint8Array instance, same size, different hash source
+    contentB[0] = 0xff; // ensure a different content hash than contentA
+    const hashA = msgLeafHash(contentA);
+    const hashB = msgLeafHash(contentB);
+    const [r1, r2] = await Promise.all([
+      mgr.ingestReceivedContent("alice", SID, contentA, hashA),
+      mgr.ingestReceivedContent("alice", SID, contentB, hashB),
+    ]);
+    const accepted = [r1, r2].filter((r) => r.ok).length;
+    const rejected = [r1, r2].filter((r) => !r.ok && (r as { reason: string }).reason === "session_size_limit_exceeded").length;
+    // Exactly one may win the race; the other must be rejected by the cap, not silently accepted too.
+    expect(accepted).toBe(1);
+    expect(rejected).toBe(1);
   });
 });
