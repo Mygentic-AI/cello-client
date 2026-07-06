@@ -116,6 +116,25 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     expect(res["messages"]).toEqual([]);
   });
 
+  // Boundary (reviewer): since_seq:0 is a VALID cursor and must batch (return seq > 0), NOT be
+  // treated as falsy/absent. Pins that 0 !== undefined at this branch.
+  it("since_seq:0 batches (returns sequence > 0), distinct from an absent since_seq", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "d".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    for (const i of [0, 1, 2]) seed("alice", s, i, "received", `m${i}`);
+
+    const res = (await client.send("cello_receive", { session_id: s, since_seq: 0 })) as R;
+    expect(res["ok"]).toBe(true);
+    expect(res["since_seq"]).toBe(0); // 0 reached the batch branch (not the plain path)
+    const msgs = res["messages"] as Array<{ sequence: number }>;
+    expect(msgs.map((m) => m.sequence)).toEqual([1, 2]); // seq > 0 (msg 0 excluded)
+  });
+
   it("S4: cello_receive WITHOUT since_seq is unchanged (drains live buffer / times out, no batch)", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
