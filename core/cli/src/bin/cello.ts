@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, telegramSetToken } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -145,6 +145,18 @@ async function main(): Promise<void> {
         result = await contactList(celloDir, agent);
       } else {
         result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]" };
+      }
+      break;
+    }
+    case "telegram": {
+      // cello telegram set-token <bot_token> <allowlisted_chat_id>
+      const sub = process.argv[3];
+      const botToken = process.argv[4];
+      const chatId = process.argv[5];
+      if (sub === "set-token" && botToken && chatId) {
+        result = await telegramSetToken(celloDir, botToken, chatId);
+      } else {
+        result = { exitCode: 1, output: "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>" };
       }
       break;
     }

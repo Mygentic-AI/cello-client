@@ -20,7 +20,7 @@ describe("F1: usage string lists every command", () => {
 
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
-      ["contact", "create-agent", "login", "logout", "receipts", "refresh", "register", "remove-agent", "sessions", "status"].sort(),
+      ["contact", "create-agent", "login", "logout", "receipts", "refresh", "register", "remove-agent", "sessions", "status", "telegram"].sort(),
     );
   });
 });

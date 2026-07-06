@@ -585,6 +585,20 @@ export class SessionNodeManager {
       )
     `);
 
+    // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
+    // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
+    // token has no sensible default (a required credential, unlike AWAY/TTL/CONTACT's real
+    // defaults) and can't legitimately wait for M9. Singleton row (id=1) — "token = daemon
+    // setting" (DoD), not per-agent.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS telegram_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        bot_token TEXT NOT NULL,
+        allowlisted_chat_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -884,6 +898,26 @@ export class SessionNodeManager {
       return { ok: false, reason: "abuse_bound_unknown_sessions_global" };
     }
     return { ok: true };
+  }
+
+  /** M8C-TGDOOR-1: the daemon-wide Telegram bot settings, or null if never configured. */
+  getTelegramSettings(): { botToken: string; allowlistedChatId: string } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT bot_token, allowlisted_chat_id FROM telegram_settings WHERE id = 1")
+      .get() as { bot_token: string; allowlisted_chat_id: string } | undefined;
+    return row ? { botToken: row.bot_token, allowlistedChatId: row.allowlisted_chat_id } : null;
+  }
+
+  /** M8C-TGDOOR-1: persist (or replace) the singleton Telegram settings row. */
+  setTelegramSettings(botToken: string, allowlistedChatId: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare(
+        `INSERT INTO telegram_settings (id, bot_token, allowlisted_chat_id, updated_at) VALUES (1, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET bot_token = excluded.bot_token, allowlisted_chat_id = excluded.allowlisted_chat_id, updated_at = excluded.updated_at`,
+      )
+      .run(botToken, allowlistedChatId, Date.now());
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */

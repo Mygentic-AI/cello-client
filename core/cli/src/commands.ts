@@ -477,3 +477,24 @@ export async function contactList(celloDir: string, agent?: string): Promise<Com
   if (agent) params.agent = agent;
   return contactCommand(celloDir, "cello_contact_list", params);
 }
+
+/** M8C-TGDOOR-1: `cello telegram set-token <bot_token> <allowlisted_chat_id>` — persists the
+ *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
+ *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
+export async function telegramSetToken(celloDir: string, botToken: string, chatId: string): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
+  }
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    await client.send("ipc.connect", { clientType: "cli" });
+    const result = (await client.send("cello_telegram_set_token", { bot_token: botToken, allowlisted_chat_id: chatId })) as { ok: boolean };
+    client.close();
+    return { exitCode: result.ok ? 0 : 1, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
+  }
+}

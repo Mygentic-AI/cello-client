@@ -26,6 +26,7 @@ export type {
 
 // Type-only import (erased at runtime — no circular dependency at load time).
 import type { DirectoryEndpoint } from "./signaling-connect.js";
+import type { TelegramBotClient } from "./telegram-bot-client.js";
 
 // --- Logger interface (injected, never imported directly) ---
 
@@ -290,6 +291,12 @@ export interface DaemonConfig {
    * real one in production).
    */
   getRelayCircuitAddress?: () => string;
+  /**
+   * M8C-TGDOOR-1: injectable Telegram Bot API client (test override — production uses
+   * HttpTelegramBotClient, constructed from telegram_settings once configured via
+   * setTelegramSettings). Absent = TGDOOR is inert (no poller starts) until settings exist.
+   */
+  telegramBotClient?: TelegramBotClient;
 }
 
 // --- Session node types ---

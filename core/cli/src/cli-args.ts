@@ -19,12 +19,13 @@ export const KNOWN_COMMANDS = new Set([
   "receipts",
   "sessions",
   "contact",
+  "telegram",
 ] as const);
 
 export type KnownCommand = typeof KNOWN_COMMANDS extends Set<infer T> ? T : never;
 
 export const USAGE =
-  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact>\n" +
+  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|telegram>\n" +
   "Run 'cello <command> --help' for command-specific usage.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
@@ -53,6 +54,9 @@ const COMMAND_HELP: Record<string, string> = {
     "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
     "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
     "  Example:  cello contact list --agent alice",
+  telegram:
+    "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>  — configure the daemon-owned Telegram doorbell (M8C-TGDOOR-1).\n" +
+    "  Starts a single long-lived poller immediately; the operator chat given is the ONLY one that ever receives doorbell events.",
 };
 
 export function helpForCommand(command: string): string {
