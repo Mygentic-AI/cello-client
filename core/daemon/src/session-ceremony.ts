@@ -176,9 +176,17 @@ async function hydrateShareAndStubs(
   // post-refresh signing would target the now-EXPIRED epoch and fail (DOD-REFRESH-1). For an un-refreshed
   // agent share.epochId IS "…:epoch:1", so this is identical to the prior behavior.
   const epochId = share.epochId;
-  const mkStub = (peerId: string, multiaddr: string): NetworkDirectoryNode => {
+  // The stub's FROST identifier (`id`) MUST be the node's DKG label, NOT its libp2p peerId. The directory
+  // derives each node's FROST participant identifier as derive(nodeId), where nodeId = the node's region
+  // (frost-handler.ts:23 `nodeIdentifier = derive(nodeId)`; the bin sets nodeId = region). So the group's
+  // node shares are bound to derive(region), and the node SIGNS under derive(region). If the client verifies
+  // /aggregates partials under derive(peerId) instead, every verifyShare fails → all nodes excluded →
+  // ceremony_exhausted. `id` feeds Identifier.derive() in the signer; `directoryPeerId` is the network dial
+  // and stays the libp2p peerId. (nodeId and peerId coincide only for legacy single-node agents whose DKG
+  // predates the region-as-nodeId change — the single-node fallback below passes peerId for that reason.)
+  const mkStub = (nodeId: string, peerId: string, multiaddr: string): NetworkDirectoryNode => {
     const stub = new NetworkDirectoryNode({
-      id: peerId,
+      id: nodeId,
       node: node!,
       directoryPeerId: peerId,
       directoryMultiaddrs: [multiaddr],
@@ -197,7 +205,8 @@ async function hydrateShareAndStubs(
     const q = share.directoryNodeIds;
     const filtered = q && q.length > 0 ? roster.filter((ep) => q.includes(ep.nodeId)) : roster;
     const holders = filtered.length > 0 ? filtered : roster;
-    directoryNodeStubs = holders.map((ep) => mkStub(ep.peerId, ep.multiaddr));
+    // FROST id = ep.nodeId (region — the DKG label); network dial = ep.peerId.
+    directoryNodeStubs = holders.map((ep) => mkStub(ep.nodeId, ep.peerId, ep.multiaddr));
   } else if (node) {
     // No consortium manifest (roster null) or a configured manifest that resolved EMPTY → the single
     // primary endpoint. INTENTIONAL asymmetry with DKG-1 (which REFUSES a configured-but-empty roster
@@ -210,7 +219,9 @@ async function hydrateShareAndStubs(
     }
     const ep = await deps.getDirectoryEndpoint();
     if (ep && ep.multiaddr) {
-      directoryNodeStubs = [mkStub(ep.peerId, ep.multiaddr)];
+      // Single-node back-compat: no region is available from getDirectoryEndpoint, and legacy single-node
+      // agents' DKG labeled the node by peerId (pre region-as-nodeId), so the FROST id stays the peerId here.
+      directoryNodeStubs = [mkStub(ep.peerId, ep.peerId, ep.multiaddr)];
     }
   }
   return { share, stubs: directoryNodeStubs };
