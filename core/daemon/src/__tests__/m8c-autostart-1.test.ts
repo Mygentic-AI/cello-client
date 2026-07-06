@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { DbRegistrationPersistence } from "../db-identity-store.js";
 import type { Logger, DaemonConfig, AgentInfo } from "../types.js";
 
 describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
@@ -126,6 +127,30 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
     const res = (await client.send("cello_use_agent", { name: "alice" })) as Result;
     expect(res["ok"]).toBe(true); // NON-blocking — still selected
     expect(res["warning"]).toBe("not_registered");
+  });
+
+  // NEGATIVE case (reviewer Finding 2 — gives the reg.status !== "active" branch teeth):
+  // a genuinely REGISTERED agent must NOT get the not_registered warning. Without this, an impl
+  // that hardcodes the warning on every use_agent would pass the whole suite and wrongly tell a
+  // registered agent to "run cello register".
+  it("A3: use_agent on a REGISTERED agent selects it with NO not_registered warning", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+
+    // Create the agent (inserts its DB row) then mark it registered (reg_status = 'active').
+    await client.send("cello_create_agent", { name: "reggie" });
+    const db = handle.getSessionNodeManager().getDb();
+    await new DbRegistrationPersistence({ db, agentName: "reggie", logger }).persistRegistrationState({
+      agentId: "reggie-agent-id",
+      primaryPubkey: "aa".repeat(32),
+      mlDsaPubkey: "bb".repeat(32),
+      registeredAt: 1_700_000_000_000,
+    });
+
+    const res = (await client.send("cello_use_agent", { name: "reggie" })) as Result;
+    expect(res["ok"]).toBe(true);
+    expect(res["warning"]).toBeUndefined(); // registered → no warning
   });
 
   // ─── A4 (F18): sole-online agent is used when none selected ───

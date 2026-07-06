@@ -1879,6 +1879,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger.info("agent.autostart.attempted", { connectionId, agentName: name });
       const startRes = startAgentInternal(name);
       if (!startRes.ok) {
+        // Structured failure envelope (D6). Today `startAgentInternal` is permissive (D12) and its
+        // only failure — agent_not_found — is already caught by the existence pre-check above, so
+        // this branch is currently unreachable. It is the RESERVED structured-failure surface for
+        // when auto-start gains a synchronous failure mode (e.g. D12's reverse: a bounded
+        // waitForSignalingConnected making `directory_unreachable` a real start failure). Kept so
+        // that extension surfaces the reason + guidance here with the selection left unchanged.
+        // See M8C-DECISIONS D12 + BUILD-JOURNAL Entry 8.
         logger.warn("agent.autostart.failed", { connectionId, agentName: name, reason: startRes.reason });
         return {
           ok: false,
@@ -1909,8 +1916,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
     } catch (err: unknown) {
       // A failed registration read must not break selection (the agent IS selected). Log the real
-      // reason so the missing warning is explainable; the selection still succeeds.
+      // reason, and surface a softer `registration_unknown` warning so the operator's surface is NOT
+      // falsely clean — we could not confirm registration, so don't imply it is fine (Finding 3).
       logger.warn("agent.registration.read.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+      result["warning"] = "registration_unknown";
+      result["warning_guidance"] = `Agent '${name}' is selected, but its registration status could not be read — run 'cello status' to check whether it is registered with the directory.`;
     }
     return result;
   });
