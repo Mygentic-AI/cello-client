@@ -880,6 +880,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Set of agents currently in "online" state (transitioned via cello_start_agent)
   const onlineAgents = new Set<string>();
 
+  // M8C-CURSOR-1: per-connection, per-session read cursor (read-before-write gating).
+  // Distinct from message_watermarks (INBOX-1, per-AGENT delivery watermark, persisted) — this is
+  // per-CONNECTION, in-memory only, and intentionally dies with the connection (a fresh connection
+  // has read nothing yet, so it must catch up before it may send — the WhatsApp-group-chat model
+  // for two attended sessions on one agent). Key = connectionId → sessionId → highest sequence this
+  // connection has read (or authored). Absent entry = -1 (nothing read yet).
+  const connectionCursors = new Map<string, Map<string, number>>();
+  function getConnectionCursor(connectionId: string, sessionId: string): number {
+    return connectionCursors.get(connectionId)?.get(sessionId) ?? -1;
+  }
+  function advanceConnectionCursor(connectionId: string, sessionId: string, seq: number): void {
+    let byId = connectionCursors.get(connectionId);
+    if (!byId) { byId = new Map(); connectionCursors.set(connectionId, byId); }
+    const prior = byId.get(sessionId) ?? -1;
+    if (seq > prior) byId.set(sessionId, seq); // monotonic — never lowers
+  }
+
   // SessionNodeManager was constructed + initialized at the top of startDaemon (PERSIST-002 — the
   // encrypted store must open before agents load from the `agents` table). Its standing receiver +
   // interrupted-session detection are already ready here, before the IPC socket opens.
@@ -3255,6 +3272,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const { messages, undecryptable } = sessionNodeManager.readTranscript(connState.currentAgent, sessionId);
     // undecryptable > 0 means some rows failed GCM auth (tamper / wrong key) — surfaced, not hidden,
     // so the reader can tell a real gap from an empty transcript.
+    // M8C-CURSOR-1: this is the ONLY reader that covers BOTH directions (sent + received), so it's
+    // the correct general catch-up path — e.g. a second attended connection on the same agent
+    // catching up on a message a DIFFERENT local connection sent (since_seq is received-only and
+    // would never surface it). Advance to the max sequence actually seen.
+    if (messages.length > 0) {
+      const maxSeq = messages.reduce((m, r) => Math.max(m, r.sequence), -1);
+      advanceConnectionCursor(connectionId, sessionId, maxSeq);
+    }
     return { ok: true, session_id: sessionId, messages, undecryptable };
   });
 
@@ -4816,6 +4841,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "session_not_active", guidance: `Session is '${record.status}', not active. Content can only be sent on an active session. If it is interrupted, call cello_close_session to seal it.` };
     }
 
+    // M8C-CURSOR-1: read-before-write gate. current_seq is the tree's highest leaf index
+    // (message_count is kept in sync with leafCount on every append, both directions — DAEMON-004
+    // finding #2), so it reflects EVERY message in the session regardless of which connection sent
+    // or received it. If this connection hasn't read up to current_seq (e.g. a second attended
+    // session on the same agent that hasn't polled since the other connection's last send), refuse
+    // rather than let it send blind — the WhatsApp-group-chat model.
+    const currentSeq = record.message_count - 1;
+    const lastReadSeq = getConnectionCursor(connectionId, sessionId);
+    if (lastReadSeq < currentSeq) {
+      return {
+        ok: false,
+        reason: "session_not_current",
+        current_seq: currentSeq,
+        last_read_seq: lastReadSeq,
+        guidance: `This connection hasn't caught up on session ${sessionId} — ${currentSeq - lastReadSeq} message(s) unread (this may include messages authored by another connection on this same agent). Call cello_get_transcript to read the full history (covers both sent and received), then retry the send.`,
+      };
+    }
+
     const correlationId = randomUUID();
     const contentBytes = new TextEncoder().encode(contentStr);
 
@@ -4876,6 +4919,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
     sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", contentBytes, correlationId);
+    // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
+    // blocked by session_not_current on its own just-sent message.
+    advanceConnectionCursor(connectionId, sessionId, leafIndex);
     logger.info("session.content.sent", {
       sessionId,
       recipientPubkey,
@@ -4927,7 +4973,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       const received = messages.filter((m) => m.direction === "received" && m.sequence > sinceSeq);
       if (received.length > 0) {
         // readTranscript is ordered by sequence ASC → the last is the max.
-        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, received[received.length - 1].sequence);
+        const maxSeq = received[received.length - 1].sequence;
+        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, maxSeq);
+        // M8C-CURSOR-1: this connection has now read up to maxSeq (received-only; if the gap also
+        // includes a LOCAL sent message from another connection, cello_get_transcript closes that).
+        advanceConnectionCursor(connectionId, sessionId, maxSeq);
       }
       logger.info("session.receive.since_seq", { sessionId, agentName, since_seq: sinceSeq, count: received.length });
       return {
@@ -4951,6 +5001,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // M8C-INBOX-1 (N3): delivery marks read — advance the persisted read watermark so this
         // message no longer counts as unread in cello_check_notifications. Monotonic (never lowers).
         sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, entry.sequenceNumber);
+        // M8C-CURSOR-1: this connection has now read this message.
+        advanceConnectionCursor(connectionId, sessionId, entry.sequenceNumber);
         return {
           ok: true,
           content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
@@ -5094,6 +5146,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // MCP-002: Also unregister from notification dispatcher
   ipcServer.onDisconnect((connectionId) => {
     perConnectionState.delete(connectionId);
+    connectionCursors.delete(connectionId); // M8C-CURSOR-1: cursor is connection-scoped, dies with it
     notificationDispatcher.unregisterConnection(connectionId);
     // Seam 2 (review H2): evict any cello_await_session waiters owned by this connection.
     // Otherwise enqueueInboundSession would hand the next inbound session to a closed

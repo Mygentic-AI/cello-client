@@ -286,13 +286,18 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_use_agent", { name: "alice" });
 
+      // M8C-CURSOR-1: read-before-write — a message was buffered (ingestReceivedContent, above)
+      // before this connection ever attached, so cello_send would now correctly be refused
+      // session_not_current until it's read. Read it first (the real operator flow), THEN send —
+      // this also lets the existing recvOk assertions below move earlier without losing coverage.
+      const recvOk = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
+      expect(recvOk.ok).toBe(true);
+      expect(recvOk.content).toBe("from-bob");
+
       // ── snake_case (the real proxy shape) → works ──
       const sendOk = await client.send("cello_send", { session_id: SID, content: "hello" }) as Record<string, unknown>;
       expect(sendOk.ok).toBe(true);
       expect(sendOk.reason).toBeUndefined();
-      const recvOk = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
-      expect(recvOk.ok).toBe(true);
-      expect(recvOk.content).toBe("from-bob");
 
       // ── camelCase (the pre-fix bug shape) → rejected as missing_params, NOT silently accepted ──
       const sendCamel = await client.send("cello_send", { sessionId: SID, content: "hello" }) as Record<string, unknown>;
