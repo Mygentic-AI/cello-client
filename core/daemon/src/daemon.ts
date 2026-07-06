@@ -1032,11 +1032,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   }
 
   /**
-   * Open a transient VISITING signaling connection into a specific directory node (the target's home)
-   * and wire ONLY what a cross-node initiator needs there: the delegated-signer ceremony handler (the
-   * broker asks the initiator to co-sign the assignment over THIS connection). Seal + inbound handlers
-   * are NOT wired — the seal is client-coordinated over the agent's own roster, and this connection is
-   * initiator-only and transient. Caller MUST stop() it after the assignment arrives.
+   * Open a transient VISITING signaling connection into a specific directory node (the target's home /
+   * broker) and wire what a cross-node initiator needs there:
+   *  - the delegated-signer ceremony handler (the broker asks the initiator to co-sign the assignment
+   *    over THIS connection); and
+   *  - Fix #1 (cross-node seal-liveness): the seal ceremony handler + session_sealed/unilateral
+   *    listeners, because for a cross-node CLOSE the broker ALSO pushes seal_verified then session_sealed
+   *    over the connection the initiator holds to it. The seal FROST still runs over the agent's OWN
+   *    roster (getNode: () => nodeRef) — only the control frames traverse this stream.
+   * Transient and initiator-only. The caller MUST stop() it after the assignment (setup path) or after
+   * the seal reaches a terminal outcome (close path).
    */
   function openVisitingConnection(
     agentName: string,
@@ -2978,6 +2983,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
         if (sealedCompletion !== null) {
           logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
+          crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
           // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
           // a reader gets it on the same surface that proves the seal — receipt-not-assent,
           // per-party frontiers, attestation modes, and final_message.answered.
@@ -3055,6 +3061,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         pendingUnilateralWaiters.delete(sessionId);
         if (uniResult.ok) {
           logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
+          crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
           // M8B FINDING-3 (cascade-2): return the legibility certificate inline — same shape as the
           // bilateral close (AC-006) — so the operator gets the receipt on the surface that proves
           // the seal, not just a bare root. It is also persisted (above) for cello_get_sealed_receipt.
