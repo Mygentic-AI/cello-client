@@ -78,21 +78,12 @@ async function main(): Promise<void> {
       // cello register <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN
       // so it need not appear in shell history). Optional phone stub follows.
       const agent = process.argv[3] ?? "";
-      const tokenArg = process.argv[4];
-      const preAuthToken = tokenArg ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
+      const preAuthToken = process.argv[4] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = process.argv[5] ?? "";
-      // M8C-ONBOARD-WARN-1 (R6): right-size the warning to what the token IS — single-use, 24h,
-      // consumed on success. The only real risk is the brief window before redemption; the env-var
-      // form is NOT more secure (shell history + process environ retain it too), so don't push it as
-      // a security fix. One calm line; if that window genuinely matters, read from a file/stdin.
-      // Only for something that actually looks like a token (reviewer F3) — otherwise the calm
-      // "single-use, 24h" note would reassure about a non-token right before the "that isn't a
-      // token" error, which reads as contradictory.
-      if (tokenArg && tokenArg.startsWith("CELLO-")) {
-        process.stderr.write(
-          "Note: this pre-auth token is single-use and expires in 24h — its only exposure risk is the brief window before you redeem it. (It's retained in shell history and the process list either way; if that window matters, pass it via a file or stdin instead.)\n",
-        );
-      }
+      // M8C-ONBOARD-WARN-1 (revised 2026-07-06, Andre): the pre-auth exposure "note" is REMOVED
+      // entirely. A single-use, 24h, consumed-on-success token has no meaningful exposure risk, so
+      // the note only drew attention to a non-issue ("this thing you weren't worried about? don't
+      // worry about it") — pure noise on the core onboarding path. No warning at all is correct.
       result = await register(celloDir, agent, preAuthToken, phoneStub);
       break;
     }
