@@ -539,6 +539,20 @@ export class SessionNodeManager {
       )
     `);
 
+    // M8C-INBOX-1 (N2): per-agent, per-session read watermark. `last_delivered_seq` is the highest
+    // RECEIVED transcript sequence the operator has been shown via cello_receive (delivery marks
+    // read — no ack verb). Unread = received transcript rows with sequence > last_delivered_seq.
+    // Persisted so a missed doorbell (fire-and-forget push) is reconcilable via cello_check_notifications
+    // across daemon restarts, not just within one process (INV-PUSHPULL). Additive table.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS message_watermarks (
+        agent_name TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        last_delivered_seq INTEGER NOT NULL,
+        PRIMARY KEY (agent_name, session_id)
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -681,6 +695,57 @@ export class SessionNodeManager {
       });
     }
     return { messages, undecryptable: 0 };
+  }
+
+  // ─── M8C-INBOX-1 (N2/N3): read-watermark accessors ───────────────────────────
+
+  /** The highest RECEIVED transcript sequence delivered to the operator for (agent, session).
+   *  -1 when nothing has been delivered yet (so a seq-0 message reads as unread). */
+  getLastDeliveredSeq(agentName: string, sessionId: string): number {
+    if (!this.#db) return -1;
+    const row = this.#db
+      .prepare("SELECT last_delivered_seq FROM message_watermarks WHERE agent_name = ? AND session_id = ?")
+      .get(agentName, sessionId) as { last_delivered_seq: number } | undefined;
+    return row ? row.last_delivered_seq : -1;
+  }
+
+  /** Advance the read watermark (delivery marks read). MONOTONIC — never lowers, so a replayed or
+   *  out-of-order cello_receive cannot un-read already-read messages. */
+  advanceLastDeliveredSeq(agentName: string, sessionId: string, seq: number): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare(
+        `INSERT INTO message_watermarks (agent_name, session_id, last_delivered_seq)
+         VALUES (?, ?, ?)
+         ON CONFLICT(agent_name, session_id)
+         DO UPDATE SET last_delivered_seq = MAX(last_delivered_seq, excluded.last_delivered_seq)`,
+      )
+      .run(agentName, sessionId, seq);
+    this.#logger.info("message.watermark.advanced", { agentName, sessionId, sequence: seq });
+  }
+
+  /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
+   *  messages beyond the read watermark. Content-free (counts + ids + last seq, never message text);
+   *  a COUNT/MAX query, no decrypt. Only sessions with unread_count > 0 are returned. */
+  getUnreadSummary(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
+    if (!this.#db) return [];
+    const rows = this.#db
+      .prepare(
+        `SELECT t.session_id AS session_id,
+                COUNT(*)      AS unread_count,
+                MAX(t.sequence) AS last_seq
+         FROM transcript t
+         LEFT JOIN message_watermarks w
+           ON w.agent_name = t.agent_name AND w.session_id = t.session_id
+         WHERE t.agent_name = ?
+           AND t.direction = 'received'
+           AND t.sequence > COALESCE(w.last_delivered_seq, -1)
+         GROUP BY t.session_id
+         HAVING unread_count > 0
+         ORDER BY t.session_id ASC`,
+      )
+      .all(agentName) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
+    return rows;
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */

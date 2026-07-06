@@ -221,6 +221,13 @@ server.tool("cello_status", "Get daemon and agent status", {}, async () => {
   return jsonText(result);
 });
 
+server.tool("cello_check_notifications", "Check for pending inbound session requests and unread messages (the push-loss reconciler — discovers anything missed while this session was away). scope 'current' (default) checks the current agent; 'all' checks every loaded agent.", {
+  scope: z.enum(["current", "all"]).optional().describe("'current' (default) = current agent only; 'all' = every loaded agent, labelled"),
+}, async ({ scope }) => {
+  const result = await proxy.call("cello_check_notifications", scope ? { scope } : {});
+  return jsonText(result);
+});
+
 server.tool("cello_backup", "Backup agent state to configured storage", {}, async () => {
   const result = await proxy.call("cello_backup");
   return jsonText(result);

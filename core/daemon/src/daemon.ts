@@ -3196,15 +3196,47 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!connState || !connState.currentAgent) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const cert = sessionNodeManager.getSealCertificate(connState.currentAgent, sessionId);
-    if (!cert) {
+    const agentName = connState.currentAgent;
+    const cert = sessionNodeManager.getSealCertificate(agentName, sessionId);
+    if (cert) {
+      return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+    }
+    // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
+    // caller could not tell a typo from a not-sealed-yet session from a wrong-agent selection.
+    // Split them (full session ids on cello_list_sessions / cello_status already let a pasted id match).
+    if (sessionNodeManager.getSessionRecord(agentName, sessionId)) {
+      // The session is THIS agent's — it simply has no seal certificate yet.
       return {
         ok: false,
-        reason: "sealed_receipt_not_found",
-        guidance: "No sealed certificate is recorded for this session. It may not be sealed yet, or the session_id is wrong — close it with cello_close_session and confirm it reports sealed, then retry.",
+        reason: "not_sealed_yet",
+        guidance: "This session exists but is not sealed yet. Close it with cello_close_session and confirm it reports sealed (or wait for the counterparty to co-seal), then retry.",
       };
     }
-    return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+    // Owned by a DIFFERENT loaded agent → the caller has the wrong current agent selected.
+    const owner = loadedAgents.find((a) => a.name !== agentName && sessionNodeManager.getSessionRecord(a.name, sessionId));
+    if (owner) {
+      return {
+        ok: false,
+        reason: "wrong_agent",
+        guidance: `This session belongs to agent '${owner.name}', not the current agent '${agentName}'. Call cello_use_agent('${owner.name}') then retry cello_get_sealed_receipt.`,
+      };
+    }
+    // A truncated paste: the id is a strict prefix of one of this agent's real session ids.
+    const truncated = sessionNodeManager
+      .getSessionsForAgent(agentName)
+      .some((s) => s.session_id.startsWith(sessionId) && s.session_id.length > sessionId.length);
+    if (truncated) {
+      return {
+        ok: false,
+        reason: "session_id_too_short",
+        guidance: "That looks like a truncated session id. cello_list_sessions and cello status show the FULL id — copy the complete id and retry.",
+      };
+    }
+    return {
+      ok: false,
+      reason: "unknown_session",
+      guidance: "No session with this id belongs to the current agent. Run cello_list_sessions to see the full ids of this agent's sessions.",
+    };
   });
 
   // DOD-LOG-1 (PERSIST-LOG-001): read the durable, decrypted conversation transcript for a session —
@@ -3566,6 +3598,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey);
     }
 
+    return { ok: true };
+  });
+
+  // M8C-INBOX-1: test hook to enqueue a pending inbound session request (mirrors the real inbound
+  // flow's enqueueInboundSession) so cello_check_notifications' pending_session_requests is testable
+  // without standing up the full libp2p inbound path.
+  handlers.set("__test_enqueue_inbound_session", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const sessionIdHex = params?.sessionId as string | undefined;
+    const counterpartyPubkeyHex = (params?.counterpartyPubkey as string) ?? "";
+    if (!agentName || !sessionIdHex) {
+      return { error: "missing_params", guidance: "Provide agentName and sessionId." };
+    }
+    enqueueInboundSession(agentName, { sessionIdHex, counterpartyPubkeyHex, genesisPrevRootHex: "" });
     return { ok: true };
   });
   } // end CELLO_ENV=test guard
@@ -4863,6 +4909,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // 1) Deliverable content wins — drain one buffered message per call (FIFO).
       const entry = sessionNodeManager.takeReceivedContent(agentName, sessionId);
       if (entry) {
+        // M8C-INBOX-1 (N3): delivery marks read — advance the persisted read watermark so this
+        // message no longer counts as unread in cello_check_notifications. Monotonic (never lowers).
+        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, entry.sequenceNumber);
         return {
           ok: true,
           content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
@@ -4910,6 +4959,48 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   };
   handlers.set("cello_receive", handleReceive);
   handlers.set("cello_receive_session", handleReceive);
+
+  // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
+  // Notifications are fire-and-forget (no ack, no redelivery); this is how a client discovers what
+  // it missed while its shim was down/busy, and the primary inbox for poll-only clients (Bedrock,
+  // cron). Content-free: pending session requests (from the in-memory queue, READ non-destructively —
+  // cello_await_session owns draining) + unread message counts (derived from the persisted read
+  // watermark, N2). No separate notification store; no ack verb (N4).
+  handlers.set("cello_check_notifications", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    const scope = params?.scope === "all" ? "all" : "current";
+
+    let agentNames: string[];
+    if (scope === "all") {
+      agentNames = loadedAgents.map((a) => a.name);
+    } else {
+      // F18: an explicit current agent, else the sole-online agent; ambiguous → no_current_agent.
+      const current = resolveCurrentAgent(connState);
+      if (!current) {
+        return {
+          ok: false,
+          reason: "no_current_agent",
+          guidance: "No current agent for this connection. Call cello_use_agent to select one, or use scope:\"all\" to check every loaded agent.",
+        };
+      }
+      agentNames = [current];
+    }
+
+    const agents = agentNames.map((agent) => {
+      const pending = (inboundSessionQueues.get(agent) ?? []).map((e) => ({
+        session_id: e.sessionIdHex,
+        from: e.counterpartyPubkeyHex,
+      }));
+      const unread = sessionNodeManager.getUnreadSummary(agent);
+      const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
+      return { agent, pending_session_requests: pending, unread, total_unread };
+    });
+
+    const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
+    const totalPending = agents.reduce((sum, a) => sum + a.pending_session_requests.length, 0);
+    logger.info("inbox.checked", { connectionId, scope, agentCount: agents.length, totalUnread, totalPending });
+    return { ok: true, scope, agents };
+  });
 
   let shutdownPromise: Promise<void> | null = null;
   handlers.set("shutdown", async (_params, _connectionId) => {
