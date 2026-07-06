@@ -53,9 +53,20 @@ export class IpcProxy {
   #nextId = 1;
   #pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   #buffer = "";
+  #notificationHandler: ((frame: Record<string, unknown>) => void) | null = null;
 
   constructor(socketPath: string) {
     this.#socketPath = socketPath;
+  }
+
+  /**
+   * Register a handler for server-initiated notification frames (frames with a `notification`
+   * key and no `id`). The daemon's NotificationDispatcher pushes these; the Claude Code shim
+   * translates each into an MCP `notifications/claude/channel` event (CELLO-M8C-WAKE-001,
+   * channel stage 1). Only one handler is supported — the last registration wins.
+   */
+  onNotification(handler: (frame: Record<string, unknown>) => void): void {
+    this.#notificationHandler = handler;
   }
 
   /**
@@ -179,9 +190,19 @@ export class IpcProxy {
         continue;
       }
 
-      // Check for notification frames (server-initiated, no id)
+      // Check for notification frames (server-initiated, no id). This branch runs BEFORE response
+      // correlation and never touches #pending — a notification must never be mistaken for a
+      // response nor consume a pending request (CELLO-M8C-WAKE-001, falsify-first).
       if ("notification" in frame) {
-        // Notifications are not correlated to requests; skip for now
+        try {
+          this.#notificationHandler?.(frame);
+        } catch (err: unknown) {
+          // A throwing handler must not kill the read loop — subsequent responses/notifications
+          // must still be processed. The shim's bridge does its own C5 error-fidelity logging;
+          // this is the last-resort guard for the proxy's own read loop.
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`cello-mcp: notification handler threw: ${msg}\n`);
+        }
         continue;
       }
 

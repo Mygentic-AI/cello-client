@@ -117,10 +117,22 @@ function jsonText(value: unknown): { content: [{ type: "text"; text: string }] }
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
 }
 
-const server = new McpServer({
-  name: "cello",
-  version: pkgForServer.version,
-});
+// Structured diagnostics for the shim. The shim holds no injected logger (it is a thin proxy),
+// so it writes `domain.noun.verb` events as JSON to the stderr tee — never console.log.
+function logEvent(event: string, context: Record<string, unknown> = {}): void {
+  process.stderr.write(JSON.stringify({ event, ...context }) + "\n");
+}
+
+const server = new McpServer(
+  {
+    name: "cello",
+    version: pkgForServer.version,
+  },
+  // CELLO-M8C-WAKE-001 (channel stage 1): declare the claude/channel capability so a `--channels`
+  // Claude Code session negotiates it and the daemon's doorbell notifications reach the model's
+  // context (mirrors the legacy in-process server.ts). Content never rides — see the bridge below.
+  { capabilities: { experimental: { "claude/channel": {} } } },
+);
 
 // ─── Agent management tools ─────────────────────────────────────────────────
 
@@ -243,3 +255,32 @@ server.tool("cello_get_inclusion_proof", "Get inclusion proof for a message in a
 
 // ─── Connect stdio transport ─────────────────────────────────────────────────
 await server.connect(new StdioServerTransport());
+
+// ─── Channel stage 1 (CELLO-M8C-WAKE-001): forward daemon notifications ──────────
+// The daemon's NotificationDispatcher pushes content-free doorbell frames over IPC
+// ({ notification: <type>, data: {...} }). The shim translates each into an MCP
+// `notifications/claude/channel` event so a live `--channels` session wakes in-context. This is
+// adapter-specific wire translation (the shim's job); the daemon owns the dispatch behavior.
+// Registered AFTER server.connect so the transport is live. Registered generically so every
+// current type (agent_state_changed / agent_current_changed / session_state_changed) AND the
+// future `cello_message` (MSGWAKE) ride the same hop — no per-type allowlist that would silently
+// drop a new type.
+proxy.onNotification((frame) => {
+  // The daemon frame's `data` blob is content-free (agent, type, agentName, sessionId, state,
+  // counterpartyPubkey) — no message content ever rides a push (INV-CONTENTFREE / SI-001).
+  const data = (frame as { data?: Record<string, unknown> }).data ?? {};
+  const type = typeof data["type"] === "string" ? (data["type"] as string) : String(frame["notification"]);
+  const agent = data["agent"];
+  server.server
+    .notification({ method: "notifications/claude/channel", params: data })
+    .then(() => {
+      logEvent("notification.channel.forwarded", { type, agent });
+    })
+    .catch((err: unknown) => {
+      // C5 error fidelity (D7 porting trap): the push is fire-and-forget, but a failure is NEVER
+      // silent. The transport may have closed; record the real reason so a missing wake is
+      // explainable. Recovery is INBOX / cello_await_session on reattach (INV-PUSHPULL).
+      const message = err instanceof Error ? err.message : String(err);
+      logEvent("notification.push.failed", { type, agent, error: message });
+    });
+});
