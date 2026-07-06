@@ -114,7 +114,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(result1).toEqual({ ok: true });
 
     // Verify agent is now online
-    const list1 = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list1 = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice1 = list1.agents.find((a) => a.name === "alice");
     expect(alice1?.state).toBe("online");
 
@@ -141,13 +141,13 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     await client.send("cello_start_agent", { name: "alice" });
 
-    const result = await client.send("cello_use_agent", { name: "alice" });
-    expect(result).toEqual({ ok: true });
+    const result = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
+    expect(result.ok).toBe(true); // M8C-AUTOSTART-1: may also carry a non-blocking not_registered warning
 
-    // Verify agent shows as 'current'
-    const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    // Verify agent shows as selected (M8C-AUTOSTART-1 F5: selected flag, not state:"current")
+    const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice = list.agents.find((a) => a.name === "alice");
-    expect(alice?.state).toBe("current");
+    expect(alice?.selected).toBe(true);
 
     // Verify agent.current.switched event
     const switchEvent = logEvents.find((e) => e.event === "agent.current.switched");
@@ -170,7 +170,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(result).toEqual({ ok: true });
 
     // Verify agent is now registered
-    const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice = list.agents.find((a) => a.name === "alice");
     expect(alice?.state).toBe("registered");
 
@@ -204,17 +204,17 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Verify isolation
-    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
-    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
 
     // Connection 1: alice=current, bob=online, charlie=registered
-    expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("current");
+    expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
     expect(list1.agents.find((a) => a.name === "bob")?.state).toBe("online");
     expect(list1.agents.find((a) => a.name === "charlie")?.state).toBe("registered");
 
     // Connection 2: alice=online, bob=current, charlie=registered
     expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("online");
-    expect(list2.agents.find((a) => a.name === "bob")?.state).toBe("current");
+    expect(list2.agents.find((a) => a.name === "bob")?.selected).toBe(true);
     expect(list2.agents.find((a) => a.name === "charlie")?.state).toBe("registered");
 
     // Verify two distinct connectionIds
@@ -242,16 +242,16 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Now switch connection 2 to also use alice
-    const switchResult = await client2.send("cello_use_agent", { name: "alice" });
-    expect(switchResult).toEqual({ ok: true });
+    const switchResult = await client2.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
+    expect(switchResult.ok).toBe(true); // M8C-AUTOSTART-1: may also carry a not_registered warning
 
     // Connection 2 sees alice as current
-    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
-    expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("current");
+    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    expect(list2.agents.find((a) => a.name === "alice")?.selected).toBe(true);
 
     // Connection 1 still sees alice as current (independent)
-    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
-    expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("current");
+    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
 
     // Verify agent.current.switched only fired for connection 2 (not connection 1)
     const switchEvents = logEvents.filter(
@@ -319,17 +319,22 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     ).rejects.toThrow();
   });
 
-  // ─── AC-011: agent_not_online vs agent_not_found distinction ───
-  it("AC-011: cello_use_agent returns agent_not_online for registered agent", async () => {
+  // ─── AC-011: use_agent AUTO-STARTS an offline agent (M8C-AUTOSTART-1) vs agent_not_found ───
+  // Supersedes the pre-M8C agent_not_online behavior: use_agent no longer requires a prior
+  // cello_start_agent — it auto-starts a loaded-but-offline agent, then selects it (login → use_agent).
+  it("AC-011: cello_use_agent auto-starts an offline (registered) agent and selects it", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
-    // Agent exists but is not online (still Registered)
-    const result = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; reason: string; guidance: string };
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBe("agent_not_online");
-    expect(result.guidance).toContain("cello_start_agent");
+    // Agent exists but is not online (still Registered) — use_agent must bring it online + select it.
+    const result = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean };
+    expect(result.ok).toBe(true);
+
+    const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    const alice = list.agents.find((a) => a.name === "alice");
+    expect(alice?.state).toBe("online");
+    expect(alice?.selected).toBe(true);
   });
 
   it("AC-011: cello_use_agent returns agent_not_found for unknown agent", async () => {
@@ -386,14 +391,17 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(r.guidance).toContain("cello_");
     });
 
-    it("agent_not_online includes guidance", async () => {
+    it("not_registered warning includes actionable guidance (M8C-AUTOSTART-1)", async () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
 
-      const r = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; guidance: string };
-      expect(r.ok).toBe(false);
-      expect(r.guidance).toContain("cello_start_agent");
+      // use_agent auto-starts + selects an unregistered agent, and its non-blocking warning
+      // carries next-step guidance (register to enable sessions).
+      const r = await client.send("cello_use_agent", { name: "alice" }) as { ok: boolean; warning?: string; warning_guidance?: string };
+      expect(r.ok).toBe(true);
+      expect(r.warning).toBe("not_registered");
+      expect(r.warning_guidance).toContain("cello register");
     });
 
     it("agent_already_current includes guidance", async () => {
@@ -429,7 +437,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     // agents array with per-connection perspective
     const agents = status.agents as Array<{ name: string; state: string; pubkey?: string }>;
     const alice = agents.find((a) => a.name === "alice");
-    expect(alice?.state).toBe("current");
+    expect(alice?.selected).toBe(true);
     expect(alice?.pubkey).toBeDefined();
     expect((alice?.pubkey as string).length).toBeGreaterThan(0);
 
@@ -456,13 +464,13 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client2.send("cello_use_agent", { name: "bob" });
 
     // Connection 2 calls cello_list_agents and sees bob as current, not alice
-    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
-    expect(list2.agents.find((a) => a.name === "bob")?.state).toBe("current");
+    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    expect(list2.agents.find((a) => a.name === "bob")?.selected).toBe(true);
     expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("online");
 
     // Connection 1 still sees alice as current
-    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
-    expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("current");
+    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
+    expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
     expect(list1.agents.find((a) => a.name === "bob")?.state).toBe("online");
   });
 
@@ -482,10 +490,10 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client1.send("cello_stop_agent", { name: "alice" });
 
     // Both connections should now see alice as registered, not current
-    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("registered");
 
-    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("registered");
   });
 
@@ -532,9 +540,9 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(sessionResult.reason).toBeDefined();
 
     // Non-directory-requiring tool succeeds (proves partitioning)
-    const listResult = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const listResult = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     expect(listResult.agents).toBeDefined();
-    expect(listResult.agents.find((a) => a.name === "alice")?.state).toBe("current");
+    expect(listResult.agents.find((a) => a.name === "alice")?.selected).toBe(true);
   });
 
   // ─── Connection disconnect cleans up per-connection state ───
@@ -552,7 +560,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     // New connection should not see alice as current
     const client2 = await connect(config.socketPath);
-    const list = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string }> };
+    const list = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     // Alice is still online (agent state persists), but not current for new connection
     expect(list.agents.find((a) => a.name === "alice")?.state).toBe("online");
   });

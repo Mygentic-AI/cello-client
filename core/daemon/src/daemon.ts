@@ -1437,17 +1437,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return agents
       .filter((a) => a.state !== "load_failed")
       .map((a) => {
-        let state: AgentInfo["state"];
-        if (a.name === currentAgent && onlineAgents.has(a.name)) {
-          state = "current";
-        } else if (onlineAgents.has(a.name)) {
-          state = "online";
-        } else {
-          state = "registered";
-        }
+        // M8C-AUTOSTART-1 (F5): `state` reports readiness only (online vs registered); selection
+        // is a SEPARATE `selected` flag. Previously `state = "current"` overloaded the current
+        // agent, making it read as a different readiness level than a second healthy online agent.
+        const online = onlineAgents.has(a.name);
+        const state: AgentInfo["state"] = online ? "online" : "registered";
+        const selected = online && a.name === currentAgent;
         return {
           name: a.name,
           state,
+          selected,
           pubkey: a.pubkey,
           // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
@@ -1537,11 +1536,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   // ─── MCP-001: cello_start_agent handler ───
-  handlers.set("cello_start_agent", async (params, _connectionId) => {
-    const name = params?.name as string | undefined;
-    if (!name) {
-      return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to start." };
-    }
+  // M8C-AUTOSTART-1 (A2): the shared start path. Extracted from cello_start_agent so cello_use_agent
+  // can AUTO-START an offline agent through the exact same code (idempotent, same signaling +
+  // standing-receiver setup, same agent_state_changed event) — never a divergent shim-side retry.
+  // Permissive by design (D12): an agent that exists goes online regardless of directory
+  // registration state (online-without-registration is an established contract). Returns a
+  // structured failure so callers can surface agent_start_failed with a real reason + guidance.
+  function startAgentInternal(name: string): { ok: true } | { ok: false; reason: string; guidance: string } {
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Run 'cello login' to register agents, or check agent names with cello_list_agents.` };
@@ -1586,6 +1587,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
     return { ok: true };
+  }
+
+  // M8C-AUTOSTART-1 (F18): resolve which agent a name-defaulting tool should act on for this
+  // connection: an explicit name wins; else the connection's current agent; else — when EXACTLY one
+  // agent is online daemon-wide — that sole agent (removes the "why did it forget my agent" moment
+  // after a /mcp reconnect). Two-or-more online with none selected stays ambiguous → null (the
+  // caller returns no_current_agent), because guessing between peers would misroute.
+  function resolveCurrentAgent(connState: { currentAgent: string | null } | undefined, explicitName?: string): string | null {
+    if (explicitName) return explicitName;
+    if (connState?.currentAgent) return connState.currentAgent;
+    if (onlineAgents.size === 1) return [...onlineAgents][0];
+    return null;
+  }
+
+  // ─── MCP-001: cello_start_agent handler ───
+  // Bring a registered agent online WITHOUT claiming it as this connection's current agent.
+  handlers.set("cello_start_agent", async (params, _connectionId) => {
+    const name = params?.name as string | undefined;
+    if (!name) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to start." };
+    }
+    return startAgentInternal(name);
   });
 
   // ─── PERSIST-002 (AC-004): cello_create_agent handler ───
@@ -1842,14 +1865,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_list_agents.` };
-    }
-    if (!onlineAgents.has(name)) {
-      return { ok: false, reason: "agent_not_online", guidance: `Agent '${name}' exists but is not online. Call cello_start_agent('${name}') first to bring it online, then retry cello_use_agent.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_list_agents.` };
     }
     const connState = perConnectionState.get(connectionId);
     if (!connState) {
       return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
+    }
+    // M8C-AUTOSTART-1 (A1): auto-start the agent if it is not online, so the incantation collapses
+    // to `login → use_agent` (no separate cello_start_agent). On a start failure, return a
+    // structured agent_start_failed and leave the current selection UNCHANGED — no half-selected
+    // state (A3). cello_start_agent stays available for bring-online-without-claiming.
+    if (!onlineAgents.has(name)) {
+      logger.info("agent.autostart.attempted", { connectionId, agentName: name });
+      const startRes = startAgentInternal(name);
+      if (!startRes.ok) {
+        logger.warn("agent.autostart.failed", { connectionId, agentName: name, reason: startRes.reason });
+        return {
+          ok: false,
+          reason: "agent_start_failed",
+          start_reason: startRes.reason,
+          guidance: `Could not start agent '${name}' to select it: ${startRes.guidance} Your current agent is unchanged.`,
+        };
+      }
     }
     if (connState.currentAgent === name) {
       return { ok: false, reason: "agent_already_current", guidance: `Agent '${name}' is already the current agent for this connection. No action needed — you can proceed with session operations.` };
@@ -1860,7 +1897,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     notificationDispatcher.setCurrentAgent(connectionId, name);
     notificationDispatcher.dispatchAgentCurrentChanged(connectionId, fromAgent, name);
     logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name });
-    return { ok: true };
+    // M8C-AUTOSTART-1 (A3, D12): not_registered is a NON-BLOCKING warning — the agent is selected
+    // and usable locally, but it cannot establish directory sessions until registered. Surface the
+    // next step (ONBOARD-NEXTSTEP style) without stranding the selection. One-row read.
+    const result: Record<string, unknown> = { ok: true };
+    try {
+      const reg = await new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName: name, logger }).loadRegistrationState();
+      if (!reg || reg.status !== "active") {
+        result["warning"] = "not_registered";
+        result["warning_guidance"] = `Agent '${name}' is now selected but is not registered with the directory — run 'cello register ${name}' to enable sessions with peers. Run 'cello status' to watch registration complete.`;
+      }
+    } catch (err: unknown) {
+      // A failed registration read must not break selection (the agent IS selected). Log the real
+      // reason so the missing warning is explainable; the selection still succeeds.
+      logger.warn("agent.registration.read.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+    }
+    return result;
   });
 
   // ─── MCP-001: cello_list_agents handler ───
@@ -2563,7 +2615,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // ─── M8B DOD-REFRESH-1: cello_refresh_shares — proactive share refresh / epoch rollover ───
   handlers.set("cello_refresh_shares", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    const agentName = (params?.name as string | undefined) ?? connState?.currentAgent;
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
       return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
     }
@@ -2596,7 +2648,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // ─── M8B DOD-RELAYSIG-1: cello_get_relay_receipts — the agent's stored relay ordering receipts ───
   handlers.set("cello_get_relay_receipts", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    const agentName = (params?.name as string | undefined) ?? connState?.currentAgent;
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
       return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
     }

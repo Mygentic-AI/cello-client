@@ -101,6 +101,13 @@ export interface AgentInfo {
    * sessions — is visible per-agent, not hidden behind the daemon-level ANY-agent aggregate.
    */
   standing_receiver_ready?: boolean;
+  /**
+   * M8C-AUTOSTART-1 (F5): whether THIS agent is the current (selected) agent for the requesting
+   * connection. Split out from `state` so a selected agent reads `state: "online"` + `selected: true`
+   * — `state` no longer overloads the value "current", so two healthy agents don't read as
+   * different readiness levels.
+   */
+  selected?: boolean;
 }
 
 // --- Connection state ---
