@@ -1,0 +1,42 @@
+{
+  "name": "@cello-protocol/gateway",
+  "version": "0.0.1",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "cello-gateway": "./dist/bin/cello-gateway.js"
+  },
+  "files": [
+    "dist/",
+    "package.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "re2-wasm": "^1.0.2"
+  },
+  "optionalDependencies": {
+    "re2": "^1.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "tsx": "^4.22.4"
+  }
+}

@@ -138,7 +138,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const h = await start(false);
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode("aa".repeat(16), "alice", "bobpubkeyhex", "peer-1", "corr");
-    snm.ingestReceivedContent("alice", "aa".repeat(16), new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
+    await snm.ingestReceivedContent("alice", "aa".repeat(16), new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
     await wait(30);
     expect(bot.sent).toHaveLength(0); // never configured — nothing sent, no crash
   });
@@ -177,8 +177,8 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     await snm.createSessionNode(sid, "alice", "bobpubkeyhex", "peer-1", "corr");
     snm.addContact("alice", "bobpubkeyhex"); // known — no AWAY-1 auto-ack noise in this test
 
-    snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
-    snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
+    await snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
+    await snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
     await wait(30);
     const waitingMsgs = bot.sent.filter((s) => s.text.includes("message waiting"));
     expect(waitingMsgs).toHaveLength(1); // G3: coalesced — two messages, one ring
@@ -188,7 +188,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     await client.send("cello_receive", { session_id: sid, timeout_ms: 100 });
     await client.send("cello_receive", { session_id: sid, timeout_ms: 100 });
 
-    snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m3"), msgLeafHash(new TextEncoder().encode("m3")), "c3");
+    await snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m3"), msgLeafHash(new TextEncoder().encode("m3")), "c3");
     await wait(30);
     const waitingMsgs2 = bot.sent.filter((s) => s.text.includes("message waiting"));
     expect(waitingMsgs2).toHaveLength(2); // G4: a NEW message after a read rings again
@@ -284,14 +284,14 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     snm.addContact("alice", "cp-a-pubkeyhex");
     snm.addContact("alice", "cp-b-pubkeyhex");
 
-    snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a1"), msgLeafHash(new TextEncoder().encode("a1")), "ca1");
-    snm.ingestReceivedContent("alice", sidB, new TextEncoder().encode("b1"), msgLeafHash(new TextEncoder().encode("b1")), "cb1");
+    await snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a1"), msgLeafHash(new TextEncoder().encode("a1")), "ca1");
+    await snm.ingestReceivedContent("alice", sidB, new TextEncoder().encode("b1"), msgLeafHash(new TextEncoder().encode("b1")), "cb1");
     await wait(30);
     expect(bot.sent.filter((s) => s.text.includes("message waiting"))).toHaveLength(2); // BOTH ring — independent
 
     // A second message on A alone must NOT ring again (still coalesced for A), and must not
     // affect B's own independent coalescing state either.
-    snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a2"), msgLeafHash(new TextEncoder().encode("a2")), "ca2");
+    await snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a2"), msgLeafHash(new TextEncoder().encode("a2")), "ca2");
     await wait(30);
     expect(bot.sent.filter((s) => s.text.includes("message waiting"))).toHaveLength(2); // unchanged
   });

@@ -31,6 +31,7 @@
   },
   "dependencies": {
     "@cello-protocol/crypto": "workspace:*",
+    "@cello-protocol/gateway": "workspace:*",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
     "@libp2p/interface": "^3.0.0",

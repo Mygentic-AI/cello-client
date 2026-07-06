@@ -266,7 +266,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     // A received leaf (via ingest) also advances it — column tracks the tree, so a
     // post-active-messaging seal binds the real transcript length, not 0.
     const content = new TextEncoder().encode("b");
-    mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
     expect(mgr.getSessionRecord("alice", sid)!.message_count).toBe(2);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(2);
   });
@@ -278,7 +278,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const contentHash = msgLeafHash(content);
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
 
-    const res = mgr.ingestReceivedContent("alice", sid, content, contentHash);
+    const res = await mgr.ingestReceivedContent("alice", sid, content, contentHash);
     expect(res.ok).toBe(true);
     expect(mgr.getSessionTreeRootHex("alice", sid)).not.toBe(rootBefore);
 
@@ -301,7 +301,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const wrongHash = msgLeafHash(new TextEncoder().encode("tampered"));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
 
-    const res = mgr.ingestReceivedContent("alice", sid, content, wrongHash);
+    const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash);
     expect(res.ok).toBe(false);
     expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootBefore);
     expect(mgr.takeReceivedContent("alice", sid)).toBeNull();
@@ -342,7 +342,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
       const content = new TextEncoder().encode("from-bob");
       const correlationId = "flow-xyz-789";
-      mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content), correlationId);
+      await mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content), correlationId);
       const recv = events.find((e) => e.event === "session.content.received");
       expect(recv).toBeDefined();
       expect(recv!.context.correlationId).toBe(correlationId);
@@ -377,7 +377,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const mgr = await makeManager(logger, join(tempDir, "ev.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     const content = new TextEncoder().encode("secret-payload");
-    mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
+    await mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
     const persistedRoot = mgr.getSessionTreeRootHex("alice", sid);
 
     await mgr.destroySessionNode("alice", sid, "sealed");
@@ -400,7 +400,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
     // One leaf arrives while active — accepted, then drained.
     const c1 = new TextEncoder().encode("m1");
-    expect(mgr.ingestReceivedContent("alice", sid, c1, msgLeafHash(c1)).ok).toBe(true);
+    expect((await mgr.ingestReceivedContent("alice", sid, c1, msgLeafHash(c1))).ok).toBe(true);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
     expect(mgr.takeReceivedContent("alice", sid)).not.toBeNull();
 
@@ -414,7 +414,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
     // A late inbound frame MUST be rejected — the frozen tree is not mutated.
     const c2 = new TextEncoder().encode("late-frame");
-    const res = mgr.ingestReceivedContent("alice", sid, c2, msgLeafHash(c2));
+    const res = await mgr.ingestReceivedContent("alice", sid, c2, msgLeafHash(c2));
     expect(res.ok).toBe(false);
     expect(mgr.getSessionTree("alice", sid).size()).toBe(1);
     expect(mgr.getSessionTreeRootHex("alice", sid)).toBe(rootAfterCommit);

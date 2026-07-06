@@ -222,7 +222,7 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
 
     // leaf 1: counterparty content arrives (received), buffered for delivery.
     const inbound = new TextEncoder().encode("from counterparty");
-    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
 
     // connB drains ONLY the buffered received content (leaf 1) via live cello_receive — it has
     // still never read leaf 0 (connA's sent message).
@@ -257,8 +257,8 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     // Seed unread history on BOTH sessions.
     const msgA = new TextEncoder().encode("on A");
     const msgB = new TextEncoder().encode("on B");
-    snm.ingestReceivedContent("alice", SID_A, msgA, msgLeafHash(msgA), "corr-a");
-    snm.ingestReceivedContent("alice", SID_B, msgB, msgLeafHash(msgB), "corr-b");
+    await snm.ingestReceivedContent("alice", SID_A, msgA, msgLeafHash(msgA), "corr-a");
+    await snm.ingestReceivedContent("alice", SID_B, msgB, msgLeafHash(msgB), "corr-b");
 
     // Catch up ONLY on session A.
     await client.send("cello_get_transcript", { session_id: SID_A });

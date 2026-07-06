@@ -46,6 +46,7 @@ import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
+import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { HttpTelegramBotClient, type TelegramBotClient } from "./telegram-bot-client.js";
@@ -335,12 +336,25 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   await mkdir(dirname(socketPath), { recursive: true });
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
 
+  // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
+  // cello_send and the inbound screen inside SessionNodeManager. Absent config falls back to a
+  // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
+  // still returning a verdict (SI-001).
+  const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
+  // M9-CORE-001 observability: announce the gateway mode at startup. The sidecar socket connects
+  // lazily on the first screen, so this records which adapter is wired (sidecar vs the always-allow
+  // passthrough default), not a live socket handshake.
+  logger.info("security.gateway.connected", {
+    mode: config.securityGateway ? "sidecar" : "passthrough",
+  });
+
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
     logger,
     dbPath: join(celloDir, "sessions.db"),
     contentTtfMs: config.contentTtfMs,
     autoNatProbers: () => [],
+    securityGateway,
   });
   await sessionNodeManager.initialize();
 
@@ -3757,12 +3771,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       if (env.structure1Cbor && env.structure2Cbor) {
         sessionNodeManager.recordOrderingRecord(recipientAgent.name, e.sessionIdHex, env.structure1Cbor, env.structure2Cbor, contentHashBytes);
       }
-      const ingest = sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
+      const ingest = await sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
         // distinctly so the tally reflects leaves actually written, not content still queued in memory.
         logger.info("content.recover.held", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, canonicalSeq: ingest.sequenceNumber });
+      } else if (ingest.ok && ingest.screenedOut) {
+        // M9 (code-review LOW-3): a terminal-screened recovered entry IS durably leafed (so it must be
+        // confirm-deleted, below) but was NEVER delivered to the agent — do not count it as a delivered
+        // recovery, and log it distinctly so observability separates "delivered" from "leafed-but-screened".
+        logger.info("content.recover.screened_out", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
+        try {
+          await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+        } catch (err: unknown) {
+          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
+        }
       } else if (ingest.ok) {
         // DOD-MSG-4 (review #3): count leaves ACTUALLY written — the directly-ingested leaf PLUS any
         // held out-of-order entries this ingest unblocked (appendedCount), not just 1.
@@ -5157,7 +5181,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // finding #2), so it reflects EVERY message in the session regardless of which connection sent
     // or received it. If this connection hasn't read up to current_seq (e.g. a second attended
     // session on the same agent that hasn't polled since the other connection's last send), refuse
-    // rather than let it send blind — the WhatsApp-group-chat model.
+    // rather than let it send blind — the WhatsApp-group-chat model. Runs BEFORE M9's
+    // governance-decisions parsing below — an access-control gate should short-circuit before any
+    // unrelated prep work for a send that may not even be allowed to proceed.
     const currentSeq = record.message_count - 1;
     const lastReadSeq = getConnectionCursor(connectionId, sessionId);
     if (lastReadSeq < currentSeq) {
@@ -5171,6 +5197,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         last_read_seq: lastReadSeq,
         guidance: `This connection hasn't caught up on session ${sessionId} — ${currentSeq - lastReadSeq} message(s) unread (this may include messages authored by another connection on this same agent). Call cello_get_transcript to read the full history (covers both sent and received), then retry the send.`,
       };
+    }
+
+    // M9-FEED-001 §6: the agent's governance re-send decisions, keyed by the flagId a prior `warn`
+    // returned. Optional; validated shape only (the gateway re-scans + applies them, INV-4). A
+    // malformed map is ignored rather than failing the send (the gateway will just re-warn).
+    const rawDecisions = params?.governance_decisions;
+    let governanceDecisions: Record<string, "redact" | "allow_once" | "allow_always"> | undefined;
+    if (rawDecisions && typeof rawDecisions === "object" && !Array.isArray(rawDecisions)) {
+      const valid: Record<string, "redact" | "allow_once" | "allow_always"> = {};
+      for (const [k, v] of Object.entries(rawDecisions as Record<string, unknown>)) {
+        if (v === "redact" || v === "allow_once" || v === "allow_always") valid[k] = v;
+      }
+      if (Object.keys(valid).length > 0) governanceDecisions = valid;
     }
 
     const correlationId = randomUUID();
@@ -5195,18 +5234,76 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
-    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
-    const contentHashHex = Buffer.from(contentHash).toString("hex");
     const recipientPubkey = record.counterparty_pubkey;
 
-    const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, contentBytes, new Uint8Array(contentHash), correlationId);
+    // M9 outbound screening seam (INV-5/SI-001). Screen BEFORE anything reaches the wire. The
+    // gateway verdict drives the four cello_send outcomes (M9-FEED-001): block / warn → NOT sent;
+    // allow → sent as-is; redact → sent in ALTERED form. A configured-but-unreachable gateway fails
+    // closed (block, gateway_unavailable), so a screening outage can never let content out ungated.
+    const outboundVerdict = await securityGateway.screenOutbound(contentBytes, {
+      direction: "outbound",
+      agentName: record.agent_name,
+      sessionId,
+      correlationId,
+      ...(governanceDecisions !== undefined ? { governanceDecisions } : {}),
+    });
+    if (outboundVerdict.disposition === "block") {
+      if (outboundVerdict.reason === GOVERNANCE_TIMEOUT) {
+        logger.error("security.gateway.timeout", { sessionId, reason: outboundVerdict.reason, correlationId });
+      } else if (outboundVerdict.reason === GATEWAY_UNAVAILABLE) {
+        logger.error("security.gateway.unavailable", { direction: "outbound", reason: outboundVerdict.reason, correlationId });
+      } else {
+        logger.info("security.verdict.returned", { disposition: "block", sessionId, reason: outboundVerdict.reason, correlationId });
+      }
+      return {
+        ok: false,
+        reason: outboundVerdict.reason ?? "blocked_by_governance",
+        guidance: outboundVerdict.guidance ??
+          "This message was blocked by the security gateway and was NOT sent. The session is still active.",
+        blocks: (outboundVerdict.events ?? []).filter((e) => e.disposition === "block"),
+      };
+    }
+    if (outboundVerdict.disposition === "warn") {
+      logger.info("security.verdict.returned", { disposition: "warn", sessionId, correlationId });
+      return {
+        ok: false,
+        reason: "governance_warn",
+        guidance: outboundVerdict.guidance ??
+          "This message was held for a governance decision and was NOT sent. Re-send the same content with a " +
+          "governance_decisions map ({flagId: redact | allow_once | allow_always}) to resolve each flagged item.",
+        flags: (outboundVerdict.events ?? []).filter((e) => e.disposition === "warn"),
+      };
+    }
+
+    // FAIL-CLOSED (code-review MED): a `redact` verdict MUST carry the redacted content. If it ever
+    // arrives without it, sending the original `contentBytes` would leak the pre-redaction draft — the
+    // one place M9 could fail OPEN. Treat it as a block, never an allow-original. (Unreachable today:
+    // the gateway always includes content on redact; this is the defensive floor.)
+    if (outboundVerdict.disposition === "redact" && outboundVerdict.content === undefined) {
+      logger.error("security.verdict.redact_without_content", { sessionId, correlationId });
+      return {
+        ok: false,
+        reason: "redact_without_content",
+        guidance: "The security gateway returned a redact verdict without the redacted content. To avoid " +
+          "leaking the original, nothing was sent. This is a gateway fault — check the gateway logs and retry.",
+      };
+    }
+
+    // allow or redact → send. On redact the ALTERED bytes are what go on the wire AND what the leaf
+    // hash binds — the transcript records what was actually sent, not the pre-redaction draft.
+    const modified = outboundVerdict.disposition === "redact" && outboundVerdict.content !== undefined;
+    const sendBytes = modified ? new Uint8Array(outboundVerdict.content as Uint8Array) : contentBytes;
+    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(sendBytes).digest();
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+
+    const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
       // surface a named, diagnosable failure.
       const nonce = randomUUID();
       try {
-        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), contentBytes);
+        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
       } catch (err: unknown) {
         logger.error("session.content.queue.failed", {
           sessionId,
@@ -5232,7 +5329,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
-    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", contentBytes, correlationId);
+    // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
+    // contentBytes — the leaf hash above already binds sendBytes; the transcript must match what
+    // actually went on the wire, not the pre-redaction draft (M9's own stated seam invariant).
+    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", sendBytes, correlationId);
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
@@ -5244,7 +5344,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       correlationId,
     });
     void newRootHex;
-    return { ok: true, sequence_number: leafIndex };
+    if (modified) {
+      logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
+    }
+    return {
+      ok: true,
+      sequence_number: leafIndex,
+      delivered: true,
+      modified,
+      // On a redact, tell the agent exactly what was transformed (the §6 sender-side surface).
+      ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+    };
   });
 
   // ─── CELLO-M7-DAEMON-004 / F1-a: cello_receive (BLOCKING, session-scoped) ────────

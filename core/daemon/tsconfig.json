@@ -9,6 +9,7 @@
   "exclude": ["dist", "src/__tests__"],
   "references": [
     { "path": "../crypto" },
+    { "path": "../gateway" },
     { "path": "../transport" }
   ]
 }

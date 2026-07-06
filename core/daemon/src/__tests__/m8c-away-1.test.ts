@@ -202,13 +202,13 @@ describe("M8C-AWAY-1: away response", () => {
     snm.addContact("alice", "bobpubkeyhex");
 
     // A2: unattended (no connection yet) — an inbound message gets an away ack.
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
     await wait(30);
     let sentEvents = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
     expect(sentEvents).toHaveLength(1);
 
     // A4: a SECOND message in the SAME away period does not re-trigger.
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
     await wait(30);
     sentEvents = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
     expect(sentEvents).toHaveLength(1); // still just one — coalesced
@@ -224,7 +224,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50); // let the disconnect propagate (perConnectionState delete) before re-checking away
     // Reconnect check: attending clears dedup immediately on cello_use_agent (not on disconnect),
     // so the agent is "away" again right after this connection closes (no other attends it).
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("third"), msgLeafHash(new TextEncoder().encode("third")), "c3");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("third"), msgLeafHash(new TextEncoder().encode("third")), "c3");
     await wait(30);
     sentEvents = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
     expect(sentEvents).toHaveLength(2); // a fresh ack after re-attending then going away again
@@ -241,7 +241,7 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     await connectAs("alice"); // attended
 
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
     await wait(30);
 
     expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
@@ -262,8 +262,8 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.createSessionNode(SID_1, "alice", "cp1pubkeyhex", "peer-1", "corr-1");
     await snm.createSessionNode(SID_2, "alice", "cp2pubkeyhex", "peer-2", "corr-2");
 
-    snm.ingestReceivedContent("alice", SID_1, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
-    snm.ingestReceivedContent("alice", SID_2, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
+    await snm.ingestReceivedContent("alice", SID_1, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
+    await snm.ingestReceivedContent("alice", SID_2, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
     await wait(30);
 
     const acked = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
@@ -281,13 +281,13 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
 
     node.failNextStream = true; // the away-ack's own send will fail
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
     await wait(30);
     expect(events.find((e) => e.event === "session.away.response.failed")).toBeDefined();
     expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
 
     // Next arrival in the SAME away period (no attend in between) — must retry, not stay silent.
-    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
+    await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
     await wait(30);
     expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
   });

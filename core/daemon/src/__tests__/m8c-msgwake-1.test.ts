@@ -101,7 +101,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
 
     // Drive the REAL inbound funnel — this is what a live session content-frame does.
     const content = new TextEncoder().encode("hello from the peer");
-    const result = handle.getSessionNodeManager().ingestReceivedContent(
+    const result = await handle.getSessionNodeManager().ingestReceivedContent(
       "alice", sessionId, content, contentHash(content), "corr-msg",
     );
     expect(result.ok).toBe(true); // sanity: the real funnel accepted the message
@@ -149,14 +149,14 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
     const contentB = new TextEncoder().encode("second message");
     const hashB = contentHash(contentB);
     mgr.recordWitnessedSequence("alice", s, Buffer.from(hashB).toString("hex"), 1);
-    const heldRes = mgr.ingestReceivedContent("alice", s, contentB, hashB, "corr-B");
+    const heldRes = await mgr.ingestReceivedContent("alice", s, contentB, hashB, "corr-B");
     expect((heldRes as { held?: boolean }).held).toBe(true); // held, not appended
     await sleep(120);
     expect(notif.filter((n) => n.notification === "cello_message")).toHaveLength(0); // NO wake at hold
 
     // content_A fills seq 0 → appends (1 wake) AND unblocks the held content_B (released → 1 wake).
     const contentA = new TextEncoder().encode("first message");
-    mgr.ingestReceivedContent("alice", s, contentA, contentHash(contentA), "corr-A");
+    await mgr.ingestReceivedContent("alice", s, contentA, contentHash(contentA), "corr-A");
     await sleep(150);
     const msgs = notif.filter((n) => n.notification === "cello_message");
     expect(msgs).toHaveLength(2); // exactly one per real message (A + released B) — no premature/extra wake
@@ -177,8 +177,8 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
 
     const content = new TextEncoder().encode("delivered twice");
     const hash = contentHash(content);
-    mgr.ingestReceivedContent("alice", s, content, hash, "first");  // appends → 1 wake
-    const dupRes = mgr.ingestReceivedContent("alice", s, content, hash, "replay"); // same hash → dedup
+    await mgr.ingestReceivedContent("alice", s, content, hash, "first");  // appends → 1 wake
+    const dupRes = await mgr.ingestReceivedContent("alice", s, content, hash, "replay"); // same hash → dedup
     expect((dupRes as { appendedCount?: number }).appendedCount).toBe(0); // no new leaf
     await sleep(150);
     expect(notif.filter((n) => n.notification === "cello_message")).toHaveLength(1); // exactly one, not two

@@ -247,7 +247,9 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
 
   it("cello-mcp.ts forwards the snake_case session_id field for all three session tools", () => {
     const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
-    expect(src).toContain('proxy.call("cello_send", { session_id, content })');
+    // M9-FEED-001: cello_send also forwards the optional governance_decisions re-send map.
+    expect(src).toContain('proxy.call("cello_send", {\n    session_id,\n    content,');
+    expect(src).toContain("governance_decisions");
     expect(src).toContain('proxy.call("cello_receive", { session_id, timeout_ms, since_seq })'); // M8C-SINCESEQ-1: + since_seq
     expect(src).toContain('proxy.call("cello_close_session", { session_id })');
   });

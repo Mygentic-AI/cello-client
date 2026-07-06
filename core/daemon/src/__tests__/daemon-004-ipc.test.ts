@@ -278,7 +278,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // Buffer one inbound message so cello_receive has something to return.
     const inbound = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -369,7 +369,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     const content = new TextEncoder().encode("from-bob");
-    snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -661,7 +661,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       // Buffer is empty when the receive begins; content lands ~40ms later.
       const content = new TextEncoder().encode("delayed-hello");
       const recvPromise = client.send("cello_receive", { session_id: SID, timeout_ms: 2000 }) as Promise<Record<string, unknown>>;
-      setTimeout(() => snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content)), 40);
+      setTimeout(() => { void snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content)); }, 40);
 
       const res = await recvPromise;
       expect(res.ok).toBe(true);
@@ -696,7 +696,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     const content = new TextEncoder().encode("via-alias");
-    snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -720,7 +720,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
 
     // One inbound message is buffered but NEVER read (mirrors the live final-message race).
     const inbound = new TextEncoder().encode("unread-final-message");
-    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
 
     // Seal teardown evicts the unread buffer.
     await snm.destroySessionNode("alice", SID, "sealed");

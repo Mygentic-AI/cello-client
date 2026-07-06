@@ -12,4 +12,5 @@ export default defineWorkspace([
   // (127.0.0.1 libp2p, tmpdir SQLite) and must gate every publish.
   "core/daemon",
   "core/cli",
+  "core/gateway",
 ]);

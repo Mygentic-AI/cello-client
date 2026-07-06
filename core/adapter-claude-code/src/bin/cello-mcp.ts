@@ -181,8 +181,20 @@ server.tool("cello_await_session", "Wait for an inbound session request", {
 server.tool("cello_send", "Send a message in an active session", {
   session_id: z.string().describe("Session ID"),
   content: z.string().describe("Message content (UTF-8 text)"),
-}, async ({ session_id, content }) => {
-  const result = await proxy.call("cello_send", { session_id, content });
+  governance_decisions: z
+    .record(z.string(), z.enum(["redact", "allow_once", "allow_always"]))
+    .optional()
+    .describe(
+      "Optional governance re-send (M9-FEED-001). When a prior cello_send returned governance_warn " +
+      "with flags, re-send the SAME content plus this map of {flagId: \"redact\"|\"allow_once\"|" +
+      "\"allow_always\"} to resolve each flagged item. Omitted flags default to redact.",
+    ),
+}, async ({ session_id, content, governance_decisions }) => {
+  const result = await proxy.call("cello_send", {
+    session_id,
+    content,
+    ...(governance_decisions !== undefined ? { governance_decisions } : {}),
+  });
   return jsonText(result);
 });
 

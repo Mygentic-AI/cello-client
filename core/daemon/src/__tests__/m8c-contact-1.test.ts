@@ -242,9 +242,9 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     snm.addContact("alice", "knownpubkeyhex"); // pre-established as known; strangerpubkeyhex is not
 
     const m1 = new TextEncoder().encode("from stranger");
-    snm.ingestReceivedContent("alice", SID_UNKNOWN, m1, msgLeafHash(m1), "c1");
+    await snm.ingestReceivedContent("alice", SID_UNKNOWN, m1, msgLeafHash(m1), "c1");
     const m2 = new TextEncoder().encode("from known");
-    snm.ingestReceivedContent("alice", SID_KNOWN, m2, msgLeafHash(m2), "c2");
+    await snm.ingestReceivedContent("alice", SID_KNOWN, m2, msgLeafHash(m2), "c2");
     await wait(30);
 
     const unknownEvent = events.find((e) => e.event === "session.away.response.sent" && e.context.sessionId === SID_UNKNOWN);

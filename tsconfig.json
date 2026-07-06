@@ -8,6 +8,7 @@
     { "path": "core/client" },
     { "path": "core/daemon" },
     { "path": "core/cli" },
-    { "path": "core/adapter-claude-code" }
+    { "path": "core/adapter-claude-code" },
+    { "path": "core/gateway" }
   ]
 }
