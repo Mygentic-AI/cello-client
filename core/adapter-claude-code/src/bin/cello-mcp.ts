@@ -186,11 +186,12 @@ server.tool("cello_send", "Send a message in an active session", {
   return jsonText(result);
 });
 
-server.tool("cello_receive", "Receive a message from an active session", {
+server.tool("cello_receive", "Receive a message from an active session. With since_seq, instead returns a batch of all messages received after that sequence number (stateless catch-up for away-then-return — no replay race).", {
   session_id: z.string().describe("Session ID"),
-  timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000)"),
-}, async ({ session_id, timeout_ms }) => {
-  const result = await proxy.call("cello_receive", { session_id, timeout_ms });
+  timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000). Ignored when since_seq is set."),
+  since_seq: z.number().optional().describe("Catch-up mode: return all messages with sequence > since_seq as a batch, instead of waiting for the next live message."),
+}, async ({ session_id, timeout_ms, since_seq }) => {
+  const result = await proxy.call("cello_receive", { session_id, timeout_ms, since_seq });
   return jsonText(result);
 });
 

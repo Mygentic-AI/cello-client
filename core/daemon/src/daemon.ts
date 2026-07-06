@@ -4913,6 +4913,31 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
 
+    // M8C-SINCESEQ-1: stateless catch-up. When since_seq is provided, return a BATCH of received
+    // transcript messages with sequence > since_seq (durable transcript, not the ephemeral buffer —
+    // so concurrent arrivals don't shift what a given since_seq returns; no replay race). Replaces
+    // the cello_get_transcript workaround for away-then-return. Received-direction only (the messages
+    // you'd have gotten live). Advances the read watermark (delivery marks read — clears INBOX
+    // unread). A distinct early branch: the plain (no since_seq) receive is entirely unchanged.
+    const rawSince = params?.since_seq;
+    if (typeof rawSince === "number" && Number.isFinite(rawSince)) {
+      const sinceSeq = rawSince;
+      const from = record.counterparty_pubkey;
+      const { messages } = sessionNodeManager.readTranscript(agentName, sessionId);
+      const received = messages.filter((m) => m.direction === "received" && m.sequence > sinceSeq);
+      if (received.length > 0) {
+        // readTranscript is ordered by sequence ASC → the last is the max.
+        sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, received[received.length - 1].sequence);
+      }
+      logger.info("session.receive.since_seq", { sessionId, agentName, since_seq: sinceSeq, count: received.length });
+      return {
+        ok: true,
+        since_seq: sinceSeq,
+        count: received.length,
+        messages: received.map((m) => ({ sequence: m.sequence, content: m.text, from })),
+      };
+    }
+
     const rawTimeout = params?.timeout_ms;
     const timeoutMs = typeof rawTimeout === "number" && Number.isFinite(rawTimeout) && rawTimeout >= 0
       ? rawTimeout
