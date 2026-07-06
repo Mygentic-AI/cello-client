@@ -23,7 +23,7 @@ import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { TelegramBotClient, TelegramUpdate } from "../telegram-bot-client.js";
-import type { CelloNode } from "@cello-protocol/transport";
+import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -73,6 +73,17 @@ class FakeTelegramBotClient implements TelegramBotClient {
   injectUpdate(u: TelegramUpdate): void { this.#pending.push(u); }
 }
 
+function makeInjectableSignaling(injectRef: { inject?: (frame: unknown) => void }): () => Promise<ConnectResult> {
+  let inbound: ((frame: unknown) => void) | null = null;
+  const stream: SignalingStream = {
+    send: async () => {},
+    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
+    close: () => {},
+  };
+  injectRef.inject = (frame: unknown) => inbound?.(frame);
+  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
+}
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe("M8C-TGDOOR-1: Telegram doorbell", () => {
@@ -99,12 +110,13 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     await FileKeyProvider.load(join(dir, "key"));
   }
 
-  async function start(withBot: boolean): Promise<Awaited<ReturnType<typeof startDaemon>>> {
+  async function start(withBot: boolean, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger: { debug() {}, info() {}, warn() {}, error() {} },
       sessionNodeFactory: new FixedFactory(new FakeNode()),
       telegramBotClient: withBot ? bot : undefined,
+      signalingConnect,
     };
     const h = await startDaemon(config);
     handle = h;
@@ -199,4 +211,96 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     await wait(60);
     expect(bot.sent.length).toBe(beforeCount); // silently dropped — no ack, nothing sent to the stranger
   });
+
+  // Reviewer finding (a60d68ed, hollow test): G1 (session-request rings) was claimed covered by
+  // the G1/G2/G5 test above but never actually exercised — that test only drives a state change.
+  // This test drives the REAL acceptInboundAssignment path via an injected session_assignment
+  // frame (seam-2-inbound-session.test.ts-style harness), the actual G1 dispatch point.
+  it("G1 (real wiring): a genuine inbound session request rings with the session-request label", async () => {
+    const bobPubkey = await (async () => {
+      const dir = join(tempDir, "agents", "bob");
+      await mkdir(dir, { recursive: true });
+      const kp = await FileKeyProvider.load(join(dir, "key"));
+      return Buffer.from(await kp.getPublicKey()).toString("hex");
+    })();
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(true, makeInjectableSignaling(injectRef));
+    await client_setToken();
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
+
+    const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 1));
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: SID_BYTES,
+        participant_a: { pubkey: Buffer.from("dd".repeat(32), "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "initiator-peer-id",
+      },
+    });
+    await wait(150);
+
+    const requestMsg = bot.sent.find((s) => s.text.includes("New session request"));
+    expect(requestMsg).toBeDefined();
+    expect(requestMsg?.chatId).toBe(CHAT_ID);
+  });
+
+  // Reviewer finding (a60d68ed, hollow test): G7's existing test only proves the NEGATIVE case
+  // (never configured). The literal claim — "cold: works with ZERO IPC connections, settings
+  // already persisted from a prior run" — was never exercised. This drives that exact scenario:
+  // settings persisted directly (no cello_telegram_set_token IPC call), zero clients ever connect.
+  it("G7 (real cold-start): settings persisted by a PRIOR daemon run are picked up on the NEXT boot with ZERO IPC connections", async () => {
+    await makeAgentDir("alice");
+    // First "run": start once just to persist settings into the on-disk DB, then stop it — this
+    // is the "prior run" the DoD's "cold (no live agent session)" clause is about.
+    const first = await start(true);
+    first.getSessionNodeManager().setTelegramSettings("t", CHAT_ID);
+    await first.stop("test_setup");
+    handle = null;
+
+    // Second "run": a FRESH startDaemon() against the SAME celloDir — settings already exist in
+    // the persisted DB, so the poller must start at BOOT with NO IPC connection ever made.
+    const second = await start(true);
+    await second.getSessionNodeManager().createSessionNode("ee".repeat(16), "alice", "bobpubkeyhex", "peer-1", "corr");
+    await second.getSessionNodeManager().markInterruptedWithDetails("alice", "ee".repeat(16), 0, "stream_close");
+    await wait(30);
+
+    expect(bot.sent.length).toBeGreaterThan(0); // rang cold — no client ever attached in this whole test
+  });
+
+  // Reviewer finding (a60d68ed, hollow test): coalescing key isolation (per-SESSION, not global)
+  // was never proven — G3/G4 only ever used one session id.
+  it("G3 (per-session isolation): two different sessions each ring independently, one does not suppress the other", async () => {
+    await makeAgentDir("alice");
+    const h = await start(true);
+    await client_setToken();
+    const snm = h.getSessionNodeManager();
+    const sidA = "f1".repeat(16);
+    const sidB = "f2".repeat(16);
+    await snm.createSessionNode(sidA, "alice", "cp-a-pubkeyhex", "peer-a", "corr-a");
+    await snm.createSessionNode(sidB, "alice", "cp-b-pubkeyhex", "peer-b", "corr-b");
+    snm.addContact("alice", "cp-a-pubkeyhex");
+    snm.addContact("alice", "cp-b-pubkeyhex");
+
+    snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a1"), msgLeafHash(new TextEncoder().encode("a1")), "ca1");
+    snm.ingestReceivedContent("alice", sidB, new TextEncoder().encode("b1"), msgLeafHash(new TextEncoder().encode("b1")), "cb1");
+    await wait(30);
+    expect(bot.sent.filter((s) => s.text.includes("message waiting"))).toHaveLength(2); // BOTH ring — independent
+
+    // A second message on A alone must NOT ring again (still coalesced for A), and must not
+    // affect B's own independent coalescing state either.
+    snm.ingestReceivedContent("alice", sidA, new TextEncoder().encode("a2"), msgLeafHash(new TextEncoder().encode("a2")), "ca2");
+    await wait(30);
+    expect(bot.sent.filter((s) => s.text.includes("message waiting"))).toHaveLength(2); // unchanged
+  });
+
+  /** Configure TGDOOR via the real IPC handler (callers create their own agent dirs first). */
+  async function client_setToken(): Promise<void> {
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_telegram_set_token", { bot_token: "t", allowlisted_chat_id: CHAT_ID });
+  }
 });

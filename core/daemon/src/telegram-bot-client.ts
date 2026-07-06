@@ -26,8 +26,16 @@ export class HttpTelegramBotClient implements TelegramBotClient {
   async getUpdates(offset: number, timeoutSec: number): Promise<TelegramUpdate[]> {
     const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${offset}&timeout=${timeoutSec}`;
     const res = await fetch(url);
-    const body = (await res.json()) as { ok: boolean; result?: TelegramUpdate[] };
-    return body.ok && body.result ? body.result : [];
+    const body = (await res.json()) as { ok: boolean; result?: TelegramUpdate[]; description?: string };
+    // Reviewer HIGH fix: fetch() does not throw on a non-2xx/ok:false Telegram response (e.g. a
+    // revoked token returns HTTP 200 with {ok:false}) — treating that the same as "genuinely no
+    // updates waiting" (an empty array) silently hides a misconfigured/dead bot forever, since the
+    // poller's only error-observability path is its catch block, which this never reached. THROW
+    // so the caller's catch/backoff/log path actually fires.
+    if (!body.ok) {
+      throw new Error(`telegram_get_updates_failed: ${body.description ?? "unknown_telegram_error"}`);
+    }
+    return body.result ?? [];
   }
 
   async sendMessage(chatId: string, text: string): Promise<{ ok: boolean; error?: string }> {

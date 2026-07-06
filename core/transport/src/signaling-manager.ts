@@ -198,6 +198,11 @@ export interface SignalingManagerOptions {
   correlationId?: string;
   rootKeys?: readonly string[];
   threshold?: number;
+  /** M8C-RELAYWAKE-1: fired every time this manager reaches 'connected' — the FIRST connect and
+   *  every reconnect after a drop. Lets a caller re-check relay-parked content on "wakeup"
+   *  without the manager needing to know anything about relays/content itself. Best-effort —
+   *  a throwing callback must never break the signaling connection it's observing. */
+  onConnected?: () => void;
 }
 
 // Keep the named config type used by MANIFEST-002 tests
@@ -260,6 +265,8 @@ export class SignalingManager {
   private readonly _correlationId: string;
   private readonly _rootKeys: readonly string[];
   private readonly _threshold: number;
+  // M8C-RELAYWAKE-1
+  private readonly _onConnected: (() => void) | undefined;
   // Per-poll-cycle correlation id, minted at dispatch and threaded through to the
   // response handler so every event in one poll flow is correlatable (DOD-INV-8).
   #pollCounter = 0;
@@ -283,6 +290,7 @@ export class SignalingManager {
     this._correlationId = opts.correlationId ?? "";
     this._rootKeys = opts.rootKeys ?? [];
     this._threshold = opts.threshold ?? 0;
+    this._onConnected = opts.onConnected;
 
     // Begin connection immediately — status starts as 'reconnecting'
     void this.reconnectLoop();
@@ -716,6 +724,16 @@ export class SignalingManager {
       directoryNodeId: result.directoryNodeId,
       manifestVersion: result.manifestVersion,
     });
+
+    // M8C-RELAYWAKE-1: best-effort — a throwing callback must never break the signaling
+    // connection it's merely observing.
+    try {
+      this._onConnected?.();
+    } catch (err: unknown) {
+      this._logger.warn("signaling.on_connected.callback_failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     result.stream.onMessage((frame: unknown) => {
       this.handleMessage(frame);

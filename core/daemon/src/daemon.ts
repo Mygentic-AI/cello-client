@@ -692,6 +692,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger,
       maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
       maxBackoffMs: 30_000,
+      // M8C-RELAYWAKE-1: "check relay on wakeup" — every time this agent's directory signaling
+      // reaches 'connected' (the first connect AND every reconnect after a drop), re-drain its
+      // parked mailbox from every relay it has session history with. Without this, a message
+      // parked while signaling was down (network blip, directory node restart, daemon offline)
+      // is only ever discovered at the NEXT agent start, not on the reconnect that actually
+      // brings the agent back — this closes that gap. Fire-and-forget; autoRecoverForAgent
+      // already catches its own per-relay errors internally.
+      onConnected: () => { void autoRecoverForAgent(agentName); },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
     perAgentSignaling.set(agentName, entry);
@@ -983,6 +991,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // claude/channel MCP capability from Tiers 1-2. Inert until telegram_settings exist.
   let telegramBotClient: TelegramBotClient | null = injectedTelegramBotClient ?? null;
   let telegramChatId: string | null = null;
+  let telegramBotToken: string | null = null; // tracked only to detect an actual token CHANGE
   // Generation counter, NOT a shared boolean — a boolean flip-to-false-then-true-again (e.g. a
   // settings update that restarts the poller) would let the OLD loop's `while` condition still
   // read true on its next check, running TWO concurrent loops. Each loop instance captures its
@@ -1038,11 +1047,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   ): void {
     notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey);
     void sendTelegramDoorbell(agentName, sessionId, "state_change", `Session ${state}`);
+    // Reviewer HIGH fix (a60d68ed): telegramRungUnread had NO cleanup at all — a session that
+    // rings once and is never read via cello_receive/since_seq (e.g. the operator only ever uses
+    // cello_get_transcript, which does not advance the read watermark) left a permanent entry for
+    // the life of the daemon process. Every state change is a natural point to drop it — the
+    // worst case if the session is still genuinely active is one possible extra ring later, far
+    // preferable to an unbounded leak (the exact class of bug fixed for TTL-1's expired-log at
+    // af8a701 in this same milestone).
+    clearTelegramRung(agentName, sessionId);
   }
 
-  async function handleInboundTelegramUpdate(update: { message?: { chat: { id: number | string }; message_id: number } }): Promise<void> {
+  async function handleInboundTelegramUpdate(
+    update: { message?: { chat: { id: number | string }; message_id: number } },
+    client: TelegramBotClient,
+  ): Promise<void> {
     const chatId = update.message?.chat?.id !== undefined ? String(update.message.chat.id) : undefined;
-    if (!chatId || !telegramBotClient) return;
+    if (!chatId) return;
     if (chatId !== telegramChatId) {
       // D6: any other chat is silently dropped — nothing enters CELLO content paths.
       logger.info("telegram.inbound.rejected", { chatId });
@@ -1050,7 +1070,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     logger.info("telegram.inbound.acknowledged", { chatId });
     try {
-      await telegramBotClient.sendMessage(
+      await client.sendMessage(
         chatId,
         "CELLO doesn't process messages here — this channel only sends you notifications. Use your CELLO client to reply.",
       );
@@ -1062,15 +1082,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Single long-lived getUpdates poller (DoD) — one in-flight loop per daemon; started once
   // settings exist, stopped on daemon shutdown. A network hiccup backs off and retries rather
   // than killing the poller (best-effort — the doorbell is a convenience, never load-bearing).
-  async function runTelegramPollerLoop(myGeneration: number): Promise<void> {
+  // Reviewer MEDIUM fix (a60d68ed): the loop previously read the SHARED, reassignable
+  // telegramBotClient/telegramUpdateOffset fresh each iteration — only myGeneration was truly
+  // loop-local. A settings update mid-await could let a stale response from the OLD client (1)
+  // still be processed once (the generation check only blocks the loop's NEXT iteration, not an
+  // in-flight call) and (2) stomp telegramUpdateOffset with the OLD bot's update_id numbering,
+  // which is meaningless to a new token (Telegram scopes update_id per bot). Fix: capture the
+  // client as a PARAMETER (never re-read from the shared variable) and re-check the generation
+  // immediately after every await before acting on its result or touching shared state.
+  async function runTelegramPollerLoop(myGeneration: number, myClient: TelegramBotClient): Promise<void> {
+    let myOffset = telegramUpdateOffset;
     while (telegramPollerGeneration === myGeneration) {
       try {
-        const updates = await telegramBotClient!.getUpdates(telegramUpdateOffset, 25);
+        const updates = await myClient.getUpdates(myOffset, 25);
+        if (telegramPollerGeneration !== myGeneration) break; // superseded while awaiting — drop stale results
         for (const u of updates) {
-          telegramUpdateOffset = u.update_id + 1;
-          if (u.message) void handleInboundTelegramUpdate(u);
+          myOffset = u.update_id + 1;
+          telegramUpdateOffset = myOffset;
+          if (u.message) void handleInboundTelegramUpdate(u, myClient);
         }
       } catch (err: unknown) {
+        if (telegramPollerGeneration !== myGeneration) break; // superseded — don't retry under a dead generation
         logger.warn("telegram.poller.error", { error: err instanceof Error ? err.message : String(err) });
         await new Promise((r) => setTimeout(r, 2000)); // back off before retrying
       }
@@ -1082,10 +1114,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   function startTelegramPollerIfConfigured(): void {
     const settings = sessionNodeManager.getTelegramSettings();
     if (!settings) return; // not configured — TGDOOR stays inert
+    // Reviewer MEDIUM fix: reset the offset on an actual token/chat CHANGE — a prior bot's
+    // update_id numbering is meaningless to a new one (Telegram scopes it per bot token).
+    if (telegramBotToken !== settings.botToken || telegramChatId !== settings.allowlistedChatId) {
+      telegramUpdateOffset = 0;
+    }
+    telegramBotToken = settings.botToken;
     telegramChatId = settings.allowlistedChatId;
-    telegramBotClient = injectedTelegramBotClient ?? new HttpTelegramBotClient(settings.botToken);
+    const client = injectedTelegramBotClient ?? new HttpTelegramBotClient(settings.botToken);
+    telegramBotClient = client;
     telegramPollerGeneration += 1;
-    void runTelegramPollerLoop(telegramPollerGeneration);
+    void runTelegramPollerLoop(telegramPollerGeneration, client);
     logger.info("telegram.poller.started", {});
   }
 
