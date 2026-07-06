@@ -14,8 +14,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, connectToDaemon, type DaemonHandle, type DaemonConfig, type Logger, type IpcClient } from "@cello-protocol/daemon";
-import { autoStartAllAgents } from "../commands.js";
+import { startDaemon, connectToDaemon, acquireLock, type DaemonHandle, type DaemonConfig, type Logger, type IpcClient } from "@cello-protocol/daemon";
+import { autoStartAllAgents, formatLoginSummary, login } from "../commands.js";
 
 describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
   let tempDir: string;
@@ -64,6 +64,64 @@ describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
     const again = await autoStartAllAgents(client);
     expect(again.failed).toEqual([]);
     expect(again.started.slice().sort()).toEqual(["alice", "bob"]);
+  });
+
+  // A minimal IpcClient stub so we can FORCE per-agent start outcomes (a {ok:false} and a throw) —
+  // the failure-enumeration path the DoD exists for, which a real daemon rarely produces.
+  function stubClient(starts: Record<string, { ok: boolean; reason?: string } | Error>): IpcClient {
+    return {
+      async send(method: string, params?: { name?: string }) {
+        if (method === "cello_list_agents") return { agents: Object.keys(starts).map((name) => ({ name })) };
+        if (method === "cello_start_agent") {
+          const r = starts[params!.name!];
+          if (r instanceof Error) throw r;
+          return r;
+        }
+        return {};
+      },
+      onNotification() { /* unused */ },
+      close() { /* unused */ },
+    } as unknown as IpcClient;
+  }
+
+  // F1 (reviewer, blocking): the failure-enumeration path — collected, not thrown; one bad agent
+  // does not abort the loop; each failure carries {name, reason} (from {ok:false}.reason AND a throw).
+  it("L2 failure path: collects per-agent failures by {name, reason} without aborting the loop", async () => {
+    const client = stubClient({
+      alice: { ok: true },
+      bob: { ok: false, reason: "boom" },
+      carol: new Error("Connection closed"),
+    });
+    const { started, failed } = await autoStartAllAgents(client);
+    expect(started).toEqual(["alice"]); // the good agent still started despite two failures
+    expect(failed).toEqual([
+      { name: "bob", reason: "boom" },
+      { name: "carol", reason: "Connection closed" },
+    ]);
+  });
+
+  it("L2 enumeration: formatLoginSummary names each failed agent + reason", () => {
+    const s = formatLoginSummary({ started: ["alice"], failed: [{ name: "bob", reason: "boom" }] });
+    expect(s).toContain("Started 1 agent(s): alice.");
+    expect(s).toContain("bob (boom)"); // the enumeration the operator sees
+    expect(formatLoginSummary({ started: [], failed: [] })).toContain("No registered agents");
+  });
+
+  // F2 (reviewer): the login() boundary — exit 0 with the summary appended, against a REAL in-process
+  // daemon (acquireLock points connectOrStart at it, so it CONNECTS instead of spawning the binary).
+  it("F2: login() returns exit 0 and appends the auto-start summary", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    await acquireLock(config.lockFilePath, { pid: process.pid, socketPath: config.socketPath, version: "0.0.1-test" });
+    const seed = await connectToDaemon(config.socketPath);
+    await seed.send("ipc.connect", { clientType: "cli" });
+    await seed.send("cello_create_agent", { name: "alice" });
+    seed.close();
+
+    const res = await login(config.celloDir, "/nonexistent-daemon-bin", logger);
+    expect(res.exitCode).toBe(0);
+    expect(res.output.startsWith("Daemon already running.")).toBe(true);
+    expect(res.output).toContain("Started 1 agent(s): alice.");
   });
 
   it("L2: zero registered agents → completes cleanly (empty summary, no throw)", async () => {
