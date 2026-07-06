@@ -2917,7 +2917,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         const brokerNodeForSeal = crossNodeBrokerBySession.get(`${record.agent_name}:${sessionId}`);
         if (brokerNodeForSeal) {
           const sealKp = keyProviders.get(record.agent_name);
-          if (sealKp) {
+          if (!sealKp) {
+            // Fallback-finder #1: never skip the cross-node reconnect silently — without a key provider
+            // we cannot open the broker connection, so the seal will revert to the pre-fix timeout. Log
+            // WHY so it is not indistinguishable from a normal counterparty-didn't-close timeout.
+            logger.warn("session.seal.broker.no_keyprovider", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
+          } else {
             const sealPubHex = Buffer.from(await sealKp.getPublicKey()).toString("hex");
             const roster = await resolveConsortiumRoster();
             const brokerTarget = roster?.find((e) => e.nodeId === brokerNodeForSeal) ?? null;
