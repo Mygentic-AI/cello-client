@@ -93,6 +93,17 @@ import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-st
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
+// M8C-ABUSE-1: persistence bounds — the non-M9 remainder (per-message cap + outbound rate are
+// M9's, not rebuilt here). "Whitelisted senders bounded only by disk" (DoD) — these bounds apply
+// ONLY to sessions/senders that are NOT a known contact (CONTACT-1's whitelist).
+/** Anti-drip-feed: cumulative RECEIVED bytes per session, from a non-contact sender. */
+export const ABUSE_MAX_SESSION_RECEIVED_BYTES = 25 * 1024 * 1024; // 25 MB
+/** Anti-drip-feed via many sessions: active sessions a single unknown counterparty may hold open
+ *  with one agent at once. */
+export const ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER = 3;
+/** Anti-swarm: total active sessions from ALL unknown (non-contact) counterparties combined, per agent. */
+export const ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL = 50;
+
 /**
  * M7 DOD-SPINE-6 / MSG-001-3b: the inputs a session node needs to connect to the relay
  * as the Structure-2 witness (relay endpoint from the FROST-signed assignment + the
@@ -806,6 +817,54 @@ export class SessionNodeManager {
     return this.#db
       .prepare("SELECT pubkey, added_at FROM contacts WHERE agent_name = ? ORDER BY added_at ASC")
       .all(agentName) as Array<{ pubkey: string; added_at: number }>;
+  }
+
+  /** M8C-ABUSE-1: cumulative RECEIVED byte total for a session (anti-drip-feed accounting). */
+  #getReceivedBytesTotal(agentName: string, sessionId: string): number {
+    if (!this.#db) return 0;
+    const row = this.#db
+      .prepare("SELECT COALESCE(SUM(LENGTH(blob)), 0) AS total FROM transcript WHERE agent_name = ? AND session_id = ? AND direction = 'received'")
+      .get(agentName, sessionId) as { total: number };
+    return row.total;
+  }
+
+  /** M8C-ABUSE-1: active sessions this agent currently holds with the given counterparty. */
+  countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number {
+    if (!this.#db) return 0;
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_name = ? AND counterparty_pubkey = ? AND status = 'active'")
+      .get(agentName, counterpartyPubkey) as { n: number };
+    return row.n;
+  }
+
+  /** M8C-ABUSE-1 (anti-swarm): active sessions this agent holds with counterparties that are NOT
+   *  a known contact — the global cap counts across ALL unknown senders combined. */
+  countActiveSessionsFromUnknownSenders(agentName: string): number {
+    if (!this.#db) return 0;
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM sessions s
+         WHERE s.agent_name = ? AND s.status = 'active'
+           AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.agent_name = s.agent_name AND c.pubkey = s.counterparty_pubkey)`,
+      )
+      .get(agentName) as { n: number };
+    return row.n;
+  }
+
+  /** M8C-ABUSE-1: is a NEW inbound session from this counterparty within the acceptance bounds?
+   *  Known contacts are exempt entirely ("bounded only by disk" — DoD). Checked BEFORE accepting
+   *  a fresh inbound session (the counts reflect sessions already active, not yet counting this one). */
+  checkUnknownSenderAcceptanceBound(agentName: string, counterpartyPubkey: string): { ok: true } | { ok: false; reason: string } {
+    if (this.isContact(agentName, counterpartyPubkey)) return { ok: true };
+    const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
+    if (perSender >= ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER) {
+      return { ok: false, reason: "abuse_bound_sessions_per_sender" };
+    }
+    const globalUnknown = this.countActiveSessionsFromUnknownSenders(agentName);
+    if (globalUnknown >= ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL) {
+      return { ok: false, reason: "abuse_bound_unknown_sessions_global" };
+    }
+    return { ok: true };
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
@@ -2579,6 +2638,27 @@ export class SessionNodeManager {
         nextExpected,
         correlationId,
       });
+    }
+
+    // M8C-ABUSE-1: per-session total-size cap (anti-drip-feed) — "whitelisted senders bounded
+    // only by disk" (DoD), so a known contact is exempt entirely. Scope (journaled): this gates
+    // the main direct-delivery path only; the narrower out-of-order held/recovery release path
+    // (#releaseHeld) is not yet gated — refusing a release mid-recovery risks stalling the strict
+    // in-order chain (DOD-MSG-4) for every subsequent message, a bigger risk than the bound itself.
+    if (!this.isContact(agentName, senderPubkey)) {
+      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
+      if (priorTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
+        this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
+          sessionId,
+          agentName,
+          senderPubkey,
+          priorTotal,
+          incoming: content.length,
+          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
+          correlationId,
+        });
+        return { ok: false, reason: "session_size_limit_exceeded" };
+      }
     }
 
     const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);

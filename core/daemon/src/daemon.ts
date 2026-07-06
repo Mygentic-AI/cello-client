@@ -4071,6 +4071,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     correlationId: string,
   ): Promise<void> {
     try {
+      // M8C-ABUSE-1 (anti-drip-feed / anti-swarm): bound acceptance from unknown (non-contact)
+      // senders — a per-sender cap (many sessions from ONE stranger) and a global cap (many
+      // sessions across ALL strangers combined). Known contacts are exempt ("bounded only by
+      // disk" — DoD). Checked FIRST, before any standing-receiver work, so a refusal is cheap.
+      const bound = sessionNodeManager.checkUnknownSenderAcceptanceBound(agentName, parsed.participantAPubkeyHex);
+      if (!bound.ok) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: bound.reason,
+          correlationId,
+        });
+        return;
+      }
       // M8B F14 (fix 2): KICK creation before polling — an inbound offer arriving while no
       // receiver exists and none is being created must trigger the ensure itself (the doc
       // comment's "retries on demand" made true), instead of polling a creation nobody

@@ -131,11 +131,18 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const add1 = (await client.send("cello_contact_add", { pubkey: cp })) as Record<string, unknown>;
     expect(add1).toMatchObject({ ok: true, agent: "alice", pubkey: cp });
 
+    const listAfterFirst = (await client.send("cello_contact_list", {})) as { contacts: Array<{ pubkey: string; added_at: number }> };
+    const originalAddedAt = listAfterFirst.contacts[0].added_at;
+
+    // Reviewer finding (a619ca33, test-teeth): re-adding must NOT refresh added_at — an
+    // INSERT OR REPLACE (which WOULD refresh it) must fail this, not just "still one row."
+    await new Promise((r) => setTimeout(r, 5)); // ensure a re-refreshed timestamp would differ
     const add2 = (await client.send("cello_contact_add", { pubkey: cp })) as Record<string, unknown>; // idempotent
     expect(add2.ok).toBe(true);
 
-    const list = (await client.send("cello_contact_list", {})) as { ok: boolean; contacts: Array<{ pubkey: string }> };
+    const list = (await client.send("cello_contact_list", {})) as { ok: boolean; contacts: Array<{ pubkey: string; added_at: number }> };
     expect(list.contacts.map((c) => c.pubkey)).toEqual([cp]); // exactly one row despite two adds
+    expect(list.contacts[0].added_at).toBe(originalAddedAt); // identity pinned at the FIRST add time
 
     const remove1 = (await client.send("cello_contact_remove", { pubkey: cp })) as Record<string, unknown>;
     expect(remove1).toMatchObject({ ok: true, removed: true });
