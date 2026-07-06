@@ -32,8 +32,16 @@ const COMMAND_HELP: Record<string, string> = {
   logout: "Usage: cello logout  — send shutdown to the running daemon.",
   status: "Usage: cello status  — query the daemon and print the structured status JSON.",
   register:
-    "Usage: cello register <agent> [preAuthToken]  — register a loaded agent with the directory. Prefer CELLO_PREAUTH_TOKEN over the positional token (argv is visible in the process list).",
-  "create-agent": "Usage: cello create-agent <name>  — creates a new local agent identity.",
+    "Usage: cello register <agent> <pre-auth-token>  — register a LOCAL agent with the directory.\n" +
+    "  The two-step onboarding: (1) 'cello create-agent <name>' makes the local identity; (2) 'cello register <name> <token>' registers it with the directory.\n" +
+    "  The token is a single-use pre-authorization ticket from the CELLO portal (or the Operations Agent on Telegram), format 'CELLO-' + 33 characters, valid 24h.\n" +
+    "  Example:  cello register alice CELLO-3xY7...\n" +
+    "  Env-var form (avoids retyping):  CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register alice\n" +
+    "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
+  "create-agent":
+    "Usage: cello create-agent <name>  — create a new LOCAL agent identity (does not touch the directory).\n" +
+    "  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ^[a-zA-Z0-9_-]{1,64}$).\n" +
+    "  Next step: 'cello register <name> <pre-auth-token>' to register it with the directory.",
   "remove-agent": "Usage: cello remove-agent <name>  — retires a local agent (one-way) and frees its name.",
   refresh: "Usage: cello refresh <name>  — proactively refresh the agent's threshold shares (new epoch).",
   receipts: "Usage: cello receipts <name>  — list the agent's stored relay ordering receipts.",

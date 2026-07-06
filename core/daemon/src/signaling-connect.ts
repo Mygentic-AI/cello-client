@@ -318,9 +318,14 @@ function wrapSignalingStream(
             }
             handler(frame);
           }
-          logger.warn("directory.signaling.stream.ended", {});
+          logger.debug("directory.signaling.stream.ended", { expected: true });
         } catch (err: unknown) {
-          logger.warn("directory.signaling.reader.error", { error: errMsg(err) });
+          // M8C-ONBOARD-LOGNOISE-1 (F11): routine reconnect churn (the reader loop ends when the
+          // directory rotates/drops the stream, ~every 40–70 min, and the caller reconnects). At
+          // `warn` a healthy daemon looked like it was failing. Log it quietly + marked expected; a
+          // genuine SUSTAINED outage still stands out via the `reconnecting`→`lost` state escalation
+          // (getAgentSignaling retry budget), which is unchanged.
+          logger.debug("directory.signaling.reader.error", { error: errMsg(err), expected: true });
         }
       })();
     },

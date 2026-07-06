@@ -49,6 +49,21 @@ describe("F2: --help/-h on subcommands", () => {
       expect(help).toContain(cmd);
     }
   });
+
+  // M8C-ONBOARD-HELP-1 (F24/R1/R2/R5): real help, not a bare command list.
+  it("create-agent help states the exact name rule", () => {
+    const help = helpForCommand("create-agent");
+    expect(help).toContain("^[a-zA-Z0-9_-]{1,64}$");
+    expect(help).toContain("no spaces");
+  });
+
+  it("register help shows the two-step, a worked example, the token format, and the env-var form", () => {
+    const help = helpForCommand("register");
+    expect(help).toContain("create-agent"); // the create → register two-step is explained
+    expect(help).toContain("CELLO-");        // token format
+    expect(help.toLowerCase()).toContain("example");
+    expect(help).toContain("CELLO_PREAUTH_TOKEN"); // env-var form documented
+  });
 });
 
 describe("F2: unknown flags are rejected, not coerced to positionals", () => {

@@ -81,11 +81,13 @@ async function main(): Promise<void> {
       const tokenArg = process.argv[4];
       const preAuthToken = tokenArg ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = process.argv[5] ?? "";
-      // L3: a token passed as an argv positional is visible in the process list
-      // (ps / /proc). Warn and steer to the env var, which is the safe path.
+      // M8C-ONBOARD-WARN-1 (R6): right-size the warning to what the token IS — single-use, 24h,
+      // consumed on success. The only real risk is the brief window before redemption; the env-var
+      // form is NOT more secure (shell history + process environ retain it too), so don't push it as
+      // a security fix. One calm line; if that window genuinely matters, read from a file/stdin.
       if (tokenArg) {
         process.stderr.write(
-          "Warning: passing the pre-auth token as a command-line argument exposes it in the process list. Prefer the CELLO_PREAUTH_TOKEN environment variable.\n",
+          "Note: this pre-auth token is single-use and expires in 24h — its only exposure risk is the brief window before you redeem it. (It's retained in shell history and the process list either way; if that window matters, pass it via a file or stdin instead.)\n",
         );
       }
       result = await register(celloDir, agent, preAuthToken, phoneStub);

@@ -98,14 +98,43 @@ describe("cli commands", () => {
   });
 
   describe("register", () => {
-    it("returns exit 1 with usage when args are missing", async () => {
+    // A well-formed pre-auth token ("CELLO-" + 33 base58 chars) so the client-side format checks
+    // pass and the call reaches the daemon path (M8C-ONBOARD-ERRORS-1).
+    const VALID_TOKEN = "CELLO-" + "1".repeat(33);
+
+    it("returns exit 1 with usage when the agent is missing", async () => {
       const result = await register(tempDir, "", "");
       expect(result.exitCode).toBe(1);
       expect(result.output).toContain("Usage: cello register");
     });
 
-    it("returns exit 1 'No daemon running' when no daemon is up", async () => {
-      const result = await register(tempDir, "alice", "preauth-token");
+    // M8C-ONBOARD-ERRORS-1 (R3): a missing token gets a specific, actionable message — NOT a bare
+    // Usage dump — that names what's missing and how to get it.
+    it("returns a specific missing-token message (not a Usage dump)", async () => {
+      const result = await register(tempDir, "alice", "");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("missing the pre-auth token");
+      expect(result.output).toContain("CELLO_PREAUTH_TOKEN");
+    });
+
+    // M8C-ONBOARD-ERRORS-1 (R4): a malformed token is caught client-side with a specific message,
+    // BEFORE any pointless DKG round-trip to a generic dkg_failed. The classic case: pasting the
+    // literal words "CELLO_PREAUTH_TOKEN" (underscore) instead of a real "CELLO-" token.
+    it("catches a malformed token client-side (CELLO_PREAUTH_TOKEN typo) with a specific message", async () => {
+      const result = await register(tempDir, "alice", "CELLO_PREAUTH_TOKEN");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("start with 'CELLO-'");
+      expect(result.output).not.toContain("No daemon running"); // short-circuited before the daemon
+    });
+
+    it("catches a CELLO- token of the wrong length as malformed", async () => {
+      const result = await register(tempDir, "alice", "CELLO-tooshort");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("malformed");
+    });
+
+    it("returns exit 1 'No daemon running' when no daemon is up (well-formed token)", async () => {
+      const result = await register(tempDir, "alice", VALID_TOKEN);
       expect(result.exitCode).toBe(1);
       expect(result.output).toContain("No daemon running");
     });
@@ -116,7 +145,7 @@ describe("cli commands", () => {
 
       // No agents are loaded in this temp dir → the daemon's cello_register
       // handler rejects with agent_not_found (full CLI → IPC → handler path).
-      const result = await register(tempDir, "ghost-agent", "preauth-token");
+      const result = await register(tempDir, "ghost-agent", VALID_TOKEN);
       expect(result.exitCode).toBe(1);
       const parsed = JSON.parse(result.output);
       expect(parsed.ok).toBe(false);

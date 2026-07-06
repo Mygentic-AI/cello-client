@@ -88,10 +88,30 @@ export async function register(
   preAuthToken: string,
   phoneStub = "",
 ): Promise<CommandResult> {
-  if (!agent || !preAuthToken) {
+  // M8C-ONBOARD-ERRORS-1 (R3/R4): specific, actionable errors on the core onboarding path — never a
+  // bare Usage dump, never a pointless DKG round-trip to a generic dkg_failed for an obviously
+  // malformed token. Client-side because a typo'd token and a missing one are knowable without the
+  // directory. (Unknown-agent stays the daemon's job — it already returns a good agent_not_found.)
+  if (!agent) {
+    return { exitCode: 1, output: "You didn't name an agent to register. Usage: cello register <agent> <pre-auth-token>. See your agents with 'cello status'." };
+  }
+  if (!preAuthToken) {
     return {
       exitCode: 1,
-      output: "Usage: cello register <agent> <preAuthToken>  (or set CELLO_PREAUTH_TOKEN). The pre-authorization ticket comes from the CELLO Operations Agent.",
+      output: `You're missing the pre-auth token. Get a single-use token from the CELLO portal (or the Operations Agent on Telegram), then run:\n  cello register ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register ${agent}\nThe token is single-use and expires in 24 hours.`,
+    };
+  }
+  // A valid pre-auth token is "CELLO-" + 33 base58 chars (verified: directory pre-auth-token-repository).
+  if (!preAuthToken.startsWith("CELLO-")) {
+    return {
+      exitCode: 1,
+      output: "That doesn't look like a pre-auth token — real ones start with 'CELLO-' followed by 33 characters. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the token itself?) Get a token from the CELLO portal, then retry.",
+    };
+  }
+  if (!/^CELLO-[1-9A-HJ-NP-Za-km-z]{33}$/.test(preAuthToken)) {
+    return {
+      exitCode: 1,
+      output: "That pre-auth token looks malformed — expected 'CELLO-' followed by exactly 33 base58 characters (no 0, O, I, or l). Copy the full token from the CELLO portal and retry.",
     };
   }
 
@@ -120,11 +140,14 @@ export async function register(
     }
     return {
       exitCode: 0,
-      output: JSON.stringify(
-        { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
-        null,
-        2,
-      ),
+      output:
+        JSON.stringify(
+          { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
+          null,
+          2,
+        ) +
+        // M8C-ONBOARD-NEXTSTEP-1 (R7): every command output carries the next step + state legibility.
+        `\n\nNext: run 'cello status' to confirm '${agent}' is registered. 'connecting' is normal — registration takes a minute or two; 'connected' means ready. If it stays disconnected, run 'cello logout' then 'cello login'.`,
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
