@@ -126,4 +126,27 @@ describe("M8C-TTL-1: session-request TTL", () => {
     expect(inbox.agents[0].pending_session_requests.find((p) => p.session_id === freshSid)).toBeDefined();
     expect(inbox.agents[0].expired_session_requests).toHaveLength(0);
   });
+
+  // Reviewer HIGH finding (aed2d71f, D19): a whitelisted CONTACT-1 contact is exempt from
+  // ABUSE-1's acceptance bounds, so they can push unlimited accepted sessions the operator never
+  // claims — each becoming a permanent, unbounded expiredSessionRequests entry. Capped at 20.
+  it("expired_session_requests is capped — does not grow unbounded past 20 per agent", async () => {
+    await makeAgentDir("alice");
+    await start();
+    const client = await connectAs("alice");
+
+    for (let i = 0; i < 25; i++) {
+      await client.send("__test_enqueue_inbound_session", {
+        agentName: "alice",
+        sessionId: i.toString(16).padStart(32, "0"),
+        counterpartyPubkey: `stranger-${i}`,
+        enqueuedAtOverride: Date.now() - INBOUND_SESSION_TTL_MS - 1000,
+      });
+    }
+
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
+      agents: Array<{ expired_session_requests: unknown[] }>;
+    };
+    expect(inbox.agents[0].expired_session_requests.length).toBeLessThanOrEqual(20);
+  });
 });

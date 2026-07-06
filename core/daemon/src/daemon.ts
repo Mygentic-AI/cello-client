@@ -3953,6 +3953,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     inboundSessionQueues.set(agentName, q);
   }
 
+  // M8C-TTL-1 (reviewer HIGH fix, aed2d71f, D19): expiredSessionRequests is a lasting log, not a
+  // consumed queue (unlike inboundSessionQueues, nothing ever drains it) — a whitelisted CONTACT-1
+  // contact is EXEMPT from ABUSE-1's acceptance bounds ("bounded only by disk"), so they can push
+  // unlimited accepted sessions the operator never claims, each becoming a permanent, unremovable
+  // entry every 24h for the life of the daemon process. Capped the same way STATUS_RESUMABLE_CAP
+  // bounds the interrupted-sessions list — keep only the MOST RECENT N per agent.
+  const EXPIRED_SESSION_REQUESTS_CAP = 20;
   // M8C-TTL-1: move any queue entries past the TTL into expiredSessionRequests (visible via
   // INBOX), instead of leaving them to sit forever or vanish silently. Called lazily on every
   // read of the queue (cello_await_session's immediate-check, cello_check_notifications) rather
@@ -3967,6 +3974,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       if (e.enqueuedAt !== undefined && now - e.enqueuedAt > INBOUND_SESSION_TTL_MS) {
         if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
         expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
+        if (expiredList.length > EXPIRED_SESSION_REQUESTS_CAP) {
+          expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
+        }
         logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
       } else {
         live.push(e);
@@ -5250,7 +5260,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
     const totalPending = agents.reduce((sum, a) => sum + a.pending_session_requests.length, 0);
-    logger.info("inbox.checked", { connectionId, scope, agentCount: agents.length, totalUnread, totalPending });
+    // M8C-TTL-1 (reviewer finding, D19): surface expired-log size so unbounded growth (were the
+    // cap ever removed or misconfigured) would be visible here, not just in an internal Map.
+    const totalExpired = agents.reduce((sum, a) => sum + a.expired_session_requests.length, 0);
+    logger.info("inbox.checked", { connectionId, scope, agentCount: agents.length, totalUnread, totalPending, totalExpired });
     return { ok: true, scope, agents };
   });
 
