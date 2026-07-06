@@ -288,6 +288,10 @@ class ProductionSessionNodeFactory implements ISessionNodeFactory {
   }
 }
 
+// M8C-TTL-1: receiver-side session-request TTL. CORE ships the DoD's own 24h default;
+// per-agent configurability is PARKED on M9-CFG-001 (D17 — same pattern as D14/D15/D16).
+export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
 export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
@@ -3721,6 +3725,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { error: "missing_params", guidance: "Provide agentName and sessionId." };
     }
     enqueueInboundSession(agentName, { sessionIdHex, counterpartyPubkeyHex, genesisPrevRootHex: "" });
+    // M8C-TTL-1: let a test backdate the just-enqueued entry's timestamp (simulating age) without
+    // waiting real hours or faking global timers — enqueueInboundSession always stamps Date.now().
+    const enqueuedAtOverride = params?.enqueuedAtOverride as number | undefined;
+    if (enqueuedAtOverride !== undefined) {
+      const q = inboundSessionQueues.get(agentName);
+      const entry = q?.[q.length - 1];
+      if (entry) entry.enqueuedAt = enqueuedAtOverride;
+    }
     return { ok: true };
   });
 
@@ -3897,7 +3909,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     sessionIdHex: string;
     counterpartyPubkeyHex: string;
     genesisPrevRootHex: string;
+    // M8C-TTL-1: when this event was queued (not set for events handed straight to a blocked
+    // waiter — those are delivered instantly and never sit in the queue this TTL governs).
+    enqueuedAt?: number;
   }
+  // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
+  // cello_check_notifications so the operator can see what they missed, not just silence.
+  const expiredSessionRequests = new Map<string, Array<{ sessionIdHex: string; counterpartyPubkeyHex: string; expiredAt: number }>>();
   // A blocked cello_await_session waiter. connectionId is carried so the disconnect
   // hook can evict waiters belonging to a dead connection (otherwise enqueue would hand
   // an inbound event to a closed connection and the event would be lost — review H2).
@@ -3931,8 +3949,30 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return;
     }
     const q = inboundSessionQueues.get(agentName) ?? [];
-    q.push(event);
+    q.push({ ...event, enqueuedAt: Date.now() }); // M8C-TTL-1: stamp queue entry time
     inboundSessionQueues.set(agentName, q);
+  }
+
+  // M8C-TTL-1: move any queue entries past the TTL into expiredSessionRequests (visible via
+  // INBOX), instead of leaving them to sit forever or vanish silently. Called lazily on every
+  // read of the queue (cello_await_session's immediate-check, cello_check_notifications) rather
+  // than on a timer — no background sweep needed, and it's always correct-as-of-the-read.
+  function reapExpiredInboundSessions(agentName: string): void {
+    const q = inboundSessionQueues.get(agentName);
+    if (!q || q.length === 0) return;
+    const now = Date.now();
+    const live: InboundSessionEvent[] = [];
+    let expiredList = expiredSessionRequests.get(agentName);
+    for (const e of q) {
+      if (e.enqueuedAt !== undefined && now - e.enqueuedAt > INBOUND_SESSION_TTL_MS) {
+        if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
+        expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
+        logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
+      } else {
+        live.push(e);
+      }
+    }
+    inboundSessionQueues.set(agentName, live);
   }
 
   // CBOR-decoded byte fields arrive as Uint8Array or Buffer; a field may also already be
@@ -4394,6 +4434,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       genesis_prev_root: e.genesisPrevRootHex,
     });
 
+    reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
     const queued = inboundSessionQueues.get(agentName);
     if (queued && queued.length > 0) {
       return toResponse(queued.shift()!);
@@ -5190,13 +5231,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     const agents = agentNames.map((agent) => {
+      reapExpiredInboundSessions(agent); // M8C-TTL-1: expired ones surface below, not as "pending"
       const pending = (inboundSessionQueues.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
       }));
+      // M8C-TTL-1: expired requests stay VISIBLE (not silently dropped) — the operator can see
+      // what they missed rather than a request just vanishing from the pending list.
+      const expired = (expiredSessionRequests.get(agent) ?? []).map((e) => ({
+        session_id: e.sessionIdHex,
+        from: e.counterpartyPubkeyHex,
+        expired_at: e.expiredAt,
+      }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
-      return { agent, pending_session_requests: pending, unread, total_unread };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
