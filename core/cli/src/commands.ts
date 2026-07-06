@@ -98,20 +98,19 @@ export async function register(
   if (!preAuthToken) {
     return {
       exitCode: 1,
-      output: `You're missing the pre-auth token. Get a single-use token from the CELLO portal (or the Operations Agent on Telegram), then run:\n  cello register ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register ${agent}\nThe token is single-use and expires in 24 hours.`,
+      output: `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register ${agent}\nThe token is single-use and expires in 24 hours.`,
     };
   }
-  // A valid pre-auth token is "CELLO-" + 33 base58 chars (verified: directory pre-auth-token-repository).
+  // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
+  // Checking just the "CELLO-" prefix catches the common typo (pasting the literal words
+  // "CELLO_PREAUTH_TOKEN") without hard-coding the exact length/alphabet — the directory stays the
+  // authority on the full format, so a future format bump can't strand a valid token behind a
+  // client-side "malformed" (reviewer F2 / D13). A wrong-length CELLO- token reaches the daemon and
+  // is rejected there with a structured reason.
   if (!preAuthToken.startsWith("CELLO-")) {
     return {
       exitCode: 1,
-      output: "That doesn't look like a pre-auth token — real ones start with 'CELLO-' followed by 33 characters. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the token itself?) Get a token from the CELLO portal, then retry.",
-    };
-  }
-  if (!/^CELLO-[1-9A-HJ-NP-Za-km-z]{33}$/.test(preAuthToken)) {
-    return {
-      exitCode: 1,
-      output: "That pre-auth token looks malformed — expected 'CELLO-' followed by exactly 33 base58 characters (no 0, O, I, or l). Copy the full token from the CELLO portal and retry.",
+      output: "That doesn't look like a pre-auth token — real ones start with 'CELLO-' followed by 33 characters. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the token itself?) Get a token from the CELLO Operations Agent on Telegram, then retry.",
     };
   }
 

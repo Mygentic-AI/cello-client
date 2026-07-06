@@ -14,8 +14,9 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, acquireLock, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
+import { createServer, type Server } from "node:net";
 import { logout, status, register } from "../commands.js";
 
 describe("cli commands", () => {
@@ -127,10 +128,13 @@ describe("cli commands", () => {
       expect(result.output).not.toContain("No daemon running"); // short-circuited before the daemon
     });
 
-    it("catches a CELLO- token of the wrong length as malformed", async () => {
+    // A CELLO- token of the wrong length passes the client-side prefix gate (D13: the client checks
+    // only the stable brand prefix; the directory is the authority on the full format) and reaches
+    // the daemon — here there's no daemon, so it surfaces "No daemon running", not a client "malformed".
+    it("lets a wrong-length CELLO- token through the client gate to the daemon", async () => {
       const result = await register(tempDir, "alice", "CELLO-tooshort");
       expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("malformed");
+      expect(result.output).toContain("No daemon running");
     });
 
     it("returns exit 1 'No daemon running' when no daemon is up (well-formed token)", async () => {
@@ -151,6 +155,36 @@ describe("cli commands", () => {
       expect(parsed.ok).toBe(false);
       expect(parsed.reason).toBe("agent_not_found");
       expect(typeof parsed.guidance).toBe("string");
+    });
+
+    // M8C-ONBOARD-NEXTSTEP-1 (reviewer F1): on SUCCESS the output carries next-step + state
+    // legibility. A fake daemon returns ok so the success branch is exercised (a real register
+    // needs the directory's DKG). Guards against a regression that drops the guidance.
+    it("appends next-step + state-legibility guidance on a successful registration", async () => {
+      const socketPath = join(tempDir, "fake-daemon.sock");
+      const server: Server = createServer((socket) => {
+        socket.on("data", (chunk: Buffer) => {
+          const line = chunk.toString("utf-8").trim();
+          if (!line) return;
+          const req = JSON.parse(line) as { id: string | number; method: string };
+          if (req.method === "cello_register") {
+            socket.write(JSON.stringify({ id: req.id, result: { ok: true, agent_id: "id-1", primary_pubkey: "pk-1" } }) + "\n");
+          }
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+      await acquireLock(join(tempDir, "daemon.lock"), { pid: process.pid, socketPath, version: "0.0.1-test" });
+
+      try {
+        const result = await register(tempDir, "alice", VALID_TOKEN);
+        expect(result.exitCode).toBe(0);
+        expect(result.output).toContain("cello status");     // next step
+        expect(result.output).toContain("connecting");        // state legibility
+        expect(result.output).toContain("connected");
+        expect(result.output).toContain("cello login");       // recovery hint
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 });

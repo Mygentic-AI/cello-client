@@ -85,7 +85,10 @@ async function main(): Promise<void> {
       // consumed on success. The only real risk is the brief window before redemption; the env-var
       // form is NOT more secure (shell history + process environ retain it too), so don't push it as
       // a security fix. One calm line; if that window genuinely matters, read from a file/stdin.
-      if (tokenArg) {
+      // Only for something that actually looks like a token (reviewer F3) — otherwise the calm
+      // "single-use, 24h" note would reassure about a non-token right before the "that isn't a
+      // token" error, which reads as contradictory.
+      if (tokenArg && tokenArg.startsWith("CELLO-")) {
         process.stderr.write(
           "Note: this pre-auth token is single-use and expires in 24h — its only exposure risk is the brief window before you redeem it. (It's retained in shell history and the process list either way; if that window matters, pass it via a file or stdin instead.)\n",
         );

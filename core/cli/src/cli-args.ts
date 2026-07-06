@@ -34,7 +34,7 @@ const COMMAND_HELP: Record<string, string> = {
   register:
     "Usage: cello register <agent> <pre-auth-token>  — register a LOCAL agent with the directory.\n" +
     "  The two-step onboarding: (1) 'cello create-agent <name>' makes the local identity; (2) 'cello register <name> <token>' registers it with the directory.\n" +
-    "  The token is a single-use pre-authorization ticket from the CELLO portal (or the Operations Agent on Telegram), format 'CELLO-' + 33 characters, valid 24h.\n" +
+    "  The token is a single-use pre-authorization ticket from the CELLO Operations Agent on Telegram, format 'CELLO-' + 33 characters, valid 24h.\n" +
     "  Example:  cello register alice CELLO-3xY7...\n" +
     "  Env-var form (avoids retyping):  CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register alice\n" +
     "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
