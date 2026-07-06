@@ -130,4 +130,57 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
     // routing: bob's connection (different current agent) got NO cello_message
     expect(notifB.filter((n) => n.notification === "cello_message")).toHaveLength(0);
   });
+
+  // M4 / M1 "recovered": HELD out-of-order content must wake ONCE, at RELEASE — not at hold time.
+  // Locks the funnel placement: a doorbell fired in ingestReceivedContent BEFORE the hold gate would
+  // wake here at hold (buffer not yet drainable) — this test would then see a wake too early.
+  it("M4: held out-of-order content fires the doorbell once at RELEASE, not at hold", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+    const notif = collect(client);
+
+    const mgr = handle.getSessionNodeManager();
+    const s = "b".repeat(64);
+    insertSessionRow("alice", s, "cp");
+
+    // content_B is witnessed at canonical seq 1 (ahead of the empty tree's next-expected 0) → HELD.
+    const contentB = new TextEncoder().encode("second message");
+    const hashB = contentHash(contentB);
+    mgr.recordWitnessedSequence("alice", s, Buffer.from(hashB).toString("hex"), 1);
+    const heldRes = mgr.ingestReceivedContent("alice", s, contentB, hashB, "corr-B");
+    expect((heldRes as { held?: boolean }).held).toBe(true); // held, not appended
+    await sleep(120);
+    expect(notif.filter((n) => n.notification === "cello_message")).toHaveLength(0); // NO wake at hold
+
+    // content_A fills seq 0 → appends (1 wake) AND unblocks the held content_B (released → 1 wake).
+    const contentA = new TextEncoder().encode("first message");
+    mgr.ingestReceivedContent("alice", s, contentA, contentHash(contentA), "corr-A");
+    await sleep(150);
+    const msgs = notif.filter((n) => n.notification === "cello_message");
+    expect(msgs).toHaveLength(2); // exactly one per real message (A + released B) — no premature/extra wake
+  });
+
+  // M1 dedup: a replay of an already-appended content hash must fire ZERO additional doorbells.
+  // Locks the funnel placement: a doorbell fired before the dedup gate would wake twice here.
+  it("M1: a deduplicated replay of the same content hash fires no extra doorbell", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+    const notif = collect(client);
+
+    const mgr = handle.getSessionNodeManager();
+    const s = "c".repeat(64);
+    insertSessionRow("alice", s, "cp");
+
+    const content = new TextEncoder().encode("delivered twice");
+    const hash = contentHash(content);
+    mgr.ingestReceivedContent("alice", s, content, hash, "first");  // appends → 1 wake
+    const dupRes = mgr.ingestReceivedContent("alice", s, content, hash, "replay"); // same hash → dedup
+    expect((dupRes as { appendedCount?: number }).appendedCount).toBe(0); // no new leaf
+    await sleep(150);
+    expect(notif.filter((n) => n.notification === "cello_message")).toHaveLength(1); // exactly one, not two
+  });
 });

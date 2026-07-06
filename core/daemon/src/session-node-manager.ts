@@ -2467,9 +2467,15 @@ export class SessionNodeManager {
     }
 
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    const senderPubkey = entry?.counterpartyPubkey
-      ?? this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey
-      ?? "unknown";
+    let senderPubkey = entry?.counterpartyPubkey
+      ?? this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+    if (!senderPubkey) {
+      // M8C-MSGWAKE-1 (reviewer F1): the sender can't be resolved from the active node or the session
+      // record. MSGWAKE now surfaces this as the doorbell's `from`, so a chronic miss would silently
+      // ship `from: "unknown"` on every wake — log it loudly instead of papering it in.
+      this.#logger.warn("session.content.sender_unresolved", { sessionId, agentName, correlationId });
+      senderPubkey = "unknown";
+    }
 
     // DOD-MSG-5: a content_hash satisfies AT MOST ONE Merkle leaf, exactly once. If this hash is
     // already a leaf in the tree — it arrived BOTH directly and via the relay-park backstop, or it
