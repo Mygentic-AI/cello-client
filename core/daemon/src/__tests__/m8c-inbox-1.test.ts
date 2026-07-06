@@ -132,6 +132,31 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     expect(mgr.getLastDeliveredSeq("alice", s)).toBe(5);
   });
 
+  // ─── N3 (coupling): a live cello_receive advances the watermark (delivery marks read) ───
+  // Drives the real handleReceive → advanceLastDeliveredSeq path (not the primitive directly), so a
+  // hollowed handleReceive that dropped the advance would leave unread stuck and fail here.
+  it("N3: cello_receive advances the read watermark so the message stops being unread", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = SID64("e");
+    insertSessionRow("alice", s);
+    // Buffer a received message (also persists its transcript row) as the real inbound path would.
+    await client.send("__test_buffer_received", { agentName: "alice", sessionId: s, seq: 0, content: "m0" });
+
+    let res = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    expect(agentsOf(res).find((x) => x.agent === "alice")!.total_unread).toBe(1);
+
+    // A real delivery — this is the only production path that advances the watermark.
+    const recv = (await client.send("cello_receive", { session_id: s, timeout_ms: 1000 })) as R;
+    expect(recv["content"]).toBe("m0");
+
+    res = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    expect(agentsOf(res).find((x) => x.agent === "alice")!.total_unread).toBe(0); // delivery marked it read
+  });
+
   // ─── N1: scope all labels every loaded agent ───
   it("N1: scope 'all' returns a labelled entry per loaded agent", async () => {
     const config = await setupWithAgents("alice", "bob");

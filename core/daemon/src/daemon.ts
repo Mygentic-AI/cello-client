@@ -3614,6 +3614,20 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     enqueueInboundSession(agentName, { sessionIdHex, counterpartyPubkeyHex, genesisPrevRootHex: "" });
     return { ok: true };
   });
+
+  // M8C-INBOX-1 (reviewer F1): buffer a received message so a test can drive a live cello_receive
+  // and assert the watermark advances (the N3 delivery-marks-read coupling), without a session tree.
+  handlers.set("__test_buffer_received", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    const seq = params?.seq as number | undefined;
+    const content = (params?.content as string) ?? "hello";
+    if (!agentName || !sessionId || typeof seq !== "number") {
+      return { error: "missing_params", guidance: "Provide agentName, sessionId, seq." };
+    }
+    sessionNodeManager.pushReceivedContentForTest(agentName, sessionId, seq, content, (params?.senderPubkey as string) ?? "cp");
+    return { ok: true };
+  });
   } // end CELLO_ENV=test guard
 
   // ─── M7-SESSION-001 (H-1): seal-interrupted bilateral RESPONDER ────────────

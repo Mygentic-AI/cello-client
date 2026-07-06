@@ -657,10 +657,18 @@ export class SessionNodeManager {
         .run(agentName, sessionId, sequence, direction, blob, Date.now());
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
     } catch (err: unknown) {
-      this.#logger.warn("transcript.message.record.failed", {
+      // M8C-INBOX-1 (reviewer F2): a RECEIVED-row write failure is not cosmetic — since INBOX-1 the
+      // transcript is the AUTHORITY for unread (getUnreadSummary). A swallowed received write means
+      // the message never shows as unread in cello_check_notifications AND is lost on restart, while
+      // cello_receive still delivers it live from the in-memory buffer (masking the loss). Surface it
+      // LOUDLY (error) so the reconcile-after-loss guarantee's dependency is visible. Sent-row
+      // failures stay a warning (they only affect the durable readable transcript, not unread).
+      const level = direction === "received" ? "error" : "warn";
+      this.#logger[level]("transcript.message.record.failed", {
         sessionId, agentName, sequence, direction,
         reason: err instanceof Error ? err.message : String(err),
         correlationId,
+        ...(direction === "received" ? { impact: "unread_reconciliation_may_undercount" } : {}),
       });
     }
   }
@@ -2605,6 +2613,20 @@ export class SessionNodeManager {
     const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
     if (!buf || buf.length === 0) return null;
     return buf.shift() ?? null;
+  }
+
+  /**
+   * TEST-ONLY (M8C-INBOX-1 reviewer F1): buffer a received message + persist its transcript row,
+   * exactly as the real inbound path (#appendVerifiedContent) does, WITHOUT standing up a session
+   * tree — so a test can drive a live cello_receive that advances the read watermark (the N3
+   * "delivery marks read" coupling). Only reachable via the CELLO_ENV=test IPC hook.
+   */
+  pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
+    this.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
+    const key = this.#k(agentName, sessionId);
+    let buf = this.#receivedContent.get(key);
+    if (!buf) { buf = []; this.#receivedContent.set(key, buf); }
+    buf.push({ contentHex: Buffer.from(content, "utf8").toString("hex"), senderPubkey, sequenceNumber: seq });
   }
 
   /**
