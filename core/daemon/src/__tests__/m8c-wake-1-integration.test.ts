@@ -18,20 +18,23 @@
  * channel feature and is proven at LIVE-1, not here.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 
-// Workspace-root-relative paths (this file is core/daemon/src/__tests__/).
+// Workspace-root-relative paths (this file is core/daemon/src/__tests__/). Spawn the BUILT shim
+// with plain `node` (fast, deterministic) rather than tsx-from-source — tsx cold-compiles the shim
+// + its imports on every spawn, which on a loaded CI runner raced past the 30s test timeout and
+// hung the initialize handshake. CI builds before test; locally we build-if-missing in beforeAll.
 const ROOT = join(import.meta.dirname, "..", "..", "..", "..");
-const TSX = join(ROOT, "node_modules", ".bin", "tsx");
-const SHIM_SRC = join(ROOT, "core", "adapter-claude-code", "src", "bin", "cello-mcp.ts");
+const SHIM_BUILT = join(ROOT, "core", "adapter-claude-code", "dist", "bin", "cello-mcp.js");
 
 describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel", () => {
   let tempDir: string;
@@ -39,6 +42,14 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
   let shim: ChildProcess | null;
   let trigger: IpcClient | null;
   let logger: Logger;
+
+  beforeAll(() => {
+    // Ensure the spawned dist shim reflects CURRENT source: incremental `tsc --build` is a fast
+    // no-op when up-to-date and rebuilds if the shim source changed (the local `pnpm test` gate runs
+    // BEFORE the build step, so the dist could otherwise be stale; CI builds first, so it's a no-op).
+    execSync("pnpm --filter @cello-protocol/connect exec tsc --build", { cwd: ROOT, stdio: "ignore" });
+    if (!existsSync(SHIM_BUILT)) throw new Error(`shim build did not produce ${SHIM_BUILT}`);
+  }, 180_000);
 
   beforeEach(async () => {
     process.env["CELLO_ENV"] = "test";
@@ -74,8 +85,8 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     await FileKeyProvider.load(join(aliceDir, "key"));
     handle = await startDaemon(config);
 
-    // ─── real shim binary over stdio ───
-    shim = spawn(TSX, [SHIM_SRC], {
+    // ─── real shim binary over stdio (built dist, plain node) ───
+    shim = spawn(process.execPath, [SHIM_BUILT], {
       env: { ...process.env, CELLO_DIR: tempDir },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -84,11 +95,13 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     const stderrEvents: Array<Record<string, unknown>> = [];
     let initializeResult: Record<string, unknown> | null = null;
     let stdoutBuf = "";
+    let stderrRaw = ""; // full stderr, so a startup failure surfaces instead of a silent hang
     const pending = new Map<number, (msg: Record<string, unknown>) => void>();
 
     // C6 observability: the shim writes domain.noun.verb events (JSON) to its stderr tee.
     let stderrBuf = "";
     shim.stderr!.on("data", (chunk: Buffer) => {
+      stderrRaw += chunk.toString("utf-8");
       stderrBuf += chunk.toString("utf-8");
       let nl: number;
       while ((nl = stderrBuf.indexOf("\n")) !== -1) {
@@ -121,8 +134,18 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     });
 
     const send = (obj: Record<string, unknown>) => shim!.stdin!.write(JSON.stringify(obj) + "\n");
+    // Per-request timeout: if the shim never answers (e.g. it crashed on startup), fail FAST with
+    // its captured stderr rather than hanging to the whole-test timeout with no diagnostics.
     const request = (obj: Record<string, unknown>) =>
-      new Promise<Record<string, unknown>>((resolve) => { pending.set(obj["id"] as number, resolve); send(obj); });
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const id = obj["id"] as number;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`shim did not answer request id=${id} within 15s. shim stderr:\n${stderrRaw || "(empty)"}`));
+        }, 15_000);
+        pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+        send(obj);
+      });
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
     // ─── raw MCP handshake ───
@@ -190,5 +213,5 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     const forwarded = stderrEvents.filter((e) => e["event"] === "notification.channel.forwarded");
     expect(forwarded.length).toBeGreaterThanOrEqual(2);
     expect(forwarded.some((e) => e["type"] === "session_state_changed" && e["agent"] === "alice")).toBe(true);
-  }, 30000);
+  }, 60000);
 });
