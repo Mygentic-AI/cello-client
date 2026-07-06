@@ -158,10 +158,17 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     });
     await sleep(500);
 
+    // C3 (no per-type allowlist): THREE distinct daemon notification types must surface through
+    // the same generic bridge — session_state_changed (created + sealed) AND the two agent-level
+    // types already triggered above (cello_start_agent → agent_state_changed; cello_use_agent →
+    // agent_current_changed). A bridge that special-cased only session_state_changed would pass
+    // the session assertions but fail these — that is the T1 bypass this guards against.
+    const typeOf = (e: Record<string, unknown>) => (e["params"] as Record<string, unknown>)?.["type"];
+    expect(channelEvents.some((e) => typeOf(e) === "agent_state_changed")).toBe(true);
+    expect(channelEvents.some((e) => typeOf(e) === "agent_current_changed")).toBe(true);
+
     // C3/C4: the session_state_changed frames surfaced as claude/channel events
-    const sessionEvents = channelEvents.filter(
-      (e) => ((e["params"] as Record<string, unknown>)?.["type"]) === "session_state_changed",
-    );
+    const sessionEvents = channelEvents.filter((e) => typeOf(e) === "session_state_changed");
     expect(sessionEvents.length).toBeGreaterThanOrEqual(2);
 
     const params = sessionEvents.map((e) => e["params"] as Record<string, unknown>);
