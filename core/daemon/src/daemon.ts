@@ -1068,6 +1068,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signaling: mgr,
       logger,
     });
+    // Fix #1 (cross-node seal-liveness): a visiting connection must ALSO be able to complete the SEAL.
+    // The broker (the node this visiting connection targets) pushes seal_verified then session_sealed to
+    // whichever stream the initiator holds to it — for a cross-node close that is THIS visiting stream.
+    // Run the seal FROST ceremony over the agent's own node (getNode: () => nodeRef, exactly as the
+    // session ceremony above) and reply/resolve on this stream. Harmless on a setup-only visiting
+    // connection: these frames never arrive before it is released after handoff.
+    wireSealCeremonyHandler({
+      agentName,
+      persistence: getPersistence(agentName),
+      agentPubkeyHex,
+      getNode: () => nodeRef,
+      getDirectoryEndpoint: getFailoverEndpoint,
+      getConsortiumEndpoints: resolveConsortiumRoster,
+      signaling: mgr,
+      logger,
+    });
+    registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
+    registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
     logger.info("signaling.visiting.connected", { agentName, node: nodeId, correlationId });
     return {
       mgr,
@@ -1077,6 +1095,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       },
     };
   }
+
+  // Fix #1 (cross-node seal-liveness): the broker node (the counterparty's home) for each cross-node
+  // session we initiated, keyed `${agentName}:${sessionIdHex}`. Set when runCrossNodeSetup establishes
+  // the session; read by cello_close_session so it can re-open a visiting connection to the broker and
+  // complete the seal there. The broker pushes seal_verified/session_sealed, but the initiator RELEASES
+  // its visiting connection after setup — so without reconnecting, the close times out
+  // (seal_unilateral_timeout) and the seal only completes whenever the daemon next happens to reconnect.
+  // Presence of an entry means the session is cross-node (same-node sessions never go through
+  // runCrossNodeSetup). In-memory only: a close in the SAME process (the common case) is covered; a close
+  // after a daemon restart falls back to the pre-fix behavior (deferred hardening: persist on the row).
+  const crossNodeBrokerBySession = new Map<string, string>();
 
   /**
    * Resolve `owningNodeId` through the signed manifest and run the session_request over a transient
@@ -1115,6 +1144,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName);
       if (result.ok) {
         releaseReason = "handoff-complete";
+        // Fix #1: remember the broker for this session so cello_close_session can reconnect to complete the seal.
+        const brokerSessionIdHex = Buffer.from(result.assignment.session_id).toString("hex");
+        crossNodeBrokerBySession.set(`${agentName}:${brokerSessionIdHex}`, owningNodeId);
         logger.info("session.crossnode.established", { agentName, brokerNode: owningNodeId, correlationId });
       } else {
         logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: result.reason, correlationId });
@@ -2874,7 +2906,35 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (record.status === "active") {
       sealInterruptedInProgress.add(sealKey(record.agent_name, sessionId));
       const correlationId = randomUUID();
+      // Fix #1 (cross-node seal-liveness): if this session was brokered by another node, the seal_verified
+      // + session_sealed frames are pushed by that BROKER — but the initiator released its visiting
+      // connection after setup, so on the home stream they never arrive and close times out. Re-open a
+      // transient visiting connection to the broker (seal-capable — openVisitingConnection now wires the
+      // seal handlers) for the duration of the seal, then release it in finally. Same-node sessions have
+      // no entry here and use the home stream unchanged.
+      let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
       try {
+        const brokerNodeForSeal = crossNodeBrokerBySession.get(`${record.agent_name}:${sessionId}`);
+        if (brokerNodeForSeal) {
+          const sealKp = keyProviders.get(record.agent_name);
+          if (sealKp) {
+            const sealPubHex = Buffer.from(await sealKp.getPublicKey()).toString("hex");
+            const roster = await resolveConsortiumRoster();
+            const brokerTarget = roster?.find((e) => e.nodeId === brokerNodeForSeal) ?? null;
+            if (!brokerTarget) {
+              logger.warn("session.seal.broker.unresolved", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
+            } else {
+              const conn = openVisitingConnection(record.agent_name, sealKp, sealPubHex, { peerId: brokerTarget.peerId, multiaddr: brokerTarget.multiaddr }, correlationId, brokerNodeForSeal);
+              if (await waitForSignalingConnected(conn.mgr, 10_000)) {
+                sealBrokerConn = conn;
+                logger.info("session.seal.broker.reconnected", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
+              } else {
+                await conn.stop("seal-broker-unreachable");
+                logger.warn("session.seal.broker.unreachable", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
+              }
+            }
+          }
+        }
         // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
         // relay witness; when the counterparty ALSO closes, the relay's #maybeProcessSeal
         // fires → directory processSeal rebuilds + verifies the signed chain → FROST
@@ -3018,6 +3078,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_list_sessions) before retrying cello_close_session.",
         };
       } finally {
+        // Fix #1: release the transient broker seal-connection (best-effort; the seal result stands).
+        if (sealBrokerConn) {
+          try { await sealBrokerConn.stop("seal-complete"); }
+          catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+        }
         sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
     }
