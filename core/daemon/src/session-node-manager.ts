@@ -309,6 +309,14 @@ export class SessionNodeManager {
       ) => void)
     | null = null;
 
+  // M8C-MSGWAKE-1 (channel stage 2): fired when a verified inbound message is buffered for
+  // cello_receive, so the daemon can push a content-free `cello_message` doorbell. Wired in
+  // daemon.ts (depends on the notification dispatcher). Content-free by signature — carries only
+  // agent / session / senderPubkey, NEVER the plaintext (INV-CONTENTFREE).
+  #onContentArrived:
+    | ((agentName: string, sessionId: string, senderPubkey: string) => void)
+    | null = null;
+
   // CELLO-M7-MSG-001 (AC-001/AC-002/AC-003): the send is no longer fire-and-forget.
   // After a content_frame is delivered over the direct session channel, the sender
   // arms a TTF timer and waits for an unsigned, transport-authenticated `persisted`
@@ -837,6 +845,16 @@ export class SessionNodeManager {
     ) => void,
   ): void {
     this.#onSessionStateChanged = cb;
+  }
+
+  /**
+   * M8C-MSGWAKE-1: inject the content-arrival callback (daemon.ts → NotificationDispatcher.
+   * dispatchCelloMessage). Setter injection, same construction-order reason as above.
+   */
+  setOnContentArrived(
+    cb: (agentName: string, sessionId: string, senderPubkey: string) => void,
+  ): void {
+    this.#onContentArrived = cb;
   }
 
   /**
@@ -2578,6 +2596,16 @@ export class SessionNodeManager {
       sequenceNumber: leafIndex,
       correlationId,
     });
+    // M8C-MSGWAKE-1: content is now buffered and drainable — fire the doorbell AFTER the push so a
+    // woken cello_receive finds the message. Content-free (agent/session/senderPubkey only). Never
+    // let a listener error escape the content path.
+    try {
+      this.#onContentArrived?.(agentName, sessionId, senderPubkey);
+    } catch (err: unknown) {
+      this.#logger.warn("notification.cello_message.dispatch.failed", {
+        sessionId, agentName, reason: err instanceof Error ? err.message : String(err),
+      });
+    }
     return { leafIndex };
   }
 

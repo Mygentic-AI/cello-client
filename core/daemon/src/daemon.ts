@@ -5058,6 +5058,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey);
   });
 
+  // M8C-MSGWAKE-1 (channel stage 2): per-message wake — a verified inbound message fires a
+  // content-free `cello_message` doorbell to the current-agent connection(s). The shim's generic
+  // bridge (WAKE) forwards it to a live --channels session as notifications/claude/channel.
+  sessionNodeManager.setOnContentArrived((agentName, sessionId, senderPubkey) => {
+    notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey);
+  });
+
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
   ipcServer.onDisconnect((connectionId) => {

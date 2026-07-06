@@ -141,6 +141,30 @@ export class NotificationDispatcher {
     }
   }
 
+  /**
+   * M8C-MSGWAKE-1 (channel stage 2): push a content-free `cello_message` doorbell to connections
+   * where the affected agent is current — one per inbound message. Same routing as
+   * session_state_changed. The payload carries only type + from (senderPubkey) + session_id; the
+   * operator calls cello_receive to fetch content (INV-CONTENTFREE / SI-001 — NO content here).
+   */
+  dispatchCelloMessage(agentName: string, sessionId: string, from: string): void {
+    const notification: IpcNotification = {
+      notification: "cello_message",
+      data: {
+        agent: agentName,
+        type: "cello_message",
+        from,
+        session_id: sessionId,
+      },
+    };
+
+    for (const connectionId of this.#getConnectionIds()) {
+      if (this.#currentAgentMap.get(connectionId) === agentName) {
+        this.#safeSend(connectionId, notification, "cello_message");
+      }
+    }
+  }
+
   #safeSend(connectionId: string, notification: IpcNotification, notificationType: string): void {
     try {
       const success = this.#sendNotification(connectionId, notification);
