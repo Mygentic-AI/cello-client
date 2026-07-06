@@ -254,4 +254,63 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const allowed = snm.checkUnknownSenderAcceptanceBound("alice", brandNewStranger);
     expect(allowed).toEqual({ ok: true });
   });
+
+  // Reviewer HIGH finding (aeffb82f, F1): the size cap ran AFTER the out-of-order hold-branch's
+  // early return, so held content skipped it entirely — a non-contact sender could drip-feed
+  // unbounded bytes by making every message arrive "out of order" relative to the relay witness.
+  it("F1 regression: an oversized OUT-OF-ORDER (held) message from a non-contact is rejected, not silently held", async () => {
+    await makeAgentDir("alice");
+    const h = await start(makeLogger().logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "strangerpubkeyhex", "peer-1", "corr");
+
+    const bigChunk = new Uint8Array(ABUSE_MAX_SESSION_RECEIVED_BYTES + 100); // over the cap alone
+    const hashHex = Buffer.from(msgLeafHash(bigChunk)).toString("hex");
+    // Witness a canonical sequence AHEAD of the (empty) tree — forces the hold branch instead of
+    // the direct-append path (nextExpected is 0 for a brand-new session).
+    snm.recordWitnessedSequence("alice", SID, hashHex, 5);
+
+    const res = snm.ingestReceivedContent("alice", SID, bigChunk, msgLeafHash(bigChunk), "corr-2");
+    expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
+
+    // Confirm nothing was silently held either — a later legitimate in-order message must not
+    // trigger a release of the oversized (rejected) content.
+    const { messages } = snm.readTranscript("alice", SID);
+    expect(messages).toHaveLength(0);
+  });
+
+  // Reviewer HIGH finding (aeffb82f, F2): counting status = 'active' ONLY let a counterparty
+  // evade both acceptance bounds for free — disconnecting flips a session to 'interrupted' (a
+  // trivial, attacker-controlled action), which still accepts content but was never counted.
+  it("F2 regression: 'interrupted' sessions still count toward BOTH the per-sender and global acceptance bounds", async () => {
+    await makeAgentDir("alice");
+    const h = await start(makeLogger().logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    const db = snm.getDb();
+    const stranger = "12".repeat(32);
+    const now = Date.now();
+
+    // All 'interrupted', not 'active' — the exact evasion: open, disconnect (interrupt), repeat.
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
+      const sid = `f1${i}`.padStart(32, "0");
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, 'alice', ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, stranger, now, now, new Date(now).toISOString());
+    }
+    expect(snm.countActiveSessionsForCounterparty("alice", stranger)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    expect(snm.checkUnknownSenderAcceptanceBound("alice", stranger)).toMatchObject({ ok: false, reason: "abuse_bound_sessions_per_sender" });
+
+    // Same for the global cap — all interrupted, still counted.
+    const db2 = snm.getDb();
+    for (let i = 0; i < ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL; i++) {
+      const sid = `f2${i}`.padStart(32, "0");
+      db2.prepare(
+        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, 'alice', ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, `other-${i}`, now, now, new Date(now).toISOString());
+    }
+    expect(snm.countActiveSessionsFromUnknownSenders("alice")).toBeGreaterThanOrEqual(ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL);
+    expect(snm.checkUnknownSenderAcceptanceBound("alice", "brand-new-stranger")).toMatchObject({ ok: false, reason: "abuse_bound_unknown_sessions_global" });
+  });
 });

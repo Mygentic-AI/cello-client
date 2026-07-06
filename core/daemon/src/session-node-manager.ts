@@ -828,23 +828,42 @@ export class SessionNodeManager {
     return row.total;
   }
 
-  /** M8C-ABUSE-1: active sessions this agent currently holds with the given counterparty. */
+  /** M8C-ABUSE-1 (reviewer HIGH fix, D18): bytes currently sitting in the out-of-order hold
+   *  buffer for this session — NOT yet committed leaves, but real bytes in memory that would
+   *  otherwise let multiple held chunks each individually pass the size gate while cumulatively
+   *  exceeding it once #releaseHeld drains them. */
+  #getHeldBytesTotal(agentName: string, sessionId: string): number {
+    const held = this.#heldContent.get(this.#k(agentName, sessionId));
+    if (!held) return 0;
+    let total = 0;
+    for (const entry of held.values()) total += entry.content.length;
+    return total;
+  }
+
+  /** M8C-ABUSE-1: non-terminal sessions this agent currently holds with the given counterparty.
+   *  Reviewer HIGH fix (aeffb82f, D18): counting `status = 'active'` ONLY let a counterparty
+   *  evade the bound for free by disconnecting (a trivial, attacker-controlled action that flips
+   *  a session to 'interrupted' — markInterruptedWithDetails) and opening a fresh session,
+   *  repeated indefinitely. 'interrupted' sessions still accept content (ingestReceivedContent
+   *  explicitly allows both statuses) and are NOT terminal (sealed/seal_interrupted_pending are),
+   *  so they must still count against the bound. */
   countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number {
     if (!this.#db) return 0;
     const row = this.#db
-      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_name = ? AND counterparty_pubkey = ? AND status = 'active'")
+      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_name = ? AND counterparty_pubkey = ? AND status IN ('active', 'interrupted')")
       .get(agentName, counterpartyPubkey) as { n: number };
     return row.n;
   }
 
-  /** M8C-ABUSE-1 (anti-swarm): active sessions this agent holds with counterparties that are NOT
-   *  a known contact — the global cap counts across ALL unknown senders combined. */
+  /** M8C-ABUSE-1 (anti-swarm): non-terminal sessions this agent holds with counterparties that are
+   *  NOT a known contact — the global cap counts across ALL unknown senders combined. Same
+   *  'interrupted'-status fix as countActiveSessionsForCounterparty above. */
   countActiveSessionsFromUnknownSenders(agentName: string): number {
     if (!this.#db) return 0;
     const row = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM sessions s
-         WHERE s.agent_name = ? AND s.status = 'active'
+         WHERE s.agent_name = ? AND s.status IN ('active', 'interrupted')
            AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.agent_name = s.agent_name AND c.pubkey = s.counterparty_pubkey)`,
       )
       .get(agentName) as { n: number };
@@ -2598,6 +2617,32 @@ export class SessionNodeManager {
       return { ok: true, leafIndex: existingIdx, sequenceNumber: existingIdx, appendedCount: 0 };
     }
 
+    // M8C-ABUSE-1 (reviewer HIGH fix, D18): per-session total-size cap (anti-drip-feed) —
+    // "whitelisted senders bounded only by disk" (DoD), so a known contact is exempt entirely.
+    // MUST run BEFORE the hold-branch below — the original placement (after it) let a
+    // non-contact sender drip-feed unbounded bytes by making every message arrive "out of order"
+    // relative to the relay witness (held content skipped the cap entirely, then #releaseHeld
+    // appended it later with no re-check). Accounts for bytes already committed AND bytes
+    // currently sitting in the hold buffer (multiple held chunks could otherwise each individually
+    // pass the check while cumulatively exceeding it once released).
+    if (!this.isContact(agentName, senderPubkey)) {
+      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
+      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      if (priorTotal + heldTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
+        this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
+          sessionId,
+          agentName,
+          senderPubkey,
+          priorTotal,
+          heldTotal,
+          incoming: content.length,
+          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
+          correlationId,
+        });
+        return { ok: false, reason: "session_size_limit_exceeded" };
+      }
+    }
+
     // DOD-MSG-4 (strict in-order gate): the RELAY is the ordering authority. If B holds the
     // canonical sequence for this hash (witnessed via leaf_deliver) and it is AHEAD of the next
     // expected leaf, HOLD the content rather than append it out of order. The missing in-between
@@ -2638,27 +2683,6 @@ export class SessionNodeManager {
         nextExpected,
         correlationId,
       });
-    }
-
-    // M8C-ABUSE-1: per-session total-size cap (anti-drip-feed) — "whitelisted senders bounded
-    // only by disk" (DoD), so a known contact is exempt entirely. Scope (journaled): this gates
-    // the main direct-delivery path only; the narrower out-of-order held/recovery release path
-    // (#releaseHeld) is not yet gated — refusing a release mid-recovery risks stalling the strict
-    // in-order chain (DOD-MSG-4) for every subsequent message, a bigger risk than the bound itself.
-    if (!this.isContact(agentName, senderPubkey)) {
-      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
-      if (priorTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
-        this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
-          sessionId,
-          agentName,
-          senderPubkey,
-          priorTotal,
-          incoming: content.length,
-          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
-          correlationId,
-        });
-        return { ok: false, reason: "session_size_limit_exceeded" };
-      }
     }
 
     const { leafIndex } = this.#appendVerifiedContent(agentName, sessionId, content, contentHashHex, senderPubkey, correlationId);
