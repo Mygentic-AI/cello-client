@@ -561,6 +561,19 @@ export class SessionNodeManager {
       )
     `);
 
+    // M8C-CONTACT-1: binary per-agent contact whitelist. This is an ACCESS-CONTROL LIST, not a
+    // setting — it belongs alongside message_watermarks/sessions as its own real subsystem, not
+    // behind the parked M9-CFG-001 config store. Identity PINS to the pubkey at add time (never
+    // re-resolved); known stays known until explicitly removed (no TTL/expiry on membership).
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS contacts (
+        agent_name TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        added_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_name, pubkey)
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -762,6 +775,37 @@ export class SessionNodeManager {
       )
       .all(agentName) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
     return rows;
+  }
+
+  /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
+  isContact(agentName: string, pubkey: string): boolean {
+    if (!this.#db) return false;
+    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_name = ? AND pubkey = ?").get(agentName, pubkey);
+    return row !== undefined;
+  }
+
+  /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
+   *  no-op, never refreshes added_at; identity does not get re-resolved). */
+  addContact(agentName: string, pubkey: string): void {
+    if (!this.#db || !pubkey) return;
+    this.#db
+      .prepare("INSERT OR IGNORE INTO contacts (agent_name, pubkey, added_at) VALUES (?, ?, ?)")
+      .run(agentName, pubkey, Date.now());
+  }
+
+  /** M8C-CONTACT-1: known stays known until explicitly removed. */
+  removeContact(agentName: string, pubkey: string): boolean {
+    if (!this.#db) return false;
+    const res = this.#db.prepare("DELETE FROM contacts WHERE agent_name = ? AND pubkey = ?").run(agentName, pubkey);
+    return res.changes > 0;
+  }
+
+  /** M8C-CONTACT-1: list an agent's known contacts, oldest-added first. */
+  listContacts(agentName: string): Array<{ pubkey: string; added_at: number }> {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare("SELECT pubkey, added_at FROM contacts WHERE agent_name = ? ORDER BY added_at ASC")
+      .all(agentName) as Array<{ pubkey: string; added_at: number }>;
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */

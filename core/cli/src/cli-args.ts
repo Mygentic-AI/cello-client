@@ -18,12 +18,13 @@ export const KNOWN_COMMANDS = new Set([
   "refresh",
   "receipts",
   "sessions",
+  "contact",
 ] as const);
 
 export type KnownCommand = typeof KNOWN_COMMANDS extends Set<infer T> ? T : never;
 
 export const USAGE =
-  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions>\n" +
+  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact>\n" +
   "Run 'cello <command> --help' for command-specific usage.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
@@ -47,6 +48,11 @@ const COMMAND_HELP: Record<string, string> = {
   receipts: "Usage: cello receipts <name>  — list the agent's stored relay ordering receipts.",
   sessions:
     "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
+  contact:
+    "Usage: cello contact add <pubkey> [--agent <name>] | cello contact remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]\n" +
+    "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
+    "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
+    "  Example:  cello contact list --agent alice",
 };
 
 export function helpForCommand(command: string): string {
@@ -56,6 +62,7 @@ export function helpForCommand(command: string): string {
 /** Flags each command recognizes. `--limit` consumes the following value. */
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   sessions: new Set(["--open", "--closed", "--failed", "--all", "--limit"]),
+  contact: new Set(["--agent"]),
 };
 
 export type ArgsCheck =

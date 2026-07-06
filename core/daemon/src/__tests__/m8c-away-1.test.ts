@@ -48,6 +48,9 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
 
 class FakeNode implements Partial<CelloNode> {
   readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
+  // Reviewer finding (a9099571): let a test toggle a transient failure on the NEXT newStream call
+  // only, to prove the away-ack dedup guard clears on failure and retries on the next arrival.
+  failNextStream = false;
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
@@ -61,6 +64,10 @@ class FakeNode implements Partial<CelloNode> {
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
+    if (this.failNextStream) {
+      this.failNextStream = false;
+      throw new Error("connection_lost: counterparty stream dead");
+    }
     return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
   }
 }
@@ -153,6 +160,9 @@ describe("M8C-AWAY-1: away response", () => {
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
     const initiatorPubkey = "cd".repeat(32);
+    // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
+    // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
+    h.getSessionNodeManager().addContact("bob", initiatorPubkey);
     injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(150);
 
@@ -187,6 +197,9 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
+    // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
+    snm.addContact("alice", "bobpubkeyhex");
 
     // A2: unattended (no connection yet) — an inbound message gets an away ack.
     snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
@@ -234,5 +247,48 @@ describe("M8C-AWAY-1: away response", () => {
     expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
     const { messages } = snm.readTranscript("alice", SID_HEX);
     expect(messages.filter((m) => m.direction === "sent")).toHaveLength(0);
+  });
+
+  // Reviewer finding (a9099571, test-teeth gap): the dedup key is per (agent, SESSION, kind) — a
+  // regression that dropped sessionId from the key would incorrectly suppress the SECOND session's
+  // ack because the first session's message already consumed that kind's dedup slot.
+  it("A4 (per-session isolation): two different unattended sessions on the SAME agent each get their own independent away ack", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    const SID_1 = "aa".repeat(32);
+    const SID_2 = "bb".repeat(32);
+    await snm.createSessionNode(SID_1, "alice", "cp1pubkeyhex", "peer-1", "corr-1");
+    await snm.createSessionNode(SID_2, "alice", "cp2pubkeyhex", "peer-2", "corr-2");
+
+    snm.ingestReceivedContent("alice", SID_1, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
+    snm.ingestReceivedContent("alice", SID_2, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
+    await wait(30);
+
+    const acked = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
+    expect(acked.map((e) => e.context.sessionId).sort()).toEqual([SID_1, SID_2].sort());
+  });
+
+  // Reviewer finding (a9099571, MEDIUM): a transient send failure must not permanently silence the
+  // rest of the away period — the dedup guard must clear so the NEXT arrival retries.
+  it("dedup clears on a send failure — the next arrival in the same away period retries", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start(logger, node);
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    node.failNextStream = true; // the away-ack's own send will fail
+    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
+    await wait(30);
+    expect(events.find((e) => e.event === "session.away.response.failed")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+
+    // Next arrival in the SAME away period (no attend in between) — must retry, not stay silent.
+    snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi again"), msgLeafHash(new TextEncoder().encode("hi again")), "c2");
+    await wait(30);
+    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
   });
 });

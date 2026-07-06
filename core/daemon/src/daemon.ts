@@ -914,9 +914,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // M8C-AWAY-1: away response — an unattended Primary auto-answers session requests + messages
   // with the default transparent away text and queues them (the DoD's own mandated default).
   // CORE ships now; the operator-configurable custom-text / opaque-privacy-mode SWITCH is PARKED
-  // on M9-CFG-001 (same pattern as LOGINSTART's autoStart:false opt-out, D14) — it's a genuine
-  // per-agent operator preference that needs the deferred config store, whereas transparent is
-  // already the correct, non-fake default this unit must ship regardless.
+  // on M9-CFG-001, journaled as D15 (M8C-DECISIONS.md, mirrors D14) — a genuine per-agent operator
+  // preference that needs the deferred config store, whereas transparent is already the correct,
+  // non-fake default this unit must ship regardless.
   // "Attended" per the design doc (2026-07-01 command-surface discussion, Agent State Model):
   // Primary + a live client session has claimed the agent via use_agent. Scanning
   // perConnectionState is cheap (a handful of connections) and needs no separate tracked state.
@@ -928,6 +928,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     request: "Agent is currently away. Your session request has been received and queued.",
     message: "Agent is currently away. Your message has been received and will be read when the operator returns.",
   };
+  // M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — a single shared,
+  // deliberately minimal template regardless of kind, distinct from AWAY-1's richer per-type text.
+  const STRANGER_TEXT = "Dispatched.";
   // Coalescing: one away ack per (agent, session, kind) per away period — cleared when the agent
   // becomes attended again (cello_use_agent) so the NEXT away period gets a fresh ack rather than
   // staying silent forever. Known imprecision (journaled, not silent): clearing fires on ANY
@@ -940,20 +943,31 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (awayAckSent.has(dedupKey)) return;
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
+    // M8C-CONTACT-1: this check MUST run synchronously (before any await below) — the caller of
+    // sendAwayResponse for a fresh inbound request fires this THEN calls addContact right after
+    // (D6: "accepting X's request adds X"), relying on this line executing first so a stranger's
+    // VERY FIRST contact is correctly judged unknown, not already-added.
+    const isKnown = sessionNodeManager.isContact(agentName, record.counterparty_pubkey);
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
-      const contentBytes = new TextEncoder().encode(AWAY_TEXT[kind]);
+      const contentBytes = new TextEncoder().encode(isKnown ? AWAY_TEXT[kind] : STRANGER_TEXT);
       const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok) {
+        // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
+        // away period — clear the guard so the next inbound arrival retries the ack.
+        awayAckSent.delete(dedupKey);
         logger.warn("session.away.response.failed", { agentName, sessionId, kind, reason: sendResult.reason });
         return;
       }
       const contentHashHex = Buffer.from(contentHash).toString("hex");
       const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
       sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
-      logger.info("session.away.response.sent", { agentName, sessionId, kind, sequenceNumber: leafIndex });
+      logger.info("session.away.response.sent", { agentName, sessionId, kind, isKnown, sequenceNumber: leafIndex });
     } catch (err: unknown) {
+      // Reviewer MEDIUM fix: same as above — an unexpected throw must not permanently lock out
+      // future retries for the rest of this away period.
+      awayAckSent.delete(dedupKey);
       logger.warn("session.away.response.failed", { agentName, sessionId, kind, error: err instanceof Error ? err.message : String(err) });
     }
   }
@@ -2942,6 +2956,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }
     }
 
+    // M8C-CONTACT-1 (D6): "initiating a session to X adds X" — pin at the pubkey the negotiator
+    // actually used (not re-resolved later).
+    sessionNodeManager.addContact(agentName, counterpartyPubkey);
+
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
     return { ok: true, sessionId, transportMode: result.mode, correlationId };
@@ -3341,11 +3359,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // M8C-CURSOR-1: this is the ONLY reader that covers BOTH directions (sent + received), so it's
     // the correct general catch-up path — e.g. a second attended connection on the same agent
     // catching up on a message a DIFFERENT local connection sent (since_seq is received-only and
-    // would never surface it). Advance to the max sequence actually seen.
-    if (messages.length > 0) {
-      const maxSeq = messages.reduce((m, r) => Math.max(m, r.sequence), -1);
-      advanceConnectionCursor(connectionId, sessionId, maxSeq);
-    }
+    // would never surface it). Route through safeCursorAdvance rather than trusting the raw max —
+    // reviewer HIGH finding (aa5928e2/a9099571): recordTranscriptMessage swallows a DB write
+    // failure without rolling back the tree's leaf count, so a hole in `messages` is possible in
+    // principle; the contiguous-run walk refuses to vault the cursor past such a hole even here.
+    safeCursorAdvance(connectionId, sessionId, new Set(messages.map((m) => m.sequence)));
     return { ok: true, session_id: sessionId, messages, undecryptable };
   });
 
@@ -4144,7 +4162,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       );
       // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
       // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
+      // ORDER MATTERS: sendAwayResponse's isContact check runs synchronously (before any await) as
+      // soon as it's invoked, so calling addContact on the NEXT line still lets a stranger's very
+      // first contact be judged correctly unknown (M8C-CONTACT-1 D6: "accepting X's request adds X"
+      // — they become known immediately after, for every subsequent interaction).
       void sendAwayResponse(agentName, parsed.sessionIdHex, "request");
+      sessionNodeManager.addContact(agentName, parsed.participantAPubkeyHex);
     } finally {
       inboundInFlight.delete(parsed.sessionIdHex);
     }
@@ -5166,6 +5189,55 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const totalPending = agents.reduce((sum, a) => sum + a.pending_session_requests.length, 0);
     logger.info("inbox.checked", { connectionId, scope, agentCount: agents.length, totalUnread, totalPending });
     return { ok: true, scope, agents };
+  });
+
+  // M8C-CONTACT-1: cello contact add/remove/list [--agent <name>]. All three resolve the target
+  // agent the same way — an explicit params.agent, else this connection's current/sole-online
+  // agent (F18) — so a CLI/AI operator gets the same no_current_agent guidance INBOX already uses.
+  function resolveContactAgent(connState: { currentAgent: string | null } | undefined, params?: Record<string, unknown>):
+    { ok: true; agent: string } | { ok: false; reason: string; guidance: string } {
+    const explicit = typeof params?.agent === "string" ? params.agent : undefined;
+    if (explicit) return { ok: true, agent: explicit };
+    const current = resolveCurrentAgent(connState);
+    if (!current) {
+      return {
+        ok: false,
+        reason: "no_current_agent",
+        guidance: "No current agent for this connection. Pass --agent <name>, or call cello_use_agent to select one first.",
+      };
+    }
+    return { ok: true, agent: current };
+  }
+
+  handlers.set("cello_contact_add", async (params, connectionId) => {
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    if (!pubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) — the contact to add." };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    sessionNodeManager.addContact(resolved.agent, pubkey);
+    logger.info("contact.added", { agent: resolved.agent, pubkey });
+    return { ok: true, agent: resolved.agent, pubkey };
+  });
+
+  handlers.set("cello_contact_remove", async (params, connectionId) => {
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    if (!pubkey) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) — the contact to remove." };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const removed = sessionNodeManager.removeContact(resolved.agent, pubkey);
+    logger.info("contact.removed", { agent: resolved.agent, pubkey, removed });
+    return { ok: true, agent: resolved.agent, pubkey, removed };
+  });
+
+  handlers.set("cello_contact_list", async (params, connectionId) => {
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const contacts = sessionNodeManager.listContacts(resolved.agent);
+    return { ok: true, agent: resolved.agent, contacts };
   });
 
   let shutdownPromise: Promise<void> | null = null;

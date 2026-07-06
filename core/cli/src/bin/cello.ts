@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -128,6 +128,24 @@ async function main(): Promise<void> {
         if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
       }
       result = await sessions(celloDir, { filter, limit });
+      break;
+    }
+    case "contact": {
+      // cello contact add <pubkey> [--agent <name>] | remove <pubkey> [--agent <name>] | list [--agent <name>]
+      const args = process.argv.slice(3);
+      const agentIdx = args.indexOf("--agent");
+      const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
+      const positional = args.filter((a, i) => !(a === "--agent" || i === agentIdx + 1));
+      const [sub, pubkey] = positional;
+      if (sub === "add" && pubkey) {
+        result = await contactAdd(celloDir, pubkey, agent);
+      } else if (sub === "remove" && pubkey) {
+        result = await contactRemove(celloDir, pubkey, agent);
+      } else if (sub === "list") {
+        result = await contactList(celloDir, agent);
+      } else {
+        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]" };
+      }
       break;
     }
     default:

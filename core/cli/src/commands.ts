@@ -436,3 +436,44 @@ export async function sessions(
     };
   }
 }
+
+/** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
+async function contactCommand(
+  celloDir: string,
+  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list",
+  params: Record<string, unknown>,
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
+  }
+  try {
+    const client = await connectToDaemon(lock.socketPath);
+    await client.send("ipc.connect", { clientType: "cli" });
+    const result = (await client.send(method, params)) as { ok: boolean };
+    client.close();
+    return { exitCode: result.ok ? 0 : 1, output: JSON.stringify(result, null, 2) };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
+  }
+}
+
+export async function contactAdd(celloDir: string, pubkey: string, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { pubkey };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_contact_add", params);
+}
+
+export async function contactRemove(celloDir: string, pubkey: string, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { pubkey };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_contact_remove", params);
+}
+
+export async function contactList(celloDir: string, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = {};
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_contact_list", params);
+}
