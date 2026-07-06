@@ -132,6 +132,26 @@ describe("encodeCapability / decodeCapability", () => {
     expect(verifyCapability(decoded!, pub, WITHIN)).toEqual({ ok: true });
   });
 
+  it("Fix #2a: decodes a token mangled by copy-paste word-wrap (injected whitespace/newlines/CR)", async () => {
+    const { kp, pub } = await issuer();
+    const cap = await signCapability(BASE_BODY, kp);
+    const blob = encodeCapability(cap);
+    // Simulate a terminal wrapping the long token so a copy injects newlines + indentation + a trailing CRLF.
+    const mangled = "  " + blob.replace(/(.{24})/g, "$1\n   ") + "\r\n";
+    const decoded = decodeCapability(mangled);
+    expect(decoded).toEqual(cap);
+    expect(verifyCapability(decoded!, pub, WITHIN)).toEqual({ ok: true });
+  });
+
+  it("Fix #2a: tolerates a standard-base64 paste (+ / and = padding, not base64url)", async () => {
+    const { kp, pub } = await issuer();
+    const cap = await signCapability(BASE_BODY, kp);
+    const stdB64 = Buffer.from(JSON.stringify(cap), "utf8").toString("base64"); // + / = alphabet
+    const decoded = decodeCapability(stdB64);
+    expect(decoded).toEqual(cap);
+    expect(verifyCapability(decoded!, pub, WITHIN)).toEqual({ ok: true });
+  });
+
   it("returns null for a non-base64url / non-JSON blob without throwing", () => {
     expect(decodeCapability("!!!not-base64!!!")).toBeNull();
     expect(decodeCapability(Buffer.from("not json", "utf8").toString("base64url"))).toBeNull();

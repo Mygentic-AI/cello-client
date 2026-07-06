@@ -91,7 +91,17 @@ export function encodeCapability(cap: PreAuthCapability): string {
 /** Parse a serialized capability blob; null if it is not valid base64url JSON (verify validates shape). */
 export function decodeCapability(blob: string): PreAuthCapability | null {
   try {
-    const obj: unknown = JSON.parse(Buffer.from(blob, "base64url").toString("utf8"));
+    // Fix #2a: robust to copy-paste mangling. A long token gets word-wrapped, and copying it can inject
+    // spaces/newlines/CRs that would otherwise corrupt the decode (the token "silently" fails or
+    // truncates). Strip ALL whitespace first, and normalize a standard-base64 paste (+ / and = padding)
+    // to base64url so either alphabet round-trips.
+    const cleaned = blob
+      .replace(/\s+/g, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    if (cleaned.length === 0) return null;
+    const obj: unknown = JSON.parse(Buffer.from(cleaned, "base64url").toString("utf8"));
     if (obj === null || typeof obj !== "object") return null;
     return obj as PreAuthCapability;
   } catch {
