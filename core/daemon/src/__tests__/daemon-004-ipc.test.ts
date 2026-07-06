@@ -293,6 +293,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       const recvOk = await client.send("cello_receive", { session_id: SID }) as Record<string, unknown>;
       expect(recvOk.ok).toBe(true);
       expect(recvOk.content).toBe("from-bob");
+      // M8C-AWAY-1: the agent was unattended when the message above was ingested, so the daemon
+      // ALSO auto-acked it (a real, correct cross-unit interaction) — cello_get_transcript catches
+      // up on that too (cello_receive only drains the received-content buffer, not the auto-ack).
+      await client.send("cello_get_transcript", { session_id: SID });
 
       // ── snake_case (the real proxy shape) → works ──
       const sendOk = await client.send("cello_send", { session_id: SID, content: "hello" }) as Record<string, unknown>;

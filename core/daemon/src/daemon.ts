@@ -896,6 +896,67 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const prior = byId.get(sessionId) ?? -1;
     if (seq > prior) byId.set(sessionId, seq); // monotonic — never lowers
   }
+  // M8C-CURSOR-1 (cello-unit-reviewer HIGH finding, confirmed by live reproduction): a
+  // received-only delivery (since_seq / live-drain cello_receive) must NOT blindly advance the
+  // cursor to the max sequence it happened to see — leaf indices are shared and strictly
+  // contiguous across BOTH directions (appendSessionLeaf always assigns leafCount, no gaps), so a
+  // gap between the connection's actual cursor and that max can hide an unread SENT leaf authored
+  // by a DIFFERENT local connection. Advancing past it would silently let this connection send
+  // without ever having seen it — defeating the read-before-write guarantee (C4/C5). Only advance
+  // through a CONTIGUOUS run of sequence numbers that were actually in this delivery, starting
+  // right after the connection's current cursor; stop at the first gap.
+  function safeCursorAdvance(connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>): void {
+    let cursor = getConnectionCursor(connectionId, sessionId);
+    while (deliveredSeqs.has(cursor + 1)) cursor += 1;
+    advanceConnectionCursor(connectionId, sessionId, cursor);
+  }
+
+  // M8C-AWAY-1: away response — an unattended Primary auto-answers session requests + messages
+  // with the default transparent away text and queues them (the DoD's own mandated default).
+  // CORE ships now; the operator-configurable custom-text / opaque-privacy-mode SWITCH is PARKED
+  // on M9-CFG-001 (same pattern as LOGINSTART's autoStart:false opt-out, D14) — it's a genuine
+  // per-agent operator preference that needs the deferred config store, whereas transparent is
+  // already the correct, non-fake default this unit must ship regardless.
+  // "Attended" per the design doc (2026-07-01 command-surface discussion, Agent State Model):
+  // Primary + a live client session has claimed the agent via use_agent. Scanning
+  // perConnectionState is cheap (a handful of connections) and needs no separate tracked state.
+  function isAttended(agentName: string): boolean {
+    for (const s of perConnectionState.values()) if (s.currentAgent === agentName) return true;
+    return false;
+  }
+  const AWAY_TEXT: Record<"request" | "message", string> = {
+    request: "Agent is currently away. Your session request has been received and queued.",
+    message: "Agent is currently away. Your message has been received and will be read when the operator returns.",
+  };
+  // Coalescing: one away ack per (agent, session, kind) per away period — cleared when the agent
+  // becomes attended again (cello_use_agent) so the NEXT away period gets a fresh ack rather than
+  // staying silent forever. Known imprecision (journaled, not silent): clearing fires on ANY
+  // use_agent selecting this name, even if another connection kept it attended throughout — an
+  // edge case, not a correctness gap in the core "queue + one calm ack while genuinely away" promise.
+  const awayAckSent = new Set<string>();
+  async function sendAwayResponse(agentName: string, sessionId: string, kind: "request" | "message"): Promise<void> {
+    if (isAttended(agentName)) return;
+    const dedupKey = `${agentName}:${sessionId}:${kind}`;
+    if (awayAckSent.has(dedupKey)) return;
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
+    if (!record || record.status !== "active") return;
+    awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
+    try {
+      const contentBytes = new TextEncoder().encode(AWAY_TEXT[kind]);
+      const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
+      const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
+      if (!sendResult.ok) {
+        logger.warn("session.away.response.failed", { agentName, sessionId, kind, reason: sendResult.reason });
+        return;
+      }
+      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
+      sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
+      logger.info("session.away.response.sent", { agentName, sessionId, kind, sequenceNumber: leafIndex });
+    } catch (err: unknown) {
+      logger.warn("session.away.response.failed", { agentName, sessionId, kind, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
 
   // SessionNodeManager was constructed + initialized at the top of startDaemon (PERSIST-002 — the
   // encrypted store must open before agents load from the `agents` table). Its standing receiver +
@@ -1917,6 +1978,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const fromAgent = connState.currentAgent;
     connState.currentAgent = name;
+    // M8C-AWAY-1: this agent just became attended — clear its away-ack dedup entries so the NEXT
+    // away period (after this attended stretch ends) gets a fresh ack instead of staying silent.
+    for (const key of Array.from(awayAckSent)) {
+      if (key.startsWith(`${name}:`)) awayAckSent.delete(key);
+    }
     // MCP-002: Update dispatcher's routing table and send notification to this connection only
     notificationDispatcher.setCurrentAgent(connectionId, name);
     notificationDispatcher.dispatchAgentCurrentChanged(connectionId, fromAgent, name);
@@ -4076,6 +4142,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         "created",
         parsed.participantAPubkeyHex,
       );
+      // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
+      // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
+      void sendAwayResponse(agentName, parsed.sessionIdHex, "request");
     } finally {
       inboundInFlight.delete(parsed.sessionIdHex);
     }
@@ -4850,6 +4919,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const currentSeq = record.message_count - 1;
     const lastReadSeq = getConnectionCursor(connectionId, sessionId);
     if (lastReadSeq < currentSeq) {
+      // M8C-CURSOR-1 (reviewer MEDIUM fix): every sibling rejection in this handler logs; this
+      // gate must too — a security-relevant control-flow path with no observability is a gap.
+      logger.warn("session.send.blocked", { sessionId, currentSeq, lastReadSeq, connectionId });
       return {
         ok: false,
         reason: "session_not_current",
@@ -4975,10 +5047,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // readTranscript is ordered by sequence ASC → the last is the max.
         const maxSeq = received[received.length - 1].sequence;
         sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, maxSeq);
-        // M8C-CURSOR-1: this connection has now read up to maxSeq (received-only; if the gap also
-        // includes a LOCAL sent message from another connection, cello_get_transcript closes that).
-        advanceConnectionCursor(connectionId, sessionId, maxSeq);
       }
+      // M8C-CURSOR-1 (reviewer HIGH fix): only advance through the CONTIGUOUS run this batch
+      // actually delivered — if a sent leaf from another local connection sits in a gap, this
+      // correctly refuses to advance past it (cello_get_transcript is still required to catch up).
+      safeCursorAdvance(connectionId, sessionId, new Set(received.map((m) => m.sequence)));
       logger.info("session.receive.since_seq", { sessionId, agentName, since_seq: sinceSeq, count: received.length });
       return {
         ok: true,
@@ -5001,8 +5074,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // M8C-INBOX-1 (N3): delivery marks read — advance the persisted read watermark so this
         // message no longer counts as unread in cello_check_notifications. Monotonic (never lowers).
         sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, entry.sequenceNumber);
-        // M8C-CURSOR-1: this connection has now read this message.
-        advanceConnectionCursor(connectionId, sessionId, entry.sequenceNumber);
+        // M8C-CURSOR-1 (reviewer HIGH fix): a single delivered message only proves THIS sequence
+        // was read — safeCursorAdvance refuses to vault past a gap (e.g. an unread sent leaf from
+        // another local connection) even though this specific sequence number is now known.
+        safeCursorAdvance(connectionId, sessionId, new Set([entry.sequenceNumber]));
         return {
           ok: true,
           content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
@@ -5140,6 +5215,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // bridge (WAKE) forwards it to a live --channels session as notifications/claude/channel.
   sessionNodeManager.setOnContentArrived((agentName, sessionId, senderPubkey) => {
     notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey);
+    // M8C-AWAY-1: an unattended agent auto-acks an inbound message on an existing session.
+    void sendAwayResponse(agentName, sessionId, "message");
   });
 
   // MCP-001: Clean up per-connection state when a connection disconnects

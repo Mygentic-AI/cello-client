@@ -15,12 +15,19 @@
  *   cello_get_transcript does. This proves why the gate's guidance points there.
  * - C6: the cursor is connection-scoped, in-memory — a fresh connection (e.g. after reconnect)
  *   starts over at -1, even though the agent/session already has history.
+ * - C7 (reviewer HIGH finding, aa5928e2, fixed): the exact interleaving the original since_seq/
+ *   live-drain "advance to max observed" logic got wrong — a LOCAL sent leaf followed by a
+ *   counterparty-RECEIVED leaf at a higher sequence. Draining only the received leaf must NOT
+ *   silently unblock a send that skips over the unread local-sent leaf.
+ * - C8 (reviewer finding, per-session isolation): one connection attending TWO different sessions
+ *   on the same agent — advancing the cursor on session A must not affect session B's gating.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -194,5 +201,74 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     const conn2 = await connectAs("alice"); // brand-new connectionId, same agent+session
     const res = (await conn2.send("cello_send", { session_id: SID, content: "again" })) as Record<string, unknown>;
     expect(res).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
+  });
+
+  function msgLeafHash(content: Uint8Array): Uint8Array {
+    return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
+  }
+
+  it("C7 (reviewer HIGH fix, live reproduction of the reported bypass): draining ONLY a later counterparty-received message must not silently unblock a send that skips an unread local-sent leaf", async () => {
+    await makeAgentDir("alice");
+    const h = await start(noopLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const connA = await connectAs("alice");
+    const connB = await connectAs("alice");
+
+    // leaf 0: connA sends (a LOCAL sent message connB has not read).
+    const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
+    expect(sendA.ok).toBe(true);
+
+    // leaf 1: counterparty content arrives (received), buffered for delivery.
+    const inbound = new TextEncoder().encode("from counterparty");
+    snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
+
+    // connB drains ONLY the buffered received content (leaf 1) via live cello_receive — it has
+    // still never read leaf 0 (connA's sent message).
+    const recv = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
+    expect(recv.content).toBe("from counterparty");
+    expect(recv.sequence_number).toBe(1);
+
+    // The bug: the old "advance to max observed" logic would set connB's cursor to 1 (having
+    // seen leaf 1), silently treating leaf 0 as read too. Fixed: connB must STILL be refused.
+    const stillBlocked = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
+    expect(stillBlocked).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 1, last_read_seq: -1 });
+
+    // Only cello_get_transcript (full bidirectional history) correctly closes the gap.
+    await connB.send("cello_get_transcript", { session_id: SID });
+    const nowOk = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
+    expect(nowOk.ok).toBe(true);
+  });
+
+  it("C8 (reviewer finding, per-session isolation): one connection attending two different sessions — advancing one's cursor must not unblock the other", async () => {
+    await makeAgentDir("alice");
+    const h = await start(noopLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    const SID_A = "aa".repeat(32);
+    const SID_B = "bb".repeat(32);
+    await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id-a", "corr-a");
+    await snm.createSessionNode(SID_B, "alice", "carolpubkeyhex", "carol-peer-id-b", "corr-b");
+
+    // Attend FIRST (M8C-AWAY-1 is now live in this daemon too — seeding while unattended would
+    // trigger its own auto-ack, adding an extra leaf this CURSOR-only test isn't about).
+    const client = await connectAs("alice");
+
+    // Seed unread history on BOTH sessions.
+    const msgA = new TextEncoder().encode("on A");
+    const msgB = new TextEncoder().encode("on B");
+    snm.ingestReceivedContent("alice", SID_A, msgA, msgLeafHash(msgA), "corr-a");
+    snm.ingestReceivedContent("alice", SID_B, msgB, msgLeafHash(msgB), "corr-b");
+
+    // Catch up ONLY on session A.
+    await client.send("cello_get_transcript", { session_id: SID_A });
+
+    const sendA = (await client.send("cello_send", { session_id: SID_A, content: "reply A" })) as Record<string, unknown>;
+    expect(sendA.ok).toBe(true); // A is caught up
+
+    // A hollow Map<connectionId, number> (dropping the per-session dimension) would let this
+    // through too, since it never read B's history — must still be refused.
+    const sendB = (await client.send("cello_send", { session_id: SID_B, content: "reply B" })) as Record<string, unknown>;
+    expect(sendB).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
   });
 });
