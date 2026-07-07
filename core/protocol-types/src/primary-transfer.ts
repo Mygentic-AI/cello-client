@@ -68,6 +68,42 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
+import { Encoder } from "cbor-x";
+
+// Same config as session.ts/revocation.ts's own TBS builders — tagUint8Array:false so byte
+// strings encode as definite-length CBOR byte strings (stable, encoder-independent layout).
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
+
+/** Domain separation tag — bound as the first TBS field so a primary-transfer release signature
+ *  can never be replayed as any other CELLO signature (and vice-versa) even before FROST's own
+ *  CONTEXT_PRIMARY_RELEASE domain separation is applied — belt and suspenders, matching the
+ *  existing AGENT_REVOCATION_DOMAIN convention (revocation.ts). */
+export const PRIMARY_TRANSFER_DOMAIN = "CELLO-PRIMARY-TRANSFER-v1";
+
+/**
+ * Canonical to-be-signed bytes for a primary-transfer release attestation (M8C-PRIMARY-DESIGN
+ * Decision 3, Pass 3). Field order is LOAD-BEARING — both the signer (the old Primary daemon,
+ * via participateInCeremony) and every verifier (each directory node, via verifySignature) must
+ * produce IDENTICAL bytes, or verification never succeeds regardless of whether the ceremony
+ * itself was genuine. Mirrors buildAgentRevocationTbs's exact structure (revocation.ts).
+ */
+export function buildPrimaryTransferTbs(
+  kLocalPubkeyHex: string,
+  newDaemonId: string,
+  oldDaemonId: string,
+  nonce: string,
+  timestamp: number,
+): Uint8Array {
+  return CBOR_ENC.encode([
+    PRIMARY_TRANSFER_DOMAIN,
+    kLocalPubkeyHex,
+    newDaemonId,
+    oldDaemonId,
+    nonce,
+    timestamp,
+  ]) as Uint8Array;
+}
+
 // ─── Direction: client → directory (repeated once per T-of-N node dialed) ────
 
 /**

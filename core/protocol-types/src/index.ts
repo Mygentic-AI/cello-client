@@ -88,6 +88,7 @@ export type {
   PrimaryTransferAck,
   PrimaryTransferError,
 } from "./primary-transfer.js";
+export { buildPrimaryTransferTbs, PRIMARY_TRANSFER_DOMAIN } from "./primary-transfer.js";
 
 export { buildAgentRevocationTbs, AGENT_REVOCATION_DOMAIN } from "./revocation.js";
 export type {
