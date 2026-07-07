@@ -276,16 +276,16 @@ describe("AC-002 + SI-001: cello_session_request notification payload is exactly
     );
 
     const notif = wireNotifications.find((n) => n.method === "notifications/claude/channel")!;
-    const params = notif.params as Record<string, unknown>;
+    const params = notif.params as { content?: unknown; meta?: Record<string, unknown> };
 
-    // Must have exactly type, from, session_id
-    expect(params.type).toBe("cello_session_request");
-    expect(params.from).toBe(counterpartyPubkey);
-    expect(params.session_id).toBe(sessionId);
-
-    // SI-001: must NOT include any extra data
-    const keys = Object.keys(params).sort();
-    expect(keys).toEqual(["from", "session_id", "type"]);
+    // Claude Code channel contract: `content` (tag body) is required or the event is dropped.
+    expect(typeof params.content).toBe("string");
+    expect((params.content as string).length).toBeGreaterThan(0);
+    // Routing rides in `meta`: exactly type + from + session_id.
+    expect(params.meta?.type).toBe("cello_session_request");
+    expect(params.meta?.from).toBe(counterpartyPubkey);
+    expect(params.meta?.session_id).toBe(sessionId);
+    expect(Object.keys(params.meta ?? {}).sort()).toEqual(["from", "session_id", "type"]);
   }, 10_000);
 
   it("SI-001: notification does NOT include genesis_prev_root, multiaddrs, or any other session data", async () => {
@@ -320,13 +320,16 @@ describe("AC-002 + SI-001: cello_session_request notification payload is exactly
     );
 
     const notif = wireNotifications.find((n) => n.method === "notifications/claude/channel")!;
-    const params = notif.params as Record<string, unknown>;
+    const params = notif.params as { content?: unknown; meta?: Record<string, unknown> };
 
-    // Exactly these three keys and nothing else
-    expect(Object.keys(params).sort()).toEqual(["from", "session_id", "type"]);
-    expect(params.genesis_prev_root).toBeUndefined();
-    expect(params.multiaddrs).toBeUndefined();
-    expect(params.content).toBeUndefined();
+    // SI-001: the pushed payload carries ONLY the routing fields (type/from/session_id) in `meta`,
+    // and a content-free announcement in `content` — never genesis_prev_root, multiaddrs, or any
+    // other session data, in either field.
+    expect(Object.keys(params.meta ?? {}).sort()).toEqual(["from", "session_id", "type"]);
+    expect(typeof params.content).toBe("string");
+    const payload = JSON.stringify(params);
+    expect(payload).not.toContain("cccc"); // the genesis_prev_root value
+    expect(payload).not.toContain("multiaddr");
   }, 10_000);
 });
 

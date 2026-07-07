@@ -186,7 +186,9 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     // types already triggered above (cello_start_agent → agent_state_changed; cello_use_agent →
     // agent_current_changed). A bridge that special-cased only session_state_changed would pass
     // the session assertions but fail these — that is the T1 bypass this guards against.
-    const typeOf = (e: Record<string, unknown>) => (e["params"] as Record<string, unknown>)?.["type"];
+    // `type` now rides in params.meta (Claude Code channel contract), not at the params top level.
+    const typeOf = (e: Record<string, unknown>) =>
+      ((e["params"] as { meta?: Record<string, unknown> })?.meta)?.["type"];
     expect(channelEvents.some((e) => typeOf(e) === "agent_state_changed")).toBe(true);
     expect(channelEvents.some((e) => typeOf(e) === "agent_current_changed")).toBe(true);
 
@@ -194,19 +196,27 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
     const sessionEvents = channelEvents.filter((e) => typeOf(e) === "session_state_changed");
     expect(sessionEvents.length).toBeGreaterThanOrEqual(2);
 
-    const params = sessionEvents.map((e) => e["params"] as Record<string, unknown>);
-    const created = params.find((p) => p["state"] === "created");
-    const sealed = params.find((p) => p["state"] === "sealed"); // C7: sealed forwards too
+    const params = sessionEvents.map((e) => e["params"] as { content?: unknown; meta?: Record<string, unknown> });
+    // Routing now rides in `meta` (Claude Code channel contract), not at the params top level.
+    const created = params.find((p) => p.meta?.["state"] === "created");
+    const sealed = params.find((p) => p.meta?.["state"] === "sealed"); // C7: sealed forwards too
     expect(created).toBeDefined();
     expect(sealed).toBeDefined();
-    expect(created!["agent"]).toBe("alice");
-    expect(created!["sessionId"]).toBe("wake1-sess");
+    expect(created!.meta?.["agent"]).toBe("alice");
+    expect(created!.meta?.["sessionId"]).toBe("wake1-sess");
 
-    // INV-CONTENTFREE: no message content on any forwarded event
+    // Claude Code channel contract: every event MUST carry a `content` string (the <channel> tag
+    // body) or Claude Code silently drops it — the root cause of the DOD-LIVE-1 doorbell failure
+    // (BUILD-JOURNAL Entry 43). content here is a synthesized, content-free announcement.
     for (const p of params) {
-      expect(p).not.toHaveProperty("content");
-      expect(p).not.toHaveProperty("message");
-      expect(p).not.toHaveProperty("text");
+      expect(typeof p.content).toBe("string");
+      expect((p.content as string).length).toBeGreaterThan(0);
+    }
+    // INV-CONTENTFREE: no MESSAGE content anywhere — not in the announcement body, not in meta.
+    for (const p of params) {
+      expect(p.meta).not.toHaveProperty("message");
+      expect(p.meta).not.toHaveProperty("text");
+      expect(p.meta).not.toHaveProperty("content");
     }
 
     // C6: the forward emits a domain.noun.verb observability event

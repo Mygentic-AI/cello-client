@@ -21,6 +21,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
+import { buildChannelParams } from "../channel-params.js";
 
 // AC-020 (1): --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
@@ -291,8 +292,13 @@ proxy.onNotification((frame) => {
   const data = (frame as { data?: Record<string, unknown> }).data ?? {};
   const type = typeof data["type"] === "string" ? (data["type"] as string) : String(frame["notification"]);
   const agent = data["agent"];
+  // Translate the raw daemon frame into Claude Code's channel contract: `{ content, meta }`.
+  // Forwarding the bare frame as `params` (no `content`) is why the doorbell never surfaced —
+  // Claude Code needs a `content` field to render the <channel> tag body (BUILD-JOURNAL Entry 43).
+  // buildChannelParams synthesizes a content-free announcement; message content still never rides.
+  const params = buildChannelParams(data);
   server.server
-    .notification({ method: "notifications/claude/channel", params: data })
+    .notification({ method: "notifications/claude/channel", params })
     .then(() => {
       logEvent("notification.channel.forwarded", { type, agent });
     })

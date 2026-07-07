@@ -296,14 +296,20 @@ describe("AC-002 + SI-001: inbound message pushes claude/channel notification vi
     );
 
     const notif = wireNotifications.find((n) => n.method === "notifications/claude/channel")!;
-    const params = notif.params as Record<string, unknown>;
+    const params = notif.params as { content?: unknown; meta?: Record<string, unknown> };
 
-    // Must have type and from
-    expect(params.type).toBe("cello_message");
-    expect(params.from).toBe(ownPubkeyA);
-    // SI-001: must NOT include message content
-    expect(params.content).toBeUndefined();
-    expect(Object.keys(params).sort()).toEqual(["from", "type"]);
+    // Claude Code channel contract: params MUST carry `content` (the <channel> tag body) — without
+    // it the event is silently dropped and the doorbell never surfaces (BUILD-JOURNAL Entry 43).
+    expect(typeof params.content).toBe("string");
+    expect((params.content as string).length).toBeGreaterThan(0);
+    // Routing rides in `meta` (becomes <channel> attributes): exactly type + from here.
+    expect(params.meta?.type).toBe("cello_message");
+    expect(params.meta?.from).toBe(ownPubkeyA);
+    expect(Object.keys(params.meta ?? {}).sort()).toEqual(["from", "type"]);
+    // SI-001 / INV-CONTENTFREE: the announcement carries NO message text — the operator sent
+    // "hello"; it must not appear anywhere in the pushed payload (content or meta).
+    expect(params.content as string).not.toContain("hello");
+    expect(JSON.stringify(params.meta)).not.toContain("hello");
   }, 20_000);
 });
 
