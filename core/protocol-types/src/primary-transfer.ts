@@ -148,8 +148,14 @@ export interface PrimaryTransferAck {
 /**
  * This node rejected the transfer request. SI-001/SI-002/SI-004/freshness failures all surface
  * here with a distinct, named reason — never a generic failure.
+ *
+ * `internal_error` is distinct from the four PERMANENT rejections: it means "this node could not
+ * complete the request due to a transient/infrastructure fault (DB unavailable, persist failed),
+ * NOT that the claim was invalid — retry may succeed." The new-Primary daemon tallying T-of-N acks
+ * must treat it as retriable, not as a genuine holder-mismatch that would (wrongly) drop this node
+ * from the quorum tally and fail an otherwise-valid transfer.
  */
 export interface PrimaryTransferError {
   type: "primary_transfer_error";
-  reason: "release_not_verified" | "nonce_reused" | "stale_request" | "not_registered";
+  reason: "release_not_verified" | "nonce_reused" | "stale_request" | "not_registered" | "internal_error";
 }
