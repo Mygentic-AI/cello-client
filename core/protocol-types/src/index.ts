@@ -83,6 +83,12 @@ export type {
   RegistrationState,
 } from "./registration.js";
 
+export type {
+  PrimaryTransferRequest,
+  PrimaryTransferAck,
+  PrimaryTransferError,
+} from "./primary-transfer.js";
+
 export { buildAgentRevocationTbs, AGENT_REVOCATION_DOMAIN } from "./revocation.js";
 export type {
   RevokeAgentRequest,
