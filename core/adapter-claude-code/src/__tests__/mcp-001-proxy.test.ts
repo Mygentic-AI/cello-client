@@ -251,7 +251,9 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
     expect(src).toContain('proxy.call("cello_send", {\n    session_id,\n    content,');
     expect(src).toContain("governance_decisions");
     expect(src).toContain('proxy.call("cello_receive", { session_id, timeout_ms, since_seq })'); // M8C-SINCESEQ-1: + since_seq
-    expect(src).toContain('proxy.call("cello_close_session", { session_id })');
+    // CC-5/F21: cello_close_session forwards snake_case session_id, plus the optional `force` flag
+    // (terminal-escape for an unsealable half-open session) only when set.
+    expect(src).toContain('proxy.call("cello_close_session", force ? { session_id, force } : { session_id })');
   });
 });
 

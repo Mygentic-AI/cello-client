@@ -245,10 +245,11 @@ server.tool("cello_receive_session", "Receive messages from an active session (a
   return jsonText(result);
 });
 
-server.tool("cello_close_session", "Close an active session and trigger the seal ceremony", {
+server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list.", {
   session_id: z.string().describe("Session ID to close"),
-}, async ({ session_id }) => {
-  const result = await proxy.call("cello_close_session", { session_id });
+  force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
+}, async ({ session_id, force }) => {
+  const result = await proxy.call("cello_close_session", force ? { session_id, force } : { session_id });
   return jsonText(result);
 });
 

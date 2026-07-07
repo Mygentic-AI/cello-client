@@ -3698,10 +3698,32 @@ export class SessionNodeManager {
     }
   }
 
+  /** CC-5/F21: count of RECEIVED messages on a session — the "did the counterparty ever speak"
+   *  signal the dead-half-open reaper uses (message_count also counts our own auto-"Dispatched." ack,
+   *  so it is NOT a reliable half-open discriminator). Mirrors #getReceivedBytesTotal. */
+  countReceivedMessages(agentName: string, sessionId: string): number {
+    if (!this.#db) return 0;
+    const row = this.#db
+      .prepare("SELECT COUNT(*) AS n FROM transcript WHERE agent_name = ? AND session_id = ? AND direction = 'received'")
+      .get(agentName, sessionId) as { n: number };
+    return row.n;
+  }
+
+  /** CC-5/F21: unilaterally mark a session locally-terminal ("abandoned") — retire its live node and
+   *  set the DB status, with NO bilateral seal (a dead half-open handshake has nothing to notarize).
+   *  Used by cello_close_session { force } and the dead-half-open reaper. Idempotent: a missing/already-
+   *  abandoned session is a no-op. */
+  async abandonSession(agentName: string, sessionId: string): Promise<void> {
+    // Status flip FIRST and synchronous (before the async node teardown yields), so a non-awaited
+    // reaper call from a read path takes effect for the SAME read (the DB is updated before the await).
+    this.#updateSessionStatus(agentName, sessionId, "abandoned");
+    await this.retireSessionNode(agentName, sessionId);
+  }
+
   #updateSessionStatus(
     agentName: string,
     sessionId: string,
-    status: "active" | "sealed" | "interrupted",
+    status: "active" | "sealed" | "interrupted" | "abandoned",
   ): void {
     if (!this.#db) return;
     const now = Date.now();

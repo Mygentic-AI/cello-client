@@ -341,7 +341,11 @@ export type SessionStatus =
   | "active"
   | "sealed"
   | "interrupted"
-  | "seal_interrupted_pending";
+  | "seal_interrupted_pending"
+  // CC-5/F21 (2026-07-07): a locally-terminal state for a half-open session that can never be
+  // bilaterally sealed — set by a force-abandon (cello_close_session { force }) or the dead-half-open
+  // reaper. No FROST notarization (nothing to notarize on a dead handshake); it just leaves the open list.
+  | "abandoned";
 
 export interface SessionRecord {
   session_id: string;

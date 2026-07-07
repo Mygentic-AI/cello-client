@@ -1745,11 +1745,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }));
   }
 
+  // CC-5/F21: reap dead half-open sessions on READ (compute-on-read, like reapExpiredInboundSessions —
+  // no background timer). A session the standing receiver opened from an inbound offer the initiator
+  // ABANDONED stays "active" forever (the counterparty never joins), clutters the open/active lists, and
+  // its normal close fires an unsealable bilateral seal. Mark such a session terminal ("abandoned") once
+  // it is PROVABLY dead: status active + counterparty never established (liveness != "alive" AND 0
+  // RECEIVED messages — message_count alone counts our own auto-"Dispatched." ack, so it is NOT the
+  // signal) + age past the grace TTL (a genuinely fresh session still setting up must survive).
+  const HALF_OPEN_TTL_MS = Number(process.env["CELLO_HALF_OPEN_TTL_MS"]) || 5 * 60 * 1000;
+  function reapDeadHalfOpenSessions(agentName?: string): void {
+    const now = Date.now();
+    for (const row of sessionNodeManager.getSessionsByStatus("active")) {
+      if (agentName !== undefined && row.agent_name !== agentName) continue;
+      if (now - row.created_at <= HALF_OPEN_TTL_MS) continue; // too young — may just be setting up
+      if (sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id) === "alive") continue; // live
+      if (sessionNodeManager.countReceivedMessages(row.agent_name, row.session_id) > 0) continue; // counterparty spoke
+      // Non-awaited: abandonSession flips the DB status synchronously (before its first await), so THIS
+      // read reflects it; the async node teardown finishes in the background.
+      void sessionNodeManager.abandonSession(row.agent_name, row.session_id).catch((err: unknown) => {
+        logger.warn("session.half_open.reap.failed", { agentName: row.agent_name, sessionId: row.session_id, reason: err instanceof Error ? err.message : String(err) });
+      });
+      logger.info("session.half_open.reaped", { agentName: row.agent_name, sessionId: row.session_id, ageMs: now - row.created_at });
+    }
+  }
+
   // M8B F16: per-session liveness for ACTIVE sessions, shared by both status surfaces
   // ("status" for the CLI, "cello_status" for MCP). The signal (session.liveness.changed,
   // tracked in the node manager) existed but nothing consumed it — a dead counterparty
   // was invisible to the operator.
   function buildActiveSessions(): ActiveSessionInfo[] {
+    reapDeadHalfOpenSessions(); // CC-5/F21: drop provably-dead half-open sessions before surfacing active ones
     return sessionNodeManager.getSessionsByStatus("active").map((row) => ({
       sessionId: row.session_id,
       agentName: row.agent_name,
@@ -3230,6 +3255,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       };
     }
 
+    // CC-5/F21 terminal-escape: force-abandon a session that can never be bilaterally sealed — a
+    // half-open handshake the counterparty never joined, whose normal close fires a seal the absent/
+    // rejecting counterparty can't complete (seal_interrupted_rejected_by_counterparty / timeout). Marks
+    // it locally-terminal ("abandoned") with NO seal, so it leaves the open list. Additive: placed BEFORE
+    // the seal branches, it never touches the seal flow. Owner-scoped (the lookup above is agent-scoped)
+    // and idempotent. NOT for a healthy session — a normal close (no force) still seals so both parties
+    // get a notarized receipt; force is the escape hatch for a provably unsealable ghost.
+    if (params?.force === true) {
+      if (record.status === "abandoned") {
+        return { ok: true, status: "abandoned", reason: "already_abandoned", guidance: "This session was already force-abandoned." };
+      }
+      await sessionNodeManager.abandonSession(record.agent_name, sessionId);
+      logger.info("session.force_abandoned", { agentName: record.agent_name, sessionId, priorStatus: record.status });
+      return {
+        ok: true,
+        status: "abandoned",
+        reason: "force_abandoned",
+        guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.`,
+      };
+    }
+
     // AC-011: seal-interrupted already in progress
     if (sealInterruptedInProgress.has(sealKey(record.agent_name, sessionId))) {
       return {
@@ -3636,6 +3682,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
+    reapDeadHalfOpenSessions(agentName); // CC-5/F21: drop provably-dead half-open sessions before listing
     return selectSessions(
       sessionNodeManager.getSessionsForAgent(agentName),
       params as Record<string, unknown> | undefined,

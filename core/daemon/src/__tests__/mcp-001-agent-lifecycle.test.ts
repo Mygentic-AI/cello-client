@@ -350,6 +350,96 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     });
   });
 
+  // ─── CC-5 / F21: force-abandon + dead-half-open reap ───
+  describe("CC-5/F21: half-open session terminal-escape (force) + reap-on-read", () => {
+    // Seed a session row directly (no libp2p node needed): abandonSession's retireSessionNode is a no-op
+    // when there is no live node, and the reaper/close read from the DB.
+    function seedSession(agent: string, sid: string, opts: { status?: string; createdAt?: number; messageCount?: number }): void {
+      const now = opts.createdAt ?? Date.now();
+      handle!.getSessionNodeManager().getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+      ).run(sid, agent, "cc".repeat(32), opts.status ?? "active", now, now, opts.messageCount ?? 1);
+    }
+    function seedReceivedMessage(agent: string, sid: string): void {
+      handle!.getSessionNodeManager().getDb().prepare(
+        `INSERT OR IGNORE INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
+         VALUES (?, ?, 0, 'received', ?, ?)`,
+      ).run(agent, sid, Buffer.from("hi from counterparty"), Date.now());
+    }
+    async function openSids(client: IpcClient): Promise<string[]> {
+      const r = (await client.send("cello_list_sessions", { filter: "open" })) as { sessions: Array<{ sessionId: string }> };
+      return r.sessions.map((s) => s.sessionId);
+    }
+    async function statusOf(client: IpcClient, sid: string): Promise<string | undefined> {
+      const r = (await client.send("cello_list_sessions", { filter: "all" })) as { sessions: Array<{ sessionId: string; status: string }> };
+      return r.sessions.find((s) => s.sessionId === sid)?.status;
+    }
+
+    it("cello_close_session { force } abandons a session and drops it from the open list", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f1".repeat(16); // fresh active session (won't be reaped) — the operator force-abandons it
+      seedSession("alice", sid, { createdAt: Date.now() });
+      expect(await openSids(client)).toContain(sid);
+
+      const closed = (await client.send("cello_close_session", { session_id: sid, force: true })) as { ok: boolean; status?: string; reason?: string };
+      expect(closed.ok).toBe(true);
+      expect(closed.status).toBe("abandoned");
+      expect(closed.reason).toBe("force_abandoned");
+
+      expect(await openSids(client)).not.toContain(sid); // gone from open
+      expect(await statusOf(client, sid)).toBe("abandoned"); // terminal in --all
+    });
+
+    it("reaps a DEAD half-open session on read — 0 RECEIVED + not alive + past TTL — even though message_count is 1 (its own Dispatched ack)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f2".repeat(16);
+      // 1h old, message_count 1 (the auto-"Dispatched." leaf), 0 received, liveness "unknown" (never set).
+      // Teeth: a reaper keyed on message_count===0 would MISS this; the correct 0-RECEIVED criterion reaps it.
+      seedSession("alice", sid, { createdAt: Date.now() - 60 * 60 * 1000, messageCount: 1 });
+
+      expect(await openSids(client)).not.toContain(sid); // reaped on the list read
+      expect(await statusOf(client, sid)).toBe("abandoned");
+    });
+
+    it("does NOT reap a FRESH active session (younger than the grace TTL)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f3".repeat(16);
+      seedSession("alice", sid, { createdAt: Date.now(), messageCount: 1 }); // just created
+      expect(await openSids(client)).toContain(sid); // survives — a genuine new session must not be abandoned
+      expect(await statusOf(client, sid)).toBe("active");
+    });
+
+    it("does NOT reap an OLD active session once the counterparty has spoken (a RECEIVED message)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f4".repeat(16);
+      seedSession("alice", sid, { createdAt: Date.now() - 60 * 60 * 1000, messageCount: 2 });
+      seedReceivedMessage("alice", sid); // counterparty established → not half-open, must survive
+      expect(await openSids(client)).toContain(sid);
+      expect(await statusOf(client, sid)).toBe("active");
+    });
+  });
+
   // ─── AC-009: ipc_connection_lost after daemon stops ───
   it("AC-009: IPC client gets connection error after daemon stops", async () => {
     const config = await setupWithAgents("alice");

@@ -19,6 +19,10 @@ export type SessionCategory = "open" | "closed" | "failed";
 
 export function classifySession(status: SessionStatus, messageCount: number): SessionCategory {
   if (status === "sealed" || status === "seal_interrupted_pending") return "closed";
+  // CC-5/F21: a force-abandoned / reaped half-open session is a dead handshake — it belongs in the
+  // "failed" bucket (out of `cello status`, visible only via --failed/--all), regardless of whether its
+  // own auto-"Dispatched." ack bumped message_count.
+  if (status === "abandoned") return "failed";
   if (status === "interrupted") return messageCount > 0 ? "open" : "failed";
   // "active"
   return "open";
