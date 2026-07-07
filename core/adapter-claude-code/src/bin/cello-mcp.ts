@@ -163,6 +163,35 @@ server.tool("cello_list_agents", "List all agents with state from this connectio
   return jsonText(result);
 });
 
+// ─── Contact whitelist tools (CC-9) ─────────────────────────────────────────
+// The per-agent whitelist is load-bearing after CC-1: a known contact is fast-tracked and exempt
+// from unknown-sender screening + the ABUSE-1 acceptance caps. These forward to the daemon handlers
+// (cello_contact_list/add/remove) so an agent driving via MCP can see and manage its own whitelist —
+// previously CLI-only (`cello contact …`). Per-agent: defaults to the current agent, or pass { agent }.
+
+server.tool("cello_contact_list", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from unknown-sender screening and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
+  agent: z.string().optional().describe("Agent name whose whitelist to list (defaults to the current agent)"),
+}, async ({ agent }) => {
+  const result = await proxy.call("cello_contact_list", agent ? { agent } : {});
+  return jsonText(result);
+});
+
+server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's contact whitelist — a known/trusted contact is fast-tracked and exempt from unknown-sender screening and anti-spam caps. Defaults to the current agent.", {
+  pubkey: z.string().describe("Hex-encoded public key of the peer to add"),
+  agent: z.string().optional().describe("Agent name whose whitelist to add to (defaults to the current agent)"),
+}, async ({ pubkey, agent }) => {
+  const result = await proxy.call("cello_contact_add", agent ? { pubkey, agent } : { pubkey });
+  return jsonText(result);
+});
+
+server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's contact whitelist — they revert to unknown (screened, and subject to the anti-spam acceptance caps). Defaults to the current agent.", {
+  pubkey: z.string().describe("Hex-encoded public key of the peer to remove"),
+  agent: z.string().optional().describe("Agent name whose whitelist to remove from (defaults to the current agent)"),
+}, async ({ pubkey, agent }) => {
+  const result = await proxy.call("cello_contact_remove", agent ? { pubkey, agent } : { pubkey });
+  return jsonText(result);
+});
+
 // ─── Session tools (proxied through daemon) ─────────────────────────────────
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {
