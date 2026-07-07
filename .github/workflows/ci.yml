@@ -52,7 +52,7 @@ jobs:
       # Tarball check 1: no server files leaked across all five publishable packages.
       - name: Tarball check — no server files leaked
         run: |
-          for pkg in core/protocol-types core/crypto core/transport core/client core/daemon core/cli core/adapter-claude-code; do
+          for pkg in core/protocol-types core/crypto core/transport core/client core/daemon core/cli core/adapter-claude-code core/gateway; do
             echo "--- Checking $pkg ---"
             OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
             echo "$OUTPUT"
@@ -279,11 +279,14 @@ jobs:
           # Publish @cello-protocol/interfaces in isolation
           (cd "$GITHUB_WORKSPACE/trustless-cello/packages/interfaces" && pnpm publish --ignore-workspace --access public --no-git-checks --tag "$TAG") || true
 
-          # Publish cello-client packages in dependency order.
+          # Publish cello-client packages in dependency order. gateway is a real dependency
+          # of daemon (workspace:* — @cello-protocol/gateway spawns as the sidecar process),
+          # so it must publish before daemon.
           pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/gateway --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
@@ -307,7 +310,7 @@ jobs:
             return 1
           }
           FAILED=0
-          for pkg in protocol-types crypto transport client daemon cli; do
+          for pkg in protocol-types crypto transport client daemon cli gateway; do
             check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
           check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
@@ -491,6 +494,7 @@ jobs:
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
+          pnpm publish --filter @cello-protocol/gateway --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/connect --access public --no-git-checks --tag "$TAG" || true
@@ -514,7 +518,7 @@ jobs:
             return 1
           }
           FAILED=0
-          for pkg in protocol-types crypto transport client daemon cli; do
+          for pkg in protocol-types crypto transport client daemon cli gateway; do
             check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
           check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
