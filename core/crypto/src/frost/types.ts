@@ -21,10 +21,21 @@
 export const CONTEXT_SESSION_ESTABLISHMENT =
   "cello-frost-session-establishment-v1" as const;
 export const CONTEXT_SEAL = "cello-frost-seal-v1" as const;
+/**
+ * M8C-PRIMARY-1: the old Primary's "share released" attestation during a device-transfer, per
+ * docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 3, Pass 3). Reuses the existing
+ * ceremony machinery unchanged — only a new domain-separation string, so a signature produced for
+ * this context can never be replayed as a real seal or session-establishment signature, and vice
+ * versa. Requires the signer's OWN local FROST share to be loaded (participateInCeremony throws
+ * otherwise) — this is exactly what distinguishes a genuine old Primary (which held the share)
+ * from a Standby that received only K_local via pairing and never the share.
+ */
+export const CONTEXT_PRIMARY_RELEASE = "cello-frost-primary-release-v1" as const;
 
 export type FrostContext =
   | typeof CONTEXT_SESSION_ESTABLISHMENT
-  | typeof CONTEXT_SEAL;
+  | typeof CONTEXT_SEAL
+  | typeof CONTEXT_PRIMARY_RELEASE;
 
 // ─── Threshold signature result ───────────────────────────────────────────────
 

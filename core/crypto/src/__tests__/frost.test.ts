@@ -31,6 +31,7 @@ import type { IThresholdSigner } from "../frost/types.js";
 import {
   CONTEXT_SESSION_ESTABLISHMENT,
   CONTEXT_SEAL,
+  CONTEXT_PRIMARY_RELEASE,
 } from "../frost/types.js";
 // createInProcessStubs is test-only infrastructure — imported directly from stubs,
 // not through the frost/index.ts production barrel.
@@ -1006,5 +1007,88 @@ describe("SI-003: primary_pubkey derived only from share commitments, not from K
     expect(Buffer.from(signerKey).toString("hex")).not.toBe(
       Buffer.from(agentPubkey).toString("hex"),
     );
+  });
+});
+
+// ─── M8C-PRIMARY-1: CONTEXT_PRIMARY_RELEASE — the device-transfer release attestation ─────────
+//
+// Per docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 3, Pass 3): reuses this same
+// ceremony machinery, unchanged, with a new domain-separation context. The only new production
+// code is the CONTEXT_PRIMARY_RELEASE constant itself — everything else (participateInCeremony,
+// verifySignature) is exercised identically to CONTEXT_SEAL/CONTEXT_SESSION_ESTABLISHMENT above.
+
+describe("M8C-PRIMARY-1: participateInCeremony — primary-release context", () => {
+  let signer: FrostThresholdSigner;
+  let scope: ReturnType<typeof createTestScope>;
+
+  beforeEach(async () => {
+    scope = createTestScope();
+    const stubs = createInProcessStubs(3);
+    const agentPubkey = makeAgentPubkey(5);
+    await bootstrapKeyShares(agentPubkey, {
+      threshold: 2,
+      participants: 3,
+      directoryNodeStubs: stubs,
+    });
+    signer = new FrostThresholdSigner(
+      { threshold: 2, participants: 3, directoryNodeStubs: stubs },
+      agentPubkey,
+    );
+  });
+
+  afterEach(async () => {
+    await scope.run(async () => {});
+  });
+
+  it("release-attestation TBS + primary-release context → valid ThresholdSignature verifiable against primary_pubkey", async () => {
+    const tbs = makeTbs("k_local:abcd:new_daemon:1111:old_daemon:2222:nonce:xyz:ts:1700000000000");
+    const result = await signer.participateInCeremony(
+      "ceremony-primary-release-001",
+      tbs,
+      CONTEXT_PRIMARY_RELEASE,
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.signature).toBeInstanceOf(Uint8Array);
+    expect(result.signature.length).toBe(64);
+
+    const pubkey = signer.getPrimaryPubkey();
+    const valid = signer.verifySignature(result.signature, tbs, CONTEXT_PRIMARY_RELEASE, pubkey);
+    expect(valid).toBe(true);
+  });
+
+  it("cross-context confusion impossible: a real seal signature does NOT verify under primary-release context, and vice versa", async () => {
+    const tbs = makeTbs("shared-tbs-bytes-for-cross-context-check");
+    const sealResult = await signer.participateInCeremony("ceremony-cross-1", tbs, CONTEXT_SEAL);
+    const releaseResult = await signer.participateInCeremony("ceremony-cross-2", tbs, CONTEXT_PRIMARY_RELEASE);
+    expect(sealResult.ok).toBe(true);
+    expect(releaseResult.ok).toBe(true);
+    if (!sealResult.ok || !releaseResult.ok) return;
+
+    const pubkey = signer.getPrimaryPubkey();
+    // A seal signature must NOT verify as a release attestation (a malicious daemon replaying a
+    // real seal signature it observed must not be able to pass it off as a release proof).
+    expect(signer.verifySignature(sealResult.signature, tbs, CONTEXT_PRIMARY_RELEASE, pubkey)).toBe(false);
+    // And a release attestation must NOT verify as a real seal (the directory must never be
+    // tricked into treating a device-transfer artifact as content-sealing authority).
+    expect(signer.verifySignature(releaseResult.signature, tbs, CONTEXT_SEAL, pubkey)).toBe(false);
+  });
+
+  it("a device that never bootstrapped a local share cannot produce a release attestation (the property the design depends on)", async () => {
+    // A fresh signer instance for an agent pubkey that was NEVER bootstrapped locally — mirrors a
+    // Standby that received only K_local via pairing (M8C-PRIMARY-DESIGN Decision 1) and never the
+    // FROST share (Decision 3). participateInCeremony must refuse, not silently produce a signature.
+    const neverBootstrappedPubkey = makeAgentPubkey(6);
+    const stubs = createInProcessStubs(3);
+    const strandedSigner = new FrostThresholdSigner(
+      { threshold: 2, participants: 3, directoryNodeStubs: stubs },
+      neverBootstrappedPubkey,
+    );
+    const tbs = makeTbs("release-attempt-without-a-local-share");
+    await expect(
+      strandedSigner.participateInCeremony("ceremony-no-share", tbs, CONTEXT_PRIMARY_RELEASE),
+    ).rejects.toThrow();
   });
 });

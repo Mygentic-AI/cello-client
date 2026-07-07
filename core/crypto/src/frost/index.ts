@@ -6,7 +6,7 @@
  * - ThresholdSignature: result type
  * - FrostThresholdSigner: FROST/Ed25519 implementation
  * - MockThresholdSigner: test double confirming the swap point
- * - CONTEXT_SESSION_ESTABLISHMENT / CONTEXT_SEAL: domain context constants
+ * - CONTEXT_SESSION_ESTABLISHMENT / CONTEXT_SEAL / CONTEXT_PRIMARY_RELEASE: domain context constants
  *
  * Note: bootstrapKeyShares and clearTestShares are test-only — NOT exported
  * from this barrel. Test files import them directly from
@@ -31,6 +31,7 @@ export type {
 export {
   CONTEXT_SESSION_ESTABLISHMENT,
   CONTEXT_SEAL,
+  CONTEXT_PRIMARY_RELEASE,
 } from "./types.js";
 
 export {

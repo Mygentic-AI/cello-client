@@ -25,6 +25,7 @@ export type {
 export {
   CONTEXT_SESSION_ESTABLISHMENT,
   CONTEXT_SEAL,
+  CONTEXT_PRIMARY_RELEASE,
   FrostThresholdSigner,
   MockThresholdSigner,
 } from "./frost/index.js";
