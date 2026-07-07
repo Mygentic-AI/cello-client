@@ -297,6 +297,59 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     }
   });
 
+  // ─── CC-3: F18 sole-online fallback on the session-action tools ───
+  // Pre-CC-3 these tools hard-failed no_current_agent unless a current agent was explicitly selected
+  // for the connection — even with exactly one agent online (the post-/mcp-reconnect papercut). CC-3
+  // routes them through resolveCurrentAgent: explicit { name } > current > sole online agent.
+  describe("CC-3: session-action tools resolve the sole online agent (F18)", () => {
+    it("cello_list_sessions resolves the sole ONLINE agent when none is selected (was no_current_agent)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      // Online, but NOT cello_use_agent → this connection's currentAgent stays null. Pre-CC-3 the guard
+      // only accepted connState.currentAgent, so this returned no_current_agent. It must now resolve.
+      await client.send("cello_start_agent", { name: "alice" });
+
+      const result = await client.send("cello_list_sessions", {}) as { ok: boolean; reason?: string };
+      expect(result.reason).not.toBe("no_current_agent");
+      expect(result.ok).toBe(true);
+    });
+
+    it("stays no_current_agent when TWO agents are online and none is selected (ambiguous — must not guess)", async () => {
+      const config = await setupWithAgents("alice", "bob");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_start_agent", { name: "bob" });
+
+      const result = await client.send("cello_list_sessions", {}) as { ok: boolean; reason?: string };
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("no_current_agent");
+    });
+
+    it("explicit { name } selects THAT agent even with two online (pins the selected agent, not just non-failure)", async () => {
+      const config = await setupWithAgents("alice", "bob");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_start_agent", { name: "bob" });
+
+      // A session owned by bob only — so the list result proves WHICH agent { name } selected, not
+      // merely that the call didn't fail (a resolver bug returning the wrong agent would still be ok:true).
+      const bobSession = "b0".repeat(16);
+      await handle.getSessionNodeManager().createSessionNode(bobSession, "bob", "cc".repeat(32), "peer-bob", "corr-bob");
+
+      const bobList = await client.send("cello_list_sessions", { name: "bob", filter: "all" }) as { ok: boolean; reason?: string; sessions: Array<{ sessionId: string }> };
+      expect(bobList.reason).not.toBe("no_current_agent");
+      expect(bobList.ok).toBe(true);
+      expect(bobList.sessions.some((s) => s.sessionId === bobSession)).toBe(true);
+
+      // alice must NOT see bob's session — proves { name: "alice" } selected alice, not "the first online agent".
+      const aliceList = await client.send("cello_list_sessions", { name: "alice", filter: "all" }) as { sessions: Array<{ sessionId: string }> };
+      expect(aliceList.sessions.some((s) => s.sessionId === bobSession)).toBe(false);
+    });
+  });
+
   // ─── AC-009: ipc_connection_lost after daemon stops ───
   it("AC-009: IPC client gets connection error after daemon stops", async () => {
     const config = await setupWithAgents("alice");

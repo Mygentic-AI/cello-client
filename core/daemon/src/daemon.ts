@@ -3028,10 +3028,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   //      to the MCP response.
   handlers.set("cello_initiate_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const agentName = connState.currentAgent;
     const correlationId = randomUUID();
 
     // AC-004/AC-019: the advertised address is chosen from the standing receiver's
@@ -3169,7 +3172,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // SI-001: no auto-seal on session_interrupted receipt; operator must call explicitly
   handlers.set("cello_close_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
 
@@ -3191,7 +3196,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // the ownership scope. A session_id owned only by a DIFFERENT agent does not exist in this
     // agent's namespace (returns null → session_not_found), which is correct for loopback (two
     // agents can hold the same session_id on one daemon).
-    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record) {
       return {
         ok: false,
@@ -3202,7 +3207,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
     // Ownership: redundant now that the lookup is agent-scoped (record.agent_name === currentAgent),
     // kept as a defensive invariant.
-    if (record.agent_name !== connState.currentAgent) {
+    if (record.agent_name !== agentName) {
       return {
         ok: false,
         reason: "session_not_owned",
@@ -3488,10 +3493,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     // DOD-LOOP-1: the certificate is keyed by (agent, session_id) — read the current agent's.
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const agentName = connState.currentAgent;
     const cert = sessionNodeManager.getSealCertificate(agentName, sessionId);
     if (cert) {
       return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
@@ -3544,10 +3552,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_list_sessions." };
     }
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const { messages, undecryptable } = sessionNodeManager.readTranscript(connState.currentAgent, sessionId);
+    const { messages, undecryptable } = sessionNodeManager.readTranscript(agentName, sessionId);
     // undecryptable > 0 means some rows failed GCM auth (tamper / wrong key) — surfaced, not hidden,
     // so the reader can tell a real gap from an empty transcript.
     // M8C-CURSOR-1: this is the ONLY reader that covers BOTH directions (sent + received), so it's
@@ -3615,11 +3625,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the live ones. Read from persisted SQLite, so it survives a daemon restart / fresh connection.
   handlers.set("cello_list_sessions", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
     return selectSessions(
-      sessionNodeManager.getSessionsForAgent(connState.currentAgent),
+      sessionNodeManager.getSessionsForAgent(agentName),
       params as Record<string, unknown> | undefined,
     );
   });
@@ -4636,10 +4648,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // contract (core/adapter-claude-code/src/server.ts) so the E2E fixture migration is drop-in.
   handlers.set("cello_await_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) {
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
-    const agentName = connState.currentAgent;
     const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
 
     const toResponse = (e: InboundSessionEvent) => ({
@@ -5182,7 +5197,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
   handlers.set("cello_send", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
 
     // round-2 BLOCKING: read the snake_case public field cello-mcp.ts actually sends.
     const sessionId = params?.session_id as string | undefined;
@@ -5192,11 +5209,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     // DOD-LOOP-1: the (agent, session_id) lookup is itself the ownership scope.
-    const record = sessionNodeManager.getSessionRecord(connState.currentAgent, sessionId);
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record) {
       return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions for active sessions." };
     }
-    if (record.agent_name !== connState.currentAgent) {
+    if (record.agent_name !== agentName) {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
     if (record.status !== "active") {
@@ -5427,8 +5444,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   const RECEIVE_DEFAULT_TIMEOUT_MS = 30000; // matches the cello-mcp shim's documented default
   const handleReceive: IpcHandler = async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    if (!connState || !connState.currentAgent) return NO_CURRENT_AGENT_RESPONSE;
-    const agentName = connState.currentAgent;
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
 
     // Read the snake_case public field cello-mcp.ts actually sends.
     const sessionId = params?.session_id as string | undefined;
