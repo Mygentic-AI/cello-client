@@ -23,6 +23,20 @@ describe("F1: usage string lists every command", () => {
       ["contact", "create-agent", "login", "logout", "receipts", "refresh", "register", "remove-agent", "sessions", "status", "telegram"].sort(),
     );
   });
+
+  // CC-7 (P2-5 / DOD-ONBOARD-HELP-1): the top-level usage must be real orientation, not a bare list.
+  it("opens with what CELLO is and the first-time onboarding path (not just a command list)", () => {
+    expect(USAGE).toContain("CELLO"); // says what it is
+    // the onboarding path a first-time user needs, in order.
+    const loginAt = USAGE.indexOf("cello login");
+    const createAt = USAGE.indexOf("cello create-agent");
+    const registerAt = USAGE.indexOf("cello register");
+    const statusAt = USAGE.indexOf("cello status");
+    expect(loginAt).toBeGreaterThanOrEqual(0);
+    expect(createAt).toBeGreaterThan(loginAt);
+    expect(registerAt).toBeGreaterThan(createAt);
+    expect(statusAt).toBeGreaterThan(registerAt);
+  });
 });
 
 describe("F2: --help/-h on subcommands", () => {

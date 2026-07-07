@@ -120,6 +120,31 @@ describe("daemon", () => {
     expect(status.agents[0].pubkey).toBe(pubkey);
   });
 
+  it("CC-8: getStatus reports an ONLINE agent as state 'online' (CLI/MCP status parity)", async () => {
+    const agentsDir = join(tempDir, "agents");
+    await mkdir(join(agentsDir, "on-agent"), { recursive: true });
+    await FileKeyProvider.load(join(agentsDir, "on-agent", "key"));
+
+    const config = makeConfig();
+    handle = await startDaemon(config);
+
+    // Offline: "registered". Pre-CC-8 the daemon-wide status (what the CLI `cello status` reads) showed
+    // "registered" even AFTER the agent came online — startAgentInternal only adds to onlineAgents, it
+    // never mutates the stored record — so an operator couldn't tell online from offline via the CLI.
+    expect(handle.getStatus().agents[0].state).toBe("registered");
+
+    const client = await connectToDaemon(config.socketPath);
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "on-agent" });
+    } finally {
+      client.close();
+    }
+
+    // CC-8: now derived from onlineAgents → "online" (matches the MCP cello_status F5 surface).
+    expect(handle.getStatus().agents[0].state).toBe("online");
+  });
+
   it("reports agentCount in daemon.started event", async () => {
     const agentsDir = join(tempDir, "agents");
     await mkdir(join(agentsDir, "a1"), { recursive: true });

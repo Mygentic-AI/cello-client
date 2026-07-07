@@ -24,9 +24,16 @@ export const KNOWN_COMMANDS = new Set([
 
 export type KnownCommand = typeof KNOWN_COMMANDS extends Set<infer T> ? T : never;
 
+// CC-7 (P2-5 / DOD-ONBOARD-HELP-1): the top level opens with what CELLO is + the onboarding path a
+// first-time user needs, then the command list. (Per-command `cello <cmd> --help` was already good.)
 export const USAGE =
+  "CELLO — a peer-to-peer identity & trust layer for agent-to-agent communication.\n" +
+  "\n" +
+  "First-time setup:  cello login  →  cello create-agent <name>  →  cello register <name> <token>  →  cello status\n" +
+  "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
+  "\n" +
   "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|telegram>\n" +
-  "Run 'cello <command> --help' for command-specific usage.";
+  "Run 'cello <command> --help' for details on any command.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
 const COMMAND_HELP: Record<string, string> = {

@@ -1773,10 +1773,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
       // aggregate below (kept for backward compatibility).
-      agents: agents.map((a) => ({
-        ...a,
-        standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
-      })),
+      // CC-8 (F5 parity): the CLI `cello status` surface must show online vs registered like the MCP
+      // cello_status does. The stored `a.state` is stale — it stays "registered" even when the agent is
+      // online, because startAgentInternal only adds to onlineAgents and never mutates the record — so
+      // derive readiness from onlineAgents here, exactly as getAgentsForConnection (F5) already does for
+      // the MCP surface. A load_failed agent keeps its state so a broken agent stays visible as broken.
+      // (No `selected` here: this is the daemon-wide surface; selection is a per-connection concept and
+      // the CLI opens an ephemeral connection that never runs cello_use_agent — see M8C-DECISIONS D24.)
+      agents: agents.map((a) => {
+        const online = onlineAgents.has(a.name);
+        const state: AgentInfo["state"] = a.state === "load_failed" ? "load_failed" : online ? "online" : "registered";
+        return {
+          ...a,
+          state,
+          standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+        };
+      }),
       connections,
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),

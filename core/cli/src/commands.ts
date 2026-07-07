@@ -196,7 +196,11 @@ export async function register(
           2,
         ) +
         // M8C-ONBOARD-NEXTSTEP-1 (R7): every command output carries the next step + state legibility.
-        `\n\nNext: run 'cello status' to confirm '${agent}' is registered. 'connecting' is normal — registration takes a minute or two; 'connected' means ready. If it stays disconnected, run 'cello logout' then 'cello login'.`,
+        // CC-6 (P2-1): broken onto multiple lines — the dense one-liner buried the three status cues.
+        `\n\nNext: run  cello status  to confirm '${agent}' is registered.\n` +
+        `  • it's normal for this to take a minute or two while registration settles.\n` +
+        `  • ready = the agent shows state 'online' and directory_signaling 'connected'.\n` +
+        `  • if it stays offline, run  cello logout  then  cello login.`,
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
