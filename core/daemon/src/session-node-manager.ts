@@ -1429,6 +1429,14 @@ export class SessionNodeManager {
     return this.#sessionLiveness.get(this.#k(agentName, sessionId)) ?? "unknown";
   }
 
+  /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
+   *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
+   *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
+   *  up a real libp2p peer connection. */
+  markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "gone"): void {
+    this.#sessionLiveness.set(this.#k(agentName, sessionId), state);
+  }
+
   /**
    * Hand the standing receiver to an inbound session.
    * Called during cello_await_session.
@@ -3734,8 +3742,11 @@ export class SessionNodeManager {
         )
         .run(status, now, agentName, sessionId);
     } catch (err: unknown) {
-      this.#logger.error("session.interrupt.db.write.failed", {
+      // CC-5 (reviewer F-2): status-agnostic event + the actual target status in context — this method
+      // now writes "abandoned" too, so labeling every failure "interrupt" was misleading.
+      this.#logger.error("session.status.write.failed", {
         sessionId,
+        status,
         error: err instanceof Error ? err.message : String(err),
       });
     }

@@ -438,6 +438,23 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(await openSids(client)).toContain(sid);
       expect(await statusOf(client, sid)).toBe("active");
     });
+
+    it("does NOT reap an OLD, 0-received active session while the counterparty is LIVE (liveness 'alive')", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f5".repeat(16);
+      seedSession("alice", sid, { createdAt: Date.now() - 60 * 60 * 1000, messageCount: 1 }); // old, 0 received
+      handle.getSessionNodeManager().markSessionLivenessForTest("alice", sid, "alive"); // peer connected, just silent
+      // Teeth for the liveness gate (reviewer F-1): this is the ONLY case where BOTH the age and the
+      // 0-received gates point to "reap" — so removing the `getSessionLiveness === "alive"` gate would
+      // wrongly abandon a live, connected-but-quiet session. It MUST survive.
+      expect(await openSids(client)).toContain(sid);
+      expect(await statusOf(client, sid)).toBe("active");
+    });
   });
 
   // ─── AC-009: ipc_connection_lost after daemon stops ───
