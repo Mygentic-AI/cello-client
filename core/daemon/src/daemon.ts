@@ -1580,8 +1580,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
-      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: "standing_receiver_unavailable" });
-      return;
+      const reason = "standing_receiver_unavailable";
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason });
+      // DOD-LEAVEMSG-1 (reviewer HIGH fix): return the typed failure, never resolve as if this
+      // were a success — #parkContent's caller (sendContent) shapes a live "dispatched to relay"
+      // response from this, and a silently-resolved void here would report a message as safely
+      // parked when nothing was ever deposited.
+      return { ok: false, reason };
     }
     const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
     // DOD-MSG-4 (2b): seal the ORDERING ENVELOPE (content + the relay's signed Structure2), not bare
@@ -1596,9 +1601,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     });
     if (res.ok) {
       logger.info("content.park.deposited", { sessionId, contentHash: contentHashHex, recipientPubkey: recipientPubkeyHex.slice(0, 16) });
-    } else {
-      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: res.reason });
+      return { ok: true };
     }
+    logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: res.reason });
+    return { ok: false, reason: res.reason ?? "relay_deposit_failed" };
   });
 
   // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked

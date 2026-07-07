@@ -104,7 +104,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const snm = h.getSessionNodeManager();
 
     let parkCalls = 0;
-    snm.setContentParkHook(async () => { parkCalls++; });
+    snm.setContentParkHook(async () => { parkCalls++; return { ok: true }; });
 
     const kp = generateKeypair();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
@@ -125,7 +125,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
-    snm.setContentParkHook(async () => { /* would deposit, but no relay is wired for this session */ });
+    snm.setContentParkHook(async () => ({ ok: true })); // would deposit, but no relay is wired for this session
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay param
 
     const content = new TextEncoder().encode("hello");
@@ -133,7 +133,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
-  it("sendContent: direct-stream failure + a relay configured but the park hook REJECTS → honest {ok:false} (never a false success)", async () => {
+  it("sendContent: direct-stream failure + a relay configured but the park hook THROWS → honest {ok:false} (never a false success)", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
@@ -153,11 +153,38 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
+  it("sendContent: direct-stream failure + a relay configured but the park hook RESOLVES {ok:false} (cello-unit-reviewer HIGH fix) → honest {ok:false}, never a false parked:true", async () => {
+    // This is the EXACT production shape: the real contentParkHook (daemon.ts) never throws on its
+    // main failure branches (standing receiver unavailable, relay explicitly rejects the deposit)
+    // — it logs and resolves normally with a typed {ok:false, reason}. A version of #parkContent
+    // that only checked "did the hook throw" would treat this as success and report a message as
+    // safely dispatched to relay when nothing was ever deposited (and, worse, skip the durable
+    // retry_queue enqueue that only fires on an honest {ok:false} — a silent message loss with a
+    // success response). This test drives that exact resolved-not-thrown failure shape.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const content = new TextEncoder().encode("hello");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
+  });
+
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
-    snm.setContentParkHook(async () => { /* deposit succeeds */ });
+    snm.setContentParkHook(async () => ({ ok: true })); // deposit succeeds
 
     const kp = generateKeypair();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {

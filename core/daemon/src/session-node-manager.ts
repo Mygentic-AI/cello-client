@@ -362,7 +362,7 @@ export class SessionNodeManager {
    * ContentParkClient. Best-effort.
    */
   #contentParkHook:
-    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<void>)
+    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
     | null = null;
 
   constructor(opts: {
@@ -418,9 +418,17 @@ export class SessionNodeManager {
    * MSG-001-3b (2b): inject the live content-park deposit (seal + ContentParkClient.deposit).
    * Injected by the composition root (daemon.ts). When absent, a not-confirmed send still records
    * the durable awaiting entry (crash backstop) but does not deposit live.
+   * DOD-LEAVEMSG-1 (cello-unit-reviewer HIGH fix): the hook returns a TYPED result — `{ok:true}` or
+   * `{ok:false, reason}` — mirroring RetryQueue's ParkFn contract. It must NEVER resolve `{ok:true}`
+   * merely because it didn't throw: the production hook's own failure branches (standing receiver
+   * unavailable, relay explicitly rejects the deposit) log-and-return without throwing, and a
+   * throw-only contract would silently report those as success — the exact "system lies about its
+   * own health" bug the reviewer caught (a park that never happened reported to the operator as
+   * "dispatched to relay," with the durable retry_queue backstop skipped because sendContent's own
+   * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<void>,
+    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -440,7 +448,7 @@ export class SessionNodeManager {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return false;
     try {
-      await hook({
+      const result = await hook({
         sessionId,
         recipientPubkeyHex: entry.counterpartyPubkey,
         relayPeerId: entry.relayPeerId,
@@ -452,6 +460,18 @@ export class SessionNodeManager {
         structure1Cbor,
         structure2Cbor,
       });
+      // DOD-LEAVEMSG-1 (reviewer HIGH fix): check the TYPED result, not just "didn't throw" — the
+      // production hook's own failure branches (standing receiver unavailable, relay explicitly
+      // rejects) resolve normally after logging, they never throw. A throw-only check would report
+      // those as success.
+      if (!result.ok) {
+        this.#logger.warn("content.park.deposit.failed", {
+          sessionId,
+          contentHash: contentHashHex,
+          reason: result.reason,
+        });
+        return false;
+      }
       return true;
     } catch (err: unknown) {
       this.#logger.warn("content.park.deposit.failed", {
