@@ -5,9 +5,13 @@
  * - K1: cello_contact_add/remove/list persist a per-agent whitelist; identity pins to the pubkey
  *   at add time (re-adding is a no-op, never refreshes added_at); known stays known until removed.
  * - K2 (D6): initiating a session to X auto-adds X as a contact.
- * - K3 (D6): accepting an inbound request from X auto-adds X as a contact.
+ * - K3 (CC-1, 2026-07-07 — SUPERSEDES the old D6 auto-add-on-accept): accepting an inbound request
+ *   does NOT auto-add the sender. Accepting the *connection* must not grant *trust*. Promotion to
+ *   "known" requires operator ENGAGEMENT: an outbound initiate, the operator replying INTO the
+ *   session (cello_send), or an explicit cello_contact_add. An unattended stranger stays unknown —
+ *   so the ABUSE-1 acceptance caps keep applying to them. (D21 / four-level-screening-policy.)
  * - K4: an UNKNOWN sender's session request gets the minimal "Dispatched." text (not the fuller
- *   AWAY-1 text) — but per K3, they become known immediately after, for every later interaction.
+ *   AWAY-1 text), and they STAY unknown until the operator engages.
  * - K5: a KNOWN contact's away response uses the normal, richer AWAY-1 per-type text.
  * - K6: --agent resolves explicitly, else falls back to the connection's current/sole-online agent
  *   (F18), matching cello_check_notifications' own resolution.
@@ -188,7 +192,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     };
   }
 
-  it("K3/K4: an inbound request from an UNKNOWN sender gets the minimal 'Dispatched.' text, then becomes a known contact", async () => {
+  it("K3/K4 (CC-1): an inbound request from an UNKNOWN sender gets 'Dispatched.' and does NOT auto-whitelist them — accepting the connection ≠ trusting the sender", async () => {
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
     const injectRef: { inject?: (frame: unknown) => void } = {};
@@ -206,8 +210,29 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe("Dispatched.");
 
-    // K3: now known, for every later interaction.
-    expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(true);
+    // CC-1 teeth: the stranger must STILL be unknown after knocking. The old code auto-added them
+    // here — which then exempted them from the ABUSE-1 caps. An unattended knock grants no trust.
+    expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
+  });
+
+  it("K3 (CC-1): the operator replying INTO an inbound session (cello_send) promotes the sender to a known contact", async () => {
+    await makeAgentDir("alice");
+    const h = await start({ logger: makeLogger().logger, node: new FakeNode() });
+    const snm = h.getSessionNodeManager();
+    const strangerPubkey = "7c".repeat(32);
+    // An inbound-originated active session whose counterparty is NOT yet a contact (the CC-1 world:
+    // accepting the connection did not add them). A brand-new empty session → first send needs no
+    // read-before-write catch-up (M8C-CURSOR-1 C3).
+    await snm.createSessionNode(SID_HEX, "alice", strangerPubkey, "stranger-peer", "corr");
+    expect(snm.isContact("alice", strangerPubkey)).toBe(false);
+
+    const client = await connectAs("alice");
+    const res = (await client.send("cello_send", { session_id: SID_HEX, content: "thanks for reaching out" })) as Record<string, unknown>;
+    expect(res.ok).toBe(true);
+
+    // Engagement = trust. A committed reply promotes them; without CC-1's addContact in cello_send
+    // this stays false (the teeth).
+    expect(snm.isContact("alice", strangerPubkey)).toBe(true);
   });
 
   it("K5: a KNOWN contact's inbound request gets the fuller AWAY-1 text, not 'Dispatched.'", async () => {

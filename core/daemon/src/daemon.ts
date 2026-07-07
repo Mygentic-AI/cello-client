@@ -970,10 +970,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (awayAckSent.has(dedupKey)) return;
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
-    // M8C-CONTACT-1: this check MUST run synchronously (before any await below) — the caller of
-    // sendAwayResponse for a fresh inbound request fires this THEN calls addContact right after
-    // (D6: "accepting X's request adds X"), relying on this line executing first so a stranger's
-    // VERY FIRST contact is correctly judged unknown, not already-added.
+    // M8C-CONTACT-1 / CC-1: select the ack wording by whether the sender is a known contact —
+    // STRANGER_TEXT ("Dispatched.") for unknown, AWAY_TEXT[kind] for known. Post-CC-1 the inbound
+    // accept path no longer auto-adds the sender, so an unattended stranger STAYS unknown across
+    // every inbound interaction (promotion now requires operator engagement — an outbound initiate,
+    // a cello_send reply, or an explicit contact add). No subsequent add is coupled to this line's
+    // ordering anymore; it is a plain read of current contact state.
     const isKnown = sessionNodeManager.isContact(agentName, record.counterparty_pubkey);
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
@@ -4410,12 +4412,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       void sendTelegramDoorbell(agentName, parsed.sessionIdHex, "session_request", "New session request");
       // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
       // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
-      // ORDER MATTERS: sendAwayResponse's isContact check runs synchronously (before any await) as
-      // soon as it's invoked, so calling addContact on the NEXT line still lets a stranger's very
-      // first contact be judged correctly unknown (M8C-CONTACT-1 D6: "accepting X's request adds X"
-      // — they become known immediately after, for every subsequent interaction).
       void sendAwayResponse(agentName, parsed.sessionIdHex, "request");
-      sessionNodeManager.addContact(agentName, parsed.participantAPubkeyHex);
+      // CC-1 (2026-07-07): do NOT auto-add the requester here. Accepting the *connection* must not
+      // grant *trust*. The old auto-add promoted any stranger who knocked once to "known" (Level-4
+      // fast-track), which defeated BOTH the screening layer AND the ABUSE-1 acceptance caps
+      // (checkUnknownSenderAcceptanceBound exempts contacts, so sessions 2+ bypassed the per-sender
+      // cap — confirmed live 2026-07-07). Promotion to "known" now requires operator engagement only:
+      // an outbound cello_initiate_session (below, ~3137), the operator replying INTO the session via
+      // cello_send, or an explicit cello_contact_add. An unattended stranger is never auto-whitelisted.
+      // See docs/planning/.../2026-07-07_1700_four-level-screening-policy.md (D21).
     } finally {
       inboundInFlight.delete(parsed.sessionIdHex);
     }
@@ -5346,6 +5351,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
     void newRootHex;
+    // CC-1 (2026-07-07): operator engagement promotes the counterparty to a known contact. A
+    // committed reply — past the read-before-write gate, content now on the wire AND in the tree —
+    // IS the operator choosing to trust this sender; the inbound-accept path deliberately no longer
+    // auto-adds (that defeated screening + anti-spam). For an OUTBOUND session the counterparty is
+    // already a contact (cello_initiate_session added it), so this is an idempotent no-op there; it
+    // matters for inbound-originated sessions, where the reply is the trust signal. addContact is
+    // INSERT OR IGNORE — it never refreshes added_at.
+    sessionNodeManager.addContact(record.agent_name, recipientPubkey);
     if (modified) {
       logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
     }

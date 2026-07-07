@@ -224,6 +224,47 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 
+  it("CC-1 (live 3f regression): repeated REAL inbound knocks from one unknown sender stay capped — the sender is NOT auto-added on accept, so the per-sender bound keeps applying (the old auto-add promoted them at session 1, exempting sessions 2+)", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const strangerPubkey = "3c".repeat(32);
+    const knock = async (n: number): Promise<void> => {
+      const sid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => (n * 16 + b) & 0xff));
+      injectRef.inject!({
+        type: "session_assignment",
+        assignment: {
+          session_id: sid,
+          participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
+          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+          session_timestamp: 1_700_000_000_000 + n,
+          signature_type: "frost",
+          initiator_session_peer_id: `stranger-peer-${n}`,
+        },
+      });
+      await wait(120); // accepts are serialized — let each settle before the next
+    };
+
+    // The first CAP knocks are accepted (sender genuinely unknown, under the per-sender bound).
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) await knock(i);
+    expect(snm.countActiveSessionsForCounterparty("bob", strangerPubkey)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    // CC-1: accepting the connection did NOT make them a contact.
+    expect(snm.isContact("bob", strangerPubkey)).toBe(false);
+
+    // The CAP+1'th REAL knock must now be refused by the actual accept-path gate — the exact live
+    // 3f failure (4 sequential sessions all accepted) is fixed.
+    events.length = 0;
+    await knock(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+    expect(snm.countActiveSessionsForCounterparty("bob", strangerPubkey)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+  });
+
   it("B4/B5: checkUnknownSenderAcceptanceBound — global anti-swarm cap trips once unknown-sender sessions reach it; a known contact is exempt regardless of count", async () => {
     await makeAgentDir("alice");
     const h = await start(makeLogger().logger, new FakeNode());
