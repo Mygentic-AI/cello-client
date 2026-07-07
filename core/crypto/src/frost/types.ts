@@ -6,9 +6,10 @@
  * Design decisions:
  * - `IThresholdSigner` is separate from `KeyProvider`. `KeyProvider` handles K_local
  *   envelope signing; `IThresholdSigner` handles the multi-party threshold ceremony.
- * - Two domain context strings are defined (M2 only):
+ * - Domain context strings (one per message-type this ceremony machinery signs):
  *   - "cello-frost-session-establishment-v1" — session establishment TBS
  *   - "cello-frost-seal-v1"                 — conversation seal TBS
+ *   - "cello-frost-primary-release-v1"      — M8C-PRIMARY-1 device-transfer release attestation
  * - Context is prepended to the TBS before signing to achieve domain separation.
  *   FROST over ed25519 does not support a native context parameter, so we use
  *   a framed encoding: `<context>\0<tbs>`.

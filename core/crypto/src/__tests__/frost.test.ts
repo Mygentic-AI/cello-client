@@ -1087,8 +1087,11 @@ describe("M8C-PRIMARY-1: participateInCeremony — primary-release context", () 
       neverBootstrappedPubkey,
     );
     const tbs = makeTbs("release-attempt-without-a-local-share");
+    // Asserts the SPECIFIC "not bootstrapped" reason, not just "threw for any reason" — pins the
+    // throw to the actual missing-local-share guard (frost-threshold-signer.ts's first check),
+    // so a future refactor that accidentally throws for some unrelated cause would fail this test.
     await expect(
       strandedSigner.participateInCeremony("ceremony-no-share", tbs, CONTEXT_PRIMARY_RELEASE),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/not bootstrapped/i);
   });
 });
