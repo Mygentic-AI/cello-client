@@ -33,7 +33,6 @@ import type {
   DaemonConfig,
   DaemonStatusResponse,
   AgentInfo,
-  ConnectionInfo,
   InterruptedSessionInfo,
   ActiveSessionInfo,
   SessionListEntry,
@@ -606,9 +605,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       assignment: carry,
     };
   };
-
-  // Stub: all connections marked as 'unverified' until connection validation is wired
-  const connections: ConnectionInfo[] = [];
 
   // M7-SIGNAL-001: Instantiate SignalingManager — owns directory signaling stream lifecycle.
   const defaultConnect = async (): Promise<ConnectResult> => {
@@ -1789,7 +1785,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
         };
       }),
-      connections,
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,
@@ -2987,7 +2982,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       daemon: "running",
       directory_signaling: directorySignalingStatus(),
       agents: getAgentsForConnection(connectionId),
-      connections,
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.
       interrupted_sessions: buildInterruptedSessions(),

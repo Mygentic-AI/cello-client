@@ -485,7 +485,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(status).toHaveProperty("daemon");
     expect(status).toHaveProperty("directory_signaling");
     expect(status).toHaveProperty("agents");
-    expect(status).toHaveProperty("connections");
+    // CC-4 (2026-07-07): the always-empty `connections` stub was dropped from the status surface.
+    expect(status).not.toHaveProperty("connections");
 
     // agents array with per-connection perspective
     const agents = status.agents as Array<{ name: string; state: string; pubkey?: string }>;

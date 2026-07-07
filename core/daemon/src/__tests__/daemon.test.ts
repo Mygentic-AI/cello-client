@@ -4,7 +4,7 @@
  * ACs tested:
  * - daemon.started event: pid, ipcSocketPath, agentCount
  * - daemon.stopped event: pid, reason
- * - Status response structure: daemon, directory_signaling, agents, connections
+ * - Status response structure: daemon, directory_signaling, agents (CC-4: `connections` field dropped)
  * - Agents loaded in 'registered' state (not auto-started)
  * - Shutdown handler: acknowledges and triggers graceful stop
  * - daemon.login.validation.complete stub (connections all 'unverified')
@@ -165,7 +165,6 @@ describe("daemon", () => {
     expect(status.daemon).toBe("running");
     expect(status.directory_signaling).toBe("reconnecting");
     expect(Array.isArray(status.agents)).toBe(true);
-    expect(Array.isArray(status.connections)).toBe(true);
   });
 
   it("IPC status method returns the same as getStatus()", async () => {
@@ -183,7 +182,6 @@ describe("daemon", () => {
       expect(result.daemon).toBe(expected.daemon);
       expect(result.directory_signaling).toBe(expected.directory_signaling);
       expect(result.agents).toEqual(expected.agents);
-      expect(result.connections).toEqual(expected.connections);
     } finally {
       client.close();
     }
@@ -205,12 +203,6 @@ describe("daemon", () => {
     expect(stopEvent).toBeDefined();
     expect(stopEvent!.context.reason).toBe("logout_requested");
     handle = null; // Already stopped
-  });
-
-  it("connections are empty (no directory signaling yet)", async () => {
-    handle = await startDaemon(makeConfig());
-    const status = handle.getStatus();
-    expect(status.connections).toEqual([]);
   });
 
   it("emits daemon.login.validation.complete with zeroed counts (stub)", async () => {

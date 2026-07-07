@@ -5,7 +5,7 @@
  * - cello login: starts daemon or connects to existing, exits 0
  * - cello logout: sends shutdown to daemon, exits 0
  * - cello status: queries daemon and prints structured JSON
- * - Status response structure: {daemon, directory_signaling, agents, connections}
+ * - Status response structure: {daemon, directory_signaling, agents} (CC-4: `connections` dropped)
  * - Logout when no daemon running: exits 0 with "No daemon running"
  * - Status when no daemon running: exits 1 with {daemon: "stopped"}
  */
@@ -94,7 +94,6 @@ describe("cli commands", () => {
       expect(parsed.daemon).toBe("running");
       expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
-      expect(Array.isArray(parsed.connections)).toBe(true);
     });
   });
 
@@ -179,8 +178,11 @@ describe("cli commands", () => {
         const result = await register(tempDir, "alice", VALID_TOKEN);
         expect(result.exitCode).toBe(0);
         expect(result.output).toContain("cello status");     // next step
-        expect(result.output).toContain("connecting");        // state legibility
-        expect(result.output).toContain("connected");
+        // CC-6 (reviewer-aligned copy): readiness is expressed via the REAL cello status output —
+        // agent state 'online' + directory_signaling 'connected' (the old "connecting" wording never
+        // appeared in that output).
+        expect(result.output).toContain("online");            // state legibility (ready state)
+        expect(result.output).toContain("connected");         // directory_signaling ready
         expect(result.output).toContain("cello login");       // recovery hint
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));

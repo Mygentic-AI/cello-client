@@ -132,7 +132,10 @@ export interface DaemonStatusResponse {
   daemon: "running";
   directory_signaling: DirectorySignalingState;
   agents: AgentInfo[];
-  connections: ConnectionInfo[];
+  // CC-4 (2026-07-07): the `connections` field was an always-empty stub ("until connection validation
+  // is wired" — F9). An empty placeholder conveys nothing and reads as a mock, so it is dropped from the
+  // status surface. The ConnectionInfo type is kept (exported) as the shape F9 will populate when the
+  // connected-client-visibility feature lands; per-connection state still lives in perConnectionState.
   /**
    * True when the standing receiver node is listening and ready to accept the
    * next inbound session. Set to true by SessionNodeManager.initialize() during
