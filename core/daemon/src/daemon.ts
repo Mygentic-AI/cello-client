@@ -2336,6 +2336,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // committed at this point (RegistrationManager awaits the persist before returning success).
         // SI-001: never log a secret — only the agent name + PUBLIC key.
         logger.info("persist.identity.persisted", { agentName: name, agentPubkey: agentPubkeyHex });
+        // CC-2 (2026-07-07): registration succeeded — arm this agent's standing receiver NOW so a
+        // brand-new agent can receive inbound immediately. Without this the agent reports
+        // standing_receiver_ready:false and cannot receive until the operator restarts (logout/login),
+        // so a fresh registration looks broken. Uses the SAME idempotent path login and cello_use_agent
+        // arm through (startAgentInternal → onlineAgents + directory signaling + ensureStandingReceiver +
+        // agent_state_changed). A start failure must NOT fail the (already durably persisted)
+        // registration — surface it as a warning and let the operator recover via login.
+        const armResult = startAgentInternal(name);
+        if (!armResult.ok) {
+          logger.warn("registration.standing_receiver.arm_failed", { agentName: name, reason: armResult.reason });
+        } else {
+          // arm_INITIATED, not armed: startAgentInternal returns ok once the agent is online + signaling
+          // is up, but ensureStandingReceiverForAgent runs fire-and-forget (its own failure emits
+          // session.standing_receiver.ensure.failed) — so this event marks the start, not readiness.
+          logger.info("registration.standing_receiver.arm_initiated", { agentName: name });
+        }
         // Capture-now-or-lose-it: persist the agent→user link (using it is future
         // trust-layer work). L1: the agent is already registered at this point —
         // a link-write failure must NOT be reported as a registration failure.
