@@ -183,3 +183,30 @@ describe("cli-args — install command surface", () => {
     expect(checkArgs("install", ["hermes", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
   });
 });
+
+describe("resolveInstallTarget — positional parsing (bin/cello.ts install case)", () => {
+  // Mirrors the target-resolution in bin/cello.ts: the "hermes" positional must be
+  // found even when a flag and its VALUE precede it (--agent alice hermes).
+  function resolveInstallTarget(args: string[]): string | undefined {
+    const agentIdx = args.indexOf("--agent");
+    const homeIdx = args.indexOf("--hermes-home");
+    return args.find(
+      (a, i) =>
+        !a.startsWith("-") &&
+        !(agentIdx !== -1 && i === agentIdx + 1) &&
+        !(homeIdx !== -1 && i === homeIdx + 1),
+    );
+  }
+
+  it("resolves hermes regardless of where the flags sit", () => {
+    expect(resolveInstallTarget(["hermes", "--agent", "alice"])).toBe("hermes");
+    expect(resolveInstallTarget(["--agent", "alice", "hermes"])).toBe("hermes");
+    expect(resolveInstallTarget(["--hermes-home", "/x", "--agent", "alice", "hermes"])).toBe("hermes");
+  });
+
+  it("does not mistake a flag value for the target", () => {
+    // No positional target given → undefined (installer rejects with usage).
+    expect(resolveInstallTarget(["--agent", "alice"])).toBeUndefined();
+    expect(resolveInstallTarget(["--hermes-home", "/x"])).toBeUndefined();
+  });
+});

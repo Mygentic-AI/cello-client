@@ -163,13 +163,21 @@ async function main(): Promise<void> {
     case "install": {
       // cello install hermes --agent <name> [--hermes-home <path>] (HERMES-001)
       const args = process.argv.slice(3);
-      const target = args.find((a) => !a.startsWith("-"));
+      const agentIdx = args.indexOf("--agent");
+      const homeIdx = args.indexOf("--hermes-home");
+      // Find the target positional, excluding both flags AND their values — so
+      // `cello install --agent alice hermes` still resolves target=hermes (mirrors
+      // the `contact` case's positional filter).
+      const target = args.find(
+        (a, i) =>
+          !a.startsWith("-") &&
+          !(agentIdx !== -1 && i === agentIdx + 1) &&
+          !(homeIdx !== -1 && i === homeIdx + 1),
+      );
       if (target !== "hermes") {
         result = { exitCode: 1, output: helpForCommand("install") };
         break;
       }
-      const agentIdx = args.indexOf("--agent");
-      const homeIdx = args.indexOf("--hermes-home");
       const { installHermes } = await import("../hermes/install-hermes.js");
       result = await installHermes({
         agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",

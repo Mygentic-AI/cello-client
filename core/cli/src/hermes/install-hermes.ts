@@ -49,11 +49,14 @@ const HERMES_COMMANDS: ReadonlyArray<ReadonlyArray<string>> = [
 const defaultExec: ExecFn = (cmd, args) =>
   new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-    // `hermes mcp add` interactively asks "Enable all N tools? [Y/n/select]" via
-    // plain input() — answer yes. (A closed stdin reads as EOF → "Cancelled." with
-    // exit 0, which is why installHermes also VERIFIES the registration afterward
-    // instead of trusting the exit code.)
-    child.stdin.write("Y\n");
+    // `hermes mcp add` is interactive: on a re-run it first asks "... already exists.
+    // Overwrite? [y/N]" (default NO), then "Enable all N tools? [Y/n/select]". Feed a
+    // few "Y" lines so BOTH prompts are answered yes on the fresh AND the re-run path
+    // (extra lines are harmless — the child stops reading once satisfied). A closed
+    // stdin would read as EOF → "Cancelled." with exit 0, which is why installHermes
+    // also VERIFIES the registration against `hermes mcp list` rather than trusting
+    // the exit code.
+    child.stdin.write("Y\nY\nY\n");
     child.stdin.end();
     let stdout = "";
     let stderr = "";
