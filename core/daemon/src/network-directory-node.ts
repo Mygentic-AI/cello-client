@@ -59,7 +59,9 @@ const CBOR_ENC = new Encoder({ tagUint8Array: false });
 // setBootstrapContext by every ceremony path (session/seal, DKG, refresh).
 export type FrostAuthSigner = (hash: Uint8Array) => Promise<Uint8Array>;
 const FROST_AUTH_DOMAIN = "CELLO-FROST-AUTH-v1";
-const FROST_AUTH_COMMIT_TAIL = new Uint8Array(Buffer.from("commit", "utf8"));
+// Domain separation (must match the directory's verifyFrostAuth): 0x00 = commit; 0x01 || framedMsg = sign.
+const FROST_AUTH_COMMIT_TAIL = new Uint8Array([0x00]);
+const FROST_AUTH_SIGN_PREFIX = 0x01;
 
 // ─── NetworkDirectoryNode ─────────────────────────────────────────────────────
 
@@ -217,7 +219,8 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       commitmentList: params.commitmentList,
       ceremonyId: params.ceremonyId,
       peerIdString: params.ceremonyId,
-      authSig: await this.#buildAuthSig(params.msg), // SEC-2: bound to THIS framedMsg
+      // SEC-2: bound to THIS framedMsg, with the 0x01 sign-frame domain-separation prefix.
+      authSig: await this.#buildAuthSig(Buffer.concat([Buffer.from([FROST_AUTH_SIGN_PREFIX]), Buffer.from(params.msg)])),
     });
 
     this.#logger.debug("frost.directory.sign.stream.opening", {});

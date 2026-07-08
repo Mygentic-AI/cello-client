@@ -28,7 +28,11 @@ function frostAuthHash(agentPubkeyHex: string, epochId: string, tail: Uint8Array
       .digest(),
   );
 }
-const COMMIT_TAIL = new Uint8Array(Buffer.from("commit", "utf8"));
+// SEC-2 domain separation: 0x00 = commit; 0x01 || framedMsg = sign.
+const COMMIT_TAIL = new Uint8Array([0x00]);
+function signTail(framedMsg: Uint8Array): Uint8Array {
+  return Buffer.concat([Buffer.from([0x01]), Buffer.from(framedMsg)]);
+}
 
 // A fake CelloNode whose newStream returns a capturing stream: it records the request bytes the client
 // sends, and yields a canned (lp-encoded) response so generateCommitment/signRound complete without error.
@@ -97,10 +101,12 @@ describe("SEC-2 client: NetworkDirectoryNode attaches a valid K_local authSig", 
     const authSig = frame.authSig as Uint8Array;
     expect(authSig).toBeInstanceOf(Uint8Array);
     const pubkey = Uint8Array.from(Buffer.from(pubkeyHex, "hex"));
-    // Verifies over the ACTUAL framedMsg…
-    expect(verify(pubkey, frostAuthHash(pubkeyHex, epochId, framedMsg), authSig)).toBe(true);
+    // Verifies over the ACTUAL framedMsg (with the sign-frame prefix)…
+    expect(verify(pubkey, frostAuthHash(pubkeyHex, epochId, signTail(framedMsg)), authSig)).toBe(true);
     // …but NOT over a different framedMsg — the binding is what defeats forging an arbitrary message.
-    expect(verify(pubkey, frostAuthHash(pubkeyHex, epochId, new Uint8Array([1, 2, 3, 4])), authSig)).toBe(false);
+    expect(verify(pubkey, frostAuthHash(pubkeyHex, epochId, signTail(new Uint8Array([1, 2, 3, 4]))), authSig)).toBe(false);
+    // …and NOT over the commit tail — commit and sign are domain-separated.
+    expect(verify(pubkey, frostAuthHash(pubkeyHex, epochId, COMMIT_TAIL), authSig)).toBe(false);
   });
 
   it("with NO signer threaded, the frame omits authSig (an enforcing directory then refuses AUTH_REQUIRED)", async () => {
