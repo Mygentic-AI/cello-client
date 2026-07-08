@@ -1749,23 +1749,36 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // no background timer). A session the standing receiver opened from an inbound offer the initiator
   // ABANDONED stays "active" forever (the counterparty never joins), clutters the open/active lists, and
   // its normal close fires an unsealable bilateral seal. Mark such a session terminal ("abandoned") once
-  // it is PROVABLY dead: status active + counterparty never established (liveness != "alive" AND 0
-  // RECEIVED messages — message_count alone counts our own auto-"Dispatched." ack, so it is NOT the
-  // signal) + age past the grace TTL (a genuinely fresh session still setting up must survive).
+  // it is PROVABLY dead: counterparty never established (liveness != "alive" AND 0 RECEIVED messages —
+  // message_count alone counts our own auto-"Dispatched." ack, so it is NOT the signal) + age past the
+  // grace TTL (a genuinely fresh session still setting up must survive).
+  // CC-10 (live 2026-07-08 Phase-2 block): scan 'interrupted' too, not just 'active'. A daemon restart
+  // flips dead half-opens to 'interrupted'; those classify as "failed" (invisible in every list) yet
+  // still count toward the unknown-sender acceptance bound (D18 deliberately counts 'interrupted') — so
+  // a stranger whose first handshakes died was silently locked out FOREVER. Reaping only 0-RECEIVED
+  // ghosts keeps D18 intact: the disconnect-evasion attacker's sessions always carry received content.
   const HALF_OPEN_TTL_MS = Number(process.env["CELLO_HALF_OPEN_TTL_MS"]) || 5 * 60 * 1000;
   function reapDeadHalfOpenSessions(agentName?: string): void {
     const now = Date.now();
-    for (const row of sessionNodeManager.getSessionsByStatus("active")) {
+    const candidates = [...sessionNodeManager.getSessionsByStatus("active"), ...sessionNodeManager.getSessionsByStatus("interrupted")];
+    for (const row of candidates) {
       if (agentName !== undefined && row.agent_name !== agentName) continue;
       if (now - row.created_at <= HALF_OPEN_TTL_MS) continue; // too young — may just be setting up
       if (sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id) === "alive") continue; // live
       if (sessionNodeManager.countReceivedMessages(row.agent_name, row.session_id) > 0) continue; // counterparty spoke
       // Non-awaited: abandonSession flips the DB status synchronously (before its first await), so THIS
-      // read reflects it; the async node teardown finishes in the background.
-      void sessionNodeManager.abandonSession(row.agent_name, row.session_id).catch((err: unknown) => {
-        logger.warn("session.half_open.reap.failed", { agentName: row.agent_name, sessionId: row.session_id, reason: err instanceof Error ? err.message : String(err) });
-      });
-      logger.info("session.half_open.reaped", { agentName: row.agent_name, sessionId: row.session_id, ageMs: now - row.created_at });
+      // read reflects it; the async node teardown finishes in the background. CC-10 reviewer LOW: only
+      // log "reaped" if the status flip actually wrote — a swallowed write failure already logs
+      // session.status.write.failed, and reporting success over it would hide a still-counting ghost.
+      void sessionNodeManager.abandonSession(row.agent_name, row.session_id)
+        .then((flipped) => {
+          if (flipped) {
+            logger.info("session.half_open.reaped", { agentName: row.agent_name, sessionId: row.session_id, priorStatus: row.status, ageMs: now - row.created_at });
+          }
+        })
+        .catch((err: unknown) => {
+          logger.warn("session.half_open.reap.failed", { agentName: row.agent_name, sessionId: row.session_id, reason: err instanceof Error ? err.message : String(err) });
+        });
     }
   }
 
@@ -4390,6 +4403,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // senders — a per-sender cap (many sessions from ONE stranger) and a global cap (many
       // sessions across ALL strangers combined). Known contacts are exempt ("bounded only by
       // disk" — DoD). Checked FIRST, before any standing-receiver work, so a refusal is cheap.
+      // CC-10: reap provably-dead ghosts for THIS agent before counting — otherwise invisible
+      // interrupted 0-received sessions (post-restart shape) consume the sender's budget forever
+      // and lock the stranger out with no list read ever clearing them. Safe here: abandonSession
+      // flips the DB status synchronously, so the bound query below sees the reaped state.
+      reapDeadHalfOpenSessions(agentName);
       const bound = sessionNodeManager.checkUnknownSenderAcceptanceBound(agentName, parsed.participantAPubkeyHex);
       if (!bound.ok) {
         logger.warn("session.inbound.accept.failed", {

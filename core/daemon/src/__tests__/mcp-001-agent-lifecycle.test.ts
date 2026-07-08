@@ -455,6 +455,37 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(await openSids(client)).toContain(sid);
       expect(await statusOf(client, sid)).toBe("active");
     });
+
+    it("CC-10: reaps a DEAD INTERRUPTED ghost on read — 0 received + not alive + past TTL (the invisible post-restart shape that silently ate the abuse budget)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f6".repeat(16);
+      // 1h old, status 'interrupted' (daemon restart flipped it), 0 messages, 0 received, no node.
+      // classifySession(interrupted, 0) → "failed" — it appears in NO list, yet pre-CC-10 it
+      // counted toward the per-sender abuse bound forever. The read must reap it to terminal.
+      seedSession("alice", sid, { status: "interrupted", createdAt: Date.now() - 60 * 60 * 1000, messageCount: 0 });
+
+      expect(await openSids(client)).not.toContain(sid);
+      expect(await statusOf(client, sid)).toBe("abandoned"); // reaped on the list read, not "interrupted"
+    });
+
+    it("CC-10 guard: does NOT reap an OLD interrupted session where the counterparty has spoken (a real resumable conversation)", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f7".repeat(16);
+      seedSession("alice", sid, { status: "interrupted", createdAt: Date.now() - 60 * 60 * 1000, messageCount: 6 });
+      seedReceivedMessage("alice", sid); // the dd7493 shape — a real interrupted conversation
+      expect(await openSids(client)).toContain(sid); // still resumable-visible
+      expect(await statusOf(client, sid)).toBe("interrupted"); // NOT abandoned
+    });
   });
 
   // ─── AC-009: ipc_connection_lost after daemon stops ───

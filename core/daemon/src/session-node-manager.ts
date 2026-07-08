@@ -3720,20 +3720,23 @@ export class SessionNodeManager {
   /** CC-5/F21: unilaterally mark a session locally-terminal ("abandoned") — retire its live node and
    *  set the DB status, with NO bilateral seal (a dead half-open handshake has nothing to notarize).
    *  Used by cello_close_session { force } and the dead-half-open reaper. Idempotent: a missing/already-
-   *  abandoned session is a no-op. */
-  async abandonSession(agentName: string, sessionId: string): Promise<void> {
+   *  abandoned session is a no-op. Resolves true iff the status flip was actually written (CC-10
+   *  reviewer LOW: callers must not report a reap as successful when the write failed). */
+  async abandonSession(agentName: string, sessionId: string): Promise<boolean> {
     // Status flip FIRST and synchronous (before the async node teardown yields), so a non-awaited
     // reaper call from a read path takes effect for the SAME read (the DB is updated before the await).
-    this.#updateSessionStatus(agentName, sessionId, "abandoned");
+    const flipped = this.#updateSessionStatus(agentName, sessionId, "abandoned");
     await this.retireSessionNode(agentName, sessionId);
+    return flipped;
   }
 
+  /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
   #updateSessionStatus(
     agentName: string,
     sessionId: string,
     status: "active" | "sealed" | "interrupted" | "abandoned",
-  ): void {
-    if (!this.#db) return;
+  ): boolean {
+    if (!this.#db) return false;
     const now = Date.now();
     try {
       this.#db
@@ -3741,6 +3744,7 @@ export class SessionNodeManager {
           "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?",
         )
         .run(status, now, agentName, sessionId);
+      return true;
     } catch (err: unknown) {
       // CC-5 (reviewer F-2): status-agnostic event + the actual target status in context — this method
       // now writes "abandoned" too, so labeling every failure "interrupt" was misleading.
@@ -3749,6 +3753,7 @@ export class SessionNodeManager {
         status,
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 }

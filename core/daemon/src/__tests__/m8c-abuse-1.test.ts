@@ -265,6 +265,116 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(snm.countActiveSessionsForCounterparty("bob", strangerPubkey)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
   });
 
+  it("CC-10 (live Phase-2 block regression): DEAD interrupted 0-received ghosts do NOT permanently consume the per-sender bound — the accept path reaps them first and admits the stranger's next knock", async () => {
+    // The live 2026-07-08 failure: a daemon restart flipped the stranger's dead half-open sessions
+    // to 'interrupted' (0 received, no live node). They classify as "failed" (invisible in every
+    // list), the CC-5 reaper only scanned 'active', and the bound counts 'interrupted' (D18) — so
+    // the stranger was silently locked out FOREVER. The accept path must reap dead ghosts before
+    // checking the bound.
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const strangerPubkey = "4d".repeat(32);
+    // Seed the cap's worth of GHOSTS: interrupted, created 1h ago, 0 messages, no received rows,
+    // no live node (liveness never marked) — the exact post-restart shape from the live block.
+    const old = Date.now() - 60 * 60 * 1000;
+    const ghostSids: string[] = [];
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
+      const sid = `d${i}`.padStart(2, "0").repeat(16);
+      ghostSids.push(sid);
+      snm.getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, 'bob', ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, strangerPubkey, old, old, old);
+    }
+    expect(snm.isContact("bob", strangerPubkey)).toBe(false);
+    expect(snm.countActiveSessionsForCounterparty("bob", strangerPubkey)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+
+    // The stranger's next REAL knock must be ACCEPTED — the ghosts are provably dead.
+    const newSid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 100 + b));
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: newSid,
+        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "stranger-peer-id",
+      },
+    });
+    await wait(150);
+
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeUndefined();
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeDefined();
+    // And the ghosts went properly terminal — slot released in the DB, not just skipped.
+    for (const sid of ghostSids) {
+      const row = snm.getDb().prepare("SELECT status FROM sessions WHERE session_id = ?").get(sid) as { status: string };
+      expect(row.status).toBe("abandoned");
+    }
+    // Observability: the reap event carries the ghost's prior status (CC-10 added priorStatus).
+    const reaped = events.filter((e) => e.event === "session.half_open.reaped");
+    expect(reaped.length).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    for (const e of reaped) expect(e.context["priorStatus"]).toBe("interrupted");
+  });
+
+  it("CC-10/D18 guard: old interrupted sessions WITH received content still count — the accept-path reap must NOT free the D18 evasion attacker's slots", async () => {
+    // D18's attack: send content, disconnect (→ interrupted), open a fresh session, repeat.
+    // Those sessions have RECEIVED bytes on the victim's side, so the reap must skip them and
+    // the bound must still refuse. Only 0-received ghosts (zero delivered abuse) are reapable.
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const attackerPubkey = "5e".repeat(32);
+    const old = Date.now() - 60 * 60 * 1000;
+    const sids: string[] = [];
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
+      const sid = `e${i}`.padStart(2, "0").repeat(16);
+      sids.push(sid);
+      snm.getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, 'bob', ?, 'interrupted', ?, ?, 2, ?)`,
+      ).run(sid, attackerPubkey, old, old, old);
+      snm.getDb().prepare(
+        `INSERT INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
+         VALUES ('bob', ?, 0, 'received', ?, ?)`,
+      ).run(sid, Buffer.from("attacker content"), old);
+    }
+    expect(snm.isContact("bob", attackerPubkey)).toBe(false);
+
+    const newSid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 150 + b));
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: newSid,
+        participant_a: { pubkey: Buffer.from(attackerPubkey, "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "attacker-peer-id",
+      },
+    });
+    await wait(150);
+
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+    // The attacker's sessions were NOT reaped — they still count.
+    for (const sid of sids) {
+      const row = snm.getDb().prepare("SELECT status FROM sessions WHERE session_id = ?").get(sid) as { status: string };
+      expect(row.status).toBe("interrupted");
+    }
+  });
+
   it("B4/B5: checkUnknownSenderAcceptanceBound — global anti-swarm cap trips once unknown-sender sessions reach it; a known contact is exempt regardless of count", async () => {
     await makeAgentDir("alice");
     const h = await start(makeLogger().logger, new FakeNode());
