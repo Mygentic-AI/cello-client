@@ -24,6 +24,7 @@ import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { FrostThresholdSigner } from "@cello-protocol/crypto";
+import type { KeyProvider } from "@cello-protocol/crypto";
 import { storeDkgResult } from "@cello-protocol/crypto/frost/frost-threshold-signer.js";
 import type { IThresholdSigner } from "@cello-protocol/crypto";
 import type { FrostContext } from "@cello-protocol/crypto/frost/types.js";
@@ -93,6 +94,11 @@ export interface CeremonyWiringDeps {
    */
   persistence: DaemonRegistrationPersistence;
   agentPubkeyHex: string;
+  /**
+   * SEC-2: the agent's K_local signer — authenticates every FROST commit/sign request the ceremony
+   * sends to the directory (the directory verifies it against agentPubkeyHex before touching its share).
+   */
+  keyProvider: KeyProvider;
   /** The agent's directory-connected libp2p node (the per-agent signaling node). */
   getNode: () => CelloNode | null;
   /** Resolve the directory endpoint to open FROST streams on (single-node / primary). */
@@ -192,7 +198,7 @@ async function hydrateShareAndStubs(
       directoryMultiaddrs: [multiaddr],
       logger: deps.logger,
     });
-    stub.setBootstrapContext(deps.agentPubkeyHex, epochId);
+    stub.setBootstrapContext(deps.agentPubkeyHex, epochId, (h) => deps.keyProvider.sign(h)); // SEC-2
     return stub;
   };
   if (node && roster !== null && roster.length > 0) {
@@ -255,6 +261,7 @@ export async function runAgentRefresh(
       participants: h.share.participants,
       directoryNodes: h.stubs,
       fromEpochN,
+      signAuth: (hash) => deps.keyProvider.sign(hash), // SEC-2
     });
   } catch (err: unknown) {
     deps.logger.error("refresh.ceremony.failed", {

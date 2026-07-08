@@ -10,6 +10,7 @@
  *   frost_sign_request:   ask directory to compute a partial signature
  */
 
+import { createHash } from "node:crypto";
 import { Encoder, decode as cborDecode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { ed25519_FROST, FrostThresholdSigner } from "@cello-protocol/crypto";
@@ -50,6 +51,16 @@ import type {
 const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
+// SEC-2: prove K_local possession on every /cello/frost/1.0.0 commit/sign request. The directory
+// verifies an Ed25519 signature, made with K_local priv, over SHA-256(FROST_AUTH_DOMAIN ||
+// agentPubkeyBytes || utf8(epochId) || tail): tail = utf8("commit") for a commit, the framedMsg for a
+// sign (binding the auth to the exact message signed). Without this the signing stream is a blind oracle
+// (see the directory's verifyFrostAuth). The signer is the agent's own K_local, threaded via
+// setBootstrapContext by every ceremony path (session/seal, DKG, refresh).
+export type FrostAuthSigner = (hash: Uint8Array) => Promise<Uint8Array>;
+const FROST_AUTH_DOMAIN = "CELLO-FROST-AUTH-v1";
+const FROST_AUTH_COMMIT_TAIL = new Uint8Array(Buffer.from("commit", "utf8"));
+
 // ─── NetworkDirectoryNode ─────────────────────────────────────────────────────
 
 export class NetworkDirectoryNode implements DirectoryNodeStub {
@@ -63,6 +74,8 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   // Set during bootstrapKeyShares — used to identify which agent's share to retrieve
   #agentPubkeyHex: string | null = null;
   #epochId: string | null = null;
+  // SEC-2: signs the K_local auth on commit/sign requests (set via setBootstrapContext).
+  #signAuth: FrostAuthSigner | null = null;
 
   // Stored during receiveShare — used by tests to get the FrostPublic for signRound calls
   #lastPub: Parameters<DirectoryNodeStub["receiveShare"]>[1] | null = null;
@@ -151,6 +164,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       agentPubkey: this.#agentPubkeyHex,
       epochId: this.#epochId,
       peerIdString: this.#node.getPeerId(),
+      authSig: await this.#buildAuthSig(FROST_AUTH_COMMIT_TAIL), // SEC-2
     });
 
     this.#logger.debug("frost.directory.stream.opening", { directoryPeerId: this.#directoryPeerId?.slice(0, 16), multiaddr: this.#directoryMultiaddrs[0] });
@@ -203,6 +217,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       commitmentList: params.commitmentList,
       ceremonyId: params.ceremonyId,
       peerIdString: params.ceremonyId,
+      authSig: await this.#buildAuthSig(params.msg), // SEC-2: bound to THIS framedMsg
     });
 
     this.#logger.debug("frost.directory.sign.stream.opening", {});
@@ -237,10 +252,37 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
     return null;
   }
 
-  // Called by the network-aware bootstrapKeyShares before distributing shares
-  setBootstrapContext(agentPubkeyHex: string, epochId: string): void {
+  // Called by the network-aware bootstrapKeyShares before distributing shares. SEC-2: `signAuth`
+  // is the agent's K_local signer, used to authenticate every subsequent commit/sign request; every
+  // ceremony path (session/seal, DKG, refresh) passes it so the enforcing directory accepts the request.
+  setBootstrapContext(agentPubkeyHex: string, epochId: string, signAuth?: FrostAuthSigner): void {
     this.#agentPubkeyHex = agentPubkeyHex;
     this.#epochId = epochId;
+    if (signAuth) this.#signAuth = signAuth;
+  }
+
+  // SEC-2: hash bound by the directory's verifyFrostAuth. tail = utf8("commit") | framedMsg.
+  #frostAuthHash(tail: Uint8Array): Uint8Array {
+    return new Uint8Array(
+      createHash("sha256")
+        .update(Buffer.concat([
+          Buffer.from(FROST_AUTH_DOMAIN, "utf8"),
+          Buffer.from(this.#agentPubkeyHex!, "hex"),
+          Buffer.from(this.#epochId!, "utf8"),
+          Buffer.from(tail),
+        ]))
+        .digest(),
+    );
+  }
+
+  // SEC-2: the K_local auth signature to attach, or undefined if no signer was threaded (which the
+  // enforcing directory then refuses AUTH_REQUIRED — surfacing an un-threaded path loudly, not silently).
+  async #buildAuthSig(tail: Uint8Array): Promise<Uint8Array | undefined> {
+    if (!this.#signAuth) {
+      this.#logger.warn("frost.directory.auth.no_signer", { agent: this.#agentPubkeyHex?.slice(0, 16), epochId: this.#epochId });
+      return undefined;
+    }
+    return this.#signAuth(this.#frostAuthHash(tail));
   }
 
   /** Open a /cello/frost/1.0.0 stream to this directory node. Used by DKG coordinator. */
@@ -582,6 +624,8 @@ export async function runNetworkDkg(
     directoryNodes: NetworkDirectoryNode[];
     /** OPS-AGENT-001: Pre-authorization token to present in Round 1 frame. */
     preAuthToken?: string;
+    /** SEC-2: K_local signer for the DKG-time commit/sign requests' auth. */
+    signAuth?: FrostAuthSigner;
   },
 ): Promise<{
   signer: FrostThresholdSigner;
@@ -724,9 +768,10 @@ export async function runNetworkDkg(
   try { ed25519_FROST.DKG.clean(clientR1.secret); } catch { /* ignore */ }
 
   // Set signing context on each directory node so generateCommitment/signRound can
-  // identify which agent's share to use in future FROST signing ceremonies.
+  // identify which agent's share to use in future FROST signing ceremonies. SEC-2: thread the
+  // K_local signer so the DKG-time and later signing requests carry a valid auth.
   for (const node of opts.directoryNodes) {
-    node.setBootstrapContext(agentPubkeyHex, epochId);
+    node.setBootstrapContext(agentPubkeyHex, epochId, opts.signAuth);
   }
 
   // ─── Build FrostThresholdSigner ───────────────────────────────────────────
@@ -844,6 +889,8 @@ export async function runNetworkRefresh(
     participants: number;
     directoryNodes: NetworkDirectoryNode[];
     fromEpochN: number;
+    /** SEC-2: K_local signer for any commit/sign auth during the refresh. */
+    signAuth?: FrostAuthSigner;
   },
 ): Promise<{
   toEpochN: number;
@@ -900,7 +947,7 @@ export async function runNetworkRefresh(
 
   // Advance every node's signing context to the new epoch.
   for (const node of opts.directoryNodes) {
-    node.setBootstrapContext(agentPubkeyHex, toEpochId);
+    node.setBootstrapContext(agentPubkeyHex, toEpochId, opts.signAuth); // SEC-2
   }
 
   return {

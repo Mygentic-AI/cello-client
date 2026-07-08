@@ -319,6 +319,7 @@ export class RegistrationManager {
         participants,
         directoryNodes,
         preAuthToken,
+        signAuth: (h) => this.#ctx.keyProvider.sign(h), // SEC-2
       });
       dkgPrimaryPubkeyHex = Buffer.from(dkgResult.primaryPubkey).toString("hex");
       this.#ctx.setThresholdSigner(dkgResult.signer);
