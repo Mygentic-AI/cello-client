@@ -20,6 +20,7 @@ export const KNOWN_COMMANDS = new Set([
   "sessions",
   "contact",
   "telegram",
+  "install",
 ] as const);
 
 export type KnownCommand = typeof KNOWN_COMMANDS extends Set<infer T> ? T : never;
@@ -32,7 +33,7 @@ export const USAGE =
   "First-time setup:  cello login  →  cello create-agent <name>  →  cello register <name> <token>  →  cello status\n" +
   "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
   "\n" +
-  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|telegram>\n" +
+  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|telegram|install>\n" +
   "Run 'cello <command> --help' for details on any command.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
@@ -64,6 +65,11 @@ const COMMAND_HELP: Record<string, string> = {
   telegram:
     "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>  — configure the daemon-owned Telegram doorbell (M8C-TGDOOR-1).\n" +
     "  Starts a single long-lived poller immediately; the operator chat given is the ONLY one that ever receives doorbell events.",
+  install:
+    "Usage: cello install hermes --agent <name> [--hermes-home <path>]  — wire the local CELLO daemon into a Hermes Agent installation.\n" +
+    "  Scaffolds the CELLO platform-adapter plugin into the Hermes home (default ~/.hermes), binds CELLO_AGENT_NAME in its .env,\n" +
+    "  and registers via 'hermes plugins enable cello' + 'hermes mcp add cello'. Idempotent — re-run to upgrade.\n" +
+    "  After installing, restart the gateway: hermes gateway restart",
 };
 
 export function helpForCommand(command: string): string {
@@ -74,6 +80,7 @@ export function helpForCommand(command: string): string {
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   sessions: new Set(["--open", "--closed", "--failed", "--all", "--limit"]),
   contact: new Set(["--agent"]),
+  install: new Set(["--agent", "--hermes-home"]),
 };
 
 export type ArgsCheck =

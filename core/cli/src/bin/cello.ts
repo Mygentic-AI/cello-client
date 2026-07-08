@@ -160,6 +160,23 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "install": {
+      // cello install hermes --agent <name> [--hermes-home <path>] (HERMES-001)
+      const args = process.argv.slice(3);
+      const target = args.find((a) => !a.startsWith("-"));
+      if (target !== "hermes") {
+        result = { exitCode: 1, output: helpForCommand("install") };
+        break;
+      }
+      const agentIdx = args.indexOf("--agent");
+      const homeIdx = args.indexOf("--hermes-home");
+      const { installHermes } = await import("../hermes/install-hermes.js");
+      result = await installHermes({
+        agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",
+        hermesHome: homeIdx !== -1 ? args[homeIdx + 1] : undefined,
+      });
+      break;
+    }
     default:
       // M8B F1: the usage string lists EVERY command (refresh/receipts were missing).
       process.stdout.write(USAGE + "\n");
