@@ -1071,10 +1071,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // preferable to an unbounded leak (the exact class of bug fixed for TTL-1's expired-log at
     // af8a701 in this same milestone).
     clearTelegramRung(agentName, sessionId);
-    // MONIKER-2 AC2b: the offered name is display material for the session's lifetime only.
-    // Terminal states are the natural drop point — same unbounded-leak reasoning as above.
-    if (state === "sealed" || state === "closed" || state === "failed" || state === "abandoned") {
-      offeredMonikers.delete(sessionId);
+    // MONIKER-2 AC2b (review F1): the offered name is display material for the session's
+    // lifetime only. Production emits "created", "interrupted", "counterparty_closing" through
+    // this wrapper — a terminal-only check was dead code and left the map growing for the
+    // daemon's lifetime (remote-fed). Drop on ANY state past "created": a prematurely dropped
+    // label degrades to fingerprint, which the spec sanctions; an unbounded map does not.
+    if (state !== "created" && offeredMonikers.delete(sessionId)) {
+      logger.debug("moniker.offer.dropped", { sessionId, state });
     }
   }
 
@@ -1272,9 +1275,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // session (spec §8: the label degrades, the session forms), but it is logged loudly.
     let moniker: string | undefined;
     try {
-      moniker = resolveOutboundMoniker(
-        new DbIdentityStore(sessionNodeManager.getDb(), logger).getOutboundName(agentName),
-      );
+      const outboundName = new DbIdentityStore(sessionNodeManager.getDb(), logger).getOutboundName(agentName);
+      moniker = resolveOutboundMoniker(outboundName);
+      // Review F4: omit-not-send is the designed degradation, but an agent whose STORED name
+      // fails the rule should be visible, not silently nameless on the wire.
+      if (outboundName !== null && moniker === undefined) {
+        logger.debug("moniker.outbound.invalid_name_omitted", { agentName, correlationId });
+      }
     } catch (err: unknown) {
       logger.warn("moniker.outbound.read_failed", {
         agentName,
@@ -4294,6 +4301,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
         }
         logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
+        // MONIKER-2 AC2b (review F1): the offer's display name expires with the offer.
+        if (offeredMonikers.delete(e.sessionIdHex)) {
+          logger.debug("moniker.offer.dropped", { sessionId: e.sessionIdHex, state: "expired" });
+        }
       } else {
         live.push(e);
       }
@@ -4382,6 +4393,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
         offeredMoniker: string | null;
         monikerRejected: boolean;
+        monikerRejectReason: "not_string" | "length" | "charset" | null;
       }
     | null {
     const raw = frame["assignment"];
@@ -4421,6 +4433,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       relayAddrs,
       offeredMoniker: monikerResult.offeredMoniker,
       monikerRejected: monikerResult.rejected,
+      monikerRejectReason: monikerResult.reason ?? null,
     };
   }
 
@@ -4551,7 +4564,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         logger.info("moniker.rejected", {
           agentName,
           pubkey: parsed.participantAPubkeyHex,
-          reason: "charset_violation",
+          reason: parsed.monikerRejectReason ?? "invalid",
           correlationId,
         });
       }

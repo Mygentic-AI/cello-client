@@ -207,6 +207,78 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     expect(h.events.find((e) => e.event === "moniker.rejected")).toBeUndefined();
   });
 
+  // Review F1: the offeredMonikers map must actually shrink on the states production EMITS
+  // ("interrupted", "counterparty_closing" — never "sealed"/"closed" through this wrapper), else
+  // every valid inbound offer is a permanent, remote-fed entry for the daemon's lifetime.
+  it("F1: the session-scoped offered name is DROPPED when the session leaves 'created' (production states)", async () => {
+    process.env["CELLO_ENV"] = "test"; // gates __test_emit_session_event
+    try {
+      const h = await startHarness();
+      const initiator = "d1".repeat(32);
+      const sidHex = Buffer.from(SID_BYTES).toString("hex");
+
+      h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Ephemeral_Bob" }));
+      await wait(120);
+
+      // A production-real state transition (session node destroyed → "interrupted").
+      await h.client.send("__test_emit_session_event", {
+        type: "destroyed",
+        state: "interrupted",
+        sessionId: sidHex,
+        agentName: "bob",
+        counterpartyPubkey: initiator,
+      });
+
+      const dropped = h.events.filter((e) => e.event === "moniker.offer.dropped");
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0].context["sessionId"]).toBe(sidHex);
+
+      // A second transition must NOT log a second drop — the entry is genuinely gone,
+      // not merely logged about on every state change.
+      await h.client.send("__test_emit_session_event", {
+        type: "destroyed",
+        state: "interrupted",
+        sessionId: sidHex,
+        agentName: "bob",
+        counterpartyPubkey: initiator,
+      });
+      expect(h.events.filter((e) => e.event === "moniker.offer.dropped")).toHaveLength(1);
+    } finally {
+      delete process.env["CELLO_ENV"];
+    }
+  });
+
+  it("F1: an EXPIRED unclaimed offer drops its offered name at reap time", async () => {
+    process.env["CELLO_ENV"] = "test"; // gates __test_enqueue_inbound_session
+    try {
+      const h = await startHarness();
+      const initiator = "d2".repeat(32);
+      const sidHex = Buffer.from(SID_BYTES).toString("hex");
+
+      // Real inbound path populates the map…
+      h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Stale_Bob" }));
+      await wait(120);
+
+      // …then a backdated duplicate queue entry for the SAME session id ages past the TTL,
+      // and the next queue read reaps it.
+      await h.client.send("__test_enqueue_inbound_session", {
+        agentName: "bob",
+        sessionId: sidHex,
+        counterpartyPubkey: initiator,
+        enqueuedAtOverride: 1, // epoch — decades past any TTL
+      });
+      // cello_await_session reaps expired entries for the NAMED agent before reading the queue
+      // (scope:"current" notifications would need a current agent this harness never selects).
+      await h.client.send("cello_await_session", { name: "bob", timeout_ms: 1_000 });
+
+      const dropped = h.events.filter((e) => e.event === "moniker.offer.dropped");
+      expect(dropped.length).toBeGreaterThanOrEqual(1);
+      expect(dropped[0].context["sessionId"]).toBe(sidHex);
+    } finally {
+      delete process.env["CELLO_ENV"];
+    }
+  });
+
   it("AC3: the offered name is NEVER auto-written to the contacts address book", async () => {
     const h = await startHarness();
     const initiator = "d0".repeat(32);

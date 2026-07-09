@@ -27,14 +27,16 @@ describe("MONIKER-2 AC2 — extractOfferedMoniker (the wire boundary)", () => {
     expect(extractOfferedMoniker({ moniker: undefined })).toEqual({ offeredMoniker: null, rejected: false });
   });
 
-  it("present-but-invalid → null AND rejected (modified sender, red flag)", () => {
-    expect(extractOfferedMoniker({ moniker: "not a name" })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: 'Bob"(unverified)' })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: "<channel>" })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: "A".repeat(65) })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: "" })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: 42 })).toEqual({ offeredMoniker: null, rejected: true });
-    expect(extractOfferedMoniker({ moniker: ["Bob"] })).toEqual({ offeredMoniker: null, rejected: true });
+  it("present-but-invalid → null AND rejected, with a diagnostic reason (review F2)", () => {
+    // Reason granularity: charset vs length vs not-a-string — so moniker.rejected tells the
+    // operator WHAT was wrong without ever logging the raw value.
+    expect(extractOfferedMoniker({ moniker: "not a name" })).toEqual({ offeredMoniker: null, rejected: true, reason: "charset" });
+    expect(extractOfferedMoniker({ moniker: 'Bob"(unverified)' })).toEqual({ offeredMoniker: null, rejected: true, reason: "charset" });
+    expect(extractOfferedMoniker({ moniker: "<channel>" })).toEqual({ offeredMoniker: null, rejected: true, reason: "charset" });
+    expect(extractOfferedMoniker({ moniker: "A".repeat(65) })).toEqual({ offeredMoniker: null, rejected: true, reason: "length" });
+    expect(extractOfferedMoniker({ moniker: "" })).toEqual({ offeredMoniker: null, rejected: true, reason: "length" });
+    expect(extractOfferedMoniker({ moniker: 42 })).toEqual({ offeredMoniker: null, rejected: true, reason: "not_string" });
+    expect(extractOfferedMoniker({ moniker: ["Bob"] })).toEqual({ offeredMoniker: null, rejected: true, reason: "not_string" });
   });
 
   it("strip-oracle: an invalid name is rejected, never repaired", () => {

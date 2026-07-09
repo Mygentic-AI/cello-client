@@ -192,12 +192,23 @@ import { validateMoniker } from "@cello-protocol/protocol-types";
 export function extractOfferedMoniker(raw: Record<string, unknown>): {
   offeredMoniker: string | null;
   rejected: boolean;
+  /** Set ONLY when rejected — WHAT was wrong, for moniker.rejected (never the raw value). */
+  reason?: "not_string" | "length" | "charset";
 } {
   if (!("moniker" in raw) || raw["moniker"] === undefined) {
     return { offeredMoniker: null, rejected: false };
   }
-  const valid = validateMoniker(raw["moniker"]);
-  return valid !== null ? { offeredMoniker: valid, rejected: false } : { offeredMoniker: null, rejected: true };
+  const value = raw["moniker"];
+  if (typeof value !== "string") {
+    return { offeredMoniker: null, rejected: true, reason: "not_string" };
+  }
+  if (value.length < 1 || value.length > 64) {
+    return { offeredMoniker: null, rejected: true, reason: "length" };
+  }
+  const valid = validateMoniker(value);
+  return valid !== null
+    ? { offeredMoniker: valid, rejected: false }
+    : { offeredMoniker: null, rejected: true, reason: "charset" };
 }
 
 /**
