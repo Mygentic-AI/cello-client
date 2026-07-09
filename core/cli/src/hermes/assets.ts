@@ -147,7 +147,10 @@ def _has_content_field(value: Any) -> bool:
 def _safe_scalar(value: Any, default: str = "unknown") -> str:
     if not isinstance(value, str) or not value:
         return default
-    if not _SAFE_SCALAR_RE.match(value):
+    # fullmatch, never match: in Python a trailing '$' ALSO matches just before a final newline,
+    # so re.match(r"^...$", "abc\n") succeeds where the daemon's JS equivalent rejects. A
+    # re-validation layer that is laxer than the rule it mirrors is not a layer.
+    if not _SAFE_SCALAR_RE.fullmatch(value):
         return default
     return value
 
@@ -165,8 +168,10 @@ def _render_who(data: Any) -> Optional[str]:
     Re-validated here rather than trusted: Hermes has no metadata layer, so this prose IS the frame
     (spec §11) and a name-shaped token is the only thing that may ever enter it.
     """
+    # fullmatch, never match - see _safe_scalar. re.match would admit "CELLO_Support\n", putting a
+    # newline into prose that IS the frame. Rejected whole; never stripped (§3: no mutation oracle).
     who = data.get("who") if isinstance(data, dict) else None
-    if not isinstance(who, str) or not _MONIKER_RE.match(who):
+    if not isinstance(who, str) or not _MONIKER_RE.fullmatch(who):
         return None
     if data.get("whoKnown") is True:
         return who

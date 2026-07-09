@@ -310,11 +310,21 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
         const h = await startHarness();
         const sidHex = Buffer.from(SID_BYTES).toString("hex");
         const alice = await connectAs(h.socketPath, "alice");
+        const bob = await connectAs(h.socketPath, "bob");
 
         // Alice opens a session to Bob. The daemon receives the assignment on BOB's behalf and
         // records Alice's offered name — display material for BOB, and for nobody else.
         h.inject(assignmentFrame({ initiatorPubkeyHex: h.alicePubkey, counterpartyPubkeyHex: h.bobPubkey, moniker: "Ms_Chelly" }));
         await wait(150);
+
+        // Bob's inbound doorbell DOES name her. Asserted here so this test also pins read-key ==
+        // write-key: a partial fix that scoped only the write would leave alice clean (her
+        // unscoped read simply misses) but would break this positive resolution.
+        const bobCreated = bob.notifications.find(
+          (n) => n.notification === "session_state_changed" && n.data["agentName"] === "bob",
+        );
+        expect(bobCreated).toBeDefined();
+        expect(bobCreated!.data["who"]).toBe("Ms_Chelly");
 
         // Bob's session node comes up and Alice's own doorbell fires for the same session id.
         await h.client.send("__test_emit_session_event", {
