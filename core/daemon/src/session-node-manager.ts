@@ -868,7 +868,10 @@ export class SessionNodeManager {
    *  THROWS on an invalid moniker — callers validate first; this is the can-never-be-stored
    *  backstop (same contract as DbIdentityStore.setMoniker). */
   addContact(agentName: string, pubkey: string, moniker?: string | null): void {
-    if (!this.#db || !pubkey) return;
+    if (!pubkey) return;
+    // Review F1: a missing DB handle must FAIL the write loudly — returning silently here let
+    // the handler log contact.added and report ok:true for a row that never landed.
+    if (!this.#db) throw new Error(`addContact('${agentName}'): database not initialized`);
     if (moniker !== undefined && moniker !== null && validateMoniker(moniker) === null) {
       throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
     }
@@ -886,7 +889,9 @@ export class SessionNodeManager {
    *  when no such contact — fail-loud at the caller, never a silent no-op success. Same
    *  validate-throw backstop as addContact. */
   setContactMoniker(agentName: string, pubkey: string, moniker: string | null): boolean {
-    if (!this.#db) return false;
+    // Review F2: false means exactly "no such contact" — a null DB handle throws instead, so the
+    // operator is never sent chasing a nonexistent missing-contact problem.
+    if (!this.#db) throw new Error(`setContactMoniker('${agentName}'): database not initialized`);
     if (moniker !== null && validateMoniker(moniker) === null) {
       throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
     }

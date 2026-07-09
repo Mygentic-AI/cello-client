@@ -5806,7 +5806,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (moniker !== undefined) {
       logger.info("contact.moniker.set", { agentName: resolved.agent, pubkey });
     }
-    return { ok: true, agent: resolved.agent, pubkey, moniker: moniker ?? null };
+    // Review F3: echo the moniker ONLY when one rode this request — a re-add without a moniker
+    // must not report null while an earlier pet name is still stored.
+    return moniker !== undefined
+      ? { ok: true, agent: resolved.agent, pubkey, moniker }
+      : { ok: true, agent: resolved.agent, pubkey };
   });
 
   // MONIKER-3 AC3: rename (string) or clear (null) an existing contact's pet name. Absence of the

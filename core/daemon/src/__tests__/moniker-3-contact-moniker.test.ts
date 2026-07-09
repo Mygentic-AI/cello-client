@@ -94,8 +94,9 @@ describe("MONIKER-3 AC2/AC3 — add, rename, clear, list", () => {
     const client = await connect(config.socketPath);
     await client.send("cello_create_agent", { name: "alice" });
 
-    const add = (await client.send("cello_contact_add", { agent: "alice", pubkey: PEER, moniker: "Bob" })) as { ok: boolean };
+    const add = (await client.send("cello_contact_add", { agent: "alice", pubkey: PEER, moniker: "Bob" })) as { ok: boolean; moniker?: string | null };
     expect(add.ok).toBe(true);
+    expect(add.moniker).toBe("Bob"); // review F3: the response echoes what was stored
 
     const list = (await client.send("cello_contact_list", { agent: "alice" })) as ListResult;
     const row = list.contacts.find((c) => c.pubkey === PEER)!;
@@ -119,7 +120,11 @@ describe("MONIKER-3 AC2/AC3 — add, rename, clear, list", () => {
     expect(renamed.added_at).toBe(before.added_at); // never-refresh rule intact
 
     // Re-add WITHOUT a moniker → stored pet name untouched (absence is not a clear).
-    await client.send("cello_contact_add", { agent: "alice", pubkey: PEER });
+    const readd = (await client.send("cello_contact_add", { agent: "alice", pubkey: PEER })) as { ok: boolean; moniker?: string | null };
+    expect(readd.ok).toBe(true);
+    // Review F3: the response must NOT claim the pet name is unset when it isn't — the field
+    // is omitted when no moniker rode the request (never a misreporting `null`).
+    expect("moniker" in readd).toBe(false);
     const kept = ((await client.send("cello_contact_list", { agent: "alice" })) as ListResult).contacts[0];
     expect(kept.moniker).toBe("Robert");
   });
@@ -168,5 +173,11 @@ describe("MONIKER-3 AC2/AC3 — add, rename, clear, list", () => {
     expect(badSet.ok).toBe(false);
     expect(badSet.reason).toBe("invalid_moniker");
     expect(((await client.send("cello_contact_list", { agent: "alice" })) as ListResult).contacts[0].moniker).toBe("Bob");
+
+    // Reviewer teeth-gap: a NON-STRING moniker over raw IPC (the shim's zod never sees this) —
+    // a coercing implementation (String(42) → "42") would wrongly accept it.
+    const numeric = (await client.send("cello_contact_add", { agent: "alice", pubkey: "cc".repeat(32), moniker: 42 })) as { ok: boolean; reason?: string };
+    expect(numeric.ok).toBe(false);
+    expect(numeric.reason).toBe("invalid_moniker");
   });
 });
