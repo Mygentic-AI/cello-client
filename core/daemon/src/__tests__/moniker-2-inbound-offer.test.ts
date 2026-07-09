@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import type { Logger, DaemonConfig } from "../types.js";
+import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -105,12 +105,18 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     inject: (frame: unknown) => void;
     client: IpcClient;
     bobPubkey: string;
+    // DOD-MONIKER-6: a SECOND local agent on the SAME daemon — the only configuration in which
+    // the session-id-keyed offer box can be misread (spec §10: "the bug requires initiator and
+    // receiver to share one daemon").
+    alicePubkey: string;
+    socketPath: string;
     snm: ReturnType<Awaited<ReturnType<typeof startDaemon>>["getSessionNodeManager"]>;
   }
 
   async function startHarness(): Promise<Harness> {
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
+    const alicePubkey = await makeAgentDir("alice");
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const config: DaemonConfig = {
@@ -127,10 +133,23 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     await wait(50);
     const snm = handle.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
+    await snm.ensureStandingReceiverForAgent("alice");
     const client = await connectToDaemon(config.socketPath);
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
-    return { events, inject: injectRef.inject!, client, bobPubkey, snm };
+    return { events, inject: injectRef.inject!, client, bobPubkey, alicePubkey, socketPath: config.socketPath, snm };
+  }
+
+  // session_state_changed is routed ONLY to connections whose current agent matches, so each
+  // agent's doorbell needs its own connection — exactly as two MCP servers on one machine.
+  async function connectAs(socketPath: string, agentName: string): Promise<{ client: IpcClient; notifications: IpcNotification[] }> {
+    const client = await connectToDaemon(socketPath);
+    clients.push(client);
+    const notifications: IpcNotification[] = [];
+    client.onNotification((n) => notifications.push(n));
+    await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_use_agent", { name: agentName });
+    return { client, notifications };
   }
 
   function assignmentFrame(opts: {
@@ -277,6 +296,90 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     } finally {
       delete process.env["CELLO_ENV"];
     }
+  });
+
+  // ─── DOD-MONIKER-6 (spec §10, "fix A") ────────────────────────────────────────
+  // The offer box is written by the RECEIVING side and keyed by session id alone, so on a daemon
+  // that hosts BOTH participants the initiator reads the box that was filled in for her
+  // counterparty — and is told she messaged herself. Two machines never hit this: an initiator's
+  // daemon never receives an offer for its own outbound session. Hence the whole tier tested green.
+  describe("DOD-MONIKER-6: the offered-name box is scoped to the agent it was written for", () => {
+    it("AC2: alice initiates to bob on ONE daemon — alice's doorbell never shows alice's own name", async () => {
+      process.env["CELLO_ENV"] = "test"; // gates __test_emit_session_event (registered at startup)
+      try {
+        const h = await startHarness();
+        const sidHex = Buffer.from(SID_BYTES).toString("hex");
+        const alice = await connectAs(h.socketPath, "alice");
+
+        // Alice opens a session to Bob. The daemon receives the assignment on BOB's behalf and
+        // records Alice's offered name — display material for BOB, and for nobody else.
+        h.inject(assignmentFrame({ initiatorPubkeyHex: h.alicePubkey, counterpartyPubkeyHex: h.bobPubkey, moniker: "Ms_Chelly" }));
+        await wait(150);
+
+        // Bob's session node comes up and Alice's own doorbell fires for the same session id.
+        await h.client.send("__test_emit_session_event", {
+          type: "created",
+          sessionId: sidHex,
+          agentName: "alice",
+          counterpartyPubkey: h.bobPubkey,
+        });
+        await wait(50);
+
+        const created = alice.notifications.find(
+          (n) => n.notification === "session_state_changed" && n.data["agentName"] === "alice",
+        );
+        expect(created).toBeDefined();
+        // The bug: "Ms_Chelly" — alice reading the box that was filled in for bob.
+        expect(created!.data["who"]).not.toBe("Ms_Chelly");
+        // Alice has no name for bob at all, so she must degrade to his fingerprint (spec §8 tiers).
+        expect(created!.data["who"]).toBe(`agent ${h.bobPubkey.slice(0, 8)}…`);
+        expect(created!.data["whoKnown"]).toBe(false);
+        // §11: the anchor rides along regardless.
+        expect(created!.data["counterpartyPubkey"]).toBe(h.bobPubkey);
+      } finally {
+        delete process.env["CELLO_ENV"];
+      }
+    });
+
+    it("AC3: a state change on alice's session must not drop bob's offered name", async () => {
+      process.env["CELLO_ENV"] = "test";
+      try {
+        const h = await startHarness();
+        const sidHex = Buffer.from(SID_BYTES).toString("hex");
+        const bob = await connectAs(h.socketPath, "bob");
+
+        h.inject(assignmentFrame({ initiatorPubkeyHex: h.alicePubkey, counterpartyPubkeyHex: h.bobPubkey, moniker: "Ms_Chelly" }));
+        await wait(150);
+
+        // Alice's half of the session is interrupted. Bob's box belongs to bob and must survive.
+        await h.client.send("__test_emit_session_event", {
+          type: "destroyed",
+          state: "interrupted",
+          sessionId: sidHex,
+          agentName: "alice",
+          counterpartyPubkey: h.bobPubkey,
+        });
+        await wait(50);
+
+        // Bob's own doorbell still names the caller.
+        await h.client.send("__test_emit_session_event", {
+          type: "created",
+          sessionId: sidHex,
+          agentName: "bob",
+          counterpartyPubkey: h.alicePubkey,
+        });
+        await wait(50);
+
+        const created = bob.notifications.filter(
+          (n) => n.notification === "session_state_changed" && n.data["agentName"] === "bob" && n.data["state"] === "created",
+        );
+        expect(created.length).toBeGreaterThanOrEqual(1);
+        expect(created[created.length - 1].data["who"]).toBe("Ms_Chelly");
+        expect(created[created.length - 1].data["whoKnown"]).toBe(false);
+      } finally {
+        delete process.env["CELLO_ENV"];
+      }
+    });
   });
 
   it("AC3: the offered name is NEVER auto-written to the contacts address book", async () => {

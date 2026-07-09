@@ -1067,7 +1067,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     } catch (err: unknown) {
       logger.warn("moniker.local.read_failed", { agentName, pubkey: pubkeyHex, reason: err instanceof Error ? err.message : String(err) });
     }
-    const resolved = whoLabel({ localMoniker, offeredMoniker: offeredMonikers.get(sessionIdHex) ?? null, pubkeyHex });
+    // DOD-MONIKER-6: read only the box written FOR this agent — never a co-resident agent's.
+    const resolved = whoLabel({ localMoniker, offeredMoniker: offeredMonikers.get(offerKey(agentName, sessionIdHex)) ?? null, pubkeyHex });
     logger.debug("moniker.resolved", { agentName, pubkey: pubkeyHex, source: resolved.source });
     return { who: resolved.who, whoKnown: resolved.whoKnown };
   }
@@ -1096,8 +1097,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // this wrapper — a terminal-only check was dead code and left the map growing for the
     // daemon's lifetime (remote-fed). Drop on ANY state past "created": a prematurely dropped
     // label degrades to fingerprint, which the spec sanctions; an unbounded map does not.
-    if (state !== "created" && offeredMonikers.delete(sessionId)) {
-      logger.debug("moniker.offer.dropped", { sessionId, state });
+    // DOD-MONIKER-6 AC3: drop only THIS agent's box — a co-resident agent's session moving on
+    // must never cost this agent the caller's name.
+    if (state !== "created" && offeredMonikers.delete(offerKey(agentName, sessionId))) {
+      logger.debug("moniker.offer.dropped", { agentName, sessionId, state });
     }
   }
 
@@ -4254,10 +4257,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // waiter — those are delivered instantly and never sit in the queue this TTL governs).
     enqueuedAt?: number;
   }
-  // MONIKER-2 AC2b: sessionIdHex → the initiator's validated offered name. Session-scoped
-  // display material ONLY (spec: promotion to a stored pet name needs an explicit operator
-  // action). In-memory by design — a restart degrades the label to fingerprint, never worse.
+  // MONIKER-2 AC2b: the initiator's validated offered name. Session-scoped display material ONLY
+  // (spec: promotion to a stored pet name needs an explicit operator action). In-memory by design —
+  // a restart degrades the label to fingerprint, never worse.
+  //
+  // DOD-MONIKER-6 (spec §10): keyed by (agentName, sessionIdHex), NEVER sessionIdHex alone. A box
+  // is written by the RECEIVING side and holds the CALLER's name, so it is meaningful only to the
+  // agent it was written for. Keyed by session id alone, a daemon hosting both participants hands
+  // the initiator the box filled in for her counterparty — she is told she messaged herself — and
+  // either agent's state change or request expiry silently drops the other's name.
   const offeredMonikers = new Map<string, string>();
+  const offerKey = (agentName: string, sessionIdHex: string): string => `${agentName}:${sessionIdHex}`;
   // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
   // cello_check_notifications so the operator can see what they missed, not just silence.
   const expiredSessionRequests = new Map<string, Array<{ sessionIdHex: string; counterpartyPubkeyHex: string; expiredAt: number }>>();
@@ -4324,8 +4334,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         }
         logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
         // MONIKER-2 AC2b (review F1): the offer's display name expires with the offer.
-        if (offeredMonikers.delete(e.sessionIdHex)) {
-          logger.debug("moniker.offer.dropped", { sessionId: e.sessionIdHex, state: "expired" });
+        if (offeredMonikers.delete(offerKey(agentName, e.sessionIdHex))) {
+          logger.debug("moniker.offer.dropped", { agentName, sessionId: e.sessionIdHex, state: "expired" });
         }
       } else {
         live.push(e);
@@ -4593,8 +4603,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // MONIKER-2 AC2b: display material for THIS offer/session only (never persisted, never
       // auto-written to contacts — AC3). Session-scoped: MONIKER-4's dispatcher resolves
       // whoLabel from here; entries are dropped when the session's terminal state dispatches.
+      // DOD-MONIKER-6: scoped to `agentName` — the agent this offer was received FOR.
       if (parsed.offeredMoniker !== null) {
-        offeredMonikers.set(parsed.sessionIdHex, parsed.offeredMoniker);
+        offeredMonikers.set(offerKey(agentName, parsed.sessionIdHex), parsed.offeredMoniker);
       }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,
