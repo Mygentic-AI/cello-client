@@ -1069,7 +1069,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     // DOD-MONIKER-6: read only the box written FOR this agent — never a co-resident agent's.
     const resolved = whoLabel({ localMoniker, offeredMoniker: offeredMonikers.get(offerKey(agentName, sessionIdHex)) ?? null, pubkeyHex });
-    logger.debug("moniker.resolved", { agentName, pubkey: pubkeyHex, source: resolved.source });
+    // `sessionId` is load-bearing for diagnosis, not decoration. `source:"offered"` is CORRECT for a
+    // RECEIVER and wrong only for an INITIATOR (an initiator must never find a box — see DOD-MONIKER-6),
+    // so a line cannot be judged without knowing who opened the session. Join on sessionId against
+    // `session.inbound.accepted`, which names the receiver; any other agent on that session is the
+    // initiator. Without this field the M8C live run produced a wrong verdict twice (journal Entry 76).
+    //
+    // The resolved LABEL is never logged: for an unverified offer it is an attacker-chosen string, and
+    // MONIKER-2 AC2 already forbids echoing the raw value (`moniker.rejected` logs the reason, not the
+    // name). `whoKnown` carries the trust bit without the payload.
+    logger.debug("moniker.resolved", {
+      agentName,
+      sessionId: sessionIdHex,
+      pubkey: pubkeyHex,
+      source: resolved.source,
+      whoKnown: resolved.whoKnown,
+    });
     return { who: resolved.who, whoKnown: resolved.whoKnown };
   }
 

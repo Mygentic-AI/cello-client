@@ -351,6 +351,44 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
       }
     });
 
+    // Entry 76: the live run produced a WRONG verdict because `moniker.resolved` carried no sessionId.
+    // `source:"offered"` is CORRECT for a receiver and wrong only for an INITIATOR, so a line cannot be
+    // classified without knowing who opened that session — and a grep for `agentName=X source=offered`
+    // flags correct lines as bugs. sessionId makes the event joinable against `session.inbound.accepted`
+    // (which names the RECEIVER for a session id); anything else on that session is the initiator.
+    it("moniker.resolved carries sessionId, so a line can be attributed to its session", async () => {
+      process.env["CELLO_ENV"] = "test";
+      try {
+        const h = await startHarness();
+        const sidHex = Buffer.from(SID_BYTES).toString("hex");
+        await connectAs(h.socketPath, "bob");
+
+        h.inject(assignmentFrame({ initiatorPubkeyHex: h.alicePubkey, counterpartyPubkeyHex: h.bobPubkey, moniker: "Ms_Chelly" }));
+        await wait(150);
+
+        const resolved = h.events.filter((e) => e.event === "moniker.resolved");
+        expect(resolved.length).toBeGreaterThanOrEqual(1);
+        const bobLine = resolved.find((e) => e.context["agentName"] === "bob");
+        expect(bobLine).toBeDefined();
+        // The four fields a diagnosis needs: who resolved, for which counterparty, on WHICH session, how.
+        expect(bobLine!.context["sessionId"]).toBe(sidHex);
+        expect(bobLine!.context["agentName"]).toBe("bob");
+        expect(bobLine!.context["pubkey"]).toBe(h.alicePubkey);
+        expect(bobLine!.context["source"]).toBe("offered");
+        expect(bobLine!.context["whoKnown"]).toBe(false);
+        // The label itself is display material and MUST NOT be logged — the offered name is
+        // attacker-chosen (MONIKER-2 AC2 logs `moniker.rejected` without the raw value; same rule).
+        expect(JSON.stringify(bobLine!.context)).not.toContain("Ms_Chelly");
+
+        // The join that classifies it: session.inbound.accepted names the RECEIVER for this session id.
+        const accepted = h.events.find((e) => e.event === "session.inbound.accepted" && e.context["sessionId"] === sidHex);
+        expect(accepted).toBeDefined();
+        expect(accepted!.context["agentName"]).toBe("bob"); // ⇒ bob is the receiver ⇒ source=offered is correct
+      } finally {
+        delete process.env["CELLO_ENV"];
+      }
+    });
+
     it("AC3: a state change on alice's session must not drop bob's offered name", async () => {
       process.env["CELLO_ENV"] = "test";
       try {
