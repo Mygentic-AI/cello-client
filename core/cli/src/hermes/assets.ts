@@ -424,34 +424,52 @@ class CelloAdapter(BasePlatformAdapter):
         # Unlike Raft's hardcoded generic hint, surface the (content-free) metadata the
         # daemon pushes - session id, counterparty pubkey, state - so the agent can act
         # without an extra discovery round-trip. Message CONTENT is never present here.
+        #
+        # OBSERVED 2026-07-09: a woken agent handed "reply [SILENT] if no action is needed"
+        # takes that exit every time. Six wakes, six [SILENT]s, ZERO tool calls - the Hermes
+        # transcript shows a "CELLO wake..." user turn followed immediately by an assistant
+        # turn of "[SILENT]", with nothing in between.
+        # A MESSAGE-ARRIVAL wake is never a no-action event: a peer is blocked waiting on a
+        # reply. So silence is offered ONLY on state-change wakes; the message path spells out
+        # the mandatory steps and forbids silence.
+        #
+        # cello_use_agent must come FIRST. The cello MCP server holds its own daemon connection,
+        # separate from this adapter's, and a freshly started one has no current agent. With more
+        # than one agent online the daemon's sole-online fallback cannot resolve, so every other
+        # cello_* call would fail with no_current_agent.
         session_id = _safe_scalar(data.get("session_id") or data.get("sessionId"))
+        agent = self._agent_name
         if kind == "cello_message":
             sender = _safe_scalar(data.get("from"))
-            headline = (
+            return (
                 "CELLO wake: a new message arrived on session "
                 + session_id
                 + " from counterparty pubkey "
                 + sender
-                + "."
-            )
-        else:
-            state = _safe_scalar(data.get("state"))
-            counterparty = _safe_scalar(data.get("counterpartyPubkey"))
-            headline = (
-                "CELLO wake: session "
+                + ". A peer is waiting on you. Message content is never pushed, so you must fetch"
+                " it. Do this now, in order: (1) call cello_use_agent with name='"
+                + agent
+                + "'; (2) call cello_receive with session_id='"
                 + session_id
-                + " changed state to '"
-                + state
-                + "' (counterparty pubkey "
-                + counterparty
-                + ")."
+                + "' to read the message; (3) reply with cello_send on that same session unless"
+                " the message genuinely needs no answer. cello_receive must precede cello_send or"
+                " the daemon rejects the send with session_not_current."
+                " Do NOT answer [SILENT] on a message wake - reading the message is not optional."
             )
-        return headline + (
-            " Message content is never pushed - act through the cello MCP tools: "
-            "call cello_check_notifications first, then cello_receive for this session "
-            "BEFORE any cello_send (the daemon rejects out-of-cursor sends with "
-            "session_not_current until you have read). "
-            "If no action is needed, reply with exactly [SILENT]."
+
+        state = _safe_scalar(data.get("state"))
+        counterparty = _safe_scalar(data.get("counterpartyPubkey"))
+        return (
+            "CELLO wake: session "
+            + session_id
+            + " changed state to '"
+            + state
+            + "' (counterparty pubkey "
+            + counterparty
+            + "). This is a state notice, not a message. If it needs no action, reply with exactly"
+            " [SILENT]. If you do need to act, call cello_use_agent with name='"
+            + agent
+            + "' first, then whichever cello_* tool you need."
         )
 
     # ------------------------------------------------------------------ outbound (no-op)
@@ -544,11 +562,16 @@ def register(ctx) -> None:
             "You are connected to CELLO, a peer-to-peer identity and trust layer for "
             "agent-to-agent communication. Operate it exclusively through the cello_* "
             "MCP tools (the 'cello' MCP server). Wake notices from this platform are "
-            "content-free by design - fetch actual messages with cello_check_notifications "
-            "and cello_receive. Always read before you send: call cello_receive on a "
-            "session before cello_send, or the daemon rejects the send with "
-            "session_not_current. If a wake needs no reply, respond with exactly [SILENT] "
-            "and make no cello_send call."
+            "content-free by design - fetch actual messages with cello_receive. "
+            "Before any other cello_* call, select your agent with cello_use_agent "
+            "(name='" + os.environ.get("CELLO_AGENT_NAME", "your-agent") + "'): the cello "
+            "MCP server holds its own daemon connection with no agent selected, so every "
+            "other call fails with no_current_agent until you do. Always read before you "
+            "send: cello_receive on a session before cello_send, or the daemon rejects the "
+            "send with session_not_current. A wake that says a MESSAGE ARRIVED is never a "
+            "no-action event - a peer is waiting; read it and reply. Reply [SILENT] only "
+            "for a state-change notice that genuinely needs nothing from you, never on a "
+            "message wake."
         ),
     )
 `;
