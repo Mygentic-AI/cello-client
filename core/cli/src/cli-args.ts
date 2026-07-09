@@ -108,6 +108,20 @@ export type ArgsCheck =
  *  - any other dash-prefixed token the command does not recognize → unknown_flag
  *    (never silently coerced into a positional).
  */
+/**
+ * Split a subcommand's argv into the `--agent <name>` flag and the remaining positionals.
+ * Extracted (MONIKER-1 review Finding 1) because the old inline filter used
+ * `i === agentIdx + 1` unguarded: with --agent ABSENT, agentIdx is -1 and the predicate
+ * silently dropped positional index 0 — `cello moniker set Bob` / `cello contact list`
+ * printed usage instead of dispatching. The flag's value is excluded ONLY when the flag exists.
+ */
+export function splitAgentFlag(args: string[]): { agent: string | undefined; positional: string[] } {
+  const agentIdx = args.indexOf("--agent");
+  const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
+  const positional = args.filter((a, i) => !(a === "--agent" || (agentIdx !== -1 && i === agentIdx + 1)));
+  return { agent, positional };
+}
+
 export function checkArgs(command: string, args: string[]): ArgsCheck {
   if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const known = COMMAND_FLAGS[command] ?? new Set<string>();

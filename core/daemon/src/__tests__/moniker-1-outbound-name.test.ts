@@ -223,6 +223,31 @@ describe("MONIKER-1 — cello_set_moniker handler", () => {
     }
   });
 
+  it("rejects a MISSING moniker param — absence is not a clear", async () => {
+    // Review Finding 3: `params?.moniker ?? null` treated an omitted key as an explicit clear,
+    // so a malformed request silently deleted a stored override and reported success. JSON
+    // preserves explicit null, so absence is distinguishable and must be rejected.
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_create_agent", { name: "alice" });
+    await client.send("cello_set_moniker", { agent: "alice", moniker: "Wonderland_Alice" });
+
+    const missing = (await client.send("cello_set_moniker", { agent: "alice" })) as {
+      ok: boolean; reason?: string;
+    };
+    expect(missing.ok).toBe(false);
+    expect(missing.reason).toBe("missing_params");
+
+    // The stored override survived the malformed request.
+    const db = openEncryptedDatabaseAtPath(join(tempDir, "sessions.db"));
+    try {
+      expect(new DbIdentityStore(db, makeLogger()).getMoniker("alice")).toBe("Wonderland_Alice");
+    } finally {
+      db.close();
+    }
+  });
+
   it("fails loud for an unknown agent", async () => {
     const config = makeConfig();
     handle = await startDaemon(config);

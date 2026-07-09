@@ -5745,7 +5745,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_set_moniker", async (params, connectionId) => {
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;
-    const raw = params?.moniker ?? null;
+    // Absence is NOT a clear (review Finding 3): JSON preserves explicit null, so a request
+    // that omits the key is malformed — rejecting it keeps a dropped field from silently
+    // deleting a stored override while reporting success.
+    if (!params || !("moniker" in params)) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'moniker' — a string to set the outbound name, or null to clear the override." };
+    }
+    const raw = params.moniker ?? null;
     const moniker = raw === null ? null : validateMoniker(raw);
     if (raw !== null && moniker === null) {
       return {

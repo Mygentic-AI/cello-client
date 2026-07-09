@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, monikerSet, telegramSetToken } from "../commands.js";
-import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand } from "../cli-args.js";
+import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand, splitAgentFlag } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -132,10 +132,7 @@ async function main(): Promise<void> {
     }
     case "contact": {
       // cello contact add <pubkey> [--agent <name>] | remove <pubkey> [--agent <name>] | list [--agent <name>]
-      const args = process.argv.slice(3);
-      const agentIdx = args.indexOf("--agent");
-      const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
-      const positional = args.filter((a, i) => !(a === "--agent" || i === agentIdx + 1));
+      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
       const [sub, pubkey] = positional;
       if (sub === "add" && pubkey) {
         result = await contactAdd(celloDir, pubkey, agent);
@@ -150,10 +147,7 @@ async function main(): Promise<void> {
     }
     case "moniker": {
       // cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>] (MONIKER-1)
-      const args = process.argv.slice(3);
-      const agentIdx = args.indexOf("--agent");
-      const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
-      const positional = args.filter((a, i) => !(a === "--agent" || i === agentIdx + 1));
+      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
       const [sub, name] = positional;
       if (sub === "set" && name) {
         result = await monikerSet(celloDir, name, agent);

@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
-import { USAGE, helpForCommand, checkArgs, KNOWN_COMMANDS } from "../cli-args.js";
+import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS } from "../cli-args.js";
 
 describe("F1: usage string lists every command", () => {
   it("mentions refresh and receipts (previously missing) alongside the rest", () => {
@@ -37,6 +37,28 @@ describe("F1: usage string lists every command", () => {
     expect(checkArgs("moniker", ["set", "Bob", "--agent", "alice"])).toEqual({ kind: "ok" });
     expect(checkArgs("moniker", ["set", "Bob", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
     expect(checkArgs("moniker", ["--help"])).toEqual({ kind: "help" });
+  });
+
+  // MONIKER-1 review Finding 1 (+ pre-existing Finding 2 in `contact`): with --agent ABSENT,
+  // the old inline filter dropped positional index 0 (`i === agentIdx + 1` with agentIdx = -1),
+  // so `cello moniker set Bob` and `cello contact list` printed usage instead of dispatching.
+  // The parse is extracted here so the dispatch-layer logic is testable.
+  describe("splitAgentFlag — the shared --agent + positionals parse", () => {
+    it("keeps ALL positionals when --agent is absent (the Finding-1 regression)", () => {
+      expect(splitAgentFlag(["set", "Bob"])).toEqual({ agent: undefined, positional: ["set", "Bob"] });
+      expect(splitAgentFlag(["clear"])).toEqual({ agent: undefined, positional: ["clear"] });
+      expect(splitAgentFlag(["list"])).toEqual({ agent: undefined, positional: ["list"] });
+    });
+
+    it("extracts --agent and its value wherever they sit", () => {
+      expect(splitAgentFlag(["set", "Bob", "--agent", "alice"])).toEqual({ agent: "alice", positional: ["set", "Bob"] });
+      expect(splitAgentFlag(["--agent", "alice", "set", "Bob"])).toEqual({ agent: "alice", positional: ["set", "Bob"] });
+      expect(splitAgentFlag(["set", "--agent", "alice", "Bob"])).toEqual({ agent: "alice", positional: ["set", "Bob"] });
+    });
+
+    it("a trailing --agent with no value yields agent undefined and drops nothing else", () => {
+      expect(splitAgentFlag(["set", "Bob", "--agent"])).toEqual({ agent: undefined, positional: ["set", "Bob"] });
+    });
   });
 
   // CC-7 (P2-5 / DOD-ONBOARD-HELP-1): the top-level usage must be real orientation, not a bare list.
