@@ -199,3 +199,6 @@ export {
   encodeSessionLivenessResponse,
   decodeSessionLivenessResponse,
 } from "./session-liveness.js";
+
+// MONIKER-0 — the single home of the agent-name / moniker charset rule (wire contract).
+export { MONIKER_RE, validateMoniker } from "./moniker.js";

@@ -8,6 +8,8 @@
  *     `cello register --help` tried to register an agent literally named "--help").
  */
 
+import { MONIKER_RE } from "@cello-protocol/protocol-types";
+
 export const KNOWN_COMMANDS = new Set([
   "login",
   "logout",
@@ -50,7 +52,8 @@ const COMMAND_HELP: Record<string, string> = {
     "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
   "create-agent":
     "Usage: cello create-agent <name>  — create a new LOCAL agent identity (does not touch the directory).\n" +
-    "  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ^[a-zA-Z0-9_-]{1,64}$).\n" +
+    // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
+    `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
     "  Next step: 'cello register <name> <pre-auth-token>' to register it with the directory.",
   "remove-agent": "Usage: cello remove-agent <name>  — retires a local agent (one-way) and frees its name.",
   refresh: "Usage: cello refresh <name>  — proactively refresh the agent's threshold shares (new epoch).",

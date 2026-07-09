@@ -9,6 +9,7 @@
  * spawning the binary; src/bin/cello.ts consumes it.
  */
 import { describe, it, expect } from "vitest";
+import { MONIKER_RE } from "@cello-protocol/protocol-types";
 import { USAGE, helpForCommand, checkArgs, KNOWN_COMMANDS } from "../cli-args.js";
 
 describe("F1: usage string lists every command", () => {
@@ -67,7 +68,9 @@ describe("F2: --help/-h on subcommands", () => {
   // M8C-ONBOARD-HELP-1 (F24/R1/R2/R5): real help, not a bare command list.
   it("create-agent help states the exact name rule", () => {
     const help = helpForCommand("create-agent");
-    expect(help).toContain("^[a-zA-Z0-9_-]{1,64}$");
+    // MONIKER-0 AC2: assert against the shared constant's own source text, not a
+    // hand-typed twin — the prose copy is DERIVED from the constant, not parallel to it.
+    expect(help).toContain(MONIKER_RE.source);
     expect(help).toContain("no spaces");
   });
 

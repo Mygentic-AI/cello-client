@@ -29,7 +29,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/daemon": "workspace:*"
+    "@cello-protocol/daemon": "workspace:*",
+    "@cello-protocol/protocol-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^25.6.2"

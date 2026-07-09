@@ -73,6 +73,9 @@ importers:
       '@cello-protocol/daemon':
         specifier: workspace:*
         version: link:../daemon
+      '@cello-protocol/protocol-types':
+        specifier: workspace:*
+        version: link:../protocol-types
     devDependencies:
       '@types/node':
         specifier: ^25.6.2

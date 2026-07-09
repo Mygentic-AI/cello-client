@@ -65,7 +65,7 @@ import { upgradeAbsentToRecovered, hasAbsentParticipant } from "./seal-receipt-u
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs } from "@cello-protocol/protocol-types";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, validateMoniker } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -1937,8 +1937,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the encrypted DB (NO key file), and wire the agent into the live daemon so it can be registered
   // and used WITHOUT a restart. Creation is explicit — cello_start_agent never auto-creates on a typo.
   handlers.set("cello_create_agent", async (params, _connectionId) => {
-    const name = params?.name as string | undefined;
-    if (!name || typeof name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+    const name = validateMoniker(params?.name);
+    if (name === null) {
       return { ok: false, reason: "invalid_agent_name", guidance: "Provide a 'name' (1-64 chars: letters, digits, '-' or '_') for the new agent." };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
@@ -2044,8 +2044,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   }
 
   handlers.set("cello_remove_agent", async (params, _connectionId) => {
-    const name = params?.name as string | undefined;
-    if (!name || typeof name !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(name)) {
+    const name = validateMoniker(params?.name);
+    if (name === null) {
       return { ok: false, reason: "invalid_agent_name", guidance: "Provide the 'name' of the agent to remove (1-64 chars: letters, digits, '-' or '_')." };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
