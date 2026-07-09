@@ -130,10 +130,11 @@ describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and witho
     expect(h.snm.isContact("bob", nameless)).toBe(false);
     expect(h.snm.isContact("bob", named)).toBe(false);
 
-    // ABUSE-1: the acceptance bound treats both identically (a named stranger is still a stranger).
-    const boundNameless = h.snm.checkUnknownSenderAcceptanceBound("bob", nameless);
-    const boundNamed = h.snm.checkUnknownSenderAcceptanceBound("bob", named);
-    expect(boundNamed).toEqual(boundNameless);
+    // ABUSE-1: the named stranger is still COUNTED as unknown. This is the assertion with teeth —
+    // comparing the two bound results is vacuous (both sit under the caps, and the bound function
+    // takes no moniker), but the count would drop to 1 if an offered name ever made a sender
+    // contact-like and exempted its session from the unknown-sender accounting.
+    expect(h.snm.countActiveSessionsFromUnknownSenders("bob")).toBe(2);
   });
 
   it("AC1: cello_list_sessions and cello_contact_list surface the resolved who", async () => {
