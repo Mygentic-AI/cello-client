@@ -911,7 +911,12 @@ export class SessionNodeManager {
   /** MONIKER-4: the operator's pet name for a pubkey (whoLabel's top tier), or null. Read-only
    *  and tolerant of a not-yet-open DB (a missing label degrades the doorbell, never blocks it). */
   getContactMoniker(agentName: string, pubkey: string): string | null {
-    if (!this.#db) return null;
+    if (!this.#db) {
+      // Review F2: the last fully-silent branch in the resolution chain — the label degrades to
+      // fingerprint, which is correct, but say so rather than returning null wordlessly.
+      this.#logger.debug("moniker.local.db_unavailable", { agentName, pubkey });
+      return null;
+    }
     const row = this.#db
       .prepare("SELECT moniker FROM contacts WHERE agent_name = ? AND pubkey = ?")
       .get(agentName, pubkey) as { moniker: string | null } | undefined;

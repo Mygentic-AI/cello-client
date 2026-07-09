@@ -57,7 +57,9 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       return `📞 CELLO — ${renderWho(data)} wants to connect. Run cello_await_session to accept.`;
     case "session_state_changed": {
       const who = renderWho(data);
-      const yourAgent = short(data["agentName"] ?? data["agent"] ?? "your agent");
+      // Review F1: agent names share MONIKER_RE (≤64 chars) — AC3's "never truncates a name"
+      // applies to YOUR agent name too; only fingerprints shorten.
+      const yourAgent = String(data["agentName"] ?? data["agent"] ?? "your agent");
       switch (String(data["state"] ?? "changed")) {
         case "created":
           return `📞 CELLO — ${who} wants to connect with ${yourAgent}. Run cello_await_session to accept.`;

@@ -77,7 +77,8 @@ describe("MONIKER-4: doorbell copy leads with who; IDs leave the body; unverifie
     expect(content).toContain("wants to connect");
     expect(content).toContain("bob"); // {yourAgent}
     expect(content).toContain("cello_await_session");
-    expect(content).not.toContain("ee".repeat(8)); // no session id fragment in the body
+    // 8 e's — matches ANY truncation of the session id (the old copy emitted 12 via short()).
+    expect(content).not.toContain("ee".repeat(4)); // no session id fragment in the body
     expect(meta.sessionId).toBe("ee".repeat(16));  // …but meta still carries it in full
     expect(meta.who).toBe("MyAlice");
     expect(meta.whoKnown).toBe("true");
@@ -107,13 +108,18 @@ describe("MONIKER-4: doorbell copy leads with who; IDs leave the body; unverifie
     const { content } = buildChannelParams({ type: "cello_message", from: "cd".repeat(32), session_id: "ee".repeat(16), who: "MyAlice", whoKnown: true });
     expect(content).toContain("MyAlice sent a message");
     expect(content).toContain("cello_receive");
-    expect(content).not.toContain("ee".repeat(8));
+    expect(content).not.toContain("ee".repeat(4));
   });
 
   it("a 64-char name is never truncated in the body (only fingerprints shorten)", () => {
     const long = "A".repeat(64);
     const { content } = buildChannelParams({ ...base, type: "session_state_changed", state: "created", who: long, whoKnown: true });
     expect(content).toContain(long);
+  });
+
+  it("review F1: YOUR agent name is not truncated either — agent names share the 64-char rule", () => {
+    const { content } = buildChannelParams({ ...base, agentName: "research_assistant", type: "session_state_changed", state: "created", who: "MyAlice", whoKnown: true });
+    expect(content).toContain("research_assistant");
   });
 
   it("old-daemon frame (no who) degrades to a shim-side fingerprint — never blank, never the old ID-first copy", () => {
