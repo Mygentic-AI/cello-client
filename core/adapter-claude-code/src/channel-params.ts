@@ -34,8 +34,12 @@ function shimFingerprint(pubkey: unknown): string {
  *  - whoKnown true → plain (the operator's own pet name — deliberate trust, CC-1).
  *  - whoKnown false + fingerprint → plain (derived identity, not a claim). The discriminator is
  *    UNFORGEABLE: MONIKER_RE excludes spaces, and every fingerprint contains one.
- *  - whoKnown false + name → `"Bob" (unverified)` — rendered as a claim; the marker itself cannot
- *    be forged because the charset excludes quotes and parentheses.
+ *  - whoKnown false + name → `"Bob" (self-declared)` — rendered as a claim; the marker itself
+ *    cannot be forged because the charset excludes quotes and parentheses.
+ *
+ * The marker says the name came from its owner rather than from the operator. `whoKnown` is true
+ * only when the operator has set a local pet name, so it appears for every contact they have not
+ * named — not only new ones. Nothing in the protocol ever verifies a name.
  *  - No `who` at all (old daemon) → shim-side fingerprint of the counterparty key. Never blank.
  * Names are NEVER truncated (only fingerprints shorten, by construction).
  */
@@ -43,7 +47,7 @@ function renderWho(data: Record<string, unknown>): string {
   const who = typeof data["who"] === "string" && data["who"].length > 0 ? data["who"] : null;
   if (who === null) return shimFingerprint(data["counterpartyPubkey"] ?? data["from"]);
   if (data["whoKnown"] === true) return who;
-  return who.includes(" ") ? who : `"${who}" (unverified)`;
+  return who.includes(" ") ? who : `"${who}" (self-declared)`;
 }
 
 /** Human-readable, content-free doorbell announcement for the `<channel>` tag body.

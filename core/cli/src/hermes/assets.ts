@@ -159,11 +159,15 @@ def _render_who(data: Any) -> Optional[str]:
     """DOD-HERMES-3: the daemon-resolved counterparty label, or None.
 
     The daemon stamps who/whoKnown on both counterparty-bearing frames (MONIKER-4 AC2) with three
-    tiers: the operator's own pet name, the caller's unverified offered name, or a fingerprint.
+    tiers: the operator's own pet name, the caller's self-declared offered name, or a fingerprint.
     Only a NAME is rendered - the fingerprint tier ('agent 77d0c806...') is derived from the very
-    pubkey every wake already carries in full, so echoing it is noise. An unverified name is marked
-    as a claim exactly as the Claude Code shim marks it, and the marker cannot be forged because
-    MONIKER_RE excludes quotes and parentheses.
+    pubkey every wake already carries in full, so echoing it is noise. A self-declared name is
+    marked as a claim exactly as the Claude Code shim marks it, and the marker cannot be forged
+    because MONIKER_RE excludes quotes and parentheses.
+
+    The marker says the name came from its owner rather than from the operator. whoKnown is true
+    only when the operator set a local pet name, so it appears for every contact they have not
+    named - not only new ones. Nothing in the protocol ever verifies a name.
 
     Re-validated here rather than trusted: Hermes has no metadata layer, so this prose IS the frame
     (spec §11) and a name-shaped token is the only thing that may ever enter it.
@@ -175,7 +179,7 @@ def _render_who(data: Any) -> Optional[str]:
         return None
     if data.get("whoKnown") is True:
         return who
-    return '"' + who + '" (unverified)'
+    return '"' + who + '" (self-declared)'
 
 
 class CelloAdapter(BasePlatformAdapter):

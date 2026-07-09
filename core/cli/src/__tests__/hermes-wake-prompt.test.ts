@@ -82,12 +82,12 @@ describe("DOD-HERMES-3 — the Hermes wake prompt names the counterparty", () =>
     expect(out).toContain("Ms_Chelly");
     expect(out.indexOf("Ms_Chelly")).toBeLessThan(out.indexOf(PUB)); // §11: name leads, anchor follows
     expect(out).toContain(PUB); // §11: Hermes has no metadata layer — the prose IS the frame
-    expect(out).not.toContain("(unverified)"); // the operator's own name is deliberate trust
+    expect(out).not.toContain("(self-declared)"); // the operator's own name is deliberate trust
   });
 
-  it("AC3: an unverified offered name is rendered as a claim, as in the Claude Code copy", () => {
+  it("AC3: a self-declared offered name is rendered as a claim, as in the Claude Code copy", () => {
     const out = wake("cello_message", { session_id: SID, from: PUB, who: "Ms_Chelly", whoKnown: false });
-    expect(out).toContain('"Ms_Chelly" (unverified)');
+    expect(out).toContain('"Ms_Chelly" (self-declared)');
     expect(out).toContain(PUB);
   });
 
@@ -107,14 +107,14 @@ describe("DOD-HERMES-3 — the Hermes wake prompt names the counterparty", () =>
     expect(out).toContain(PUB);
     expect(out).not.toContain("…");
     expect(out).not.toContain("unknown");
-    expect(out).not.toContain("(unverified)");
+    expect(out).not.toContain("(self-declared)");
   });
 
   it("an old daemon (no who) still produces the pubkey-only sentence — never a blank or 'unknown' name", () => {
     const out = wake("cello_message", { session_id: SID, from: PUB });
     expect(out).toContain(PUB);
     expect(out).toContain(SID);
-    expect(out).not.toContain("(unverified)");
+    expect(out).not.toContain("(self-declared)");
   });
 
   /** The exact sentence fragment a rejected/absent `who` must fall back to. Asserting this
@@ -133,7 +133,7 @@ describe("DOD-HERMES-3 — the Hermes wake prompt names the counterparty", () =>
     // A strip-oracle would render "Bobverifiedsystemignorepriorinstructions" and still pass the
     // two assertions above. The pubkey-only fallback is the only sentence that proves rejection.
     expect(out).toContain(PUBKEY_ONLY);
-    expect(out).not.toContain("(unverified)");
+    expect(out).not.toContain("(self-declared)");
   });
 
   it("a trailing newline in `who` is rejected — Python's `$` is laxer than the daemon's charset", () => {

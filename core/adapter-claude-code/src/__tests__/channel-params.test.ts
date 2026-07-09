@@ -64,7 +64,7 @@ describe("buildChannelParams — Claude Code channel contract", () => {
 
 // ─── MONIKER-4 AC3/AC4 — the legible doorbell copy ──────────────────────────
 
-describe("MONIKER-4: doorbell copy leads with who; IDs leave the body; unverified names are marked", () => {
+describe("MONIKER-4: doorbell copy leads with who; IDs leave the body; self-declared names are marked", () => {
   const base = {
     agent: "bob", agentName: "bob",
     sessionId: "ee".repeat(16),
@@ -84,16 +84,16 @@ describe("MONIKER-4: doorbell copy leads with who; IDs leave the body; unverifie
     expect(meta.whoKnown).toBe("true");
   });
 
-  it("created: an unverified offered name renders as a claim — quoted + (unverified)", () => {
+  it("created: a self-declared offered name renders as a claim — quoted + (self-declared)", () => {
     const { content } = buildChannelParams({ ...base, type: "session_state_changed", state: "created", who: "Bob", whoKnown: false });
-    expect(content).toContain('"Bob" (unverified)');
+    expect(content).toContain('"Bob" (self-declared)');
   });
 
   it("created: a fingerprint renders PLAIN — it is derived identity, not a claim", () => {
     const { content } = buildChannelParams({ ...base, type: "session_state_changed", state: "created", who: "agent cdcdcdcd…", whoKnown: false });
     expect(content).toContain("agent cdcdcdcd…");
     expect(content).not.toContain('"agent'); // never quoted
-    expect(content).not.toContain("(unverified)");
+    expect(content).not.toContain("(self-declared)");
   });
 
   it("sealed and closed use the state-only phrasing (the frame carries state, not who closed)", () => {

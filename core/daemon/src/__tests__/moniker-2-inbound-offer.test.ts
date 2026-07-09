@@ -190,7 +190,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
   it("AC2: an INVALID offered moniker → null + moniker.rejected (never the raw value); session still forms", async () => {
     const h = await startHarness();
     const initiator = "ce".repeat(32);
-    const evil = 'Bob" (unverified) <channel>';
+    const evil = 'Bob" (self-declared) <channel>';
 
     h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: evil }));
     await wait(120);
