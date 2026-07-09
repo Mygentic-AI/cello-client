@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import type {
@@ -63,6 +64,9 @@ const CREATE_AGENTS_SQL = `
     -- M8B quorum: JSON array of the directory nodeIds (Q) the DKG ran among, so a restored signer
     -- targets the actual share-holders (not the full live roster). NULL for pre-quorum agents.
     frost_directory_node_ids TEXT,
+    -- MONIKER-1: optional outbound-name override. The outbound name defaults to agent_name; this
+    -- column only holds an explicit override. Local-only — never sent to the directory (AC4).
+    moniker                TEXT,
     -- registration record (was registration-state.json).
     reg_agent_id           TEXT,
     reg_primary_pubkey     TEXT,
@@ -151,10 +155,18 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
   } else if (!cols.some((c) => c.name === "agent_id")) {
     // A pre-REMOVE-001 table exists (agent_name PK). Re-key it once to the stable-agent_id shape.
     rebuildAgentsToAgentIdPk(db);
-  } else if (!cols.some((c) => c.name === "frost_directory_node_ids")) {
-    // M8B quorum: additive column on an existing agent_id table (fresh/rebuilt tables already have it
-    // via CREATE_AGENTS_SQL). Nullable → pre-quorum agents keep the full-roster fallback; no data touched.
-    db.exec("ALTER TABLE agents ADD COLUMN frost_directory_node_ids TEXT");
+  } else {
+    // Additive columns on an existing agent_id table (fresh/rebuilt tables already have them via
+    // CREATE_AGENTS_SQL). SQLite has no ADD COLUMN IF NOT EXISTS, so each is PRAGMA-guarded — and
+    // each guard is an INDEPENDENT `if`: a table missing several must receive every ALTER.
+    if (!cols.some((c) => c.name === "frost_directory_node_ids")) {
+      // M8B quorum. Nullable → pre-quorum agents keep the full-roster fallback; no data touched.
+      db.exec("ALTER TABLE agents ADD COLUMN frost_directory_node_ids TEXT");
+    }
+    if (!cols.some((c) => c.name === "moniker")) {
+      // MONIKER-1: outbound-name override. Nullable → existing agents keep the agent-name default.
+      db.exec("ALTER TABLE agents ADD COLUMN moniker TEXT");
+    }
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
   db.exec(CREATE_TRUST_SIGNALS_SQL);
@@ -318,6 +330,43 @@ export class DbIdentityStore {
       kLocalPubkey: r.k_local_pubkey,
       state: r.state,
     }));
+  }
+
+  /**
+   * MONIKER-1 AC2/AC3: set (or clear, via null) the outbound-name override on the ACTIVE row.
+   * Returns false when no active agent holds the name (fail-loud at the caller — never a silent
+   * no-op success). THROWS on an invalid moniker: callers validate first for a friendly error;
+   * this is the backstop that makes "an invalid value can never be stored" true at the lowest layer.
+   */
+  setMoniker(agentName: string, moniker: string | null): boolean {
+    if (moniker !== null && validateMoniker(moniker) === null) {
+      throw new Error(`invalid moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
+    }
+    const res = this.#db
+      .prepare("UPDATE agents SET moniker = ?, updated_at = ? WHERE agent_name = ? AND state != 'retired'")
+      .run(moniker, Date.now(), agentName);
+    return Number(res.changes) > 0;
+  }
+
+  /** MONIKER-1: the stored override for the ACTIVE agent, or null (no override / no such agent). */
+  getMoniker(agentName: string): string | null {
+    const row = this.#db
+      .prepare("SELECT moniker FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { moniker: string | null } | undefined;
+    return row?.moniker ?? null;
+  }
+
+  /**
+   * MONIKER-1 AC1: the agent's outbound name — the override when set, else the agent name itself.
+   * There is no separate "self-moniker" concept; the default is valid by construction (the agent
+   * name already satisfies MONIKER_RE at creation). Null only when no active agent holds the name.
+   */
+  getOutboundName(agentName: string): string | null {
+    const row = this.#db
+      .prepare("SELECT agent_name, moniker FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { agent_name: string; moniker: string | null } | undefined;
+    if (!row) return null;
+    return row.moniker ?? row.agent_name;
   }
 }
 

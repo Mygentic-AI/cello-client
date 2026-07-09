@@ -444,7 +444,7 @@ export async function sessions(
 /** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
 async function contactCommand(
   celloDir: string,
-  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list",
+  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_set_moniker",
   params: Record<string, unknown>,
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
@@ -480,6 +480,15 @@ export async function contactList(celloDir: string, agent?: string): Promise<Com
   const params: Record<string, unknown> = {};
   if (agent) params.agent = agent;
   return contactCommand(celloDir, "cello_contact_list", params);
+}
+
+/** MONIKER-1: `cello moniker set <name>` / `cello moniker clear` — set (string) or clear (null)
+ *  the agent's outbound-name override via cello_set_moniker. Validation lives daemon-side
+ *  (shared MONIKER-0 rule); the CLI surfaces the daemon's verdict verbatim. */
+export async function monikerSet(celloDir: string, moniker: string | null, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { moniker };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_set_moniker", params);
 }
 
 /** M8C-TGDOOR-1: `cello telegram set-token <bot_token> <allowlisted_chat_id>` — persists the

@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { startDaemon, acquireLock, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { logout, status, register } from "../commands.js";
+import { logout, status, register, createAgent, monikerSet } from "../commands.js";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -94,6 +94,42 @@ describe("cli commands", () => {
       expect(parsed.daemon).toBe("running");
       expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
+    });
+  });
+
+  // MONIKER-1 AC2/AC3: `cello moniker set|clear` round-trips to the daemon's cello_set_moniker.
+  describe("moniker", () => {
+    it("sets and clears the outbound-name override against a live daemon", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+      const create = await createAgent(tempDir, "alice");
+      expect(create.exitCode).toBe(0);
+
+      const set = await monikerSet(tempDir, "Wonderland_Alice", "alice");
+      expect(set.exitCode).toBe(0);
+      expect(JSON.parse(set.output)).toMatchObject({ ok: true, agent: "alice", moniker: "Wonderland_Alice" });
+
+      const cleared = await monikerSet(tempDir, null, "alice");
+      expect(cleared.exitCode).toBe(0);
+      expect(JSON.parse(cleared.output)).toMatchObject({ ok: true, agent: "alice", moniker: null });
+    });
+
+    it("surfaces the daemon's invalid_moniker rejection verbatim", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+      await createAgent(tempDir, "alice");
+
+      const bad = await monikerSet(tempDir, "not a valid name", "alice");
+      expect(bad.exitCode).toBe(1);
+      const parsed = JSON.parse(bad.output);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.reason).toBe("invalid_moniker");
+    });
+
+    it("returns {daemon: stopped} when no daemon is running", async () => {
+      const result = await monikerSet(tempDir, "Bob", "alice");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("stopped");
     });
   });
 

@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, telegramSetToken } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, monikerSet, telegramSetToken } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -145,6 +145,22 @@ async function main(): Promise<void> {
         result = await contactList(celloDir, agent);
       } else {
         result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]" };
+      }
+      break;
+    }
+    case "moniker": {
+      // cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>] (MONIKER-1)
+      const args = process.argv.slice(3);
+      const agentIdx = args.indexOf("--agent");
+      const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
+      const positional = args.filter((a, i) => !(a === "--agent" || i === agentIdx + 1));
+      const [sub, name] = positional;
+      if (sub === "set" && name) {
+        result = await monikerSet(celloDir, name, agent);
+      } else if (sub === "clear" && !name) {
+        result = await monikerSet(celloDir, null, agent);
+      } else {
+        result = { exitCode: 1, output: helpForCommand("moniker") };
       }
       break;
     }

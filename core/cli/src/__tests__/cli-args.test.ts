@@ -21,8 +21,22 @@ describe("F1: usage string lists every command", () => {
 
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
-      ["contact", "create-agent", "install", "login", "logout", "receipts", "refresh", "register", "remove-agent", "sessions", "status", "telegram"].sort(),
+      ["contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh", "register", "remove-agent", "sessions", "status", "telegram"].sort(),
     );
+  });
+
+  // MONIKER-1 AC2: `cello moniker set <name>` / `cello moniker clear` — the outbound-name override.
+  it("moniker help states the set/clear surface and derives the name rule from the constant", () => {
+    const help = helpForCommand("moniker");
+    expect(help).toContain("moniker set");
+    expect(help).toContain("moniker clear");
+    expect(help).toContain(MONIKER_RE.source); // derived, never hand-typed (MONIKER-0 AC2)
+  });
+
+  it("moniker accepts --agent and rejects unknown flags", () => {
+    expect(checkArgs("moniker", ["set", "Bob", "--agent", "alice"])).toEqual({ kind: "ok" });
+    expect(checkArgs("moniker", ["set", "Bob", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    expect(checkArgs("moniker", ["--help"])).toEqual({ kind: "help" });
   });
 
   // CC-7 (P2-5 / DOD-ONBOARD-HELP-1): the top-level usage must be real orientation, not a bare list.

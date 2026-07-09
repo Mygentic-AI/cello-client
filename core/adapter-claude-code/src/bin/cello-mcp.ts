@@ -192,6 +192,16 @@ server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an a
   return jsonText(result);
 });
 
+// MONIKER-1: outbound-name override. Forward-only (D7 — validation and persistence live in the
+// daemon's cello_set_moniker; the shim adds no logic).
+server.tool("cello_set_moniker", "Set (or clear, by passing null) an agent's outbound display name — what a counterparty's doorbell shows. Defaults to the agent name; local-only, never sent to the directory. 1-64 chars: letters, digits, '-' or '_'. Defaults to the current agent.", {
+  moniker: z.string().nullable().describe("The outbound name to set, or null to clear the override (reverts to the agent name)"),
+  agent: z.string().optional().describe("Agent name whose outbound name to set (defaults to the current agent)"),
+}, async ({ moniker, agent }) => {
+  const result = await proxy.call("cello_set_moniker", agent ? { moniker, agent } : { moniker });
+  return jsonText(result);
+});
+
 // ─── Session tools (proxied through daemon) ─────────────────────────────────
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {

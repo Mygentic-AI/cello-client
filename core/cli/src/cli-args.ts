@@ -21,6 +21,7 @@ export const KNOWN_COMMANDS = new Set([
   "receipts",
   "sessions",
   "contact",
+  "moniker",
   "telegram",
   "install",
 ] as const);
@@ -35,7 +36,7 @@ export const USAGE =
   "First-time setup:  cello login  →  cello create-agent <name>  →  cello register <name> <token>  →  cello status\n" +
   "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
   "\n" +
-  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|telegram|install>\n" +
+  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|moniker|telegram|install>\n" +
   "Run 'cello <command> --help' for details on any command.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
@@ -65,6 +66,13 @@ const COMMAND_HELP: Record<string, string> = {
     "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
     "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
     "  Example:  cello contact list --agent alice",
+  moniker:
+    "Usage: cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>]\n" +
+    "  The agent's OUTBOUND name — what a counterparty's doorbell shows (MONIKER-1). Defaults to the agent name; 'set' stores an override, 'clear' restores the default.\n" +
+    // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
+    `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
+    "  Local-only: never sent to the directory; the receiver treats it as an unverified hint (like caller ID).\n" +
+    "  Example:  cello moniker set Wonderland_Alice --agent alice",
   telegram:
     "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>  — configure the daemon-owned Telegram doorbell (M8C-TGDOOR-1).\n" +
     "  Starts a single long-lived poller immediately; the operator chat given is the ONLY one that ever receives doorbell events.",
@@ -83,6 +91,7 @@ export function helpForCommand(command: string): string {
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   sessions: new Set(["--open", "--closed", "--failed", "--all", "--limit"]),
   contact: new Set(["--agent"]),
+  moniker: new Set(["--agent"]),
   install: new Set(["--agent", "--hermes-home"]),
 };
 

@@ -5738,6 +5738,30 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { ok: true, agent: resolved.agent, contacts };
   });
 
+  // MONIKER-1 AC2/AC3: cello_set_moniker — set (or clear, via explicit null) an agent's outbound-name
+  // override on the agents table. Validated at set-time with the shared MONIKER-0 rule; an invalid
+  // value is rejected here AND at the store (backstop) — it can never be stored. Local-only: the
+  // name is never sent to the directory (AC4).
+  handlers.set("cello_set_moniker", async (params, connectionId) => {
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const raw = params?.moniker ?? null;
+    const moniker = raw === null ? null : validateMoniker(raw);
+    if (raw !== null && moniker === null) {
+      return {
+        ok: false,
+        reason: "invalid_moniker",
+        guidance: `A moniker is 1-64 chars: letters, digits, '-' or '_' (regex ${MONIKER_RE.source}). Pass null to clear the override.`,
+      };
+    }
+    const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
+    if (!store.setMoniker(resolved.agent, moniker)) {
+      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${resolved.agent}'. See cello_list_agents.` };
+    }
+    logger.info("agent.moniker.set", { agentName: resolved.agent, cleared: moniker === null });
+    return { ok: true, agent: resolved.agent, moniker };
+  });
+
   // M8C-TGDOOR-1: cello_telegram_set_token — persist the daemon-wide bot token + allowlisted
   // operator chat ID, then start the poller immediately (no restart needed).
   handlers.set("cello_telegram_set_token", async (params, _connectionId) => {
