@@ -76,6 +76,7 @@ import {
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment, sessionRequestErrorReason, parseDiscoveryLookupResult, discoveryLookupErrorReason, extractOfferedMoniker, resolveOutboundMoniker } from "./session-assignment-parser.js";
+import { whoLabel } from "./who-label.js";
 import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
@@ -1055,13 +1056,32 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Wraps notificationDispatcher.dispatchSessionStateChanged so every call site gets the
   // Telegram state-change doorbell for free (DoD: state changes ALWAYS ring, never coalesced) —
   // one wrapper rather than hooking each of the several existing call sites individually.
+  // MONIKER-4 AC2: resolve the counterparty's display label — local pet name (MONIKER-3) ??
+  // offered name for this session (MONIKER-2) ?? fingerprint. Total: any failure inside
+  // resolution degrades to fingerprint via whoLabel's own tiers; a label can never block a
+  // doorbell (spec §8).
+  function resolveWho(agentName: string, pubkeyHex: string, sessionIdHex: string): { who: string; whoKnown: boolean } {
+    let localMoniker: string | null = null;
+    try {
+      localMoniker = sessionNodeManager.getContactMoniker(agentName, pubkeyHex);
+    } catch (err: unknown) {
+      logger.warn("moniker.local.read_failed", { agentName, pubkey: pubkeyHex, reason: err instanceof Error ? err.message : String(err) });
+    }
+    const resolved = whoLabel({ localMoniker, offeredMoniker: offeredMonikers.get(sessionIdHex) ?? null, pubkeyHex });
+    logger.debug("moniker.resolved", { agentName, pubkey: pubkeyHex, source: resolved.source });
+    return { who: resolved.who, whoKnown: resolved.whoKnown };
+  }
+
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
     sessionId: string,
     state: string,
     counterpartyPubkey: string | null,
   ): void {
-    notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey);
+    // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
+    // offered-name drop below so a terminal state's own doorbell still shows the name.
+    const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
+    notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey, who);
     void sendTelegramDoorbell(agentName, sessionId, "state_change", `Session ${state}`);
     // Reviewer HIGH fix (a60d68ed): telegramRungUnread had NO cleanup at all — a session that
     // rings once and is never read via cello_receive/since_seq (e.g. the operator only ever uses
@@ -5947,7 +5967,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // content-free `cello_message` doorbell to the current-agent connection(s). The shim's generic
   // bridge (WAKE) forwards it to a live --channels session as notifications/claude/channel.
   sessionNodeManager.setOnContentArrived((agentName, sessionId, senderPubkey) => {
-    notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey);
+    // MONIKER-4 AC2: the message doorbell names the sender the same way the session doorbell does.
+    notificationDispatcher.dispatchCelloMessage(agentName, sessionId, senderPubkey, resolveWho(agentName, senderPubkey, sessionId));
     // M8C-AWAY-1: an unattended agent auto-acks an inbound message on an existing session.
     void sendAwayResponse(agentName, sessionId, "message");
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.

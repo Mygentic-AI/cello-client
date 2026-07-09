@@ -245,6 +245,9 @@ describe("MCP-002: notification routing", () => {
       sessionId: "sess-001",
       state: "created",
       counterpartyPubkey: "deadbeef",
+      // MONIKER-4 AC2: resolved display label (fingerprint tier for an unknown fake key).
+      who: "agent deadbeef…",
+      whoKnown: false,
     });
     expect(sessionB[0].data).toEqual(sessionA[0].data);
   });
@@ -323,6 +326,8 @@ describe("MCP-002: notification routing", () => {
       sessionId: "sess-003",
       state: "sealed",
       counterpartyPubkey: "beef0001",
+      who: "agent beef0001…",
+      whoKnown: false,
     });
   });
 
@@ -364,6 +369,8 @@ describe("MCP-002: notification routing", () => {
       sessionId: "sess-004",
       state: "interrupted",
       counterpartyPubkey: "cafe0002",
+      who: "agent cafe0002…",
+      whoKnown: false,
     });
   });
 

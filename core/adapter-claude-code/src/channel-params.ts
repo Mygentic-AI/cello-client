@@ -23,16 +23,56 @@ function short(v: unknown): string {
   return s.length > 12 ? `${s.slice(0, 12)}…` : s;
 }
 
-/** Human-readable, content-free doorbell announcement for the `<channel>` tag body. */
+/** Shim-side fingerprint — mirrors the daemon's who-label format for old-daemon frames. */
+function shimFingerprint(pubkey: unknown): string {
+  const s = typeof pubkey === "string" && pubkey.length >= 8 ? pubkey.slice(0, 8) : null;
+  return s !== null ? `agent ${s}…` : "agent unknown…";
+}
+
+/**
+ * MONIKER-4 AC3/AC4 — the rendered counterparty label.
+ *  - whoKnown true → plain (the operator's own pet name — deliberate trust, CC-1).
+ *  - whoKnown false + fingerprint → plain (derived identity, not a claim). The discriminator is
+ *    UNFORGEABLE: MONIKER_RE excludes spaces, and every fingerprint contains one.
+ *  - whoKnown false + name → `"Bob" (unverified)` — rendered as a claim; the marker itself cannot
+ *    be forged because the charset excludes quotes and parentheses.
+ *  - No `who` at all (old daemon) → shim-side fingerprint of the counterparty key. Never blank.
+ * Names are NEVER truncated (only fingerprints shorten, by construction).
+ */
+function renderWho(data: Record<string, unknown>): string {
+  const who = typeof data["who"] === "string" && data["who"].length > 0 ? data["who"] : null;
+  if (who === null) return shimFingerprint(data["counterpartyPubkey"] ?? data["from"]);
+  if (data["whoKnown"] === true) return who;
+  return who.includes(" ") ? who : `"${who}" (unverified)`;
+}
+
+/** Human-readable, content-free doorbell announcement for the `<channel>` tag body.
+ *  MONIKER-4 AC3: the label LEADS; session IDs stay out of the body (they remain as `<channel>`
+ *  meta attributes, where tools read them). */
 function doorbellText(type: string, data: Record<string, unknown>): string {
-  const session = short(data["session_id"] ?? data["sessionId"]);
   switch (type) {
     case "cello_message":
-      return `CELLO: a new message is waiting (session ${session}, from ${short(data["from"])}). Call cello_receive to read it.`;
+      return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.`;
     case "cello_session_request":
-      return `CELLO: an incoming session request from ${short(data["from"])} (session ${session}). Call cello_await_session to accept it.`;
-    case "session_state_changed":
-      return `CELLO: session ${session} for ${short(data["agentName"] ?? data["agent"] ?? "your agent")} is now "${String(data["state"] ?? "changed")}". Call cello_list_sessions, then cello_receive.`;
+      return `📞 CELLO — ${renderWho(data)} wants to connect. Run cello_await_session to accept.`;
+    case "session_state_changed": {
+      const who = renderWho(data);
+      const yourAgent = short(data["agentName"] ?? data["agent"] ?? "your agent");
+      switch (String(data["state"] ?? "changed")) {
+        case "created":
+          return `📞 CELLO — ${who} wants to connect with ${yourAgent}. Run cello_await_session to accept.`;
+        case "active":
+          return `✅ CELLO — you're connected to ${who}.`;
+        case "sealed":
+          return `🔒 CELLO — session with ${who} sealed. Receipt saved.`;
+        case "closed":
+          // The frame carries state, not who closed it — attributing the action would be a lie
+          // half the time (spec AC3 note).
+          return `👋 CELLO — session with ${who} ended.`;
+        default:
+          return `CELLO — session with ${who} is now "${String(data["state"] ?? "changed")}".`;
+      }
+    }
     case "agent_state_changed":
       return `CELLO: agent ${short(data["agent"])} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":

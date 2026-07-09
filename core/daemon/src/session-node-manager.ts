@@ -908,6 +908,16 @@ export class SessionNodeManager {
     return res.changes > 0;
   }
 
+  /** MONIKER-4: the operator's pet name for a pubkey (whoLabel's top tier), or null. Read-only
+   *  and tolerant of a not-yet-open DB (a missing label degrades the doorbell, never blocks it). */
+  getContactMoniker(agentName: string, pubkey: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT moniker FROM contacts WHERE agent_name = ? AND pubkey = ?")
+      .get(agentName, pubkey) as { moniker: string | null } | undefined;
+    return row?.moniker ?? null;
+  }
+
   /** M8C-CONTACT-1: list an agent's known contacts, oldest-added first. MONIKER-3 AC3: includes
    *  the pet name (null when none set). */
   listContacts(agentName: string): Array<{ pubkey: string; added_at: number; moniker: string | null }> {

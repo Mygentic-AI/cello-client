@@ -120,6 +120,9 @@ export class NotificationDispatcher {
     sessionId: string,
     state: string,
     counterpartyPubkey: string | null,
+    // MONIKER-4 AC2: the resolved display label. Optional and additive — legacy call sites
+    // omit it and the fields stay off the frame; counterpartyPubkey remains the anchor.
+    who?: { who: string; whoKnown: boolean },
   ): void {
     const notification: IpcNotification = {
       notification: "session_state_changed",
@@ -130,6 +133,7 @@ export class NotificationDispatcher {
         sessionId,
         state,
         counterpartyPubkey,
+        ...(who !== undefined ? { who: who.who, whoKnown: who.whoKnown } : {}),
       },
     };
 
@@ -147,7 +151,13 @@ export class NotificationDispatcher {
    * session_state_changed. The payload carries only type + from (senderPubkey) + session_id; the
    * operator calls cello_receive to fetch content (INV-CONTENTFREE / SI-001 — NO content here).
    */
-  dispatchCelloMessage(agentName: string, sessionId: string, from: string): void {
+  dispatchCelloMessage(
+    agentName: string,
+    sessionId: string,
+    from: string,
+    // MONIKER-4 AC2: same additive label contract as dispatchSessionStateChanged; `from` anchors.
+    who?: { who: string; whoKnown: boolean },
+  ): void {
     const notification: IpcNotification = {
       notification: "cello_message",
       data: {
@@ -155,6 +165,7 @@ export class NotificationDispatcher {
         type: "cello_message",
         from,
         session_id: sessionId,
+        ...(who !== undefined ? { who: who.who, whoKnown: who.whoKnown } : {}),
       },
     };
 
