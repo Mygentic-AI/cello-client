@@ -176,3 +176,37 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
 }
+
+// ─── MONIKER-2: the offer-moniker validation seams ──────────────────────────
+
+import { validateMoniker } from "@cello-protocol/protocol-types";
+
+/**
+ * MONIKER-2 AC2 — the receiver's wire boundary, validated ONCE here so downstream
+ * code can never observe an invalid moniker. Absent ≠ invalid (spec §3): an absent
+ * field is an older client (silent, rejected: false); a present-but-invalid value
+ * means the sender runs modified code (rejected: true — the caller logs
+ * `moniker.rejected`, never the raw value). Reject, never strip: the value is
+ * returned verbatim or null, never repaired.
+ */
+export function extractOfferedMoniker(raw: Record<string, unknown>): {
+  offeredMoniker: string | null;
+  rejected: boolean;
+} {
+  if (!("moniker" in raw) || raw["moniker"] === undefined) {
+    return { offeredMoniker: null, rejected: false };
+  }
+  const valid = validateMoniker(raw["moniker"]);
+  return valid !== null ? { offeredMoniker: valid, rejected: false } : { offeredMoniker: null, rejected: true };
+}
+
+/**
+ * MONIKER-2 AC1 / MONIKER-1 AC3 (offer-construction half) — defense-in-depth
+ * re-validation of the initiator's own outbound name. Returns undefined (field
+ * OMITTED from the wire, never an empty string) when there is no name or the
+ * stored value somehow fails validation.
+ */
+export function resolveOutboundMoniker(outboundName: string | null): string | undefined {
+  if (outboundName === null) return undefined;
+  return validateMoniker(outboundName) ?? undefined;
+}

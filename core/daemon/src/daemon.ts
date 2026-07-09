@@ -75,7 +75,7 @@ import {
 } from "./transport-composition.js";
 import type { ITransportSelector, SessionNegotiator, SessionNegotiationResult } from "./transport-selector.js";
 import { selectAdvertisedAddress } from "./transport-selector.js";
-import { parseSessionAssignment, sessionRequestErrorReason, parseDiscoveryLookupResult, discoveryLookupErrorReason } from "./session-assignment-parser.js";
+import { parseSessionAssignment, sessionRequestErrorReason, parseDiscoveryLookupResult, discoveryLookupErrorReason, extractOfferedMoniker, resolveOutboundMoniker } from "./session-assignment-parser.js";
 import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, verifyUnilateralCertificate, verifyBilateralSealCertificate, runAgentRefresh } from "./session-ceremony.js";
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
@@ -1071,6 +1071,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // preferable to an unbounded leak (the exact class of bug fixed for TTL-1's expired-log at
     // af8a701 in this same milestone).
     clearTelegramRung(agentName, sessionId);
+    // MONIKER-2 AC2b: the offered name is display material for the session's lifetime only.
+    // Terminal states are the natural drop point — same unbounded-leak reasoning as above.
+    if (state === "sealed" || state === "closed" || state === "failed" || state === "abandoned") {
+      offeredMonikers.delete(sessionId);
+    }
   }
 
   async function handleInboundTelegramUpdate(
@@ -1261,6 +1266,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       const t = frame["type"];
       if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
     });
+    // MONIKER-2 AC1: the outbound name rides the request (agent name, or the MONIKER-1
+    // override), re-validated at offer construction (defense in depth) and OMITTED — never
+    // an empty string — when absent or invalid. A failure reading it must never block the
+    // session (spec §8: the label degrades, the session forms), but it is logged loudly.
+    let moniker: string | undefined;
+    try {
+      moniker = resolveOutboundMoniker(
+        new DbIdentityStore(sessionNodeManager.getDb(), logger).getOutboundName(agentName),
+      );
+    } catch (err: unknown) {
+      logger.warn("moniker.outbound.read_failed", {
+        agentName,
+        reason: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+      moniker = undefined;
+    }
     try {
       const sent = await signaling.sendRaw({
         type: "session_request",
@@ -1268,6 +1290,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         initiator_session_peer_id: sr.peerId,
         initiator_session_addrs: sr.addrs,
         wants_session_offer: true,
+        ...(moniker !== undefined ? { moniker } : {}),
       });
       if (!sent.ok) {
         return { ok: false, reason: sent.reason ?? "directory_unreachable", guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream." };
@@ -4194,10 +4217,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     sessionIdHex: string;
     counterpartyPubkeyHex: string;
     genesisPrevRootHex: string;
+    // MONIKER-2 AC2: the initiator's offered name — already validated at the wire boundary
+    // (extractInboundSessionAssignment), so downstream can never observe an invalid value.
+    // null = absent or rejected; an unverified display hint either way, never identity.
+    offeredMoniker?: string | null;
     // M8C-TTL-1: when this event was queued (not set for events handed straight to a blocked
     // waiter — those are delivered instantly and never sit in the queue this TTL governs).
     enqueuedAt?: number;
   }
+  // MONIKER-2 AC2b: sessionIdHex → the initiator's validated offered name. Session-scoped
+  // display material ONLY (spec: promotion to a stored pet name needs an explicit operator
+  // action). In-memory by design — a restart degrades the label to fingerprint, never worse.
+  const offeredMonikers = new Map<string, string>();
   // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
   // cello_check_notifications so the operator can see what they missed, not just silence.
   const expiredSessionRequests = new Map<string, Array<{ sessionIdHex: string; counterpartyPubkeyHex: string; expiredAt: number }>>();
@@ -4345,6 +4376,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         signerPubkeyHex: string | null;
         relayPeerId: string;
         relayAddrs: string[];
+        // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
+        // boundary — downstream code can never observe an invalid moniker. null when
+        // absent (older client) or invalid; monikerRejected distinguishes the two so the
+        // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
+        offeredMoniker: string | null;
+        monikerRejected: boolean;
       }
     | null {
     const raw = frame["assignment"];
@@ -4365,6 +4402,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
         ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
         : [];
+    // MONIKER-2 AC2: validate the offered name ONCE, at this wire boundary.
+    const monikerResult = extractOfferedMoniker(a);
     return {
       sessionIdHex,
       participantAPubkeyHex,
@@ -4380,6 +4419,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
       relayPeerId,
       relayAddrs,
+      offeredMoniker: monikerResult.offeredMoniker,
+      monikerRejected: monikerResult.rejected,
     };
   }
 
@@ -4503,10 +4544,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         sessionPeerId: result.peerId,
         correlationId,
       });
+      // MONIKER-2 AC2: a present-but-invalid moniker is a red flag (the sender runs modified
+      // code) — logged with the spec'd fields and NEVER the raw value. Not grounds to refuse
+      // the session (version skew is real; refusing hands strangers a DoS lever).
+      if (parsed.monikerRejected) {
+        logger.info("moniker.rejected", {
+          agentName,
+          pubkey: parsed.participantAPubkeyHex,
+          reason: "charset_violation",
+          correlationId,
+        });
+      }
+      // MONIKER-2 AC2b: display material for THIS offer/session only (never persisted, never
+      // auto-written to contacts — AC3). Session-scoped: MONIKER-4's dispatcher resolves
+      // whoLabel from here; entries are dropped when the session's terminal state dispatches.
+      if (parsed.offeredMoniker !== null) {
+        offeredMonikers.set(parsed.sessionIdHex, parsed.offeredMoniker);
+      }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,
         counterpartyPubkeyHex: parsed.participantAPubkeyHex,
         genesisPrevRootHex,
+        offeredMoniker: parsed.offeredMoniker,
       });
       dispatchSessionStateChangedWithTelegram(
         agentName,
@@ -4740,6 +4799,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       session_id: e.sessionIdHex,
       counterparty_pubkey: e.counterpartyPubkeyHex,
       genesis_prev_root: e.genesisPrevRootHex,
+      // MONIKER-2: validated-at-boundary display hint; null = absent or rejected.
+      offered_moniker: e.offeredMoniker ?? null,
     });
 
     reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
