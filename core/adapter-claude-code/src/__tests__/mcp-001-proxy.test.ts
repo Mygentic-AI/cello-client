@@ -280,12 +280,17 @@ describe("MCP-001 AC-014: distinct reason codes", () => {
       // Wait for socket to be closed by server
       await new Promise((r) => setTimeout(r, 100));
 
-      const result = await proxy.call("anything", {});
-      expect(result).toEqual({
-        ok: false,
-        reason: "ipc_connection_lost",
-        guidance: expect.stringContaining("daemon was lost"),
-      });
+      // AC-014 is about the REASON CODE, which is unchanged. RECONNECT-001 changed the guidance:
+      // the proxy now reconnects automatically, so the old "close and reopen Claude Code" advice
+      // is obsolete and must not be asserted. The guidance must still name a real remedy.
+      const result = (await proxy.call("anything", {})) as {
+        ok: boolean;
+        reason: string;
+        guidance: string;
+      };
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("ipc_connection_lost");
+      expect(result.guidance).toMatch(/cello status|cello login|mcp reconnect/i);
 
       proxy.close();
     } finally {

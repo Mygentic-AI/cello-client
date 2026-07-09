@@ -79,7 +79,9 @@ process.stderr.write = (
 // operator (or test) running the daemon under a non-default home would have cello-mcp
 // look in ~/.cello and fail to find the socket.
 const socketPath = join(celloDir, "daemon.sock");
-const proxy = new IpcProxy(socketPath);
+// RECONNECT-001: clientType is handed to the proxy so it can replay `ipc.connect` after a daemon
+// restart. Without it the reconnected socket has no registered client and no current agent.
+const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
 
 try {
   await proxy.connect();
