@@ -178,11 +178,25 @@ server.tool("cello_contact_list", "List an agent's contact whitelist — the pee
   return jsonText(result);
 });
 
-server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's contact whitelist — a known/trusted contact is fast-tracked and exempt from unknown-sender screening and anti-spam caps. Defaults to the current agent.", {
+server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's contact whitelist — a known/trusted contact is fast-tracked and exempt from unknown-sender screening and anti-spam caps. Optionally set your own pet name (moniker) for them. Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to add"),
+  moniker: z.string().optional().describe("Optional pet name for this contact (1-64 chars: letters, digits, '-' or '_') — always wins over the name they offer"),
   agent: z.string().optional().describe("Agent name whose whitelist to add to (defaults to the current agent)"),
-}, async ({ pubkey, agent }) => {
-  const result = await proxy.call("cello_contact_add", agent ? { pubkey, agent } : { pubkey });
+}, async ({ pubkey, moniker, agent }) => {
+  const params: Record<string, unknown> = { pubkey };
+  if (moniker !== undefined) params.moniker = moniker;
+  if (agent) params.agent = agent;
+  const result = await proxy.call("cello_contact_add", params);
+  return jsonText(result);
+});
+
+// MONIKER-3: rename/clear a contact's pet name. Forward-only (D7).
+server.tool("cello_contact_set_moniker", "Set (or clear, by passing null) YOUR pet name for an existing contact — the top-priority display name shown for them (always wins over the name they offer). Defaults to the current agent.", {
+  pubkey: z.string().describe("Hex-encoded public key of the contact to rename"),
+  moniker: z.string().nullable().describe("The pet name to set (1-64 chars: letters, digits, '-' or '_'), or null to clear it"),
+  agent: z.string().optional().describe("Agent name whose contact to rename (defaults to the current agent)"),
+}, async ({ pubkey, moniker, agent }) => {
+  const result = await proxy.call("cello_contact_set_moniker", agent ? { pubkey, moniker, agent } : { pubkey, moniker });
   return jsonText(result);
 });
 

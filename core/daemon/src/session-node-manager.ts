@@ -86,7 +86,7 @@ import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
-import { encodeSealPayload } from "@cello-protocol/protocol-types";
+import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -630,6 +630,13 @@ export class SessionNodeManager {
         PRIMARY KEY (agent_name, pubkey)
       )
     `);
+    // MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
+    // SQLite has no ADD COLUMN IF NOT EXISTS, so the ALTER is PRAGMA-guarded to stay
+    // idempotent; existing rows → NULL, no data loss.
+    const contactCols = this.#db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>;
+    if (!contactCols.some((c) => c.name === "moniker")) {
+      this.#db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");
+    }
 
     // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
     // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
@@ -856,12 +863,37 @@ export class SessionNodeManager {
   }
 
   /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
-   *  no-op, never refreshes added_at; identity does not get re-resolved). */
-  addContact(agentName: string, pubkey: string): void {
+   *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an
+   *  optional pet name; a NEW non-null moniker on re-add updates it, absence leaves it untouched.
+   *  THROWS on an invalid moniker — callers validate first; this is the can-never-be-stored
+   *  backstop (same contract as DbIdentityStore.setMoniker). */
+  addContact(agentName: string, pubkey: string, moniker?: string | null): void {
     if (!this.#db || !pubkey) return;
+    if (moniker !== undefined && moniker !== null && validateMoniker(moniker) === null) {
+      throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
+    }
     this.#db
       .prepare("INSERT OR IGNORE INTO contacts (agent_name, pubkey, added_at) VALUES (?, ?, ?)")
       .run(agentName, pubkey, Date.now());
+    if (moniker !== undefined && moniker !== null) {
+      this.#db
+        .prepare("UPDATE contacts SET moniker = ? WHERE agent_name = ? AND pubkey = ?")
+        .run(moniker, agentName, pubkey);
+    }
+  }
+
+  /** MONIKER-3 AC3: rename (string) or clear (null) an EXISTING contact's pet name. Returns false
+   *  when no such contact — fail-loud at the caller, never a silent no-op success. Same
+   *  validate-throw backstop as addContact. */
+  setContactMoniker(agentName: string, pubkey: string, moniker: string | null): boolean {
+    if (!this.#db) return false;
+    if (moniker !== null && validateMoniker(moniker) === null) {
+      throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
+    }
+    const res = this.#db
+      .prepare("UPDATE contacts SET moniker = ? WHERE agent_name = ? AND pubkey = ?")
+      .run(moniker, agentName, pubkey);
+    return res.changes > 0;
   }
 
   /** M8C-CONTACT-1: known stays known until explicitly removed. */
@@ -871,12 +903,13 @@ export class SessionNodeManager {
     return res.changes > 0;
   }
 
-  /** M8C-CONTACT-1: list an agent's known contacts, oldest-added first. */
-  listContacts(agentName: string): Array<{ pubkey: string; added_at: number }> {
+  /** M8C-CONTACT-1: list an agent's known contacts, oldest-added first. MONIKER-3 AC3: includes
+   *  the pet name (null when none set). */
+  listContacts(agentName: string): Array<{ pubkey: string; added_at: number; moniker: string | null }> {
     if (!this.#db) return [];
     return this.#db
-      .prepare("SELECT pubkey, added_at FROM contacts WHERE agent_name = ? ORDER BY added_at ASC")
-      .all(agentName) as Array<{ pubkey: string; added_at: number }>;
+      .prepare("SELECT pubkey, added_at, moniker FROM contacts WHERE agent_name = ? ORDER BY added_at ASC")
+      .all(agentName) as Array<{ pubkey: string; added_at: number; moniker: string | null }>;
   }
 
   /** M8C-ABUSE-1: cumulative RECEIVED byte total for a session (anti-drip-feed accounting). */

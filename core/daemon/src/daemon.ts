@@ -5788,9 +5788,50 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;
-    sessionNodeManager.addContact(resolved.agent, pubkey);
+    // MONIKER-3 AC3: optional pet name. Invalid → reject the request WHOLE (no contact row
+    // either) — a half-applied add would store trust without the name the operator asked for.
+    let moniker: string | null | undefined;
+    if (params && "moniker" in params && params.moniker !== undefined && params.moniker !== null) {
+      moniker = validateMoniker(params.moniker);
+      if (moniker === null) {
+        return {
+          ok: false,
+          reason: "invalid_moniker",
+          guidance: `A moniker is 1-64 chars: letters, digits, '-' or '_' (regex ${MONIKER_RE.source}).`,
+        };
+      }
+    }
+    sessionNodeManager.addContact(resolved.agent, pubkey, moniker);
     logger.info("contact.added", { agent: resolved.agent, pubkey });
-    return { ok: true, agent: resolved.agent, pubkey };
+    if (moniker !== undefined) {
+      logger.info("contact.moniker.set", { agentName: resolved.agent, pubkey });
+    }
+    return { ok: true, agent: resolved.agent, pubkey, moniker: moniker ?? null };
+  });
+
+  // MONIKER-3 AC3: rename (string) or clear (null) an existing contact's pet name. Absence of the
+  // key is NOT a clear (Entry-66-F3): a request that omits it is malformed and rejected.
+  handlers.set("cello_contact_set_moniker", async (params, connectionId) => {
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    if (!pubkey || !params || !("moniker" in params)) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'moniker' — a string to set the pet name, or null to clear it." };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const raw = params.moniker ?? null;
+    const moniker = raw === null ? null : validateMoniker(raw);
+    if (raw !== null && moniker === null) {
+      return {
+        ok: false,
+        reason: "invalid_moniker",
+        guidance: `A moniker is 1-64 chars: letters, digits, '-' or '_' (regex ${MONIKER_RE.source}). Pass null to clear.`,
+      };
+    }
+    if (!sessionNodeManager.setContactMoniker(resolved.agent, pubkey, moniker)) {
+      return { ok: false, reason: "contact_not_found", guidance: `No contact ${pubkey.slice(0, 16)}… for agent '${resolved.agent}'. Add it first with cello_contact_add.` };
+    }
+    logger.info("contact.moniker.set", { agentName: resolved.agent, pubkey, cleared: moniker === null });
+    return { ok: true, agent: resolved.agent, pubkey, moniker };
   });
 
   handlers.set("cello_contact_remove", async (params, connectionId) => {
