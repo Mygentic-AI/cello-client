@@ -112,6 +112,11 @@ _CONTENT_FIELD_NAMES = {
 # conservative charset (or overlong) renders as 'unknown' in the wake prompt.
 _SAFE_SCALAR_RE = re.compile(r"^[A-Za-z0-9+/=_.:@-]{1,120}$")
 
+# The protocol's moniker charset (core/protocol-types MONIKER_RE). Deliberately excludes spaces,
+# quotes, parentheses and markup, so a fingerprint ("agent 77d0c806...") never matches and neither
+# does anything that could restructure the wake sentence.
+_MONIKER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 
 def _cello_socket_path() -> Path:
     cello_dir = os.environ.get("CELLO_DIR") or str(Path.home() / ".cello")
@@ -145,6 +150,27 @@ def _safe_scalar(value: Any, default: str = "unknown") -> str:
     if not _SAFE_SCALAR_RE.match(value):
         return default
     return value
+
+
+def _render_who(data: Any) -> Optional[str]:
+    """DOD-HERMES-3: the daemon-resolved counterparty label, or None.
+
+    The daemon stamps who/whoKnown on both counterparty-bearing frames (MONIKER-4 AC2) with three
+    tiers: the operator's own pet name, the caller's unverified offered name, or a fingerprint.
+    Only a NAME is rendered - the fingerprint tier ('agent 77d0c806...') is derived from the very
+    pubkey every wake already carries in full, so echoing it is noise. An unverified name is marked
+    as a claim exactly as the Claude Code shim marks it, and the marker cannot be forged because
+    MONIKER_RE excludes quotes and parentheses.
+
+    Re-validated here rather than trusted: Hermes has no metadata layer, so this prose IS the frame
+    (spec §11) and a name-shaped token is the only thing that may ever enter it.
+    """
+    who = data.get("who") if isinstance(data, dict) else None
+    if not isinstance(who, str) or not _MONIKER_RE.match(who):
+        return None
+    if data.get("whoKnown") is True:
+        return who
+    return '"' + who + '" (unverified)'
 
 
 class CelloAdapter(BasePlatformAdapter):
@@ -441,11 +467,18 @@ class CelloAdapter(BasePlatformAdapter):
         agent = self._agent_name
         if kind == "cello_message":
             sender = _safe_scalar(data.get("from"))
+            # DOD-HERMES-3 AC1/AC2: the name LEADS, the pubkey rides beside it (spec §11).
+            who = _render_who(data)
+            origin = (
+                "from " + who + " (counterparty pubkey " + sender + ")"
+                if who is not None
+                else "from counterparty pubkey " + sender
+            )
             return (
                 "CELLO wake: a new message arrived on session "
                 + session_id
-                + " from counterparty pubkey "
-                + sender
+                + " "
+                + origin
                 + ". A peer is waiting on you. Message content is never pushed, so you must fetch"
                 " it. Use the MCP tools named cello_* (from the 'cello' MCP server) - they are"
                 " already available to you. Do NOT run the 'cello' command-line program, and do"
@@ -462,14 +495,20 @@ class CelloAdapter(BasePlatformAdapter):
 
         state = _safe_scalar(data.get("state"))
         counterparty = _safe_scalar(data.get("counterpartyPubkey"))
+        who = _render_who(data)
+        subject = (
+            who + " (counterparty pubkey " + counterparty + ")"
+            if who is not None
+            else "counterparty pubkey " + counterparty
+        )
         return (
             "CELLO wake: session "
             + session_id
+            + " with "
+            + subject
             + " changed state to '"
             + state
-            + "' (counterparty pubkey "
-            + counterparty
-            + "). This is a state notice, not a message. If it needs no action, reply with exactly"
+            + "'. This is a state notice, not a message. If it needs no action, reply with exactly"
             " [SILENT]. If you do need to act, call cello_use_agent with name='"
             + agent
             + "' first, then whichever cello_* tool you need."
