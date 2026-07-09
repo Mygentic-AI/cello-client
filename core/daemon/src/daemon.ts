@@ -65,7 +65,7 @@ import { upgradeAbsentToRecovered, hasAbsentParticipant } from "./seal-receipt-u
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, validateMoniker } from "@cello-protocol/protocol-types";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -1939,7 +1939,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_create_agent", async (params, _connectionId) => {
     const name = validateMoniker(params?.name);
     if (name === null) {
-      return { ok: false, reason: "invalid_agent_name", guidance: "Provide a 'name' (1-64 chars: letters, digits, '-' or '_') for the new agent." };
+      return { ok: false, reason: "invalid_agent_name", guidance: `Provide a 'name' (1-64 chars: letters, digits, '-' or '_'; regex ${MONIKER_RE.source}) for the new agent.` };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
     if (store.hasActiveAgent(name) || agents.some((a) => a.name === name)) {
@@ -2046,7 +2046,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_remove_agent", async (params, _connectionId) => {
     const name = validateMoniker(params?.name);
     if (name === null) {
-      return { ok: false, reason: "invalid_agent_name", guidance: "Provide the 'name' of the agent to remove (1-64 chars: letters, digits, '-' or '_')." };
+      return { ok: false, reason: "invalid_agent_name", guidance: `Provide the 'name' of the agent to remove (1-64 chars: letters, digits, '-' or '_'; regex ${MONIKER_RE.source}).` };
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
     // The active row (a fresh removal) OR the most-recent retired row (a DB-001 re-push). Captured BEFORE

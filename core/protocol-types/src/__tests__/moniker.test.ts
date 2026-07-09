@@ -112,6 +112,21 @@ describe("MONIKER-0 AC3 — named reject battery (the injection defense)", () =>
   });
 });
 
+describe("MONIKER-0 AC4 — the constant and the function are provably one rule", () => {
+  // Guards against a future reimplementation of validateMoniker with a second,
+  // internal regex that dodges the named battery but widens elsewhere (e.g.
+  // admits "."). For every ASCII codepoint, the function's verdict must equal
+  // the constant's — so there is exactly ONE rule, at one address.
+  it("agrees with MONIKER_RE on every single-character ASCII input", () => {
+    for (let code = 0; code < 128; code++) {
+      const ch = String.fromCharCode(code);
+      expect(validateMoniker(ch), `codepoint 0x${code.toString(16)}`).toBe(
+        MONIKER_RE.test(ch) ? ch : null,
+      );
+    }
+  });
+});
+
 describe("MONIKER-0 AC3 — strip-oracle regression", () => {
   // Stripping disallowed characters is a mutation oracle: a sender blocked
   // from "CELLO_Support" sends "C*E*L*L*O*_*S*u*p*p*o*r*t" and stripping
