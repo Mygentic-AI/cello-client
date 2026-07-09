@@ -393,6 +393,9 @@ export interface SessionListEntry {
   createdAt: string;
   updatedAt: string;
   interruptedAt: string | null;
+  /** MONIKER-5 AC1: the resolved display label (pet name ?? offered ?? fingerprint). */
+  who: string;
+  whoKnown: boolean;
 }
 
 /**

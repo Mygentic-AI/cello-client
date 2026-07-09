@@ -3729,6 +3729,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       sessionId: row.session_id,
       agentName: row.agent_name,
       counterpartyPubkey: row.counterparty_pubkey,
+      // MONIKER-5 AC1: the same resolution the doorbell uses — pet name ?? offered ?? fingerprint.
+      ...resolveWho(row.agent_name, row.counterparty_pubkey, row.session_id),
       status: row.status,
       category,
       messageCount,
@@ -5873,7 +5875,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_contact_list", async (params, connectionId) => {
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;
-    const contacts = sessionNodeManager.listContacts(resolved.agent);
+    // MONIKER-5 AC1: each row shows the resolved who (a contact has no session, so the offered
+    // tier doesn't apply — pet name ?? fingerprint).
+    const contacts = sessionNodeManager.listContacts(resolved.agent).map((c) => ({
+      ...c,
+      ...whoLabel({ localMoniker: c.moniker, offeredMoniker: null, pubkeyHex: c.pubkey }),
+    }));
     return { ok: true, agent: resolved.agent, contacts };
   });
 
