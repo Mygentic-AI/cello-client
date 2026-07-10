@@ -36,6 +36,42 @@ PKGS=(
   "connect:core/adapter-claude-code"
 )
 
+# Every version below is read from the WORKING TREE. A stale checkout therefore reports
+# "nothing to promote" while the world has moved on — the script's one job is to refuse when things
+# do not line up, so it must refuse here too rather than silently agree with itself.
+echo "=== Checking the checkout is current ==="
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git fetch origin --quiet 2>/dev/null || echo "  (fetch failed — offline? proceeding on local refs)"
+  BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  # Resolve the ACTUAL upstream. `origin/$BRANCH` is a guess: on a branch with no remote counterpart
+  # it does not resolve, and `|| echo 0` would report "0 behind" — a silent fallback inside the very
+  # guard that exists to stop silent fallbacks. No upstream ⇒ refuse; there is nothing to compare to.
+  UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+  if [[ -z "$UPSTREAM" ]]; then
+    echo "  ✗ '$BRANCH' has no upstream, so 'is this checkout current?' cannot be answered."
+    echo "    Publish and promote from a tracking branch (normally main). Refusing."
+    exit 1
+  fi
+  BEHIND=$(git rev-list --count "HEAD..$UPSTREAM")   # no fallback: a failure here must be loud
+  DIRTY=$(git status --porcelain -- '*/package.json' | wc -l | tr -d ' ')
+  if [[ "$BEHIND" != "0" ]]; then
+    echo "  ✗ $BRANCH is $BEHIND commit(s) behind $UPSTREAM."
+    echo "    Versions are read from your working tree, so this run would compare npm against a stale"
+    echo "    checkout and could report 'nothing to promote' when a cascade is waiting."
+    echo "    Run: git pull --ff-only && re-run this script."
+    exit 1
+  fi
+  if [[ "$DIRTY" != "0" ]]; then
+    echo "  ✗ uncommitted package.json changes. Commit or stash them; a version that is not on a tag"
+    echo "    was never published, and promoting it would point latest at a version npm does not have."
+    exit 1
+  fi
+  echo "  ✓ $BRANCH is current with origin, package.json files clean"
+else
+  echo "  (not a git repo — skipping)"
+fi
+echo
+
 echo "=== Verifying beta == local, and finding what actually needs promoting ==="
 FAILED=0
 declare -a PLAN=()
