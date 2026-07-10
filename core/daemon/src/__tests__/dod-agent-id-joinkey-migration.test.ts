@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
+import { migrateContactsAddTierMetadata } from "../contacts-tier-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { RetryQueue } from "../retry-queue.js";
@@ -272,7 +273,12 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
        VALUES ('id-a','alice',x'00','pub-a','created',1,1)`,
     ).run();
     migrated.exec("INSERT INTO contacts (agent_name, pubkey, added_at) VALUES ('alice','p',1)");
+    // Replay the manager's FULL init migration sequence, in order: the join-key re-key, then the
+    // DOD-TIER-1 contacts ADD COLUMN. `initialize()` runs both, so a faithful legacy replay must too —
+    // otherwise `migrated` lacks the tier metadata that a fresh init now creates. This keeps the
+    // fresh==migrated invariant honest against BOTH migrations, not just the re-key.
     migrateSessionTablesToAgentId(migrated, makeLogger().logger);
+    migrateContactsAddTierMetadata(migrated, makeLogger().logger);
     new RetryQueue(migrated, makeLogger().logger);
 
     for (const t of SEVEN) {

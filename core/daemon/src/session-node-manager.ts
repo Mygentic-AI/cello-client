@@ -76,6 +76,7 @@ import {
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
+import { TIER, normalizeTier, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -651,6 +652,12 @@ export class SessionNodeManager {
     // absent, is skipped, and RetryQueue then creates it directly in the re-keyed shape.
     migrateSessionTablesToAgentId(this.#db, this.#logger);
 
+    // DOD-TIER-1 (address-book Step 1): give `contacts` its tier metadata (tier / provenance /
+    // last_offered_moniker / away_message). Pure ADD COLUMN, no rebuild — so it runs AFTER the
+    // agent-id re-key above (it never needs to appear in that migration's pinned DDL) and BEFORE any
+    // read below. Idempotent, no column DEFAULT, grandfathers existing contacts to WHITELISTED once.
+    migrateContactsAddTierMetadata(this.#db, this.#logger);
+
     // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
     // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
     // token has no sensible default (a required credential, unlike AWAY/TTL/CONTACT's real
@@ -892,12 +899,31 @@ export class SessionNodeManager {
     return row !== undefined;
   }
 
+  /** DOD-TIER-1: the reachability tier for a counterparty of this agent. TOTAL by construction — an
+   *  absent contact row (undefined) OR a row whose `tier` is NULL both resolve to UNKNOWN via
+   *  `normalizeTier`, which also guards the JS `null >= 0`/`0 || 1` traps. A missing DB degrades to
+   *  UNKNOWN (the tighter default), never throws for a read. */
+  getTier(agentName: string, pubkey: string): number {
+    if (!this.#db) return TIER.UNKNOWN;
+    const row = this.#db
+      .prepare("SELECT tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
+      .get(this.#requireAgentId(agentName), pubkey) as { tier: number | null } | undefined;
+    return normalizeTier(row?.tier);
+  }
+
   /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
    *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an
    *  optional pet name; a NEW non-null moniker on re-add updates it, absence leaves it untouched.
    *  THROWS on an invalid moniker — callers validate first; this is the can-never-be-stored
-   *  backstop (same contract as DbIdentityStore.setMoniker). */
-  addContact(agentName: string, pubkey: string, moniker?: string | null): void {
+   *  backstop (same contract as DbIdentityStore.setMoniker).
+   *
+   *  DOD-TIER-1: a NEW row is stamped `tier = UNKNOWN` (never NULL — so there is no NULL window
+   *  between this step and Step 3's tier-on-create wiring; `getTier` normalizes any stray NULL to
+   *  UNKNOWN anyway, so this is honesty, not correctness) and an optional `provenance`
+   *  ('accepted' | 'initiated' | null). INSERT OR IGNORE means an EXISTING contact is untouched —
+   *  tier and provenance pin at first add, exactly as `added_at`/`moniker` already do. Raising the
+   *  tier is `cello_contact_set_tier`'s job (Step 3), never a side effect of re-adding. */
+  addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null): void {
     if (!pubkey) return;
     // Review F1: a missing DB handle must FAIL the write loudly — returning silently here let
     // the handler log contact.added and report ok:true for a row that never landed.
@@ -907,8 +933,8 @@ export class SessionNodeManager {
     }
     const agentId = this.#requireAgentId(agentName);
     this.#db
-      .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at) VALUES (?, ?, ?)")
-      .run(agentId, pubkey, Date.now());
+      .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at, tier, provenance) VALUES (?, ?, ?, ?, ?)")
+      .run(agentId, pubkey, Date.now(), TIER.UNKNOWN, provenance ?? null);
     if (moniker !== undefined && moniker !== null) {
       this.#db
         .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
