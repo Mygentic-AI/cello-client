@@ -216,6 +216,8 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
         session_timestamp: 1_700_000_000_000,
         signature_type: "frost",
         initiator_session_peer_id: "stranger-peer-id",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     });
     await wait(150);
@@ -245,6 +247,8 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
           session_timestamp: 1_700_000_000_000 + n,
           signature_type: "frost",
           initiator_session_peer_id: `stranger-peer-${n}`,
+          // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+          counterparty_session_peer_id: "bob-session-peer-id",
         },
       });
       await wait(120); // accepts are serialized — let each settle before the next
@@ -306,6 +310,8 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
         session_timestamp: 1_700_000_000_000,
         signature_type: "frost",
         initiator_session_peer_id: "stranger-peer-id",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     });
     await wait(150);
@@ -362,6 +368,8 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
         session_timestamp: 1_700_000_000_000,
         signature_type: "frost",
         initiator_session_peer_id: "attacker-peer-id",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     });
     await wait(150);

@@ -220,6 +220,8 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
           initiator_session_peer_id: naPeerId,
           session_timestamp: TS,
           signature_type: "frost",
+          // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+          counterparty_session_peer_id: "bob-session-peer-id",
         },
       });
 

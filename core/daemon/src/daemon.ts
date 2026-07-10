@@ -4429,6 +4429,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         participantAPubkeyHex: string;
         participantBPubkeyHex: string;
         initiatorPeerId: string;
+        // DOD-INBOUND-GUARD-1: the responder's accepted session endpoint. The directory omits
+        // this field when the offer was never accepted (offer-accept timeout → "empty defaults"),
+        // so null/"" here means NOBODY accepted — the initiator's F13 guard refuses the same
+        // assignment on its side, and the handler must refuse it here too. null when absent.
+        counterpartySessionPeerId: string | null;
         sessionTimestamp: number;
         signatureType: string | null;
         signerPubkeyHex: string | null;
@@ -4469,6 +4474,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       participantBPubkeyHex,
       initiatorPeerId:
         typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
+      counterpartySessionPeerId:
+        typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
       sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
       signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
       // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
@@ -4696,6 +4703,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger.debug("session.inbound.not_local", {
         sessionId: parsed.sessionIdHex,
         counterpartyPubkey: parsed.participantBPubkeyHex,
+        correlationId,
+      });
+      return;
+    }
+
+    // DOD-INBOUND-GUARD-1 (D3): the receive-side mirror of the initiator's F13 guard (~3189).
+    // An empty counterparty endpoint means the offer-accept never happened (this agent's standing
+    // receiver was not up when the directory's session_offer arrived) and the directory signed the
+    // assignment anyway, with "empty defaults". The initiator refuses that assignment and creates
+    // NO session — accepting it here builds a phantom session whose away-reply lands in the
+    // initiator's transcript with no session row: permanently unread AND unreadable. Refuse it
+    // loudly, before any session state exists. Nothing legitimate is lost — a session whose
+    // initiator has no address to dial is unusable by construction.
+    if (!parsed.counterpartySessionPeerId) {
+      logger.warn("session.inbound.assignment.incomplete", {
+        agentName: localAgent.name,
+        sessionId: parsed.sessionIdHex,
         correlationId,
       });
       return;

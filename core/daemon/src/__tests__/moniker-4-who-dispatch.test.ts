@@ -160,6 +160,8 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
       session_timestamp: 1_700_000_000_000,
       signature_type: "frost",
       initiator_session_peer_id: "alice-session-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterparty_session_peer_id: "bob-session-peer-id",
     };
     if (moniker !== undefined) assignment["moniker"] = moniker;
     return { type: "session_assignment", assignment };

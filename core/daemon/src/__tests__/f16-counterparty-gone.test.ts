@@ -171,6 +171,8 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
         initiator_session_peer_id: naPeerId,
         session_timestamp: TS,
         signature_type: "frost",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     });
     const awaited = await awaitP;

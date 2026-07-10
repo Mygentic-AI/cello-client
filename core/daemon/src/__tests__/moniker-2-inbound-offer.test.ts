@@ -165,6 +165,9 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
       session_timestamp: TS,
       signature_type: "frost",
       initiator_session_peer_id: "alice-session-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint;
+      // frames without it are refused (they mean nobody accepted the offer).
+      counterparty_session_peer_id: "bob-session-peer-id",
     };
     if (opts.moniker !== undefined) assignment["moniker"] = opts.moniker;
     return { type: "session_assignment", assignment };

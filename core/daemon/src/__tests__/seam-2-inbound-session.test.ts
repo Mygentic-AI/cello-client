@@ -151,6 +151,10 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     initiatorPeerId?: string;
     sessionTimestamp?: number;
     signatureType?: string;
+    // DOD-INBOUND-GUARD-1: the responder's accepted endpoint. The directory OMITS this field
+    // when nobody accepted the offer (directory-frames.ts encodes it only when non-empty), so
+    // `null` here builds exactly that broken frame. Defaults to present — a complete assignment.
+    counterpartyPeerId?: string | null;
   }): Record<string, unknown> {
     const assignment: Record<string, unknown> = {
       session_id: opts.sessionId ?? SID_BYTES,
@@ -160,6 +164,8 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       signature_type: opts.signatureType ?? "frost",
     };
     if (opts.initiatorPeerId !== undefined) assignment["initiator_session_peer_id"] = opts.initiatorPeerId;
+    const counterpartyPeerId = opts.counterpartyPeerId === undefined ? "bob-session-peer-id" : opts.counterpartyPeerId;
+    if (counterpartyPeerId !== null) assignment["counterparty_session_peer_id"] = counterpartyPeerId;
     return { type: "session_assignment", assignment };
   }
 
@@ -360,6 +366,73 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const refused = events.find((e) => e.event === "session.inbound.assignment.refused");
     expect(refused).toBeDefined();
     expect(refused!.context["reason"]).toBe("unsupported_signature_type");
+  });
+
+  // ─── DOD-INBOUND-GUARD-1 (D3, M8C-PHANTOM-SESSION-FIX-PLAN §4) ─────────────────────────────
+  // When the responder never accepts the session offer (standing receiver not up yet), the
+  // directory signs an assignment whose counterparty endpoint is EMPTY and pushes it to both
+  // parties. The initiator's F13 guard refuses it — the receiver must refuse it too, instead of
+  // building a session the initiator never created and auto-replying into a void. Mirrors F13.
+  describe("DOD-INBOUND-GUARD-1: the receiver refuses an assignment with no counterparty endpoint", () => {
+    async function refusalCase(counterpartyPeerId: string | null): Promise<{
+      events: LogEvent[];
+      snm: ReturnType<Awaited<ReturnType<typeof startDaemon>>["getSessionNodeManager"]>;
+    }> {
+      const { logger, events } = makeLogger();
+      const bobPubkey = await makeAgentDir("bob");
+      const node = new FakeNode();
+      const captured: Record<string, unknown>[] = [];
+      const injectRef: { inject?: (frame: unknown) => void } = {};
+      const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+      await wait(50);
+      const snm = h.getSessionNodeManager();
+      // Bob is fully online — acceptance WOULD succeed if the guard did not refuse. This keeps
+      // the test red for the right reason pre-fix (the assignment is currently accepted).
+      await snm.ensureStandingReceiverForAgent("bob");
+
+      injectRef.inject!(assignmentFrame({
+        initiatorPubkeyHex: "cd".repeat(32),
+        counterpartyPubkeyHex: bobPubkey,
+        initiatorPeerId: "alice-session-peer-id",
+        counterpartyPeerId,
+      }));
+      await wait(120);
+      return { events, snm };
+    }
+
+    function assertRefused(events: LogEvent[], snm: { getSessionRecord(a: string, s: string): unknown }): void {
+      // AC2: no session node, no DB row, no accept, no away response.
+      expect(snm.getSessionRecord("bob", SID_HEX)).toBeNull();
+      expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+      expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+      // SI: the refusal is loud — distinguishable from a dropped frame.
+      const incomplete = events.find((e) => e.event === "session.inbound.assignment.incomplete");
+      expect(incomplete).toBeDefined();
+      expect(incomplete!.level).toBe("warn");
+      expect(incomplete!.context["agentName"]).toBe("bob");
+      expect(incomplete!.context["sessionId"]).toBe(SID_HEX);
+      expect(incomplete!.context["correlationId"]).toBeTruthy();
+    }
+
+    it("AC2/AC3: an assignment MISSING counterparty_session_peer_id is refused loudly, and never surfaces on cello_await_session", async () => {
+      const { events, snm } = await refusalCase(null); // field omitted — the directory's actual broken frame
+      assertRefused(events, snm);
+
+      // AC3: cello_await_session never surfaces the refused assignment.
+      const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+      try {
+        await client.send("ipc.connect", { clientType: "test" });
+        await client.send("cello_start_agent", { name: "bob" });
+        await client.send("cello_use_agent", { name: "bob" });
+        const res = (await client.send("cello_await_session", { timeout_ms: 500 })) as Record<string, unknown>;
+        expect(res.type).toBe("timeout");
+      } finally { client.close(); }
+    });
+
+    it("AC2: an EMPTY-STRING counterparty_session_peer_id is refused the same way", async () => {
+      const { events, snm } = await refusalCase(""); // hostile/skewed encoder variant — same refusal
+      assertRefused(events, snm);
+    });
   });
 
   it("H2: a session arriving after the awaiting connection disconnected is NOT lost (delivered to a fresh await)", async () => {

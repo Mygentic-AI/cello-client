@@ -238,6 +238,8 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
         session_timestamp: 1_700_000_000_000,
         signature_type: "frost",
         initiator_session_peer_id: "initiator-peer-id",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     });
     await wait(150);

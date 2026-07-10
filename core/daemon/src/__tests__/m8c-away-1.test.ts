@@ -147,6 +147,8 @@ describe("M8C-AWAY-1: away response", () => {
         session_timestamp: TS,
         signature_type: "frost",
         initiator_session_peer_id: "alice-session-peer-id",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterparty_session_peer_id: "bob-session-peer-id",
       },
     };
   }
