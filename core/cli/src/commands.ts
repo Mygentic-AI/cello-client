@@ -125,8 +125,18 @@ async function daemonGone(lockFilePath: string, lock: { pid: number; socketPath:
   if (!isProcessAlive(lock.pid)) return true;
   const lockNow = await readLock(lockFilePath);
   if (lockNow && lockNow.pid === lock.pid) return false; // daemon hasn't finished its cleanup
+  // Review F5: a lock re-acquired by a DIFFERENT pid means a new daemon already started — which
+  // proves the old daemon's cleanup completed (its lock had to be gone for login to spawn). The
+  // socket now belongs to the new daemon; probing it would wrongly report the OLD one alive.
+  if (lockNow && lockNow.pid !== lock.pid) return true;
   try {
-    const probe = await connectToDaemon(lock.socketPath);
+    // Review F4: connectToDaemon has no connect timeout of its own — bound the probe so a
+    // pathological hang cannot stall the poll loop past its deadline. On the expected path the
+    // lock is already gone, so this fails fast (ENOENT/ECONNREFUSED).
+    const probe = await Promise.race([
+      connectToDaemon(lock.socketPath),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe_timeout")), 500)),
+    ]);
     probe.close();
     return false; // something still answers on the socket
   } catch {
@@ -134,20 +144,38 @@ async function daemonGone(lockFilePath: string, lock: { pid: number; socketPath:
   }
 }
 
-export async function logout(celloDir: string, onProgress?: (line: string) => void): Promise<CommandResult> {
+export async function logout(
+  celloDir: string,
+  onProgress?: (line: string) => void,
+  // Review F1: injectable bounds so the timeout path is testable without a 5 s wait. Production
+  // (the bin) passes nothing and gets the named defaults.
+  waitOpts?: { timeoutMs?: number; pollMs?: number },
+): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
   const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+  const timeoutMs = waitOpts?.timeoutMs ?? LOGOUT_WAIT_TIMEOUT_MS;
+  const pollMs = waitOpts?.pollMs ?? LOGOUT_WAIT_POLL_MS;
 
   if (!lock) {
     return { exitCode: 0, output: "No daemon running." };
   }
 
   // DOD-LOGOUT-WAIT-1: a lock whose pid is dead is not a running daemon — say so (exit 0) and
-  // clean the stale lock up so the next login doesn't have to.
+  // clean the stale lock up so the next login doesn't have to. Review F3: only CLAIM the removal
+  // when it actually happened — removeLock swallows non-ENOENT errors into a (here discarded)
+  // warn, and printing "Removed" for a lock still on disk would be this unit's own lie in
+  // miniature.
   if (!isProcessAlive(lock.pid)) {
-    await removeLock(lockFilePath, noopLogger).catch(() => { /* best-effort */ });
-    return { exitCode: 0, output: "No daemon running. (Removed a stale daemon.lock.)" };
+    const removed = await removeLock(lockFilePath, noopLogger)
+      .then(async () => (await readLock(lockFilePath)) === null)
+      .catch(() => false);
+    return {
+      exitCode: 0,
+      output: removed
+        ? "No daemon running. (Removed a stale daemon.lock.)"
+        : `No daemon running. (A stale daemon.lock remains at ${lockFilePath} and could not be removed — check its permissions.)`,
+    };
   }
 
   try {
@@ -168,17 +196,17 @@ export async function logout(celloDir: string, onProgress?: (line: string) => vo
   // out while being told otherwise. Wait until the daemon is genuinely gone; "Daemon stopped."
   // for a daemon that is still running is the same class of lie as a success log on a failed
   // send (DOD-SENDRAW-1).
-  const deadline = Date.now() + LOGOUT_WAIT_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await daemonGone(lockFilePath, lock)) {
       return { exitCode: 0, output: "Daemon stopped." };
     }
-    await new Promise((r) => setTimeout(r, LOGOUT_WAIT_POLL_MS));
+    await new Promise((r) => setTimeout(r, pollMs));
   }
   return {
     exitCode: 1,
     output:
-      `Daemon shutdown did not complete within ${LOGOUT_WAIT_TIMEOUT_MS / 1000}s ` +
+      `Daemon shutdown did not complete within ${timeoutMs / 1000}s ` +
       `(pid ${lock.pid}, socket ${lock.socketPath}). The daemon acknowledged the request but is ` +
       `still running — it may be stuck closing sessions or its database. Check 'cello status'; ` +
       `if it never exits, stop it manually (kill ${lock.pid}) and re-run 'cello logout' to clean up.`,

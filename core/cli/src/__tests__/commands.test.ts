@@ -87,6 +87,7 @@ describe("cli commands", () => {
         const config = makeConfig();
         handle = await startDaemon(config);
 
+        const started = Date.now();
         const result = await logout(tempDir);
         expect(result.exitCode).toBe(0);
         expect(result.output).toContain("Daemon stopped");
@@ -95,6 +96,9 @@ describe("cli commands", () => {
         // IMMEDIATELY on return — the exact inputs connectOrStart consults:
         await expect(readLock(config.lockFilePath)).resolves.toBeNull();
         await expect(connectToDaemon(config.socketPath)).rejects.toThrow();
+        // Anti-sleep pin (review): logout POLLS — it returns promptly once the daemon dies,
+        // well inside the 5s bound. A flat sleep-to-deadline hollow fails this.
+        expect(Date.now() - started).toBeLessThan(3_000);
       });
 
       it("AC2 (Andre's live transcript): logout;login against a REAL spawned daemon yields 'Daemon started.' — never 'Daemon already running.'", async () => {
@@ -103,10 +107,12 @@ describe("cli commands", () => {
         // the real built daemon via login, then logout && login with no delay.
         const daemonBin = join(import.meta.dirname, "../../../daemon/dist/bin/cello-daemon.js");
         const first = await login(tempDir, daemonBin, logger);
-        expect(first.exitCode).toBe(0);
-        expect(first.output.startsWith("Daemon started.")).toBe(true);
-
         try {
+          // Review F2: these asserts live INSIDE the try — a failure here must still reap the
+          // spawned daemon via the finally-logout, or CI leaks a detached process.
+          expect(first.exitCode).toBe(0);
+          expect(first.output.startsWith("Daemon started.")).toBe(true);
+
           const outLogout = await logout(tempDir);
           expect(outLogout.exitCode).toBe(0);
           expect(outLogout.output).toContain("Daemon stopped");
@@ -141,7 +147,39 @@ describe("cli commands", () => {
         const result = await logout(tempDir);
         expect(result.exitCode).toBe(0);
         expect(result.output).toContain("No daemon running");
+        expect(result.output).toContain("Removed a stale daemon.lock");
         await expect(readLock(config.lockFilePath)).resolves.toBeNull();
+      });
+
+      // Review F1 (blocking): the FAIL-LOUD timeout branch was unguarded — an implementation
+      // whose timeout printed "Daemon stopped." exit 0 (the exact lie this unit kills) passed
+      // the suite. A fake daemon acknowledges the shutdown but never dies: live pid (ours),
+      // lock never removed, socket stays up.
+      it("timeout: a daemon that acknowledges but never dies → exit 1 naming pid + socket, NEVER 'Daemon stopped.'", async () => {
+        const config = makeConfig();
+        await acquireLock(config.lockFilePath, { pid: process.pid, socketPath: config.socketPath, version: "0.0.1-test" });
+        const server: Server = createServer((socket) => {
+          socket.on("data", (chunk: Buffer) => {
+            const line = chunk.toString("utf-8").trim();
+            if (!line) return;
+            const req = JSON.parse(line) as { id: string | number; method: string };
+            // Acknowledge shutdown like the real daemon (daemon.ts shutdown handler), then
+            // deliberately stay up — the hung-daemon shape.
+            socket.write(JSON.stringify({ id: req.id, result: { acknowledged: true } }) + "\n");
+          });
+        });
+        await new Promise<void>((resolve) => server.listen(config.socketPath, resolve));
+
+        try {
+          const result = await logout(tempDir, undefined, { timeoutMs: 600, pollMs: 25 });
+          expect(result.exitCode).toBe(1);
+          expect(result.output).not.toContain("Daemon stopped");
+          expect(result.output).toContain(String(process.pid));
+          expect(result.output).toContain(config.socketPath);
+          expect(result.output).toMatch(/did not complete/i);
+        } finally {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
       });
     });
   });
