@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
+import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -172,6 +173,32 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     if (opts.moniker !== undefined) assignment["moniker"] = opts.moniker;
     return { type: "session_assignment", assignment };
   }
+
+  it("DOD-RENAME-1: a differing self-declared name from a NAMED contact surfaces a rename notice in cello_check_notifications (INBOX, not a push)", async () => {
+    const h = await startHarness();
+    const initiator = "d1".repeat(32);
+    const sid = (n: number): Uint8Array => Uint8Array.from(Array.from({ length: 16 }, (_, b) => (n * 16 + b) & 0xff));
+    // bob KNOWS and has PERSONALLY NAMED the initiator — the precondition for Option-C rename notices.
+    h.snm.addContact("bob", initiator, undefined, "accepted", TIER.KNOWN);
+    h.snm.setContactMoniker("bob", initiator, "Mum");
+
+    // First offer establishes the baseline (no notice); a later DIFFERING name fires the notice.
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Alice", sessionId: sid(1) }));
+    await wait(120);
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "AliceCorp", sessionId: sid(2) }));
+    await wait(120);
+
+    const bob = await connectAs(h.socketPath, "bob");
+    const inbox = (await bob.client.send("cello_check_notifications", {})) as {
+      agents: Array<{ agent: string; rename_notices: Array<{ pubkey: string; claimed_name: string; notice: string }> }>;
+    };
+    const bobAgent = inbox.agents.find((a) => a.agent === "bob")!;
+    expect(bobAgent.rename_notices).toHaveLength(1);
+    expect(bobAgent.rename_notices[0]).toMatchObject({ pubkey: initiator, claimed_name: "AliceCorp" });
+    expect(bobAgent.rename_notices[0].notice).toContain('"AliceCorp"'); // rendered as a quoted, untrusted claim
+    // AC2: the operator's local pet name is never overwritten by the offered name.
+    expect(h.snm.getContactMoniker("bob", initiator)).toBe("Mum");
+  });
 
   it("AC2: a valid offered moniker survives the boundary and rides the await_session event", async () => {
     const h = await startHarness();

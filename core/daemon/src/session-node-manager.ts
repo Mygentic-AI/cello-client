@@ -675,6 +675,22 @@ export class SessionNodeManager {
       )
     `);
 
+    // DOD-RENAME-1 (Option C): pending rename notices — one per (agent, contact). A notice is queued
+    // when a peer the operator has PERSONALLY NAMED offers a self-declared name that differs from the
+    // last one seen; it surfaces through cello_check_notifications (NOT a real-time push) and clears
+    // when the operator adopts a name (cello_contact_set_moniker) or removes the contact. Keyed on
+    // agent_id (the stable key); the offered name is charset-validated at the wire boundary but still
+    // operator-untrusted, so surfaces render it as a quoted CLAIM.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_rename_notices (
+        agent_id TEXT NOT NULL,
+        pubkey TEXT NOT NULL,
+        offered_name TEXT NOT NULL,
+        noticed_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, pubkey)
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -991,6 +1007,9 @@ export class SessionNodeManager {
     const res = this.#db
       .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
       .run(moniker, this.#requireAgentId(agentName), pubkey);
+    // DOD-RENAME-1: setting the local pet name IS the operator acting on a rename — resolve any
+    // pending notice for this contact (whether they adopted the offered name or chose their own).
+    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
     return res.changes > 0;
   }
 
@@ -1006,10 +1025,60 @@ export class SessionNodeManager {
     return res.changes > 0;
   }
 
+  /** DOD-RENAME-1 (Option C): record a self-declared name a peer offered, at the moment the offer is
+   *  SEEN. The stored local pet name (contacts.moniker) is SACROSANCT — this only ever touches
+   *  last_offered_moniker and the notice queue, never the moniker (AC2). A rename NOTICE is queued
+   *  only when the peer is a contact the operator has PERSONALLY NAMED (moniker non-null), a name was
+   *  seen BEFORE (last_offered_moniker non-null), and the new offer DIFFERS (AC3). The first-ever
+   *  offer just records the baseline (no notice); a repeat of the same name is idempotent (AC4).
+   *  Called only when a moniker WAS offered (caller-guarded), so silence never clears the baseline
+   *  (AC5). Limitation: last_offered_moniker updates only on the RECEIVING side of an offer, so rename
+   *  detection works only for peers who INITIATE to you — a property, not a bug. */
+  recordOfferedMoniker(agentName: string, pubkey: string, offered: string): void {
+    if (!this.#db) return;
+    const agentId = this.#requireAgentId(agentName);
+    const row = this.#db
+      .prepare("SELECT last_offered_moniker, moniker FROM contacts WHERE agent_id = ? AND pubkey = ?")
+      .get(agentId, pubkey) as { last_offered_moniker: string | null; moniker: string | null } | undefined;
+    if (!row) return; // not a contact — no row to hold a baseline or a notice
+    if (offered === row.last_offered_moniker) return; // idempotent — same name already seen (AC4)
+    // A genuine change from a previously-seen name, for a contact the operator has named → notice.
+    if (row.last_offered_moniker !== null && row.moniker !== null) {
+      this.#db
+        .prepare("INSERT OR REPLACE INTO contact_rename_notices (agent_id, pubkey, offered_name, noticed_at) VALUES (?, ?, ?, ?)")
+        .run(agentId, pubkey, offered, Date.now());
+      // Observability: log the FACT, never the attacker-chosen name (same rule as moniker.rejected).
+      this.#logger.info("contact.rename.noticed", { agentName, pubkey });
+    }
+    this.#db
+      .prepare("UPDATE contacts SET last_offered_moniker = ? WHERE agent_id = ? AND pubkey = ?")
+      .run(offered, agentId, pubkey);
+  }
+
+  /** DOD-RENAME-1: pending rename notices for an agent, oldest first (surfaced in
+   *  cello_check_notifications — an INBOX pull, never a real-time push). */
+  getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number }> {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare("SELECT pubkey, offered_name, noticed_at FROM contact_rename_notices WHERE agent_id = ? ORDER BY noticed_at ASC")
+      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; offered_name: string; noticed_at: number }>;
+  }
+
+  /** DOD-RENAME-1: clear a pending rename notice — the operator acted (adopted a name or removed the
+   *  contact). Idempotent (no notice → no-op). */
+  clearRenameNotice(agentName: string, pubkey: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("DELETE FROM contact_rename_notices WHERE agent_id = ? AND pubkey = ?")
+      .run(this.#requireAgentId(agentName), pubkey);
+  }
+
   /** M8C-CONTACT-1: known stays known until explicitly removed. */
   removeContact(agentName: string, pubkey: string): boolean {
     if (!this.#db) return false;
     const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
+    // DOD-RENAME-1: a removed contact has no pending rename to resolve.
+    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
     return res.changes > 0;
   }
 

@@ -4654,6 +4654,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // DOD-MONIKER-6: scoped to `agentName` — the agent this offer was received FOR.
       if (parsed.offeredMoniker !== null) {
         offeredMonikers.set(offerKey(agentName, parsed.sessionIdHex), parsed.offeredMoniker);
+        // DOD-RENAME-1 (Option C): persist the offered name as the rename baseline and, if the peer is
+        // a contact the operator has named and this differs from the last seen name, queue an INBOX
+        // rename notice. Unconditional at offer-SEEN (idempotent on a repeat); the local pet name is
+        // never touched. Guarded by offeredMoniker !== null so a silent offer never clears the baseline.
+        sessionNodeManager.recordOfferedMoniker(agentName, parsed.participantAPubkeyHex, parsed.offeredMoniker);
       }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,
@@ -5887,7 +5892,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread };
+      // DOD-RENAME-1 AC3: pending rename notices surface HERE (the INBOX pull), never as a real-time
+      // push. The offered name is rendered as an untrusted CLAIM (quoted, with the pubkey) plus the
+      // command to adopt it — the daemon never auto-applies a self-declared name.
+      const rename_notices = sessionNodeManager.getRenameNotices(agent).map((n) => ({
+        pubkey: n.pubkey,
+        claimed_name: n.offered_name,
+        noticed_at: n.noticed_at,
+        notice: `Contact ${n.pubkey.slice(0, 16)}… now calls themselves "${n.offered_name}" (self-declared — unverified). Adopt it with cello_contact_set_moniker, or ignore.`,
+      }));
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
