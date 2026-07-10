@@ -237,7 +237,13 @@ export interface ReceivedEnvelope {
  */
 export type InitiateSessionResult =
   | { ok: true; sessionId: Uint8Array; genesisPrevRoot: Uint8Array }
-  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" | "session_request_missing_peer_id" | "counterparty_offline" | "unknown_agent" | "discovery_node_unresolvable" | "visiting_connection_unreachable" };
+  | { ok: false; reason: "target_offline" | "relay_unavailable" | "target_busy" | "timeout" | "directory_unreachable" | "frost_signer_not_configured" | "directory_below_threshold" | "ceremony_timeout" | "ceremony_exhausted" | "ceremony_conflict" | "no_connection" | "relay_auth_error" | "relay_auth_failed" | "dial_counterparty_failed" | "unsupported_signature_type" | "frost_signature_invalid" | "assignment_missing_session_peer_id" | "assignment_peer_id_mismatch" | "assignment_tbs_verification_failed" | "session_request_missing_peer_id" | "counterparty_offline" | "unknown_agent" | "discovery_node_unresolvable" | "visiting_connection_unreachable"
+      // DOD-DIR-FAILCLOSED-1 (D2): the directory failed closed — the target never accepted the
+      // session_offer, so no (endpoint-less) assignment was signed. Distinct from target_offline.
+      | "counterparty_did_not_accept"
+      // Present in the directory's reason union since M7/M8; never surfaced here (collapsed to
+      // directory_unreachable) until D2 traced the same defect across all three allowlists.
+      | "agent_revoked" | "agent_suspended" };
 
 // ─── CelloClient interface ────────────────────────────────────────────────────
 

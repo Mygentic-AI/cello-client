@@ -155,5 +155,13 @@ export function mapSessionRequestErrorFrame(
   if (reason === "no_connection") return { ok: false, reason: "no_connection" };
   if (reason === "connection_id_required") return { ok: false, reason: "no_connection" };
   if (reason === "session_request_missing_peer_id") return { ok: false, reason: "session_request_missing_peer_id" };
+  // DOD-DIR-FAILCLOSED-1 (D2): the directory refused to sign an endpoint-less assignment because the
+  // target never accepted the session_offer. Falling through to `directory_unreachable` would blame a
+  // healthy directory for a counterparty that declined.
+  if (reason === "counterparty_did_not_accept") return { ok: false, reason: "counterparty_did_not_accept" };
+  // Same collapse, pre-existing: both have been in the directory's reason union since M7/M8 and were
+  // never mapped here, so a revoked/suspended agent read as "directory_unreachable".
+  if (reason === "agent_revoked") return { ok: false, reason: "agent_revoked" };
+  if (reason === "agent_suspended") return { ok: false, reason: "agent_suspended" };
   return { ok: false, reason: "directory_unreachable" };
 }

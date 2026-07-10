@@ -255,4 +255,37 @@ describe("CELLO-M6B-002: MCP tool error messages", () => {
       await cleanup();
     }
   });
+
+  // ─── DOD-DIR-FAILCLOSED-1 (D2) cross-repo: the fail-closed reason must SURVIVE the mapper ───
+  //
+  // The directory now fails closed with session_request_error{counterparty_did_not_accept} instead
+  // of FROST-signing an endpoint-less assignment. But every mapper keeps its OWN allowlist, and an
+  // unlisted reason falls through to `directory_unreachable` — telling the operator the DIRECTORY
+  // was unreachable when the directory was fine and the COUNTERPARTY simply never accepted. That
+  // names the wrong subsystem, which is exactly what the debugging discipline forbids.
+  // `agent_revoked` / `agent_suspended` were already being swallowed the same way.
+  describe("DOD-DIR-FAILCLOSED-1: distinct directory reasons are not collapsed to directory_unreachable", () => {
+    it("counterparty_did_not_accept survives the mapper (the counterparty refused — the directory is fine)", () => {
+      const result = mapSessionRequestErrorFrame({ type: "session_request_error", reason: "counterparty_did_not_accept" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("counterparty_did_not_accept");
+        expect(result.reason).not.toBe("directory_unreachable");
+      }
+    });
+
+    it("agent_revoked and agent_suspended survive the mapper (pre-existing collapse, same defect)", () => {
+      for (const reason of ["agent_revoked", "agent_suspended"] as const) {
+        const result = mapSessionRequestErrorFrame({ type: "session_request_error", reason });
+        expect(result.ok).toBe(false);
+        if (!result.ok) expect(result.reason).toBe(reason);
+      }
+    });
+
+    it("a genuinely unknown reason still falls back to directory_unreachable (the fallback is correct — just not for known reasons)", () => {
+      const result = mapSessionRequestErrorFrame({ type: "session_request_error", reason: "some_future_reason" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("directory_unreachable");
+    });
+  });
 });

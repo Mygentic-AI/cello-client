@@ -173,6 +173,13 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     "session_request_missing_peer_id",
     "agent_revoked", // CELLO-M7-REMOVE-001 DOD-REMOVE-3: the target (or initiator) agent is revoked
     "agent_suspended", // CELLO-M8-LEVER-001 DOD-INV-6: the target/initiator is PAUSED (reversible suspend)
+    // DOD-DIR-FAILCLOSED-1 (D2): the directory fails closed instead of FROST-signing an
+    // endpoint-less assignment — the target never accepted the session_offer. Distinct from
+    // target_offline: the target IS connected to the directory, it just cannot serve this session
+    // (e.g. its standing receiver has not come up). Omitting it here collapses the cause to
+    // `directory_unreachable`, blaming the DIRECTORY for a healthy directory and a COUNTERPARTY
+    // that declined — the wrong subsystem, which is what makes such bugs cost days.
+    "counterparty_did_not_accept",
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
 }
