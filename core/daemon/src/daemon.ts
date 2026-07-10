@@ -5678,10 +5678,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "missing_params", guidance: "Provide 'session_id' (hex) to receive content for a specific session." };
     }
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
+    // DOD-UNREAD-1 D4b: a TRANSCRIPT-ONLY session — received rows exist but no sessions row (the
+    // pre-D3/D4a phantom residue: the counterparty's reply landed while this side refused the
+    // session). Those rows are counted unread by getUnreadSummary, so cello_receive MUST be able
+    // to read them or the badge can never clear. Reading is a transcript operation: the since_seq
+    // catch-up below works from the durable transcript alone. Only a session with NEITHER a row
+    // NOR transcript rows is truly not found.
+    let transcriptOnly = false;
     if (!record) {
-      return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
-    }
-    if (record.agent_name !== agentName) {
+      if (sessionNodeManager.readTranscript(agentName, sessionId).messages.length === 0) {
+        return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
+      }
+      transcriptOnly = true;
+    } else if (record.agent_name !== agentName) {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
 
@@ -5694,7 +5703,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const rawSince = params?.since_seq;
     if (typeof rawSince === "number" && Number.isFinite(rawSince)) {
       const sinceSeq = rawSince;
-      const from = record.counterparty_pubkey;
+      // D4b AC2: a transcript-only session has no record to attribute from — `from` is null,
+      // NEVER the string "unknown" (the transcript stores no counterparty; don't invent one).
+      const from = record ? record.counterparty_pubkey : null;
       const { messages } = sessionNodeManager.readTranscript(agentName, sessionId);
       const received = messages.filter((m) => m.direction === "received" && m.sequence > sinceSeq);
       if (received.length > 0) {
@@ -5713,6 +5724,18 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         since_seq: sinceSeq,
         count: received.length,
         messages: received.map((m) => ({ sequence: m.sequence, content: m.text, from })),
+      };
+    }
+
+    // D4b AC3: the plain (blocking) receive waits on a LIVE session's buffer — a transcript-only
+    // session has no live node and nothing will ever arrive. Waiting to a null timeout would be
+    // misleading and session_not_found would be a lie (the transcript exists). A distinct reason
+    // points the caller at the read that works.
+    if (transcriptOnly) {
+      return {
+        ok: false,
+        reason: "session_not_live",
+        guidance: "This session exists only as a durable transcript (no live session — it was never established or predates this daemon). Read it with cello_receive { since_seq } (e.g. since_seq: -1 for everything) or cello_get_transcript.",
       };
     }
 

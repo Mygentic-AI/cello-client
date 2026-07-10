@@ -205,4 +205,71 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     expect(accepted).toBe(1);
     expect(rejected).toBe(1);
   });
+
+  // ─── DOD-UNREAD-1 D4a (M8C-PHANTOM-SESSION-FIX-PLAN §4, producer-first) ─────────────────────
+  // Never record content you cannot attribute. Pre-fix, ingest for a session with NO sessions row
+  // wrote a received transcript row with senderPubkey="unknown" — an unattributable, unreadable,
+  // permanently-unread artifact (the transcript has no counterparty column, so the attribution is
+  // gone for good). After D3 this path is unreachable from the wire, which makes the guard a
+  // fail-loud assertion exactly where one belongs.
+  describe("DOD-UNREAD-1 D4a: ingest refuses content for a session with no sessions row", () => {
+    interface LogEvent { level: string; event: string; context: Record<string, unknown> }
+    function makeCapturingLogger(): { logger: Logger; events: LogEvent[] } {
+      const events: LogEvent[] = [];
+      const logger: Logger = {
+        debug(event, context) { events.push({ level: "debug", event, context: context ?? {} }); },
+        info(event, context) { events.push({ level: "info", event, context: context ?? {} }); },
+        warn(event, context) { events.push({ level: "warn", event, context: context ?? {} }); },
+        error(event, context) { events.push({ level: "error", event, context: context ?? {} }); },
+      };
+      return { logger, events };
+    }
+
+    async function setupCapturing(): Promise<{ mgr: SessionNodeManager; events: LogEvent[] }> {
+      const { logger, events } = makeCapturingLogger();
+      const dbPath = join(tempDir, `snm-orphan-${Math.random().toString(36).slice(2)}.db`);
+      const mgr = new SessionNodeManager({ factory: new SharedFactory(new FakeNode() as unknown as CelloNode), logger, dbPath, securityGateway: new CountingGateway("allow") });
+      managers.push(mgr);
+      await mgr.initialize();
+      return { mgr, events };
+    }
+
+    it("AC1-AC4: no sessions row → refused loudly; no transcript row, no leaf, no buffer, no unread minted", async () => {
+      const { mgr, events } = await setupCapturing();
+      // Deliberately NO createSessionNode — the session does not exist for alice.
+      const content = enc("reply into the void");
+      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-orphan");
+
+      // AC1: refused, with a distinct reason.
+      expect(res.ok).toBe(false);
+      expect((res as { reason: string }).reason).toBe("session_orphaned");
+      // AC2/SI: loud, at warn, with the spec'd fields — distinguishable from a dropped frame.
+      const orphaned = events.find((e) => e.event === "session.content.orphaned");
+      expect(orphaned).toBeDefined();
+      expect(orphaned!.level).toBe("warn");
+      expect(orphaned!.context["agentName"]).toBe("alice");
+      expect(orphaned!.context["sessionId"]).toBe(SID);
+      expect(orphaned!.context["correlationId"]).toBe("corr-orphan");
+      // AC3 (drop, visibly): nothing was recorded anywhere.
+      expect(mgr.readTranscript("alice", SID).messages).toHaveLength(0);
+      expect(mgr.getSessionTree("alice", SID).size()).toBe(0);
+      expect(mgr.takeReceivedContent("alice", SID)).toBeNull();
+      // THE INVARIANT: no unread is minted for a session cello_receive cannot read.
+      expect(mgr.getUnreadSummary("alice")).toHaveLength(0);
+      // AC4: "unknown" was never papered in.
+      expect(events.find((e) => e.event === "session.content.sender_unresolved")).toBeUndefined();
+    });
+
+    it("regression: with a sessions row, ingest still delivers and attributes the sender from the record", async () => {
+      const { mgr } = await setupCapturing();
+      await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
+      const content = enc("attributed message");
+      const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
+      expect(res.ok).toBe(true);
+      const entry = mgr.takeReceivedContent("alice", SID);
+      expect(entry).not.toBeNull();
+      expect(entry!.senderPubkey).toBe("bobpubkey"); // from the session record, never "unknown"
+      expect(mgr.readTranscript("alice", SID).messages).toHaveLength(1);
+    });
+  });
 });

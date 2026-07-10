@@ -2708,9 +2708,20 @@ export class SessionNodeManager {
     // local transcript is INCOMPLETE (not frozen-final). Recovering that parked content COMPLETES
     // the local view to match the counterparty BEFORE the bilateral seal — it is not a resumption
     // (no new activity, no re-accept) and its root was never committed. So allow 'active' AND
-    // 'interrupted'; reject only the two committed states. (No DB row = test-only path, allowed.)
+    // 'interrupted'; reject only the two committed states.
     const record = this.getSessionRecord(agentName, sessionId);
-    if (record && (record.status === "sealed" || record.status === "seal_interrupted_pending")) {
+    // DOD-UNREAD-1 D4a: NEVER record content you cannot attribute. With no sessions row there is
+    // no counterparty — the transcript has no counterparty column, so a row written here is
+    // unattributable forever, counted unread by getUnreadSummary, and unreadable by cello_receive
+    // (the phantom-session residue). The old "(No DB row = test-only path, allowed.)" fallback
+    // papered that in with senderPubkey="unknown". Refuse loudly instead; the content stays
+    // un-acked, so a live sender redelivers once the session actually exists. After D3
+    // (DOD-INBOUND-GUARD-1) this path is unreachable from the wire — a fail-loud assertion.
+    if (!record) {
+      this.#logger.warn("session.content.orphaned", { agentName, sessionId, correlationId });
+      return { ok: false, reason: "session_orphaned" };
+    }
+    if (record.status === "sealed" || record.status === "seal_interrupted_pending") {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
         reason: "session_committed",
@@ -2736,14 +2747,13 @@ export class SessionNodeManager {
     }
 
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    let senderPubkey = entry?.counterpartyPubkey
-      ?? this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+    const senderPubkey = entry?.counterpartyPubkey ?? record.counterparty_pubkey;
     if (!senderPubkey) {
-      // M8C-MSGWAKE-1 (reviewer F1): the sender can't be resolved from the active node or the session
-      // record. MSGWAKE now surfaces this as the doorbell's `from`, so a chronic miss would silently
-      // ship `from: "unknown"` on every wake — log it loudly instead of papering it in.
+      // DOD-UNREAD-1 D4a (AC4, supersedes the MSGWAKE-1 F1 paper-in): the schema requires
+      // counterparty_pubkey NOT NULL, so this is unreachable unless a row was hand-crafted empty.
+      // Either way, "unknown" is never written to a transcript row — refuse instead.
       this.#logger.warn("session.content.sender_unresolved", { sessionId, agentName, correlationId });
-      senderPubkey = "unknown";
+      return { ok: false, reason: "sender_unresolved" };
     }
 
     // DOD-MSG-5: a content_hash satisfies AT MOST ONE Merkle leaf, exactly once. If this hash is

@@ -152,4 +152,78 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     expect(res).not.toHaveProperty("messages"); // no batch shape
     expect(res["content"]).toBeNull();
   });
+
+  // ─── DOD-UNREAD-1 D4b (M8C-PHANTOM-SESSION-FIX-PLAN §4, reader for legacy residue) ──────────
+  // Installs that predate D3/D4a carry received transcript rows with NO sessions row (the phantom
+  // sessions' orphaned replies). getUnreadSummary counts them; cello_receive returned
+  // session_not_found — permanently unread AND unreadable. The catch-up read must work from the
+  // durable transcript alone; the badge clears only by ACTUAL delivery, never by hiding.
+  describe("DOD-UNREAD-1 D4b: a transcript-only session (no sessions row) is readable via since_seq", () => {
+    // The real residue shape: received rows exist (recordTranscriptMessage never required a
+    // sessions row), the sessions table has nothing.
+    function seedOrphan(agent: string, session: string, texts: string[]) {
+      texts.forEach((t, i) => seed(agent, session, i, "received", t));
+    }
+
+    it("acceptance: unread counted → since_seq delivers with from:null → watermark advances → unread clears by DELIVERY", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const s = "e".repeat(64);
+      seedOrphan("alice", s, ["Dispatched.", "Agent is currently away. Your session request has been received and queued."]);
+
+      // BEFORE the read: the badge shows the two messages (they are real — never hide them).
+      const before = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+      const beforeAgents = before["agents"] as Array<{ unread: Array<{ session_id: string; unread_count: number }> }>;
+      const beforeEntry = beforeAgents[0].unread.find((u) => u.session_id === s);
+      expect(beforeEntry).toBeDefined();
+      expect(beforeEntry!.unread_count).toBe(2);
+
+      // The catch-up read works WITHOUT a sessions row, and attribution is null — never "unknown".
+      const res = (await client.send("cello_receive", { session_id: s, since_seq: -1 })) as R;
+      expect(res["ok"]).toBe(true);
+      expect(res["count"]).toBe(2);
+      const msgs = res["messages"] as Array<{ sequence: number; content: string; from: string | null }>;
+      expect(msgs.map((m) => m.sequence)).toEqual([0, 1]);
+      expect(msgs.map((m) => m.content)).toEqual(["Dispatched.", "Agent is currently away. Your session request has been received and queued."]);
+      expect(msgs.every((m) => m.from === null)).toBe(true);
+
+      // AFTER actual delivery: the badge clears — by the watermark, not by a JOIN that hides rows.
+      const after = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+      const afterAgents = after["agents"] as Array<{ unread: Array<{ session_id: string }> }>;
+      expect(afterAgents[0].unread.find((u) => u.session_id === s)).toBeUndefined();
+    });
+
+    it("plain receive on a transcript-only session → session_not_live with since_seq guidance — never session_not_found", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const s = "f".repeat(64);
+      seedOrphan("alice", s, ["stranded reply"]);
+
+      const res = (await client.send("cello_receive", { session_id: s, timeout_ms: 200 })) as R;
+      expect(res["ok"]).toBe(false);
+      expect(res["reason"]).toBe("session_not_live"); // session_not_found would be a lie — the transcript exists
+      expect(String(res["guidance"])).toMatch(/since_seq/);
+    });
+
+    it("regression: a session with NEITHER a sessions row NOR transcript rows is still session_not_found", async () => {
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const s = "9".repeat(64);
+      const plain = (await client.send("cello_receive", { session_id: s, timeout_ms: 100 })) as R;
+      expect(plain["ok"]).toBe(false);
+      expect(plain["reason"]).toBe("session_not_found");
+      const batch = (await client.send("cello_receive", { session_id: s, since_seq: -1 })) as R;
+      expect(batch["ok"]).toBe(false);
+      expect(batch["reason"]).toBe("session_not_found");
+    });
+  });
 });
