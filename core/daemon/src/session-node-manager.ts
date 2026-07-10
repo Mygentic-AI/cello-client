@@ -3137,10 +3137,16 @@ export class SessionNodeManager {
     // the append/hold branch is synchronous, so whichever call resumes first appends/holds before
     // the second's re-check runs, and the second's freshly-recomputed totals correctly include the
     // first's contribution.
-    if (!this.isContact(agentName, senderPubkey)) {
+    {
+      // DOD-TIER-2 AC2 (re-check): the SAME tier cap as the primary gate above, recomputed in this
+      // synchronous window (the totals can go stale across the screenInbound await). Applied to EVERY
+      // sender — a contact is no longer exempt (INV-TIER-BOUND). Must mirror the primary gate exactly
+      // so a sender can never pass one and fail the other.
+      const senderTier = this.getTier(agentName, senderPubkey);
+      const cap = tierBoundsFor(senderTier).maxBytesPerSession;
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
-      if (priorTotal + heldTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
+      if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
           agentName,
@@ -3148,7 +3154,8 @@ export class SessionNodeManager {
           priorTotal,
           heldTotal,
           incoming: content.length,
-          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
+          cap,
+          tier: senderTier,
           correlationId,
           recheck: true,
         });
