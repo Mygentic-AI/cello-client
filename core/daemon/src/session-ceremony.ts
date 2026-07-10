@@ -63,8 +63,20 @@ export function wireSessionOfferHandler(deps: {
     const rejectFrame: Record<string, unknown> = { type: "session_offer_reject", reason };
     if (sessionId) rejectFrame["session_id"] = sessionId;
     try {
-      await deps.signaling.sendRaw(rejectFrame);
-      deps.logger.info("session.offer.reject.sent", { agentName: deps.agentName, reason });
+      // The production seam (transport SignalingManager.sendRaw) NEVER throws — it resolves
+      // {ok:false, reason} on every failure (reconnecting, lost, stream throw). Discarding the
+      // result would log reject.sent while nothing left the machine (D1 review F1). The catch
+      // stays as belt-and-braces for a seam that does throw.
+      const res = await deps.signaling.sendRaw(rejectFrame);
+      if (res.ok) {
+        deps.logger.info("session.offer.reject.sent", { agentName: deps.agentName, reason });
+      } else {
+        deps.logger.warn("session.offer.reject.failed", {
+          agentName: deps.agentName,
+          reason,
+          detail: res.reason ?? "send_not_ok",
+        });
+      }
     } catch (err: unknown) {
       deps.logger.warn("session.offer.reject.failed", {
         agentName: deps.agentName,
@@ -90,16 +102,27 @@ export function wireSessionOfferHandler(deps: {
         return;
       }
       try {
-        await deps.signaling.sendRaw({
+        // Same production contract as the reject above (D1 review F3, pre-existing): sendRaw
+        // resolves {ok:false, reason} instead of throwing. Logging "accepted" on {ok:false}
+        // pointed the operator away from the exact failure that fabricates phantom sessions —
+        // the directory hears nothing, stalls 2 s, and signs an endpoint-less assignment.
+        const res = await deps.signaling.sendRaw({
           type: "session_offer_accept",
           session_id: sessionId,
           counterparty_session_peer_id: sr.peerId,
           counterparty_session_addrs: sr.addrs,
         });
-        deps.logger.info("session.offer.accepted", {
-          agentName: deps.agentName,
-          sessionPeerId: sr.peerId,
-        });
+        if (res.ok) {
+          deps.logger.info("session.offer.accepted", {
+            agentName: deps.agentName,
+            sessionPeerId: sr.peerId,
+          });
+        } else {
+          deps.logger.warn("session.offer.accept.failed", {
+            agentName: deps.agentName,
+            detail: res.reason ?? "send_not_ok",
+          });
+        }
       } catch (err: unknown) {
         deps.logger.warn("session.offer.accept.failed", {
           agentName: deps.agentName,

@@ -96,7 +96,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
     return { logger, events };
   }
 
-  function makeSeam(opts?: { sendRawError?: Error }): {
+  function makeSeam(opts?: { sendRawError?: Error; sendRawResult?: { ok: boolean; reason?: string } }): {
     seam: SignalingSeam;
     sent: Record<string, unknown>[];
     inject: (frame: Record<string, unknown>) => void;
@@ -107,6 +107,10 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
       status: "connected",
       async sendRaw(frame: unknown) {
         if (opts?.sendRawError) throw opts.sendRawError;
+        // The PRODUCTION seam (transport SignalingManager.sendRaw) never throws — it resolves
+        // {ok:false, reason} on every failure mode. A fake that only throws lets an
+        // implementation that discards the result pass (D1 review F1).
+        if (opts?.sendRawResult) return opts.sendRawResult as never;
         sent.push(frame as Record<string, unknown>);
         return { ok: true } as never;
       },
@@ -120,7 +124,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
 
   function wire(deps: {
     sr: { peerId: string; addrs: string[] } | null;
-    seamOpts?: { sendRawError?: Error };
+    seamOpts?: { sendRawError?: Error; sendRawResult?: { ok: boolean; reason?: string } };
   }) {
     const { logger, events } = makeCapturingLogger();
     const { seam, sent, inject } = makeSeam(deps.seamOpts);
@@ -197,6 +201,38 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
     expect(String(failed!.context["detail"])).toContain("stream torn down");
     // The abort is still there — the operator sees both the cause and the failed answer.
     expect(h.events.find((e) => e.event === "session.offer.abort")).toBeDefined();
+  });
+
+  // D1 review F1: the PRODUCTION seam never throws — it resolves {ok:false, reason} (transport
+  // signaling-manager.ts sendRaw). An implementation that discards the result logs reject.sent
+  // while nothing left the machine — a silent vanish under exactly the degraded condition this
+  // unit exists to fix. These two tests drive the production failure contract.
+  it("SI (production contract): sendRaw resolving {ok:false} → reject.failed with the reason, and NO reject.sent", async () => {
+    const h = wire({ sr: null, seamOpts: { sendRawResult: { ok: false, reason: "signaling_lost" } } });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const failed = h.events.find((e) => e.event === "session.offer.reject.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level).toBe("warn");
+    expect(failed!.context["reason"]).toBe("standing_receiver_unavailable");
+    expect(String(failed!.context["detail"])).toContain("signaling_lost");
+    expect(h.events.find((e) => e.event === "session.offer.reject.sent")).toBeUndefined();
+  });
+
+  it("SI (production contract, accept path — review F3): accept sendRaw {ok:false} → accept.failed with the reason, and NO session.offer.accepted", async () => {
+    const h = wire({
+      sr: { peerId: "bob-sr-peer", addrs: [] },
+      seamOpts: { sendRawResult: { ok: false, reason: "signaling_reconnecting" } },
+    });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const failed = h.events.find((e) => e.event === "session.offer.accept.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level).toBe("warn");
+    expect(String(failed!.context["detail"])).toContain("signaling_reconnecting");
+    expect(h.events.find((e) => e.event === "session.offer.accepted")).toBeUndefined();
   });
 
   it("frames that are not session_offer are untouched (no reject, no events)", async () => {
