@@ -20,6 +20,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 async function waitFor(fn: () => boolean, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -57,6 +58,8 @@ describe("AC-004: direct-session liveness flips to 'gone' on real session-node d
     const dbPath = join(mkdtempSync(join(tmpdir(), "cello-session-003-")), "sessions.db");
     const mgr = new SessionNodeManager({ factory: new RealNodeFactory(), logger, dbPath });
     await mgr.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(mgr.getDb(), ["agentA"]);
 
     // B is the counterparty — a real session node dialing A's session node.
     const kpB = generateKeypair();

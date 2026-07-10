@@ -594,7 +594,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const initiatorPubkey = "cd".repeat(32);
     // Bob has an ACTIVE session with no content yet — his own tree is empty.
     await snm.createSessionNode(SID, "bob", initiatorPubkey, "alice-peer-id", "corr");
-    const bobOwnRoot = snm.getSessionTreeRootHex("alice", SID); // canonical empty-tree root
+    const bobOwnRoot = snm.getSessionTreeRootHex("bob", SID); // canonical empty-tree root
 
     // The initiator sends a BOGUS merkleRoot. SI-001: Bob must co-sign his OWN root.
     injectRef.inject!({

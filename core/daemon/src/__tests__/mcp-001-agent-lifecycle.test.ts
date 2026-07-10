@@ -354,18 +354,23 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
   describe("CC-5/F21: half-open session terminal-escape (force) + reap-on-read", () => {
     // Seed a session row directly (no libp2p node needed): abandonSession's retireSessionNode is a no-op
     // when there is no live node, and the reaper/close read from the DB.
+    // DOD-AGENT-ID-JOINKEY-1: `sessions`/`transcript` are keyed by the stable agent_id, never
+    // agent_name. `setupWithAgents` already gave this daemon a real `agents` row for each name (the
+    // flat-file + one-time migration path), so resolve it rather than writing the mutable name.
     function seedSession(agent: string, sid: string, opts: { status?: string; createdAt?: number; messageCount?: number }): void {
       const now = opts.createdAt ?? Date.now();
+      const agentId = handle!.getSessionNodeManager().resolveAgentId(agent);
       handle!.getSessionNodeManager().getDb().prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
-      ).run(sid, agent, "cc".repeat(32), opts.status ?? "active", now, now, opts.messageCount ?? 1);
+      ).run(sid, agentId, "cc".repeat(32), opts.status ?? "active", now, now, opts.messageCount ?? 1);
     }
     function seedReceivedMessage(agent: string, sid: string): void {
+      const agentId = handle!.getSessionNodeManager().resolveAgentId(agent);
       handle!.getSessionNodeManager().getDb().prepare(
-        `INSERT OR IGNORE INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
+        `INSERT OR IGNORE INTO transcript (agent_id, session_id, sequence, direction, blob, created_at)
          VALUES (?, ?, 0, 'received', ?, ?)`,
-      ).run(agent, sid, Buffer.from("hi from counterparty"), Date.now());
+      ).run(agentId, sid, Buffer.from("hi from counterparty"), Date.now());
     }
     async function openSids(client: IpcClient): Promise<string[]> {
       const r = (await client.send("cello_list_sessions", { filter: "open" })) as { sessions: Array<{ sessionId: string }> };

@@ -75,6 +75,7 @@ import {
 } from "./sqlcipher-db.js";
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
+import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -502,7 +503,7 @@ export class SessionNodeManager {
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT NOT NULL,
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         counterparty_pubkey TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -510,7 +511,9 @@ export class SessionNodeManager {
         -- DOD-LOOP-1: composite key so two of the operator's agents can hold both ends of the
         -- SAME session_id on ONE daemon (the loopback case). A bare session_id PK would reject
         -- the second end's row.
-        PRIMARY KEY (agent_name, session_id)
+        -- DOD-AGENT-ID-JOINKEY-1: keyed on the STABLE agent_id, never the mutable, reuse-freed
+        -- agent_name. The display name lives on the agents table and is joined in for reads.
+        PRIMARY KEY (agent_id, session_id)
       )
     `);
 
@@ -556,7 +559,7 @@ export class SessionNodeManager {
     // Merkle root so the achieved commitment is never discarded.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS seal_interrupted_artifacts (
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         role TEXT NOT NULL,
         own_leaf TEXT NOT NULL,
@@ -565,7 +568,7 @@ export class SessionNodeManager {
         nonce TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         -- DOD-LOOP-1: composite key (per-agent end of a loopback session).
-        PRIMARY KEY (agent_name, session_id)
+        PRIMARY KEY (agent_id, session_id)
       )
     `);
 
@@ -576,14 +579,14 @@ export class SessionNodeManager {
     // by session_id ORDER BY leaf_index is the only read pattern.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS session_tree_leaves (
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         leaf_index INTEGER NOT NULL,
         leaf_kind TEXT NOT NULL,
         leaf_hash_hex TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
-        PRIMARY KEY (agent_name, session_id, leaf_index)
+        PRIMARY KEY (agent_id, session_id, leaf_index)
       )
     `);
 
@@ -594,13 +597,13 @@ export class SessionNodeManager {
     // provided by whole-DB SQLCipher, not a per-column cipher (relay/directory never see it — INV-3).
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS transcript (
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         sequence INTEGER NOT NULL,
         direction TEXT NOT NULL,        -- 'sent' | 'received'
         blob BLOB NOT NULL,             -- readable plaintext bytes (whole-DB SQLCipher-encrypted at rest)
         created_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_name, session_id, sequence, direction)
+        PRIMARY KEY (agent_id, session_id, sequence, direction)
       )
     `);
 
@@ -611,10 +614,10 @@ export class SessionNodeManager {
     // across daemon restarts, not just within one process (INV-PUSHPULL). Additive table.
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS message_watermarks (
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         last_delivered_seq INTEGER NOT NULL,
-        PRIMARY KEY (agent_name, session_id)
+        PRIMARY KEY (agent_id, session_id)
       )
     `);
 
@@ -624,10 +627,10 @@ export class SessionNodeManager {
     // re-resolved); known stays known until explicitly removed (no TTL/expiry on membership).
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS contacts (
-        agent_name TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
         pubkey TEXT NOT NULL,
         added_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_name, pubkey)
+        PRIMARY KEY (agent_id, pubkey)
       )
     `);
     // MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
@@ -637,6 +640,16 @@ export class SessionNodeManager {
     if (!contactCols.some((c) => c.name === "moniker")) {
       this.#db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");
     }
+
+    // DOD-AGENT-ID-JOINKEY-1: finish REMOVE-001. Re-key the seven child tables from the mutable,
+    // reuse-freed `agent_name` to the stable `agent_id`, in ONE transaction. Runs AFTER every
+    // CREATE/ALTER above, so an existing table has its full historical column set before it is
+    // rebuilt, and BEFORE any read below touches it. A no-op once the tables carry `agent_id`.
+    //
+    // `retry_queue` (the seventh) is created later, by RetryQueue's constructor. On an existing
+    // database it already exists here and is re-keyed in the same transaction; on a fresh one it is
+    // absent, is skipped, and RetryQueue then creates it directly in the re-keyed shape.
+    migrateSessionTablesToAgentId(this.#db, this.#logger);
 
     // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
     // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
@@ -655,9 +668,18 @@ export class SessionNodeManager {
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
+    // DOD-AGENT-ID-JOINKEY-1: this sweep spans EVERY agent, so it cannot resolve one name up front.
+    // It scopes its UPDATE by the row's own agent_id and LEFT JOINs `agents` only to LOG a human
+    // name. LEFT, not INNER: an inner join would silently skip a session whose agent row is missing,
+    // leaving it 'active' forever — a stuck row hidden by the query that was meant to find it. An
+    // orphan is instead marked interrupted like any other AND reported loudly.
     const activeRows = this.#db
-      .prepare("SELECT * FROM sessions WHERE status = 'active'")
-      .all() as unknown as SessionRecord[];
+      .prepare(
+        `SELECT s.session_id, s.agent_id, a.agent_name
+         FROM sessions s LEFT JOIN agents a ON a.agent_id = s.agent_id
+         WHERE s.status = 'active'`,
+      )
+      .all() as unknown as Array<{ session_id: string; agent_id: string; agent_name: string | null }>;
 
     if (activeRows.length > 0) {
       const now = Date.now();
@@ -666,9 +688,16 @@ export class SessionNodeManager {
         try {
           this.#db
             .prepare(
-              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE agent_name = ? AND session_id = ?",
+              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE agent_id = ? AND session_id = ?",
             )
-            .run(now, interruptedAt, row.agent_name, row.session_id);
+            .run(now, interruptedAt, row.agent_id, row.session_id);
+          if (row.agent_name === null) {
+            this.#logger.error("session.agent.orphaned", {
+              sessionId: row.session_id,
+              agentId: row.agent_id,
+              impact: "session row references an agent_id with no agents row",
+            });
+          }
           this.#logger.warn("session.interrupted.detected", {
             sessionId: row.session_id,
             agentName: row.agent_name,
@@ -747,13 +776,14 @@ export class SessionNodeManager {
   ): void {
     if (!this.#db) return;
     try {
+      const agentId = this.#requireAgentId(agentName);
       const blob = Buffer.from(plaintext);
       this.#db
         .prepare(
-          `INSERT OR IGNORE INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
+          `INSERT OR IGNORE INTO transcript (agent_id, session_id, sequence, direction, blob, created_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(agentName, sessionId, sequence, direction, blob, Date.now());
+        .run(agentId, sessionId, sequence, direction, blob, Date.now());
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
     } catch (err: unknown) {
       // M8C-INBOX-1 (reviewer F2): a RECEIVED-row write failure is not cosmetic — since INBOX-1 the
@@ -785,9 +815,9 @@ export class SessionNodeManager {
     const rows = this.#db
       .prepare(
         `SELECT sequence, direction, blob, created_at FROM transcript
-         WHERE agent_name = ? AND session_id = ? ORDER BY sequence ASC, direction ASC`,
+         WHERE agent_id = ? AND session_id = ? ORDER BY sequence ASC, direction ASC`,
       )
-      .all(agentName, sessionId) as Array<{ sequence: number; direction: string; blob: Uint8Array; created_at: number }>;
+      .all(this.#requireAgentId(agentName), sessionId) as Array<{ sequence: number; direction: string; blob: Uint8Array; created_at: number }>;
     const messages: Array<{ sequence: number; direction: "sent" | "received"; text: string; createdAt: number }> = [];
     // PERSIST-002 (AC-010): the blob is plaintext (whole-DB SQLCipher at rest), so there is no
     // per-row decrypt step that can fail — `undecryptable` stays 0 and is kept only for callers that
@@ -811,8 +841,8 @@ export class SessionNodeManager {
   getLastDeliveredSeq(agentName: string, sessionId: string): number {
     if (!this.#db) return -1;
     const row = this.#db
-      .prepare("SELECT last_delivered_seq FROM message_watermarks WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as { last_delivered_seq: number } | undefined;
+      .prepare("SELECT last_delivered_seq FROM message_watermarks WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { last_delivered_seq: number } | undefined;
     return row ? row.last_delivered_seq : -1;
   }
 
@@ -822,12 +852,12 @@ export class SessionNodeManager {
     if (!this.#db) return;
     this.#db
       .prepare(
-        `INSERT INTO message_watermarks (agent_name, session_id, last_delivered_seq)
+        `INSERT INTO message_watermarks (agent_id, session_id, last_delivered_seq)
          VALUES (?, ?, ?)
-         ON CONFLICT(agent_name, session_id)
+         ON CONFLICT(agent_id, session_id)
          DO UPDATE SET last_delivered_seq = MAX(last_delivered_seq, excluded.last_delivered_seq)`,
       )
-      .run(agentName, sessionId, seq);
+      .run(this.#requireAgentId(agentName), sessionId, seq);
     this.#logger.info("message.watermark.advanced", { agentName, sessionId, sequence: seq });
   }
 
@@ -843,22 +873,22 @@ export class SessionNodeManager {
                 MAX(t.sequence) AS last_seq
          FROM transcript t
          LEFT JOIN message_watermarks w
-           ON w.agent_name = t.agent_name AND w.session_id = t.session_id
-         WHERE t.agent_name = ?
+           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
+         WHERE t.agent_id = ?
            AND t.direction = 'received'
            AND t.sequence > COALESCE(w.last_delivered_seq, -1)
          GROUP BY t.session_id
          HAVING unread_count > 0
          ORDER BY t.session_id ASC`,
       )
-      .all(agentName) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
+      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
     return rows;
   }
 
   /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
   isContact(agentName: string, pubkey: string): boolean {
     if (!this.#db) return false;
-    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_name = ? AND pubkey = ?").get(agentName, pubkey);
+    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_id = ? AND pubkey = ?").get(this.#requireAgentId(agentName), pubkey);
     return row !== undefined;
   }
 
@@ -875,13 +905,14 @@ export class SessionNodeManager {
     if (moniker !== undefined && moniker !== null && validateMoniker(moniker) === null) {
       throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
     }
+    const agentId = this.#requireAgentId(agentName);
     this.#db
-      .prepare("INSERT OR IGNORE INTO contacts (agent_name, pubkey, added_at) VALUES (?, ?, ?)")
-      .run(agentName, pubkey, Date.now());
+      .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at) VALUES (?, ?, ?)")
+      .run(agentId, pubkey, Date.now());
     if (moniker !== undefined && moniker !== null) {
       this.#db
-        .prepare("UPDATE contacts SET moniker = ? WHERE agent_name = ? AND pubkey = ?")
-        .run(moniker, agentName, pubkey);
+        .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
+        .run(moniker, agentId, pubkey);
     }
   }
 
@@ -896,15 +927,15 @@ export class SessionNodeManager {
       throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
     }
     const res = this.#db
-      .prepare("UPDATE contacts SET moniker = ? WHERE agent_name = ? AND pubkey = ?")
-      .run(moniker, agentName, pubkey);
+      .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
+      .run(moniker, this.#requireAgentId(agentName), pubkey);
     return res.changes > 0;
   }
 
   /** M8C-CONTACT-1: known stays known until explicitly removed. */
   removeContact(agentName: string, pubkey: string): boolean {
     if (!this.#db) return false;
-    const res = this.#db.prepare("DELETE FROM contacts WHERE agent_name = ? AND pubkey = ?").run(agentName, pubkey);
+    const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
     return res.changes > 0;
   }
 
@@ -918,8 +949,8 @@ export class SessionNodeManager {
       return null;
     }
     const row = this.#db
-      .prepare("SELECT moniker FROM contacts WHERE agent_name = ? AND pubkey = ?")
-      .get(agentName, pubkey) as { moniker: string | null } | undefined;
+      .prepare("SELECT moniker FROM contacts WHERE agent_id = ? AND pubkey = ?")
+      .get(this.#requireAgentId(agentName), pubkey) as { moniker: string | null } | undefined;
     return row?.moniker ?? null;
   }
 
@@ -928,16 +959,16 @@ export class SessionNodeManager {
   listContacts(agentName: string): Array<{ pubkey: string; added_at: number; moniker: string | null }> {
     if (!this.#db) return [];
     return this.#db
-      .prepare("SELECT pubkey, added_at, moniker FROM contacts WHERE agent_name = ? ORDER BY added_at ASC")
-      .all(agentName) as Array<{ pubkey: string; added_at: number; moniker: string | null }>;
+      .prepare("SELECT pubkey, added_at, moniker FROM contacts WHERE agent_id = ? ORDER BY added_at ASC")
+      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; added_at: number; moniker: string | null }>;
   }
 
   /** M8C-ABUSE-1: cumulative RECEIVED byte total for a session (anti-drip-feed accounting). */
   #getReceivedBytesTotal(agentName: string, sessionId: string): number {
     if (!this.#db) return 0;
     const row = this.#db
-      .prepare("SELECT COALESCE(SUM(LENGTH(blob)), 0) AS total FROM transcript WHERE agent_name = ? AND session_id = ? AND direction = 'received'")
-      .get(agentName, sessionId) as { total: number };
+      .prepare("SELECT COALESCE(SUM(LENGTH(blob)), 0) AS total FROM transcript WHERE agent_id = ? AND session_id = ? AND direction = 'received'")
+      .get(this.#requireAgentId(agentName), sessionId) as { total: number };
     return row.total;
   }
 
@@ -963,8 +994,8 @@ export class SessionNodeManager {
   countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number {
     if (!this.#db) return 0;
     const row = this.#db
-      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_name = ? AND counterparty_pubkey = ? AND status IN ('active', 'interrupted')")
-      .get(agentName, counterpartyPubkey) as { n: number };
+      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ? AND status IN ('active', 'interrupted')")
+      .get(this.#requireAgentId(agentName), counterpartyPubkey) as { n: number };
     return row.n;
   }
 
@@ -976,10 +1007,10 @@ export class SessionNodeManager {
     const row = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM sessions s
-         WHERE s.agent_name = ? AND s.status IN ('active', 'interrupted')
-           AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.agent_name = s.agent_name AND c.pubkey = s.counterparty_pubkey)`,
+         WHERE s.agent_id = ? AND s.status IN ('active', 'interrupted')
+           AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey)`,
       )
-      .get(agentName) as { n: number };
+      .get(this.#requireAgentId(agentName)) as { n: number };
     return row.n;
   }
 
@@ -1123,6 +1154,69 @@ export class SessionNodeManager {
    */
   #k(agentName: string, sessionId: string): string {
     return `${agentName}\x1f${sessionId}`;
+  }
+
+  /**
+   * DOD-AGENT-ID-JOINKEY-1: resolve an agent's NAME to its STABLE agent_id. This is the ONE place a
+   * name becomes a key, and it is the boundary between the two worlds:
+   *
+   *   - ABOVE it, addressing by name is correct. The operator says `cello_use_agent { name }`, and
+   *     the in-memory maps (#k, standing receivers, keyProviders) key by name safely, because
+   *     name-addressing only ever resolves ACTIVE agents and the `agents_active_name` partial unique
+   *     index makes active names unique.
+   *   - BELOW it, only `agent_id` may touch SQL. `agent_name` is a mutable display attribute that a
+   *     retire frees for reuse; a table joined on it hands a new keypair the dead identity's rows.
+   *
+   * It resolves ONLY non-retired agents — a retired identity is gone from the runtime (`list` omits
+   * it, `start` returns agent_not_found), so no live surface may act as one.
+   *
+   * It THROWS on an unresolvable name rather than returning null. A null would flow into a
+   * `WHERE agent_id IS NULL` that quietly matches nothing: reads would return empty and writes would
+   * vanish, and the daemon would look healthy while losing an agent's data. Every caller has already
+   * resolved the agent before it gets here, so an unresolvable name is a bug in the caller, not a
+   * condition to absorb.
+   */
+  #requireAgentId(agentName: string): string {
+    if (!this.#db) throw new Error("agent_id_unresolved: database is not open");
+    const row = this.#db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agentName) as { agent_id: string } | undefined;
+    if (!row) {
+      this.#logger.error("session.agent_id.unresolved", { agentName });
+      throw new Error(
+        `agent_id_unresolved: no active agent named '${agentName}'. The session tables are keyed by the ` +
+          `stable agent_id (DOD-AGENT-ID-JOINKEY-1); scoping a query by an unresolvable name would ` +
+          `silently match nothing.`,
+      );
+    }
+    return row.agent_id;
+  }
+
+  /**
+   * DOD-AGENT-ID-JOINKEY-1: the public form of the name→stable-id resolver, for components that own
+   * agent-scoped tables of their own (RetryQueue) and must be handed the STABLE key, never a name.
+   * The daemon resolves ONCE, at its own boundary, exactly as this class does internally. Throws on
+   * an unresolvable name — see #requireAgentId for why null is not an option.
+   */
+  resolveAgentId(agentName: string): string {
+    return this.#requireAgentId(agentName);
+  }
+
+  /**
+   * Reverse lookup: the display name of a stable agent_id, or null if no such agent.
+   *
+   * Deliberately INCLUDES retired agents. Its caller (the startup awaiting-content re-park) holds an
+   * agent_id read off a durable row and needs a name to find that agent's standing receiver. A
+   * retired agent resolves to its name and then has no standing receiver, so the park fails cleanly
+   * and loudly — which is correct. Filtering retired agents out here would instead make the row
+   * unattributable and the failure mute.
+   */
+  agentNameForId(agentId: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT agent_name FROM agents WHERE agent_id = ?")
+      .get(agentId) as { agent_name: string } | undefined;
+    return row?.agent_name ?? null;
   }
 
   /**
@@ -1400,8 +1494,8 @@ export class SessionNodeManager {
         // before the in-memory entry exists) can deposit un-acked content to the same relay.
         try {
           this.#db
-            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
-            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), agentName, sessionId);
+            ?.prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
+            .run(relay.relayPeerId, JSON.stringify(relay.relayAddrs), Date.now(), this.#requireAgentId(agentName), sessionId);
         } catch (err: unknown) {
           this.#logger.warn("session.relay.endpoint.persist.failed", {
             sessionId,
@@ -1880,8 +1974,24 @@ export class SessionNodeManager {
    */
   getSessionsByStatus(status: "active" | "sealed" | "interrupted"): SessionRecord[] {
     if (!this.#db) return [];
+    // Spans EVERY agent (cello_status is daemon-wide), so no single name can be resolved up front —
+    // the display name is joined in from `agents`, its one source of truth. `agent_name` is no
+    // longer a `sessions` column, so without this join buildActiveSessions/buildInterruptedSessions
+    // read `row.agent_name` as undefined.
+    //
+    // DOD-AGENT-ID-JOINKEY-1 (reviewer Finding 1): INNER JOIN with `state != 'retired'`, NOT a bare
+    // LEFT JOIN. This is the LIVE-status + reaper surface, and a retired agent is gone from the
+    // runtime — its leftover session rows (kept for accountability, never re-statused) are not
+    // resumable and must not appear here. If they did, the half-open reaper would resolve their
+    // RETIRED name via #requireAgentId, which throws, taking down cello_status for the whole daemon.
+    // Excluding them also guarantees a non-null agent_name on every returned row. The full historical
+    // archive (getAllSessions) keeps its LEFT JOIN and still shows retired/orphaned rows.
     return this.#db
-      .prepare("SELECT * FROM sessions WHERE status = ?")
+      .prepare(
+        `SELECT s.*, a.agent_name AS agent_name
+         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
+         WHERE s.status = ? AND a.state != 'retired'`,
+      )
       .all(status) as unknown as SessionRecord[];
   }
 
@@ -1895,9 +2005,13 @@ export class SessionNodeManager {
    */
   getSessionsForAgent(agentName: string): SessionRecord[] {
     if (!this.#db) return [];
-    return this.#db
-      .prepare("SELECT * FROM sessions WHERE agent_name = ? ORDER BY updated_at DESC")
-      .all(agentName) as unknown as SessionRecord[];
+    // Scoped by the STABLE id. `agent_name` is not a column of `sessions` any more, so it is stamped
+    // back on for display — and it is exactly the name we just resolved the id FROM, so no join is
+    // needed and no stale copy can exist.
+    const rows = this.#db
+      .prepare("SELECT * FROM sessions WHERE agent_id = ? ORDER BY updated_at DESC")
+      .all(this.#requireAgentId(agentName)) as unknown as SessionRecord[];
+    return rows.map((r) => ({ ...r, agent_name: agentName }));
   }
 
   /**
@@ -1907,8 +2021,15 @@ export class SessionNodeManager {
    */
   getAllSessions(): SessionRecord[] {
     if (!this.#db) return [];
+    // Spans EVERY agent, so no single name can be resolved up front: the display name is joined in
+    // from `agents`, its one source of truth. LEFT JOIN, not INNER — a session whose agent row is
+    // missing must still be listed (an invisible session is worse than an unnamed one).
     return this.#db
-      .prepare("SELECT * FROM sessions ORDER BY updated_at DESC")
+      .prepare(
+        `SELECT s.*, a.agent_name AS agent_name
+         FROM sessions s LEFT JOIN agents a ON a.agent_id = s.agent_id
+         ORDER BY s.updated_at DESC`,
+      )
       .all() as unknown as SessionRecord[];
   }
 
@@ -1924,8 +2045,8 @@ export class SessionNodeManager {
   recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void {
     if (!this.#db) return;
     this.#db
-      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
-      .run(legibilityJson, sealedRootHex, Date.now(), agentName, sessionId);
+      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
+      .run(legibilityJson, sealedRootHex, Date.now(), this.#requireAgentId(agentName), sessionId);
   }
 
   /**
@@ -1950,10 +2071,10 @@ export class SessionNodeManager {
     this.#db
       .prepare(
         `INSERT OR IGNORE INTO sessions
-           (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at)
+           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(sessionId, agentName, counterpartyPubkeyHex, "sealed", now, now);
+      .run(sessionId, this.#requireAgentId(agentName), counterpartyPubkeyHex, "sealed", now, now);
     this.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson);
   }
 
@@ -1966,8 +2087,8 @@ export class SessionNodeManager {
   recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void {
     if (!this.#db) return;
     this.#db
-      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
-      .run(primaryPubkeyHex, Date.now(), agentName, sessionId);
+      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
+      .run(primaryPubkeyHex, Date.now(), this.#requireAgentId(agentName), sessionId);
   }
 
   /**
@@ -1981,8 +2102,8 @@ export class SessionNodeManager {
   getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
+      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
     if (!row || !row.seal_legibility || !row.sealed_root_hex) return null;
     let legibility: unknown;
     try {
@@ -2042,9 +2163,9 @@ export class SessionNodeManager {
       // UPDATE only mutates a row that is still active.
       this.#db
         .prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE agent_name = ? AND session_id = ? AND status = 'active'",
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE agent_id = ? AND session_id = ? AND status = 'active'",
         )
-        .run(now, authoritativeCount, interruptedAt, agentName, sessionId);
+        .run(now, authoritativeCount, interruptedAt, this.#requireAgentId(agentName), sessionId);
     } catch (err: unknown) {
       this.#logger.error("session.interrupt.db.write.failed", {
         sessionId,
@@ -2143,11 +2264,11 @@ export class SessionNodeManager {
       this.#db
         .prepare(
           `INSERT OR REPLACE INTO seal_interrupted_artifacts
-           (agent_name, session_id, role, own_leaf, counterparty_leaf, merkle_root, nonce, created_at)
+           (agent_id, session_id, role, own_leaf, counterparty_leaf, merkle_root, nonce, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          opts.agentName,
+          this.#requireAgentId(opts.agentName),
           opts.sessionId,
           opts.role,
           JSON.stringify(opts.ownLeaf),
@@ -2170,9 +2291,9 @@ export class SessionNodeManager {
     // 'sealed' row or an already-pending one.
     const result = this.#db
       .prepare(
-        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE agent_name = ? AND session_id = ? AND status IN ('active', 'interrupted')",
+        "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE agent_id = ? AND session_id = ? AND status IN ('active', 'interrupted')",
       )
-      .run(now, opts.agentName, opts.sessionId);
+      .run(now, this.#requireAgentId(opts.agentName), opts.sessionId);
     return Number(result.changes) > 0;
   }
 
@@ -2189,8 +2310,8 @@ export class SessionNodeManager {
   } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as
+      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as
       | {
           role: string;
           own_leaf: string;
@@ -2216,9 +2337,11 @@ export class SessionNodeManager {
   getSessionRecord(agentName: string, sessionId: string): SessionRecord | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT * FROM sessions WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as unknown as SessionRecord | undefined;
-    return row ?? null;
+      .prepare("SELECT * FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as unknown as SessionRecord | undefined;
+    // `agent_name` is display-only and no longer stored on the row; stamp back the name whose
+    // agent_id scoped this lookup (~50 daemon call sites read `record.agent_name`).
+    return row ? { ...row, agent_name: agentName } : null;
   }
 
   /**
@@ -2229,8 +2352,8 @@ export class SessionNodeManager {
   getPersistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
+      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
     if (!row?.relay_peer_id || !row?.relay_addrs) return null;
     try {
       const addrs = JSON.parse(row.relay_addrs) as unknown;
@@ -2250,8 +2373,8 @@ export class SessionNodeManager {
   getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> {
     if (!this.#db) return [];
     const rows = this.#db
-      .prepare("SELECT DISTINCT relay_peer_id, relay_addrs FROM sessions WHERE agent_name = ? AND relay_peer_id IS NOT NULL")
-      .all(agentName) as Array<{ relay_peer_id?: string | null; relay_addrs?: string | null }>;
+      .prepare("SELECT DISTINCT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND relay_peer_id IS NOT NULL")
+      .all(this.#requireAgentId(agentName)) as Array<{ relay_peer_id?: string | null; relay_addrs?: string | null }>;
     const byPeer = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
     for (const row of rows) {
       if (!row.relay_peer_id || !row.relay_addrs) continue;
@@ -2308,10 +2431,10 @@ export class SessionNodeManager {
         this.#db
           .prepare(
             `INSERT INTO session_tree_leaves
-             (agent_name, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
+             (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
              VALUES (?, ?, ?, ?, ?, ?)`,
           )
-          .run(agentName, sessionId, leafIndex, kind, leafHashHex, Date.now());
+          .run(this.#requireAgentId(agentName), sessionId, leafIndex, kind, leafHashHex, Date.now());
         // DAEMON-004 (finding #2): keep sessions.message_count synced to the tree
         // size. message_count is the bilateral leafCount the seal flow signs over
         // (handleSealInterruptedFlow / the responder). If it diverged from the
@@ -2319,8 +2442,8 @@ export class SessionNodeManager {
         // truncated transcript and the bilateral leafCount check would mismatch.
         // The tree (leafIndex + 1 leaves) is authoritative; the column tracks it.
         this.#db
-          .prepare("UPDATE sessions SET message_count = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?")
-          .run(leafIndex + 1, Date.now(), agentName, sessionId);
+          .prepare("UPDATE sessions SET message_count = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
+          .run(leafIndex + 1, Date.now(), this.#requireAgentId(agentName), sessionId);
       } catch (err: unknown) {
         // A persist failure must be visible, not swallowed: the in-memory tree
         // has advanced but the durable transcript has not, which would diverge
@@ -3169,8 +3292,8 @@ export class SessionNodeManager {
   getSealedRootHex(agentName: string, sessionId: string): string | null {
     if (!this.#db) return null;
     const row = this.#db
-      .prepare("SELECT sealed_root_hex FROM sessions WHERE agent_name = ? AND session_id = ?")
-      .get(agentName, sessionId) as { sealed_root_hex?: string | null } | undefined;
+      .prepare("SELECT sealed_root_hex FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { sealed_root_hex?: string | null } | undefined;
     return row?.sealed_root_hex ?? null;
   }
 
@@ -3327,9 +3450,9 @@ export class SessionNodeManager {
     if (!this.#db) return SessionTree.empty();
     const rows = this.#db
       .prepare(
-        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE agent_name = ? AND session_id = ? ORDER BY leaf_index ASC",
+        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index ASC",
       )
-      .all(agentName, sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
+      .all(this.#requireAgentId(agentName), sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
     return SessionTree.fromLeaves(
       rows.map((r) => ({ kind: r.leaf_kind === "ctrl" ? "ctrl" : "msg", hashHex: r.leaf_hash_hex })),
     );
@@ -3803,10 +3926,10 @@ export class SessionNodeManager {
       this.#db
         .prepare(
           `INSERT INTO sessions
-           (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at)
+           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(sessionId, agentName, counterpartyPubkey, status, now, now);
+        .run(sessionId, this.#requireAgentId(agentName), counterpartyPubkey, status, now, now);
       return true;
     } catch (err: unknown) {
       // D4 review F2: this helper serves the CREATE/ACCEPT paths (and interrupt-restore) — the old
@@ -3827,8 +3950,8 @@ export class SessionNodeManager {
   countReceivedMessages(agentName: string, sessionId: string): number {
     if (!this.#db) return 0;
     const row = this.#db
-      .prepare("SELECT COUNT(*) AS n FROM transcript WHERE agent_name = ? AND session_id = ? AND direction = 'received'")
-      .get(agentName, sessionId) as { n: number };
+      .prepare("SELECT COUNT(*) AS n FROM transcript WHERE agent_id = ? AND session_id = ? AND direction = 'received'")
+      .get(this.#requireAgentId(agentName), sessionId) as { n: number };
     return row.n;
   }
 
@@ -3856,9 +3979,9 @@ export class SessionNodeManager {
     try {
       this.#db
         .prepare(
-          "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_name = ? AND session_id = ?",
+          "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?",
         )
-        .run(status, now, agentName, sessionId);
+        .run(status, now, this.#requireAgentId(agentName), sessionId);
       return true;
     } catch (err: unknown) {
       // CC-5 (reviewer F-2): status-agnostic event + the actual target status in context — this method

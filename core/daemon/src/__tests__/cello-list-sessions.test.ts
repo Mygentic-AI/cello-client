@@ -31,7 +31,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { openTestDb } from "./helpers/encrypted-db.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
@@ -82,33 +82,17 @@ class StubNodeFactory implements ISessionNodeFactory {
 }
 
 /**
- * M7 sessions table mirroring production: composite PRIMARY KEY (agent_name,
- * session_id) — the DOD-LOOP-1 shape, so the pre-created table is identical to
- * what the daemon's `initialize()` CREATE TABLE IF NOT EXISTS would build. The
- * message_count / interrupted_at columns (added by ALTER in production) are
- * inlined here for the test inserts; the daemon's idempotent ALTERs no-op on them.
+ * DOD-AGENT-ID-JOINKEY-1: this helper used to hand-roll its own `sessions` CREATE TABLE "mirroring
+ * production". A second copy of a schema is a second thing to forget: it kept the old
+ * PRIMARY KEY (agent_name, session_id) shape and would have silently diverged from the re-keyed one.
+ * The manager's own `initialize()` is now the single source of the schema — this only inserts rows.
  */
-function createSessionsTable(db: DaemonDatabase): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      session_id TEXT NOT NULL,
-      agent_name TEXT NOT NULL,
-      counterparty_pubkey TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      message_count INTEGER NOT NULL DEFAULT 0,
-      interrupted_at TEXT,
-      PRIMARY KEY (agent_name, session_id)
-    )
-  `);
-}
 
 function insertRow(
   db: DaemonDatabase,
   opts: {
     sessionId: string;
-    agentName: string;
+    agentId: string;
     counterpartyPubkey: string;
     status: string;
     messageCount?: number;
@@ -120,11 +104,11 @@ function insertRow(
   const now = Date.now();
   db.prepare(
     `INSERT OR REPLACE INTO sessions
-       (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.sessionId,
-    opts.agentName,
+    opts.agentId,
     opts.counterpartyPubkey,
     opts.status,
     opts.createdAt ?? now,
@@ -152,11 +136,15 @@ describe("cello_list_sessions: SessionNodeManager.getSessionsForAgent", () => {
     const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
     await mgr.initialize();
     const db = mgr.getDb();
+    // Production always has these rows: the daemon creates an agent long before it has a session.
+    const ids = await seedAgents(db, ["alice", "bob"]);
+    const alice = ids.get("alice")!;
+    const bob = ids.get("bob")!;
 
-    insertRow(db, { sessionId: "a1".padEnd(64, "0"), agentName: "alice", counterpartyPubkey: "cpA", status: "active", messageCount: 2 });
-    insertRow(db, { sessionId: "a2".padEnd(64, "0"), agentName: "alice", counterpartyPubkey: "cpB", status: "interrupted", messageCount: 5, interruptedAt: "2026-06-20T00:00:00.000Z" });
-    insertRow(db, { sessionId: "a3".padEnd(64, "0"), agentName: "alice", counterpartyPubkey: "cpC", status: "sealed", messageCount: 4 });
-    insertRow(db, { sessionId: "b1".padEnd(64, "0"), agentName: "bob", counterpartyPubkey: "cpD", status: "active", messageCount: 9 });
+    insertRow(db, { sessionId: "a1".padEnd(64, "0"), agentId: alice, counterpartyPubkey: "cpA", status: "active", messageCount: 2 });
+    insertRow(db, { sessionId: "a2".padEnd(64, "0"), agentId: alice, counterpartyPubkey: "cpB", status: "interrupted", messageCount: 5, interruptedAt: "2026-06-20T00:00:00.000Z" });
+    insertRow(db, { sessionId: "a3".padEnd(64, "0"), agentId: alice, counterpartyPubkey: "cpC", status: "sealed", messageCount: 4 });
+    insertRow(db, { sessionId: "b1".padEnd(64, "0"), agentId: bob, counterpartyPubkey: "cpD", status: "active", messageCount: 9 });
 
     const aliceSessions = mgr.getSessionsForAgent("alice");
     expect(aliceSessions).toHaveLength(3);
@@ -170,7 +158,11 @@ describe("cello_list_sessions: SessionNodeManager.getSessionsForAgent", () => {
     const dbPath = join(tempDir, "sessions.db");
     const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
     await mgr.initialize();
-    expect(mgr.getSessionsForAgent("ghost")).toEqual([]);
+    // "an agent with no sessions" means a REAL agent that has not opened one — not a name that was
+    // never created. A nonexistent name is now a loud programming error (agent_id_unresolved), not
+    // an empty list, because a query scoped to an unresolvable agent silently matches nothing.
+    await seedAgents(mgr.getDb(), ["lonely"]);
+    expect(mgr.getSessionsForAgent("lonely")).toEqual([]);
   });
 });
 
@@ -233,19 +225,24 @@ describe("cello_list_sessions: MCP handler", () => {
 
   it("LIST-3: filter (open default / closed / failed / all) + limit, scoped to the current agent", async () => {
     // Pre-populate the sessions DB before the daemon opens it (matches SESSION-001 AC-006 pattern).
-    const db = openTestDb(join(tempDir, "sessions.db"));
-    createSessionsTable(db);
+    // The schema comes from the manager's own initialize() — never a second, hand-rolled copy.
+    const seedMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "sessions.db") });
+    await seedMgr.initialize();
+    const db = seedMgr.getDb();
+    const ids = await seedAgents(db, ["alice", "bob"]);
+    const alice = ids.get("alice")!;
+    const bob = ids.get("bob")!;
     const t0 = Date.now() - 30_000;
     // aa: active (reconciled to interrupted-with-messages at startup) → category OPEN
-    insertRow(db, { sessionId: "aa".padEnd(64, "1"), agentName: "alice", counterpartyPubkey: "cpActive", status: "active", messageCount: 2, createdAt: t0, updatedAt: t0 + 1000 });
+    insertRow(db, { sessionId: "aa".padEnd(64, "1"), agentId: alice, counterpartyPubkey: "cpActive", status: "active", messageCount: 2, createdAt: t0, updatedAt: t0 + 1000 });
     // bb: interrupted WITH messages → resumable → OPEN
-    insertRow(db, { sessionId: "bb".padEnd(64, "2"), agentName: "alice", counterpartyPubkey: "cpIntr", status: "interrupted", messageCount: 5, createdAt: t0, updatedAt: t0 + 3000, interruptedAt: new Date(t0 + 3000).toISOString() });
+    insertRow(db, { sessionId: "bb".padEnd(64, "2"), agentId: alice, counterpartyPubkey: "cpIntr", status: "interrupted", messageCount: 5, createdAt: t0, updatedAt: t0 + 3000, interruptedAt: new Date(t0 + 3000).toISOString() });
     // cc: sealed → CLOSED
-    insertRow(db, { sessionId: "cc".padEnd(64, "3"), agentName: "alice", counterpartyPubkey: "cpSealed", status: "sealed", messageCount: 4, createdAt: t0, updatedAt: t0 + 2000 });
+    insertRow(db, { sessionId: "cc".padEnd(64, "3"), agentId: alice, counterpartyPubkey: "cpSealed", status: "sealed", messageCount: 4, createdAt: t0, updatedAt: t0 + 2000 });
     // ee: interrupted with ZERO messages → a failed init → FAILED (must not show by default)
-    insertRow(db, { sessionId: "ee".padEnd(64, "5"), agentName: "alice", counterpartyPubkey: "cpFailed", status: "interrupted", messageCount: 0, createdAt: t0, updatedAt: t0 + 500, interruptedAt: new Date(t0 + 500).toISOString() });
+    insertRow(db, { sessionId: "ee".padEnd(64, "5"), agentId: alice, counterpartyPubkey: "cpFailed", status: "interrupted", messageCount: 0, createdAt: t0, updatedAt: t0 + 500, interruptedAt: new Date(t0 + 500).toISOString() });
     // dd: another agent's — always excluded from alice's per-agent list
-    insertRow(db, { sessionId: "dd".padEnd(64, "4"), agentName: "bob", counterpartyPubkey: "cpBob", status: "active", messageCount: 9, createdAt: t0, updatedAt: t0 + 9000 });
+    insertRow(db, { sessionId: "dd".padEnd(64, "4"), agentId: bob, counterpartyPubkey: "cpBob", status: "active", messageCount: 9, createdAt: t0, updatedAt: t0 + 9000 });
     db.close();
 
     await setupAgent("alice");

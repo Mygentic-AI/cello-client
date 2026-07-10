@@ -349,6 +349,17 @@ export type SessionStatus =
 
 export interface SessionRecord {
   session_id: string;
+  /**
+   * DOD-AGENT-ID-JOINKEY-1: the STABLE key this row is scoped by. Every `sessions` query joins on
+   * this, never on `agent_name`.
+   */
+  agent_id: string;
+  /**
+   * DISPLAY ONLY. Joined in from the `agents` table (its single source of truth) — it is NOT a column
+   * of `sessions`, precisely so a rename cannot leave a stale copy behind. Never put it in a
+   * PRIMARY KEY, a JOIN predicate, or a WHERE-match: a retire FREES the name for reuse, so it does
+   * not identify an agent across the retired boundary.
+   */
   agent_name: string;
   counterparty_pubkey: string;
   status: SessionStatus;

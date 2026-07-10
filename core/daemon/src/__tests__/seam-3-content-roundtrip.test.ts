@@ -31,6 +31,7 @@ import { createNode } from "@cello-protocol/transport";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -110,6 +111,9 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const B = makeManager();
     await A.manager.initialize();
     await B.manager.initialize();
+    // Production always has these rows: the daemon creates an agent long before it has a session.
+    await seedAgents(A.manager.getDb(), ["alice"]);
+    await seedAgents(B.manager.getDb(), ["bob"]);
     // DOD-LOOP-1: bob comes online → his per-agent standing receiver is created.
     await B.manager.ensureStandingReceiverForAgent("bob");
 
@@ -164,6 +168,9 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const B = makeManager();
     await A.manager.initialize();
     await B.manager.initialize();
+    // Production always has these rows: the daemon creates an agent long before it has a session.
+    await seedAgents(A.manager.getDb(), ["alice"]);
+    await seedAgents(B.manager.getDb(), ["bob"]);
     await B.manager.ensureStandingReceiverForAgent("bob");
 
     const bInfo = B.manager.getStandingReceiverInfo("bob");

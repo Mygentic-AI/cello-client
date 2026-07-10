@@ -27,6 +27,7 @@ import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway } from "@cello-protocol/gateway";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 function makeLogger(): Logger { return { debug() {}, info() {}, warn() {}, error() {} }; }
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -92,6 +93,8 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     const mgr = new SessionNodeManager({ factory: new SharedFactory(new FakeNode() as unknown as CelloNode), logger: makeLogger(), dbPath, securityGateway: client });
     managers.push(mgr);
     await mgr.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(mgr.getDb(), ["alice"]);
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-gate1");
     return { mgr, logPath };
   }

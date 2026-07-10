@@ -75,6 +75,13 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
+    // DOD-AGENT-ID-JOINKEY-1: enqueue_awaiting_content now requires a resolvable OWNING agent (it
+    // resolves the name to an agent_id and throws agent_id_unresolved otherwise). Production always
+    // has an agent by the time content is awaiting ACK; a flat-file agent + the one-time migration
+    // that runs inside startDaemon gives this daemon a real `agents` row for "alice" to resolve.
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+
     // ── Run 1: a sender enqueues un-acked content (TTF fired) but crashes before park ──
     handle = await startDaemon(makeConfig());
     const socketPath = join(tempDir, "daemon.sock");
@@ -82,6 +89,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
       const client = await connectToDaemon(socketPath);
       try {
         const res = await client.send("enqueue_awaiting_content", {
+          agentName: "alice",
           sessionId,
           contentHash: contentHashHex,
           content: Buffer.from(content).toString("hex"),
@@ -141,17 +149,22 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
+    // DOD-AGENT-ID-JOINKEY-1: same as AC-004 — enqueue_awaiting_content/mark_content_acked need a
+    // resolvable owning agent.
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+
     handle = await startDaemon(makeConfig());
     const socketPath = join(tempDir, "daemon.sock");
     {
       const client = await connectToDaemon(socketPath);
       try {
         await client.send("enqueue_awaiting_content", {
-          sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"),
+          agentName: "alice", sessionId, contentHash: contentHashHex, content: Buffer.from(content).toString("hex"),
         });
         // The persisted ACK arrives → clear the durable awaiting entry.
         const acked = await client.send("mark_content_acked", {
-          sessionId, contentHash: contentHashHex,
+          agentName: "alice", sessionId, contentHash: contentHashHex,
         }) as { acked: boolean; awaitingDepth: number };
         expect(acked.acked).toBe(true);
         expect(acked.awaitingDepth).toBe(0);
@@ -191,12 +204,15 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
     const snm = handle.getSessionNodeManager();
 
     // Persist a session OWNED BY alice with a relay endpoint (what the crash-backstop flush reads).
+    // DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by the stable agent_id, never agent_name — resolve
+    // it off the `agents` row the flat-file migration created above.
+    const aliceId = snm.resolveAgentId("alice");
     const sessionId = randomBytes(16).toString("hex");
     const counterparty = "cd".repeat(32);
     const now = Date.now();
     snm.getDb()
-      .prepare("INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, relay_peer_id, relay_addrs) VALUES (?,?,?,?,?,?,?,?)")
-      .run(sessionId, "alice", counterparty, "interrupted", now, now, "12D3KooWRelayStub", JSON.stringify(["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelayStub"]));
+      .prepare("INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, relay_peer_id, relay_addrs) VALUES (?,?,?,?,?,?,?,?)")
+      .run(sessionId, aliceId, counterparty, "interrupted", now, now, "12D3KooWRelayStub", JSON.stringify(["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelayStub"]));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {

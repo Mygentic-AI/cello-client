@@ -33,6 +33,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { CelloNode } from "@cello-protocol/transport";
 import { createNode } from "@cello-protocol/transport";
 import { generateKeypair } from "@cello-protocol/crypto";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 function makeLogger(): { logger: Logger; events: Array<{ level: string; event: string; context: Record<string, unknown> }> } {
   const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
@@ -121,6 +122,9 @@ describe("M8B F14: standing receiver re-arm", () => {
     // No retry schedule — isolates the TEARDOWN re-arm path from the retry path.
     const { manager } = makeManager(factory, []);
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "bob" — production
+    // always has an `agents` row before a session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
     try {
       await manager.ensureStandingReceiverForAgent("bob");
       expect(manager.getStandingReceiverReady("bob")).toBe(true);
@@ -150,6 +154,9 @@ describe("M8B F14: standing receiver re-arm", () => {
     const factory = new FlakyNodeFactory();
     const { manager } = makeManager(factory, []);
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "bob" — production
+    // always has an `agents` row before a session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
     try {
       await manager.ensureStandingReceiverForAgent("bob");
       factory.failNext = 1;
@@ -172,6 +179,9 @@ describe("M8B F14: standing receiver re-arm", () => {
     const factory = new FlakyNodeFactory();
     const { manager, events } = makeManager(factory, [30, 30]);
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "bob" — production
+    // always has an `agents` row before a session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
     try {
       factory.failNext = 2; // attempts 1+2 fail, attempt 3 succeeds
       await manager.ensureStandingReceiverForAgent("bob");
@@ -187,6 +197,9 @@ describe("M8B F14: standing receiver re-arm", () => {
     const factory = new FlakyNodeFactory();
     const { manager, events } = makeManager(factory, [10, 10]);
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "bob" — production
+    // always has an `agents` row before a session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
     try {
       factory.failNext = 100; // every attempt fails
       await manager.ensureStandingReceiverForAgent("bob");
@@ -207,6 +220,9 @@ describe("M8B F14: standing receiver re-arm", () => {
     const factory = new ParkingNodeFactory();
     const { manager } = makeManager(factory, [50]);
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "bob" — production
+    // always has an `agents` row before a session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
     try {
       const ensureP = manager.ensureStandingReceiverForAgent("bob"); // parks on createNode
       await wait(50);

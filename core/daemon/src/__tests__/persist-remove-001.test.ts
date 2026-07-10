@@ -203,3 +203,160 @@ describe("REMOVE-001 DOD-REMOVE-1 — retire-and-keep + name reuse (local)", () 
     expect(((await client.send("cello_remove_agent", { name: "x" })) as RemoveRes).reason).toBe("agent_not_found");
   });
 });
+
+/**
+ * DOD-AGENT-ID-JOINKEY-1 — AC4: the retire-reuse history bleed.
+ *
+ * REMOVE-001 (above) made the name REUSABLE: retire keeps every row and frees the name. It re-keyed the
+ * parent `agents` table to a stable `agent_id` and left seven child tables joining on the name it had
+ * just turned into a mutable, reusable attribute. So a NEW agent created under a retired agent's name —
+ * a different agent_id, a different K_local keypair — inherits the dead identity's rows through every
+ * `WHERE agent_name = ?`.
+ *
+ * That is not stale data. It is one keypair reading another keypair's transcript and contacts, and
+ * resuming one of its interrupted sessions would seal with the wrong key.
+ *
+ * RED-FIRST: this must FAIL on the `agent_name` join and pass on the `agent_id` join.
+ */
+describe("DOD-AGENT-ID-JOINKEY-1 AC4 — a recreated name inherits NOTHING from the retired identity", () => {
+  it("the new agent sees none of the retired agent's contacts, transcript, or watermarks", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const snm = handle.getSessionNodeManager();
+    const client = await connect(config.socketPath);
+
+    const SESSION = "aa".repeat(16);
+    const STRANGER = "bb".repeat(32);
+
+    // ── The FIRST 'ada' generates history across three of the seven child tables, through the REAL
+    //    write paths (IPC for contacts; the manager's public API for transcript + watermarks).
+    const first = (await client.send("cello_create_agent", { name: "ada" })) as CreateRes;
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    const id1 = first.agentId!;
+    const pub1 = first.pubkey!;
+
+    expect(((await client.send("cello_use_agent", { name: "ada" })) as { ok: boolean }).ok).toBe(true);
+    expect(((await client.send("cello_contact_add", { pubkey: STRANGER })) as { ok: boolean }).ok).toBe(true);
+    snm.recordTranscriptMessage("ada", SESSION, 0, "received", Buffer.from("the dead identity's secret"));
+    snm.advanceLastDeliveredSeq("ada", SESSION, 7);
+
+    // Baseline — the history is really there, or the isolation assertions below would pass vacuously.
+    expect(snm.listContacts("ada").map((c) => c.pubkey)).toEqual([STRANGER]);
+    expect(snm.readTranscript("ada", SESSION).messages).toHaveLength(1);
+    expect(snm.getLastDeliveredSeq("ada", SESSION)).toBe(7);
+
+    // ── Retire 'ada'. Rows are KEPT (SI-002 accountability) and the name is FREED.
+    expect(((await client.send("cello_remove_agent", { name: "ada" })) as RemoveRes).ok).toBe(true);
+
+    // ── A NEW 'ada' — same name, DIFFERENT identity.
+    const second = (await client.send("cello_create_agent", { name: "ada" })) as CreateRes;
+    expect(second.ok, JSON.stringify(second)).toBe(true);
+    const id2 = second.agentId!;
+    const pub2 = second.pubkey!;
+
+    // PRECONDITIONS — assert the two agents are genuinely distinct BEFORE asserting isolation.
+    // Without these, a fixture bug (the second create silently no-op'd, or reused the first's id)
+    // would make the isolation assertions below pass while proving nothing at all.
+    expect(id2, "the recreated agent must have a DIFFERENT stable agent_id").not.toBe(id1);
+    expect(pub2, "the recreated agent must have a DIFFERENT K_local pubkey").not.toBe(pub1);
+    expect(readRow(tempDir, "ada", "retired")!.agent_id).toBe(id1);
+    expect(readRow(tempDir, "ada", "created")!.agent_id).toBe(id2);
+
+    // ── THE BLEED. Every one of these reads `WHERE agent_name = 'ada'` today, so each returns the
+    //    RETIRED identity's rows to a brand-new keypair.
+    expect(
+      snm.listContacts("ada"),
+      "the new 'ada' (a different keypair) must not inherit the retired 'ada' contact whitelist — " +
+        "an access-control list crossing an identity boundary",
+    ).toEqual([]);
+
+    expect(
+      snm.readTranscript("ada", SESSION).messages,
+      "the new 'ada' must not be able to read the retired 'ada' conversation transcript",
+    ).toEqual([]);
+
+    expect(
+      snm.getLastDeliveredSeq("ada", SESSION),
+      "the new 'ada' must not inherit the retired 'ada' read watermark (-1 = nothing delivered yet, " +
+        "so a seq-0 message still reads as unread)",
+    ).toBe(-1);
+
+    expect(
+      snm.getUnreadSummary("ada"),
+      "the new 'ada' must not see the retired 'ada' unread messages",
+    ).toEqual([]);
+
+    // ── And the retired identity's history SURVIVES — this migration destroys nothing. It is simply
+    //    no longer reachable by name, because the name no longer identifies it.
+    const db = openEncryptedDatabaseAtPath(join(tempDir, "sessions.db"));
+    try {
+      const kept = db.prepare("SELECT COUNT(*) AS n FROM transcript").get() as { n: number };
+      expect(kept.n, "the retired identity's transcript row must still exist (accountability, SI-002)").toBe(1);
+      const contacts = db.prepare("SELECT COUNT(*) AS n FROM contacts").get() as { n: number };
+      expect(contacts.n, "the retired identity's contact row must still exist").toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+/**
+ * DOD-AGENT-ID-JOINKEY-1 — cello-unit-reviewer Finding 1 (regression, red-first).
+ *
+ * Retiring an agent keeps its `sessions` rows (accountability). Those rows are still `active` /
+ * `interrupted` — `removeAgent` does not re-status them. The live-status surfaces (`cello_status`)
+ * and the half-open reaper iterate every such row, and the reaper resolves the row's agent NAME to a
+ * stable id (`countReceivedMessages` → `#requireAgentId`). Post-migration that resolver refuses a
+ * RETIRED name and THROWS — synchronously, unguarded, inside the reap loop — so `cello_status` throws
+ * for the WHOLE daemon the moment any retired agent still owns a session row. Pre-migration the
+ * name-scoped query just returned a count (the bleed), so this is a regression the strict resolver
+ * introduced. The AC4 test above never writes a `sessions` row, so it does not enter this path.
+ */
+describe("DOD-AGENT-ID-JOINKEY-1 — a retired agent's leftover session must not break cello_status", () => {
+  it("cello_status succeeds after retiring an agent that still owns an old active session row", async () => {
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const snm = handle.getSessionNodeManager();
+    const client = await connect(config.socketPath);
+
+    // A real agent with a stable id.
+    const created = (await client.send("cello_create_agent", { name: "ada" })) as CreateRes;
+    expect(created.ok, JSON.stringify(created)).toBe(true);
+    const adaId = created.agentId!;
+
+    // Give it an OLD, zero-received active session row — exactly a reap candidate (past the half-open
+    // TTL, counterparty never spoke). Written by agent_id, as production does.
+    const tenMinAgo = Date.now() - 10 * 60 * 1000;
+    snm.getDb()
+      .prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count)
+         VALUES (?, ?, ?, 'active', ?, ?, 0)`,
+      )
+      .run("dd".repeat(16), adaId, "cc".repeat(32), tenMinAgo, tenMinAgo);
+
+    // Baseline via the DB — NOT via cello_status, because status runs the half-open reaper, which
+    // would mark this old zero-received row 'abandoned' while ada is still active (correct behaviour)
+    // and rob the test of its precondition. Confirm the row is there and 'active'.
+    expect(
+      (snm.getDb().prepare("SELECT status FROM sessions WHERE agent_id = ?").get(adaId) as { status: string }).status,
+    ).toBe("active");
+
+    // Retire ada. Its session row is KEPT (accountability) and still says 'active'.
+    expect(((await client.send("cello_remove_agent", { name: "ada" })) as RemoveRes).ok).toBe(true);
+
+    // THE REGRESSION: cello_status must still succeed. Pre-fix, buildActiveSessions →
+    // reapDeadHalfOpenSessions → countReceivedMessages('ada', …) → #requireAgentId('ada') threw
+    // ("agent_id_unresolved" — ada is retired), and the throw propagated out of the whole handler.
+    const after = (await client.send("cello_status")) as
+      | { active_sessions: Array<{ sessionId: string; agentName: string }>; interrupted_sessions: unknown[] }
+      | { error: string };
+    expect("error" in after ? after.error : null, "cello_status must not throw after retiring an agent with a live session row").toBeNull();
+
+    // The retired agent's session is a dead identity's leftover — it must not appear in the LIVE
+    // status surface (it is not resumable; ada has no runtime). It survives in the durable archive.
+    expect(
+      (after as { active_sessions: Array<{ agentName: string }> }).active_sessions.some((s) => s.agentName === "ada"),
+      "a retired agent's session must not surface in the live active-session status",
+    ).toBe(false);
+  });
+});

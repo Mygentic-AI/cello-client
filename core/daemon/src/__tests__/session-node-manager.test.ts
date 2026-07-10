@@ -56,6 +56,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import { SessionNodeManager } from "../session-node-manager.js";
 import {
   SessionConnectionGater,
@@ -194,6 +195,8 @@ describe("SessionNodeManager — unit tests", () => {
     const stub = new StubNodeFactory();
     const { manager, events } = await makeManager({ factory: stub });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["test-agent"]);
 
     // Directly fill the active node map to the cap using stub nodes
     // We use the public API to add 32 sessions
@@ -327,6 +330,8 @@ describe("SessionNodeManager — unit tests", () => {
     const stub = new StubNodeFactory();
     const { manager } = await makeManager({ factory: stub });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["agent"]);
     for (let i = 0; i < MAX_SESSION_NODES; i++) {
       await manager.createSessionNode(`ac013-s${i}`, "agent", `pk${i}`, `peer${i}`, `c${i}`);
     }
@@ -487,6 +492,8 @@ describe("SessionNodeManager — unit tests", () => {
     const { logger: logger2 } = makeLogger();
     const manager2 = new SessionNodeManager({ factory: captureFactory, logger: logger2, dbPath: dbPath2 });
     await manager2.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager2.getDb(), ["test-agent"]);
     // DOD-LOOP-1: bring the agent online so its standing receiver (and gater) is created.
     await manager2.ensureStandingReceiverForAgent("test-agent");
 
@@ -580,6 +587,8 @@ describe("SessionNodeManager — unit tests", () => {
     const stub = new StubNodeFactory();
     const { manager, events } = await makeManager({ factory: stub });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["test-agent"]);
 
     const result = await manager.createSessionNode(
       "si003-session",
@@ -741,6 +750,8 @@ describe("SessionNodeManager — integration tests", () => {
   it("SEAM 1b: connectToCounterparty dials the counterparty THROUGH the session node (N_A holds the connection)", async () => {
     const { manager } = await makeManager({ factory: new RealNodeFactory() });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice"]);
     // The counterparty: a plain real node, listening, with no restrictive gater.
     const counterparty = await makeRealNode();
     cleanupNodes.push(counterparty);
@@ -771,6 +782,8 @@ describe("SessionNodeManager — integration tests", () => {
   it("SEAM 1b: connectToCounterparty returns no_counterparty_addrs when the assignment carried no addrs", async () => {
     const { manager } = await makeManager({ factory: new RealNodeFactory() });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice"]);
     try {
       const sid = "1c".repeat(16);
       await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
@@ -824,6 +837,8 @@ describe("SessionNodeManager — integration tests", () => {
     const real = new RealNodeFactory();
     const { manager, events } = await makeManager({ factory: real });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice"]);
 
     try {
       // Create a directory node to compare Peer ID against
@@ -880,6 +895,8 @@ describe("SessionNodeManager — integration tests", () => {
     const real = new RealNodeFactory();
     const { manager, events } = await makeManager({ factory: real });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["bob"]);
 
     try {
       // DOD-LOOP-1: bring bob online so he has his own standing receiver, then assert it's ready.
@@ -944,6 +961,8 @@ describe("SessionNodeManager — integration tests", () => {
     const real = new RealNodeFactory();
     const { manager, events, dbPath } = await makeManager({ factory: real });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice"]);
 
     try {
       const result = await manager.createSessionNode(
@@ -1017,6 +1036,8 @@ describe("SessionNodeManager — integration tests", () => {
     const real = new RealNodeFactory();
     const { manager } = await makeManager({ factory: real });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice"]);
 
     let capturedAddrs: string[] = [];
     try {
@@ -1184,6 +1205,8 @@ describe("SessionNodeManager — integration tests", () => {
     const real = new RealNodeFactory();
     const { manager, events, dbPath } = await makeManager({ factory: real });
     await manager.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    await seedAgents(manager.getDb(), ["alice", "bob"]);
 
     // Create 2 sessions
     const r1 = await manager.createSessionNode("gc-session-1", "alice", "pk-alice", "peer-1", "c1");
@@ -1238,6 +1261,10 @@ describe("SessionNodeManager — integration tests", () => {
     db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)").run(
       "orphan-2", "bob", "pk-bob", "active", now, now,
     );
+    // DOD-AGENT-ID-JOINKEY-1: initialize() re-keys this table from agent_name to agent_id, backfilling
+    // by resolving each row's name against `agents` — production always has these rows already
+    // (REMOVE-001 created them long before this migration exists), so seed them here too.
+    await seedAgents(db, ["alice", "bob"]);
     db.close();
 
     // Fresh daemon restart — should detect and fix orphans
@@ -1355,12 +1382,16 @@ describe("SessionNodeManager — integration tests", () => {
     const now = Date.now();
     // Use named columns to be schema-agnostic (works with both 6-col legacy schema
     // and the M7-SESSION-001 8-col schema that added message_count + interrupted_at).
+    // DOD-AGENT-ID-JOINKEY-1: the daemon already opened this DB (creating `sessions` in its
+    // re-keyed, agent_id-shaped form) before this test writes to it — there is no `agents` FK
+    // enforced at the SQLite layer, and this test only exercises interrupted-status persistence
+    // across a restart, not name resolution, so a bare id string is sufficient here.
     db.prepare(
-      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-    ).run("sigterm-s1", "alice", "pk-alice", "active", now, now);
+      "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    ).run("sigterm-s1", "alice-id", "pk-alice", "active", now, now);
     db.prepare(
-      "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-    ).run("sigterm-s2", "bob", "pk-bob", "active", now, now);
+      "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    ).run("sigterm-s2", "bob-id", "pk-bob", "active", now, now);
     db.close();
 
     // Step (c): send SIGTERM and wait for clean exit

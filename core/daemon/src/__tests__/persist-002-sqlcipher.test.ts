@@ -34,6 +34,7 @@ import {
   DbEncryptionError,
   isPlaintextSqliteFile,
 } from "../sqlcipher-db.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 function makeLogger(): Logger {
   return { debug() {}, info() {}, warn() {}, error() {} };
@@ -81,15 +82,21 @@ async function initManager(dbPath: string): Promise<SessionNodeManager> {
   return mgr;
 }
 
-function insertSessionRow(mgr: SessionNodeManager, counterparty: string): void {
+/**
+ * DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by the stable agent_id, never agent_name. Production
+ * always has an `agents` row before a session exists, so seed one here (idempotent) and insert
+ * against its resolved id — never a bare, never-created name.
+ */
+async function insertSessionRow(mgr: SessionNodeManager, counterparty: string): Promise<void> {
   const now = Date.now();
+  const ids = await seedAgents(mgr.getDb(), ["alice"]);
   mgr
     .getDb()
     .prepare(
-      `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at)
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
     )
-    .run("sess-needle-id", "alice", counterparty, "active", now, now);
+    .run("sess-needle-id", ids.get("alice")!, counterparty, "active", now, now);
 }
 
 describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)", () => {
@@ -99,7 +106,7 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
     const TRANSCRIPT_NEEDLE = "TOP-SECRET-PLAINTEXT-NEEDLE-9f3a";
 
     const mgr = await initManager(dbPath);
-    insertSessionRow(mgr, COUNTERPARTY_NEEDLE);
+    await insertSessionRow(mgr, COUNTERPARTY_NEEDLE);
     mgr.recordTranscriptMessage("alice", "sess-needle-id", 0, "sent", new TextEncoder().encode(TRANSCRIPT_NEEDLE));
 
     const raw = await allDbBytes(dbPath);
@@ -129,7 +136,7 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
   it("AC-001: plain node:sqlite cannot read the encrypted file; the keyed handle can", async () => {
     const dbPath = join(tempDir, "sessions.db");
     const mgr = await initManager(dbPath);
-    insertSessionRow(mgr, "cphex");
+    await insertSessionRow(mgr, "cphex");
 
     let plaintextLeak = false;
     try {
@@ -153,7 +160,7 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
   it("AC-010: the transcript read surface still round-trips (whole-DB SQLCipher, no column cipher)", async () => {
     const dbPath = join(tempDir, "sessions.db");
     const mgr = await initManager(dbPath);
-    insertSessionRow(mgr, "cphex");
+    await insertSessionRow(mgr, "cphex");
     mgr.recordTranscriptMessage("alice", "sess-needle-id", 0, "sent", new TextEncoder().encode("hello"));
     mgr.recordTranscriptMessage("alice", "sess-needle-id", 1, "received", new TextEncoder().encode("world"));
 
@@ -177,7 +184,7 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
 
     // Build a real encrypted DB with data, then release the handle so the file is final.
     const mgr = await initManager(dbPath);
-    insertSessionRow(mgr, "cphex-intact");
+    await insertSessionRow(mgr, "cphex-intact");
     mgr.recordTranscriptMessage("alice", "sess-needle-id", 0, "sent", new TextEncoder().encode("intact-data"));
     mgr.getDb().close();
 

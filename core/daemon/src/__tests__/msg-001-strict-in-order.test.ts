@@ -30,6 +30,7 @@ import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
 import { encodeStructure1 } from "../session-relay-client.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -99,6 +100,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
 
   it("a content witnessed AHEAD of the next expected leaf is HELD, not appended out of order", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"));
+    await seedAgents(mgr.getDb(), [AGENT]);
     await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
 
     const c0 = new TextEncoder().encode("m0");
@@ -134,6 +136,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
 
   it("the in-order happy path is unchanged — sequential arrivals append immediately", async () => {
     const mgr = await makeManager(logger, join(tempDir, "happy.db"));
+    await seedAgents(mgr.getDb(), [AGENT]);
     await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
     const msgs = ["a", "b", "c"].map((s) => new TextEncoder().encode(s));
     const hashes = msgs.map(msgLeafHash);
@@ -148,6 +151,7 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
 
   it("without a witness (relay-degraded) content still appends in arrival order — no regression", async () => {
     const mgr = await makeManager(logger, join(tempDir, "nowitness.db"));
+    await seedAgents(mgr.getDb(), [AGENT]);
     await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
     // No recordWitnessedSequence calls: B has no canonical sequence to gate on, so it falls
     // back to the pre-MSG-4 behavior (append on arrival). This preserves delivery when the
@@ -227,6 +231,7 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
 
   async function managerWithCounterparty(kp: ReturnType<typeof generateKeypair>, dbName: string): Promise<SessionNodeManager> {
     const mgr = await makeManager(logger, join(tempDir, dbName));
+    await seedAgents(mgr.getDb(), ["alice"]);
     const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
     await mgr.createSessionNode(sid, "alice", cpHex, "peer-id", "corr");
     return mgr;

@@ -31,6 +31,26 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import type { DaemonDatabase } from "../sqlcipher-db.js";
+
+/**
+ * DOD-AGENT-ID-JOINKEY-1: `sessions`/`transcript` are now keyed by the STABLE `agent_id`, not the
+ * mutable `agent_name`. Every raw-SQL seed below runs AFTER `makeAgentDir` + daemon start, so the
+ * named agent already has a real `agents` row (imported from its flat-file key at startup) —
+ * resolve its id off that row rather than writing the (no-longer-a-column) name.
+ */
+function resolveAgentId(db: DaemonDatabase, agentName: string): string {
+  const row = db
+    .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+    .get(agentName) as { agent_id: string } | undefined;
+  if (!row) {
+    throw new Error(
+      `test fixture bug: agent '${agentName}' has no 'agents' row yet — create it (makeAgentDir + ` +
+        `daemon start) before hand-writing a session row for it`,
+    );
+  }
+  return row.agent_id;
+}
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -166,12 +186,13 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const db = snm.getDb();
     const strangerPubkey = "ee".repeat(32);
     const now = Date.now();
+    const aliceId = resolveAgentId(db, "alice");
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
       const sid = i.toString(16).padStart(32, "0");
       db.prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'alice', ?, 'active', ?, ?, 0, NULL)`,
-      ).run(sid, strangerPubkey, now, now);
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+      ).run(sid, aliceId, strangerPubkey, now, now);
     }
     expect(snm.isContact("alice", strangerPubkey)).toBe(false); // genuinely still unknown
 
@@ -196,12 +217,13 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     // Pre-seed the per-sender cap's worth of active sessions directly (bypassing acceptance, so
     // the sender stays genuinely unknown — see the previous test's note).
     const now = Date.now();
+    const bobId = resolveAgentId(snm.getDb(), "bob");
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
       const sid = i.toString(16).padStart(32, "0");
       snm.getDb().prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'bob', ?, 'active', ?, ?, 0, NULL)`,
-      ).run(sid, strangerPubkey, now, now);
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+      ).run(sid, bobId, strangerPubkey, now, now);
     }
     expect(snm.isContact("bob", strangerPubkey)).toBe(false);
 
@@ -288,13 +310,14 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     // no live node (liveness never marked) — the exact post-restart shape from the live block.
     const old = Date.now() - 60 * 60 * 1000;
     const ghostSids: string[] = [];
+    const bobId = resolveAgentId(snm.getDb(), "bob");
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
       const sid = `d${i}`.padStart(2, "0").repeat(16);
       ghostSids.push(sid);
       snm.getDb().prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'bob', ?, 'interrupted', ?, ?, 0, ?)`,
-      ).run(sid, strangerPubkey, old, old, old);
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, bobId, strangerPubkey, old, old, old);
     }
     expect(snm.isContact("bob", strangerPubkey)).toBe(false);
     expect(snm.countActiveSessionsForCounterparty("bob", strangerPubkey)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
@@ -344,17 +367,18 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const attackerPubkey = "5e".repeat(32);
     const old = Date.now() - 60 * 60 * 1000;
     const sids: string[] = [];
+    const bobId = resolveAgentId(snm.getDb(), "bob");
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
       const sid = `e${i}`.padStart(2, "0").repeat(16);
       sids.push(sid);
       snm.getDb().prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'bob', ?, 'interrupted', ?, ?, 2, ?)`,
-      ).run(sid, attackerPubkey, old, old, old);
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 2, ?)`,
+      ).run(sid, bobId, attackerPubkey, old, old, old);
       snm.getDb().prepare(
-        `INSERT INTO transcript (agent_name, session_id, sequence, direction, blob, created_at)
-         VALUES ('bob', ?, 0, 'received', ?, ?)`,
-      ).run(sid, Buffer.from("attacker content"), old);
+        `INSERT INTO transcript (agent_id, session_id, sequence, direction, blob, created_at)
+         VALUES (?, ?, 0, 'received', ?, ?)`,
+      ).run(bobId, sid, Buffer.from("attacker content"), old);
     }
     expect(snm.isContact("bob", attackerPubkey)).toBe(false);
 
@@ -392,13 +416,14 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     // Seed ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL active sessions from DISTINCT unknown senders directly
     // (fast — no need to drive the full acceptance flow N times for a unit-level bound check).
     const now = Date.now();
+    const aliceId = resolveAgentId(db, "alice");
     for (let i = 0; i < ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL; i++) {
       const sid = i.toString(16).padStart(32, "0");
       const cp = `stranger-${i}`;
       db.prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'alice', ?, 'active', ?, ?, 0, NULL)`,
-      ).run(sid, cp, now, now);
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+      ).run(sid, aliceId, cp, now, now);
     }
     expect(snm.countActiveSessionsFromUnknownSenders("alice")).toBe(ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL);
 
@@ -448,14 +473,15 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const db = snm.getDb();
     const stranger = "12".repeat(32);
     const now = Date.now();
+    const aliceId = resolveAgentId(db, "alice");
 
     // All 'interrupted', not 'active' — the exact evasion: open, disconnect (interrupt), repeat.
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
       const sid = `f1${i}`.padStart(32, "0");
       db.prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'alice', ?, 'interrupted', ?, ?, 0, ?)`,
-      ).run(sid, stranger, now, now, new Date(now).toISOString());
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, aliceId, stranger, now, now, new Date(now).toISOString());
     }
     expect(snm.countActiveSessionsForCounterparty("alice", stranger)).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
     expect(snm.checkUnknownSenderAcceptanceBound("alice", stranger)).toMatchObject({ ok: false, reason: "abuse_bound_sessions_per_sender" });
@@ -465,9 +491,9 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     for (let i = 0; i < ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL; i++) {
       const sid = `f2${i}`.padStart(32, "0");
       db2.prepare(
-        `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
-         VALUES (?, 'alice', ?, 'interrupted', ?, ?, 0, ?)`,
-      ).run(sid, `other-${i}`, now, now, new Date(now).toISOString());
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, aliceId, `other-${i}`, now, now, new Date(now).toISOString());
     }
     expect(snm.countActiveSessionsFromUnknownSenders("alice")).toBeGreaterThanOrEqual(ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL);
     expect(snm.checkUnknownSenderAcceptanceBound("alice", "brand-new-stranger")).toMatchObject({ ok: false, reason: "abuse_bound_unknown_sessions_global" });

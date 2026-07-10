@@ -1635,12 +1635,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // entry; a TTF expiry records the un-acked content for the crash backstop (the relay
   // park deposit itself is added in 3b). Both side effects are best-effort and never
   // throw into the content stream handler.
+  // DOD-AGENT-ID-JOINKEY-1: RetryQueue owns an agent-scoped table, so it is handed the STABLE
+  // agent_id. The daemon resolves the operator-facing name ONCE, here at its own boundary.
   sessionNodeManager.setAwaitingAckHooks({
     onPersisted: (agentName, sessionId, contentHashHex) => {
-      retryQueue.markContentAcked(agentName, sessionId, Buffer.from(contentHashHex, "hex"));
+      retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));
     },
     onTtf: (agentName, sessionId, contentHashHex, content) => {
-      retryQueue.enqueueAwaitingContent(agentName, sessionId, Buffer.from(contentHashHex, "hex"), content);
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
     },
   });
 
@@ -1695,8 +1697,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // PERSISTED session state (the in-memory entry is gone after a restart). Same seal + deposit
   // as the live hook above; the endpoint + recipient come from the sessions row.
   const startupParkFn: import("./retry-queue.js").ParkFn = async (entry) => {
-    const ep = sessionNodeManager.getPersistedRelayEndpoint(entry.agentName, entry.sessionId);
-    const record = sessionNodeManager.getSessionRecord(entry.agentName, entry.sessionId);
+    // The durable row carries the OWNING agent's stable id. Resolve it back to a name for the
+    // name-addressed session/standing-receiver lookups. A retired owner resolves fine and then has no
+    // standing receiver, so the park fails loudly below rather than silently re-parking as someone else.
+    const ownerName = sessionNodeManager.agentNameForId(entry.agentId);
+    if (ownerName === null) return { parked: false, error: "owning_agent_not_found" };
+    const ep = sessionNodeManager.getPersistedRelayEndpoint(ownerName, entry.sessionId);
+    const record = sessionNodeManager.getSessionRecord(ownerName, entry.sessionId);
     if (!ep) return { parked: false, error: "no_persisted_relay_endpoint" };
     if (!record?.counterparty_pubkey) return { parked: false, error: "no_counterparty" };
     // DOD-LOOP-1: the re-park must originate from the session's OWNING agent (the original
@@ -1728,17 +1735,22 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // Re-park un-acked awaiting content to the relay store-and-forward queue. Runs once pre-IPC
   // (the crash backstop) and again per-agent when an agent comes online — because post-DOD-LOOP-1
   // the native `startupParkFn` needs the OWNING agent's standing receiver, which exists only once
-  // that agent is online. `filterAgent` scopes the drain to one agent's sessions on the agent-
+  // that agent is online. `filterAgentName` scopes the drain to one agent's sessions on the agent-
   // online re-run; with no filter it attempts all (the pre-IPC pass / injected-target test path).
-  async function flushAwaitingContent(filterAgent?: string): Promise<void> {
+  async function flushAwaitingContent(filterAgentName?: string): Promise<void> {
+    // DOD-AGENT-ID-JOINKEY-1: the queue is keyed by the STABLE agent_id, but the caller (and the
+    // human-readable log) speak the NAME. Resolve once here; log the name, filter by the id.
+    const filterAgentId = filterAgentName !== undefined
+      ? sessionNodeManager.resolveAgentId(filterAgentName)
+      : undefined;
     const all = retryQueue.getAwaitingSessions();
-    const sessions = filterAgent === undefined
+    const sessions = filterAgentId === undefined
       ? all
-      : all.filter((s) => s.agentName === filterAgent);
+      : all.filter((s) => s.agentId === filterAgentId);
     if (sessions.length === 0) return;
     const parkFn = config.contentParkFn ?? startupParkFn;
     if (!parkFn) {
-      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s.agentName, s.sessionId), 0);
+      const pendingCount = sessions.reduce((n, s) => n + retryQueue.getAwaitingDepth(s.agentId, s.sessionId), 0);
       logger.warn("content.park.flush.deferred", {
         sessionCount: sessions.length,
         pendingCount,
@@ -1749,7 +1761,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     let parkedTotal = 0;
     for (const s of sessions) {
       try {
-        parkedTotal += await retryQueue.drainAwaitingToPark(s.agentName, s.sessionId, parkFn);
+        parkedTotal += await retryQueue.drainAwaitingToPark(s.agentId, s.sessionId, parkFn);
       } catch (err: unknown) {
         logger.error("content.park.flush.failed", {
           sessionId: s.sessionId,
@@ -1760,7 +1772,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     logger.info("content.park.flush.completed", {
       sessionCount: sessions.length,
       parkedCount: parkedTotal,
-      ...(filterAgent !== undefined ? { agentName: filterAgent } : {}),
+      ...(filterAgentName !== undefined ? { agentName: filterAgentName } : {}),
     });
   }
 
@@ -3814,10 +3826,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     // DOD-LOOP-1: awaiting content is keyed by the OWNING agent. Prefer an explicit agentName param;
     // fall back to the connection's current agent.
+    // DOD-AGENT-ID-JOINKEY-1: the old `?? ""` fell back to an EMPTY-STRING agent, silently merging
+    // every unaddressed caller's awaiting content into one nameless queue. There is no such agent.
     const agentName = (params?.agentName as string | undefined)
-      ?? perConnectionState.get(connectionId)?.currentAgent ?? "";
-    retryQueue.enqueueAwaitingContent(agentName, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
-    return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(agentName, sessionId) };
+      ?? perConnectionState.get(connectionId)?.currentAgent;
+    if (!agentName) {
+      return { error: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass agentName." };
+    }
+    const agentId = sessionNodeManager.resolveAgentId(agentName);
+    retryQueue.enqueueAwaitingContent(agentId, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
+    return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(agentId, sessionId) };
   });
 
   // CELLO-M7-MSG-001: a `persisted` delivery ACK (or a confirmed park) clears the durable
@@ -3829,9 +3847,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { error: "missing_params", guidance: "Provide sessionId and contentHash (hex)." };
     }
     const agentName = (params?.agentName as string | undefined)
-      ?? perConnectionState.get(connectionId)?.currentAgent ?? "";
-    retryQueue.markContentAcked(agentName, sessionId, Buffer.from(contentHashHex, "hex"));
-    return { acked: true, awaitingDepth: retryQueue.getAwaitingDepth(agentName, sessionId) };
+      ?? perConnectionState.get(connectionId)?.currentAgent;
+    if (!agentName) {
+      return { error: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass agentName." };
+    }
+    const agentId = sessionNodeManager.resolveAgentId(agentName);
+    retryQueue.markContentAcked(agentId, sessionId, Buffer.from(contentHashHex, "hex"));
+    return { acked: true, awaitingDepth: retryQueue.getAwaitingDepth(agentId, sessionId) };
   });
 
   handlers.set("check_nonce", async (params, _connectionId) => {

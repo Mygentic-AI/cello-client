@@ -24,6 +24,7 @@ import * as lp from "it-length-prefixed";
 import { Encoder } from "cbor-x";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -138,6 +139,9 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const mgrA = await makeManager(a.logger, join(tempDir, "a.db"), nodeA);
     const mgrB = await makeManager(b.logger, join(tempDir, "b.db"), nodeB);
     managers.push(mgrA, mgrB);
+    // Production always has these rows: the daemon creates an agent long before it has a session.
+    await seedAgents(mgrA.getDb(), ["alice"]);
+    await seedAgents(mgrB.getDb(), ["bob"]);
 
     await mgrA.createSessionNode(SID, "alice", "bobpk", nodeB.getPeerId(), "corr-a");
     await mgrB.createSessionNode(SID, "bob", "alicepk", nodeA.getPeerId(), "corr-b");
@@ -170,6 +174,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const a = makeLogger();
     const mgrA = await makeManager(a.logger, join(tempDir, "a2.db"), nodeA);
     managers.push(mgrA);
+    await seedAgents(mgrA.getDb(), ["alice"]);
     await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
 
     const content = new TextEncoder().encode("level test");

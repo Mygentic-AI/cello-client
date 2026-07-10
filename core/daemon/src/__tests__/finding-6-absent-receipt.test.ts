@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionNodeManager, type ISessionNodeFactory } from "../session-node-manager.js";
 import { upgradeAbsentToRecovered, hasAbsentParticipant } from "../seal-receipt-upgrade.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 
 const silentLogger: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
@@ -29,10 +30,12 @@ describe("FINDING-6: recordSealCertificateEnsuringRow (durable absent-party rece
   beforeEach(async () => { tempDir = await mkdtemp(join(tmpdir(), "cello-f6-")); });
   afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
 
-  async function newManager(): Promise<SessionNodeManager> {
+  async function newManager(): Promise<{ mgr: SessionNodeManager; bob: string }> {
     const mgr = new SessionNodeManager({ factory: stubFactory, logger: silentLogger, dbPath: join(tempDir, `f6-${Math.random().toString(36).slice(2)}.db`) });
     await mgr.initialize();
-    return mgr;
+    // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
+    const ids = await seedAgents(mgr.getDb(), ["bob"]);
+    return { mgr, bob: ids.get("bob")! };
   }
 
   const SID = "6f".padEnd(32, "0"); // 16-byte session id hex
@@ -41,13 +44,13 @@ describe("FINDING-6: recordSealCertificateEnsuringRow (durable absent-party rece
   const LEG = JSON.stringify({ attests: "receipt", participants: [{ pubkey: CP, content_frontier_seq: 2, attestation_mode: "live" }] });
 
   it("plain recordSealCertificate SILENTLY no-ops when B has no local row (the bug)", async () => {
-    const mgr = await newManager();
+    const { mgr } = await newManager();
     mgr.recordSealCertificate("bob", SID, ROOT, LEG);
     expect(mgr.getSealCertificate("bob", SID)).toBeNull();
   });
 
   it("recordSealCertificateEnsuringRow persists a RETRIEVABLE cert when there is no prior row", async () => {
-    const mgr = await newManager();
+    const { mgr } = await newManager();
     mgr.recordSealCertificateEnsuringRow("bob", SID, CP, ROOT, LEG);
     const cert = mgr.getSealCertificate("bob", SID);
     expect(cert).not.toBeNull();
@@ -56,14 +59,14 @@ describe("FINDING-6: recordSealCertificateEnsuringRow (durable absent-party rece
   });
 
   it("updates an EXISTING row (interrupted post-restart) without duplicating it", async () => {
-    const mgr = await newManager();
+    const { mgr, bob } = await newManager();
     const now = Date.now();
     mgr.getDb()
-      .prepare("INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)")
-      .run(SID, "bob", CP, "interrupted", now, now);
+      .prepare("INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)")
+      .run(SID, bob, CP, "interrupted", now, now);
     mgr.recordSealCertificateEnsuringRow("bob", SID, CP, "dd".repeat(32), LEG);
     expect(mgr.getSealCertificate("bob", SID)!.sealed_root).toBe("dd".repeat(32));
-    const { c } = mgr.getDb().prepare("SELECT COUNT(*) c FROM sessions WHERE agent_name=? AND session_id=?").get("bob", SID) as { c: number };
+    const { c } = mgr.getDb().prepare("SELECT COUNT(*) c FROM sessions WHERE agent_id=? AND session_id=?").get(bob, SID) as { c: number };
     expect(c).toBe(1);
   });
 });

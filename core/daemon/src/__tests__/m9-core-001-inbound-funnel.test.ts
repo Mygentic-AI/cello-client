@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { SessionNodeManager, ABUSE_MAX_SESSION_RECEIVED_BYTES } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -104,6 +105,9 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     const mgr = new SessionNodeManager({ factory: new SharedFactory(new FakeNode() as unknown as CelloNode), logger: makeLogger(), dbPath, securityGateway: gw });
     managers.push(mgr);
     await mgr.initialize();
+    // DOD-AGENT-ID-JOINKEY-1: ingestReceivedContent/createSessionNode resolve the NAME against a
+    // real `agents` row — production always has one by the time a session exists.
+    await seedAgents(mgr.getDb(), ["alice"]);
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     return mgr;
   }
@@ -231,6 +235,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       const mgr = new SessionNodeManager({ factory: new SharedFactory(new FakeNode() as unknown as CelloNode), logger, dbPath, securityGateway: new CountingGateway("allow") });
       managers.push(mgr);
       await mgr.initialize();
+      // DOD-AGENT-ID-JOINKEY-1: "alice" must be a REAL agent — the AC under test is a MISSING
+      // SESSION row, not a missing agent (a name that was never created is a different, unrelated
+      // failure — agent_id_unresolved — and would not exercise session_orphaned at all).
+      await seedAgents(mgr.getDb(), ["alice"]);
       return { mgr, events };
     }
 

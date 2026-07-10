@@ -36,6 +36,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { seedAgents } from "./helpers/seed-agents.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -142,6 +143,9 @@ class LoopbackFakeNode implements Partial<CelloNode> {
 async function makeManager(logger: Logger, dbPath: string, node: CelloNode): Promise<SessionNodeManager> {
   const mgr = new SessionNodeManager({ factory: new ControlledFactory(node), logger, dbPath });
   await mgr.initialize();
+  // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "alice" — production
+  // always has an `agents` row before a session exists, so seed one here rather than at every call site.
+  await seedAgents(mgr.getDb(), ["alice"]);
   return mgr;
 }
 
@@ -339,6 +343,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const mgr = new SessionNodeManager({ factory: new ControlledFactory(new ConfigurableFakeNode()), logger, dbPath: join(tempDir, "ci.db") });
     // initialize() is async but ingest does not require the standing receiver; run after init.
     return mgr.initialize().then(async () => {
+      await seedAgents(mgr.getDb(), ["alice"]);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
       const content = new TextEncoder().encode("from-bob");
       const correlationId = "flow-xyz-789";

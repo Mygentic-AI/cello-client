@@ -68,13 +68,22 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     }
   }
 
+  /**
+   * DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by the STABLE `agent_id`, not the mutable
+   * `agent_name`. Every caller here runs AFTER `setupWithAgents` + daemon start, so the named agent
+   * already has a real `agents` row (imported from its flat-file key at startup) — resolve its id.
+   */
   function insertSessionRow(agent: string, session: string) {
     const db = handle!.getSessionNodeManager().getDb()!;
+    const agentRow = db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agent) as { agent_id: string } | undefined;
+    if (!agentRow) throw new Error(`test fixture bug: agent '${agent}' has no 'agents' row yet`);
     const now = Date.now();
     db.prepare(
-      `INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
        VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
-    ).run(session, agent, "cphex", now, now);
+    ).run(session, agentRow.agent_id, "cphex", now, now);
   }
 
   type R = Record<string, unknown>;

@@ -44,6 +44,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
+import { seedAgents } from "./helpers/seed-agents.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { Encoder } from "cbor-x";
 import * as lp from "it-length-prefixed";
@@ -117,12 +118,17 @@ async function makeSessionNodeManager(
   return mgr;
 }
 
-/** Insert a session row directly into the DB. */
+/**
+ * Insert a session row directly into the DB.
+ *
+ * DOD-AGENT-ID-JOINKEY-1: `sessions` is now keyed on the STABLE `agent_id`, not the mutable
+ * `agent_name` — callers must resolve/seed a real agent first (via `seedAgents`) and pass its id.
+ */
 function insertSession(
   db: DaemonDatabase,
   opts: {
     sessionId: string;
-    agentName: string;
+    agentId: string;
     counterpartyPubkey: string;
     status: "active" | "interrupted" | "sealed";
     messageCount?: number;
@@ -132,12 +138,12 @@ function insertSession(
   const now = Date.now();
   db.prepare(
     `INSERT INTO sessions
-     (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at,
+     (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at,
       message_count, interrupted_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.sessionId,
-    opts.agentName,
+    opts.agentId,
     opts.counterpartyPubkey,
     opts.status,
     now,
@@ -145,6 +151,26 @@ function insertSession(
     opts.messageCount ?? 0,
     opts.interruptedAt ?? null,
   );
+}
+
+/**
+ * DOD-AGENT-ID-JOINKEY-1: resolve an already-created agent's NAME to its stable `agent_id` by
+ * reading the `agents` table directly. Used by tests that create the agent through the REAL path
+ * (a flat-file key + daemon startup, which imports it into `agents`) and only afterwards need to
+ * hand-write a `sessions` row for it — the daemon's own resolver (`#requireAgentId`) is private, so
+ * the test reads the same row it populated.
+ */
+function resolveAgentId(db: DaemonDatabase, agentName: string): string {
+  const row = db
+    .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+    .get(agentName) as { agent_id: string } | undefined;
+  if (!row) {
+    throw new Error(
+      `test fixture bug: agent '${agentName}' has no 'agents' row yet — create it (makeAgentDir/makeAgent ` +
+        `+ daemon start, or seedAgents) before hand-writing a session row for it`,
+    );
+  }
+  return row.agent_id;
 }
 
 /** Create a fake relay stream that delivers specific frames in order. */
@@ -194,6 +220,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
   let mgr: SessionNodeManager;
   let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
   let logger: Logger;
+  let ids: Map<string, string>;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-"));
@@ -201,6 +228,10 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     logger = l.logger;
     logEvents = l.events;
     mgr = await makeSessionNodeManager(logger, join(tempDir, "sessions.db"));
+    // DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by agent_id, and registerRelayStream (via
+    // markInterruptedWithDetails) resolves the NAME against a real `agents` row — production always
+    // has one by the time a session exists.
+    ids = await seedAgents(mgr.getDb(), ["alice", "bob", "carol"]);
   });
 
   afterEach(async () => {
@@ -217,7 +248,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     const db = mgr.getDb();
     insertSession(db, {
       sessionId,
-      agentName: "alice",
+      agentId: ids.get("alice")!,
       counterpartyPubkey: "bbccdd",
       status: "active",
       messageCount: 5,
@@ -264,7 +295,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     const db = mgr.getDb();
     insertSession(db, {
       sessionId,
-      agentName: "bob",
+      agentId: ids.get("bob")!,
       counterpartyPubkey: "ddeeff",
       status: "active",
       messageCount: 3,
@@ -298,7 +329,7 @@ describe("SESSION-001: SessionNodeManager.registerRelayStream", () => {
     const db = mgr.getDb();
     insertSession(db, {
       sessionId,
-      agentName: "carol",
+      agentId: ids.get("carol")!,
       counterpartyPubkey: "aabb11",
       status: "active",
     });
@@ -359,9 +390,11 @@ describe("SESSION-001: SQLite schema extension", () => {
     // Verify the columns exist by inserting and reading back
     const sessionId = "ee1122334455667788aabbcc001122334455667788aabbcc0011223344556677";
     const db2 = mgr.getDb();
+    // DOD-AGENT-ID-JOINKEY-1: `sessions` is now keyed by agent_id — seed a real agent for "dave".
+    const daveId = (await seedAgents(db2, ["dave"])).get("dave")!;
     insertSession(db2, {
       sessionId,
-      agentName: "dave",
+      agentId: daveId,
       counterpartyPubkey: "ffee11",
       status: "interrupted",
       messageCount: 7,
@@ -392,11 +425,15 @@ describe("SESSION-001: SQLite schema extension", () => {
 describe("SESSION-001: getSessionRecord", () => {
   let tempDir: string;
   let mgr: SessionNodeManager;
+  let eveId: string;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-getrecord-"));
     const { logger } = makeLogger();
     mgr = await makeSessionNodeManager(logger, join(tempDir, "sessions.db"));
+    // DOD-AGENT-ID-JOINKEY-1: getSessionRecord resolves the NAME against a real `agents` row —
+    // "an agent with no session" means a REAL agent, not a name that was never created.
+    eveId = (await seedAgents(mgr.getDb(), ["eve"])).get("eve")!;
   });
 
   afterEach(async () => {
@@ -412,7 +449,7 @@ describe("SESSION-001: getSessionRecord", () => {
     const sessionId = "aa001122334455667788aabbcc001122334455667788aabbcc0011223344556677";
     insertSession(mgr.getDb(), {
       sessionId,
-      agentName: "eve",
+      agentId: eveId,
       counterpartyPubkey: "112233",
       status: "interrupted",
       messageCount: 2,
@@ -497,6 +534,11 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     const isoNow = new Date(now).toISOString();
     const sid1 = "aabb1122334455667788aabbcc001122334455667788aabbcc00112233445566";
     const sid2 = "bbcc1122334455667788aabbcc001122334455667788aabbcc00112233445567";
+    // DOD-AGENT-ID-JOINKEY-1: this hand-rolled OLD schema (agent_name, no agent_id) simulates a
+    // pre-migration database. `SessionNodeManager.initialize()` re-keys it to agent_id by JOINing
+    // against `agents` — production always has that row by the time a session exists, so seed real
+    // agents named "alice"/"bob" here too (on the SAME connection) before the daemon starts.
+    await seedAgents(db, ["alice", "bob"]);
     db.prepare(
       "INSERT INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     ).run(sid1, "alice", "pubkey1", "interrupted", now, now, 3, isoNow);
@@ -579,6 +621,11 @@ describe("SESSION-001: cello_close_session error codes", () => {
     return h;
   }
 
+  /**
+   * DOD-AGENT-ID-JOINKEY-1: called AFTER makeAgentDir + startTestDaemon, so the named agent already
+   * has a real `agents` row (imported from its flat-file key at daemon startup). Resolve its stable
+   * agent_id off that row rather than writing the mutable name into the re-keyed `sessions` table.
+   */
   function insertSessionRow(
     sessionId: string,
     agentName: string,
@@ -587,10 +634,11 @@ describe("SESSION-001: cello_close_session error codes", () => {
   ): void {
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const agentId = resolveAgentId(db, agentName);
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(sessionId, agentName, "counterparty_pubkey_hex", status, now, now, messageCount, new Date(now).toISOString());
+      "INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(sessionId, agentId, "counterparty_pubkey_hex", status, now, now, messageCount, new Date(now).toISOString());
     db.close();
   }
 
@@ -735,14 +783,16 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
     // Wait a moment for the SignalingManager to transition to 'connected'
     await new Promise<void>((r) => setTimeout(r, 50));
 
-    // Insert an interrupted session
+    // Insert an interrupted session. DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by agent_id — "alice"
+    // already has a real `agents` row from the flat-file key imported when startDaemon ran above.
     const sessionId = "ac0111122334455667788aabbcc001122334455667788aabbcc00112233445566";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const agentId = resolveAgentId(db, "alice");
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(sessionId, "alice", "counterparty_pubkey_hex", "interrupted", now, now, 2, new Date(now).toISOString());
+      "INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(sessionId, agentId, "counterparty_pubkey_hex", "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -871,14 +921,16 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
     // Wait for SignalingManager to connect
     await new Promise<void>((r) => setTimeout(r, 50));
 
-    // Insert an interrupted session using the counterparty pubkey
+    // Insert an interrupted session using the counterparty pubkey. DOD-AGENT-ID-JOINKEY-1: keyed by
+    // agent_id — "alice" already has a real `agents` row from the flat-file key startDaemon imported.
     const sessionId = "si002aabb1122334455667788aabbcc001122334455667788aabbcc001122334455";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const agentId = resolveAgentId(db, "alice");
     const now = Date.now();
     db.prepare(
-      "INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    ).run(sessionId, "alice", counterpartyPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
+      "INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(sessionId, agentId, counterpartyPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -965,12 +1017,15 @@ describe("SESSION-001: AC-016 composition root wiring", () => {
     // Access the SessionNodeManager from the composition root
     const snm = h.getSessionNodeManager();
 
-    // Insert an active session row
+    // Insert an active session row. DOD-AGENT-ID-JOINKEY-1: no agent was created above (no
+    // makeAgentDir / cello_create_agent) — seed a real "alice" so `sessions` (keyed by agent_id) and
+    // registerRelayStream's internal name resolution both have a genuine agent to scope to.
     const sessionId = "ac016aabb1122334455667788aabbcc001122334455667788aabbcc001122334455";
     const db = snm.getDb();
+    const aliceId = (await seedAgents(db, ["alice"])).get("alice")!;
     insertSession(db, {
       sessionId,
-      agentName: "alice",
+      agentId: aliceId,
       counterpartyPubkey: "deadbeef",
       status: "active",
       messageCount: 3,
@@ -1024,9 +1079,10 @@ describe("SESSION-001 SI-001: no auto-seal on session_interrupted receipt", () =
   it("SI-001: session_interrupted frame receipt does NOT trigger any seal events", async () => {
     const sessionId = "1122334455667788aabbcc001122334455667788aabbcc00112233445566778899";
     const db = mgr.getDb();
+    const frankId = (await seedAgents(db, ["frank"])).get("frank")!;
     insertSession(db, {
       sessionId,
-      agentName: "frank",
+      agentId: frankId,
       counterpartyPubkey: "aabb11",
       status: "active",
     });
@@ -1079,9 +1135,10 @@ describe("SESSION-001: markInterruptedWithDetails", () => {
   it("sets message_count and interrupted_at on update", async () => {
     const sessionId = "bb2233445566778899aabbcc001122334455667788aabbcc001122334455667788";
     const db = mgr.getDb();
+    const graceId = (await seedAgents(db, ["grace"])).get("grace")!;
     insertSession(db, {
       sessionId,
-      agentName: "grace",
+      agentId: graceId,
       counterpartyPubkey: "ccdd22",
       status: "active",
     });
@@ -1151,12 +1208,14 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
   let tempDir: string;
   let mgr: SessionNodeManager;
   let logEvents: Array<{ level: string; event: string; context: Record<string, unknown> }>;
+  let ids: Map<string, string>;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-h3-"));
     const l = makeLogger();
     logEvents = l.events;
     mgr = await makeSessionNodeManager(l.logger, join(tempDir, "sessions.db"));
+    ids = await seedAgents(mgr.getDb(), ["alice", "bob"]);
   });
 
   afterEach(async () => {
@@ -1166,7 +1225,7 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
   it("H-3: a 'sealed' session is NOT reverted to interrupted by a relay frame", async () => {
     const sessionId = "5ea1ed00112233445566778899aabbccddeeff00112233445566778899aabbcc";
     const db = mgr.getDb();
-    insertSession(db, { sessionId, agentName: "alice", counterpartyPubkey: "cp1", status: "sealed", messageCount: 4 });
+    insertSession(db, { sessionId, agentId: ids.get("alice")!, counterpartyPubkey: "cp1", status: "sealed", messageCount: 4 });
 
     // Deliver a session_interrupted frame naming the sealed (bound) session.
     const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: sessionId, reason: "peer_disconnected" });
@@ -1188,8 +1247,8 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
     const boundId = "b0undaa00112233445566778899aabbccddeeff00112233445566778899aabbcc";
     const otherId = "07he4baa00112233445566778899aabbccddeeff00112233445566778899aabbcc";
     const db = mgr.getDb();
-    insertSession(db, { sessionId: boundId, agentName: "alice", counterpartyPubkey: "cp1", status: "active", messageCount: 2 });
-    insertSession(db, { sessionId: otherId, agentName: "bob", counterpartyPubkey: "cp2", status: "active", messageCount: 9 });
+    insertSession(db, { sessionId: boundId, agentId: ids.get("alice")!, counterpartyPubkey: "cp1", status: "active", messageCount: 2 });
+    insertSession(db, { sessionId: otherId, agentId: ids.get("bob")!, counterpartyPubkey: "cp2", status: "active", messageCount: 9 });
 
     // Stream is bound to boundId but the frame names otherId (cross-session attempt).
     const frame = CBOR_ENC.encode({ type: "session_interrupted", session_id: otherId, reason: "peer_disconnected" });
@@ -1213,11 +1272,13 @@ describe("SESSION-001 H-3: relay frame interrupt path is guarded", () => {
 describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
   let tempDir: string;
   let mgr: SessionNodeManager;
+  let aliceId: string;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-session-001-m1push-"));
     const { logger } = makeLogger();
     mgr = await makeSessionNodeManager(logger, join(tempDir, "sessions.db"));
+    aliceId = (await seedAgents(mgr.getDb(), ["alice"])).get("alice")!;
   });
 
   afterEach(async () => {
@@ -1229,7 +1290,7 @@ describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
     mgr.setOnSessionStateChanged((agentName, sessionId, state, cp) => calls.push({ agentName, sessionId, state, cp }));
 
     const sessionId = "m1push0011223344556677889900aabbccddeeff00112233445566778899aabb";
-    insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "active", messageCount: 3 });
+    insertSession(mgr.getDb(), { sessionId, agentId: aliceId, counterpartyPubkey: "cphex", status: "active", messageCount: 3 });
 
     await mgr.markInterruptedWithDetails("alice", sessionId, 3, "relay_frame");
 
@@ -1242,7 +1303,7 @@ describe("SESSION-001 M-1 PUSH: onSessionStateChanged callback", () => {
     mgr.setOnSessionStateChanged(() => calls.push(1));
 
     const sessionId = "m1push5ea1ed11223344556677889900aabbccddeeff00112233445566778899";
-    insertSession(mgr.getDb(), { sessionId, agentName: "alice", counterpartyPubkey: "cphex", status: "sealed", messageCount: 3 });
+    insertSession(mgr.getDb(), { sessionId, agentId: aliceId, counterpartyPubkey: "cphex", status: "sealed", messageCount: 3 });
 
     await mgr.markInterruptedWithDetails("alice", sessionId, 3, "relay_frame");
     expect(calls).toHaveLength(0);
@@ -1316,9 +1377,10 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const sessionId = "h1in00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const aliceId = resolveAgentId(db, "alice");
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, aliceId, cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -1392,9 +1454,10 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const sessionId = "l2nonce00112233445566778899aabbccddeeff00112233445566778899aabb";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const aliceId = resolveAgentId(db, "alice");
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(sessionId, "alice", cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, aliceId, cpPubkeyHex, "interrupted", now, now, 2, new Date(now).toISOString());
     db.close();
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -1443,9 +1506,10 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const sessionId = "resp00112233445566778899aabbccddeeff00112233445566778899aabbccdd";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const bobId = resolveAgentId(db, "bob");
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, bobId, initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
     db.close();
 
     // Deliver the inbound request (as if from the directory signaling stream).
@@ -1513,9 +1577,10 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
     const sessionId = "resp2011223344556677889900aabbccddeeff00112233445566778899aabbc";
     const dbPath = join(tempDir, "sessions.db");
     const db = openTestDb(dbPath);
+    const bobId = resolveAgentId(db, "bob");
     const now = Date.now();
-    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_name, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(sessionId, "bob", initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
+    db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(sessionId, bobId, initiatorPubkeyHex, "interrupted", now, now, 5, new Date(now).toISOString());
     db.close();
 
     inboundHandler!({
