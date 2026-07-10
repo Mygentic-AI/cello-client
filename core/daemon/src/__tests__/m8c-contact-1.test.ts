@@ -136,6 +136,11 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const add1 = (await client.send("cello_contact_add", { pubkey: cp })) as Record<string, unknown>;
     expect(add1).toMatchObject({ ok: true, agent: "alice", pubkey: cp });
 
+    // DOD-TIER-4 AC3 / DEC-AB-1 (F2, end-to-end through the real IPC handler): an explicit
+    // cello_contact_add lands the contact at KNOWN — red if daemon.ts:5943 drops the tier arg.
+    const afterAdd = (await client.send("cello_contact_list", {})) as { contacts: Array<{ pubkey: string; tier: number }> };
+    expect(afterAdd.contacts.find((c) => c.pubkey === cp)?.tier).toBe(TIER.KNOWN);
+
     const listAfterFirst = (await client.send("cello_contact_list", {})) as { contacts: Array<{ pubkey: string; added_at: number }> };
     const originalAddedAt = listAfterFirst.contacts[0].added_at;
 
@@ -157,6 +162,30 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     const emptyList = (await client.send("cello_contact_list", {})) as { contacts: unknown[] };
     expect(emptyList.contacts).toHaveLength(0);
+  });
+
+  it("DOD-CONTACT-VIEW-1: cello_contact_set_tier validates the value, updates the tier, and list reflects it", async () => {
+    await makeAgentDir("alice");
+    await start({ logger: makeLogger().logger, node: new FakeNode() });
+    const client = await connectAs("alice");
+    const cp = "cd".repeat(32);
+    await client.send("cello_contact_add", { pubkey: cp }); // KNOWN by default (explicit add)
+
+    // An unknown tier value is REFUSED, never coerced (AC1).
+    const bad = (await client.send("cello_contact_set_tier", { pubkey: cp, tier: 99 })) as Record<string, unknown>;
+    expect(bad).toMatchObject({ ok: false, reason: "invalid_tier" });
+
+    // A valid tier is accepted and the list reflects it end-to-end.
+    const ok = (await client.send("cello_contact_set_tier", { pubkey: cp, tier: TIER.WHITELISTED })) as Record<string, unknown>;
+    expect(ok).toMatchObject({ ok: true, tier: TIER.WHITELISTED });
+    const list = (await client.send("cello_contact_list", {})) as { contacts: Array<{ pubkey: string; tier: number; provenance: string | null; sealed_count: number; last_spoke: number | null }> };
+    const row = list.contacts.find((c) => c.pubkey === cp)!;
+    expect(row.tier).toBe(TIER.WHITELISTED);
+    expect(row).toMatchObject({ sealed_count: 0, last_spoke: null }); // no sessions yet → never, not error
+
+    // Setting a tier on a non-existent contact fails loud.
+    const missing = (await client.send("cello_contact_set_tier", { pubkey: "ff".repeat(32), tier: 2 })) as Record<string, unknown>;
+    expect(missing).toMatchObject({ ok: false, reason: "contact_not_found" });
   });
 
   it("K6: --agent (params.agent) resolves an explicit agent, independent of this connection's current agent", async () => {

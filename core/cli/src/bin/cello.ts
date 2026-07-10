@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, monikerSet, telegramSetToken } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, monikerSet, telegramSetToken } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand, splitAgentFlag } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -136,15 +136,19 @@ async function main(): Promise<void> {
     case "contact": {
       // cello contact add <pubkey> [--agent <name>] | remove <pubkey> [--agent <name>] | list [--agent <name>]
       const { agent, positional } = splitAgentFlag(process.argv.slice(3));
-      const [sub, pubkey] = positional;
+      const [sub, pubkey, tierArg] = positional;
       if (sub === "add" && pubkey) {
         result = await contactAdd(celloDir, pubkey, agent);
       } else if (sub === "remove" && pubkey) {
         result = await contactRemove(celloDir, pubkey, agent);
       } else if (sub === "list") {
         result = await contactList(celloDir, agent);
+      } else if (sub === "tier" && pubkey && tierArg !== undefined) {
+        // cello contact tier <pubkey> <0..4> — daemon validates the value; a non-numeric arg is
+        // surfaced as the daemon's invalid_tier verdict (NaN → rejected there).
+        result = await contactSetTier(celloDir, pubkey, Number(tierArg), agent);
       } else {
-        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]" };
+        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>]" };
       }
       break;
     }

@@ -178,7 +178,7 @@ server.tool("cello_contact_list", "List an agent's contact whitelist — the pee
   return jsonText(result);
 });
 
-server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's contact whitelist — a known/trusted contact is fast-tracked and exempt from unknown-sender screening and anti-spam caps. Optionally set your own pet name (moniker) for them. Defaults to the current agent.", {
+server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's address book — a deliberate add makes them a KNOWN contact (higher reachability and anti-spam caps than a stranger, but NOT auto-accepted when you're away, and always screened). Promote them to whitelisted/vip with cello_contact_set_tier to let them reach you unattended. Optionally set your own pet name (moniker). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to add"),
   moniker: z.string().optional().describe("Optional pet name for this contact (1-64 chars: letters, digits, '-' or '_') — always wins over the name they offer"),
   agent: z.string().optional().describe("Agent name whose whitelist to add to (defaults to the current agent)"),
@@ -200,7 +200,17 @@ server.tool("cello_contact_set_moniker", "Set (or clear, by passing null) YOUR p
   return jsonText(result);
 });
 
-server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's contact whitelist — they revert to unknown (screened, and subject to the anti-spam acceptance caps). Defaults to the current agent.", {
+// DOD-CONTACT-VIEW-1: set a contact's reachability tier. Forward-only (D7).
+server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still screened and bounded — a higher tier only RAISES limits, never removes them. Defaults to the current agent.", {
+  pubkey: z.string().describe("Hex-encoded public key of the contact"),
+  tier: z.number().int().min(0).max(4).describe("0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip"),
+  agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
+}, async ({ pubkey, tier, agent }) => {
+  const result = await proxy.call("cello_contact_set_tier", agent ? { pubkey, tier, agent } : { pubkey, tier });
+  return jsonText(result);
+});
+
+server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's address book — they revert to unknown (stranger anti-spam caps; always screened). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to remove"),
   agent: z.string().optional().describe("Agent name whose whitelist to remove from (defaults to the current agent)"),
 }, async ({ pubkey, agent }) => {

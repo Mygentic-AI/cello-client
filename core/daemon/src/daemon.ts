@@ -44,7 +44,7 @@ import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { TIER } from "./contacts-tier-migration.js";
+import { TIER, isKnownTierValue } from "./contacts-tier-migration.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
@@ -5975,6 +5975,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     logger.info("contact.moniker.set", { agentName: resolved.agent, pubkey, cleared: moniker === null });
     return { ok: true, agent: resolved.agent, pubkey, moniker };
+  });
+
+  // DOD-CONTACT-VIEW-1 AC1: set a contact's reachability tier. Validates the tier is a known constant
+  // (0..4) — an unknown value is REFUSED, never coerced. Emits contact.tier.changed (old→new).
+  handlers.set("cello_contact_set_tier", async (params, connectionId) => {
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const tier = typeof params?.tier === "number" ? params.tier : undefined;
+    if (!pubkey || tier === undefined) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'tier' (0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip)." };
+    }
+    if (!isKnownTierValue(tier)) {
+      return { ok: false, reason: "invalid_tier", guidance: "tier must be one of 0 (blocked), 1 (unknown), 2 (known), 3 (whitelisted), 4 (vip)." };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const oldTier = sessionNodeManager.getTier(resolved.agent, pubkey);
+    if (!sessionNodeManager.setContactTier(resolved.agent, pubkey, tier)) {
+      return { ok: false, reason: "contact_not_found", guidance: `No contact ${pubkey.slice(0, 16)}… for agent '${resolved.agent}'. Add it first with cello_contact_add.` };
+    }
+    logger.info("contact.tier.changed", { agentName: resolved.agent, pubkey, oldTier, newTier: tier });
+    return { ok: true, agent: resolved.agent, pubkey, tier };
   });
 
   handlers.set("cello_contact_remove", async (params, connectionId) => {

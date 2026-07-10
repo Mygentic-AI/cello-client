@@ -533,7 +533,7 @@ export async function sessions(
 /** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
 async function contactCommand(
   celloDir: string,
-  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_set_moniker",
+  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_set_moniker",
   params: Record<string, unknown>,
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
@@ -569,6 +569,14 @@ export async function contactList(celloDir: string, agent?: string): Promise<Com
   const params: Record<string, unknown> = {};
   if (agent) params.agent = agent;
   return contactCommand(celloDir, "cello_contact_list", params);
+}
+
+/** DOD-CONTACT-VIEW-1: `cello contact tier <pubkey> <tier> [--agent <name>]`. Validation (a known
+ *  0..4 constant) lives daemon-side; the CLI surfaces the verdict verbatim. */
+export async function contactSetTier(celloDir: string, pubkey: string, tier: number, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { pubkey, tier };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_contact_set_tier", params);
 }
 
 /** MONIKER-1: `cello moniker set <name>` / `cello moniker clear` — set (string) or clear (null)

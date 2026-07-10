@@ -987,6 +987,18 @@ export class SessionNodeManager {
     return res.changes > 0;
   }
 
+  /** DOD-CONTACT-VIEW-1: set an EXISTING contact's reachability tier. Returns false when no such
+   *  contact — fail-loud at the caller, never a silent no-op success (same contract as
+   *  setContactMoniker). The caller validates the tier is a known constant BEFORE calling; this
+   *  stores whatever it is handed (the handler is the validation boundary). */
+  setContactTier(agentName: string, pubkey: string, tier: number): boolean {
+    if (!this.#db) throw new Error(`setContactTier('${agentName}'): database not initialized`);
+    const res = this.#db
+      .prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?")
+      .run(tier, this.#requireAgentId(agentName), pubkey);
+    return res.changes > 0;
+  }
+
   /** M8C-CONTACT-1: known stays known until explicitly removed. */
   removeContact(agentName: string, pubkey: string): boolean {
     if (!this.#db) return false;
@@ -1009,13 +1021,31 @@ export class SessionNodeManager {
     return row?.moniker ?? null;
   }
 
-  /** M8C-CONTACT-1: list an agent's known contacts, oldest-added first. MONIKER-3 AC3: includes
-   *  the pet name (null when none set). */
-  listContacts(agentName: string): Array<{ pubkey: string; added_at: number; moniker: string | null }> {
+  /** M8C-CONTACT-1 + DOD-CONTACT-VIEW-1: list an agent's contacts, oldest-added first, each with its
+   *  pet name (MONIKER-3), tier + provenance (the address-book metadata), and a READ-side LEFT JOIN
+   *  against `sessions` for how many SEALED sessions were shared and when they last spoke (MAX
+   *  updated_at). No new stored data — a pure read. A contact with no sessions shows 0 / null (never),
+   *  not an error. The JOIN is scoped by agent_id so one agent's sessions never bleed into another's. */
+  listContacts(agentName: string): Array<{
+    pubkey: string; added_at: number; moniker: string | null;
+    tier: number | null; provenance: string | null; sealed_count: number; last_spoke: number | null;
+  }> {
     if (!this.#db) return [];
     return this.#db
-      .prepare("SELECT pubkey, added_at, moniker FROM contacts WHERE agent_id = ? ORDER BY added_at ASC")
-      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; added_at: number; moniker: string | null }>;
+      .prepare(
+        `SELECT c.pubkey, c.added_at, c.moniker, c.tier, c.provenance,
+                COUNT(CASE WHEN s.status = 'sealed' THEN 1 END) AS sealed_count,
+                MAX(s.updated_at) AS last_spoke
+         FROM contacts c
+         LEFT JOIN sessions s ON s.agent_id = c.agent_id AND s.counterparty_pubkey = c.pubkey
+         WHERE c.agent_id = ?
+         GROUP BY c.pubkey, c.added_at, c.moniker, c.tier, c.provenance
+         ORDER BY c.added_at ASC`,
+      )
+      .all(this.#requireAgentId(agentName)) as Array<{
+        pubkey: string; added_at: number; moniker: string | null;
+        tier: number | null; provenance: string | null; sealed_count: number; last_spoke: number | null;
+      }>;
   }
 
   /** M8C-ABUSE-1: cumulative RECEIVED byte total for a session (anti-drip-feed accounting). */

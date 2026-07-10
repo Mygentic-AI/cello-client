@@ -62,7 +62,7 @@ const COMMAND_HELP: Record<string, string> = {
   sessions:
     "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
   contact:
-    "Usage: cello contact add <pubkey> [--agent <name>] | cello contact remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]\n" +
+    "Usage: cello contact add <pubkey> [--agent <name>] | cello contact remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>]\n" +
     "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
     "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
     "  Example:  cello contact list --agent alice",
