@@ -44,6 +44,7 @@ import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
+import { TIER } from "./contacts-tier-migration.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
@@ -977,7 +978,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // every inbound interaction (promotion now requires operator engagement — an outbound initiate,
     // a cello_send reply, or an explicit contact add). No subsequent add is coupled to this line's
     // ordering anymore; it is a plain read of current contact state.
-    const isKnown = sessionNodeManager.isContact(agentName, record.counterparty_pubkey);
+    const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
       const contentBytes = new TextEncoder().encode(isKnown ? AWAY_TEXT[kind] : STRANGER_TEXT);
@@ -3285,9 +3286,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     // M8C-CONTACT-1 (D6): "initiating a session to X adds X" — pin at the pubkey the negotiator
-    // actually used (not re-resolved later). DOD-TIER-1 AC5: provenance 'initiated' — I opened this
-    // session. (Tier stays UNKNOWN in Step 1; Step 3 assigns the session-created tier.)
-    sessionNodeManager.addContact(agentName, counterpartyPubkey, undefined, "initiated");
+    // actually used (not re-resolved later). DOD-TIER-4 AC3: a deliberate outbound initiate makes the
+    // counterparty KNOWN, provenance 'initiated'. (Not WHITELISTED — auto-accept stays an explicit
+    // cello_contact_set_tier act, design §1.)
+    sessionNodeManager.addContact(agentName, counterpartyPubkey, undefined, "initiated", TIER.KNOWN);
 
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
@@ -5649,11 +5651,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // auto-adds (that defeated screening + anti-spam). For an OUTBOUND session the counterparty is
     // already a contact (cello_initiate_session added it), so this is an idempotent no-op there; it
     // matters for inbound-originated sessions, where the reply is the trust signal. addContact is
-    // INSERT OR IGNORE — it never refreshes added_at. DOD-TIER-1 AC5: provenance 'accepted' — the
-    // relationship formed by my accepting/engaging with their inbound session. For an OUTBOUND session
-    // the row already exists ('initiated' from cello_initiate_session) and INSERT OR IGNORE leaves its
-    // provenance untouched — 'initiated' correctly wins there.
-    sessionNodeManager.addContact(record.agent_name, recipientPubkey, undefined, "accepted");
+    // INSERT OR IGNORE — it never refreshes added_at. DOD-TIER-4 AC3: engaging (a committed reply into
+    // an inbound session I accepted) makes the counterparty KNOWN, provenance 'accepted'. For an
+    // OUTBOUND session the row already exists ('initiated', KNOWN) and INSERT OR IGNORE leaves it
+    // untouched — 'initiated' correctly wins there.
+    sessionNodeManager.addContact(record.agent_name, recipientPubkey, undefined, "accepted", TIER.KNOWN);
     if (modified) {
       logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
     }
@@ -5935,7 +5937,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         };
       }
     }
-    sessionNodeManager.addContact(resolved.agent, pubkey, moniker);
+    // DOD-TIER-4 / DEC-AB-1: an explicit cello_contact_add is a deliberate operator vouch → KNOWN
+    // (still not auto-accept; that is a separate cello_contact_set_tier to whitelisted). provenance
+    // stays null — this relationship formed by neither initiating nor accepting a session (AC5).
+    sessionNodeManager.addContact(resolved.agent, pubkey, moniker, null, TIER.KNOWN);
     logger.info("contact.added", { agent: resolved.agent, pubkey });
     if (moniker !== undefined) {
       logger.info("contact.moniker.set", { agentName: resolved.agent, pubkey });

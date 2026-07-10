@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
+import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -164,7 +165,7 @@ describe("M8C-AWAY-1: away response", () => {
     const initiatorPubkey = "cd".repeat(32);
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
-    h.getSessionNodeManager().addContact("bob", initiatorPubkey);
+    h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
     injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(150);
 
@@ -201,7 +202,7 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
-    snm.addContact("alice", "bobpubkeyhex");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     // A2: unattended (no connection yet) — an inbound message gets an away ack.
     await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");

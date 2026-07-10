@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
+import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -246,7 +247,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
     const knownPubkey = "ef".repeat(32);
-    h.getSessionNodeManager().addContact("bob", knownPubkey); // already known BEFORE this session
+    h.getSessionNodeManager().addContact("bob", knownPubkey, undefined, null, TIER.KNOWN); // KNOWN BEFORE this session
 
     injectRef.inject!(assignmentFrame(knownPubkey, bobPubkey));
     await wait(150);
@@ -266,7 +267,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const SID_KNOWN = "22".repeat(32);
     await snm.createSessionNode(SID_UNKNOWN, "alice", "strangerpubkeyhex", "peer-1", "corr-1");
     await snm.createSessionNode(SID_KNOWN, "alice", "knownpubkeyhex", "peer-2", "corr-2");
-    snm.addContact("alice", "knownpubkeyhex"); // pre-established as known; strangerpubkeyhex is not
+    snm.addContact("alice", "knownpubkeyhex", undefined, null, TIER.KNOWN); // pre-established KNOWN; strangerpubkeyhex is not
 
     const m1 = new TextEncoder().encode("from stranger");
     await snm.ingestReceivedContent("alice", SID_UNKNOWN, m1, msgLeafHash(m1), "c1");
@@ -326,5 +327,8 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
       .prepare("SELECT provenance FROM contacts WHERE pubkey = ?")
       .get(targetPubkey) as { provenance: string | null };
     expect(provRow.provenance).toBe("initiated");
+    // DOD-TIER-4 AC3 (end-to-end): a deliberate outbound initiate makes the target KNOWN (not
+    // WHITELISTED — auto-accept stays an explicit set_tier). Red if daemon.ts drops the tier arg.
+    expect(h.getSessionNodeManager().getTier("alice", targetPubkey)).toBe(TIER.KNOWN);
   });
 });

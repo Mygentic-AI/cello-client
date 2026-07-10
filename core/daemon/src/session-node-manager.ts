@@ -924,19 +924,35 @@ export class SessionNodeManager {
     return normalizeTier(row?.tier);
   }
 
+  /** DOD-TIER-4: the DISPLAY/relationship check — is this counterparty a genuine contact (KNOWN or
+   *  above)? Replaces the old binary `isContact` for behaviour that keyed on "we have a relationship"
+   *  (e.g. the away-response wording). An UNKNOWN-tier contact (a mere row) is NOT known. */
+  isKnown(agentName: string, pubkey: string): boolean {
+    return this.getTier(agentName, pubkey) >= TIER.KNOWN;
+  }
+
+  /** DOD-TIER-4: the POLICY gate — may an inbound session from this counterparty be auto-accepted
+   *  when the operator is unattended (WHITELISTED or VIP)? The behavioural consumer is the offline
+   *  relay mailbox (LEAVEMSG-1), out of scope for this unit; defined here as the seam. Being merely
+   *  KNOWN is NOT enough to auto-accept — whitelisting is the deliberate `cello_contact_set_tier` act. */
+  isAutoAccept(agentName: string, pubkey: string): boolean {
+    return this.getTier(agentName, pubkey) >= TIER.WHITELISTED;
+  }
+
   /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
    *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an
    *  optional pet name; a NEW non-null moniker on re-add updates it, absence leaves it untouched.
    *  THROWS on an invalid moniker — callers validate first; this is the can-never-be-stored
    *  backstop (same contract as DbIdentityStore.setMoniker).
    *
-   *  DOD-TIER-1: a NEW row is stamped `tier = UNKNOWN` (never NULL — so there is no NULL window
-   *  between this step and Step 3's tier-on-create wiring; `getTier` normalizes any stray NULL to
-   *  UNKNOWN anyway, so this is honesty, not correctness) and an optional `provenance`
-   *  ('accepted' | 'initiated' | null). INSERT OR IGNORE means an EXISTING contact is untouched —
-   *  tier and provenance pin at first add, exactly as `added_at`/`moniker` already do. Raising the
-   *  tier is `cello_contact_set_tier`'s job (Step 3), never a side effect of re-adding. */
-  addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null): void {
+   *  DOD-TIER-1/4: a NEW row is stamped `tier` (never NULL) and an optional `provenance`
+   *  ('accepted' | 'initiated' | null). The `tier` defaults to the least-privilege UNKNOWN floor —
+   *  a caller GRANTS trust by passing a higher tier explicitly. Every production creation path is a
+   *  deliberate operator action and passes KNOWN (initiate, engage/reply, explicit cello_contact_add
+   *  — DEC-AB-1). INSERT OR IGNORE means an EXISTING contact is untouched — tier and provenance pin
+   *  at first add, exactly as `added_at`/`moniker` already do; re-adding never downgrades a contact
+   *  the operator has since promoted. Raising the tier later is `cello_contact_set_tier`'s job. */
+  addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null, tier: number = TIER.UNKNOWN): void {
     if (!pubkey) return;
     // Review F1: a missing DB handle must FAIL the write loudly — returning silently here let
     // the handler log contact.added and report ok:true for a row that never landed.
@@ -947,7 +963,7 @@ export class SessionNodeManager {
     const agentId = this.#requireAgentId(agentName);
     this.#db
       .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at, tier, provenance) VALUES (?, ?, ?, ?, ?)")
-      .run(agentId, pubkey, Date.now(), TIER.UNKNOWN, provenance ?? null);
+      .run(agentId, pubkey, Date.now(), tier, provenance ?? null);
     if (moniker !== undefined && moniker !== null) {
       this.#db
         .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
