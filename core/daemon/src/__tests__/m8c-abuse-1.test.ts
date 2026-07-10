@@ -27,6 +27,7 @@ import {
   ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER,
   ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL,
 } from "../session-node-manager.js";
+import { TIER } from "../contacts-tier-migration.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -153,20 +154,26 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 
-  it("B2: a KNOWN contact is exempt from the size cap entirely", async () => {
+  it("B2 (DOD-TIER-2): a KNOWN contact gets the larger 100 MB cap — real headroom past UNKNOWN's 25 MB, not exemption", async () => {
     await makeAgentDir("alice");
     const h = await start(makeLogger().logger, new FakeNode());
     const snm = h.getSessionNodeManager();
+    const db = snm.getDb();
     await snm.createSessionNode(SID, "alice", "friendpubkeyhex", "peer-1", "corr");
     snm.addContact("alice", "friendpubkeyhex");
+    // 'exempt entirely' is gone (INV-TIER-BOUND: no tier unbounded). Set the contact to KNOWN (100 MB
+    // cap) explicitly — cello_contact_set_tier is Step 3. Prior received == exactly UNKNOWN's 25 MB
+    // cap, so a stranger (or an UNKNOWN-tier contact) would be refused; a KNOWN contact has headroom.
+    db.prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?")
+      .run(TIER.KNOWN, resolveAgentId(db, "alice"), "friendpubkeyhex");
 
-    const bigChunk = new Uint8Array(ABUSE_MAX_SESSION_RECEIVED_BYTES - 100);
+    const bigChunk = new Uint8Array(ABUSE_MAX_SESSION_RECEIVED_BYTES);
     const { leafIndex } = snm.appendSessionLeaf("alice", SID, "msg", "aa".repeat(32), "seed");
     snm.recordTranscriptMessage("alice", SID, leafIndex, "received", bigChunk, "seed");
 
-    const small = new TextEncoder().encode("still fine — known contact");
+    const small = new TextEncoder().encode("still fine — 25 MB + this is under KNOWN's 100 MB");
     const res = await snm.ingestReceivedContent("alice", SID, small, msgLeafHash(small), "corr-2");
-    expect(res.ok).toBe(true); // no cap applied to a known contact
+    expect(res.ok).toBe(true); // 25 MB + small < 100 MB (KNOWN) — would be refused at UNKNOWN's 25 MB
   });
 
   it("B3: checkUnknownSenderAcceptanceBound refuses a sender once THEIR OWN active-session count reaches the per-sender cap", async () => {
@@ -199,8 +206,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const blocked = snm.checkUnknownSenderAcceptanceBound("alice", strangerPubkey);
     expect(blocked).toMatchObject({ ok: false, reason: "abuse_bound_sessions_per_sender" });
 
-    // A known contact with the SAME session count is exempt.
+    // DOD-TIER-2: a HIGHER-tier contact with the SAME session count is admitted — the cap is the
+    // sender's tier cap, not a flat 3-then-exempt. KNOWN's cap is 5, so 3 active sessions is under it.
     snm.addContact("alice", strangerPubkey);
+    db.prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?").run(TIER.KNOWN, aliceId, strangerPubkey);
     expect(snm.checkUnknownSenderAcceptanceBound("alice", strangerPubkey)).toEqual({ ok: true });
   });
 
@@ -433,8 +442,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const blocked = snm.checkUnknownSenderAcceptanceBound("alice", brandNewStranger);
     expect(blocked).toMatchObject({ ok: false, reason: "abuse_bound_unknown_sessions_global" });
 
-    // B5: a KNOWN contact is exempt from this same global saturation entirely.
+    // B5 (DOD-TIER-2): a KNOWN+ contact is not part of the stranger pool — exempt from the GLOBAL
+    // anti-swarm cap (still bounded by its own tier cap). Set the tier explicitly (set_tier is Step 3).
     snm.addContact("alice", brandNewStranger);
+    db.prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?").run(TIER.KNOWN, aliceId, brandNewStranger);
     const allowed = snm.checkUnknownSenderAcceptanceBound("alice", brandNewStranger);
     expect(allowed).toEqual({ ok: true });
   });

@@ -65,6 +65,41 @@ export function normalizeTier(tier: number | null | undefined): number {
   return tier;
 }
 
+/** DOD-TIER-2: the abuse bounds for one tier. INV-TIER-BOUND — every field is FINITE (no tier is
+ *  unbounded; `vip` is a large but real number, never Infinity). Step 4 lets settings OVERRIDE these
+ *  defaults, but a setting may only raise/lower within finite bounds, never remove one. */
+export interface TierBound {
+  /** Max concurrent (active|interrupted) sessions this agent will hold from ONE sender at this tier. */
+  readonly maxSessionsPerSender: number;
+  /** Max cumulative RECEIVED bytes for a single session at this tier (anti-drip-feed). */
+  readonly maxBytesPerSession: number;
+}
+
+/**
+ * The hardcoded default bounds grid (DOD-TIER-2). One named map — the SINGLE source; call sites
+ * reference it via `tierBoundsFor`, never inline a number. Step 4 (DOD-TIER-BOUNDS-SETTINGS) makes
+ * these overridable per agent; until then they are the policy.
+ *
+ * INV-TIER-BOUND: a HIGHER tier only RAISES a bound — no tier removes one. `vip` is 50 sessions / 2 GiB,
+ * deliberately finite. `blocked` is 0/0, which is what makes DOD-TIER-3 fall out for free: a 0 session
+ * cap refuses a blocked sender through the SAME per-sender-cap path an over-cap unknown takes, with no
+ * separate branch and therefore no distinguishing oracle.
+ */
+export const DEFAULT_TIER_BOUNDS: Readonly<Record<number, TierBound>> = Object.freeze({
+  [TIER.BLOCKED]: { maxSessionsPerSender: 0, maxBytesPerSession: 0 },
+  [TIER.UNKNOWN]: { maxSessionsPerSender: 3, maxBytesPerSession: 25 * 1024 * 1024 },
+  [TIER.KNOWN]: { maxSessionsPerSender: 5, maxBytesPerSession: 100 * 1024 * 1024 },
+  [TIER.WHITELISTED]: { maxSessionsPerSender: 20, maxBytesPerSession: 500 * 1024 * 1024 },
+  [TIER.VIP]: { maxSessionsPerSender: 50, maxBytesPerSession: 2 * 1024 * 1024 * 1024 },
+});
+
+/** The bounds for a tier, TOTAL: any input is normalized to a defined tier first, so the return is
+ *  always a real `TierBound` — a corrupt/out-of-range tier gets UNKNOWN's bounds, never `undefined`
+ *  (the `grid[99]` crash the whole tier design guards against). */
+export function tierBoundsFor(tier: number | null | undefined): TierBound {
+  return DEFAULT_TIER_BOUNDS[normalizeTier(tier)];
+}
+
 interface TierColumn {
   readonly name: string;
   /** Column DDL WITHOUT a default — see `migrateContactsAddTierMetadata` for why no default. */

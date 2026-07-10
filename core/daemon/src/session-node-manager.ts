@@ -76,7 +76,7 @@ import {
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
-import { TIER, normalizeTier, isKnownTierValue, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -101,15 +101,18 @@ import {
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
-// M8C-ABUSE-1: persistence bounds — the non-M9 remainder (per-message cap + outbound rate are
-// M9's, not rebuilt here). "Whitelisted senders bounded only by disk" (DoD) — these bounds apply
-// ONLY to sessions/senders that are NOT a known contact (CONTACT-1's whitelist).
-/** Anti-drip-feed: cumulative RECEIVED bytes per session, from a non-contact sender. */
-export const ABUSE_MAX_SESSION_RECEIVED_BYTES = 25 * 1024 * 1024; // 25 MB
-/** Anti-drip-feed via many sessions: active sessions a single unknown counterparty may hold open
- *  with one agent at once. */
-export const ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER = 3;
-/** Anti-swarm: total active sessions from ALL unknown (non-contact) counterparties combined, per agent. */
+// M8C-ABUSE-1 + DOD-TIER-2: persistence bounds. Formerly a binary "known contacts exempt entirely,
+// everyone else 3 sessions / 25 MB"; now TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-
+// migration). The two consts below are kept for back-compat but DERIVE from the grid's UNKNOWN row —
+// the grid is the single source (DOD-TIER-2 AC4), so these can never drift from it.
+/** Anti-drip-feed: cumulative RECEIVED bytes per session at the UNKNOWN tier (= the grid's UNKNOWN
+ *  byte cap). Higher tiers get more (DEFAULT_TIER_BOUNDS); no tier is unbounded (INV-TIER-BOUND). */
+export const ABUSE_MAX_SESSION_RECEIVED_BYTES = DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxBytesPerSession; // 25 MB
+/** Anti-drip-feed via many sessions: active sessions an UNKNOWN counterparty may hold open at once
+ *  (= the grid's UNKNOWN per-sender cap). */
+export const ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER = DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxSessionsPerSender; // 3
+/** Anti-swarm: total active sessions from ALL UNKNOWN-tier counterparties combined, per agent. A
+ *  scalar across the whole unknown pool — not per-tier — so it stays a standalone const. */
 export const ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL = 50;
 
 /**
@@ -1035,8 +1038,12 @@ export class SessionNodeManager {
     return row.n;
   }
 
-  /** M8C-ABUSE-1 (anti-swarm): non-terminal sessions this agent holds with counterparties that are
-   *  NOT a known contact — the global cap counts across ALL unknown senders combined. Same
+  /** M8C-ABUSE-1 (anti-swarm) + DOD-TIER-2: non-terminal sessions this agent holds with UNKNOWN-tier
+   *  counterparties — the global cap counts across the whole stranger pool. A sender is exempt from
+   *  THIS pool iff it is a KNOWN+ contact (tier >= KNOWN); a bare stranger (no row → UNKNOWN) or an
+   *  explicitly UNKNOWN-tier contact both count. Keying on `tier >= KNOWN` (bounded to <= VIP so a
+   *  corrupt high value cannot grant pool-exemption) replaces the old row-existence proxy, which
+   *  would have let a merely-recorded UNKNOWN contact escape the anti-swarm cap. Same
    *  'interrupted'-status fix as countActiveSessionsForCounterparty above. */
   countActiveSessionsFromUnknownSenders(agentName: string): number {
     if (!this.#db) return 0;
@@ -1044,24 +1051,38 @@ export class SessionNodeManager {
       .prepare(
         `SELECT COUNT(*) AS n FROM sessions s
          WHERE s.agent_id = ? AND s.status IN ('active', 'interrupted')
-           AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey)`,
+           AND NOT EXISTS (
+             SELECT 1 FROM contacts c
+             WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey
+               AND c.tier >= ${TIER.KNOWN} AND c.tier <= ${TIER.VIP}
+           )`,
       )
       .get(this.#requireAgentId(agentName)) as { n: number };
     return row.n;
   }
 
-  /** M8C-ABUSE-1: is a NEW inbound session from this counterparty within the acceptance bounds?
-   *  Known contacts are exempt entirely ("bounded only by disk" — DoD). Checked BEFORE accepting
-   *  a fresh inbound session (the counts reflect sessions already active, not yet counting this one). */
+  /** M8C-ABUSE-1 + DOD-TIER-2/3: is a NEW inbound session from this counterparty within the
+   *  acceptance bounds? The per-sender cap is now the sender's TIER cap (DEFAULT_TIER_BOUNDS), not a
+   *  flat "3 for strangers, unbounded for contacts". This is where DOD-TIER-3 falls out for free: a
+   *  BLOCKED sender's cap is 0, so `perSender (>= 0) >= 0` refuses it through the SAME reason and the
+   *  SAME path an over-cap UNKNOWN takes — no separate blocked branch, no distinguishing oracle. The
+   *  global anti-swarm cap then applies ONLY to UNKNOWN-tier senders (KNOWN+ are trusted, not part of
+   *  the stranger pool; BLOCKED never reaches it). Checked BEFORE accepting a fresh inbound session
+   *  (counts reflect sessions already active, not yet counting this one). */
   checkUnknownSenderAcceptanceBound(agentName: string, counterpartyPubkey: string): { ok: true } | { ok: false; reason: string } {
-    if (this.isContact(agentName, counterpartyPubkey)) return { ok: true };
+    const tier = this.getTier(agentName, counterpartyPubkey);
+    const perSenderCap = tierBoundsFor(tier).maxSessionsPerSender;
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
-    if (perSender >= ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER) {
+    if (perSender >= perSenderCap) {
       return { ok: false, reason: "abuse_bound_sessions_per_sender" };
     }
-    const globalUnknown = this.countActiveSessionsFromUnknownSenders(agentName);
-    if (globalUnknown >= ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL) {
-      return { ok: false, reason: "abuse_bound_unknown_sessions_global" };
+    // The global stranger cap is only for the UNKNOWN pool. A KNOWN+ sender is past it by trust;
+    // a BLOCKED sender was already refused above (cap 0).
+    if (tier === TIER.UNKNOWN) {
+      const globalUnknown = this.countActiveSessionsFromUnknownSenders(agentName);
+      if (globalUnknown >= ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL) {
+        return { ok: false, reason: "abuse_bound_unknown_sessions_global" };
+      }
     }
     return { ok: true };
   }
@@ -2992,10 +3013,15 @@ export class SessionNodeManager {
     // seam below (cheap + synchronous — fail fast on volume before spending gateway compute on
     // content headed for rejection anyway); both gates are independent and either rejects on its
     // own criteria, so ordering between them does not change correctness.
-    if (!this.isContact(agentName, senderPubkey)) {
+    {
+      // DOD-TIER-2 AC2: the per-session byte cap is the sender's TIER cap (DEFAULT_TIER_BOUNDS),
+      // applied to EVERY sender — no tier is unbounded (INV-TIER-BOUND), so a contact is no longer
+      // "exempt entirely". A stranger (no row → UNKNOWN) keeps the 25 MB cap; KNOWN+ get more.
+      const senderTier = this.getTier(agentName, senderPubkey);
+      const cap = tierBoundsFor(senderTier).maxBytesPerSession;
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
-      if (priorTotal + heldTotal + content.length > ABUSE_MAX_SESSION_RECEIVED_BYTES) {
+      if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
           agentName,
@@ -3003,7 +3029,8 @@ export class SessionNodeManager {
           priorTotal,
           heldTotal,
           incoming: content.length,
-          cap: ABUSE_MAX_SESSION_RECEIVED_BYTES,
+          cap,
+          tier: senderTier,
           correlationId,
         });
         return { ok: false, reason: "session_size_limit_exceeded" };
