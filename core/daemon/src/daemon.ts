@@ -4537,10 +4537,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     correlationId: string,
   ): Promise<void> {
     try {
-      // M8C-ABUSE-1 (anti-drip-feed / anti-swarm): bound acceptance from unknown (non-contact)
-      // senders — a per-sender cap (many sessions from ONE stranger) and a global cap (many
-      // sessions across ALL strangers combined). Known contacts are exempt ("bounded only by
-      // disk" — DoD). Checked FIRST, before any standing-receiver work, so a refusal is cheap.
+      // M8C-ABUSE-1 + DOD-TIER-2/3: bound acceptance by the sender's TIER — a per-sender cap that is
+      // the sender's tier cap (BLOCKED 0 → refused here, indistinguishably from an over-cap stranger),
+      // plus a global anti-swarm cap that applies only to the UNKNOWN-tier stranger pool. No tier is
+      // unbounded (INV-TIER-BOUND); KNOWN+ are exempt from the GLOBAL pool only, not from their own
+      // cap. Checked FIRST, before any standing-receiver work, so a refusal is cheap.
       // CC-10: reap provably-dead ghosts for THIS agent before counting — otherwise invisible
       // interrupted 0-received sessions (post-restart shape) consume the sender's budget forever
       // and lock the stranger out with no list read ever clearing them. Safe here: abandonSession
@@ -4672,8 +4673,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // CC-1 (2026-07-07): do NOT auto-add the requester here. Accepting the *connection* must not
       // grant *trust*. The old auto-add promoted any stranger who knocked once to "known" (Level-4
       // fast-track), which defeated BOTH the screening layer AND the ABUSE-1 acceptance caps
-      // (checkUnknownSenderAcceptanceBound exempts contacts, so sessions 2+ bypassed the per-sender
-      // cap — confirmed live 2026-07-07). Promotion to "known" now requires operator engagement only:
+      // (a higher tier raises the per-sender cap, so auto-promoting a stranger would have let their
+      // sessions 2+ ride a larger bound — DOD-TIER-2). Promotion to "known" now requires operator engagement only:
       // an outbound cello_initiate_session (below, ~3137), the operator replying INTO the session via
       // cello_send, or an explicit cello_contact_add. An unattended stranger is never auto-whitelisted.
       // See docs/planning/.../2026-07-07_1700_four-level-screening-policy.md (D21).

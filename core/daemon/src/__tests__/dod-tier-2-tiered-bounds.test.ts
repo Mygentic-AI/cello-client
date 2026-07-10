@@ -166,6 +166,28 @@ describe("DOD-TIER-2/3 — tier-graduated acceptance bound", () => {
     setTier(db, alice, friend, TIER.KNOWN);
     expect(mgr.checkUnknownSenderAcceptanceBound("alice", friend)).toEqual({ ok: true });
   });
+
+  it("the pool counts an UNKNOWN-TIER CONTACT's sessions but excludes a KNOWN+ one (tier, not row-existence)", () => {
+    // Distinguishes the new `tier >= KNOWN` pool semantics from the old row-existence proxy: BOTH
+    // senders below have contact ROWS, so the old query would have exempted BOTH (pool 0). Only the
+    // KNOWN one is genuinely trusted; the UNKNOWN-tier contact must still count toward the stranger pool.
+    const unknownContact = "1a".repeat(32);
+    const knownContact = "2b".repeat(32);
+    setTier(db, alice, unknownContact, TIER.UNKNOWN);
+    setTier(db, alice, knownContact, TIER.KNOWN);
+    seedSessions(db, alice, unknownContact, 4);
+    seedSessions(db, alice, knownContact, 7);
+    expect(mgr.countActiveSessionsFromUnknownSenders("alice")).toBe(4); // only the UNKNOWN-tier contact
+  });
+
+  it("an UNKNOWN-tier CONTACT is refused by the GLOBAL cap when the pool is full (would escape under row-existence)", () => {
+    for (let i = 0; i < 50; i++) seedSessions(db, alice, `s${i}`.padStart(64, "0"), 1); // saturate the pool
+    const unknownContact = "3c".repeat(32);
+    setTier(db, alice, unknownContact, TIER.UNKNOWN); // a contact ROW, but UNKNOWN tier
+    // own count 0 < 3, but tier === UNKNOWN → the global check runs → pool 50 >= 50 → refused globally.
+    expect(mgr.checkUnknownSenderAcceptanceBound("alice", unknownContact))
+      .toMatchObject({ ok: false, reason: "abuse_bound_unknown_sessions_global" });
+  });
 });
 
 describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
@@ -216,5 +238,21 @@ describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
     const tip2 = new TextEncoder().encode("still fine for a KNOWN contact");
     const knownRes = await mgr.ingestReceivedContent("alice", SID2, tip2, msgLeafHash(tip2), "corr-3");
     expect(knownRes.ok).toBe(true);
+  });
+
+  it("a KNOWN contact's byte cap is FINITE — refused past 100 MB (INV-TIER-BOUND, kills a `tier>=KNOWN?Infinity` bypass)", async () => {
+    // Behavioural proof that KNOWN is bounded, not exempt: prior received == exactly the 100 MB cap,
+    // so any further byte exceeds it. A cap of Infinity for KNOWN would let this through — this is red
+    // under such a bypass.
+    const SID3 = "cc".repeat(16);
+    const known = "44".repeat(32);
+    setTier(db, alice, known, TIER.KNOWN);
+    await mgr.createSessionNode(SID3, "alice", known, "peer-3", "corr");
+    const huge = new Uint8Array(DEFAULT_TIER_BOUNDS[TIER.KNOWN].maxBytesPerSession); // exactly 100 MB
+    const { leafIndex } = mgr.appendSessionLeaf("alice", SID3, "msg", "cc".repeat(32), "seed3");
+    mgr.recordTranscriptMessage("alice", SID3, leafIndex, "received", huge, "seed3");
+    const tip = new TextEncoder().encode("this pushes past the 100 MB KNOWN cap");
+    const res = await mgr.ingestReceivedContent("alice", SID3, tip, msgLeafHash(tip), "corr-4");
+    expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 });

@@ -257,6 +257,50 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 
+  it("DOD-TIER-3 (real wiring): a BLOCKED sender's inbound knock creates NOTHING — no node, no row, no accept, no away/doorbell — refused identically to an over-cap unknown", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    // A BLOCKED contact (tier 0). getTier → BLOCKED → per-sender cap 0 → refused before any state.
+    const blockedPubkey = "b0".repeat(32);
+    const bobId = resolveAgentId(snm.getDb(), "bob");
+    snm.addContact("bob", blockedPubkey);
+    snm.getDb().prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?").run(TIER.BLOCKED, bobId, blockedPubkey);
+
+    events.length = 0; // observe only the knock's effects
+    const sid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 100 + b));
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: sid,
+        participant_a: { pubkey: Buffer.from(blockedPubkey, "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "blocked-peer-id",
+        counterparty_session_peer_id: "bob-session-peer-id",
+      },
+    });
+    await wait(150);
+
+    // Refused with the SAME reason an over-cap unknown gets — no distinguishing oracle (DOD-TIER-3 AC1).
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    // AC2: nothing created — no session node, no accept, no away reply, no Telegram doorbell. This is
+    // the direct test for the reviewer's bypass (moving any of these ABOVE the bound check).
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+    expect(events.find((e) => e.event === "session.node.created")).toBeUndefined();
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+    expect(events.find((e) => e.event === "telegram.doorbell.sent")).toBeUndefined();
+    // And no session ROW for the blocked sender.
+    const row = snm.getDb().prepare("SELECT 1 FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ?").get(bobId, blockedPubkey);
+    expect(row).toBeUndefined();
+  });
+
   it("CC-1 (live 3f regression): repeated REAL inbound knocks from one unknown sender stay capped — the sender is NOT auto-added on accept, so the per-sender bound keeps applying (the old auto-add promoted them at session 1, exempting sessions 2+)", async () => {
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
