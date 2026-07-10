@@ -137,6 +137,42 @@ describe("DOD-TIER-1 — contacts tier metadata migration (real SQLCipher)", () 
     db.close();
   });
 
+  it("is ATOMIC: if the grandfather backfill fails, the ADD COLUMNs roll back too (no half-migrated state)", () => {
+    // F1 (review): the ALTERs and the backfill must commit together. If they didn't, a crash after
+    // the `tier` ALTER but before the backfill would leave the column present with the grandfather
+    // never run — and the one-time gate would skip it FOREVER, silently demoting every legacy contact.
+    // Proof: inject a failure into the backfill and assert the whole thing rolled back — the `tier`
+    // column must NOT exist afterward, so a clean re-run does the entire add+grandfather.
+    const dbPath = join(tempDir, "atomic.db");
+    const real = openTestDb(dbPath);
+    createPreTierContacts(real);
+    real.prepare("INSERT INTO contacts (agent_id, pubkey, added_at) VALUES (?, ?, ?)").run("agentX", "legacy", 111);
+
+    // A minimal wrapper (migrate only uses exec + prepare) that fails the grandfather UPDATE. An
+    // explicit delegation, not a Proxy — the real DB has private fields, so its methods must run with
+    // the real object as `this`, which `real.exec(sql)` / `real.prepare(sql)` preserve.
+    const failingBackfill = {
+      exec: (sql: string) => real.exec(sql),
+      prepare: (sql: string) =>
+        /UPDATE\s+contacts\s+SET\s+tier/i.test(sql)
+          ? { run: () => { throw new Error("injected backfill failure"); } }
+          : real.prepare(sql),
+    } as unknown as DaemonDatabase;
+
+    expect(() => migrateContactsAddTierMetadata(failingBackfill, silent)).toThrow(/injected backfill failure/);
+
+    // Rolled back: the tier column must be gone, and the legacy row untouched (still one row, no tier).
+    const cols = contactColumns(real).map((c) => c.name);
+    expect(cols).not.toContain("tier");
+    expect(cols).not.toContain("provenance");
+
+    // And a clean re-run (no injection) now does the WHOLE thing: columns added AND row grandfathered.
+    migrateContactsAddTierMetadata(real, silent);
+    const row = real.prepare("SELECT tier FROM contacts WHERE pubkey = 'legacy'").get() as { tier: number };
+    expect(row.tier).toBe(TIER.WHITELISTED);
+    real.close();
+  });
+
   it("fresh == migrated: a migrated contacts schema is structurally identical to a fresh one", async () => {
     // MIGRATED: pre-seed a legacy contacts (+ a row + the agent) then let the manager initialize().
     const oldPath = join(tempDir, "old.db");

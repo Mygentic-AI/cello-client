@@ -319,5 +319,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const res = (await client.send("cello_initiate_session", { target_pubkey: targetPubkey })) as Record<string, unknown>;
     expect(res.ok).toBe(true);
     expect(h.getSessionNodeManager().isContact("alice", targetPubkey)).toBe(true);
+    // DOD-TIER-1 AC5 (end-to-end): the initiate path stamps provenance 'initiated' (I opened the
+    // session). This drives the REAL production handler — a manager-level test that passes the value
+    // directly cannot catch a call site that forgets to pass it. Goes red if daemon.ts drops the arg.
+    const provRow = h.getSessionNodeManager().getDb()
+      .prepare("SELECT provenance FROM contacts WHERE pubkey = ?")
+      .get(targetPubkey) as { provenance: string | null };
+    expect(provRow.provenance).toBe("initiated");
   });
 });

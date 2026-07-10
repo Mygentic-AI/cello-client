@@ -76,7 +76,7 @@ import {
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
-import { TIER, normalizeTier, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { TIER, normalizeTier, isKnownTierValue, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -899,15 +899,25 @@ export class SessionNodeManager {
     return row !== undefined;
   }
 
-  /** DOD-TIER-1: the reachability tier for a counterparty of this agent. TOTAL by construction — an
-   *  absent contact row (undefined) OR a row whose `tier` is NULL both resolve to UNKNOWN via
-   *  `normalizeTier`, which also guards the JS `null >= 0`/`0 || 1` traps. A missing DB degrades to
-   *  UNKNOWN (the tighter default), never throws for a read. */
+  /** DOD-TIER-1: the reachability tier for a counterparty of this agent. The RESULT is total — an
+   *  absent contact row (undefined), a NULL `tier`, or a corrupt out-of-range value all resolve to
+   *  UNKNOWN via `normalizeTier`, so the return is always in 0..4 and guards the JS `null >= 0`/`0 ||
+   *  1`/`grid[99]` traps. It is a SECURITY read (Step 2 gates inbound bounds on it), so it FAILS
+   *  CLOSED, never open: an uninitialized DB throws (same contract as addContact) rather than
+   *  silently returning UNKNOWN and admitting a BLOCKED sender; an unresolvable/retired agent name
+   *  throws via #requireAgentId. Both are invariant violations a caller must surface, not swallow. */
   getTier(agentName: string, pubkey: string): number {
-    if (!this.#db) return TIER.UNKNOWN;
+    // Fail CLOSED: a read that decides whether to admit a sender must not degrade to "unclassified"
+    // when it cannot reach the ACL — that would admit a blocked contact. Throw as addContact does.
+    if (!this.#db) throw new Error(`getTier('${agentName}'): database not initialized`);
     const row = this.#db
       .prepare("SELECT tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
       .get(this.#requireAgentId(agentName), pubkey) as { tier: number | null } | undefined;
+    if (row && row.tier !== null && !isKnownTierValue(row.tier)) {
+      // A stored tier outside 0..4 is corruption — surface it. normalizeTier still maps it to the
+      // tighter UNKNOWN so the caller is safe, but a silent map would hide a broken row.
+      this.#logger.warn("contact.tier.corrupt", { agentName, pubkey, storedTier: row.tier });
+    }
     return normalizeTier(row?.tier);
   }
 

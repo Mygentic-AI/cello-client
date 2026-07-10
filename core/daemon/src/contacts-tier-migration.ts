@@ -57,6 +57,11 @@ export function isKnownTierValue(n: number): boolean {
  */
 export function normalizeTier(tier: number | null | undefined): number {
   if (tier === null || tier === undefined) return TIER.UNKNOWN;
+  // TOTAL over ALL inputs: a stored value that is not one of the five defined tiers (a corrupt or
+  // future-version row) also collapses to UNKNOWN, so `getTier` is guaranteed to return a value in
+  // 0..4 and every downstream `grid[tier]` lookup / `>=` comparison is total. Without this, a corrupt
+  // `tier = 99` would sail through and become the `grid[99] → undefined` crash the bound grid fears.
+  if (!isKnownTierValue(tier)) return TIER.UNKNOWN;
   return tier;
 }
 
@@ -93,25 +98,45 @@ export function migrateContactsAddTierMetadata(db: DaemonDatabase, logger: Logge
     (db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>).map((c) => c.name),
   );
 
-  const added: string[] = [];
-  for (const col of TIER_METADATA_COLUMNS) {
-    if (!existing.has(col.name)) {
-      db.exec(`ALTER TABLE contacts ADD COLUMN ${col.ddl}`);
-      added.push(col.name);
+  const toAdd = TIER_METADATA_COLUMNS.filter((c) => !existing.has(c.name));
+  if (toAdd.length === 0) return; // idempotent: every column already present → nothing to do
+
+  // The ADD COLUMNs and the grandfather backfill MUST commit atomically, in ONE transaction (SQLite
+  // DDL is transactional — the same reason the join-key migration uses one BEGIN…COMMIT). If a crash
+  // landed between the `tier` ALTER committing and the backfill, the next init would see the column
+  // exists, skip the one-time grandfather FOREVER, and silently demote every legacy contact to
+  // UNKNOWN — the exact "silently revoking access people already rely on" failure this file exists to
+  // avoid, with no log and no error. Wrapping both makes "column added" and "existing rows
+  // grandfathered" inseparable: a crash rolls back BOTH, and the clean re-run does the whole thing —
+  // which is what makes column-existence a VALID durability marker for the one-time gate.
+  const addsTier = toAdd.some((c) => c.name === "tier");
+  let grandfathered = 0;
+  db.exec("BEGIN");
+  try {
+    for (const col of toAdd) db.exec(`ALTER TABLE contacts ADD COLUMN ${col.ddl}`);
+    // Grandfather EXISTING contacts to WHITELISTED — but ONLY on the migration that first adds `tier`
+    // (a one-time, column-birth event). A NULL written AFTER the column exists is never promoted here;
+    // it is a read-time UNKNOWN via normalizeTier, the tighter default.
+    if (addsTier) {
+      grandfathered = Number(db.prepare("UPDATE contacts SET tier = ? WHERE tier IS NULL").run(TIER.WHITELISTED).changes);
     }
+    db.exec("COMMIT");
+  } catch (err) {
+    // SQLite may have already aborted the transaction; a failing ROLLBACK must not mask the real error.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* the failing statement may have already aborted the txn */
+    }
+    logger.error("contacts.tier.migration.failed", {
+      columns: toAdd.map((c) => c.name),
+      reason: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
 
-  if (added.length > 0) {
-    logger.info("contacts.tier.columns.added", { columns: added });
-  }
-
-  // Grandfather EXISTING contacts to WHITELISTED — but ONLY on the migration that first adds `tier`.
-  // Gating on `added.includes("tier")` makes the promotion a one-time, column-birth event: a NULL
-  // written after the column exists is never silently promoted (it is a read-time UNKNOWN instead).
-  if (added.includes("tier")) {
-    const res = db.prepare("UPDATE contacts SET tier = ? WHERE tier IS NULL").run(TIER.WHITELISTED);
-    if (res.changes > 0) {
-      logger.info("contacts.tier.grandfathered", { count: res.changes, tier: TIER.WHITELISTED });
-    }
+  logger.info("contacts.tier.columns.added", { columns: toAdd.map((c) => c.name) });
+  if (grandfathered > 0) {
+    logger.info("contacts.tier.grandfathered", { count: grandfathered, tier: TIER.WHITELISTED });
   }
 }

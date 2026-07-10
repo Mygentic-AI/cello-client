@@ -71,6 +71,22 @@ describe("DOD-TIER-1 — normalizeTier totality (the read-side default)", () => 
       expect(normalizeTier(v)).toBe(v);
     }
   });
+
+  it("is TOTAL: a corrupt / out-of-range stored value also collapses to UNKNOWN (no grid[99] crash)", () => {
+    for (const v of [99, -1, 5, 1.5, NaN, Infinity]) {
+      expect(normalizeTier(v)).toBe(TIER.UNKNOWN);
+    }
+  });
+});
+
+describe("DOD-TIER-1 — getTier FAILS CLOSED on an unreachable ACL", () => {
+  it("throws (never returns UNKNOWN) when the DB is not initialized — a security read must not admit on failure", () => {
+    // getTier gates inbound bounds in Step 2. If it degraded to UNKNOWN when it cannot read the ACL,
+    // a BLOCKED sender would read as UNKNOWN and be admitted. So a missing DB throws, like addContact.
+    const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
+    // NOT initialized — #db is undefined.
+    expect(() => mgr.getTier("ada", "anypubkey")).toThrow(/not initialized/);
+  });
 });
 
 describe("DOD-TIER-1 — SessionNodeManager.getTier + addContact stamping", () => {

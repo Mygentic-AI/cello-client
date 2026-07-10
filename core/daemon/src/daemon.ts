@@ -3285,8 +3285,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
 
     // M8C-CONTACT-1 (D6): "initiating a session to X adds X" — pin at the pubkey the negotiator
-    // actually used (not re-resolved later).
-    sessionNodeManager.addContact(agentName, counterpartyPubkey);
+    // actually used (not re-resolved later). DOD-TIER-1 AC5: provenance 'initiated' — I opened this
+    // session. (Tier stays UNKNOWN in Step 1; Step 3 assigns the session-created tier.)
+    sessionNodeManager.addContact(agentName, counterpartyPubkey, undefined, "initiated");
 
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
@@ -5647,8 +5648,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // auto-adds (that defeated screening + anti-spam). For an OUTBOUND session the counterparty is
     // already a contact (cello_initiate_session added it), so this is an idempotent no-op there; it
     // matters for inbound-originated sessions, where the reply is the trust signal. addContact is
-    // INSERT OR IGNORE — it never refreshes added_at.
-    sessionNodeManager.addContact(record.agent_name, recipientPubkey);
+    // INSERT OR IGNORE — it never refreshes added_at. DOD-TIER-1 AC5: provenance 'accepted' — the
+    // relationship formed by my accepting/engaging with their inbound session. For an OUTBOUND session
+    // the row already exists ('initiated' from cello_initiate_session) and INSERT OR IGNORE leaves its
+    // provenance untouched — 'initiated' correctly wins there.
+    sessionNodeManager.addContact(record.agent_name, recipientPubkey, undefined, "accepted");
     if (modified) {
       logger.info("security.verdict.returned", { disposition: "redact", sessionId, sequenceNumber: leafIndex, correlationId });
     }
