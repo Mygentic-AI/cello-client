@@ -75,6 +75,7 @@ export function wireSessionOfferHandler(deps: {
           agentName: deps.agentName,
           reason,
           detail: res.reason ?? "send_not_ok",
+          ...(res.guidance ? { guidance: res.guidance } : {}),
         });
       }
     } catch (err: unknown) {
@@ -121,6 +122,7 @@ export function wireSessionOfferHandler(deps: {
           deps.logger.warn("session.offer.accept.failed", {
             agentName: deps.agentName,
             detail: res.reason ?? "send_not_ok",
+            ...(res.guidance ? { guidance: res.guidance } : {}),
           });
         }
       } catch (err: unknown) {
@@ -525,6 +527,7 @@ export async function sendSealFrostSignature(
         agentName: deps.agentName,
         sessionId: sidHex,
         detail: res.reason ?? "send_not_ok",
+        ...(res.guidance ? { guidance: res.guidance } : {}),
       });
     }
   } catch (err: unknown) {
@@ -704,6 +707,7 @@ export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void
             deps.logger.warn("session.ceremony.reply.failed", {
               agentName: deps.agentName,
               detail: res.reason ?? "send_not_ok",
+              ...(res.guidance ? { guidance: res.guidance } : {}),
             });
           }
         } catch (err: unknown) {

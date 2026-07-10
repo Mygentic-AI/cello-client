@@ -31,6 +31,10 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 export interface SignalingSendResult {
   ok: boolean;
   reason?: string;
+  /** DOD-SENDRAW-1 review F2: the transport's OperationResult carries the SPECIFIC cause here
+   *  (e.g. `Send failed: <exception text>`) while `reason` is the generic label — failure logs
+   *  must thread it through or the operator gets the label, not the cause. */
+  guidance?: string;
 }
 
 /**

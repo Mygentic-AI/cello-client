@@ -42,12 +42,26 @@ export default [
       // This shape shipped four times before the rule (session-ceremony offer accept, the seal
       // FROST signature, the ceremony reply, trust_signal_ack). Branch on the result; the
       // existing no-unused-vars rule catches an assigned-but-ignored result.
+      // Three selectors close the three discard shapes (review F1): awaited-and-discarded,
+      // void-wrapped, and bare-floating. sendSignalingFrame is the same contract one layer up
+      // (registration-context wraps sendRaw), so it is covered by the same name regex.
       "no-restricted-syntax": ["error", {
-        selector: 'ExpressionStatement > AwaitExpression > CallExpression[callee.property.name="sendRaw"]',
+        selector: 'ExpressionStatement > AwaitExpression > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
         message:
           "sendRaw never throws — it resolves {ok:false, reason}. Discarding the result hides " +
           "every send failure. Branch on it: const res = await ...sendRaw(...); if (!res.ok) " +
           "log the failure with res.reason. (DOD-SENDRAW-1)",
+      }, {
+        selector: 'ExpressionStatement > UnaryExpression[operator="void"] > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
+        message:
+          "void does not excuse ignoring sendRaw's result — it resolves {ok:false, reason} " +
+          "instead of throwing, so this hides every send failure. Branch on the result. " +
+          "(DOD-SENDRAW-1)",
+      }, {
+        selector: 'ExpressionStatement > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
+        message:
+          "Floating sendRaw call — the result ({ok:false, reason} on failure; it never throws) " +
+          "is discarded AND unawaited. Await it and branch on the result. (DOD-SENDRAW-1)",
       }],
     },
   },

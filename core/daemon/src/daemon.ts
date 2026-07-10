@@ -4850,6 +4850,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         signalKind,
         correlationId,
         detail: ackRes.reason ?? "send_not_ok",
+        ...(ackRes.guidance ? { guidance: ackRes.guidance } : {}),
       });
     }
   }

@@ -261,7 +261,7 @@ describe("DOD-SENDRAW-1: seal + ceremony sends branch on the seam's resolved res
     };
     return { logger, events };
   }
-  function makeSeam(result: { ok: boolean; reason?: string }): { seam: SignalingSeam; sent: Record<string, unknown>[]; inject: (frame: Record<string, unknown>) => void } {
+  function makeSeam(result: { ok: boolean; reason?: string; guidance?: string }): { seam: SignalingSeam; sent: Record<string, unknown>[]; inject: (frame: Record<string, unknown>) => void } {
     const sent: Record<string, unknown>[] = [];
     let handler: ((frame: Record<string, unknown>) => void) | null = null;
     const seam: SignalingSeam = {
@@ -278,9 +278,9 @@ describe("DOD-SENDRAW-1: seal + ceremony sends branch on the seam's resolved res
   const SID = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 21));
   const SID_HEX = Buffer.from(SID).toString("hex");
 
-  it("seal_frost_signature: {ok:false} → signature.send.failed with the reason, and NO .sent", async () => {
+  it("seal_frost_signature: {ok:false} → signature.send.failed with the reason AND the specific guidance, and NO .sent", async () => {
     const { logger, events } = makeCapturingLogger();
-    const { seam } = makeSeam({ ok: false, reason: "signaling_lost" });
+    const { seam } = makeSeam({ ok: false, reason: "signaling_lost", guidance: "Send failed: stream reset by peer" });
     await sendSealFrostSignature({ agentName: "bob", signaling: seam, logger }, SID, SID_HEX, new Uint8Array(64));
     const failed = events.find((e) => e.event === "session.seal.frost.signature.send.failed");
     expect(failed).toBeDefined();
@@ -288,6 +288,9 @@ describe("DOD-SENDRAW-1: seal + ceremony sends branch on the seam's resolved res
     expect(failed!.context["agentName"]).toBe("bob");
     expect(failed!.context["sessionId"]).toBe(SID_HEX);
     expect(String(failed!.context["detail"])).toContain("signaling_lost");
+    // Review F2: `reason` is the generic label; the SPECIFIC cause rides in guidance — it must
+    // reach the operator's log, not be discarded.
+    expect(String(failed!.context["guidance"])).toContain("stream reset by peer");
     expect(events.find((e) => e.event === "session.seal.frost.signature.sent")).toBeUndefined();
   });
 
