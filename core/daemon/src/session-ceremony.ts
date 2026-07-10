@@ -498,18 +498,42 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
       }
       if (!frostSignature) return; // ceremony failed (threshold not met) — no signature to send
 
-      try {
-        await deps.signaling.sendRaw({ type: "seal_frost_signature", session_id: sessionId, frost_signature: frostSignature });
-        deps.logger.info("session.seal.frost.signature.sent", { agentName: deps.agentName, sessionId: sidHex });
-      } catch (err: unknown) {
-        deps.logger.warn("session.seal.frost.signature.send.failed", {
-          agentName: deps.agentName,
-          sessionId: sidHex,
-          detail: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await sendSealFrostSignature(deps, sessionId, sidHex, frostSignature);
     })();
   });
+}
+
+/**
+ * DOD-SENDRAW-1: deliver the co-signed seal FROST signature to the directory, branching on the
+ * seam's RESOLVED result. The production seam (transport SignalingManager.sendRaw) never throws —
+ * it resolves {ok:false, reason} on every failure — so the old try/catch logged `.sent` for a
+ * signature that never left the machine, inside the non-repudiation ceremony, and the failure
+ * event was unreachable. Exported so the send contract is testable without a live FROST ceremony.
+ */
+export async function sendSealFrostSignature(
+  deps: { agentName: string; signaling: SignalingSeam; logger: Logger },
+  sessionId: Uint8Array,
+  sidHex: string,
+  frostSignature: Uint8Array,
+): Promise<void> {
+  try {
+    const res = await deps.signaling.sendRaw({ type: "seal_frost_signature", session_id: sessionId, frost_signature: frostSignature });
+    if (res.ok) {
+      deps.logger.info("session.seal.frost.signature.sent", { agentName: deps.agentName, sessionId: sidHex });
+    } else {
+      deps.logger.warn("session.seal.frost.signature.send.failed", {
+        agentName: deps.agentName,
+        sessionId: sidHex,
+        detail: res.reason ?? "send_not_ok",
+      });
+    }
+  } catch (err: unknown) {
+    deps.logger.warn("session.seal.frost.signature.send.failed", {
+      agentName: deps.agentName,
+      sessionId: sidHex,
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**
@@ -669,11 +693,19 @@ export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void
       const context = typeof frame["context"] === "string" ? (frame["context"] as string) : undefined;
 
       // L3: the reply send is best-effort — a throw here must not become an unhandled
-      // rejection in this fire-and-forget handler.
+      // rejection in this fire-and-forget handler. DOD-SENDRAW-1: the production seam never
+      // throws — it resolves {ok:false, reason} — so the failure must be read off the RESULT;
+      // catch-only made session.ceremony.reply.failed unreachable in production.
       const reply = async (signature: Uint8Array | null): Promise<void> => {
         if (!ceremonyId) return;
         try {
-          await deps.signaling.sendRaw({ type: "ceremony_result", ceremony_id: ceremonyId, signature });
+          const res = await deps.signaling.sendRaw({ type: "ceremony_result", ceremony_id: ceremonyId, signature });
+          if (!res.ok) {
+            deps.logger.warn("session.ceremony.reply.failed", {
+              agentName: deps.agentName,
+              detail: res.reason ?? "send_not_ok",
+            });
+          }
         } catch (err: unknown) {
           deps.logger.warn("session.ceremony.reply.failed", {
             agentName: deps.agentName,

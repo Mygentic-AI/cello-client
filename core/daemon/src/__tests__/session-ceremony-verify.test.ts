@@ -14,7 +14,7 @@
  * tests; the reason plumbing they share is validated here.
  */
 import { describe, it, expect } from "vitest";
-import { verifyBilateralSealCertificate, wireSessionOfferHandler } from "../session-ceremony.js";
+import { verifyBilateralSealCertificate, wireSessionOfferHandler, wireSessionCeremonyHandler, sendSealFrostSignature } from "../session-ceremony.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
 import type { SignalingSeam } from "../registration-context.js";
 import type { Logger } from "../types.js";
@@ -241,5 +241,87 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
     await wait(20);
     expect(h.sent).toHaveLength(0);
     expect(h.events).toHaveLength(0);
+  });
+});
+
+// ─── DOD-SENDRAW-1: sendRaw resolves {ok:false} — it never throws in production ─────────────
+// The transport SignalingManager.sendRaw has zero throw statements; every failure resolves
+// {ok:false, reason}. A site that discards the result logs success while nothing left the
+// machine, and its catch-based failure event can never fire. These tests drive the RESOLVE
+// contract (a throwing fake is exactly what let this class hide — D1 review F1).
+describe("DOD-SENDRAW-1: seal + ceremony sends branch on the seam's resolved result", () => {
+  interface LogEvent { level: string; event: string; context: Record<string, unknown> }
+  function makeCapturingLogger(): { logger: Logger; events: LogEvent[] } {
+    const events: LogEvent[] = [];
+    const logger: Logger = {
+      debug(event, context) { events.push({ level: "debug", event, context: context ?? {} }); },
+      info(event, context) { events.push({ level: "info", event, context: context ?? {} }); },
+      warn(event, context) { events.push({ level: "warn", event, context: context ?? {} }); },
+      error(event, context) { events.push({ level: "error", event, context: context ?? {} }); },
+    };
+    return { logger, events };
+  }
+  function makeSeam(result: { ok: boolean; reason?: string }): { seam: SignalingSeam; sent: Record<string, unknown>[]; inject: (frame: Record<string, unknown>) => void } {
+    const sent: Record<string, unknown>[] = [];
+    let handler: ((frame: Record<string, unknown>) => void) | null = null;
+    const seam: SignalingSeam = {
+      status: "connected",
+      async sendRaw(frame: unknown) {
+        sent.push(frame as Record<string, unknown>);
+        return result as never;
+      },
+      registerInboundHandler(h) { handler = h; return () => { handler = null; }; },
+    };
+    return { seam, sent, inject: (frame) => handler?.(frame) };
+  }
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const SID = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 21));
+  const SID_HEX = Buffer.from(SID).toString("hex");
+
+  it("seal_frost_signature: {ok:false} → signature.send.failed with the reason, and NO .sent", async () => {
+    const { logger, events } = makeCapturingLogger();
+    const { seam } = makeSeam({ ok: false, reason: "signaling_lost" });
+    await sendSealFrostSignature({ agentName: "bob", signaling: seam, logger }, SID, SID_HEX, new Uint8Array(64));
+    const failed = events.find((e) => e.event === "session.seal.frost.signature.send.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level).toBe("warn");
+    expect(failed!.context["agentName"]).toBe("bob");
+    expect(failed!.context["sessionId"]).toBe(SID_HEX);
+    expect(String(failed!.context["detail"])).toContain("signaling_lost");
+    expect(events.find((e) => e.event === "session.seal.frost.signature.sent")).toBeUndefined();
+  });
+
+  it("seal_frost_signature: {ok:true} → .sent, and NO failure event", async () => {
+    const { logger, events } = makeCapturingLogger();
+    const { seam, sent } = makeSeam({ ok: true });
+    await sendSealFrostSignature({ agentName: "bob", signaling: seam, logger }, SID, SID_HEX, new Uint8Array(64));
+    expect(sent[0]!["type"]).toBe("seal_frost_signature");
+    expect(events.find((e) => e.event === "session.seal.frost.signature.sent")).toBeDefined();
+    expect(events.find((e) => e.event === "session.seal.frost.signature.send.failed")).toBeUndefined();
+  });
+
+  it("ceremony reply: a {ok:false} ceremony_result send → session.ceremony.reply.failed with the reason (previously unreachable)", async () => {
+    const { logger, events } = makeCapturingLogger();
+    const { seam, sent, inject } = makeSeam({ ok: false, reason: "signaling_reconnecting" });
+    // Minimal deps: the no-tbs abort path reaches reply(null) → sendRaw without touching the
+    // FROST machinery (persistence/keyProvider/node stubs are never called on this path).
+    wireSessionCeremonyHandler({
+      agentName: "bob",
+      persistence: {} as never,
+      agentPubkeyHex: "aa".repeat(32),
+      keyProvider: {} as never,
+      getNode: () => null,
+      getDirectoryEndpoint: async () => null,
+      getConsortiumEndpoints: async () => null,
+      signaling: seam,
+      logger,
+    });
+    inject({ type: "ceremony_request", ceremony_id: "cer-1" }); // no tbs → reply(null)
+    await wait(20);
+    expect(sent[0]!["type"]).toBe("ceremony_result");
+    const failed = events.find((e) => e.event === "session.ceremony.reply.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level).toBe("warn");
+    expect(String(failed!.context["detail"])).toContain("signaling_reconnecting");
   });
 });

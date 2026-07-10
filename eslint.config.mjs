@@ -34,6 +34,21 @@ export default [
             "core/daemon/src/sqlcipher-db.ts. Tests may use it for in-memory fixtures.",
         }],
       }],
+      // DOD-SENDRAW-1: the signaling seam's sendRaw NEVER throws — it catches internally and
+      // resolves {ok:false, reason} on every failure (transport signaling-manager.ts). A bare
+      // `await x.sendRaw(...)` that discards the result therefore reports nothing when the send
+      // fails, and the classic `try { await sendRaw(); log("sent") } catch { log("failed") }`
+      // lies in BOTH directions: the success line always fires, the failure line never can.
+      // This shape shipped four times before the rule (session-ceremony offer accept, the seal
+      // FROST signature, the ceremony reply, trust_signal_ack). Branch on the result; the
+      // existing no-unused-vars rule catches an assigned-but-ignored result.
+      "no-restricted-syntax": ["error", {
+        selector: 'ExpressionStatement > AwaitExpression > CallExpression[callee.property.name="sendRaw"]',
+        message:
+          "sendRaw never throws — it resolves {ok:false, reason}. Discarding the result hides " +
+          "every send failure. Branch on it: const res = await ...sendRaw(...); if (!res.ok) " +
+          "log the failure with res.reason. (DOD-SENDRAW-1)",
+      }],
     },
   },
   {

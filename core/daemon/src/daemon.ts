@@ -4841,7 +4841,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return;
     }
     logger.info("daemon.trust_signal.received", { agentName, signalKind, verified: true, correlationId });
-    await mgr.sendRaw({ type: "trust_signal_ack", id });
+    // DOD-SENDRAW-1: sendRaw never throws — a discarded result hid every failed ack, leaving the
+    // sender to retransmit against a daemon that believed it had answered.
+    const ackRes = await mgr.sendRaw({ type: "trust_signal_ack", id });
+    if (!ackRes.ok) {
+      logger.warn("daemon.trust_signal.ack_send_failed", {
+        agentName,
+        signalKind,
+        correlationId,
+        detail: ackRes.reason ?? "send_not_ok",
+      });
+    }
   }
 
   function wirePerAgentSessionInbound(mgr: SignalingManager): void {
