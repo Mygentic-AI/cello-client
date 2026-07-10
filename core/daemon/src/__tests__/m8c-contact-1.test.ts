@@ -265,6 +265,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // Engagement = trust. A committed reply promotes them; without CC-1's addContact in cello_send
     // this stays false (the teeth).
     expect(snm.isContact("alice", strangerPubkey)).toBe(true);
+    // DOD-TIER-4 AC3 (F2, end-to-end for the engage path): the reply stamps the new contact KNOWN
+    // (provenance 'accepted') — red if daemon.ts:5658 drops the tier arg. This is the inbound-
+    // originated case the other end-to-end assertions (initiate, explicit add) do not cover.
+    expect(snm.getTier("alice", strangerPubkey)).toBe(TIER.KNOWN);
+    const prov = snm.getDb().prepare("SELECT provenance FROM contacts WHERE pubkey = ?").get(strangerPubkey) as { provenance: string | null };
+    expect(prov.provenance).toBe("accepted");
   });
 
   it("K5: a KNOWN contact's inbound request gets the fuller AWAY-1 text, not 'Dispatched.'", async () => {

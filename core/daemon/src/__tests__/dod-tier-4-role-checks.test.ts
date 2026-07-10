@@ -103,4 +103,11 @@ describe("DOD-TIER-4 — isAutoAccept / isKnown role checks", () => {
     expect(mgr.getTier("alice", "known1".padStart(64, "0"))).toBe(TIER.KNOWN);
     expect(mgr.getTier("alice", "default".padStart(64, "0"))).toBe(TIER.UNKNOWN);
   });
+
+  it("addContact THROWS on an out-of-range tier — a can-never-be-stored backstop (review F3)", () => {
+    expect(() => mgr.addContact("alice", "bad".padStart(64, "0"), undefined, null, 99)).toThrow(/invalid contact tier/);
+    expect(() => mgr.addContact("alice", "neg".padStart(64, "0"), undefined, null, -1)).toThrow(/invalid contact tier/);
+    // The corrupt row was never written.
+    expect(mgr.isContact("alice", "bad".padStart(64, "0"))).toBe(false);
+  });
 });

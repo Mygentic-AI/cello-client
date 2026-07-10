@@ -960,6 +960,13 @@ export class SessionNodeManager {
     if (moniker !== undefined && moniker !== null && validateMoniker(moniker) === null) {
       throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
     }
+    // DOD-TIER-4 (review F3): the stored tier must be a known 0..4 constant — a can-never-be-stored
+    // backstop mirroring the moniker validation above. All callers pass a TIER constant; this catches
+    // a future caller (or a bad refactor) that would otherwise persist a corrupt tier the read side
+    // must then defensively normalize.
+    if (!isKnownTierValue(tier)) {
+      throw new Error(`invalid contact tier for agent '${agentName}': ${tier} (must be 0..4)`);
+    }
     const agentId = this.#requireAgentId(agentName);
     this.#db
       .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at, tier, provenance) VALUES (?, ?, ?, ?, ?)")
