@@ -429,9 +429,19 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       } finally { client.close(); }
     });
 
-    it("AC2: an EMPTY-STRING counterparty_session_peer_id is refused the same way", async () => {
+    it("AC2/AC3: an EMPTY-STRING counterparty_session_peer_id is refused the same way", async () => {
       const { events, snm } = await refusalCase(""); // hostile/skewed encoder variant — same refusal
       assertRefused(events, snm);
+
+      // AC3, same as the absent-field variant: never surfaces on cello_await_session.
+      const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+      try {
+        await client.send("ipc.connect", { clientType: "test" });
+        await client.send("cello_start_agent", { name: "bob" });
+        await client.send("cello_use_agent", { name: "bob" });
+        const res = (await client.send("cello_await_session", { timeout_ms: 500 })) as Record<string, unknown>;
+        expect(res.type).toBe("timeout");
+      } finally { client.close(); }
     });
   });
 
