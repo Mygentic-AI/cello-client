@@ -69,7 +69,10 @@ async function main(): Promise<void> {
       result = await login(celloDir, daemonBin, logger);
       break;
     case "logout":
-      result = await logout(celloDir);
+      // DOD-LOGOUT-WAIT-1: logout now WAITS for the daemon to actually die before claiming
+      // "Daemon stopped." — the immediate progress line tells the operator the command
+      // activated and the short pause is expected.
+      result = await logout(celloDir, (line) => process.stdout.write(line + "\n"));
       break;
     case "status":
       result = await status(celloDir);

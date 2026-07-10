@@ -27,6 +27,8 @@ import {
   connectOrStart,
   connectToDaemon,
   readLock,
+  removeLock,
+  isProcessAlive,
   type DaemonStatusResponse,
   type IpcClient,
   type Logger,
@@ -105,23 +107,82 @@ export function formatLoginSummary(result: { started: string[]; failed: Array<{ 
   return parts.join("\n");
 }
 
-export async function logout(celloDir: string): Promise<CommandResult> {
+// DOD-LOGOUT-WAIT-1: how long logout waits for the daemon to actually die after acknowledging
+// the shutdown request, and how often it re-checks. A daemon closing SQLCipher + libp2p takes
+// real time; 5 s is generous headroom, and a daemon still alive past it is genuinely stuck.
+const LOGOUT_WAIT_TIMEOUT_MS = 5_000;
+const LOGOUT_WAIT_POLL_MS = 50;
+
+/**
+ * DOD-LOGOUT-WAIT-1: is the daemon behind `lock` actually GONE — judged by the same inputs
+ * connectOrStart consults, so a completed logout GUARANTEES the next login starts fresh:
+ *  - pid dead → login treats any remaining lock as stale and starts fresh; or
+ *  - lock removed (the daemon's final shutdown cleanup) AND the socket refusing connections.
+ * The pid check alone is not sufficient in-process (tests share the CLI's pid), and the lock
+ * check alone is not sufficient for a crash that never cleaned up — together they cover both.
+ */
+async function daemonGone(lockFilePath: string, lock: { pid: number; socketPath: string }): Promise<boolean> {
+  if (!isProcessAlive(lock.pid)) return true;
+  const lockNow = await readLock(lockFilePath);
+  if (lockNow && lockNow.pid === lock.pid) return false; // daemon hasn't finished its cleanup
+  try {
+    const probe = await connectToDaemon(lock.socketPath);
+    probe.close();
+    return false; // something still answers on the socket
+  } catch {
+    return true;
+  }
+}
+
+export async function logout(celloDir: string, onProgress?: (line: string) => void): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
+  const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
   if (!lock) {
     return { exitCode: 0, output: "No daemon running." };
+  }
+
+  // DOD-LOGOUT-WAIT-1: a lock whose pid is dead is not a running daemon — say so (exit 0) and
+  // clean the stale lock up so the next login doesn't have to.
+  if (!isProcessAlive(lock.pid)) {
+    await removeLock(lockFilePath, noopLogger).catch(() => { /* best-effort */ });
+    return { exitCode: 0, output: "No daemon running. (Removed a stale daemon.lock.)" };
   }
 
   try {
     const client = await connectToDaemon(lock.socketPath);
     await client.send("shutdown");
     client.close();
-    return { exitCode: 0, output: "Daemon stopped." };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to stop daemon: ${message}` };
   }
+
+  // The request is in — tell the operator NOW, then report "stopped" only when it is true.
+  onProgress?.("Shutting down the daemon…");
+
+  // DOD-LOGOUT-WAIT-1: returning the instant the shutdown request was WRITTEN left a window
+  // where `cello logout && cello login` found the daemon mid-death — connectOrStart saw a live
+  // pid + connectable socket and printed "Daemon already running.", leaving the operator logged
+  // out while being told otherwise. Wait until the daemon is genuinely gone; "Daemon stopped."
+  // for a daemon that is still running is the same class of lie as a success log on a failed
+  // send (DOD-SENDRAW-1).
+  const deadline = Date.now() + LOGOUT_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (await daemonGone(lockFilePath, lock)) {
+      return { exitCode: 0, output: "Daemon stopped." };
+    }
+    await new Promise((r) => setTimeout(r, LOGOUT_WAIT_POLL_MS));
+  }
+  return {
+    exitCode: 1,
+    output:
+      `Daemon shutdown did not complete within ${LOGOUT_WAIT_TIMEOUT_MS / 1000}s ` +
+      `(pid ${lock.pid}, socket ${lock.socketPath}). The daemon acknowledged the request but is ` +
+      `still running — it may be stuck closing sessions or its database. Check 'cello status'; ` +
+      `if it never exits, stop it manually (kill ${lock.pid}) and re-run 'cello logout' to clean up.`,
+  };
 }
 
 /**

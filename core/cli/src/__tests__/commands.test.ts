@@ -14,10 +14,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, acquireLock, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, acquireLock, readLock, connectToDaemon, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { logout, status, register, createAgent, monikerSet } from "../commands.js";
+import { login, logout, status, register, createAgent, monikerSet } from "../commands.js";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -73,6 +73,76 @@ describe("cli commands", () => {
       // Give shutdown time
       await new Promise((r) => setTimeout(r, 200));
       handle = null; // Already stopped
+    });
+
+    // ─── DOD-LOGOUT-WAIT-1 ─────────────────────────────────────────────────────────────────
+    // `cello logout && cello login` printed "Daemon already running." and left the operator
+    // logged OUT: logout returned the instant the shutdown request was WRITTEN, while the
+    // daemon was still dying — connectOrStart then saw a live pid + connectable socket and
+    // reported alreadyRunning. "Daemon stopped." for a daemon that is still running is the
+    // SENDRAW-1 lie at the CLI surface. logout must not return success until the daemon is
+    // actually gone.
+    describe("DOD-LOGOUT-WAIT-1: logout waits for actual daemon death", () => {
+      it("AC1: on return, the socket refuses connections and the lock file is gone — no grace delay", async () => {
+        const config = makeConfig();
+        handle = await startDaemon(config);
+
+        const result = await logout(tempDir);
+        expect(result.exitCode).toBe(0);
+        expect(result.output).toContain("Daemon stopped");
+        handle = null;
+
+        // IMMEDIATELY on return — the exact inputs connectOrStart consults:
+        await expect(readLock(config.lockFilePath)).resolves.toBeNull();
+        await expect(connectToDaemon(config.socketPath)).rejects.toThrow();
+      });
+
+      it("AC2 (Andre's live transcript): logout;login against a REAL spawned daemon yields 'Daemon started.' — never 'Daemon already running.'", async () => {
+        // An in-process daemon dies too fast to reproduce the race — the live bug needs a
+        // separate PROCESS that takes real time to shut down, exactly as production. So: spawn
+        // the real built daemon via login, then logout && login with no delay.
+        const daemonBin = join(import.meta.dirname, "../../../daemon/dist/bin/cello-daemon.js");
+        const first = await login(tempDir, daemonBin, logger);
+        expect(first.exitCode).toBe(0);
+        expect(first.output.startsWith("Daemon started.")).toBe(true);
+
+        try {
+          const outLogout = await logout(tempDir);
+          expect(outLogout.exitCode).toBe(0);
+          expect(outLogout.output).toContain("Daemon stopped");
+
+          // No delay — the exact `cello logout && cello login` shape.
+          const res = await login(tempDir, daemonBin, logger);
+          expect(res.exitCode).toBe(0);
+          expect(res.output.startsWith("Daemon started.")).toBe(true);
+          expect(res.output).not.toContain("already running");
+        } finally {
+          // logout now WAITS for death, so this reliably reaps the spawned daemon.
+          await logout(tempDir);
+        }
+      }, 45_000);
+
+      it("emits an immediate 'Shutting down' progress line so the operator knows the command activated", async () => {
+        const config = makeConfig();
+        handle = await startDaemon(config);
+
+        const progress: string[] = [];
+        const result = await logout(tempDir, (line) => progress.push(line));
+        expect(progress.some((l) => /shutting down/i.test(l))).toBe(true);
+        expect(result.output).toContain("Daemon stopped");
+        handle = null;
+      });
+
+      it("a stale lock (dead pid) → 'No daemon running.' exit 0, and the stale lock is cleaned up", async () => {
+        const config = makeConfig();
+        // A pid that cannot be alive (beyond pid_max) + no listening socket.
+        await acquireLock(config.lockFilePath, { pid: 999999999, socketPath: config.socketPath, version: "0.0.1-test" });
+
+        const result = await logout(tempDir);
+        expect(result.exitCode).toBe(0);
+        expect(result.output).toContain("No daemon running");
+        await expect(readLock(config.lockFilePath)).resolves.toBeNull();
+      });
     });
   });
 
