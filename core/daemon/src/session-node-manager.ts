@@ -1228,8 +1228,32 @@ export class SessionNodeManager {
     const peerId = node.getPeerId();
     const addrs = node.listenAddresses();
 
-    // Persist to SQLite
-    this.#insertSessionRow(sessionId, agentName, counterpartyPubkey, "active");
+    // Persist to SQLite. D4 review F1: #insertSessionRow swallows the write failure (returns
+    // false) — ignoring it let a session go fully live with NO sessions row, which after D4a means
+    // every inbound message is refused session_orphaned while the session looks healthy to both
+    // operators. A rowless session is a dead session by definition — fail ONCE, here, at creation.
+    if (!this.#insertSessionRow(sessionId, agentName, counterpartyPubkey, "active")) {
+      try {
+        await node.stop();
+      } catch (err: unknown) {
+        this.#logger.warn("session.node.stop.failed", {
+          sessionId,
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      }
+      // The handed-off standing receiver was consumed above — rebuild it (idempotent).
+      if (reuseStandingReceiver) void this.#ensureStandingReceiver(agentName, correlationId);
+      return {
+        ok: false,
+        reason: "session_persist_failed",
+        guidance:
+          "The daemon could not persist the session row (see session.row.write.failed in the log). " +
+          "The session was not created — a session without a durable row cannot receive content. " +
+          "Check the daemon's database (disk space, permissions) and retry.",
+      };
+    }
 
     // Log observability event (session.node.created)
     this.#logger.info("session.node.created", {
@@ -1543,8 +1567,32 @@ export class SessionNodeManager {
     const peerId = node.getPeerId();
     const addrs = node.listenAddresses();
 
-    // Persist to SQLite
-    this.#insertSessionRow(sessionId, agentName, counterpartyPubkey, "active");
+    // Persist to SQLite. D4 review F1 (same as createSessionNode): a swallowed row-write failure
+    // must fail the accept ONCE here — after D4a a rowless session refuses every ingest. The
+    // standing receiver (this node) is consumed and rebuilt rather than left with its gater
+    // pointed at this initiator.
+    if (!this.#insertSessionRow(sessionId, agentName, counterpartyPubkey, "active")) {
+      this.#standingReceivers.delete(agentName);
+      try {
+        await node.stop();
+      } catch (err: unknown) {
+        this.#logger.warn("session.node.stop.failed", {
+          sessionId,
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      }
+      void this.#ensureStandingReceiver(agentName, correlationId);
+      return {
+        ok: false,
+        reason: "session_persist_failed",
+        guidance:
+          "The daemon could not persist the session row (see session.row.write.failed in the log). " +
+          "The inbound session was not accepted — a session without a durable row cannot receive content. " +
+          "Check the daemon's database (disk space, permissions).",
+      };
+    }
 
     // Log observability event
     this.#logger.info("session.node.created", {
@@ -3761,8 +3809,12 @@ export class SessionNodeManager {
         .run(sessionId, agentName, counterpartyPubkey, status, now, now);
       return true;
     } catch (err: unknown) {
-      this.#logger.error("session.interrupt.db.write.failed", {
+      // D4 review F2: this helper serves the CREATE/ACCEPT paths (and interrupt-restore) — the old
+      // event name `session.interrupt.db.write.failed` steered diagnosis to the interrupt path only.
+      this.#logger.error("session.row.write.failed", {
         sessionId,
+        agentName,
+        status,
         error: err instanceof Error ? err.message : String(err),
       });
       return false;

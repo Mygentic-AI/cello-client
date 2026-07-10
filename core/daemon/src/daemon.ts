@@ -5690,9 +5690,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
       }
       transcriptOnly = true;
-    } else if (record.agent_name !== agentName) {
-      return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
+    // (D4 review F3: the old `record.agent_name !== agentName` → session_not_owned branch was dead
+    // code — getSessionRecord is keyed by (agent_name, session_id), so a record can never belong to
+    // a different agent. A cross-agent session id simply has no record under this agent.)
 
     // M8C-SINCESEQ-1: stateless catch-up. When since_seq is provided, return a BATCH of received
     // transcript messages with sequence > since_seq (durable transcript, not the ephemeral buffer —

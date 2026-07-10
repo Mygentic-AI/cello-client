@@ -271,5 +271,19 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       expect(entry!.senderPubkey).toBe("bobpubkey"); // from the session record, never "unknown"
       expect(mgr.readTranscript("alice", SID).messages).toHaveLength(1);
     });
+
+    // D4 review F1: #insertSessionRow swallows a DB write failure (logs + returns false) and both
+    // creators ignored the boolean — a session node could go fully live with NO sessions row.
+    // Post-D4a a rowless session refuses every ingest (session_orphaned) while looking healthy to
+    // both operators. The failure must happen ONCE, at creation, not per-message forever.
+    it("F1: a session whose row write fails is refused at creation (session_persist_failed), not left live-but-orphaned", async () => {
+      const { mgr } = await setupCapturing();
+      mgr.getDb().exec("DROP TABLE sessions"); // force the row write to fail
+      const res = await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-f1");
+      expect(res.ok).toBe(false);
+      expect((res as { reason: string }).reason).toBe("session_persist_failed");
+      // No live node remains — a rowless session is a dead session by definition after D4a.
+      expect(mgr.getSessionNodePeerId("alice", SID)).toBeNull();
+    });
   });
 });
