@@ -51,6 +51,28 @@ export function wireSessionOfferHandler(deps: {
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
+  // DOD-OFFER-REJECT-1 (D1): answer, never vanish. A silent abort left the directory waiting
+  // 2 s for an accept that would never come, after which it FROST-signed an assignment with an
+  // EMPTY counterparty endpoint and pushed it to both parties — the phantom session's origin.
+  // The reject lets the directory fail fast (D2 resolves its waiter on this frame; until the
+  // directory understands it, the frame is inert and the timeout path still applies). This is
+  // the Generic Reject of the inbound-state matrix, arriving as a protocol necessity.
+  // session_id is echoed when present; a no_session_id offer has nothing to echo, so the field
+  // is omitted (never an empty value on the wire — same rule as the directory's encoder).
+  async function sendOfferReject(sessionId: Uint8Array | null, reason: string): Promise<void> {
+    const rejectFrame: Record<string, unknown> = { type: "session_offer_reject", reason };
+    if (sessionId) rejectFrame["session_id"] = sessionId;
+    try {
+      await deps.signaling.sendRaw(rejectFrame);
+      deps.logger.info("session.offer.reject.sent", { agentName: deps.agentName, reason });
+    } catch (err: unknown) {
+      deps.logger.warn("session.offer.reject.failed", {
+        agentName: deps.agentName,
+        reason,
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   return deps.signaling.registerInboundHandler((frame) => {
     if (frame["type"] !== "session_offer") return;
     void (async () => {
@@ -58,11 +80,13 @@ export function wireSessionOfferHandler(deps: {
       const sessionId = sidRaw instanceof Uint8Array ? sidRaw : Buffer.isBuffer(sidRaw) ? new Uint8Array(sidRaw as Buffer) : null;
       if (!sessionId) {
         deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "no_session_id" });
+        await sendOfferReject(null, "no_session_id");
         return;
       }
       const sr = deps.getStandingReceiverEndpoint();
       if (!sr) {
         deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "standing_receiver_unavailable" });
+        await sendOfferReject(sessionId, "standing_receiver_unavailable");
         return;
       }
       try {

@@ -14,8 +14,9 @@
  * tests; the reason plumbing they share is validated here.
  */
 import { describe, it, expect } from "vitest";
-import { verifyBilateralSealCertificate } from "../session-ceremony.js";
+import { verifyBilateralSealCertificate, wireSessionOfferHandler } from "../session-ceremony.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
+import type { SignalingSeam } from "../registration-context.js";
 import type { Logger } from "../types.js";
 
 const noopLogger: Logger = {
@@ -71,5 +72,138 @@ describe("F2-a: verifyBilateralSealCertificate returns a reason on verified:fals
       cert,
     );
     expect(verdict).toMatchObject({ ok: false, reason: "no_signer_pubkey" });
+  });
+});
+
+// ─── DOD-OFFER-REJECT-1 (D1, M8C-PHANTOM-SESSION-FIX-PLAN §4) ────────────────────────────────
+// The responder must ANSWER, not vanish. Before this, wireSessionOfferHandler returned silently
+// on standing_receiver_unavailable / no_session_id, and the directory stalled 2 s then signed an
+// assignment with an empty counterparty endpoint ("proceed with empty defaults") — the phantom
+// session's origin. The reject frame is the Generic Reject of 2026-07-08_inbound-state-matrix,
+// arriving as a protocol necessity. The directory's handling of it is D2 (this half is inert
+// until the directory understands the frame).
+describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer_reject instead of vanishing", () => {
+  interface LogEvent { level: string; event: string; context: Record<string, unknown> }
+
+  function makeCapturingLogger(): { logger: Logger; events: LogEvent[] } {
+    const events: LogEvent[] = [];
+    const logger: Logger = {
+      debug(event, context) { events.push({ level: "debug", event, context: context ?? {} }); },
+      info(event, context) { events.push({ level: "info", event, context: context ?? {} }); },
+      warn(event, context) { events.push({ level: "warn", event, context: context ?? {} }); },
+      error(event, context) { events.push({ level: "error", event, context: context ?? {} }); },
+    };
+    return { logger, events };
+  }
+
+  function makeSeam(opts?: { sendRawError?: Error }): {
+    seam: SignalingSeam;
+    sent: Record<string, unknown>[];
+    inject: (frame: Record<string, unknown>) => void;
+  } {
+    const sent: Record<string, unknown>[] = [];
+    let handler: ((frame: Record<string, unknown>) => void) | null = null;
+    const seam: SignalingSeam = {
+      status: "connected",
+      async sendRaw(frame: unknown) {
+        if (opts?.sendRawError) throw opts.sendRawError;
+        sent.push(frame as Record<string, unknown>);
+        return { ok: true } as never;
+      },
+      registerInboundHandler(h) { handler = h; return () => { handler = null; }; },
+    };
+    return { seam, sent, inject: (frame) => handler?.(frame) };
+  }
+
+  const SID = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 7));
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  function wire(deps: {
+    sr: { peerId: string; addrs: string[] } | null;
+    seamOpts?: { sendRawError?: Error };
+  }) {
+    const { logger, events } = makeCapturingLogger();
+    const { seam, sent, inject } = makeSeam(deps.seamOpts);
+    wireSessionOfferHandler({
+      agentName: "bob",
+      getStandingReceiverEndpoint: () => deps.sr,
+      signaling: seam,
+      logger,
+    });
+    return { events, sent, inject };
+  }
+
+  it("AC1: standing_receiver_unavailable → sends session_offer_reject {type, session_id, reason}", async () => {
+    const h = wire({ sr: null });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const reject = h.sent.find((f) => f["type"] === "session_offer_reject");
+    expect(reject).toBeDefined();
+    expect(reject!["session_id"]).toEqual(SID);
+    expect(reject!["reason"]).toBe("standing_receiver_unavailable");
+    // Nothing else went out — no accept for an offer we cannot serve.
+    expect(h.sent.find((f) => f["type"] === "session_offer_accept")).toBeUndefined();
+  });
+
+  it("AC3: session.offer.abort is STILL logged with the same reason (the reject adds, never replaces)", async () => {
+    const h = wire({ sr: null });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const abort = h.events.find((e) => e.event === "session.offer.abort");
+    expect(abort).toBeDefined();
+    expect(abort!.level).toBe("warn");
+    expect(abort!.context["reason"]).toBe("standing_receiver_unavailable");
+    expect(abort!.context["agentName"]).toBe("bob");
+  });
+
+  it("AC1: no_session_id → sends session_offer_reject with reason (session_id omitted — there is none to echo)", async () => {
+    const h = wire({ sr: { peerId: "bob-sr-peer", addrs: [] } });
+    h.inject({ type: "session_offer" }); // no session_id
+    await wait(20);
+
+    const reject = h.sent.find((f) => f["type"] === "session_offer_reject");
+    expect(reject).toBeDefined();
+    expect(reject!["reason"]).toBe("no_session_id");
+    expect("session_id" in reject!).toBe(false);
+    const abort = h.events.find((e) => e.event === "session.offer.abort");
+    expect(abort).toBeDefined();
+    expect(abort!.context["reason"]).toBe("no_session_id");
+  });
+
+  it("regression: a healthy offer still sends session_offer_accept, and NO reject", async () => {
+    const h = wire({ sr: { peerId: "bob-sr-peer", addrs: ["/ip4/127.0.0.1/tcp/1"] } });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const accept = h.sent.find((f) => f["type"] === "session_offer_accept");
+    expect(accept).toBeDefined();
+    expect(accept!["counterparty_session_peer_id"]).toBe("bob-sr-peer");
+    expect(h.sent.find((f) => f["type"] === "session_offer_reject")).toBeUndefined();
+    expect(h.events.find((e) => e.event === "session.offer.accepted")).toBeDefined();
+  });
+
+  it("SI: a failed reject send is LOUD (session.offer.reject.failed with the upstream detail), never thrown", async () => {
+    const h = wire({ sr: null, seamOpts: { sendRawError: new Error("stream torn down") } });
+    h.inject({ type: "session_offer", session_id: SID });
+    await wait(20);
+
+    const failed = h.events.find((e) => e.event === "session.offer.reject.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level).toBe("warn");
+    expect(failed!.context["agentName"]).toBe("bob");
+    expect(failed!.context["reason"]).toBe("standing_receiver_unavailable");
+    expect(String(failed!.context["detail"])).toContain("stream torn down");
+    // The abort is still there — the operator sees both the cause and the failed answer.
+    expect(h.events.find((e) => e.event === "session.offer.abort")).toBeDefined();
+  });
+
+  it("frames that are not session_offer are untouched (no reject, no events)", async () => {
+    const h = wire({ sr: null });
+    h.inject({ type: "session_assignment" });
+    await wait(20);
+    expect(h.sent).toHaveLength(0);
+    expect(h.events).toHaveLength(0);
   });
 });
