@@ -24,7 +24,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
@@ -149,6 +149,30 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     for (const t of ["cello_agents", "cello_use_agent", "cello_inbox", "cello_transcript", "cello_contacts", "cello_sealed_receipt"]) {
       expect(doc, `SKILL.md never mentions ${t}, a live tool`).toContain(t);
     }
+  });
+
+  it("the LEGACY quarantine is exactly these files — it may not grow (DOD-LEGACY-MCP-1)", () => {
+    // HONESTY BOUND. `dist/server.js` — the legacy in-process MCP server — SHIPS in this tarball and
+    // still registers cello_receive_session, cello_list_sessions and cello_get_sealed_receipt: names
+    // that are renamed away or deleted. It is unreachable at runtime (bin/cello-mcp.ts never imports
+    // it) but it IS exported from the package root, so the tarball carries a SECOND vocabulary.
+    //
+    // I claimed "zero occurrences in the connect dist" after grepping only cello-mcp.js. That claim
+    // was false, and Ms_Chelly caught it. The fix is not to re-word the claim — it is to make the
+    // quarantine VISIBLE and BOUNDED, so it cannot quietly grow while an audit elsewhere reports
+    // green. Deleting it is DOD-LEGACY-MCP-1 (removing a public export is a riskier change than a
+    // help pass, and it takes its tests with it).
+    //
+    // If this test fails because a NEW file joined the list: do not add it here. Fix the file.
+    const legacy = readdirSync(join(here, ".."))
+      .filter((f) => f.endsWith(".ts"))
+      .filter((f) => /cello_(receive_session|list_sessions|get_sealed_receipt|list_agents|check_notifications|get_transcript|set_moniker|contact_list)/
+        .test(readFileSync(join(here, "..", f), "utf8")));
+    expect(
+      legacy.sort(),
+      "Only the known-legacy server.ts may still name a renamed-away tool. Anything else is a live " +
+        "surface handing an agent a tool that does not exist.",
+    ).toEqual(["server.ts"]);
   });
 
   it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
