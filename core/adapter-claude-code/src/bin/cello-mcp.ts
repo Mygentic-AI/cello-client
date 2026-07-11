@@ -210,6 +210,16 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
   return jsonText(result);
 });
 
+// DOD-AWAY-TIER-1: per-contact away message. Forward-only (D7).
+server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom away message for a specific contact — the text they receive when they reach you and you're away. It is the most specific level of away-text resolution (per-contact → per-tier → agent default → system default) and is screened on the outbound path like any message. Defaults to the current agent.", {
+  pubkey: z.string().describe("Hex-encoded public key of the contact"),
+  message: z.string().nullable().describe("The away text to send this contact, or null to clear it"),
+  agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
+}, async ({ pubkey, message, agent }) => {
+  const result = await proxy.call("cello_contact_set_away", agent ? { pubkey, message, agent } : { pubkey, message });
+  return jsonText(result);
+});
+
 server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's address book — they revert to unknown (stranger anti-spam caps; always screened). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to remove"),
   agent: z.string().optional().describe("Agent name whose whitelist to remove from (defaults to the current agent)"),

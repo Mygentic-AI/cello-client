@@ -533,7 +533,7 @@ export async function sessions(
 /** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
 async function contactCommand(
   celloDir: string,
-  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_set_moniker",
+  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_contact_set_away" | "cello_set_moniker",
   params: Record<string, unknown>,
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
@@ -577,6 +577,14 @@ export async function contactSetTier(celloDir: string, pubkey: string, tier: num
   const params: Record<string, unknown> = { pubkey, tier };
   if (agent) params.agent = agent;
   return contactCommand(celloDir, "cello_contact_set_tier", params);
+}
+
+/** DOD-AWAY-TIER-1: `cello contact away <pubkey> <message> [--agent <name>]` — set a per-contact away
+ *  message (or clear it with an empty message → null). */
+export async function contactSetAway(celloDir: string, pubkey: string, message: string | null, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { pubkey, message };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_contact_set_away", params);
 }
 
 /** MONIKER-1: `cello moniker set <name>` / `cello moniker clear` — set (string) or clear (null)

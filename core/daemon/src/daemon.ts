@@ -982,7 +982,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
-      const contentBytes = new TextEncoder().encode(isKnown ? AWAY_TEXT[kind] : STRANGER_TEXT);
+      // DOD-AWAY-TIER-1: resolve most-specific-first — per-contact away_message → per-tier away
+      // (settings) → agent default (settings) → the system default (code, per kind). Total.
+      const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
+        ?? (isKnown ? AWAY_TEXT[kind] : STRANGER_TEXT);
+      const draftBytes = new TextEncoder().encode(awayText);
+      // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
+      // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn
+      // verdict means it is not sent (the dedup guard stays set — one screen per away period, no spam);
+      // a redact verdict sends the ALTERED bytes.
+      const awayVerdict = await securityGateway.screenOutbound(draftBytes, {
+        direction: "outbound", agentName, sessionId, correlationId: randomUUID(),
+      });
+      if (awayVerdict.disposition === "block" || awayVerdict.disposition === "warn") {
+        logger.info("session.away.response.screened_out", { agentName, sessionId, kind, disposition: awayVerdict.disposition });
+        return;
+      }
+      if (awayVerdict.disposition === "redact" && awayVerdict.content === undefined) {
+        logger.error("session.away.response.redact_without_content", { agentName, sessionId, kind });
+        return;
+      }
+      const contentBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
+        ? new Uint8Array(awayVerdict.content)
+        : draftBytes;
       const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok) {
@@ -6026,6 +6048,27 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       logger.info("contact.tier.changed", { agentName: resolved.agent, pubkey, oldTier, newTier: tier });
     }
     return { ok: true, agent: resolved.agent, pubkey, tier };
+  });
+
+  // DOD-AWAY-TIER-1 AC2: set (or clear, with null) a contact's per-contact away message — the most
+  // specific level of the away-text resolution. Validated as a string-or-null; the text is screened
+  // on the outbound path at send time (SI), never here.
+  handlers.set("cello_contact_set_away", async (params, connectionId) => {
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    if (!pubkey || !params || !("message" in params)) {
+      return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'message' — a string away text, or null to clear it." };
+    }
+    const message = params.message === null ? null : typeof params.message === "string" ? params.message : undefined;
+    if (message === undefined) {
+      return { ok: false, reason: "invalid_message", guidance: "'message' must be a string (the away text) or null (to clear)." };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    if (!sessionNodeManager.setContactAwayMessage(resolved.agent, pubkey, message)) {
+      return { ok: false, reason: "contact_not_found", guidance: `No contact ${pubkey.slice(0, 16)}… for agent '${resolved.agent}'. Add it first with cello_contact_add.` };
+    }
+    logger.info("contact.away.set", { agentName: resolved.agent, pubkey, cleared: message === null });
+    return { ok: true, agent: resolved.agent, pubkey };
   });
 
   handlers.set("cello_contact_remove", async (params, connectionId) => {

@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, monikerSet, telegramSetToken } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, contactSetAway, monikerSet, telegramSetToken } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand, splitAgentFlag } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -147,8 +147,12 @@ async function main(): Promise<void> {
         // cello contact tier <pubkey> <0..4> — daemon validates the value; a non-numeric arg is
         // surfaced as the daemon's invalid_tier verdict (NaN → rejected there).
         result = await contactSetTier(celloDir, pubkey, Number(tierArg), agent);
+      } else if (sub === "away" && pubkey) {
+        // cello contact away <pubkey> <message…> — the rest of the args form the away text; empty → clear.
+        const message = positional.slice(2).join(" ");
+        result = await contactSetAway(celloDir, pubkey, message.length > 0 ? message : null, agent);
       } else {
-        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>]" };
+        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>] | cello contact away <pubkey> <message> [--agent <name>]" };
       }
       break;
     }

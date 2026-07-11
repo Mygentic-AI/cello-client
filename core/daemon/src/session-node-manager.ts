@@ -77,7 +77,7 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
-import { boundSettingKey, settableTierName, isValidSettingKey } from "./agent-settings-keys.js";
+import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -1046,6 +1046,36 @@ export class SessionNodeManager {
     // pending notice for this contact (whether they adopted the offered name or chose their own).
     if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
     return res.changes > 0;
+  }
+
+  /** DOD-AWAY-TIER-1: set (or clear, with null) a contact's per-contact away message. Returns false
+   *  when no such contact — fail-loud at the caller (same contract as setContactMoniker/setContactTier). */
+  setContactAwayMessage(agentName: string, pubkey: string, message: string | null): boolean {
+    if (!this.#db) throw new Error(`setContactAwayMessage('${agentName}'): database not initialized`);
+    const res = this.#db
+      .prepare("UPDATE contacts SET away_message = ? WHERE agent_id = ? AND pubkey = ?")
+      .run(message, this.#requireAgentId(agentName), pubkey);
+    return res.changes > 0;
+  }
+
+  /** DOD-AWAY-TIER-1: resolve the most-specific CUSTOM away text for a counterparty, most-specific
+   *  first: per-contact `away_message` → per-tier away setting → agent default away setting. Returns
+   *  null when none is configured, so the CALLER applies the system default (code) — making the full
+   *  four-level resolution TOTAL. A pure read; the resolved text is screened on the outbound path by
+   *  the caller like any content (SI — it does not bypass the gateway). */
+  resolveAwayMessage(agentName: string, pubkey: string): string | null {
+    if (!this.#db) return null;
+    const agentId = this.#requireAgentId(agentName);
+    const row = this.#db
+      .prepare("SELECT away_message FROM contacts WHERE agent_id = ? AND pubkey = ?")
+      .get(agentId, pubkey) as { away_message: string | null } | undefined;
+    if (row?.away_message != null) return row.away_message; // 1. per-contact
+    const tierName = settableTierName(this.getTier(agentName, pubkey));
+    if (tierName !== null) {
+      const tierAway = this.getSetting(agentName, awayTierSettingKey(tierName));
+      if (tierAway !== null) return tierAway; // 2. per-tier
+    }
+    return this.getSetting(agentName, AWAY_DEFAULT_KEY); // 3. agent default, else null → caller's system default
   }
 
   /** DOD-CONTACT-VIEW-1: set an EXISTING contact's reachability tier. Returns false when no such
