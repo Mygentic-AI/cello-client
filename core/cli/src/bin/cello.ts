@@ -12,7 +12,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, contactSetAway, monikerSet, telegramSetToken } from "../commands.js";
+import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, contactSetAway, settingsGet, settingsSet, monikerSet, telegramSetToken } from "../commands.js";
 import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand, splitAgentFlag } from "../cli-args.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -153,6 +153,19 @@ async function main(): Promise<void> {
         result = await contactSetAway(celloDir, pubkey, message.length > 0 ? message : null, agent);
       } else {
         result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>] | cello contact away <pubkey> <message> [--agent <name>]" };
+      }
+      break;
+    }
+    case "settings": {
+      // cello settings get [key] [--agent] | set <key> <value> [--agent] (DOD-SETTINGS-SURFACE-1)
+      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
+      const [sub, key, value] = positional;
+      if (sub === "get") {
+        result = await settingsGet(celloDir, key, agent); // key optional → list all when absent
+      } else if (sub === "set" && key && value !== undefined) {
+        result = await settingsSet(celloDir, key, value, agent);
+      } else {
+        result = { exitCode: 1, output: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]" };
       }
       break;
     }

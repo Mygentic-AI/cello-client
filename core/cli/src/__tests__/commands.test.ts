@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { startDaemon, acquireLock, readLock, connectToDaemon, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { login, logout, status, register, createAgent, monikerSet } from "../commands.js";
+import { login, logout, status, register, createAgent, monikerSet, settingsGet, settingsSet } from "../commands.js";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -236,6 +236,47 @@ describe("cli commands", () => {
 
     it("returns {daemon: stopped} when no daemon is running", async () => {
       const result = await monikerSet(tempDir, "Bob", "alice");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("stopped");
+    });
+  });
+
+  describe("settings (DOD-SETTINGS-SURFACE-1)", () => {
+    it("sets a bound override and reads it back against a live daemon", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+      expect((await createAgent(tempDir, "alice")).exitCode).toBe(0);
+
+      const set = await settingsSet(tempDir, "bounds.known.max_sessions", "8", "alice");
+      expect(set.exitCode).toBe(0);
+      expect(JSON.parse(set.output)).toMatchObject({ ok: true, key: "bounds.known.max_sessions", value: "8" });
+
+      const get = await settingsGet(tempDir, "bounds.known.max_sessions", "alice");
+      expect(get.exitCode).toBe(0);
+      expect(JSON.parse(get.output)).toMatchObject({ ok: true, value: "8" });
+
+      // An unset key returns null (the built-in default is used).
+      const unset = await settingsGet(tempDir, "away.default", "alice");
+      expect(JSON.parse(unset.output)).toMatchObject({ ok: true, value: null });
+    });
+
+    it("surfaces the daemon's invalid_value / invalid_key rejections verbatim (INV-TIER-BOUND at the surface)", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+      await createAgent(tempDir, "alice");
+
+      for (const bad of ["Infinity", "-5", "0"]) {
+        const r = await settingsSet(tempDir, "bounds.known.max_sessions", bad, "alice");
+        expect(r.exitCode).toBe(1);
+        expect(JSON.parse(r.output).reason).toBe("invalid_value");
+      }
+      const badKey = await settingsSet(tempDir, "bounds.knwon.max_sessions", "8", "alice");
+      expect(badKey.exitCode).toBe(1);
+      expect(JSON.parse(badKey.output).reason).toBe("invalid_key");
+    });
+
+    it("returns {daemon: stopped} when no daemon is running", async () => {
+      const result = await settingsGet(tempDir, "away.default", "alice");
       expect(result.exitCode).toBe(1);
       expect(result.output).toContain("stopped");
     });

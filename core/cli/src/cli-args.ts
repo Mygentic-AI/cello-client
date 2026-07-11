@@ -21,6 +21,7 @@ export const KNOWN_COMMANDS = new Set([
   "receipts",
   "sessions",
   "contact",
+  "settings",
   "moniker",
   "telegram",
   "install",
@@ -36,7 +37,7 @@ export const USAGE =
   "First-time setup:  cello login  →  cello create-agent <name>  →  cello register <name> <token>  →  cello status\n" +
   "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
   "\n" +
-  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|moniker|telegram|install>\n" +
+  "Usage: cello <login|logout|status|register|create-agent|remove-agent|refresh|receipts|sessions|contact|settings|moniker|telegram|install>\n" +
   "Run 'cello <command> --help' for details on any command.";
 
 /** Per-command usage lines (the same text the commands print on bad input). */
@@ -66,6 +67,11 @@ const COMMAND_HELP: Record<string, string> = {
     "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
     "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
     "  Example:  cello contact list --agent alice",
+  settings:
+    "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]\n" +
+    "  Per-agent reachability policy (DOD-SETTINGS-1). Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes\n" +
+    "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
+    "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
   moniker:
     "Usage: cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>]\n" +
     "  The agent's OUTBOUND name — what a counterparty's doorbell shows (MONIKER-1). Defaults to the agent name; 'set' stores an override, 'clear' restores the default.\n" +
@@ -91,6 +97,7 @@ export function helpForCommand(command: string): string {
 const COMMAND_FLAGS: Record<string, ReadonlySet<string>> = {
   sessions: new Set(["--open", "--closed", "--failed", "--all", "--limit"]),
   contact: new Set(["--agent"]),
+  settings: new Set(["--agent"]),
   moniker: new Set(["--agent"]),
   install: new Set(["--agent", "--hermes-home"]),
 };

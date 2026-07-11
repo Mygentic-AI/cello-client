@@ -238,6 +238,29 @@ server.tool("cello_set_moniker", "Set (or clear, by passing null) an agent's out
   return jsonText(result);
 });
 
+// DOD-SETTINGS-SURFACE-1: per-agent reachability-policy settings. Forward-only (D7 — the daemon owns
+// key + value validation). This is what makes the tier bound overrides and the per-tier / agent-default
+// away messages operator-reachable.
+server.tool("cello_settings_get", "Read a per-agent reachability-policy setting (a single key), or ALL set values when no key is given. An unset key returns null — the built-in default is used. Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes (tier = unknown|known|whitelisted|vip), away.default, away.tier.<tier>. Defaults to the current agent.", {
+  key: z.string().optional().describe("The setting key to read; omit to list every set value"),
+  agent: z.string().optional().describe("Agent whose settings to read (defaults to the current agent)"),
+}, async ({ key, agent }) => {
+  const params: Record<string, unknown> = {};
+  if (key !== undefined) params.key = key;
+  if (agent) params.agent = agent;
+  const result = await proxy.call("cello_settings_get", params);
+  return jsonText(result);
+});
+
+server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. A bound override (bounds.<tier>.max_sessions / max_bytes; tier = unknown|known|whitelisted|vip) must be a FINITE POSITIVE INTEGER — a higher value raises the bound, never removes it (Infinity/negative/0 are refused). An away text (away.default, away.tier.<tier>) is the message a sender at that tier gets when you're away. Unknown keys are refused. Defaults to the current agent.", {
+  key: z.string().describe("The setting key (see the list in cello_settings_get)"),
+  value: z.union([z.string(), z.number()]).describe("The value — an integer for a bound, a text for an away message"),
+  agent: z.string().optional().describe("Agent whose setting to write (defaults to the current agent)"),
+}, async ({ key, value, agent }) => {
+  const result = await proxy.call("cello_settings_set", agent ? { key, value, agent } : { key, value });
+  return jsonText(result);
+});
+
 // ─── Session tools (proxied through daemon) ─────────────────────────────────
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {

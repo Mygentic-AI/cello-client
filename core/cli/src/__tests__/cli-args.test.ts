@@ -21,7 +21,7 @@ describe("F1: usage string lists every command", () => {
 
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
-      ["contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh", "register", "remove-agent", "sessions", "status", "telegram"].sort(),
+      ["contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh", "register", "remove-agent", "sessions", "settings", "status", "telegram"].sort(),
     );
   });
 

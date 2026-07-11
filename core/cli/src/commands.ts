@@ -533,7 +533,7 @@ export async function sessions(
 /** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
 async function contactCommand(
   celloDir: string,
-  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_contact_set_away" | "cello_set_moniker",
+  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_contact_set_away" | "cello_set_moniker" | "cello_settings_get" | "cello_settings_set",
   params: Record<string, unknown>,
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
@@ -585,6 +585,23 @@ export async function contactSetAway(celloDir: string, pubkey: string, message: 
   const params: Record<string, unknown> = { pubkey, message };
   if (agent) params.agent = agent;
   return contactCommand(celloDir, "cello_contact_set_away", params);
+}
+
+/** DOD-SETTINGS-SURFACE-1: `cello settings get [key] [--agent <name>]` — a single key, or all set
+ *  values when no key. Validation lives daemon-side; the CLI surfaces the verdict verbatim. */
+export async function settingsGet(celloDir: string, key: string | undefined, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = {};
+  if (key !== undefined) params.key = key;
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_settings_get", params);
+}
+
+/** DOD-SETTINGS-SURFACE-1: `cello settings set <key> <value> [--agent <name>]` — the daemon validates
+ *  the key (known) and, for bound keys, a finite positive integer (rejects Infinity/negative/0). */
+export async function settingsSet(celloDir: string, key: string, value: string, agent?: string): Promise<CommandResult> {
+  const params: Record<string, unknown> = { key, value };
+  if (agent) params.agent = agent;
+  return contactCommand(celloDir, "cello_settings_set", params);
 }
 
 /** MONIKER-1: `cello moniker set <name>` / `cello moniker clear` — set (string) or clear (null)
