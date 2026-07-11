@@ -19,6 +19,20 @@ describe("F1: usage string lists every command", () => {
     }
   });
 
+  it("F1: `--` end-of-flags terminator lets a dash-prefixed positional VALUE through (settings set away.default '- back Monday')", () => {
+    // checkArgs must not reject the dash value after `--`, and splitAgentFlag must keep it positional.
+    expect(checkArgs("settings", ["set", "away.default", "--", "- back Monday"])).toEqual({ kind: "ok" });
+    const { agent, positional } = splitAgentFlag(["set", "away.default", "--", "- back Monday"]);
+    expect(agent).toBeUndefined();
+    expect(positional).toEqual(["set", "away.default", "- back Monday"]);
+    // --agent BEFORE the terminator still resolves; a dash value AFTER it is verbatim.
+    const withAgent = splitAgentFlag(["set", "bounds.known.max_sessions", "--agent", "alice", "--", "-5"]);
+    expect(withAgent.agent).toBe("alice");
+    expect(withAgent.positional).toEqual(["set", "bounds.known.max_sessions", "-5"]);
+    // Without the terminator, a bare dash value is still a fail-loud unknown flag (unchanged).
+    expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
+  });
+
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
       ["contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh", "register", "remove-agent", "sessions", "settings", "status", "telegram"].sort(),

@@ -123,9 +123,17 @@ export type ArgsCheck =
  * printed usage instead of dispatching. The flag's value is excluded ONLY when the flag exists.
  */
 export function splitAgentFlag(args: string[]): { agent: string | undefined; positional: string[] } {
-  const agentIdx = args.indexOf("--agent");
-  const agent = agentIdx !== -1 ? args[agentIdx + 1] : undefined;
-  const positional = args.filter((a, i) => !(a === "--agent" || (agentIdx !== -1 && i === agentIdx + 1)));
+  // POSIX `--` end-of-flags terminator (review F1): everything after the first `--` is a positional
+  // VALUE, verbatim — so a value that starts with `-` (a negative number, or an away text like
+  // "- back Monday") can be passed. --agent is recognized only BEFORE the terminator.
+  const ddIdx = args.indexOf("--");
+  const flagScan = ddIdx === -1 ? args : args.slice(0, ddIdx);
+  const afterTerminator = ddIdx === -1 ? [] : args.slice(ddIdx + 1);
+  const agentIdx = flagScan.indexOf("--agent");
+  const agent = agentIdx !== -1 ? flagScan[agentIdx + 1] : undefined;
+  const positional = flagScan
+    .filter((a, i) => !(a === "--agent" || (agentIdx !== -1 && i === agentIdx + 1)))
+    .concat(afterTerminator);
   return { agent, positional };
 }
 
@@ -134,6 +142,7 @@ export function checkArgs(command: string, args: string[]): ArgsCheck {
   const known = COMMAND_FLAGS[command] ?? new Set<string>();
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    if (arg === "--") break; // POSIX end-of-flags — everything after is a positional value (review F1)
     if (arg.startsWith("-")) {
       if (!known.has(arg)) return { kind: "unknown_flag", flag: arg };
       if (arg === "--limit") i++; // consumes its value
