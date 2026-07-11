@@ -3166,8 +3166,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // DOD-ONBOARD-HELP-1: cello_receive_session is DELETED (Andre, 2026-07-11). It was a literal
   // alias — the same handler object as cello_receive — that claimed an "accept/join" step CELLO
   // does not have (inbound sessions are auto-accepted by the standing receiver). No alias, no
-  // deprecated shim, no dead handler. Kept as an (empty) extension point for
-  // future tools that need the plain no_current_agent guard without their own handler.
+  // deprecated shim, no dead handler.
+  //
+  // The list below stays as an (empty) extension point: a future tool that needs only the plain
+  // no_current_agent guard, with no handler of its own, is registered here.
   const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
 
   const NO_CURRENT_AGENT_RESPONSE = {

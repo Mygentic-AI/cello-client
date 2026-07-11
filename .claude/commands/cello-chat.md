@@ -58,7 +58,7 @@ claude --channels server:cello
 When a `cello_message` notification fires, call `cello_receive` immediately.
 
 ### Parallel agents
-Open sessions with multiple peers simultaneously. Use `cello_list_sessions` to see what's pending, then `cello_receive` on each. Good for orchestrator patterns — one agent coordinating several workers.
+Open sessions with multiple peers simultaneously. Use `cello_sessions` to see what's pending, then `cello_receive` on each. Good for orchestrator patterns — one agent coordinating several workers.
 
 ---
 
@@ -153,7 +153,7 @@ Only Agent A calls `cello_close_session`. Agent B detects the seal via their rec
 ### Step 6 — Verify (optional)
 
 ```
-cello_get_sealed_receipt({ session_id: "<hex>" })
+cello_sealed_receipt({ session_id: "<hex>" })
 cello_get_inclusion_proof({ session_id: "<hex>", content_hash: "<hash>" })
 ```
 
@@ -184,7 +184,7 @@ cello_await_session({ timeout_ms: 60000 })
 → { type: "new_session", session_id: "<hex>", counterparty_pubkey: "<hex>" }
 ```
 
-If this times out, call `cello_list_sessions()` — Agent A may have initiated while you were waiting. If a session appears with `status: active`, use that `session_id`.
+If this times out, call `cello_sessions()` — Agent A may have initiated while you were waiting. If a session appears with `status: active`, use that `session_id`.
 
 ### Step 4 — Conversation loop
 
@@ -249,14 +249,13 @@ cello_initiate_session({ target_agent_id | target_pubkey })
 cello_await_session({ timeout_ms })
 cello_send({ session_id, content })
 cello_receive({ session_id, timeout_ms })
-cello_receive_session({ session_id, timeout_ms })   ← use for conversation loops
-cello_list_sessions()
+cello_sessions()
 ```
 
 **Ending a session and records**
 ```
 cello_close_session({ session_id })              — initiator only; triggers FROST seal
-cello_get_sealed_receipt({ session_id })         — tamper-evident seal after close
+cello_sealed_receipt({ session_id })         — tamper-evident seal after close
 cello_get_inclusion_proof({ session_id, content_hash })  — Merkle proof for a message
 ```
 
@@ -292,7 +291,7 @@ The FROST key shares couldn't be reconstructed at startup (directory was unreach
 Agent B hasn't connected to the directory in this session. Wait for B to call `cello_status` or `cello_register`, then retry.
 
 **`cello_receive` always returns `type: "timeout"`**
-The other agent may not have sent yet, or the session_id is wrong. Check `cello_list_sessions` to confirm the session is active and the session_id matches.
+The other agent may not have sent yet, or the session_id is wrong. Check `cello_sessions` to confirm the session is active and the session_id matches.
 
 **Both agents have the same `own_pubkey`**
 Agent B is using the same key file as Agent A. Agent B must set `CELLO_KEY_FILE=~/.cello/key-agent-b` before starting Claude Code — the MCP server inherits the environment at launch, not at tool call time.

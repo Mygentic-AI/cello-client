@@ -27,7 +27,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, RENAMED_AWAY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
+import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SHIM_SRC = join(here, "..", "bin", "cello-mcp.ts");
@@ -114,18 +114,41 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     expect(source).not.toContain("cello_receive_session");
   });
 
-  it("the PUBLISHED docs (SKILL.md) name no renamed-away or deleted tool", () => {
-    // SKILL.md ships in the tarball and instructs an agent which tools to call. A dead name here is
-    // not a doc nit — it is an agent calling a tool that does not exist. This shipped in
-    // connect@0.0.66 precisely because every other audit only read .ts files.
+  it("every cello_* token in a PUBLISHED doc is a REAL tool", () => {
+    // ALLOWLIST, not a denylist — and the distinction is the whole finding.
+    //
+    // The first cut checked SKILL.md against RENAMED_AWAY_TOOLS (the 8 names this story killed). It
+    // went green while SKILL.md handed an agent ELEVEN other tools that do not exist —
+    // cello_request_connection, cello_accept_connection, cello_get_policy, cello_setup_guidance,
+    // cello_list_connections … all M1 leftovers that survive only in the legacy in-process server.
+    // A denylist can only catch the deaths you remember. This doc had drifted into fiction: it also
+    // never mentioned 15 tools that DO exist.
+    //
+    // An allowlist is safe HERE (and was not, in core/cli/src) because a shipped .md is pure
+    // agent-facing prose — it carries no IPC wire names, which is the one thing that legitimately
+    // names a tool that is not on the tool surface.
     expect(SHIPPED_DOCS.length, "no shipped .md found — this audit would be vacuous").toBeGreaterThan(0);
-    const stale: string[] = [];
-    for (const doc of SHIPPED_DOCS) {
-      for (const dead of RENAMED_AWAY_TOOLS) {
-        if (doc.text.includes(dead)) stale.push(`${doc.name}: ${dead}`);
-      }
+    const known = knownToolNames();
+    const stale = SHIPPED_DOCS.flatMap((d) =>
+      [...new Set(d.text.match(/cello_[a-z_]+/g) ?? [])]
+        .filter((t) => !known.has(t))
+        .map((t) => `${d.name}: ${t}`),
+    );
+    expect(
+      stale,
+      `A PUBLISHED doc names a tool that does not exist. SKILL.md ships inside the tarball and is ` +
+        `the doc that hands an agent its tool list — a dead name here is an agent calling a tool ` +
+        `that is not there.\n  ${stale.join("\n  ")}`,
+    ).toEqual([]);
+  });
+
+  it("the shipped docs actually document the LIVE surface (not a stale subset)", () => {
+    // The mirror of the above: absence of dead names is not presence of real ones. SKILL.md had
+    // drifted so far it omitted 15 live tools while advertising 11 dead ones.
+    const doc = SHIPPED_DOCS.map((d) => d.text).join("\n");
+    for (const t of ["cello_agents", "cello_use_agent", "cello_inbox", "cello_transcript", "cello_contacts", "cello_sealed_receipt"]) {
+      expect(doc, `SKILL.md never mentions ${t}, a live tool`).toContain(t);
     }
-    expect(stale, `A PUBLISHED doc names a tool that no longer exists:\n  ${stale.join("\n  ")}`).toEqual([]);
   });
 
   it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
