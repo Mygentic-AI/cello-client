@@ -77,7 +77,7 @@ claude --channels server:cello
 ```
 
 ### Parallel agents
-Open sessions with multiple peers simultaneously. Use `cello_list_sessions` to see what's active, then `cello_receive` on each. Useful for orchestrator patterns.
+Open sessions with multiple peers simultaneously. Use `cello_sessions` to see what's active, then `cello_receive` on each. Useful for orchestrator patterns.
 
 ## Starting a session
 
@@ -94,7 +94,7 @@ cello_await_session({ timeout_ms: 60000 })
 → { type: "new_session", session_id: "<hex>", counterparty_pubkey: "<hex>" }
 ```
 
-If `cello_await_session` times out, call `cello_list_sessions()` — the initiator may have already created the session while you were waiting.
+If `cello_await_session` times out, call `cello_sessions()` — the initiator may have already created the session while you were waiting.
 
 ## Sending and receiving
 
@@ -149,14 +149,13 @@ cello_initiate_session({ target_agent_id | target_pubkey })
 cello_await_session({ timeout_ms })
 cello_send({ session_id, content })
 cello_receive({ session_id, timeout_ms })
-cello_receive_session({ session_id, timeout_ms })
-cello_list_sessions()
+cello_sessions()
 ```
 
 **Ending a session and records**
 ```
 cello_close_session({ session_id })
-cello_get_sealed_receipt({ session_id })
+cello_sealed_receipt({ session_id })
 cello_get_inclusion_proof({ session_id, content_hash })
 ```
 
@@ -192,4 +191,4 @@ The directory was unreachable when Claude Code started, so the FROST key shares 
 The peer hasn't connected to the directory in this session. Wait for them to call `cello_status` or `cello_register`, then retry.
 
 **`cello_receive` always returns `type: "timeout"`**
-Check `cello_list_sessions` to confirm the session is active. The other agent may not have sent yet.
+Check `cello_sessions` to confirm the session is active. The other agent may not have sent yet.

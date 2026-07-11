@@ -563,13 +563,23 @@ describe("AC-008: SKILL.md references M1 tools and not M0-removed tools", () => 
     const skillPath = join(__dirname, "../../SKILL.md");
     const content = await readFile(skillPath, "utf-8");
 
-    // M1 tools should be mentioned
+    // The live tools should be mentioned (post-DOD-ONBOARD-HELP-1 names).
     expect(content).toContain("cello_initiate_session");
     expect(content).toContain("cello_await_session");
-    expect(content).toContain("cello_list_sessions");
+    expect(content).toContain("cello_sessions"); // was cello_list_sessions
 
-    // M0-removed tools must NOT be mentioned
+    // M0-removed tools must NOT be mentioned.
     expect(content).not.toContain("cello_connect_peer");
     expect(content).not.toContain("cello_list_peers");
+
+    // DOD-ONBOARD-HELP-1: nor may the renamed-away / DELETED names. SKILL.md SHIPS inside the
+    // connect tarball and tells an agent which tools to call, so a dead name here makes that agent
+    // call a tool that does not exist. This test asserted only the M0 removals, so it sailed through
+    // while SKILL.md still named cello_list_sessions, cello_get_sealed_receipt and
+    // cello_receive_session — all of them gone. (The systematic version of this check, driven by
+    // package.json's `files:`, lives in dod-onboard-help-1-tool-parity.test.ts.)
+    expect(content).not.toContain("cello_list_sessions");
+    expect(content).not.toContain("cello_get_sealed_receipt");
+    expect(content).not.toContain("cello_receive_session");
   });
 });

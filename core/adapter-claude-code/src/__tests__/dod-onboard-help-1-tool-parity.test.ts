@@ -27,11 +27,31 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
+import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, RENAMED_AWAY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SHIM_SRC = join(here, "..", "bin", "cello-mcp.ts");
 const source = readFileSync(SHIM_SRC, "utf8");
+
+/**
+ * The package's PUBLISHED non-code files — from `files:` in package.json, so this follows what
+ * actually ships rather than what I remember shipping.
+ *
+ * SKILL.md is the reason this exists. It ships INSIDE the connect tarball (`files: ["dist/",
+ * "package.json", "SKILL.md"]`) and it tells an agent which tools to call — and it was naming
+ * `cello_list_sessions`, `cello_get_sealed_receipt` and `cello_receive_session` after all three had
+ * been renamed or deleted. Every audit written for this story scanned `.ts` files, so not one of
+ * them ever looked at it, and it went out in connect@0.0.66.
+ *
+ * That is the same class as the Hermes scaffolded assets, caught for the third time. The lesson the
+ * audits kept missing: follow what SHIPS, not what compiles.
+ */
+const PKG = JSON.parse(readFileSync(join(here, "..", "..", "package.json"), "utf8")) as {
+  files?: string[];
+};
+const SHIPPED_DOCS = (PKG.files ?? [])
+  .filter((f) => f.endsWith(".md"))
+  .map((f) => ({ name: f, text: readFileSync(join(here, "..", "..", f), "utf8") }));
 
 /** Every tool the shim entrypoint registers — the surface an operator's MCP client actually sees. */
 function registeredTools(): string[] {
@@ -92,6 +112,20 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     // handler is gone too, so a lingering registration here would proxy to a method that no longer
     // exists — a tool that is guaranteed to fail. Assert the whole file, not just the registration.
     expect(source).not.toContain("cello_receive_session");
+  });
+
+  it("the PUBLISHED docs (SKILL.md) name no renamed-away or deleted tool", () => {
+    // SKILL.md ships in the tarball and instructs an agent which tools to call. A dead name here is
+    // not a doc nit — it is an agent calling a tool that does not exist. This shipped in
+    // connect@0.0.66 precisely because every other audit only read .ts files.
+    expect(SHIPPED_DOCS.length, "no shipped .md found — this audit would be vacuous").toBeGreaterThan(0);
+    const stale: string[] = [];
+    for (const doc of SHIPPED_DOCS) {
+      for (const dead of RENAMED_AWAY_TOOLS) {
+        if (doc.text.includes(dead)) stale.push(`${doc.name}: ${dead}`);
+      }
+    }
+    expect(stale, `A PUBLISHED doc names a tool that no longer exists:\n  ${stale.join("\n  ")}`).toEqual([]);
   });
 
   it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
