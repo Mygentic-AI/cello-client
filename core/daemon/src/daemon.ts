@@ -6175,9 +6175,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   });
 
   handlers.set("cello_contact_remove", async (params, connectionId) => {
+    // Deliberately NOT shape-gated. `remove` is the ESCAPE HATCH, and gating it would trap the very
+    // rows the gate exists to prevent: a junk contact written by the older, unvalidated code (pubkey
+    // = the literal text "tier") could never be deleted, because deleting it requires naming it.
+    // Validation belongs on the paths that CREATE or MUTATE a row, never on the one that removes it.
+    // Removing a key that was never stored is a harmless not_found.
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
-    const badPubkey = invalidPubkey(pubkey);
-    if (badPubkey) return badPubkey;
     if (!pubkey) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) — the contact to remove." };
     }

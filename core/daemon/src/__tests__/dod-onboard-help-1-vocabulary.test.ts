@@ -336,7 +336,6 @@ describe("DOD-ONBOARD-HELP-1 (review F7) — a contact pubkey must be a pubkey",
     // "tier" is what `cello contact tier add` would send as the pubkey.
     for (const [method, extra] of [
       ["cello_contact_add", {}],
-      ["cello_contact_remove", {}],
       ["cello_contact_set_tier", { tier: 3 }],
       ["cello_contact_set_away", { message: "later" }],
       ["cello_contact_set_moniker", { moniker: "Bob" }],
@@ -349,8 +348,16 @@ describe("DOD-ONBOARD-HELP-1 (review F7) — a contact pubkey must be a pubkey",
     }
 
     // A well-formed key gets PAST the shape gate (it fails later, on no_current_agent — which proves
-    // the validator is not simply refusing everything).
+    // the validator is not simply refusing everything). The regex is the SAME one
+    // cello_initiate_session already enforces on target_pubkey, so this is the codebase's existing
+    // rule, not a new and stricter one.
     const good = (await client.send("cello_contact_add", { pubkey: "a".repeat(64) })) as Record<string, unknown>;
     expect(good.reason).not.toBe("invalid_pubkey");
+
+    // REMOVE is deliberately NOT shape-gated — it is the escape hatch. Gating it would make a junk
+    // row written by the older unvalidated code permanently undeletable, because deleting it means
+    // naming it. A validator that traps the mess it was built to prevent is worse than no validator.
+    const rm = (await client.send("cello_contact_remove", { pubkey: "tier" })) as Record<string, unknown>;
+    expect(rm.reason, "remove must not refuse a malformed key — that is the only way out").not.toBe("invalid_pubkey");
   });
 });
