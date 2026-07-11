@@ -216,6 +216,32 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(typo).toMatchObject({ ok: false, reason: "invalid_key" });
   });
 
+  it("DOD-AWAY-TIER-1: cello_contact_set_away stores a message, treats empty as CLEAR, and refuses over-length / unknown contact", async () => {
+    await makeAgentDir("alice");
+    const h = await start({ logger: makeLogger().logger, node: new FakeNode() });
+    const client = await connectAs("alice");
+    const snm = h.getSessionNodeManager();
+    const cp = "cd".repeat(32);
+    await client.send("cello_contact_add", { pubkey: cp });
+
+    // A valid message is stored.
+    await client.send("cello_contact_set_away", { pubkey: cp, message: "Away — back Monday" });
+    expect(snm.resolveAwayMessage("alice", cp)).toBe("Away — back Monday");
+
+    // F2: an empty message CLEARS (never stores a blank away reply) — consistent with the CLI + null.
+    const cleared = (await client.send("cello_contact_set_away", { pubkey: cp, message: "   " })) as Record<string, unknown>;
+    expect(cleared.ok).toBe(true);
+    expect(snm.resolveAwayMessage("alice", cp)).toBeNull();
+
+    // F3: over-length is refused.
+    const tooLong = (await client.send("cello_contact_set_away", { pubkey: cp, message: "x".repeat(3000) })) as Record<string, unknown>;
+    expect(tooLong).toMatchObject({ ok: false, reason: "invalid_message" });
+
+    // Unknown contact → contact_not_found.
+    const missing = (await client.send("cello_contact_set_away", { pubkey: "ff".repeat(32), message: "hi" })) as Record<string, unknown>;
+    expect(missing).toMatchObject({ ok: false, reason: "contact_not_found" });
+  });
+
   it("K6: --agent (params.agent) resolves an explicit agent, independent of this connection's current agent", async () => {
     await makeAgentDir("alice");
     await makeAgentDir("bob");

@@ -45,7 +45,7 @@ import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { TIER, isKnownTierValue } from "./contacts-tier-migration.js";
-import { isValidSettingKey, allSettingKeys, validateSettingValue } from "./agent-settings-keys.js";
+import { isValidSettingKey, allSettingKeys, validateSettingValue, AWAY_MESSAGE_MAX_LEN } from "./agent-settings-keys.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
@@ -6058,9 +6058,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!pubkey || !params || !("message" in params)) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'message' — a string away text, or null to clear it." };
     }
-    const message = params.message === null ? null : typeof params.message === "string" ? params.message : undefined;
-    if (message === undefined) {
+    const rawMessage = params.message === null ? null : typeof params.message === "string" ? params.message : undefined;
+    if (rawMessage === undefined) {
       return { ok: false, reason: "invalid_message", guidance: "'message' must be a string (the away text) or null (to clear)." };
+    }
+    // Review F2/F3: an empty / whitespace-only message CLEARS (consistent with the CLI + null), never
+    // stores a blank away reply; a valid message is length-bounded.
+    const message = rawMessage !== null && rawMessage.trim().length === 0 ? null : rawMessage;
+    if (message !== null && message.length > AWAY_MESSAGE_MAX_LEN) {
+      return { ok: false, reason: "invalid_message", guidance: `The away message must be <= ${AWAY_MESSAGE_MAX_LEN} characters.` };
     }
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;

@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { startDaemon } from "../daemon.js";
 import { TIER } from "../contacts-tier-migration.js";
+import type { SecurityGatewayClient, ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -116,10 +117,11 @@ describe("M8C-AWAY-1: away response", () => {
     return Buffer.from(await kp.getPublicKey()).toString("hex");
   }
 
-  async function start(logger: Logger, node: CelloNode, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
+  async function start(logger: Logger, node: CelloNode, signalingConnect?: () => Promise<ConnectResult>, securityGateway?: SecurityGatewayClient): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, sessionNodeFactory: new FixedFactory(node), signalingConnect,
+      ...(securityGateway ? { securityGateway } : {}),
     };
     const h = await startDaemon(config);
     handle = h;
@@ -174,6 +176,77 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0].direction).toBe("sent");
     expect(messages[0].text).toContain("session request has been received and queued");
+  });
+
+  // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
+  class StubGateway implements SecurityGatewayClient {
+    constructor(private readonly outbound: (c: Uint8Array) => ScreenVerdict) {}
+    async screenInbound(content: Uint8Array, _ctx: ScreenContext): Promise<ScreenVerdict> { return { disposition: "allow", content }; }
+    async screenOutbound(content: Uint8Array, _ctx: ScreenContext): Promise<ScreenVerdict> { return this.outbound(content); }
+  }
+
+  it("DOD-AWAY-TIER-1 T1: an unattended away response USES the resolution — a per-contact away text is what's sent + contact.away.resolved fires", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    const initiatorPubkey = "cd".repeat(32);
+    snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+    snm.setContactAwayMessage("bob", initiatorPubkey, "Hey - reach me on Signal");
+
+    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey)); // unattended
+    await wait(150);
+
+    // The RESOLVED custom text is what landed in the transcript — not the system default (bypass:
+    // reverting the caller to the constant would send "session request has been received…" here).
+    const { messages } = snm.readTranscript("bob", SID_HEX);
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe("Hey - reach me on Signal");
+    // Observability AC: contact.away.resolved fired with the matched level.
+    expect(events.find((e) => e.event === "contact.away.resolved" && e.context.level === "contact")).toBeDefined();
+  });
+
+  it("DOD-AWAY-TIER-1 T2 (SI): a BLOCK verdict on the away text means nothing is sent", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const gateway = new StubGateway(() => ({ disposition: "block", reason: "away_pii" }));
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef), gateway);
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    const initiatorPubkey = "cd".repeat(32);
+    snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+
+    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    await wait(150);
+
+    expect(events.find((e) => e.event === "session.away.response.screened_out" && e.context.disposition === "block")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")).toHaveLength(0);
+  });
+
+  it("DOD-AWAY-TIER-1 T2 (SI): a REDACT verdict sends the ALTERED bytes, never the pre-redaction draft", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const redacted = new TextEncoder().encode("[redacted away]");
+    const gateway = new StubGateway(() => ({ disposition: "redact", content: redacted }));
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef), gateway);
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    const initiatorPubkey = "cd".repeat(32);
+    snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+    snm.setContactAwayMessage("bob", initiatorPubkey, "my home address is 123 Main St"); // would-be leak
+
+    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    await wait(150);
+
+    const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")[0];
+    expect(sent?.text).toBe("[redacted away]"); // the ALTERED bytes — the draft never went on the wire
   });
 
   it("A3: an inbound session request while ATTENDED gets NO auto-ack", async () => {

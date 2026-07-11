@@ -60,9 +60,11 @@ describe("DOD-TIER-BOUNDS-SETTINGS — value validation (AC2, INV-TIER-BOUND)", 
       expect(validateSettingValue(key, bad).ok, bad).toBe(false);
     }
   });
-  it("away-text values are free-form (any string)", () => {
+  it("away-text values are free-form but non-empty and length-bounded (review F2/F3)", () => {
     expect(validateSettingValue(AWAY_DEFAULT_KEY, "Out for lunch, back at 3").ok).toBe(true);
-    expect(validateSettingValue(awayTierSettingKey("vip"), "").ok).toBe(true);
+    expect(validateSettingValue(awayTierSettingKey("vip"), "").ok).toBe(false); // empty → refused (use null to clear)
+    expect(validateSettingValue(awayTierSettingKey("vip"), "   ").ok).toBe(false); // whitespace-only → refused
+    expect(validateSettingValue(AWAY_DEFAULT_KEY, "x".repeat(3000)).ok).toBe(false); // over the length cap
   });
 });
 

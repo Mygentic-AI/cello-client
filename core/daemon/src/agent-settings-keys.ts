@@ -92,6 +92,20 @@ export function validateSettingValue(key: string, value: string): { ok: true } |
     if (Number(value) > Number.MAX_SAFE_INTEGER) {
       return { ok: false, reason: "a bound must be <= Number.MAX_SAFE_INTEGER" };
     }
+    return { ok: true };
+  }
+  // Away-text (review F2/F3): an EMPTY / whitespace-only away text is refused — to CLEAR, use null
+  // (cello_contact_set_away) or omit the key; storing "" would silently blank every away reply,
+  // including the minimal stranger disclosure. Bounded to a sane length (an answering-machine line,
+  // not a document).
+  if (value.trim().length === 0) {
+    return { ok: false, reason: "an away message cannot be empty or whitespace-only (omit the key or pass null to clear)" };
+  }
+  if (value.length > AWAY_MESSAGE_MAX_LEN) {
+    return { ok: false, reason: `an away message must be <= ${AWAY_MESSAGE_MAX_LEN} characters` };
   }
   return { ok: true };
 }
+
+/** Max length of an away message (per-contact or per-tier/agent-default) — an answering-machine line. */
+export const AWAY_MESSAGE_MAX_LEN = 2048;

@@ -1088,7 +1088,7 @@ export class SessionNodeManager {
       }
     }
     const agentDefault = this.getSetting(agentName, AWAY_DEFAULT_KEY);
-    // 3. agent default, else null → caller applies the system default (logged as "system" there).
+    // 3. agent default, else null → caller applies the system default (code). Level logged HERE.
     this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: agentDefault !== null ? "agent_default" : "system" });
     return agentDefault;
   }
