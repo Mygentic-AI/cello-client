@@ -8,18 +8,18 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import {
   DUAL_SURFACE_VERBS,
   MCP_ONLY_TOOLS,
-  DEAD_CLI_VERBS,
+  deadCliVerbPattern,
   knownToolNames,
   toCliGuidance,
   renderForSurface,
@@ -113,15 +113,26 @@ describe("DOD-ONBOARD-HELP-1 §5 — guidance renders for the surface that asked
           {
             agent: "alice",
             rename_notices: [
-              { pubkey: "ab", notice: 'Adopt it: cello_contact_set_moniker { pubkey: "ab" }, or ignore.' },
+              {
+                pubkey: "ab",
+                notice: 'Adopt it: cello_contact_set_moniker { pubkey: "ab", moniker: "Zoe" }, or ignore.',
+              },
             ],
           },
         ],
       },
       "cli",
     ) as { agents: Array<{ rename_notices: Array<{ notice: string }> }> };
-    expect(out.agents[0].rename_notices[0].notice).toContain("cello contact <pubkey> set-moniker");
-    expect(out.agents[0].rename_notices[0].notice).not.toContain("cello_contact_set_moniker");
+    const notice = out.agents[0].rename_notices[0].notice;
+    expect(notice).not.toContain("cello_contact_set_moniker");
+
+    // TYPEABLE, not merely renamed. The earlier version of this test asserted only that the tool
+    // NAME had changed — and passed on `cello contact <pubkey> set-moniker { pubkey: "ab", … }`:
+    // the tool's JSON still bolted on, next to a literal placeholder. It looked translated and was
+    // not runnable. So assert the property that actually matters — an operator can PASTE this.
+    expect(notice).toContain('cello contact ab set-moniker "Zoe"');
+    expect(notice, "no MCP JSON arguments may survive").not.toMatch(/[{}]/);
+    expect(notice, "no unfilled <pubkey> placeholder").not.toContain("<pubkey>");
   });
 
   it("renders `warning_guidance` — an instruction key that is not called `guidance`", () => {
@@ -153,12 +164,22 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
    * operator-facing guidance too. A stale name in any of them passed a green audit. An audit whose
    * blind spot is "the other files" is an audit that certifies what it happens to look at.
    */
-  const files = readdirSync(SRC_DIR)
-    .filter((f) => f.endsWith(".ts") && !f.endsWith(".d.ts"))
-    // vocabulary.ts DEFINES the dead names (that is its job) — scanning it would flag the list
-    // against itself. It ships no operator-facing strings of its own.
-    .filter((f) => f !== "vocabulary.ts")
-    .sort();
+  // RECURSIVE (review F5): a flat readdir skipped core/daemon/src/bin/ entirely, while the comment
+  // above promised "EVERY non-test source file". No leak there today, but the next file added under
+  // a subdirectory would have been invisible — an audit that quietly stops at the first directory.
+  function sourceFiles(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir)) {
+      if (entry === "__tests__") continue;
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
+      // vocabulary.ts DEFINES the dead names (that is its job) — scanning it would flag the list
+      // against itself. It ships no operator-facing strings of its own.
+      else if (entry.endsWith(".ts") && !entry.endsWith(".d.ts") && entry !== "vocabulary.ts") out.push(full);
+    }
+    return out;
+  }
+  const files = sourceFiles(SRC_DIR).map((f) => relative(SRC_DIR, f)).sort();
 
   /**
    * Every token in a source file that the daemon can HAND TO A USER as an instruction.
@@ -210,7 +231,7 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
   it("the daemon never hands out a DEAD CLI verb (the tool audit is structurally blind to these)", () => {
     // Review finding: `cello register` survived in daemon.ts's unregistered-agent warning, because a
     // bare CLI verb carries no `cello_` token for the audit above to catch. Two audits, two shapes.
-    const dead = scan(new RegExp(DEAD_CLI_VERBS.map((v) => v.replace(/ /g, "\\s")).join("|"), "g"));
+    const dead = scan(deadCliVerbPattern());
     expect(
       dead,
       `The daemon tells an operator to run a command that no longer dispatches (DOD-ONBOARD-HELP-1 ` +

@@ -5997,6 +5997,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         noticed_at: n.noticed_at,
         // Names the contact by the operator's OWN pet name (AC3); the self-declared name is a quoted,
         // untrusted claim; the adopt command carries its arguments so it is copy-pasteable.
+        // The MCP call form below is translated WHOLE (arguments and all) for a CLI caller by
+        // vocabulary.ts's CALL_FORMS — rewriting only the tool name would leave the tool's JSON
+        // bolted onto a CLI verb, which looks like a command and is not one. `claimed_name` above
+        // carries the peer's self-declared name UNTOUCHED, so the operator always has the raw value
+        // even though the prose copy passes through the renderer.
         notice:
           `Your contact ${n.moniker !== null ? `"${n.moniker}" ` : ""}(${n.pubkey.slice(0, 16)}…) now calls themselves ` +
           `"${n.offered_name}" (self-declared — unverified). Adopt it: cello_contact_set_moniker ` +

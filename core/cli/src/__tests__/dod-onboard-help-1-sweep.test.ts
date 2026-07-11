@@ -20,7 +20,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
-import { DEAD_CLI_VERBS, RENAMED_AWAY_TOOLS } from "@cello-protocol/daemon";
+import { deadCliVerbPattern, RENAMED_AWAY_TOOLS } from "@cello-protocol/daemon";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, "..");
@@ -67,7 +67,15 @@ function scan(re: RegExp): Array<{ file: string; line: number; token: string }> 
         if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return;
         const code = raw
           .replace(/\s\/\/[^"'`]*$/, "") // trailing inline comment
-          .replace(/(["'`])cello_[a-z_]+\1/g, '""'); // a bare literal = a wire identifier, not prose
+          // Strip a quoted tool name ONLY in a WIRE POSITION — directly after `(`, `,`, `:` or `|`,
+          // which is where an IPC method name is passed as an argument, mapped in IPC_METHODS, or
+          // listed in a method union type.
+          //
+          // The first cut stripped ANY exactly-quoted token, anywhere. Review showed the hole: house
+          // style quotes commands inside prose ("Fetch it with 'cello_check_notifications' first"),
+          // and that inner literal was stripped too — so a stale name hid inside the very sentence
+          // that hands it to a user. Position is what separates an identifier from an instruction.
+          .replace(/([(,:|]\s*)(["'`])cello_[a-z_]+\2/g, '$1""')
         for (const m of code.matchAll(re)) {
           hits.push({ file: relative(SRC, file), line: i + 1, token: m[0] });
         }
@@ -87,13 +95,49 @@ describe("DOD-ONBOARD-HELP-1 §2 — no shipped string names a DEAD command", ()
   });
 
   it("never tells a user to run a renamed-away CLI command", () => {
-    const dead = scan(new RegExp(DEAD_CLI_VERBS.map((v) => v.replace(/ /g, "\\s")).join("|"), "g"));
+    const dead = scan(deadCliVerbPattern());
     expect(
       dead,
       `A shipped string tells the operator to run a command that no longer dispatches. §2 renamed ` +
         `it and DELETED the old name — there are no aliases, so this instruction dead-ends.\n` +
         show(dead),
     ).toEqual([]);
+  });
+
+  it("NEGATIVE CONTROL — the dead-verb scan really fires, and on punctuation too", () => {
+    // The bug review caught: a trailing-space anchor let `'cello register'` (quoted, in the Hermes
+    // plugin) sail past. These assert the pattern catches every punctuation form AND still lets the
+    // live commands through — the two ways this check can be silently useless.
+    const re = () => deadCliVerbPattern();
+    for (const dead of [
+      "run 'cello register' first",
+      "run `cello register`.",
+      "see cello install, then",
+      "cello receipts\n",
+      "use cello close(id)",
+      "cello contact add <pk>",
+      "cello contact set-tier <pk> 3",
+    ]) {
+      expect(re().test(dead), `must FLAG: ${dead}`).toBe(true);
+    }
+    for (const live of [
+      "run 'cello register-agent alice'",
+      "cello close-session <id>",
+      "cello initiate-session <pk>",
+      "cello relay-receipts <name>",
+      "cello contact <pubkey> add",
+      "cello contacts --agent alice",
+    ]) {
+      expect(re().test(live), `must ALLOW: ${live}`).toBe(false);
+    }
+  });
+
+  it("NEGATIVE CONTROL — a stale tool name quoted INSIDE prose is not hidden by the literal-strip", () => {
+    // Review's F3. A wire literal (`client.send("cello_list_agents")`) must be stripped; the SAME
+    // token quoted inside a sentence must NOT be — that sentence is an instruction to a human.
+    const strip = (line: string) => line.replace(/([(,:|]\s*)(["'`])cello_[a-z_]+\2/g, '$1""');
+    expect(strip('const r = await client.send("cello_list_agents");')).not.toContain("cello_list_agents");
+    expect(strip('output: "Fetch it with \'cello_check_notifications\' first."')).toContain("cello_check_notifications");
   });
 
   it("never names an MCP tool that was renamed away", () => {

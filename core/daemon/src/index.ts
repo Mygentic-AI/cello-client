@@ -61,6 +61,7 @@ export {
   MCP_ONLY_TOOLS,
   NON_TOOL_IDENTIFIERS,
   DEAD_CLI_VERBS,
+  deadCliVerbPattern,
   RENAMED_AWAY_TOOLS,
   knownToolNames,
   toCliGuidance,

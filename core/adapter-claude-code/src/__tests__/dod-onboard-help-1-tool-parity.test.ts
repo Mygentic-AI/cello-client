@@ -12,6 +12,15 @@
  * The shim's tool names must be string literals (the MCP SDK registers them alongside zod schemas),
  * so they cannot be derived from the table at runtime. That is exactly why this audit exists: a
  * literal that can drift, plus a test that will not let it.
+ *
+ * SCOPE — read this before widening it. This audits `bin/cello-mcp.ts`, the PUBLISHED entrypoint.
+ * `src/server.ts` (and `core/client/src/mcp-server.ts`) are the legacy M1 in-process servers. An
+ * earlier version of this comment claimed they were "not published" — that was WRONG, and review
+ * caught it: both are exported from their package roots and ship in `dist/`. Nothing drives them at
+ * runtime (the shim proxies to the daemon), but they still register the pre-rename tool names, so
+ * they are a SECOND vocabulary sitting on the public export surface — the exact thing §2b abolishes.
+ * Tracked as DOD-LEGACY-MCP-1: delete the dead `createMcpServer` / `createMcpSessionServer` exports.
+ * Not fixed here because deleting public exports is a separate, riskier change than a help pass.
  */
 
 import { describe, it, expect } from "vitest";
@@ -24,7 +33,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const SHIM_SRC = join(here, "..", "bin", "cello-mcp.ts");
 const source = readFileSync(SHIM_SRC, "utf8");
 
-/** Every tool the PUBLISHED shim actually registers. (server.ts is legacy and is not published.) */
+/** Every tool the shim entrypoint registers — the surface an operator's MCP client actually sees. */
 function registeredTools(): string[] {
   return [...source.matchAll(/server\.tool\("(cello_[a-z_]+)"/g)].map((m) => m[1]).sort();
 }

@@ -123,15 +123,38 @@ export function knownToolNames(): ReadonlySet<string> {
  * `cello close `, and `cello register-agent` does not match `cello register `.
  */
 export const DEAD_CLI_VERBS: readonly string[] = [
-  "cello register ",
-  "cello install ",
+  "cello register",
+  "cello install",
   "cello receipts",
-  "cello close ",
-  "cello initiate ",
-  "cello contact list",
-  "cello contact add",
-  "cello contact remove",
+  "cello close",
+  "cello initiate",
 ];
+
+/**
+ * The pre-§3 flat contact shape: `cello contact <op> <pubkey>`. The arguments are REVERSED now
+ * (`cello contact <pubkey> <op>`), so these are not merely renamed — following one silently targets
+ * a contact named "add". In the live shape an OP can never follow `contact` directly; a pubkey does.
+ */
+const DEAD_CONTACT_OPS = ["list", "add", "remove", "tier", "away", "set-tier", "set-away", "set-moniker"];
+
+/**
+ * Match any dead CLI verb, wherever it is SPOKEN — the one regex both audits share.
+ *
+ * The negative lookahead `(?![-\w])` is what makes this work, and the first cut got it wrong: it
+ * anchored on a trailing SPACE (`"cello register "`), which review broke immediately — a verb
+ * followed by a quote, period, backtick, paren or comma slipped straight through, and a live string
+ * (`'cello register'`, in the Hermes plugin scaffolded onto the operator's disk) was sailing past a
+ * green audit. An audit defeated by a full stop is not an audit.
+ *
+ * The lookahead still lets the LIVE commands through, because each dead verb is a strict prefix of
+ * its replacement: `cello register-agent`, `cello close-session`, `cello initiate-session` all have
+ * a `-` right where the lookahead refuses one.
+ */
+export function deadCliVerbPattern(): RegExp {
+  const verbs = DEAD_CLI_VERBS.map((v) => v.replace(/^cello /, "")).join("|");
+  const ops = DEAD_CONTACT_OPS.join("|");
+  return new RegExp(`cello\\s+(?:${verbs})(?![-\\w])|cello\\s+contact\\s+(?:${ops})(?![-\\w])`, "g");
+}
 
 /**
  * MCP tool names this story RENAMED AWAY. Nothing may hand one of these to an agent again.
@@ -170,8 +193,34 @@ const CLI_BY_MCP: ReadonlyArray<DualSurfaceVerb> = [...DUAL_SURFACE_VERBS].sort(
  * offer, so it is left alone — inventing one would send the operator to a command that does not
  * exist, which is the exact failure this whole mechanism prevents.
  */
+/**
+ * Instructions that carry ARGUMENTS, not just a name — rewritten whole, before the token pass.
+ *
+ * Renaming the tool is not enough when the instruction is a CALL. `cello inbox`'s rename notice ends
+ * with a literal, copy-pasteable invocation:
+ *
+ *     Adopt it: cello_contact_set_moniker { pubkey: "abcd…", moniker: "Zoe" }, or ignore.
+ *
+ * Rewriting only the token gave a CLI operator `cello contact <pubkey> set-moniker { pubkey: "abcd…",
+ * moniker: "Zoe" }` — the tool's name with the tool's JSON still bolted on, and a literal `<pubkey>`
+ * placeholder next to the real key. It looks like a command and is not one; pasting it now trips the
+ * invalid_pubkey gate. Half a translation is its own kind of wrong answer.
+ *
+ * So the call form is translated as a unit, arguments and all, and the result is a line the operator
+ * can actually paste. Run BEFORE the token pass, which would otherwise have already eaten the name.
+ */
+const CALL_FORMS: ReadonlyArray<{ re: RegExp; cli: (m: RegExpExecArray) => string }> = [
+  {
+    re: /cello_contact_set_moniker\s*\{\s*pubkey:\s*"([^"]*)",\s*moniker:\s*"([^"]*)"\s*\}/g,
+    cli: (m) => `cello contact ${m[1]} set-moniker "${m[2]}"`,
+  },
+];
+
 export function toCliGuidance(text: string): string {
   let out = text;
+  for (const { re, cli } of CALL_FORMS) {
+    out = out.replace(new RegExp(re.source, re.flags), (...args) => cli(args as unknown as RegExpExecArray));
+  }
   for (const { mcp, cli } of CLI_BY_MCP) {
     // Word-boundary on the tail: `cello_agents` must not match inside `cello_agents_foo`.
     out = out.replace(new RegExp(`${mcp}(?![a-z_])`, "g"), cli);

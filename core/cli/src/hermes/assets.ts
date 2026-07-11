@@ -275,7 +275,7 @@ class CelloAdapter(BasePlatformAdapter):
                 )
         if isinstance(result, dict) and result.get("warning"):
             # e.g. not_registered: selected and usable locally, but no directory
-            # sessions until 'cello register' - surface it, do not block the bind.
+            # sessions until 'cello register-agent' - surface it, do not block the bind.
             logger.warning(
                 "[cello] %s",
                 result.get("warning_guidance") or result.get("warning"),
