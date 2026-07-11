@@ -188,6 +188,24 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(missing).toMatchObject({ ok: false, reason: "contact_not_found" });
   });
 
+  it("DOD-SETTINGS-1: cello_settings_set refuses an unknown key, stores a valid one, and get reflects it", async () => {
+    await makeAgentDir("alice");
+    await start({ logger: makeLogger().logger, node: new FakeNode() });
+    const client = await connectAs("alice");
+
+    // Unknown key → refused, never stored.
+    const bad = (await client.send("cello_settings_set", { key: "random.key", value: "x" })) as Record<string, unknown>;
+    expect(bad).toMatchObject({ ok: false, reason: "invalid_key" });
+
+    // Valid key → stored; get reflects it; an unset key returns null (AC3 default fallback).
+    const ok = (await client.send("cello_settings_set", { key: "bounds.known.max_sessions", value: 8 })) as Record<string, unknown>;
+    expect(ok).toMatchObject({ ok: true, key: "bounds.known.max_sessions", value: "8" });
+    const got = (await client.send("cello_settings_get", { key: "bounds.known.max_sessions" })) as Record<string, unknown>;
+    expect(got).toMatchObject({ ok: true, value: "8" });
+    const unset = (await client.send("cello_settings_get", { key: "away.default" })) as Record<string, unknown>;
+    expect(unset).toMatchObject({ ok: true, value: null });
+  });
+
   it("K6: --agent (params.agent) resolves an explicit agent, independent of this connection's current agent", async () => {
     await makeAgentDir("alice");
     await makeAgentDir("bob");

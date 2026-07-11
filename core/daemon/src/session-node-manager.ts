@@ -691,6 +691,21 @@ export class SessionNodeManager {
       )
     `);
 
+    // DOD-SETTINGS-1: a daemon-side per-agent settings store for REACHABILITY POLICY (the tier bounds
+    // overrides and the per-tier/agent away messages). A generic key-value table on the stable
+    // agent_id, in the same SQLCipher DB. Deliberately NOT M9-CFG-001's gateway config store: this is
+    // daemon reachability policy, not gateway SCREENING config, and the M9 store is unwired + plaintext.
+    // reconcile with DOD-CONFIG-1 later; this is daemon reachability policy, not gateway config.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_settings (
+        agent_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, key)
+      )
+    `);
+
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
     // killed process. Batch-update to 'interrupted' before IPC opens.
@@ -1236,6 +1251,39 @@ export class SessionNodeManager {
          ON CONFLICT(id) DO UPDATE SET bot_token = excluded.bot_token, allowlisted_chat_id = excluded.allowlisted_chat_id, updated_at = excluded.updated_at`,
       )
       .run(botToken, allowlistedChatId, Date.now());
+  }
+
+  /** DOD-SETTINGS-1: read a per-agent setting, or null if unset. The get-with-default is the CALLER's
+   *  job (an unset key falls back to the hardcoded grid/system default — the daemon runs correctly on
+   *  defaults alone, AC3). Returns null on a missing DB (settings are always optional). */
+  getSetting(agentName: string, key: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT value FROM agent_settings WHERE agent_id = ? AND key = ?")
+      .get(this.#requireAgentId(agentName), key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  /** DOD-SETTINGS-1: write a per-agent setting (upsert). Key VALIDATION is the handler's boundary
+   *  (isValidSettingKey); value validation for typed settings (finite bounds, etc.) belongs to the
+   *  specific consumer. Throws on a missing DB — a write that silently no-ops would be a lie. */
+  setSetting(agentName: string, key: string, value: string): void {
+    if (!this.#db) throw new Error(`setSetting('${agentName}'): database not initialized`);
+    this.#db
+      .prepare(
+        `INSERT INTO agent_settings (agent_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(agent_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(this.#requireAgentId(agentName), key, value, Date.now());
+  }
+
+  /** DOD-SETTINGS-1: all explicitly-set settings for an agent (the ones that OVERRIDE a default),
+   *  key-sorted. Unset keys are absent — the operator sees only what they changed. */
+  getAllSettings(agentName: string): Array<{ key: string; value: string }> {
+    if (!this.#db) return [];
+    return this.#db
+      .prepare("SELECT key, value FROM agent_settings WHERE agent_id = ? ORDER BY key ASC")
+      .all(this.#requireAgentId(agentName)) as Array<{ key: string; value: string }>;
   }
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */

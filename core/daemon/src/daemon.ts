@@ -45,6 +45,7 @@ import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { TIER, isKnownTierValue } from "./contacts-tier-migration.js";
+import { isValidSettingKey, allSettingKeys } from "./agent-settings-keys.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
@@ -6049,6 +6050,38 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       ...whoLabel({ localMoniker: c.moniker, offeredMoniker: null, pubkeyHex: c.pubkey }),
     }));
     return { ok: true, agent: resolved.agent, contacts };
+  });
+
+  // DOD-SETTINGS-1 AC2: read a per-agent reachability-policy setting (or all set ones). An unset key
+  // returns value:null — the CONSUMER applies the hardcoded default (the daemon runs on defaults alone).
+  handlers.set("cello_settings_get", async (params, connectionId) => {
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    const key = typeof params?.key === "string" ? params.key : undefined;
+    if (key !== undefined) {
+      return { ok: true, agent: resolved.agent, key, value: sessionNodeManager.getSetting(resolved.agent, key) };
+    }
+    return { ok: true, agent: resolved.agent, settings: sessionNodeManager.getAllSettings(resolved.agent) };
+  });
+
+  // DOD-SETTINGS-1 AC2: write a per-agent setting. The KEY is validated against the known namespace —
+  // an unknown key is REFUSED (a typo'd key that persisted would be a setting that never takes effect,
+  // invisible to the operator). Per-key VALUE validation (finite bounds, etc.) lives with the consumer.
+  handlers.set("cello_settings_set", async (params, connectionId) => {
+    const key = typeof params?.key === "string" ? params.key : undefined;
+    const rawValue = params?.value;
+    const value = typeof rawValue === "string" ? rawValue : typeof rawValue === "number" ? String(rawValue) : undefined;
+    if (!key || value === undefined) {
+      return { ok: false, reason: "missing_params", guidance: `Provide 'key' and 'value' (string or number). Valid keys: ${allSettingKeys().join(", ")}` };
+    }
+    if (!isValidSettingKey(key)) {
+      return { ok: false, reason: "invalid_key", guidance: `Unknown setting key '${key}'. Valid keys: ${allSettingKeys().join(", ")}` };
+    }
+    const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
+    if (!resolved.ok) return resolved;
+    sessionNodeManager.setSetting(resolved.agent, key, value);
+    logger.info("setting.changed", { agentName: resolved.agent, key });
+    return { ok: true, agent: resolved.agent, key, value };
   });
 
   // MONIKER-1 AC2/AC3: cello_set_moniker — set (or clear, via explicit null) an agent's outbound-name
