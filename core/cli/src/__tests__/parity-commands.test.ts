@@ -17,7 +17,7 @@
  *   ipc-proxy.ts invariant 1). The cross-invocation tests below are what make that real.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger } from "@cello-protocol/daemon";
@@ -35,6 +35,7 @@ import {
   closeSession,
   awaitSession,
   receiveSession,
+  sealedReceipt,
   readCurrentAgent,
 } from "../parity-commands.js";
 import { createAgent } from "../commands.js";
@@ -264,6 +265,86 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       const joined = await receiveSession(tempDir, "deadbeef", { timeoutMs: 500 });
       const body = JSON.parse(joined.exitCode === 0 ? joined.stdout : joined.stderr);
       expect(typeof body.ok).toBe("boolean");
+    });
+  });
+
+  // ─── Unit-review fixes (F1, F2, F4, T1) ──────────────────────────────────────────────────
+
+  describe("review fixes: the replay must not lie, misroute, or resurrect", () => {
+    it("F1: `stop-agent` CLEARS the selection — a read-only command can never silently re-online it", async () => {
+      // The defect: every agent-scoped command replays cello_use_agent, which AUTO-STARTS an offline
+      // agent. So `stop-agent alice` followed by `cello inbox` brought alice back online — reachable
+      // again — with no signal. Stopping an agent is kill-switch-adjacent; reading must never re-arm it.
+      await createAgent(tempDir, "alice");
+      await useAgent(tempDir, "alice", {});
+      expect(await readCurrentAgent(tempDir)).toBe("alice");
+
+      await stopAgent(tempDir, "alice", {});
+      expect(await readCurrentAgent(tempDir)).toBeUndefined(); // the durable mirror follows the daemon
+    });
+
+    it("F1: an OFFLINE selected agent fails LOUD rather than being auto-started by a read", async () => {
+      await createAgent(tempDir, "alice");
+      // Persist a selection, then take the agent offline WITHOUT going through stopAgent (so the
+      // selection file survives — the exact state a crash or a direct MCP stop would leave).
+      await useAgent(tempDir, "alice", {});
+      // Take alice offline via the daemon's OWN handler, leaving the persisted selection in place —
+      // exactly the state an MCP-side stop, or a crash, would leave behind.
+      const { connectToDaemon, readLock } = await import("@cello-protocol/daemon");
+      const lock = await readLock(join(tempDir, "daemon.lock"));
+      const c = await connectToDaemon(lock!.socketPath);
+      await c.send("ipc.connect", { clientType: "test" });
+      await c.send("cello_stop_agent", { name: "alice" });
+      c.close();
+      expect(await readCurrentAgent(tempDir)).toBe("alice"); // selection still there, agent offline
+
+      const out = await inbox(tempDir, {});
+      expect(out.exitCode).toBe(1);
+      expect(out.stdout).toBe(""); // never a fabricated result
+      const err = JSON.parse(out.stderr);
+      expect(err.reason).toBe("selected_agent_offline");
+      expect(String(err.guidance)).toContain("start-agent");
+    });
+
+    it("F2: an EMPTY --agent fails loud — it never runs as a different agent", async () => {
+      // `cello send $SID msg --agent "$VAR"` with VAR unset yields --agent "". Before the fix this
+      // suppressed the persisted selection AND skipped the replay, so the daemon's sole-online
+      // fallback ran the command as whatever agent happened to be up — exit 0, wrong identity.
+      await createAgent(tempDir, "alice");
+      await useAgent(tempDir, "alice", {});
+
+      const out = await inbox(tempDir, { agent: "" });
+      expect(out.exitCode).toBe(1);
+      expect(out.stdout).toBe("");
+      expect(JSON.parse(out.stderr).reason).toBe("missing_agent_value");
+    });
+
+    it("F4: an UNREADABLE selection file throws — it does not read as 'never selected'", async () => {
+      // A blanket catch would swallow EISDIR/EACCES and let the sole-online fallback run the command
+      // as a different agent. Only ENOENT ('never selected') is a non-error.
+      const dir = await mkdtemp(join(tmpdir(), "cello-parity-badfile-"));
+      try {
+        await mkdir(join(dir, "current-agent")); // a DIRECTORY where the file should be → EISDIR
+        await expect(readCurrentAgent(dir)).rejects.toThrow();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("T1: `sealed-receipt` reaches cello_get_sealed_receipt — NOT cello_get_relay_receipts", async () => {
+      // The command exists precisely because those two were confused. It had zero behavioral
+      // coverage: swapping it to the relay-receipts handler would have kept every test green.
+      // A bogus session id must produce the SEAL handler's own distinctive verdict.
+      await createAgent(tempDir, "alice");
+      await useAgent(tempDir, "alice", {});
+      const out = await sealedReceipt(tempDir, "deadbeef", {});
+      const body = JSON.parse(out.exitCode === 0 ? out.stdout : out.stderr);
+      expect(body.ok).toBe(false);
+      // cello_get_relay_receipts answers { ok:true, receipts:[] } for any agent — it would never say
+      // this. These reasons belong to the sealed-receipt handler alone.
+      expect(["session_not_found", "not_sealed", "session_id_too_short", "unknown_session", "not_sealed_yet"])
+        .toContain(body.reason);
+      expect(body.receipts).toBeUndefined(); // definitively not the relay-receipts shape
     });
   });
 

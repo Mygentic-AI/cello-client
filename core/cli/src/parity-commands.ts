@@ -29,7 +29,7 @@
  */
 
 import { join } from "node:path";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, unlink } from "node:fs/promises";
 import { connectToDaemon, readLock, type IpcClient } from "@cello-protocol/daemon";
 import { emitIpcResult, emitTransportError, type EmittedOutput, type EmitOptions } from "./json-out.js";
 
@@ -46,13 +46,35 @@ function currentAgentPath(celloDir: string): string {
   return join(celloDir, "current-agent");
 }
 
-/** The persisted agent selection, or undefined if none was ever made. */
+/**
+ * The persisted agent selection, or undefined if none was ever made.
+ *
+ * ENOENT — never selected — is the ONLY swallowed error (review F4). A blanket catch here would let
+ * an unreadable file (EACCES, EISDIR, a corrupt mount) read as "no selection", after which the
+ * daemon's sole-online fallback would quietly run the command as whatever agent happens to be up:
+ * the operator's selection silently replaced by a different identity, exit 0. Anything that is not
+ * "the file isn't there" is a real failure and is thrown.
+ */
 export async function readCurrentAgent(celloDir: string): Promise<string | undefined> {
   try {
     const raw = (await readFile(currentAgentPath(celloDir), "utf8")).trim();
     return raw.length > 0 ? raw : undefined;
-  } catch {
-    return undefined; // never selected (ENOENT) — not an error
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return undefined; // never selected
+    throw err;
+  }
+}
+
+/**
+ * Forget the persisted selection. Called by `stop-agent` (review F1): the daemon clears an agent
+ * from every connection's current-agent state when it is stopped, so the CLI's durable mirror of
+ * that state must be cleared too. Leaving it behind was a genuine defect — see stopAgent().
+ */
+async function clearCurrentAgent(celloDir: string): Promise<void> {
+  try {
+    await unlink(currentAgentPath(celloDir));
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
   }
 }
 
@@ -95,13 +117,51 @@ async function withDaemon(
     await client.send("ipc.connect", { clientType: "cli" });
 
     if (agentScoped) {
+      // Review F2 — an EMPTY --agent must never be treated as "no --agent". `--agent "$VAR"` with
+      // VAR unset yields "", which is not nullish: it would suppress the persisted selection, fail
+      // the truthiness check below, run NO replay, and let the daemon's sole-online fallback execute
+      // the command as whatever agent happened to be up — exit 0, wrong identity, silently. That is
+      // the exact misroute this module exists to prevent, and the bash idiom makes it likely.
+      if (opts.agent !== undefined && opts.agent.trim() === "") {
+        return emitTransportError(
+          "missing_agent_value",
+          "--agent was given an empty value (an unset shell variable?). Name an agent explicitly, or omit --agent to use the selection from 'cello use-agent'.",
+          opts,
+        );
+      }
+
       const selected = opts.agent ?? (await readCurrentAgent(celloDir));
       if (selected) {
-        // Replay the selection onto THIS connection. If the daemon refuses (retired/unknown agent),
-        // stop here and surface it — continuing would let the sole-online fallback silently run the
-        // command as a DIFFERENT agent than the operator named.
+        // Review F1 — the replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an
+        // offline agent (AUTOSTART-1), so replaying it blindly meant `cello stop-agent alice` could
+        // be silently undone by the very next read-only command (`cello inbox`), bringing alice back
+        // online and reachable with no signal. Stopping an agent is kill-switch-adjacent; a command
+        // that reads must never re-arm it. The MCP surface never does this — the daemon clears the
+        // agent from every connection on stop, and later calls get no_current_agent.
+        //
+        // So: only replay an agent that is ALREADY ONLINE. An offline selection fails loud, naming
+        // the remedy, rather than quietly starting it or quietly running as someone else.
+        if (!(await isAgentOnline(client, selected))) {
+          return emitTransportError(
+            "selected_agent_offline",
+            `Agent '${selected}' is not online, so this command was not run as it. Bring it online with 'cello start-agent ${selected}' (or select another with 'cello use-agent <name>'). It is NOT auto-started here: that would silently undo a deliberate 'cello stop-agent'.`,
+            opts,
+          );
+        }
+        // The agent is online — claim it for this connection. A refusal (retired/unknown) stops the
+        // command: continuing would let the sole-online fallback run it as a DIFFERENT agent.
         const used = (await client.send("cello_use_agent", { name: selected })) as Record<string, unknown>;
-        if (used.ok !== true) return emitIpcResult(used, opts);
+        if (used.ok !== true) {
+          // Defensive: cello_use_agent is ok-bearing on every path today, but if it ever returned an
+          // ok-less body, emitIpcResult would print IT as this command's successful result. Fail loud
+          // on any shape that is not an explicit ok:false, rather than pass off the wrong body.
+          if (used.ok === false) return emitIpcResult(used, opts);
+          return emitTransportError(
+            "unexpected_replay_response",
+            `Selecting agent '${selected}' returned an unrecognized response, so the command was not run. This is a daemon/CLI version mismatch — check 'cello status'.`,
+            opts,
+          );
+        }
       }
       // No selection at all → send nothing, and let the daemon apply its own documented fallback
       // (sole online agent; ambiguous → no_current_agent). Guessing here would misroute.
@@ -118,6 +178,17 @@ async function withDaemon(
   } finally {
     client.close();
   }
+}
+
+/**
+ * Is this agent currently ONLINE? Asked via cello_list_agents (a real handler, no new IPC path) so
+ * the replay can refuse to auto-start a stopped agent (review F1). Fails CLOSED: any unexpected
+ * shape reads as "not online", which fails the command loud rather than resurrecting an agent the
+ * operator deliberately stopped.
+ */
+async function isAgentOnline(client: IpcClient, name: string): Promise<boolean> {
+  const res = (await client.send("cello_list_agents")) as { agents?: Array<{ name?: string; state?: string }> };
+  return (res.agents ?? []).some((a) => a.name === name && a.state === "online");
 }
 
 /** The common case: one IPC call, agent-scoped unless stated otherwise. */
@@ -138,21 +209,62 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined));
 }
 
+/**
+ * The ONE place a CLI command's daemon IPC method is named (review T2).
+ *
+ * The registry's `ipcMethod` field is set FROM this map, and every function below dispatches FROM
+ * this map — so the field that DoD §9's parity test audits is, by construction, the literal that is
+ * actually sent. Previously the two were independent strings: the registry could say
+ * `cello_contact_set_moniker` while the code called `cello_contact_set_away`, and the audit — which
+ * only read the metadata — would happily pass. A comment-in-a-field is not a guarantee; this is.
+ */
+export const IPC_METHODS = {
+  agents: "cello_list_agents",
+  "start-agent": "cello_start_agent",
+  "stop-agent": "cello_stop_agent",
+  "use-agent": "cello_use_agent",
+  inbox: "cello_check_notifications",
+  transcript: "cello_get_transcript",
+  "sealed-receipt": "cello_get_sealed_receipt",
+  initiate: "cello_initiate_session",
+  send: "cello_send",
+  receive: "cello_receive",
+  "receive-session": "cello_receive_session",
+  close: "cello_close_session",
+  "await-session": "cello_await_session",
+  "contact-add": "cello_contact_add",
+  "contact-remove": "cello_contact_remove",
+  "contact-list": "cello_contact_list",
+  "contact-set-tier": "cello_contact_set_tier",
+  "contact-set-away": "cello_contact_set_away",
+  "contact-set-moniker": "cello_contact_set_moniker",
+} as const;
+
 // ─── Group A: agent lifecycle ──────────────────────────────────────────────────────────────────
 
 /** `cello agents` → cello_list_agents. Daemon-wide, not agent-scoped. */
 export function listAgents(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_list_agents", {}, opts, false);
+  return ipcCommand(celloDir, IPC_METHODS.agents, {}, opts, false);
 }
 
 /** `cello start-agent <name>` → cello_start_agent. Brings an agent online WITHOUT claiming current. */
 export function startAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_start_agent", { name }, opts, false);
+  return ipcCommand(celloDir, IPC_METHODS["start-agent"], { name }, opts, false);
 }
 
-/** `cello stop-agent <name>` → cello_stop_agent. */
-export function stopAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_stop_agent", { name }, opts, false);
+/**
+ * `cello stop-agent <name>` → cello_stop_agent.
+ *
+ * Also CLEARS the persisted selection when it names this agent (review F1). The daemon clears a
+ * stopped agent from every connection's current-agent state; the CLI's durable mirror of that state
+ * must follow, or the next command would try to act as an agent the operator just stopped.
+ */
+export async function stopAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
+  const out = await ipcCommand(celloDir, IPC_METHODS["stop-agent"], { name }, opts, false);
+  if (out.exitCode === 0 && (await readCurrentAgent(celloDir)) === name) {
+    await clearCurrentAgent(celloDir);
+  }
+  return out;
 }
 
 /**
@@ -162,7 +274,7 @@ export function stopAgent(celloDir: string, name: string, opts: ParityOptions): 
  * daemon refused.
  */
 export async function useAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
-  const out = await ipcCommand(celloDir, "cello_use_agent", { name }, opts, false);
+  const out = await ipcCommand(celloDir, IPC_METHODS["use-agent"], { name }, opts, false);
   if (out.exitCode === 0) await writeCurrentAgent(celloDir, name);
   return out;
 }
@@ -172,12 +284,12 @@ export function inbox(
   celloDir: string,
   opts: ParityOptions & { scope?: "current" | "all" },
 ): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_check_notifications", defined({ scope: opts.scope }), opts);
+  return ipcCommand(celloDir, IPC_METHODS.inbox, defined({ scope: opts.scope }), opts);
 }
 
 /** `cello transcript <session-id>` → cello_get_transcript (durable, survives a daemon restart). */
 export function transcript(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_get_transcript", { session_id: sessionId }, opts);
+  return ipcCommand(celloDir, IPC_METHODS.transcript, { session_id: sessionId }, opts);
 }
 
 /**
@@ -190,29 +302,51 @@ export function transcript(celloDir: string, sessionId: string, opts: ParityOpti
  * Added under the standing rule: a real, non-stub handler with no CLI command gets one.
  */
 export function sealedReceipt(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_get_sealed_receipt", { session_id: sessionId }, opts);
+  return ipcCommand(celloDir, IPC_METHODS["sealed-receipt"], { session_id: sessionId }, opts);
+}
+
+// Review F3: the WHOLE address book now speaks the §3 contract, not just the three new sub-verbs.
+// Previously add/remove/list/tier/away went through the legacy path (errors pretty-printed to
+// STDOUT, no --pretty) while the new set-moniker used the parity path (errors to stderr) — so a
+// bash script branching on stderr got DIFFERENT conventions between sub-verbs of the same command.
+// One command, one contract. (Behavior change, journaled: contact failures now print JSON on stderr
+// rather than stdout; the exit codes were already correct.)
+
+/** `cello contact add <pubkey>` → cello_contact_add. */
+export function contactAdd(celloDir: string, pubkey: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["contact-add"], { pubkey }, opts);
+}
+
+/** `cello contact remove <pubkey>` → cello_contact_remove. */
+export function contactRemove(celloDir: string, pubkey: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["contact-remove"], { pubkey }, opts);
+}
+
+/** `cello contact list` → cello_contact_list. */
+export function contactList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["contact-list"], {}, opts);
 }
 
 /** `cello contact set-tier <pubkey> <tier>` → cello_contact_set_tier. */
 export function contactSetTier(celloDir: string, pubkey: string, tier: number, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_contact_set_tier", { pubkey, tier }, opts);
+  return ipcCommand(celloDir, IPC_METHODS["contact-set-tier"], { pubkey, tier }, opts);
 }
 
 /** `cello contact set-away <pubkey> <message>` → cello_contact_set_away (empty message clears it). */
 export function contactSetAway(celloDir: string, pubkey: string, message: string | null, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_contact_set_away", { pubkey, message }, opts);
+  return ipcCommand(celloDir, IPC_METHODS["contact-set-away"], { pubkey, message }, opts);
 }
 
 /** `cello contact set-moniker <pubkey> <moniker>` → cello_contact_set_moniker (per-CONTACT pet name). */
 export function contactSetMoniker(celloDir: string, pubkey: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_contact_set_moniker", { pubkey, moniker }, opts);
+  return ipcCommand(celloDir, IPC_METHODS["contact-set-moniker"], { pubkey, moniker }, opts);
 }
 
 // ─── Group B: live conversation (mirrors the MCP params EXACTLY) ───────────────────────────────
 
 /** `cello initiate <target-pubkey>` → cello_initiate_session. Prints the session_id. */
 export function initiate(celloDir: string, targetPubkey: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_initiate_session", { target_pubkey: targetPubkey }, opts);
+  return ipcCommand(celloDir, IPC_METHODS.initiate, { target_pubkey: targetPubkey }, opts);
 }
 
 /**
@@ -279,7 +413,7 @@ export function closeSession(
   opts: ParityOptions & { force?: boolean },
 ): Promise<CliOutput> {
   const params = opts.force ? { session_id: sessionId, force: true } : { session_id: sessionId };
-  return ipcCommand(celloDir, "cello_close_session", params, opts);
+  return ipcCommand(celloDir, IPC_METHODS.close, params, opts);
 }
 
 /** `cello await-session [--timeout-ms N]` → cello_await_session. Blocks for an inbound doorbell. */
@@ -287,5 +421,5 @@ export function awaitSession(
   celloDir: string,
   opts: ParityOptions & { timeoutMs?: number },
 ): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_await_session", defined({ timeout_ms: opts.timeoutMs }), opts);
+  return ipcCommand(celloDir, IPC_METHODS["await-session"], defined({ timeout_ms: opts.timeoutMs }), opts);
 }

@@ -161,7 +161,30 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     expect(second.ok).toBe(true);
   });
 
-  it("C4/C5 (WhatsApp-group-chat model + SINCESEQ-gap regression lock): a second connection on the SAME agent+session is blocked by the first connection's OWN sent message; since_seq (received-only) does NOT unblock it, only cello_get_transcript does", async () => {
+  // ─── DOD-CURSOR-DURABLE-1 (2026-07-11, Andre's explicit go) — C4/C5/C6/C7 CHANGE ON PURPOSE ───
+  //
+  // These four clauses asserted that a connection is blocked by a message THIS AGENT SENT from a
+  // DIFFERENT local connection. That is no longer true, and the change is deliberate, not a
+  // regression. The gate now passes if EITHER the connection cursor is caught up (unchanged) OR the
+  // agent has no unread RECEIVED messages (new, durable, persisted).
+  //
+  // WHY the old rule had to go: the cursor is in-memory and per-connection. A stateless client — the
+  // `cello` CLI, a fresh process per command — always presents cursor -1, so it could never satisfy
+  // it. Once the counterparty spoke, EVERY CLI send was refused forever, even though the agent had
+  // demonstrably read the message. A bash agent could speak once and then never reply. The same bug
+  // silently hit any RECONNECTING MCP client (fresh connectionId → cursor -1).
+  //
+  // The line the gate now draws, exactly:
+  //   • unread COUNTERPARTY content still blocks — fully preserved, and now durable (C1, C2, C8,
+  //     and the D-clauses below). This is the guarantee that matters: never reply to something
+  //     nobody on your side has seen.
+  //   • a message YOUR OWN AGENT sent from another window no longer blocks — RELAXED. The agent
+  //     authored it; the daemon cannot referee which of an operator's own windows a human is
+  //     looking at, and a socket is not a trust boundary. The principal is the agent.
+  //
+  // The clauses below are rewritten to lock the NEW boundary — including, explicitly, that the
+  // counterparty half did NOT weaken.
+  it("C4/C5 (rewritten, DOD-CURSOR-DURABLE-1): a second connection on the same agent is NO LONGER blocked by the first connection's own SENT message — but IS still blocked by unread COUNTERPARTY content", async () => {
     await makeAgentDir("alice");
     const h = await start(noopLogger, new FakeNode());
     await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
@@ -172,23 +195,26 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
     expect(sendA.ok).toBe(true); // A's own send is never blocked
 
-    // B has read nothing — A's message is a "sent" (not "received") row for this agent, so it is
-    // invisible to B's since_seq batch by SINCESEQ's own received-only spec (the gap).
-    const bBlocked = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
-    expect(bBlocked).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
+    // THE DELIBERATE CHANGE: B has read nothing, but the only thing it hasn't seen is a message THIS
+    // AGENT sent. There is no unread counterparty content, so B may send. (Old behavior: refused.)
+    const bNowAllowed = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
+    expect(bNowAllowed.ok).toBe(true);
 
-    const sinceSeqAttempt = (await connB.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
-    expect(sinceSeqAttempt.count).toBe(0); // regression lock: since_seq alone cannot see A's sent message
+    // THE HALF THAT DID NOT WEAKEN: now the COUNTERPARTY speaks. Nobody on alice's side has read it.
+    const inbound = new TextEncoder().encode("from bob");
+    await h.getSessionNodeManager().ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-in");
 
-    const stillBlocked = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
-    expect(stillBlocked.reason).toBe("session_not_current"); // since_seq did NOT unblock B
+    const refused = (await connB.send("cello_send", { session_id: SID, content: "blind reply" })) as Record<string, unknown>;
+    expect(refused).toMatchObject({ ok: false, reason: "session_not_current" });
+    expect(refused.unread_received).toBe(1); // the gate names WHY: one unread counterparty message
 
-    await connB.send("cello_get_transcript", { session_id: SID }); // the correct catch-up path
-    const bNowOk = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
-    expect(bNowOk.ok).toBe(true);
+    // And connA — which also never read bob — is refused too. Unread counterparty content blocks
+    // EVERY connection on the agent, exactly as before.
+    const refusedA = (await connA.send("cello_send", { session_id: SID, content: "also blind" })) as Record<string, unknown>;
+    expect(refusedA).toMatchObject({ ok: false, reason: "session_not_current" });
   });
 
-  it("C6: the cursor is connection-scoped — a fresh connection starts at -1 even with existing history", async () => {
+  it("C6 (rewritten, DOD-CURSOR-DURABLE-1): a fresh connection is no longer blocked by the agent's OWN prior send — this is the stateless-CLI path (a new process per command)", async () => {
     await makeAgentDir("alice");
     const h = await start(noopLogger, new FakeNode());
     await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
@@ -198,9 +224,11 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     expect(sent.ok).toBe(true);
     conn1.close();
 
-    const conn2 = await connectAs("alice"); // brand-new connectionId, same agent+session
+    // Exactly what `cello send` does twice in a row: a brand-new connectionId, cursor -1, on a
+    // session that already has history. The only unread leaf is this agent's OWN message.
+    const conn2 = await connectAs("alice");
     const res = (await conn2.send("cello_send", { session_id: SID, content: "again" })) as Record<string, unknown>;
-    expect(res).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
+    expect(res.ok).toBe(true);
   });
 
   function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -230,15 +258,120 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     expect(recv.content).toBe("from counterparty");
     expect(recv.sequence_number).toBe(1);
 
-    // The bug: the old "advance to max observed" logic would set connB's cursor to 1 (having
-    // seen leaf 1), silently treating leaf 0 as read too. Fixed: connB must STILL be refused.
-    const stillBlocked = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
-    expect(stillBlocked).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 1, last_read_seq: -1 });
+    // DOD-CURSOR-DURABLE-1 (rewritten): connB has now READ the counterparty's message (leaf 1), so
+    // the durable clause is satisfied — there is no unread received content. The only leaf it has
+    // not seen is leaf 0, which THIS AGENT sent. Under the per-agent rule that no longer blocks, so
+    // the send is allowed. (Old behavior: refused, because the per-connection cursor was still -1.)
+    //
+    // The C7 hazard the original clause guarded — "advance to max observed silently marks an
+    // earlier leaf read" — is still guarded where it matters: safeCursorAdvance/safeWatermarkAdvance
+    // both refuse to vault past a gap, so an unread RECEIVED leaf can never be skipped. That is
+    // proved by D3 below (a hole in the transcript keeps the counterparty message unread).
+    const nowAllowed = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
+    expect(nowAllowed.ok).toBe(true);
+  });
 
-    // Only cello_get_transcript (full bidirectional history) correctly closes the gap.
-    await connB.send("cello_get_transcript", { session_id: SID });
-    const nowOk = (await connB.send("cello_send", { session_id: SID, content: "from B" })) as Record<string, unknown>;
-    expect(nowOk.ok).toBe(true);
+  // ─── DOD-CURSOR-DURABLE-1 — the new durable clauses ────────────────────────────────────────
+  describe("DOD-CURSOR-DURABLE-1: read-before-write survives the connection", () => {
+    it("D1 (the fix): a FRESH connection may send once the AGENT has read the counterparty — the stateless-CLI case", async () => {
+      await makeAgentDir("alice");
+      const h = await start(noopLogger, new FakeNode());
+      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      seedReceived("alice", SID, "hello from bob");
+
+      // Connection 1 = `cello receive`. It reads, advancing the PERSISTED watermark, then exits.
+      const reader = await connectAs("alice");
+      const got = (await reader.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
+      expect(got.count).toBe(1);
+      reader.close();
+
+      // Connection 2 = `cello send`, a brand-new process. Its cursor is -1 and always will be.
+      // Before this fix it was refused forever; now the agent's durable read unblocks it.
+      const sender = await connectAs("alice");
+      const res = (await sender.send("cello_send", { session_id: SID, content: "reply from bash" })) as Record<string, unknown>;
+      expect(res.ok).toBe(true);
+    });
+
+    it("D2 (the guarantee HOLDS): unread counterparty content still refuses a fresh connection — the fix is not a bypass", async () => {
+      await makeAgentDir("alice");
+      const h = await start(noopLogger, new FakeNode());
+      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      seedReceived("alice", SID, "hello from bob"); // NOBODY reads it
+
+      const sender = await connectAs("alice");
+      const res = (await sender.send("cello_send", { session_id: SID, content: "blind reply" })) as Record<string, unknown>;
+      expect(res).toMatchObject({ ok: false, reason: "session_not_current", unread_received: 1 });
+
+      // ...and it stays refused across a reconnect. The block is durable, not an artifact of one socket.
+      sender.close();
+      const sender2 = await connectAs("alice");
+      const again = (await sender2.send("cello_send", { session_id: SID, content: "still blind" })) as Record<string, unknown>;
+      expect(again).toMatchObject({ ok: false, reason: "session_not_current" });
+    });
+
+    it("D3 (AC3 + hole safety): cello_get_transcript advances the PERSISTED watermark, and a gap in the transcript keeps later messages unread", async () => {
+      await makeAgentDir("alice");
+      const h = await start(noopLogger, new FakeNode());
+      const snm = h.getSessionNodeManager();
+      await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+      // Attend FIRST (as C8 does): seeding while unattended trips M8C-AWAY-1's auto-ack, which
+      // appends its own SENT leaf and muddies the exact sequence numbers this clause is about.
+      const attendant = await connectAs("alice");
+
+      seedReceived("alice", SID, "bob 1"); // received leaf 0
+      expect(snm.getLastDeliveredSeq("alice", SID)).toBe(-1); // nothing read yet
+
+      // A fresh connection reads the TRANSCRIPT (not cello_receive) — the remedy the gate's guidance
+      // names. Before AC3 this advanced only the dying connection cursor, so the next process was
+      // still blocked and the documented remedy was a dead end for any stateless client.
+      const reader = await connectAs("alice");
+      await reader.send("cello_get_transcript", { session_id: SID });
+      reader.close();
+      expect(snm.getLastDeliveredSeq("alice", SID)).toBe(0); // PERSISTED — survives the socket
+      expect(snm.getUnreadReceivedCount("alice", SID)).toBe(0);
+
+      const sender = await connectAs("alice");
+      const res = (await sender.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
+      expect(res.ok).toBe(true); // sent leaf (seq 2 after the reply)
+
+      // Hole safety: append a leaf with NO transcript row (the shape an undecryptable/failed write
+      // leaves), then a real received message BEYOND it. The contiguous walk must stop at the gap,
+      // so the later counterparty message can never be silently marked read.
+      snm.appendSessionLeaf("alice", SID, "msg", "bb".repeat(32), "hole"); // no transcript row
+      const bob2Seq = seedReceived("alice", SID, "bob 2 (beyond the hole)");
+
+      const reader2 = await connectAs("alice");
+      await reader2.send("cello_get_transcript", { session_id: SID });
+      // The walk may advance THROUGH rows it actually saw (the reply it sent), but it must STOP at
+      // the hole — so the watermark never reaches bob 2, and bob 2 stays unread. That is the whole
+      // point: a message the agent has not seen cannot be marked read by a gap.
+      expect(snm.getLastDeliveredSeq("alice", SID)).toBeLessThan(bob2Seq);
+      expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0); // "bob 2" still unread
+
+      // ...and because it is still unread, the gate still refuses the send. Hole safety is not
+      // cosmetic — it is what stops the fix becoming a bypass.
+      const refused = (await reader2.send("cello_send", { session_id: SID, content: "blind" })) as Record<string, unknown>;
+      expect(refused).toMatchObject({ ok: false, reason: "session_not_current" });
+      attendant.close();
+    });
+
+    it("D4 (the safety property): the long-lived single-connection path is UNCHANGED — read-then-send behaves exactly as before", async () => {
+      await makeAgentDir("alice");
+      const h = await start(noopLogger, new FakeNode());
+      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      seedReceived("alice", SID, "hello from bob");
+
+      // This is the MCP shim's shape: ONE socket for the whole session. It is refused before reading
+      // and allowed after — identical to pre-fix behavior, satisfied by the connection-cursor clause.
+      const mcp = await connectAs("alice");
+      const blocked = (await mcp.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
+      expect(blocked).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
+
+      await mcp.send("cello_get_transcript", { session_id: SID });
+      const ok = (await mcp.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
+      expect(ok.ok).toBe(true);
+    });
   });
 
   it("C8 (reviewer finding, per-session isolation): one connection attending two different sessions — advancing one's cursor must not unblock the other", async () => {

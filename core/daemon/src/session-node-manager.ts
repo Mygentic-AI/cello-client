@@ -903,6 +903,17 @@ export class SessionNodeManager {
     this.#logger.info("message.watermark.advanced", { agentName, sessionId, sequence: seq });
   }
 
+  /**
+   * The ONE definition of "unread" in this daemon: a RECEIVED transcript row whose sequence is
+   * beyond the agent's persisted read watermark. A constant, not a copy-pasted string, so the
+   * INBOX unread count and the DOD-CURSOR-DURABLE-1 read-before-write gate can never drift into
+   * disagreeing about what "unread" means — the gate deciding one thing while the inbox shows
+   * another is precisely the bug this shape prevents. Interpolated SQL only (no user input).
+   */
+  static readonly #UNREAD_RECEIVED_WHERE = `
+           t.direction = 'received'
+           AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
+
   /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
    *  messages beyond the read watermark. Content-free (counts + ids + last seq, never message text);
    *  a COUNT/MAX query, no decrypt. Only sessions with unread_count > 0 are returned. */
@@ -917,14 +928,41 @@ export class SessionNodeManager {
          LEFT JOIN message_watermarks w
            ON w.agent_id = t.agent_id AND w.session_id = t.session_id
          WHERE t.agent_id = ?
-           AND t.direction = 'received'
-           AND t.sequence > COALESCE(w.last_delivered_seq, -1)
+           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}
          GROUP BY t.session_id
          HAVING unread_count > 0
          ORDER BY t.session_id ASC`,
       )
       .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
     return rows;
+  }
+
+  /**
+   * DOD-CURSOR-DURABLE-1: how many RECEIVED messages in THIS session the agent has not read —
+   * the durable half of the read-before-write gate. Same predicate as getUnreadSummary (shared
+   * constant above), scoped to one session.
+   *
+   * This is DURABLE and PER-AGENT, where the send gate's other authority (the connection cursor) is
+   * in-memory and per-connection. It is what lets a stateless client — the `cello` CLI, one process
+   * per command — prove it has read the counterparty, which a dead socket's cursor never can.
+   *
+   * FAILS CLOSED: an uninitialized DB returns a positive count (treated as "unread"), never 0. A 0
+   * here unblocks a send; guessing 0 from a broken DB would silently defeat the gate.
+   */
+  getUnreadReceivedCount(agentName: string, sessionId: string): number {
+    if (!this.#db) return 1; // fail closed — never unblock a send because the DB is unavailable
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS unread_count
+         FROM transcript t
+         LEFT JOIN message_watermarks w
+           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
+         WHERE t.agent_id = ?
+           AND t.session_id = ?
+           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}`,
+      )
+      .get(this.#requireAgentId(agentName), sessionId) as { unread_count: number } | undefined;
+    return row ? row.unread_count : 0;
   }
 
   /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */

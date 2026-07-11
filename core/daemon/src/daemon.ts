@@ -941,6 +941,23 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     advanceConnectionCursor(connectionId, sessionId, cursor);
   }
 
+  /**
+   * DOD-CURSOR-DURABLE-1: the same hole-safe walk, applied to the PERSISTED per-(agent, session)
+   * read watermark. Used by cello_get_transcript, whose delivery covers BOTH directions.
+   *
+   * Walks a CONTIGUOUS run from the agent's current watermark, stopping at the first gap — for the
+   * identical reason safeCursorAdvance does: leaf indices are contiguous across both directions, so
+   * a gap can hide an unread RECEIVED message (e.g. a row that failed to decrypt is absent from
+   * `messages`). Advancing past it would mark unseen counterparty content as read and unblock a
+   * send that never saw it — defeating the very guarantee this gate exists to enforce. Monotonic:
+   * advanceLastDeliveredSeq takes MAX, so this can never lower a watermark.
+   */
+  function safeWatermarkAdvance(agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>): void {
+    let frontier = sessionNodeManager.getLastDeliveredSeq(agentName, sessionId);
+    while (deliveredSeqs.has(frontier + 1)) frontier += 1;
+    if (frontier >= 0) sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, frontier);
+  }
+
   // M8C-AWAY-1: away response — an unattended Primary auto-answers session requests + messages
   // with the default transparent away text and queues them (the DoD's own mandated default).
   // CORE ships now; the operator-configurable custom-text / opaque-privacy-mode SWITCH is PARKED
@@ -3745,7 +3762,16 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // reviewer HIGH finding (aa5928e2/a9099571): recordTranscriptMessage swallows a DB write
     // failure without rolling back the tree's leaf count, so a hole in `messages` is possible in
     // principle; the contiguous-run walk refuses to vault the cursor past such a hole even here.
-    safeCursorAdvance(connectionId, sessionId, new Set(messages.map((m) => m.sequence)));
+    const deliveredSeqs = new Set(messages.map((m) => m.sequence));
+    safeCursorAdvance(connectionId, sessionId, deliveredSeqs);
+    // DOD-CURSOR-DURABLE-1 (AC3): reading the full history IS reading — so this must advance the
+    // PERSISTED watermark too, not just this connection's in-memory cursor. Previously it advanced
+    // only the cursor, which made the gate's own guidance ("call cello_get_transcript, then retry")
+    // a dead end for any stateless client: a fresh process reads the transcript, exits, and the next
+    // process still presents an unread count. Same contiguous-run safety as the cursor — never vault
+    // past a gap (an undecryptable row is absent from `messages`, so the walk stops there and those
+    // messages correctly stay unread).
+    safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
     return { ok: true, session_id: sessionId, messages, undecryptable };
   });
 
@@ -5523,18 +5549,52 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // rather than let it send blind — the WhatsApp-group-chat model. Runs BEFORE M9's
     // governance-decisions parsing below — an access-control gate should short-circuit before any
     // unrelated prep work for a send that may not even be allowed to proceed.
+    // DOD-CURSOR-DURABLE-1: the gate now consults TWO authorities and passes if EITHER says the
+    // caller is caught up.
+    //
+    //   1. the connection cursor (in-memory, per-connection) — today's rule, UNCHANGED. A
+    //      long-lived client (the MCP shim, one socket for the whole session) satisfies this
+    //      exactly as before, so the shipped single-connection path is byte-for-byte identical.
+    //
+    //   2. the persisted per-(agent, session) read watermark — NEW. A STATELESS client (the `cello`
+    //      CLI runs a fresh process, and therefore a fresh connection, per command) always presents
+    //      cursor -1, so authority 1 can never be satisfied by it: after the counterparty spoke
+    //      once, every CLI send was refused forever, even though the agent had demonstrably read
+    //      the message. That made a two-way conversation impossible from bash — and it silently hit
+    //      any RECONNECTING MCP client too, whose fresh connectionId also resets the cursor to -1.
+    //
+    // What the gate protects, precisely: an agent must never reply to COUNTERPARTY content nobody
+    // on its side has seen. That guarantee is preserved and is now durable — it survives the socket.
+    //
+    // What it deliberately no longer protects (the approved trade — see
+    // 2026-07-11_cursor-durable-read-before-write-design.md §6, Andre's go): a message this agent
+    // SENT from a DIFFERENT local connection no longer blocks. Two attended windows on one agent
+    // used to gate each other; now they do not, because a locally-authored message is not "unread
+    // counterparty content" — the AGENT wrote it. The principal here is the agent, not the socket,
+    // and the daemon cannot referee which of an operator's own windows a human is looking at.
     const currentSeq = record.message_count - 1;
-    const lastReadSeq = getConnectionCursor(connectionId, sessionId);
-    if (lastReadSeq < currentSeq) {
+    const connectionCursor = getConnectionCursor(connectionId, sessionId);
+    const unreadReceived = sessionNodeManager.getUnreadReceivedCount(agentName, sessionId);
+    const caughtUp = connectionCursor >= currentSeq || unreadReceived === 0;
+    if (!caughtUp) {
       // M8C-CURSOR-1 (reviewer MEDIUM fix): every sibling rejection in this handler logs; this
       // gate must too — a security-relevant control-flow path with no observability is a gap.
-      logger.warn("session.send.blocked", { sessionId, currentSeq, lastReadSeq, connectionId });
+      // Both authorities are logged, so the next reader can tell WHICH one refused.
+      logger.warn("session.send.blocked", {
+        sessionId,
+        currentSeq,
+        lastReadSeq: connectionCursor,
+        unreadReceived,
+        connectionId,
+        agentName,
+      });
       return {
         ok: false,
         reason: "session_not_current",
         current_seq: currentSeq,
-        last_read_seq: lastReadSeq,
-        guidance: `This connection hasn't caught up on session ${sessionId} — ${currentSeq - lastReadSeq} message(s) unread (this may include messages authored by another connection on this same agent). Call cello_get_transcript to read the full history (covers both sent and received), then retry the send.`,
+        last_read_seq: connectionCursor,
+        unread_received: unreadReceived,
+        guidance: `This agent hasn't read ${unreadReceived} received message(s) on session ${sessionId}. Call cello_receive (or cello_get_transcript for the full history) to read them, then retry the send.`,
       };
     }
 

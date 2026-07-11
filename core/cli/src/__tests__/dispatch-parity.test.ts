@@ -57,6 +57,12 @@ vi.mock("../parity-commands.js", async (importOriginal) => {
     inbox: stub(),
     transcript: stub(),
     contactSetMoniker: stub(),
+    contactAdd: stub(),
+    contactRemove: stub(),
+    contactList: stub(),
+    contactSetTier: stub(),
+    contactSetAway: stub(),
+    sealedReceipt: stub(),
     initiate: stub(),
     send: stub(),
     receive: stub(),
@@ -133,23 +139,26 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
   });
 
   it("contact: every sub-verb routes to its OWN function (not a neighbour)", async () => {
+    // Review F3: the whole address book now goes through the §3 parity path (one command, one
+    // contract) — errors on stderr, --pretty available — instead of half legacy / half parity.
+    const o = { agent: undefined, pretty: false };
     await run("contact", ["add", "pk1", "--agent", "alice"]);
-    expect(commands.contactAdd).toHaveBeenCalledWith(CELLO_DIR, "pk1", "alice");
+    expect(parity.contactAdd).toHaveBeenCalledWith(CELLO_DIR, "pk1", { agent: "alice", pretty: false });
 
     await run("contact", ["remove", "pk1"]);
-    expect(commands.contactRemove).toHaveBeenCalledWith(CELLO_DIR, "pk1", undefined);
+    expect(parity.contactRemove).toHaveBeenCalledWith(CELLO_DIR, "pk1", o);
 
     await run("contact", ["list", "--agent", "alice"]);
-    expect(commands.contactList).toHaveBeenCalledWith(CELLO_DIR, "alice");
+    expect(parity.contactList).toHaveBeenCalledWith(CELLO_DIR, { agent: "alice", pretty: false });
 
     await run("contact", ["tier", "pk1", "3"]);
-    expect(commands.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 3, undefined);
+    expect(parity.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 3, o);
 
     await run("contact", ["away", "pk1", "back", "on", "Monday"]);
-    expect(commands.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "back on Monday", undefined);
+    expect(parity.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "back on Monday", o);
 
     await run("contact", ["away", "pk1"]); // empty message → CLEAR (null), not ""
-    expect(commands.contactSetAway).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, undefined);
+    expect(parity.contactSetAway).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, o);
   });
 
   it("settings / moniker: sub-verbs and the clear path", async () => {
@@ -202,8 +211,26 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.inbox).toHaveBeenCalledWith(CELLO_DIR, { agent: undefined, pretty: false, scope: "all" });
     await run("inbox", []);
     expect(parity.inbox).toHaveBeenLastCalledWith(CELLO_DIR, { agent: undefined, pretty: false, scope: undefined });
-    await run("inbox", ["--scope", "sideways", "--agent", "alice"]);
-    expect(parity.inbox).toHaveBeenLastCalledWith(CELLO_DIR, { agent: "alice", pretty: false, scope: undefined });
+    // Review F6: an unrecognized scope FAILS LOUD — it is not silently downgraded to `current`,
+    // which would answer a question the operator never asked (and hide another agent's inbox).
+    const bad = await findCommand("inbox")!.run(ctx, ["--scope", "sideways"]);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stdout).toBe("");
+    expect(JSON.parse(bad.stderr)).toMatchObject({ ok: false, reason: "invalid_flag_value", flag: "--scope" });
+  });
+
+  it("F5: a NON-NUMERIC numeric flag fails loud — it never silently changes what the command does", async () => {
+    // --since-seq abc used to be dropped, turning a catch-up BATCH into a 30s blocking live wait
+    // that answers "nothing new" to a question that was never asked.
+    const bad = await findCommand("receive")!.run(ctx, ["sid1", "--since-seq", "abc"]);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stdout).toBe("");
+    expect(JSON.parse(bad.stderr)).toMatchObject({ ok: false, reason: "invalid_flag_value", flag: "--since-seq" });
+    expect(parity.receive).not.toHaveBeenCalled(); // the command was NOT run
+
+    const badTimeout = await findCommand("await-session")!.run(ctx, ["--timeout-ms", "soon"]);
+    expect(badTimeout.exitCode).toBe(1);
+    expect(parity.awaitSession).not.toHaveBeenCalled();
   });
 
   it("send: message is the remaining args joined; --agent and --pretty are not part of it", async () => {
@@ -245,18 +272,24 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     // These two are easy to conflate — conflating them would rename YOUR agent instead of tagging a
     // contact, and both "succeed". The registry must keep them apart.
     await run("contact", ["set-moniker", "pk1", "Sup"]);
-    expect(parity.contactSetMoniker).toHaveBeenCalledWith(CELLO_DIR, "pk1", "Sup", { agent: undefined });
+    expect(parity.contactSetMoniker).toHaveBeenCalledWith(CELLO_DIR, "pk1", "Sup", { agent: undefined, pretty: false });
     expect(commands.monikerSet).not.toHaveBeenCalled();
 
     await run("contact", ["set-moniker", "pk1"]); // empty → clear
-    expect(parity.contactSetMoniker).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, { agent: undefined });
+    expect(parity.contactSetMoniker).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, { agent: undefined, pretty: false });
   });
 
   it("set-tier / set-away are accepted, and the legacy tier / away verbs still work", async () => {
+    const o = { agent: undefined, pretty: false };
     await run("contact", ["set-tier", "pk1", "4"]);
-    expect(commands.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 4, undefined);
+    expect(parity.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 4, o);
     await run("contact", ["set-away", "pk1", "on", "leave"]);
-    expect(commands.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "on leave", undefined);
+    expect(parity.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "on leave", o);
+  });
+
+  it("sealed-receipt dispatches (review T1: it had NO behavioral coverage at all)", async () => {
+    await run("sealed-receipt", ["sid9", "--agent", "alice"]);
+    expect(parity.sealedReceipt).toHaveBeenCalledWith(CELLO_DIR, "sid9", { agent: "alice", pretty: false });
   });
 });
 

@@ -25,11 +25,6 @@ import {
   relayReceipts,
   sessions,
   type SessionFilter,
-  contactAdd,
-  contactRemove,
-  contactList,
-  contactSetTier,
-  contactSetAway,
   settingsGet,
   settingsSet,
   monikerSet,
@@ -38,6 +33,12 @@ import {
 } from "./commands.js";
 import { splitAgentFlag } from "./arg-parse.js";
 import {
+  IPC_METHODS,
+  contactAdd,
+  contactRemove,
+  contactList,
+  contactSetTier,
+  contactSetAway,
   listAgents,
   startAgent,
   stopAgent,
@@ -120,10 +121,45 @@ function takeValueFlag(args: string[], flag: string): { value?: string; rest: st
   return { value: args[i + 1], rest: args.filter((_, j) => j !== i && j !== i + 1) };
 }
 
-function numberOrUndefined(raw: string | undefined): number | undefined {
+/**
+ * Review F5 — a numeric flag given a NON-NUMERIC value must fail loud, never be silently dropped.
+ *
+ * `--since-seq abc` used to parse to undefined, which `defined()` then removed, which turned a
+ * stateless CATCH-UP into a 30-second BLOCKING live wait that returns `content: null` — so a script
+ * asking "what did I miss?" was answered "nothing new" to a question it never asked. Silently
+ * changing the meaning of a command is worse than refusing it.
+ *
+ * Throws a BadFlagValue, which run() converts to a structured error + exit 1.
+ */
+class BadFlagValue extends Error {
+  constructor(readonly flag: string, readonly value: string) {
+    super(`${flag} expects a number, got '${value}'`);
+  }
+}
+
+function numberOrUndefined(raw: string | undefined, flag: string): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
-  return Number.isFinite(n) ? n : undefined;
+  if (!Number.isFinite(n)) throw new BadFlagValue(flag, raw);
+  return n;
+}
+
+/** Turn a BadFlagValue into the §3 structured error; rethrow anything else. */
+function flagError(err: unknown): CliOutput {
+  if (err instanceof BadFlagValue) {
+    return {
+      stdout: "",
+      stderr: JSON.stringify({
+        ok: false,
+        reason: "invalid_flag_value",
+        flag: err.flag,
+        value: err.value,
+        guidance: `${err.flag} expects a number. Got '${err.value}'. The command was NOT run — a dropped flag would have silently changed what it does.`,
+      }),
+      exitCode: 1,
+    };
+  }
+  throw err;
 }
 
 /** Adapt a legacy CommandResult (single `output` string, always stdout) to the CliOutput triple. */
@@ -273,28 +309,30 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  ('tier' and 'away' remain accepted as aliases of set-tier / set-away.)\n" +
       "  Example:  cello contact list --agent alice",
     flags: AGENT_FLAG,
+    jsonOut: true, // review F3: the WHOLE address book honors §3 — one command, one contract
     async run(ctx, args) {
-      const { agent, positional } = splitAgentFlag(args);
+      const { agent, pretty, positional } = parityOpts(args);
+      const o = { agent, pretty };
       const [sub, pubkey, valueArg] = positional;
-      if (sub === "add" && pubkey) return legacy(await contactAdd(ctx.celloDir, pubkey, agent));
-      if (sub === "remove" && pubkey) return legacy(await contactRemove(ctx.celloDir, pubkey, agent));
-      if (sub === "list") return legacy(await contactList(ctx.celloDir, agent));
+      if (sub === "add" && pubkey) return contactAdd(ctx.celloDir, pubkey, o);
+      if (sub === "remove" && pubkey) return contactRemove(ctx.celloDir, pubkey, o);
+      if (sub === "list") return contactList(ctx.celloDir, o);
       // set-tier / set-away are the DOD-CLI-PARITY-1 names; tier / away are the pre-existing verbs,
       // kept as aliases so no existing script or muscle-memory breaks.
       if ((sub === "set-tier" || sub === "tier") && pubkey && valueArg !== undefined) {
         // Daemon validates the value; a non-numeric arg surfaces as its invalid_tier verdict.
-        return legacy(await contactSetTier(ctx.celloDir, pubkey, Number(valueArg), agent));
+        return contactSetTier(ctx.celloDir, pubkey, Number(valueArg), o);
       }
       if ((sub === "set-away" || sub === "away") && pubkey) {
         // The rest of the args form the away text; empty → clear.
         const message = positional.slice(2).join(" ");
-        return legacy(await contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, agent));
+        return contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, o);
       }
       if (sub === "set-moniker" && pubkey) {
         // DOD-CLI-PARITY-1: the per-CONTACT pet name (cello_contact_set_moniker) — was MCP-only.
         // Empty → null clears it, mirroring the tool.
         const moniker = positional.slice(2).join(" ");
-        return contactSetMoniker(ctx.celloDir, pubkey, moniker.length > 0 ? moniker : null, { agent });
+        return contactSetMoniker(ctx.celloDir, pubkey, moniker.length > 0 ? moniker : null, o);
       }
       return {
         stdout: helpForSpec("contact"),
@@ -402,7 +440,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     help:
       "Usage: cello agents [--pretty]  — list all loaded agents (name, state).\n" +
       "  The CLI twin of the cello_list_agents MCP tool. Prints JSON; use --pretty for humans.",
-    ipcMethod: "cello_list_agents",
+    ipcMethod: IPC_METHODS.agents,
     jsonOut: true,
     async run(ctx, args) {
       const { pretty } = parityOpts(args);
@@ -416,7 +454,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "Usage: cello start-agent <name> [--pretty]  — bring a registered agent ONLINE.\n" +
       "  Does NOT select it as the current agent — use 'cello use-agent <name>' for that.\n" +
       "  Idempotent: starting an already-online agent is safe.",
-    ipcMethod: "cello_start_agent",
+    ipcMethod: IPC_METHODS["start-agent"],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
@@ -427,7 +465,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: "stop-agent",
     summary: "Take an agent offline.",
     help: "Usage: cello stop-agent <name> [--pretty]  — take an agent offline.",
-    ipcMethod: "cello_stop_agent",
+    ipcMethod: IPC_METHODS["stop-agent"],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
@@ -444,7 +482,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  each CLI command opens its own daemon connection — a selection that lived only on the socket\n" +
       "  would vanish the moment the command exited. Override per-command with '--agent <name>'.\n" +
       "  A selection the daemon rejects is not recorded.",
-    ipcMethod: "cello_use_agent",
+    ipcMethod: IPC_METHODS["use-agent"],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
@@ -462,13 +500,28 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--agent", consumesValue: false },
       { name: "--scope", consumesValue: true },
     ],
-    ipcMethod: "cello_check_notifications",
+    ipcMethod: IPC_METHODS.inbox,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const { value } = takeValueFlag(positional, "--scope");
-      const scope = value === "all" ? "all" : value === "current" ? "current" : undefined;
-      return inbox(ctx.celloDir, { agent, pretty, scope });
+      // Review F6: an UNRECOGNIZED scope must not silently become the default. A typo'd
+      // `--scope all` (e.g. "al") would have answered with `current`'s data and exit 0 — the
+      // operator reads "no notifications" while another agent's inbox is full.
+      if (value !== undefined && value !== "all" && value !== "current") {
+        return {
+          stdout: "",
+          stderr: JSON.stringify({
+            ok: false,
+            reason: "invalid_flag_value",
+            flag: "--scope",
+            value,
+            guidance: "--scope must be 'current' or 'all'. The command was NOT run — answering a different question than the one asked is worse than refusing.",
+          }),
+          exitCode: 1,
+        };
+      }
+      return inbox(ctx.celloDir, { agent, pretty, scope: value });
     },
   },
   {
@@ -479,7 +532,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  Sent AND received messages in order; survives a daemon restart. This is also how you satisfy\n" +
       "  read-before-write after being away: read it, then 'cello send' is accepted.",
     flags: AGENT_FLAG,
-    ipcMethod: "cello_get_transcript",
+    ipcMethod: IPC_METHODS.transcript,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -497,7 +550,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  unanswered final message reads as delivered-but-unanswered, never as agreement.\n" +
       "  Distinct from 'cello receipts <name>', which lists RELAY ORDERING receipts (a different thing).",
     flags: AGENT_FLAG,
-    ipcMethod: "cello_get_sealed_receipt",
+    ipcMethod: IPC_METHODS["sealed-receipt"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -514,7 +567,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  <target-pubkey> is the counterparty's hex public key. Prints the session_id you then pass to\n" +
       "  'cello send' / 'cello receive' / 'cello close'. Adds the counterparty to your address book.",
     flags: AGENT_FLAG,
-    ipcMethod: "cello_initiate_session",
+    ipcMethod: IPC_METHODS.initiate,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -534,7 +587,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--agent", consumesValue: false },
       { name: "--stdin", consumesValue: false },
     ],
-    ipcMethod: "cello_send",
+    ipcMethod: IPC_METHODS.send,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -558,18 +611,22 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--timeout-ms", consumesValue: true },
       { name: "--since-seq", consumesValue: true },
     ],
-    ipcMethod: "cello_receive",
+    ipcMethod: IPC_METHODS.receive,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const since = takeValueFlag(positional, "--since-seq");
       const timeout = takeValueFlag(since.rest, "--timeout-ms");
-      return receive(ctx.celloDir, timeout.rest[0] ?? "", {
-        agent,
-        pretty,
-        sinceSeq: numberOrUndefined(since.value),
-        timeoutMs: numberOrUndefined(timeout.value),
-      });
+      try {
+        return await receive(ctx.celloDir, timeout.rest[0] ?? "", {
+          agent,
+          pretty,
+          sinceSeq: numberOrUndefined(since.value, "--since-seq"),
+          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
+        });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
     },
   },
   {
@@ -579,16 +636,20 @@ export const COMMANDS: readonly CommandSpec[] = [
       "Usage: cello receive-session <session-id> [--timeout-ms N] [--agent <name>] [--pretty]\n" +
       "  Joins an inbound session (the one 'cello await-session' told you about).",
     flags: AGENT_AND_TIMEOUT,
-    ipcMethod: "cello_receive_session",
+    ipcMethod: IPC_METHODS["receive-session"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const timeout = takeValueFlag(positional, "--timeout-ms");
-      return receiveSession(ctx.celloDir, timeout.rest[0] ?? "", {
-        agent,
-        pretty,
-        timeoutMs: numberOrUndefined(timeout.value),
-      });
+      try {
+        return await receiveSession(ctx.celloDir, timeout.rest[0] ?? "", {
+          agent,
+          pretty,
+          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
+        });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
     },
   },
   {
@@ -603,7 +664,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--agent", consumesValue: false },
       { name: "--force", consumesValue: false },
     ],
-    ipcMethod: "cello_close_session",
+    ipcMethod: IPC_METHODS.close,
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -621,12 +682,16 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  On expiry it returns {\"type\":\"timeout\"} and exits 0 — a timeout is a normal answer, not an\n" +
       "  error (this mirrors cello_await_session exactly). Branch on .type in scripts.",
     flags: AGENT_AND_TIMEOUT,
-    ipcMethod: "cello_await_session",
+    ipcMethod: IPC_METHODS["await-session"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const timeout = takeValueFlag(positional, "--timeout-ms");
-      return awaitSession(ctx.celloDir, { agent, pretty, timeoutMs: numberOrUndefined(timeout.value) });
+      try {
+        return await awaitSession(ctx.celloDir, { agent, pretty, timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms") });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
     },
   },
 ];
