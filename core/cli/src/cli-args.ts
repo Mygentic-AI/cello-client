@@ -49,7 +49,7 @@ export const USAGE =
   // promise the binary does not keep, made to precisely the reader who would script against it.
   "The session and agent commands (agents, use-agent, initiate-session, send, receive, close-session,\n" +
   "…) print JSON and exit non-zero on failure, so any bash-capable agent can drive CELLO with no MCP\n" +
-  "dependency. Every command here is also an MCP tool of the same name: cello send ↔ cello_send.";
+  "dependency. Where a command has an MCP tool, it carries the SAME name: cello send ↔ cello_send.";
 
 /** Per-command help — the registry entry's own text, verbatim. */
 export function helpForCommand(command: string): string {

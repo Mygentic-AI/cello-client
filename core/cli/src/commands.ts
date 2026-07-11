@@ -237,7 +237,7 @@ export async function register(
   if (!preAuthToken) {
     return {
       exitCode: 1,
-      output: `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register ${agent}\nThe token is single-use and expires in 24 hours.`,
+      output: `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register-agent ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register-agent ${agent}\nThe token is single-use and expires in 24 hours.`,
     };
   }
   // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
@@ -385,7 +385,8 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
  */
 export async function relayReceipts(celloDir: string, name: string): Promise<CommandResult> {
   if (!name) {
-    return { exitCode: 1, output: "Usage: cello receipts <name>  — list the agent's stored relay ordering receipts." };
+    return { exitCode: 1, output: "Usage: cello relay-receipts <name>  — ADVANCED/DEBUG: the per-message proofs a relay signed when it "
+        + "delivered for this agent. For a session's notarized seal, use 'cello sealed-receipt <session-id>'." };
   }
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);

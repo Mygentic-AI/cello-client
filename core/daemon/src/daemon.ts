@@ -2360,7 +2360,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       const reg = await new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName: name, logger }).loadRegistrationState();
       if (!reg || reg.status !== "active") {
         result["warning"] = "not_registered";
-        result["warning_guidance"] = `Agent '${name}' is now selected but is not registered with the directory — run 'cello register ${name}' to enable sessions with peers. Run 'cello status' to watch registration complete.`;
+        result["warning_guidance"] = `Agent '${name}' is now selected but is not registered with the directory — run 'cello register-agent ${name}' to enable sessions with peers. Run 'cello status' to watch registration complete.`;
       }
     } catch (err: unknown) {
       // A failed registration read must not break selection (the agent IS selected). Log the real
@@ -2420,7 +2420,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const keyProvider = keyProviders.get(name);
     if (!keyProvider) {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with 'cello create-agent'('${name}') (or 'cello create-agent ${name}'), then retry 'cello register-agent'.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with 'cello create-agent ${name}', then retry 'cello register-agent'.` };
     }
     if (!directoryEndpointResolver) {
       return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };
@@ -6017,6 +6017,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // M8C-CONTACT-1: cello contact add/remove/list [--agent <name>]. All three resolve the target
   // agent the same way — an explicit params.agent, else this connection's current/sole-online
   // agent (F18) — so a CLI/AI operator gets the same no_current_agent guidance INBOX already uses.
+  /**
+   * Review finding 7 — a contact pubkey must LOOK like a pubkey, or the row can never work.
+   *
+   * The address-book handlers took `params.pubkey` as any string and stored it. So
+   * `cello contact tier add` — a plausible slip under the new `contact <pubkey> <op>` shape, where
+   * the FIRST positional is the pubkey — persisted a contact whose pubkey is the literal text
+   * "tier", and answered ok:true. Nothing would ever match it: it is not a key, so it can never be
+   * a counterparty. The operator is told they added someone; they added a typo.
+   *
+   * A key is 32 bytes, hex: 64 characters. Anything else is refused, loudly, with the value echoed
+   * so the slip is obvious. Returns null when the pubkey is absent — the caller's own
+   * missing_params check owns that case and says something more useful.
+   */
+  function invalidPubkey(pubkey: string | undefined): { ok: false; reason: string; guidance: string } | null {
+    if (pubkey === undefined) return null; // absent → the caller's missing_params check owns it
+    if (/^[0-9a-fA-F]{64}$/.test(pubkey)) return null;
+    return {
+      ok: false,
+      reason: "invalid_pubkey",
+      guidance: `'${pubkey}' is not a public key. A CELLO public key is 64 hex characters (32 bytes). Nothing was changed — storing it would create an address-book entry that can never match anyone. Note the argument order is 'cello contact <pubkey> <operation>'.`,
+    };
+  }
+
   function resolveContactAgent(connState: { currentAgent: string | null } | undefined, params?: Record<string, unknown>):
     { ok: true; agent: string } | { ok: false; reason: string; guidance: string } {
     const explicit = typeof params?.agent === "string" ? params.agent : undefined;
@@ -6034,6 +6057,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   handlers.set("cello_contact_add", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const badPubkey = invalidPubkey(pubkey);
+    if (badPubkey) return badPubkey;
     if (!pubkey) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) — the contact to add." };
     }
@@ -6071,6 +6096,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // key is NOT a clear (Entry-66-F3): a request that omits it is malformed and rejected.
   handlers.set("cello_contact_set_moniker", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const badPubkey = invalidPubkey(pubkey);
+    if (badPubkey) return badPubkey;
     if (!pubkey || !params || !("moniker" in params)) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'moniker' — a string to set the pet name, or null to clear it." };
     }
@@ -6096,6 +6123,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // (0..4) — an unknown value is REFUSED, never coerced. Emits contact.tier.changed (old→new).
   handlers.set("cello_contact_set_tier", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const badPubkey = invalidPubkey(pubkey);
+    if (badPubkey) return badPubkey;
     const tier = typeof params?.tier === "number" ? params.tier : undefined;
     if (!pubkey || tier === undefined) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'tier' (0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip)." };
@@ -6121,6 +6150,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // on the outbound path at send time (SI), never here.
   handlers.set("cello_contact_set_away", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const badPubkey = invalidPubkey(pubkey);
+    if (badPubkey) return badPubkey;
     if (!pubkey || !params || !("message" in params)) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) and 'message' — a string away text, or null to clear it." };
     }
@@ -6145,6 +6176,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   handlers.set("cello_contact_remove", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
+    const badPubkey = invalidPubkey(pubkey);
+    if (badPubkey) return badPubkey;
     if (!pubkey) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'pubkey' (hex) — the contact to remove." };
     }

@@ -615,8 +615,8 @@ def register(ctx) -> None:
             "\n"
             "HOW TO USE CELLO: exclusively through the MCP tools named cello_* , served by "
             "the MCP server called 'cello'. They are already available to you. Their names "
-            "are cello_use_agent, cello_receive, cello_send, cello_check_notifications, "
-            "cello_list_sessions, cello_close_session, cello_status, and others.\n"
+            "are cello_use_agent, cello_receive, cello_send, cello_inbox, "
+            "cello_sessions, cello_close_session, cello_status, and others.\n"
             "\n"
             "NEVER run the 'cello' command-line program. It is not the way in, and running "
             "it from inside a turn spawns a daemon bound to your process that dies when your "
@@ -684,7 +684,7 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
 ## How to operate CELLO (after setup)
 
 - Wake notices from the CELLO platform are **content-free** — they name a session and a
-  counterparty pubkey, never the message. Fetch content with \`cello_check_notifications\`
+  counterparty pubkey, never the message. Fetch content with \`cello_inbox\`
   and \`cello_receive\`.
 - **Read before you send.** Call \`cello_receive\` on a session before \`cello_send\`; the
   daemon rejects out-of-cursor sends with \`session_not_current\`.

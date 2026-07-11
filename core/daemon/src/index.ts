@@ -59,6 +59,9 @@ export { ManifestDirectoryChallengeVerifier, TestDirectoryChallengeVerifier } fr
 export {
   DUAL_SURFACE_VERBS,
   MCP_ONLY_TOOLS,
+  NON_TOOL_IDENTIFIERS,
+  DEAD_CLI_VERBS,
+  RENAMED_AWAY_TOOLS,
   knownToolNames,
   toCliGuidance,
   renderForSurface,

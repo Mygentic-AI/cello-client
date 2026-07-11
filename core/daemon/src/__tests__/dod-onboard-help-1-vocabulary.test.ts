@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -19,13 +19,14 @@ import type { Logger, DaemonConfig } from "../types.js";
 import {
   DUAL_SURFACE_VERBS,
   MCP_ONLY_TOOLS,
+  DEAD_CLI_VERBS,
   knownToolNames,
   toCliGuidance,
   renderForSurface,
 } from "../vocabulary.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const DAEMON_SRC = join(here, "..", "daemon.ts");
+const SRC_DIR = join(here, "..");
 
 describe("DOD-ONBOARD-HELP-1 §2b — the vocabulary obeys its own rule", () => {
   it("every MCP tool name is `cello_` + the CLI command name, snake_cased", () => {
@@ -101,6 +102,41 @@ describe("DOD-ONBOARD-HELP-1 §5 — guidance renders for the surface that asked
     expect(toCliGuidance("Run cello_backup first.")).toBe("Run cello_backup first.");
   });
 
+  it("renders NESTED instructions too — `cello inbox`'s rename notices are not top-level", () => {
+    // Review finding 4. The adopt hint lives at agents[i].rename_notices[j].notice. The first cut
+    // rewrote only a TOP-LEVEL `guidance`, so a CLI operator running `cello inbox` was handed an MCP
+    // tool name plus JSON arguments they cannot type. A choke point that only covers the easy shape
+    // isn't a choke point — it just moves the leak somewhere less visible.
+    const out = renderForSurface(
+      {
+        agents: [
+          {
+            agent: "alice",
+            rename_notices: [
+              { pubkey: "ab", notice: 'Adopt it: cello_contact_set_moniker { pubkey: "ab" }, or ignore.' },
+            ],
+          },
+        ],
+      },
+      "cli",
+    ) as { agents: Array<{ rename_notices: Array<{ notice: string }> }> };
+    expect(out.agents[0].rename_notices[0].notice).toContain("cello contact <pubkey> set-moniker");
+    expect(out.agents[0].rename_notices[0].notice).not.toContain("cello_contact_set_moniker");
+  });
+
+  it("renders `warning_guidance` — an instruction key that is not called `guidance`", () => {
+    const out = renderForSurface(
+      { ok: true, warning_guidance: "Not registered — run cello_status to check." },
+      "cli",
+    ) as Record<string, unknown>;
+    expect(out.warning_guidance).toBe("Not registered — run cello status to check.");
+  });
+
+  it("an MCP caller gets a NESTED payload back untouched, object identity and all", () => {
+    const r = { agents: [{ rename_notices: [{ notice: "Adopt it: cello_contact_set_moniker." }] }] };
+    expect(renderForSurface(r, "mcp")).toBe(r);
+  });
+
   it("passes non-objects and guidance-free payloads straight through", () => {
     expect(renderForSurface({ agents: [] }, "cli")).toEqual({ agents: [] });
     expect(renderForSurface(null, "cli")).toBeNull();
@@ -108,16 +144,28 @@ describe("DOD-ONBOARD-HELP-1 §5 — guidance renders for the surface that asked
   });
 });
 
-describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a tool that doesn't exist", () => {
-  const source = readFileSync(DAEMON_SRC, "utf8");
+describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a command that doesn't exist", () => {
+  /**
+   * Scan EVERY non-test source file in the daemon, not just daemon.ts.
+   *
+   * The first cut scanned daemon.ts alone, and review found the hole immediately:
+   * session-node-manager.ts, session-ceremony.ts and transport-selector.ts all produce
+   * operator-facing guidance too. A stale name in any of them passed a green audit. An audit whose
+   * blind spot is "the other files" is an audit that certifies what it happens to look at.
+   */
+  const files = readdirSync(SRC_DIR)
+    .filter((f) => f.endsWith(".ts") && !f.endsWith(".d.ts"))
+    // vocabulary.ts DEFINES the dead names (that is its job) — scanning it would flag the list
+    // against itself. It ships no operator-facing strings of its own.
+    .filter((f) => f !== "vocabulary.ts")
+    .sort();
 
   /**
-   * Every `cello_*` token the daemon can HAND TO A USER.
+   * Every token in a source file that the daemon can HAND TO A USER as an instruction.
    *
-   * Deliberately NOT scoped to lines containing `guidance:` — that was the first cut, and it had a
-   * hole: the seal-timeout message, the sealed-session notice, and the moniker-adopt hint are
-   * operator-facing strings that sit on a ternary/continuation line with no `guidance:` on it. The
-   * audit would have passed while three live strings still named a dead tool. So: scan CODE.
+   * Deliberately NOT scoped to lines containing `guidance:` — several operator-facing strings sit on
+   * a ternary/continuation line with no `guidance:` on it (the seal-timeout message, the
+   * sealed-session notice, the moniker-adopt hint). So: scan CODE.
    *
    * Excluded, correctly:
    *  - comments — they document the IPC METHOD, whose name is accurate and does not move,
@@ -125,38 +173,56 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a too
    *    to an OLD connect shim (connect has no daemon dep, so they are not pinned together),
    *  - the custody stub-tool array (cello_backup / cello_restore / cello_get_inclusion_proof).
    */
-  function operatorFacingToolTokens(): Array<{ line: number; token: string }> {
-    const found: Array<{ line: number; token: string }> = [];
-    source.split("\n").forEach((raw, i) => {
-      const t = raw.trim();
-      if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return; // comment
-      if (/handlers\.set\(/.test(raw)) return; // IPC method registration
-      if (/for \(const tool of \[/.test(raw)) return; // custody stub list
-      const code = raw.replace(/\s\/\/[^"'`]*$/, ""); // drop a trailing inline comment
-      for (const m of code.matchAll(/cello_[a-z_]+/g)) {
-        found.push({ line: i + 1, token: m[0] });
-      }
-    });
+  function scan(re: RegExp): Array<{ file: string; line: number; token: string }> {
+    const found: Array<{ file: string; line: number; token: string }> = [];
+    for (const file of files) {
+      readFileSync(join(SRC_DIR, file), "utf8")
+        .split("\n")
+        .forEach((raw, i) => {
+          const t = raw.trim();
+          if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return; // comment
+          if (/handlers\.set\(/.test(raw)) return; // IPC method registration
+          if (/for \(const tool of \[/.test(raw)) return; // custody stub list
+          const code = raw.replace(/\s\/\/[^"'`]*$/, ""); // drop a trailing inline comment
+          for (const m of code.matchAll(re)) {
+            found.push({ file, line: i + 1, token: m[0] });
+          }
+        });
+    }
     return found;
   }
-  const guidanceToolTokens = operatorFacingToolTokens;
+
+  const show = (hits: Array<{ file: string; line: number; token: string }>) =>
+    hits.map((u) => `  ${u.file}:${u.line}  ${u.token}`).join("\n");
 
   it("every cello_* token the daemon shows a user resolves to a real tool", () => {
     const known = knownToolNames();
-    const unknown = guidanceToolTokens().filter((t) => !known.has(t.token));
+    const unknown = scan(/cello_[a-z_]+/g).filter((t) => !known.has(t.token));
     expect(
       unknown,
-      `daemon.ts guidance names tool(s) that do not exist. An error message handing the operator a ` +
-        `dead command is worse than no message. Either rename to the vocabulary name, or — if it is ` +
-        `CLI-only (register-agent, bridge, refresh, relay-receipts) — write the CLI verb ` +
-        `('cello create-agent'), not a cello_* token.\n` +
-        unknown.map((u) => `  daemon.ts:${u.line}  ${u.token}`).join("\n"),
+      `The daemon names MCP tool(s) that do not exist. An error message handing the operator a dead ` +
+        `command is worse than no message. Either rename to the vocabulary name, or — if the ` +
+        `capability is CLI-only (register-agent, bridge, refresh, relay-receipts) — write the CLI ` +
+        `verb ('cello create-agent'), not a cello_* token.\n` + show(unknown),
     ).toEqual([]);
   });
 
-  it("the guidance strings actually USE the vocabulary (the audit is not vacuous)", () => {
-    // Guard against the audit passing simply because someone stripped every tool name out.
-    expect(guidanceToolTokens().length).toBeGreaterThan(20);
+  it("the daemon never hands out a DEAD CLI verb (the tool audit is structurally blind to these)", () => {
+    // Review finding: `cello register` survived in daemon.ts's unregistered-agent warning, because a
+    // bare CLI verb carries no `cello_` token for the audit above to catch. Two audits, two shapes.
+    const dead = scan(new RegExp(DEAD_CLI_VERBS.map((v) => v.replace(/ /g, "\\s")).join("|"), "g"));
+    expect(
+      dead,
+      `The daemon tells an operator to run a command that no longer dispatches (DOD-ONBOARD-HELP-1 ` +
+        `§2 renamed it and deleted the old name — there are no aliases).\n` + show(dead),
+    ).toEqual([]);
+  });
+
+  it("the audit is not vacuous — it really is reading tool names out of the source", () => {
+    expect(scan(/cello_[a-z_]+/g).length).toBeGreaterThan(20);
+    expect(files.length).toBeGreaterThan(10); // and really is reading the whole package
+    expect(files).toContain("daemon.ts");
+    expect(files).toContain("session-node-manager.ts");
   });
 
   it("MCP_ONLY_TOOLS are the custody stubs, and are the only allowed non-dual names", () => {
@@ -226,5 +292,65 @@ describe("DOD-ONBOARD-HELP-1 §5 — a live daemon renders guidance per connecti
 
     expect(String(mcpRes.guidance)).toContain("cello_use_agent");
     expect(String(mcpRes.guidance)).not.toContain("cello use-agent");
+  });
+});
+
+/**
+ * Review finding 7 — the address book must not accept an address that can never match anyone.
+ *
+ * Under §3's new `contact <pubkey> <op>` shape the FIRST positional is the pubkey, so the muscle
+ * memory of the old shape (`contact tier <pk> 3`) can put a VERB where a key belongs. Most of those
+ * slips die in the CLI (unknown op → usage, exit 1), but `cello contact tier add` has a valid op —
+ * it reached the daemon, which stored a contact whose pubkey is the literal string "tier" and
+ * replied ok:true. The operator is told they added someone. They added a typo.
+ */
+describe("DOD-ONBOARD-HELP-1 (review F7) — a contact pubkey must be a pubkey", () => {
+  let handle: DaemonHandle | undefined;
+  let tempDir: string | undefined;
+  const clients: IpcClient[] = [];
+  const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+  afterEach(async () => {
+    for (const c of clients) c.close();
+    clients.length = 0;
+    if (handle) await handle.stop();
+    handle = undefined;
+    if (tempDir) await rm(tempDir, { recursive: true, force: true });
+    tempDir = undefined;
+  });
+
+  it("refuses a non-hex pubkey on every contact handler, and changes nothing", async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-pubkey-"));
+    handle = await startDaemon({
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger,
+    });
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "cli" });
+
+    // "tier" is what `cello contact tier add` would send as the pubkey.
+    for (const [method, extra] of [
+      ["cello_contact_add", {}],
+      ["cello_contact_remove", {}],
+      ["cello_contact_set_tier", { tier: 3 }],
+      ["cello_contact_set_away", { message: "later" }],
+      ["cello_contact_set_moniker", { moniker: "Bob" }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const res = (await client.send(method, { pubkey: "tier", ...extra })) as Record<string, unknown>;
+      expect(res.ok, `${method} accepted a non-hex pubkey`).toBe(false);
+      expect(res.reason, `${method} must say WHY`).toBe("invalid_pubkey");
+      expect(String(res.guidance)).toContain("64 hex characters");
+      expect(String(res.guidance)).toContain("Nothing was changed");
+    }
+
+    // A well-formed key gets PAST the shape gate (it fails later, on no_current_agent — which proves
+    // the validator is not simply refusing everything).
+    const good = (await client.send("cello_contact_add", { pubkey: "a".repeat(64) })) as Record<string, unknown>;
+    expect(good.reason).not.toBe("invalid_pubkey");
   });
 });
