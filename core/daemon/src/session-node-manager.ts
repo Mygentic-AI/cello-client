@@ -77,7 +77,7 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
-import { boundSettingKey, settableTierName } from "./agent-settings-keys.js";
+import { boundSettingKey, settableTierName, isValidSettingKey } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -1289,6 +1289,10 @@ export class SessionNodeManager {
    *  specific consumer. Throws on a missing DB — a write that silently no-ops would be a lie. */
   setSetting(agentName: string, key: string, value: string): void {
     if (!this.#db) throw new Error(`setSetting('${agentName}'): database not initialized`);
+    // Store-level backstop (review F2): the handler validates the key, but the dual-layer convention
+    // (cf. MONIKER-1) means an unknown key can NEVER be stored — an internal caller that hand-typed a
+    // key instead of using the builders would otherwise persist a setting that never takes effect.
+    if (!isValidSettingKey(key)) throw new Error(`invalid_key: '${key}' is not a known setting`);
     this.#db
       .prepare(
         `INSERT INTO agent_settings (agent_id, key, value, updated_at) VALUES (?, ?, ?, ?)

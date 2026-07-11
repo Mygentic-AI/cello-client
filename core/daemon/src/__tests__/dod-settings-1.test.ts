@@ -91,4 +91,22 @@ describe("DOD-SETTINGS-1 — the per-agent store", () => {
     expect(mgr.getSetting("bob", AWAY_DEFAULT_KEY)).toBeNull();
     expect(mgr.getAllSettings("bob")).toEqual([]);
   });
+
+  it("T1: settings are keyed on the STABLE agent_id, never the mutable agent_name", () => {
+    const db = mgr.getDb();
+    const aliceId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = 'alice'").get() as { agent_id: string }).agent_id;
+    mgr.setSetting("alice", AWAY_DEFAULT_KEY, "hi");
+    const row = db.prepare("SELECT agent_id FROM agent_settings WHERE key = ?").get(AWAY_DEFAULT_KEY) as { agent_id: string };
+    expect(row.agent_id).toBe(aliceId); // the stable id …
+    expect(row.agent_id).not.toBe("alice"); // … never the name (a name-keyed store would orphan on rename)
+  });
+
+  it("T2: setSetting fails closed on an uninitialized DB (a silent no-op write would be a lie)", () => {
+    const bare = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
+    expect(() => bare.setSetting("alice", AWAY_DEFAULT_KEY, "hi")).toThrow(/not initialized/);
+  });
+
+  it("F2: setSetting has a store-level backstop — an unknown key can never be persisted", () => {
+    expect(() => mgr.setSetting("alice", "bogus.key", "x")).toThrow(/invalid_key/);
+  });
 });

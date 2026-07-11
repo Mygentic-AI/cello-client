@@ -210,6 +210,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(got).toMatchObject({ ok: true, value: "8" });
     const unset = (await client.send("cello_settings_get", { key: "away.default" })) as Record<string, unknown>;
     expect(unset).toMatchObject({ ok: true, value: null });
+
+    // F1: a typo'd GET key is REFUSED, not silently returned as null (which would masquerade as "unset").
+    const typo = (await client.send("cello_settings_get", { key: "bounds.knwon.max_sessions" })) as Record<string, unknown>;
+    expect(typo).toMatchObject({ ok: false, reason: "invalid_key" });
   });
 
   it("K6: --agent (params.agent) resolves an explicit agent, independent of this connection's current agent", async () => {

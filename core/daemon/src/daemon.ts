@@ -6057,9 +6057,17 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_settings_get", async (params, connectionId) => {
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;
-    const key = typeof params?.key === "string" ? params.key : undefined;
-    if (key !== undefined) {
-      return { ok: true, agent: resolved.agent, key, value: sessionNodeManager.getSetting(resolved.agent, key) };
+    // A key was PROVIDED (present and non-null) → it must be a valid string key. Distinguish "key
+    // absent" (list all) from "key present but malformed/unknown" (review F1/F3) — a typo'd read must
+    // NOT masquerade as "unset", the exact invisibility this store exists to prevent.
+    if (params && "key" in params && params.key !== undefined && params.key !== null) {
+      if (typeof params.key !== "string") {
+        return { ok: false, reason: "missing_params", guidance: "'key' must be a string setting key, or omit it to list every set value." };
+      }
+      if (!isValidSettingKey(params.key)) {
+        return { ok: false, reason: "invalid_key", guidance: `Unknown setting key '${params.key}'. Valid keys: ${allSettingKeys().join(", ")}` };
+      }
+      return { ok: true, agent: resolved.agent, key: params.key, value: sessionNodeManager.getSetting(resolved.agent, params.key) };
     }
     return { ok: true, agent: resolved.agent, settings: sessionNodeManager.getAllSettings(resolved.agent) };
   });
