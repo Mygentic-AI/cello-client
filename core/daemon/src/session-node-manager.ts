@@ -1075,13 +1075,22 @@ export class SessionNodeManager {
     const row = this.#db
       .prepare("SELECT away_message FROM contacts WHERE agent_id = ? AND pubkey = ?")
       .get(agentId, pubkey) as { away_message: string | null } | undefined;
-    if (row?.away_message != null) return row.away_message; // 1. per-contact
+    if (row?.away_message != null) {
+      this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: "contact" }); // obs AC
+      return row.away_message; // 1. per-contact
+    }
     const tierName = settableTierName(this.getTier(agentName, pubkey));
     if (tierName !== null) {
       const tierAway = this.getSetting(agentName, awayTierSettingKey(tierName));
-      if (tierAway !== null) return tierAway; // 2. per-tier
+      if (tierAway !== null) {
+        this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: "tier" });
+        return tierAway; // 2. per-tier
+      }
     }
-    return this.getSetting(agentName, AWAY_DEFAULT_KEY); // 3. agent default, else null → caller's system default
+    const agentDefault = this.getSetting(agentName, AWAY_DEFAULT_KEY);
+    // 3. agent default, else null → caller applies the system default (logged as "system" there).
+    this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: agentDefault !== null ? "agent_default" : "system" });
+    return agentDefault;
   }
 
   /** DOD-CONTACT-VIEW-1: set an EXISTING contact's reachability tier. Returns false when no such
