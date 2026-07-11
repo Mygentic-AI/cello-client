@@ -305,10 +305,12 @@ export function transcript(celloDir: string, sessionId: string, opts: ParityOpti
  * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt.
  *
  * NOT in the brief's mapping table, which listed cello_get_sealed_receipt as "already covered by
- * `receipts`". It is not: `cello receipts <name>` calls cello_get_relay_receipts — a DIFFERENT
- * handler (relay ordering receipts). The notarized bilateral SEAL receipt — the artifact the whole
- * close ceremony exists to produce, and the one an arbitrator reads — had no CLI surface at all.
- * Added under the standing rule: a real, non-stub handler with no CLI command gets one.
+ * `receipts`". It is not: `cello relay-receipts <name>` calls cello_get_relay_receipts — a DIFFERENT
+ * handler (per-message relay delivery proofs). The notarized bilateral SEAL receipt — the artifact
+ * the whole close ceremony exists to produce, and the one an arbitrator reads — had no CLI surface
+ * at all. Added under the standing rule: a real, non-stub handler with no CLI command gets one.
+ * (DOD-ONBOARD-HELP-1 later renamed `receipts` → `relay-receipts` precisely because two names that
+ * differed by a single plural could not be told apart — the very confusion this comment records.)
  */
 export function sealedReceipt(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["sealed-receipt"], { session_id: sessionId }, opts);
