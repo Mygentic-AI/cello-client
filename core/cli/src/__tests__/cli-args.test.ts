@@ -14,7 +14,7 @@ import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS } from
 
 describe("F1: usage string lists every command", () => {
   it("mentions refresh and receipts (previously missing) alongside the rest", () => {
-    for (const cmd of ["login", "logout", "status", "register", "create-agent", "remove-agent", "refresh", "receipts", "sessions"]) {
+    for (const cmd of ["login", "logout", "status", "register-agent", "create-agent", "remove-agent", "refresh", "relay-receipts", "sessions"]) {
       expect(USAGE, `usage must list '${cmd}'`).toContain(cmd);
     }
   });
@@ -35,19 +35,33 @@ describe("F1: usage string lists every command", () => {
 
   // This hand-written list is deliberately INDEPENDENT of the registry — it is the outside anchor
   // that the registry's own derive-lock tests cannot be (they would agree with any table, including
-  // a wrong one). Adding a command means updating this list on purpose.
-  // DOD-CLI-PARITY-1 added the 12 parity commands below the original 14.
+  // a wrong one). Adding OR RENAMING a command means updating this list on purpose. It is what
+  // caught every half-rename in DOD-ONBOARD-HELP-1: the old names had to be struck out by hand.
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
       [
-        // original surface
-        "contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh",
-        "register", "remove-agent", "sessions", "settings", "status", "telegram",
-        // DOD-CLI-PARITY-1 — Group A (operator control) and Group B (live conversation)
-        "agents", "start-agent", "stop-agent", "use-agent", "inbox", "transcript",
-        "initiate", "send", "receive", "receive-session", "close", "await-session", "sealed-receipt",
+        // Setup
+        "login", "logout", "status", "create-agent", "register-agent", "remove-agent",
+        // Agents
+        "agents", "start-agent", "use-agent", "stop-agent", "refresh",
+        // Messaging
+        "initiate-session", "await-session", "receive-session", "close-session", "send", "receive", "inbox",
+        // Sessions & receipts
+        "sessions", "transcript", "sealed-receipt", "relay-receipts",
+        // Contacts
+        "contacts", "contact",
+        // Other
+        "settings", "moniker", "telegram", "bridge",
       ].sort(),
     );
+  });
+
+  // DOD-ONBOARD-HELP-1 §2: the renames are CLEAN. No aliases — one user, no install base, so an
+  // alias would be permanent debt bought for nobody.
+  it("the OLD command names are gone from the dispatchable set", () => {
+    for (const old of ["install", "register", "close", "initiate", "receipts"]) {
+      expect(KNOWN_COMMANDS.has(old), `'${old}' must be deleted, not aliased`).toBe(false);
+    }
   });
 
   // MONIKER-1 AC2: `cello moniker set <name>` / `cello moniker clear` — the outbound-name override.
@@ -103,13 +117,13 @@ describe("F1: usage string lists every command", () => {
 
 describe("F2: --help/-h on subcommands", () => {
   it("checkArgs reports help for --help and -h on any command", () => {
-    expect(checkArgs("register", ["--help"])).toEqual({ kind: "help" });
+    expect(checkArgs("register-agent", ["--help"])).toEqual({ kind: "help" });
     expect(checkArgs("create-agent", ["-h"])).toEqual({ kind: "help" });
     expect(checkArgs("sessions", ["--help"])).toEqual({ kind: "help" });
   });
 
   it("--help anywhere wins, even after an unknown flag (the doc-comment contract)", () => {
-    expect(checkArgs("register", ["--bogus", "--help"])).toEqual({ kind: "help" });
+    expect(checkArgs("register-agent", ["--bogus", "--help"])).toEqual({ kind: "help" });
     expect(checkArgs("sessions", ["--bogus", "-h"])).toEqual({ kind: "help" });
   });
 
@@ -136,7 +150,7 @@ describe("F2: --help/-h on subcommands", () => {
   });
 
   it("register help shows the two-step, a worked example, the token format, and the env-var form", () => {
-    const help = helpForCommand("register");
+    const help = helpForCommand("register-agent");
     expect(help).toContain("create-agent"); // the create → register two-step is explained
     expect(help).toContain("CELLO-");        // token format
     expect(help.toLowerCase()).toContain("example");
@@ -146,7 +160,7 @@ describe("F2: --help/-h on subcommands", () => {
 
 describe("F2: unknown flags are rejected, not coerced to positionals", () => {
   it("rejects an unknown flag on a command that takes no flags", () => {
-    const res = checkArgs("register", ["--bogus"]);
+    const res = checkArgs("register-agent", ["--bogus"]);
     expect(res).toEqual({ kind: "unknown_flag", flag: "--bogus" });
   });
 
@@ -165,7 +179,7 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
   });
 
   it("plain positionals pass through untouched", () => {
-    expect(checkArgs("register", ["alice", "token-123"])).toEqual({ kind: "ok" });
+    expect(checkArgs("register-agent", ["alice", "token-123"])).toEqual({ kind: "ok" });
     expect(checkArgs("refresh", ["alice"])).toEqual({ kind: "ok" });
   });
 });

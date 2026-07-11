@@ -195,7 +195,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
 
       const recv = (await clientA.send("cello_receive", { session_id: SID_HEX, timeout_ms: 200 })) as Record<string, unknown>;
       expect(recv.reason, `a receive on a dead session must say so (got ${JSON.stringify(recv)})`).toBe("counterparty_gone");
-      expect(String(recv.guidance)).toMatch(/cello_close_session/);
+      expect(String(recv.guidance)).toMatch(/close.session/); // rendered per surface: `cello close-session` (CLI) / `cello_close_session` (MCP)
       expect(String(recv.guidance)).toMatch(/grace/i);
 
       // Status: the active session carries its liveness — on BOTH the CLI ("status")

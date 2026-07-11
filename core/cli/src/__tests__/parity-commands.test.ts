@@ -245,7 +245,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect(JSON.parse(out.stdout).type).toBe("timeout");
     });
 
-    it("`cello initiate <target>` reaches cello_initiate_session with target_pubkey", async () => {
+    it("`cello initiate-session <target>` reaches cello_initiate_session with target_pubkey", async () => {
       await createAgent(tempDir, "alice");
       await useAgent(tempDir, "alice", {});
       const out = await initiate(tempDir, "ab".repeat(32), {});

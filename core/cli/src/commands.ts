@@ -232,7 +232,7 @@ export async function register(
   // malformed token. Client-side because a typo'd token and a missing one are knowable without the
   // directory. (Unknown-agent stays the daemon's job — it already returns a good agent_not_found.)
   if (!agent) {
-    return { exitCode: 1, output: "You didn't name an agent to register. Usage: cello register <agent> <pre-auth-token>. See your agents with 'cello status'." };
+    return { exitCode: 1, output: "You didn't name an agent to register. Usage: cello register-agent <agent> <pre-auth-token>. See your agents with 'cello status'." };
   }
   if (!preAuthToken) {
     return {

@@ -84,8 +84,30 @@ export interface FlagSpec {
   consumesValue?: boolean;
 }
 
+/**
+ * DOD-ONBOARD-HELP-1 §1 — the help is GROUPED, not alphabetical, and the groups render in this
+ * order. A new user reads it top-to-bottom as the order they will actually do things: get set up,
+ * bring an agent online, hold a conversation, then look at what it produced.
+ */
+export const GROUP_ORDER = [
+  "Setup",
+  "Agents",
+  "Messaging",
+  "Sessions & receipts",
+  "Contacts",
+  "Other",
+] as const;
+
+export type CommandGroup = (typeof GROUP_ORDER)[number];
+
 export interface CommandSpec {
   name: string;
+  /**
+   * Which section of `cello --help` this command appears under. Registry metadata, so the table
+   * cannot drift from dispatch — adding a command FORCES choosing where a reader will find it.
+   * Within a group, commands render in DECLARATION order (logical, not alphabetical).
+   */
+  group: CommandGroup;
   /** One line. Rendered as this command's row in the `cello --help` Commands: table. */
   summary: string;
   /** Full per-command help, printed by `cello <cmd> --help`. */
@@ -172,7 +194,7 @@ function legacy(result: CommandResult): CliOutput {
  *
  * `consumesValue: false` is deliberate and is what checkArgs PARITY requires: the pre-existing
  * checkArgs never skipped --agent's value (only `--limit` did), and flipping this to true would
- * change `cello contact list --agent --bogus` from a fail-loud unknown_flag into a silently
+ * change `cello contacts --agent --bogus` from a fail-loud unknown_flag into a silently
  * accepted agent literally named "--bogus". The value is claimed by splitAgentFlag (arg-parse.ts),
  * which owns --agent parsing; checkArgs only needs to know the FLAG is legal. Same for install's
  * --agent / --hermes-home below.
@@ -186,9 +208,11 @@ const AGENT_AND_TIMEOUT: readonly FlagSpec[] = [
 ];
 
 export const COMMANDS: readonly CommandSpec[] = [
+  // ═══ Setup — get a working agent, in the order you actually do it ═══════════════════════════
   {
     name: "login",
-    summary: "Start the local daemon (or connect to a running one) and bring your agents online.",
+    group: "Setup",
+    summary: "Start the local CELLO daemon and bring your agents online.",
     help: "Usage: cello login  — start the daemon (or connect to an existing one).",
     async run(ctx) {
       return legacy(await login(ctx.celloDir, ctx.daemonBin, ctx.logger));
@@ -196,7 +220,8 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: "logout",
-    summary: "Stop the running daemon (waits until it is actually gone).",
+    group: "Setup",
+    summary: "Stop the daemon. Waits until it has actually exited.",
     help: "Usage: cello logout  — send shutdown to the running daemon.",
     async run(ctx) {
       // DOD-LOGOUT-WAIT-1: logout WAITS for the daemon to actually die before claiming
@@ -207,25 +232,40 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: "status",
-    summary: "Show daemon + agent state as structured JSON.",
+    group: "Setup",
+    summary: "Show whether the daemon is running and which agents are online.",
     help: "Usage: cello status  — query the daemon and print the structured status JSON.",
     async run(ctx) {
       return legacy(await status(ctx.celloDir));
     },
   },
   {
-    name: "register",
-    summary: "Register a local agent with the directory using a pre-auth token.",
+    name: "create-agent",
+    group: "Setup",
+    summary: "Create a new agent on this machine. Step 1 of 2.",
     help:
-      "Usage: cello register <agent> <pre-auth-token>  — register a LOCAL agent with the directory.\n" +
-      "  The two-step onboarding: (1) 'cello create-agent <name>' makes the local identity; (2) 'cello register <name> <token>' registers it with the directory.\n" +
+      "Usage: cello create-agent <name>  — create a new LOCAL agent identity (does not touch the directory).\n" +
+      // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
+      `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
+      "  Next step: 'cello register-agent <name> <pre-auth-token>' to register it with the directory.",
+    async run(ctx, args) {
+      return legacy(await createAgent(ctx.celloDir, args[0] ?? ""));
+    },
+  },
+  {
+    name: "register-agent",
+    group: "Setup",
+    summary: "Publish an agent to the directory so others can reach it. Step 2 of 2.",
+    help:
+      "Usage: cello register-agent <agent> <pre-auth-token>  — register a LOCAL agent with the directory.\n" +
+      "  The two-step onboarding: (1) 'cello create-agent <name>' makes the identity on this machine; (2) 'cello register-agent <name> <token>' publishes it to the directory so others can find and reach it.\n" +
       "  The token is a single-use pre-authorization ticket from the CELLO Operations Agent on Telegram, format 'CELLO-' + 33 characters, valid 24h.\n" +
-      "  Example:  cello register alice CELLO-3xY7...\n" +
-      "  Env-var form (avoids retyping):  CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register alice\n" +
+      "  Example:  cello register-agent alice CELLO-3xY7...\n" +
+      "  Env-var form (avoids retyping):  CELLO_PREAUTH_TOKEN=CELLO-3xY7... cello register-agent alice\n" +
       "  Quoting is only needed if a value contains spaces (agent names and tokens never do).",
     async run(ctx, args) {
-      // cello register <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN so it need
-      // not appear in shell history). Optional phone stub follows.
+      // cello register-agent <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN so it
+      // need not appear in shell history). Optional phone stub follows.
       const agent = args[0] ?? "";
       const preAuthToken = args[1] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
       const phoneStub = args[2] ?? "";
@@ -233,213 +273,23 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
   {
-    name: "create-agent",
-    summary: "Create a new local agent identity (does not touch the directory).",
-    help:
-      "Usage: cello create-agent <name>  — create a new LOCAL agent identity (does not touch the directory).\n" +
-      // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
-      `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
-      "  Next step: 'cello register <name> <pre-auth-token>' to register it with the directory.",
-    async run(ctx, args) {
-      return legacy(await createAgent(ctx.celloDir, args[0] ?? ""));
-    },
-  },
-  {
     name: "remove-agent",
-    summary: "Retire a local agent (one-way) and free its name.",
+    group: "Setup",
+    summary: "Retire an agent permanently and free its name. Cannot be undone.",
     help: "Usage: cello remove-agent <name>  — retires a local agent (one-way) and frees its name.",
     async run(ctx, args) {
       return legacy(await removeAgent(ctx.celloDir, args[0] ?? ""));
     },
   },
-  {
-    name: "refresh",
-    summary: "Refresh an agent's threshold shares (new epoch).",
-    help: "Usage: cello refresh <name>  — proactively refresh the agent's threshold shares (new epoch).",
-    async run(ctx, args) {
-      return legacy(await refreshShares(ctx.celloDir, args[0] ?? ""));
-    },
-  },
-  {
-    name: "receipts",
-    summary: "List an agent's stored relay ordering receipts.",
-    help: "Usage: cello receipts <name>  — list the agent's stored relay ordering receipts.",
-    async run(ctx, args) {
-      return legacy(await relayReceipts(ctx.celloDir, args[0] ?? ""));
-    },
-  },
-  {
-    name: "sessions",
-    summary: "List session history (open by default; --all for everything).",
-    help:
-      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
-    flags: [
-      { name: "--open" },
-      { name: "--closed" },
-      { name: "--failed" },
-      { name: "--all" },
-      { name: "--limit", consumesValue: true },
-    ],
-    async run(ctx, args) {
-      let filter: SessionFilter | undefined;
-      if (args.includes("--all")) filter = "all";
-      else if (args.includes("--closed")) filter = "closed";
-      else if (args.includes("--failed")) filter = "failed";
-      else if (args.includes("--open")) filter = "open";
-      const limitIdx = args.indexOf("--limit");
-      let limit: number | undefined;
-      if (limitIdx !== -1 && args[limitIdx + 1] !== undefined) {
-        const n = Number(args[limitIdx + 1]);
-        if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
-      }
-      return legacy(await sessions(ctx.celloDir, { filter, limit }));
-    },
-  },
-  {
-    name: "contact",
-    summary: "Manage the per-agent address book (add, remove, list, set-tier, set-away, set-moniker).",
-    help:
-      "Usage: cello contact add <pubkey> [--agent <name>] | cello contact remove <pubkey> [--agent <name>] | cello contact list [--agent <name>]\n" +
-      "       cello contact set-tier <pubkey> <0..4> [--agent <name>]      — trust tier (unknown|known|whitelisted|vip)\n" +
-      "       cello contact set-away <pubkey> <message…> [--agent <name>]  — per-contact away text (empty clears it)\n" +
-      "       cello contact set-moniker <pubkey> <moniker> [--agent <name>] — YOUR pet name for THEM (empty clears it)\n" +
-      "  Per-agent contact whitelist (M8C-CONTACT-1). --agent defaults to the current/sole-online agent.\n" +
-      "  Contacts are added automatically too: initiating a session to X, or accepting X's inbound request, adds X.\n" +
-      "  Note: 'set-moniker' is the name YOU give a CONTACT. The top-level 'cello moniker' is your OWN outbound name.\n" +
-      "  ('tier' and 'away' remain accepted as aliases of set-tier / set-away.)\n" +
-      "  Example:  cello contact list --agent alice",
-    flags: AGENT_FLAG,
-    jsonOut: true, // review F3: the WHOLE address book honors §3 — one command, one contract
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const o = { agent, pretty };
-      const [sub, pubkey, valueArg] = positional;
-      if (sub === "add" && pubkey) return contactAdd(ctx.celloDir, pubkey, o);
-      if (sub === "remove" && pubkey) return contactRemove(ctx.celloDir, pubkey, o);
-      if (sub === "list") return contactList(ctx.celloDir, o);
-      // set-tier / set-away are the DOD-CLI-PARITY-1 names; tier / away are the pre-existing verbs,
-      // kept as aliases so no existing script or muscle-memory breaks.
-      if ((sub === "set-tier" || sub === "tier") && pubkey && valueArg !== undefined) {
-        // Daemon validates the value; a non-numeric arg surfaces as its invalid_tier verdict.
-        return contactSetTier(ctx.celloDir, pubkey, Number(valueArg), o);
-      }
-      if ((sub === "set-away" || sub === "away") && pubkey) {
-        // The rest of the args form the away text; empty → clear.
-        const message = positional.slice(2).join(" ");
-        return contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, o);
-      }
-      if (sub === "set-moniker" && pubkey) {
-        // DOD-CLI-PARITY-1: the per-CONTACT pet name (cello_contact_set_moniker) — was MCP-only.
-        // Empty → null clears it, mirroring the tool.
-        const moniker = positional.slice(2).join(" ");
-        return contactSetMoniker(ctx.celloDir, pubkey, moniker.length > 0 ? moniker : null, o);
-      }
-      return {
-        stdout: helpForSpec("contact"),
-        stderr: "",
-        exitCode: 1,
-      };
-    },
-  },
-  {
-    name: "settings",
-    summary: "Get or set an agent's reachability policy (session/byte bounds, away text).",
-    help:
-      "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]\n" +
-      "  Per-agent reachability policy (DOD-SETTINGS-1). Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes\n" +
-      "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
-      "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
-    flags: AGENT_FLAG,
-    async run(ctx, args) {
-      const { agent, positional } = splitAgentFlag(args);
-      const [sub, key, value] = positional;
-      if (sub === "get") return legacy(await settingsGet(ctx.celloDir, key, agent)); // key optional → all
-      if (sub === "set" && key && value !== undefined) {
-        return legacy(await settingsSet(ctx.celloDir, key, value, agent));
-      }
-      return {
-        stdout: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]",
-        stderr: "",
-        exitCode: 1,
-      };
-    },
-  },
-  {
-    name: "moniker",
-    summary: "Set or clear the agent's OWN outbound display name (what a counterparty sees).",
-    help:
-      "Usage: cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>]\n" +
-      "  The agent's OUTBOUND name — what a counterparty's doorbell shows (MONIKER-1). Defaults to the agent name; 'set' stores an override, 'clear' restores the default.\n" +
-      // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
-      `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
-      "  Local-only: never sent to the directory; the receiver treats it as an unverified hint (like caller ID).\n" +
-      "  Example:  cello moniker set Wonderland_Alice --agent alice",
-    flags: AGENT_FLAG,
-    async run(ctx, args) {
-      const { agent, positional } = splitAgentFlag(args);
-      const [sub, name] = positional;
-      if (sub === "set" && name) return legacy(await monikerSet(ctx.celloDir, name, agent));
-      if (sub === "clear" && !name) return legacy(await monikerSet(ctx.celloDir, null, agent));
-      return { stdout: helpForSpec("moniker"), stderr: "", exitCode: 1 };
-    },
-  },
-  {
-    name: "telegram",
-    summary: "Configure the daemon-owned Telegram doorbell.",
-    help:
-      "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>  — configure the daemon-owned Telegram doorbell (M8C-TGDOOR-1).\n" +
-      "  Starts a single long-lived poller immediately; the operator chat given is the ONLY one that ever receives doorbell events.",
-    async run(ctx, args) {
-      const [sub, botToken, chatId] = args;
-      if (sub === "set-token" && botToken && chatId) {
-        return legacy(await telegramSetToken(ctx.celloDir, botToken, chatId));
-      }
-      return { stdout: "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>", stderr: "", exitCode: 1 };
-    },
-  },
-  {
-    name: "install",
-    summary: "Wire the local CELLO daemon into a Hermes Agent installation.",
-    help:
-      "Usage: cello install hermes --agent <name> [--hermes-home <path>]  — wire the local CELLO daemon into a Hermes Agent installation.\n" +
-      "  Scaffolds the CELLO platform-adapter plugin into the Hermes home (default ~/.hermes), binds CELLO_AGENT_NAME in its .env,\n" +
-      "  and registers via 'hermes plugins enable cello' + 'hermes mcp add cello'. Idempotent — re-run to upgrade.\n" +
-      "  After installing, restart the gateway: hermes gateway restart",
-    flags: [{ name: "--agent" }, { name: "--hermes-home" }],
-    async run(_ctx, args) {
-      const agentIdx = args.indexOf("--agent");
-      const homeIdx = args.indexOf("--hermes-home");
-      // Find the target positional, excluding both flags AND their values — so
-      // `cello install --agent alice hermes` still resolves target=hermes.
-      const target = args.find(
-        (a, i) =>
-          !a.startsWith("-") &&
-          !(agentIdx !== -1 && i === agentIdx + 1) &&
-          !(homeIdx !== -1 && i === homeIdx + 1),
-      );
-      if (target !== "hermes") {
-        return { stdout: helpForSpec("install"), stderr: "", exitCode: 1 };
-      }
-      const { installHermes } = await import("./hermes/install-hermes.js");
-      return legacy(
-        await installHermes({
-          agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",
-          hermesHome: homeIdx !== -1 ? args[homeIdx + 1] : undefined,
-        }),
-      );
-    },
-  },
 
-  // ═══ DOD-CLI-PARITY-1 — the MCP-only capabilities, now reachable from bash ══════════════════
-  // Each honors the §3 contract (jsonOut) and calls the SAME daemon handler as its cello_* MCP
-  // tool (ipcMethod). Group A = operator control + address book; Group B = live conversation.
-
+  // ═══ Agents — day-to-day control of who is online and who you are acting as ═════════════════
   {
     name: "agents",
-    summary: "List every loaded agent and whether it is online.",
+    group: "Agents",
+    summary: "List your agents and whether each one is online.",
     help:
       "Usage: cello agents [--pretty]  — list all loaded agents (name, state).\n" +
-      "  The CLI twin of the cello_list_agents MCP tool. Prints JSON; use --pretty for humans.",
+      "  The CLI twin of the cello_agents MCP tool. Prints JSON; use --pretty for humans.",
     ipcMethod: IPC_METHODS.agents,
     jsonOut: true,
     async run(ctx, args) {
@@ -449,7 +299,8 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: "start-agent",
-    summary: "Bring an agent online (without selecting it as current).",
+    group: "Agents",
+    summary: "Bring an agent online so it can be reached.",
     help:
       "Usage: cello start-agent <name> [--pretty]  — bring a registered agent ONLINE.\n" +
       "  Does NOT select it as the current agent — use 'cello use-agent <name>' for that.\n" +
@@ -462,22 +313,12 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
   {
-    name: "stop-agent",
-    summary: "Take an agent offline.",
-    help: "Usage: cello stop-agent <name> [--pretty]  — take an agent offline.",
-    ipcMethod: IPC_METHODS["stop-agent"],
-    jsonOut: true,
-    async run(ctx, args) {
-      const { pretty, positional } = parityOpts(args);
-      return stopAgent(ctx.celloDir, positional[0] ?? "", { pretty });
-    },
-  },
-  {
     name: "use-agent",
-    summary: "Select the agent that later commands act as (auto-starts it; persists).",
+    group: "Agents",
+    summary: "Select the agent that later commands operate through.",
     help:
       "Usage: cello use-agent <name> [--pretty]  — select the CURRENT agent for later commands.\n" +
-      "  Auto-starts the agent if it is offline (AUTOSTART-1).\n" +
+      "  Brings the agent online first if it is offline (AUTOSTART-1).\n" +
       "  The selection PERSISTS across invocations (recorded in <cello-dir>/current-agent), because\n" +
       "  each CLI command opens its own daemon connection — a selection that lived only on the socket\n" +
       "  would vanish the moment the command exited. Override per-command with '--agent <name>'.\n" +
@@ -490,12 +331,200 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
   {
-    name: "inbox",
-    summary: "Check pending session requests and unread counts (the push-loss reconciler).",
+    name: "stop-agent",
+    group: "Agents",
+    summary: "Take an agent offline. It stops accepting anything until restarted.",
+    help: "Usage: cello stop-agent <name> [--pretty]  — take an agent offline.",
+    ipcMethod: IPC_METHODS["stop-agent"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      return stopAgent(ctx.celloDir, positional[0] ?? "", { pretty });
+    },
+  },
+  {
+    name: "refresh",
+    group: "Agents",
+    // VERIFIED against the handler (cello_refresh_shares → runAgentRefresh), not guessed. It runs a
+    // resharing ceremony with the directory nodes and moves the agent to a NEW key epoch. Routine
+    // key hygiene — nothing is re-registered and the agent's public identity does not change.
+    summary: "Rotate an agent's signing-key shares to a fresh epoch (routine key hygiene).",
     help:
-      "Usage: cello inbox [--scope current|all] [--agent <name>] [--pretty]  — poll for what you missed.\n" +
-      "  Content-free: pending session requests + unread message counts. Non-destructive (it does not\n" +
-      "  drain anything — 'cello await-session' owns that). --scope all covers every loaded agent.",
+      "Usage: cello refresh <name>  — rotate the agent's split signing-key shares to a new epoch.\n" +
+      "  CELLO never holds your whole signing key in one place — it is split into shares held with the\n" +
+      "  directory nodes. This runs a ceremony that replaces every share with a fresh one. Your public\n" +
+      "  identity does NOT change and you do not re-register; old shares simply stop being usable.\n" +
+      "  Requires the directory to be reachable (the agent must be online and connected).\n" +
+      "  Occasional hygiene, not something you need day to day.",
+    async run(ctx, args) {
+      return legacy(await refreshShares(ctx.celloDir, args[0] ?? ""));
+    },
+  },
+
+  // ═══ Messaging — the conversation itself ════════════════════════════════════════════════════
+  {
+    name: "initiate-session",
+    group: "Messaging",
+    summary: "Open a session with someone (by public key). Prints the session id.",
+    help:
+      "Usage: cello initiate-session <target-pubkey> [--agent <name>] [--pretty]  — open a session.\n" +
+      "  <target-pubkey> is the counterparty's hex public key. Prints the session_id you then pass to\n" +
+      "  'cello send' / 'cello receive' / 'cello close-session'. Adds them to your address book.",
+    flags: AGENT_FLAG,
+    ipcMethod: IPC_METHODS["initiate-session"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      return initiate(ctx.celloDir, positional[0] ?? "", { agent, pretty });
+    },
+  },
+  {
+    name: "await-session",
+    group: "Messaging",
+    summary: "Wait for someone to open a session with you.",
+    help:
+      "Usage: cello await-session [--timeout-ms N] [--agent <name>] [--pretty]\n" +
+      "  BLOCKS until someone opens a session with you (default 30000ms), then prints the request.\n" +
+      "  On expiry it returns {\"type\":\"timeout\"} and exits 0 — a timeout is a normal answer, not an\n" +
+      "  error (this mirrors cello_await_session exactly). Branch on .type in scripts.",
+    flags: AGENT_AND_TIMEOUT,
+    ipcMethod: IPC_METHODS["await-session"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const timeout = takeValueFlag(positional, "--timeout-ms");
+      try {
+        return await awaitSession(ctx.celloDir, { agent, pretty, timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms") });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
+    },
+  },
+  {
+    name: "receive-session",
+    group: "Messaging",
+    // TRUTH, not the old claim. The daemon registers the SAME handler for cello_receive_session and
+    // cello_receive (`handlers.set("cello_receive_session", handleReceive)`) — it does not accept or
+    // join anything; inbound sessions are auto-accepted by the standing receiver. The old summary
+    // ("Accept / join an inbound session request") described a step that does not exist. Slated for
+    // deletion under the no-aliases doctrine; until then it says what it is.
+    summary: "Alias of 'receive' — same behavior, no separate accept step. Prefer 'cello receive'.",
+    help:
+      "Usage: cello receive-session <session-id> [--timeout-ms N] [--agent <name>] [--pretty]\n" +
+      "  An ALIAS of 'cello receive' — the daemon runs the identical handler for both. It does NOT\n" +
+      "  'accept' or 'join' anything: an inbound session is auto-accepted for you, so there is no\n" +
+      "  separate accept step to run. Use 'cello receive'; this exists only for backward parity with\n" +
+      "  the cello_receive_session MCP tool and is expected to be removed.",
+    flags: AGENT_AND_TIMEOUT,
+    ipcMethod: IPC_METHODS["receive-session"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const timeout = takeValueFlag(positional, "--timeout-ms");
+      try {
+        return await receiveSession(ctx.celloDir, timeout.rest[0] ?? "", {
+          agent,
+          pretty,
+          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
+        });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
+    },
+  },
+  {
+    name: "close-session",
+    group: "Messaging",
+    summary: "End a session. Both sides sign off and get a tamper-proof receipt.",
+    help:
+      "Usage: cello close-session <session-id> [--force] [--agent <name>] [--pretty]\n" +
+      "  Both parties sign off on the whole conversation and each gets a notarized receipt\n" +
+      "  ('cello sealed-receipt <session-id>' prints it).\n" +
+      "  --force abandons a half-open session that can never be sealed (a handshake the counterparty\n" +
+      "  never joined). It FORFEITS the receipt — never use it on a healthy session.",
+    flags: [
+      { name: "--agent", consumesValue: false },
+      { name: "--force", consumesValue: false },
+    ],
+    ipcMethod: IPC_METHODS["close-session"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const force = positional.includes("--force");
+      const rest = positional.filter((a) => a !== "--force");
+      return closeSession(ctx.celloDir, rest[0] ?? "", { agent, pretty, force });
+    },
+  },
+  {
+    name: "send",
+    group: "Messaging",
+    // §4: "honors read-before-write" was jargon for a rule the operator meets as a REFUSAL. Say the
+    // rule, and say that the tool will tell you.
+    summary: "Send a message. Any unread messages must be read first — you'll be told, and blocked until you do.",
+    help:
+      "Usage: cello send <session-id> <message…> [--stdin] [--agent <name>] [--pretty]\n" +
+      "  The message is the remaining arguments, or the whole of stdin with --stdin (for text with\n" +
+      "  newlines/quotes).\n" +
+      "  If the other side has said something you have not read, the send is REFUSED and tells you how\n" +
+      "  many messages are waiting. Read them ('cello receive <session-id>', or 'cello transcript\n" +
+      "  <session-id>' for the whole conversation) and send again. This is deliberate: you cannot\n" +
+      "  reply to something you never saw. The refusal is printed verbatim and never auto-fixed.",
+    flags: [
+      { name: "--agent", consumesValue: false },
+      { name: "--stdin", consumesValue: false },
+    ],
+    ipcMethod: IPC_METHODS.send,
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const useStdin = positional.includes("--stdin");
+      const rest = positional.filter((a) => a !== "--stdin");
+      const sessionId = rest[0] ?? "";
+      const content = useStdin ? await readStdin() : rest.slice(1).join(" ");
+      return send(ctx.celloDir, sessionId, content, { agent, pretty });
+    },
+  },
+  {
+    name: "receive",
+    group: "Messaging",
+    summary: "Read the next message, or catch up on everything you missed with --since-seq.",
+    help:
+      "Usage: cello receive <session-id> [--since-seq N] [--timeout-ms N] [--agent <name>] [--pretty]\n" +
+      "  Default: WAITS for the next message (up to --timeout-ms, default 30000).\n" +
+      "  With --since-seq N: returns every message after number N at once, immediately, without\n" +
+      "  waiting — this is how you catch up after being away. Mirrors cello_receive exactly.",
+    flags: [
+      { name: "--agent", consumesValue: false },
+      { name: "--timeout-ms", consumesValue: true },
+      { name: "--since-seq", consumesValue: true },
+    ],
+    ipcMethod: IPC_METHODS.receive,
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const since = takeValueFlag(positional, "--since-seq");
+      const timeout = takeValueFlag(since.rest, "--timeout-ms");
+      try {
+        return await receive(ctx.celloDir, timeout.rest[0] ?? "", {
+          agent,
+          pretty,
+          sinceSeq: numberOrUndefined(since.value, "--since-seq"),
+          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
+        });
+      } catch (err: unknown) {
+        return flagError(err);
+      }
+    },
+  },
+  {
+    name: "inbox",
+    group: "Messaging",
+    summary: "See who tried to reach you and what is unread, without reading anything.",
+    help:
+      "Usage: cello inbox [--scope current|all] [--agent <name>] [--pretty]  — what did I miss?\n" +
+      "  Shows pending session requests and unread message COUNTS — never message content, and it\n" +
+      "  does not mark anything as read ('cello receive' does that). Use it after being away.\n" +
+      "  --scope all covers every agent you have, not just the current one.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--scope", consumesValue: true },
@@ -524,13 +553,44 @@ export const COMMANDS: readonly CommandSpec[] = [
       return inbox(ctx.celloDir, { agent, pretty, scope: value });
     },
   },
+
+  // ═══ Sessions & receipts — what the conversations left behind ═══════════════════════════════
+  {
+    name: "sessions",
+    group: "Sessions & receipts",
+    summary: "List your sessions (open by default; --all/--closed/--failed to filter).",
+    help:
+      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
+    flags: [
+      { name: "--open" },
+      { name: "--closed" },
+      { name: "--failed" },
+      { name: "--all" },
+      { name: "--limit", consumesValue: true },
+    ],
+    async run(ctx, args) {
+      let filter: SessionFilter | undefined;
+      if (args.includes("--all")) filter = "all";
+      else if (args.includes("--closed")) filter = "closed";
+      else if (args.includes("--failed")) filter = "failed";
+      else if (args.includes("--open")) filter = "open";
+      const limitIdx = args.indexOf("--limit");
+      let limit: number | undefined;
+      if (limitIdx !== -1 && args[limitIdx + 1] !== undefined) {
+        const n = Number(args[limitIdx + 1]);
+        if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
+      }
+      return legacy(await sessions(ctx.celloDir, { filter, limit }));
+    },
+  },
   {
     name: "transcript",
-    summary: "Print a session's durable conversation transcript (sent + received).",
+    group: "Sessions & receipts",
+    summary: "Print the full conversation for a session — everything sent and received.",
     help:
-      "Usage: cello transcript <session-id> [--agent <name>] [--pretty]  — the durable transcript.\n" +
-      "  Sent AND received messages in order; survives a daemon restart. This is also how you satisfy\n" +
-      "  read-before-write after being away: read it, then 'cello send' is accepted.",
+      "Usage: cello transcript <session-id> [--agent <name>] [--pretty]  — the whole conversation.\n" +
+      "  Sent AND received messages, in order. Stored on disk, so it survives a daemon restart.\n" +
+      "  Reading it also catches you up, which un-blocks 'cello send' after you have been away.",
     flags: AGENT_FLAG,
     ipcMethod: IPC_METHODS.transcript,
     jsonOut: true,
@@ -539,16 +599,19 @@ export const COMMANDS: readonly CommandSpec[] = [
       return transcript(ctx.celloDir, positional[0] ?? "", { agent, pretty });
     },
   },
-
   {
     name: "sealed-receipt",
-    summary: "Print a closed session's notarized bilateral seal receipt.",
+    group: "Sessions & receipts",
+    // THE one users want. Named and described so it cannot be confused with relay-receipts.
+    summary: "Print a closed session's notarized receipt — proof both sides signed off on the conversation.",
     help:
       "Usage: cello sealed-receipt <session-id> [--agent <name>] [--pretty]  — the NOTARIZED receipt.\n" +
-      "  The artifact the bilateral close ceremony produces: per-party content frontiers and the sealed\n" +
-      "  root both sides agree on. It attests RECEIPT, never assent (implies_assent: false) — an\n" +
-      "  unanswered final message reads as delivered-but-unanswered, never as agreement.\n" +
-      "  Distinct from 'cello receipts <name>', which lists RELAY ORDERING receipts (a different thing).",
+      "  This is the proof CELLO exists to produce: when a session closes, both parties sign off on\n" +
+      "  the whole conversation and the directory notarizes it. The receipt is tamper-evident — if a\n" +
+      "  single message were altered, added or dropped, it would no longer match.\n" +
+      "  It attests RECEIPT, never agreement (implies_assent: false) — an unanswered last message\n" +
+      "  reads as delivered-but-unanswered, never as consent.\n" +
+      "  NOT the same as 'cello relay-receipts', which is a low-level delivery-plumbing artifact.",
     flags: AGENT_FLAG,
     ipcMethod: IPC_METHODS["sealed-receipt"],
     jsonOut: true,
@@ -557,141 +620,197 @@ export const COMMANDS: readonly CommandSpec[] = [
       return sealedReceipt(ctx.celloDir, positional[0] ?? "", { agent, pretty });
     },
   },
+  {
+    name: "relay-receipts",
+    group: "Sessions & receipts",
+    // VERIFIED against the handler (cello_get_relay_receipts → getRelayReceipts): per-MESSAGE
+    // signatures from a RELAY attesting it handled and ordered that message. Renamed from
+    // `receipts` because a name that differed from `sealed-receipt` by one plural could not be
+    // rescued by any description — Andre could not tell them apart, and he wrote the protocol.
+    summary: "Advanced/debug: per-message proofs signed by a relay. Not the session receipt — see 'sealed-receipt'.",
+    help:
+      "Usage: cello relay-receipts <name>  — ADVANCED / DEBUG. You almost certainly want\n" +
+      "  'cello sealed-receipt <session-id>' instead.\n" +
+      "  When a message cannot go directly to the other agent (they are offline, or the network is in\n" +
+      "  the way), it goes via a relay. The relay signs a small receipt saying it handled that message\n" +
+      "  and where it fell in the order. This lists those — a plumbing artifact for diagnosing\n" +
+      "  delivery, one per message.\n" +
+      "  It says NOTHING about the conversation being agreed or sealed. That is 'cello sealed-receipt'.",
+    async run(ctx, args) {
+      return legacy(await relayReceipts(ctx.celloDir, args[0] ?? ""));
+    },
+  },
 
-  // ─── Group B: live conversation ───────────────────────────────────────────────────────────
+  // ═══ Contacts — the address book (plural) and one contact (singular) ════════════════════════
   {
-    name: "initiate",
-    summary: "Start a session with a target agent (by pubkey). Prints the session_id.",
+    name: "contacts",
+    group: "Contacts",
+    summary: "List your address book — everyone this agent knows, and how much they're trusted.",
     help:
-      "Usage: cello initiate <target-pubkey> [--agent <name>] [--pretty]  — open a session.\n" +
-      "  <target-pubkey> is the counterparty's hex public key. Prints the session_id you then pass to\n" +
-      "  'cello send' / 'cello receive' / 'cello close'. Adds the counterparty to your address book.",
+      "Usage: cello contacts [--agent <name>] [--pretty]  — list the whole address book.\n" +
+      "  Contacts are added automatically when you open a session with someone, or accept theirs.\n" +
+      "  To act on ONE contact, use 'cello contact <pubkey> <operation>'.\n" +
+      "  --agent defaults to the current agent (or the only online one).",
     flags: AGENT_FLAG,
-    ipcMethod: IPC_METHODS.initiate,
     jsonOut: true,
+    ipcMethod: IPC_METHODS.contacts,
     async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      return initiate(ctx.celloDir, positional[0] ?? "", { agent, pretty });
+      const { agent, pretty } = parityOpts(args);
+      return contactList(ctx.celloDir, { agent, pretty });
     },
   },
   {
-    name: "send",
-    summary: "Send a message in a session (honors read-before-write).",
+    name: "contact",
+    group: "Contacts",
+    summary: "Act on ONE contact: add, remove, set-tier, set-away, set-moniker.",
     help:
-      "Usage: cello send <session-id> <message…> [--stdin] [--agent <name>] [--pretty]\n" +
-      "  The message is the remaining arguments, or the whole of stdin with --stdin (for text with\n" +
-      "  newlines/quotes). READ-BEFORE-WRITE: if the counterparty has spoken since you last read, the\n" +
-      "  daemon rejects the send with session_not_current and its cursor — that verdict is printed\n" +
-      "  verbatim and NOT auto-fixed. Catch up with 'cello transcript <session-id>', then resend.",
-    flags: [
-      { name: "--agent", consumesValue: false },
-      { name: "--stdin", consumesValue: false },
-    ],
-    ipcMethod: IPC_METHODS.send,
-    jsonOut: true,
+      "Usage: cello contact <pubkey> <operation> [args] [--agent <name>] [--pretty]\n" +
+      "\n" +
+      "  Operations:\n" +
+      "    add                       add this peer to the address book\n" +
+      "    remove                    remove them (they go back to being a stranger)\n" +
+      "    set-tier <0..4>           how much they're trusted: 0=blocked, 1=stranger, 2=known,\n" +
+      "                              3=trusted (reaches you even when you're away), 4=vip.\n" +
+      "                              A higher tier RAISES their limits; it never removes screening.\n" +
+      "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
+      "    set-moniker <name>        YOUR pet name for THEM (empty clears it). Always wins over the\n" +
+      "                              name they offer — the one thing they cannot spoof.\n" +
+      "\n" +
+      "  To list the whole book, use 'cello contacts'.\n" +
+      "  Note: 'set-moniker' names a CONTACT. 'cello moniker' sets your OWN outbound name.\n" +
+      "  Example:  cello contact 178d420b… set-tier 3 --agent alice",
+    flags: AGENT_FLAG,
+    jsonOut: true, // review F3: the WHOLE address book honors §3 — one command, one contract
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
-      const useStdin = positional.includes("--stdin");
-      const rest = positional.filter((a) => a !== "--stdin");
-      const sessionId = rest[0] ?? "";
-      const content = useStdin ? await readStdin() : rest.slice(1).join(" ");
-      return send(ctx.celloDir, sessionId, content, { agent, pretty });
-    },
-  },
-  {
-    name: "receive",
-    summary: "Receive the next message, or catch up in a batch with --since-seq.",
-    help:
-      "Usage: cello receive <session-id> [--since-seq N] [--timeout-ms N] [--agent <name>] [--pretty]\n" +
-      "  Default: BLOCKS for the next live message (up to --timeout-ms, default 30000).\n" +
-      "  With --since-seq N: stateless CATCH-UP — returns every message after sequence N as a batch,\n" +
-      "  immediately (no replay race, --timeout-ms ignored). Mirrors cello_receive exactly.",
-    flags: [
-      { name: "--agent", consumesValue: false },
-      { name: "--timeout-ms", consumesValue: true },
-      { name: "--since-seq", consumesValue: true },
-    ],
-    ipcMethod: IPC_METHODS.receive,
-    jsonOut: true,
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const since = takeValueFlag(positional, "--since-seq");
-      const timeout = takeValueFlag(since.rest, "--timeout-ms");
-      try {
-        return await receive(ctx.celloDir, timeout.rest[0] ?? "", {
-          agent,
-          pretty,
-          sinceSeq: numberOrUndefined(since.value, "--since-seq"),
-          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
-        });
-      } catch (err: unknown) {
-        return flagError(err);
+      const o = { agent, pretty };
+      // §3 SHAPE: `contact <pubkey> <op>` — the subject first, then what to do to them. (The old
+      // shape was `contact <op> <pubkey>`, which read like a verb table rather than an address book.)
+      const [pubkey, op, valueArg] = positional;
+      if (!pubkey || !op) return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
+      if (op === "add") return contactAdd(ctx.celloDir, pubkey, o);
+      if (op === "remove") return contactRemove(ctx.celloDir, pubkey, o);
+      if (op === "set-tier" && valueArg !== undefined) {
+        // Daemon validates the value; a non-numeric arg surfaces as its invalid_tier verdict.
+        return contactSetTier(ctx.celloDir, pubkey, Number(valueArg), o);
       }
-    },
-  },
-  {
-    name: "receive-session",
-    summary: "Accept / join an inbound session request.",
-    help:
-      "Usage: cello receive-session <session-id> [--timeout-ms N] [--agent <name>] [--pretty]\n" +
-      "  Joins an inbound session (the one 'cello await-session' told you about).",
-    flags: AGENT_AND_TIMEOUT,
-    ipcMethod: IPC_METHODS["receive-session"],
-    jsonOut: true,
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const timeout = takeValueFlag(positional, "--timeout-ms");
-      try {
-        return await receiveSession(ctx.celloDir, timeout.rest[0] ?? "", {
-          agent,
-          pretty,
-          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
-        });
-      } catch (err: unknown) {
-        return flagError(err);
+      if (op === "set-away") {
+        // The rest of the args form the away text; empty → clear.
+        const message = positional.slice(2).join(" ");
+        return contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, o);
       }
-    },
-  },
-  {
-    name: "close",
-    summary: "Close a session — triggers the bilateral seal ceremony.",
-    help:
-      "Usage: cello close <session-id> [--force] [--agent <name>] [--pretty]\n" +
-      "  Normally runs the bilateral SEAL ceremony: both parties get a notarized receipt.\n" +
-      "  --force abandons a half-open session that can never be sealed (a handshake the counterparty\n" +
-      "  never joined). It FORFEITS the receipt — never use it on a healthy session.",
-    flags: [
-      { name: "--agent", consumesValue: false },
-      { name: "--force", consumesValue: false },
-    ],
-    ipcMethod: IPC_METHODS.close,
-    jsonOut: true,
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const force = positional.includes("--force");
-      const rest = positional.filter((a) => a !== "--force");
-      return closeSession(ctx.celloDir, rest[0] ?? "", { agent, pretty, force });
-    },
-  },
-  {
-    name: "await-session",
-    summary: "Block until an inbound session request arrives (the doorbell).",
-    help:
-      "Usage: cello await-session [--timeout-ms N] [--agent <name>] [--pretty]\n" +
-      "  BLOCKS until someone opens a session with you (default 30000ms), then prints the request.\n" +
-      "  On expiry it returns {\"type\":\"timeout\"} and exits 0 — a timeout is a normal answer, not an\n" +
-      "  error (this mirrors cello_await_session exactly). Branch on .type in scripts.",
-    flags: AGENT_AND_TIMEOUT,
-    ipcMethod: IPC_METHODS["await-session"],
-    jsonOut: true,
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const timeout = takeValueFlag(positional, "--timeout-ms");
-      try {
-        return await awaitSession(ctx.celloDir, { agent, pretty, timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms") });
-      } catch (err: unknown) {
-        return flagError(err);
+      if (op === "set-moniker") {
+        // Empty → null clears it, mirroring the tool.
+        const moniker = positional.slice(2).join(" ");
+        return contactSetMoniker(ctx.celloDir, pubkey, moniker.length > 0 ? moniker : null, o);
       }
+      return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
+    },
+  },
+
+  // ═══ Other ══════════════════════════════════════════════════════════════════════════════════
+  {
+    name: "settings",
+    group: "Other",
+    summary: "Get or set how reachable an agent is (limits per trust tier, away messages).",
+    help:
+      "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]\n" +
+      "  Per-agent reachability policy (DOD-SETTINGS-1). Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes\n" +
+      "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
+      "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
+    flags: AGENT_FLAG,
+    async run(ctx, args) {
+      const { agent, positional } = splitAgentFlag(args);
+      const [sub, key, value] = positional;
+      if (sub === "get") return legacy(await settingsGet(ctx.celloDir, key, agent)); // key optional → all
+      if (sub === "set" && key && value !== undefined) {
+        return legacy(await settingsSet(ctx.celloDir, key, value, agent));
+      }
+      return {
+        stdout: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]",
+        stderr: "",
+        exitCode: 1,
+      };
+    },
+  },
+  {
+    name: "moniker",
+    group: "Other",
+    summary: "Set the name OTHERS see when this agent contacts them (like caller ID).",
+    help:
+      "Usage: cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>]\n" +
+      "  Your OUTBOUND name — what shows up on the counterparty's screen when you reach them.\n" +
+      "  Defaults to the agent name; 'set' overrides it, 'clear' restores the default.\n" +
+      // MONIKER-0 AC2: the regex text is DERIVED from the shared constant, never hand-typed.
+      `  Name rule: 1–64 characters, letters/digits/'-'/'_' only, no spaces (regex ${MONIKER_RE.source}).\n` +
+      "  It is a HINT, not proof — like caller ID, the receiver is shown it as self-declared and can\n" +
+      "  override it with their own pet name for you. Never sent to the directory.\n" +
+      "  Example:  cello moniker set Wonderland_Alice --agent alice",
+    flags: AGENT_FLAG,
+    async run(ctx, args) {
+      const { agent, positional } = splitAgentFlag(args);
+      const [sub, name] = positional;
+      if (sub === "set" && name) return legacy(await monikerSet(ctx.celloDir, name, agent));
+      if (sub === "clear" && !name) return legacy(await monikerSet(ctx.celloDir, null, agent));
+      return { stdout: helpForSpec("moniker"), stderr: "", exitCode: 1 };
+    },
+  },
+  {
+    name: "telegram",
+    group: "Other",
+    summary: "Connect a Telegram bot to your daemon for notifications, status updates, etc.",
+    help:
+      "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>\n" +
+      "  Connects a Telegram bot to your daemon so you get notified there (someone reaching you,\n" +
+      "  status updates, and more over time). Starts polling immediately.\n" +
+      "  The chat id you give is the ONLY chat that ever receives anything.",
+    async run(ctx, args) {
+      const [sub, botToken, chatId] = args;
+      if (sub === "set-token" && botToken && chatId) {
+        return legacy(await telegramSetToken(ctx.celloDir, botToken, chatId));
+      }
+      return { stdout: "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>", stderr: "", exitCode: 1 };
+    },
+  },
+  {
+    name: "bridge",
+    group: "Other",
+    // Renamed from `install`, which read as "install CELLO itself" and hardcoded Hermes — the
+    // runtime is a PARAMETER. More runtimes are coming; the description must not claim otherwise.
+    summary: "Bridge CELLO into a third-party agent runtime (Hermes, OpenClaw, …).",
+    help:
+      "Usage: cello bridge <runtime> --agent <name> [--hermes-home <path>]\n" +
+      "  Wires the local CELLO daemon into a third-party agent runtime so that agent can use CELLO.\n" +
+      "  Supported runtimes: hermes  (more coming).\n" +
+      "\n" +
+      "  hermes: scaffolds the CELLO plugin into the Hermes home (default ~/.hermes), binds\n" +
+      "  CELLO_AGENT_NAME in its .env, and registers via 'hermes plugins enable cello' +\n" +
+      "  'hermes mcp add cello'. Idempotent — re-run to upgrade.\n" +
+      "  Afterwards, restart the gateway: hermes gateway restart\n" +
+      "\n" +
+      "  Example:  cello bridge hermes --agent alice",
+    flags: [{ name: "--agent" }, { name: "--hermes-home" }],
+    async run(_ctx, args) {
+      const agentIdx = args.indexOf("--agent");
+      const homeIdx = args.indexOf("--hermes-home");
+      // Find the target positional, excluding both flags AND their values — so
+      // `cello bridge --agent alice hermes` still resolves target=hermes.
+      const target = args.find(
+        (a, i) =>
+          !a.startsWith("-") &&
+          !(agentIdx !== -1 && i === agentIdx + 1) &&
+          !(homeIdx !== -1 && i === homeIdx + 1),
+      );
+      if (target !== "hermes") {
+        return { stdout: helpForSpec("bridge"), stderr: "", exitCode: 1 };
+      }
+      const { installHermes } = await import("./hermes/install-hermes.js");
+      return legacy(
+        await installHermes({
+          agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",
+          hermesHome: homeIdx !== -1 ? args[homeIdx + 1] : undefined,
+        }),
+      );
     },
   },
 ];
@@ -732,11 +851,20 @@ export function flagsFor(name: string): ReadonlyMap<string, FlagSpec> {
 }
 
 /**
- * DOD-ONBOARD-HELP-1: render the described `Commands:` table — each command on its own line with
- * its one-line summary (git / `claude --help` style). Arguments stay in per-command `--help`.
+ * DOD-ONBOARD-HELP-1 §1: render the `Commands:` table GROUPED and in logical order.
+ *
+ * Flat-and-arbitrary was the reopen: `register` appeared before `create-agent`, so the table
+ * literally listed step 2 above step 1. Sections in GROUP_ORDER, commands in declaration order
+ * within each — the order a reader would actually do them. Name column is padded across the WHOLE
+ * table (not per group) so the summaries line up as one column down the page.
  */
 export function renderCommandsTable(): string {
   const width = Math.max(...COMMANDS.map((c) => c.name.length));
-  const rows = COMMANDS.map((c) => `  ${c.name.padEnd(width)}  ${c.summary}`);
-  return `Commands:\n${rows.join("\n")}`;
+  const sections = GROUP_ORDER.map((group) => {
+    const rows = COMMANDS.filter((c) => c.group === group).map(
+      (c) => `  ${c.name.padEnd(width)}  ${c.summary}`,
+    );
+    return rows.length === 0 ? null : `${group}:\n${rows.join("\n")}`;
+  }).filter((s): s is string => s !== null);
+  return sections.join("\n\n");
 }

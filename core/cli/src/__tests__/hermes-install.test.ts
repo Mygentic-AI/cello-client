@@ -1,5 +1,5 @@
 /**
- * HERMES-001 — `cello install hermes` installer tests.
+ * HERMES-001 — `cello bridge hermes` installer tests.
  *
  * The installer scaffolds the CELLO platform-adapter plugin into a Hermes Agent home
  * directory, binds the agent name via the Hermes env file, and registers the plugin +
@@ -74,7 +74,7 @@ describe("installHermes — successful scaffold", () => {
     // Skill
     const skill = readFileSync(join(hermesHome, "skills", "cello-bridge-setup", "SKILL.md"), "utf-8");
     expect(skill).toContain("name: cello-bridge-setup");
-    expect(skill).toContain("cello install hermes");
+    expect(skill).toContain("cello bridge hermes");
 
     // Agent binding in the Hermes env file
     const env = readFileSync(join(hermesHome, ".env"), "utf-8");
@@ -166,21 +166,21 @@ describe("installHermes — hermes CLI failure paths", () => {
 
 describe("cli-args — install command surface", () => {
   it("install is a known command and appears in USAGE", () => {
-    expect(KNOWN_COMMANDS.has("install" as never)).toBe(true);
-    expect(USAGE).toContain("install");
+    expect(KNOWN_COMMANDS.has("bridge" as never)).toBe(true);
+    expect(USAGE).toContain("bridge");
   });
 
   it("help for install documents the hermes target and flags", () => {
-    const help = helpForCommand("install");
+    const help = helpForCommand("bridge");
     expect(help).toContain("hermes");
     expect(help).toContain("--agent");
     expect(help).toContain("--hermes-home");
   });
 
   it("checkArgs accepts install's flags and rejects unknown ones", () => {
-    expect(checkArgs("install", ["hermes", "--agent", "alice"])).toEqual({ kind: "ok" });
-    expect(checkArgs("install", ["hermes", "--hermes-home", "/tmp/x"])).toEqual({ kind: "ok" });
-    expect(checkArgs("install", ["hermes", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    expect(checkArgs("bridge", ["hermes", "--agent", "alice"])).toEqual({ kind: "ok" });
+    expect(checkArgs("bridge", ["hermes", "--hermes-home", "/tmp/x"])).toEqual({ kind: "ok" });
+    expect(checkArgs("bridge", ["hermes", "--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
   });
 });
 

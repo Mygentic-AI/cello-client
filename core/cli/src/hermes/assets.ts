@@ -1,5 +1,5 @@
 /**
- * HERMES-001 — file assets scaffolded by `cello install hermes`.
+ * HERMES-001 — file assets scaffolded by `cello bridge hermes`.
  *
  * These are the exact file contents written into the operator's Hermes Agent home
  * (default ~/.hermes). They are embedded as string constants because the published
@@ -57,7 +57,7 @@ session changes state or a message arrives. The agent itself reads and replies
 through the cello_* MCP tools (the 'cello' entry in mcp_servers) - this adapter
 never touches message content, and its send() is a deliberate no-op.
 
-Installed and kept up to date by 'cello install hermes'. Do not edit in place;
+Installed and kept up to date by 'cello bridge hermes'. Do not edit in place;
 re-run the installer to upgrade.
 """
 
@@ -213,7 +213,7 @@ class CelloAdapter(BasePlatformAdapter):
         if not self._agent_name:
             logger.error(
                 "[cello] CELLO_AGENT_NAME is not set - cannot bind this Hermes "
-                "instance to a CELLO agent. Run 'cello install hermes --agent <name>' "
+                "instance to a CELLO agent. Run 'cello bridge hermes --agent <name>' "
                 "or set CELLO_AGENT_NAME in the Hermes env file, then restart the gateway."
             )
             return False
@@ -577,7 +577,7 @@ def interactive_setup() -> None:
 
     print_info("Bind this Hermes instance to a registered CELLO agent.")
     print_info("If you have not set up CELLO yet, run: cello login, then")
-    print_info("cello create-agent <name> and cello register <name> <token>.")
+    print_info("cello create-agent <name> and cello register-agent <name> <token>.")
     print()
 
     agent = prompt("CELLO agent name", default=existing or "")
@@ -604,7 +604,7 @@ def register(ctx) -> None:
         install_hint=(
             "Install the CELLO client and start its daemon: "
             "npx --yes @cello-protocol/cli@latest login "
-            "(then 'cello install hermes --agent <name>')"
+            "(then 'cello bridge hermes --agent <name>')"
         ),
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
@@ -667,14 +667,14 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
 1. **Check CELLO is set up.** Run \`cello status\`. If the CLI is missing or the daemon
    is not running, walk the user through CELLO onboarding first:
    \`npx --yes @cello-protocol/cli@latest login\`, then \`cello create-agent <name>\`,
-   then \`cello register <name> <pre-auth-token>\` (token from the CELLO Operations
+   then \`cello register-agent <name> <pre-auth-token>\` (token from the CELLO Operations
    Agent on Telegram). Confirm with \`cello status\`.
 2. **Pick the agent.** Ask the user which registered CELLO agent this Hermes instance
    should bind to (the \`cello status\` output lists them).
 3. **Run the installer** — one command does all the work (plugin scaffold, env binding,
    \`hermes plugins enable cello\`, \`hermes mcp add cello\`):
 
-       cello install hermes --agent <name>
+       cello bridge hermes --agent <name>
 
    Pass \`--hermes-home <path>\` only if Hermes does not live at ~/.hermes.
 4. **Restart the gateway:** \`hermes gateway restart\`.

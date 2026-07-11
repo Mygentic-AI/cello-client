@@ -61,7 +61,7 @@ describe("Phase 0: KNOWN_COMMANDS / helpForCommand / checkArgs all DERIVE from t
     expect(checkArgs("sessions", ["--all", "--limit", "5"])).toEqual({ kind: "ok" });
     expect(checkArgs("sessions", ["--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
     // a command that declares no flags rejects any flag
-    expect(checkArgs("register", ["--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    expect(checkArgs("register-agent", ["--bogus"])).toEqual({ kind: "unknown_flag", flag: "--bogus" });
   });
 });
 
@@ -76,7 +76,11 @@ describe("DOD-ONBOARD-HELP-1: `cello --help` renders a DESCRIBED Commands: table
   });
 
   it("USAGE embeds the table — every command is listed WITH a description", () => {
-    expect(USAGE).toContain("Commands:");
+    // The reopen (2026-07-11) replaced the single flat `Commands:` block with GROUPED sections, so
+    // the group headers ARE the structure now — an umbrella "Commands:" above them would be noise.
+    // The guarantee is unchanged and is asserted below: every command, with its summary.
+    expect(USAGE).toContain("Setup:");
+    expect(USAGE).toContain("Messaging:");
     for (const spec of COMMANDS) {
       expect(USAGE, `usage must list '${spec.name}'`).toContain(spec.name);
       expect(USAGE, `usage must describe '${spec.name}'`).toContain(spec.summary);

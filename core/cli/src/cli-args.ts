@@ -34,7 +34,7 @@ export type KnownCommand = string;
 export const USAGE =
   "CELLO — a peer-to-peer identity & trust layer for agent-to-agent communication.\n" +
   "\n" +
-  "First-time setup:  cello login  →  cello create-agent <name>  →  cello register <name> <token>  →  cello status\n" +
+  "First-time setup:  cello login  →  cello create-agent <name>  →  cello register-agent <name> <token>  →  cello status\n" +
   "  (get <token> from the CELLO Operations Agent on Telegram; 'cello login' starts the local daemon.)\n" +
   "\n" +
   "Usage: cello <command> [args]\n" +
@@ -44,11 +44,12 @@ export const USAGE =
   "\n" +
   "Run 'cello <command> --help' for details on any command.\n" +
   // Scoped deliberately: only the parity commands (jsonOut) honor the full §3 contract — JSON on
-  // stdout, structured error on stderr. The older commands (login, register, …) still print human
-  // text, and their failures go to stdout. Claiming the contract for EVERY command would be a
+  // stdout, structured error on stderr. The older commands (login, register-agent, …) still print
+  // human text, and their failures go to stdout. Claiming the contract for EVERY command would be a
   // promise the binary does not keep, made to precisely the reader who would script against it.
-  "The session and agent commands (agents, use-agent, initiate, send, receive, close, …) print JSON\n" +
-  "and exit non-zero on failure, so any bash-capable agent can drive CELLO with no MCP dependency.";
+  "The session and agent commands (agents, use-agent, initiate-session, send, receive, close-session,\n" +
+  "…) print JSON and exit non-zero on failure, so any bash-capable agent can drive CELLO with no MCP\n" +
+  "dependency. Every command here is also an MCP tool of the same name: cello send ↔ cello_send.";
 
 /** Per-command help — the registry entry's own text, verbatim. */
 export function helpForCommand(command: string): string {

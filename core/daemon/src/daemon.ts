@@ -43,6 +43,7 @@ import type {
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
+import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { TIER, isKnownTierValue } from "./contacts-tier-migration.js";
 import { isValidSettingKey, allSettingKeys, validateSettingValue, AWAY_MESSAGE_MAX_LEN } from "./agent-settings-keys.js";
@@ -1987,7 +1988,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   function startAgentInternal(name: string): { ok: true } | { ok: false; reason: string; guidance: string } {
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Run 'cello login' to register agents, or check agent names with cello_list_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Run 'cello login' to register agents, or check agent names with cello_agents.` };
     }
     if (onlineAgents.has(name)) {
       // Idempotent — already online, no event
@@ -2064,7 +2065,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
     if (store.hasActiveAgent(name) || agents.some((a) => a.name === name)) {
-      return { ok: false, reason: "agent_already_exists", guidance: `Agent '${name}' already exists. Choose a different name, or see cello_list_agents.` };
+      return { ok: false, reason: "agent_already_exists", guidance: `Agent '${name}' already exists. Choose a different name, or see cello_agents.` };
     }
     let pubkeyHex: string;
     let agentId: string;
@@ -2174,7 +2175,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // any retire — the active-only accessors filter retired rows out once state is flipped.
     const target = store.getAgentForRevocation(name);
     if (!target) {
-      return { ok: false, reason: "agent_not_found", guidance: `No agent named '${name}'. Check cello_list_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `No agent named '${name}'. Check cello_agents.` };
     }
     const wasActive = target.state !== "retired";
     const agentId = target.localAgentId;
@@ -2274,7 +2275,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_list_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_agents.` };
     }
     if (!onlineAgents.has(name)) {
       // Idempotent — already registered/offline, no event
@@ -2307,7 +2308,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_list_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it with 'cello create-agent ${name}', register it, then retry — or check names with cello_agents.` };
     }
     const connState = perConnectionState.get(connectionId);
     if (!connState) {
@@ -2415,11 +2416,11 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
     }
     if (!preAuthToken) {
-      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry cello_register." };
+      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
     }
     const keyProvider = keyProviders.get(name);
     if (!keyProvider) {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with cello_create_agent('${name}') (or 'cello create-agent ${name}'), then retry cello_register.` };
+      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with 'cello create-agent'('${name}') (or 'cello create-agent ${name}'), then retry 'cello register-agent'.` };
     }
     if (!directoryEndpointResolver) {
       return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };
@@ -2471,7 +2472,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         return {
           ok: false,
           reason: "directory_signaling_timeout",
-          guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry cello_register.`,
+          guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry 'cello register-agent'.`,
         };
       }
 
@@ -3375,7 +3376,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "session_not_found",
-        guidance: "No session found with this ID. Check cello_list_sessions for active and interrupted sessions.",
+        guidance: "No session found with this ID. Check cello_sessions for active and interrupted sessions.",
       };
     }
 
@@ -3385,7 +3386,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "session_not_owned",
-        guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it (see cello_list_sessions), then retry.",
+        guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it (see cello_sessions), then retry.",
       };
     }
 
@@ -3394,7 +3395,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "session_already_sealed",
-        guidance: "This session is already sealed. No further action is needed — check cello_list_sessions to view its sealed record and the FROST notarization.",
+        guidance: "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
       };
     }
 
@@ -3644,7 +3645,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         return {
           ok: false,
           reason: uniResult.reason,
-          guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_list_sessions) before retrying cello_close_session.",
+          guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_sessions) before retrying cello_close_session.",
         };
       } finally {
         // Fix #1: release the transient broker seal-connection (best-effort; the seal result stands).
@@ -3660,7 +3661,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return {
       ok: false,
       reason: "session_not_closeable",
-      guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_list_sessions; a seal_interrupted_pending session is awaiting FROST notarization.`,
+      guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_sessions; a seal_interrupted_pending session is awaiting FROST notarization.`,
     };
   });
 
@@ -3684,7 +3685,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
     const sessionId = params?.["session_id"] as string | undefined;
     if (!sessionId || typeof sessionId !== "string") {
-      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_list_sessions for sealed sessions." };
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_sessions for sealed sessions." };
     }
     // DOD-LOOP-1: the certificate is keyed by (agent, session_id) — read the current agent's.
     const connState = perConnectionState.get(connectionId);
@@ -3716,7 +3717,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "wrong_agent",
-        guidance: `This session belongs to agent '${owner.name}', not the current agent '${agentName}'. Call cello_use_agent('${owner.name}') then retry cello_get_sealed_receipt.`,
+        guidance: `This session belongs to agent '${owner.name}', not the current agent '${agentName}'. Call cello_use_agent('${owner.name}') then retry cello_sealed_receipt.`,
       };
     }
     // A truncated paste: the id is a strict prefix of one of this agent's real session ids.
@@ -3727,13 +3728,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "session_id_too_short",
-        guidance: "That looks like a truncated session id. cello_list_sessions and cello status show the FULL id — copy the complete id and retry.",
+        guidance: "That looks like a truncated session id. cello_sessions and cello status show the FULL id — copy the complete id and retry.",
       };
     }
     return {
       ok: false,
       reason: "unknown_session",
-      guidance: "No session with this id belongs to the current agent. Run cello_list_sessions to see the full ids of this agent's sessions.",
+      guidance: "No session with this id belongs to the current agent. Run cello_sessions to see the full ids of this agent's sessions.",
     };
   });
 
@@ -3744,7 +3745,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   handlers.set("cello_get_transcript", async (params, connectionId) => {
     const sessionId = params?.["session_id"] as string | undefined;
     if (!sessionId || typeof sessionId !== "string") {
-      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_list_sessions." };
+      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_sessions." };
     }
     const connState = perConnectionState.get(connectionId);
     // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
@@ -5200,7 +5201,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "seal_interrupted_counterparty_unavailable",
-        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_list_connections.",
+        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_status.",
       };
     }
 
@@ -5218,7 +5219,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "seal_interrupted_counterparty_unavailable",
-        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_list_connections.",
+        guidance: "The counterparty is not currently reachable to complete the seal-interrupted flow. Retry when the counterparty is online — check their connection status via cello_status.",
       };
     }
 
@@ -5451,7 +5452,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         ok: false,
         reason,
         guidance: ackResult.type === "timeout"
-          ? "The counterparty did not acknowledge the seal in time. Retry when they are online — check cello_list_connections. The session remains active and usable."
+          ? "The counterparty did not acknowledge the seal in time. Retry when they are online — check cello_status. The session remains active and usable."
           : "The counterparty rejected the seal request. Their session state may be inconsistent. Ask them to check cello status before retrying.",
       };
     }
@@ -5532,7 +5533,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // DOD-LOOP-1: the (agent, session_id) lookup is itself the ownership scope.
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record) {
-      return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions for active sessions." };
+      return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_sessions for active sessions." };
     }
     if (record.agent_name !== agentName) {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
@@ -5594,7 +5595,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         current_seq: currentSeq,
         last_read_seq: connectionCursor,
         unread_received: unreadReceived,
-        guidance: `This agent hasn't read ${unreadReceived} received message(s) on session ${sessionId}. Call cello_receive (or cello_get_transcript for the full history) to read them, then retry the send.`,
+        // DOD-ONBOARD-HELP-1 §5: say what is wrong and what to do, in that order, in plain words.
+        // The old text opened with the internal noun ("this agent hasn't read…"); a refused send is
+        // the most common wall a new operator hits, so it leads with the COUNT and the FIX. The
+        // session id is interpolated so the remedy is copy-pasteable, not a template to fill in.
+        // Rendered per surface at the IPC boundary — a CLI caller sees `cello receive <id>`.
+        guidance: `${unreadReceived} unread message(s) — run cello_receive ${sessionId} first to read them, then send again. (Or cello_transcript ${sessionId} for the whole conversation.) You are blocked from replying to something you haven't read.`,
       };
     }
 
@@ -5720,7 +5726,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: sendResult.reason,
-        guidance: "The content could not be delivered over the session stream right now. It has been queued in the durable retry queue and will be retried when the counterparty reconnects. The session remains usable — check cello_list_connections for the counterparty's status.",
+        guidance: "The content could not be delivered over the session stream right now. It has been queued in the durable retry queue and will be retried when the counterparty reconnects. The session remains usable — check cello_status for the counterparty's status.",
       };
     }
 
@@ -5821,7 +5827,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     let transcriptOnly = false;
     if (!record) {
       if (sessionNodeManager.readTranscript(agentName, sessionId).messages.length === 0) {
-        return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_list_sessions." };
+        return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_sessions." };
       }
       transcriptOnly = true;
     }
@@ -5870,7 +5876,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       return {
         ok: false,
         reason: "session_not_live",
-        guidance: "This session exists only as a durable transcript (no live session — it was never established or predates this daemon). Read it with cello_receive { since_seq } (e.g. since_seq: -1 for everything) or cello_get_transcript.",
+        guidance: "This session exists only as a durable transcript (no live session — it was never established or predates this daemon). Read it with cello_receive { since_seq } (e.g. since_seq: -1 for everything) or cello_transcript.",
       };
     }
 
@@ -5913,8 +5919,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
           unread_count: terminal.unreadCount,
           guidance: terminal.unreadCount > 0
-            ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_get_transcript to retrieve the full sealed history. No further actions are required on this session.`
-            : "The session has been sealed by both parties. The full history is available via cello_get_transcript. No further actions are required on this session.",
+            ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
+            : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
         };
       }
       // 3) Out of time — non-blocking-equivalent empty answer.
@@ -5932,7 +5938,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
           };
         }
-        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting, or read cello_get_transcript for the full session history." };
+        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting, or read cello_transcript for the full session history." };
       }
       await new Promise((r) => setTimeout(r, Math.min(20, remaining)));
     }
@@ -6231,7 +6237,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
     if (!store.setMoniker(resolved.agent, moniker)) {
-      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${resolved.agent}'. See cello_list_agents.` };
+      return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${resolved.agent}'. See cello_agents.` };
     }
     logger.info("agent.moniker.set", { agentName: resolved.agent, cleared: moniker === null });
     return { ok: true, agent: resolved.agent, moniker };
@@ -6264,10 +6270,31 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     return { acknowledged: true };
   });
 
+  // DOD-ONBOARD-HELP-1 §5 — render every response for the surface that asked.
+  //
+  // The daemon is where an operator actually MEETS the tool names: a refused send says "call
+  // cello_receive first". Those strings are written with the canonical MCP names, so an MCP caller
+  // gets them verbatim — but a CLI caller must be told `cello receive`, the thing they can type.
+  // (P2-7 was the one-off report of this; it is a whole CLASS, and this closes the class.)
+  //
+  // Wrapping the handler map is the ONE choke point that has both the response and the connection's
+  // clientType. Doing it per-handler would mean 60+ call sites, and the 61st would forget.
+  const renderedHandlers = new Map<string, IpcHandler>();
+  for (const [method, handler] of handlers) {
+    renderedHandlers.set(method, async (params, connectionId) => {
+      const result = await handler(params, connectionId);
+      // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and the
+      // CLI verb is the safe answer — it is at least a real command an operator can run, whereas an
+      // MCP tool name is useless in a terminal.
+      const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
+      return renderForSurface(result, surface);
+    });
+  }
+
   // Create and start IPC server
   const ipcServer: IpcServer = createIpcServer(
     { socketPath, maxConnections, logger },
-    handlers,
+    renderedHandlers,
   );
 
   try {

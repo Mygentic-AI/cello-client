@@ -55,6 +55,9 @@ importers:
         specifier: ^4.4.2
         version: 4.4.3
     devDependencies:
+      '@cello-protocol/daemon':
+        specifier: workspace:*
+        version: link:../daemon
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
         version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))

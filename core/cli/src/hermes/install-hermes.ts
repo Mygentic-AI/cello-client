@@ -1,5 +1,5 @@
 /**
- * HERMES-001 — `cello install hermes`: wire the local CELLO daemon into a Hermes
+ * HERMES-001 — `cello bridge hermes`: wire the local CELLO daemon into a Hermes
  * Agent installation.
  *
  * What it does (design: trustless-cello 2026-07-09_1915_hermes-agent-integration-plan.md §5):
@@ -97,7 +97,7 @@ export async function installHermes(
     return {
       exitCode: 1,
       output:
-        "Missing agent name. Usage: cello install hermes --agent <name> [--hermes-home <path>]\n" +
+        "Missing agent name. Usage: cello bridge hermes --agent <name> [--hermes-home <path>]\n" +
         "The agent must be a local CELLO agent (see 'cello status' for the list).",
     };
   }
@@ -155,7 +155,7 @@ export async function installHermes(
       out.push(
         `\n'hermes ${args.join(" ")}' failed (exit ${result.code}):`,
         (result.stderr || result.stdout).trim(),
-        "Fix the error above and re-run 'cello install hermes' (it is idempotent).",
+        "Fix the error above and re-run 'cello bridge hermes' (it is idempotent).",
       );
       return { exitCode: 1, output: out.join("\n") };
     }

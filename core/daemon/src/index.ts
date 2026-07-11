@@ -52,3 +52,16 @@ export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll
 export { InMemoryManifestVersionStore } from "./manifest-version-store.js";
 export { DbManifestVersionStore } from "./manifest-version-store-db.js";
 export { ManifestDirectoryChallengeVerifier, TestDirectoryChallengeVerifier } from "./challenge-verifier.js";
+
+// DOD-ONBOARD-HELP-1 §2b — the ONE vocabulary (capability → {cli, mcp}). Exported so the CLI
+// registry and the connect shim's audit test derive their names from the SAME table the daemon
+// renders its guidance from, instead of three lists of literals that drift.
+export {
+  DUAL_SURFACE_VERBS,
+  MCP_ONLY_TOOLS,
+  knownToolNames,
+  toCliGuidance,
+  renderForSurface,
+  type DualSurfaceVerb,
+  type ClientSurface,
+} from "./vocabulary.js";

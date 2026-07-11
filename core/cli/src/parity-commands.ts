@@ -218,6 +218,15 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
  * `cello_contact_set_moniker` while the code called `cello_contact_set_away`, and the audit — which
  * only read the metadata — would happily pass. A comment-in-a-field is not a guarantee; this is.
  */
+/**
+ * CLI command name → the daemon IPC method it calls.
+ *
+ * The KEYS are the CLI/MCP capability names (DOD-ONBOARD-HELP-1 §2b: one vocabulary). The VALUES
+ * are the daemon's IPC WIRE names, which deliberately do NOT move — the shim maps tool
+ * `cello_agents` onto the existing `cello_list_agents` method. Renaming the wire would break a new
+ * daemon talking to an OLD connect shim; connect has no daemon dependency, so nothing pins the two
+ * together. That asymmetry is the whole reason this table exists rather than a string concat.
+ */
 export const IPC_METHODS = {
   agents: "cello_list_agents",
   "start-agent": "cello_start_agent",
@@ -226,15 +235,15 @@ export const IPC_METHODS = {
   inbox: "cello_check_notifications",
   transcript: "cello_get_transcript",
   "sealed-receipt": "cello_get_sealed_receipt",
-  initiate: "cello_initiate_session",
+  "initiate-session": "cello_initiate_session",
   send: "cello_send",
   receive: "cello_receive",
   "receive-session": "cello_receive_session",
-  close: "cello_close_session",
+  "close-session": "cello_close_session",
   "await-session": "cello_await_session",
+  contacts: "cello_contact_list",
   "contact-add": "cello_contact_add",
   "contact-remove": "cello_contact_remove",
-  "contact-list": "cello_contact_list",
   "contact-set-tier": "cello_contact_set_tier",
   "contact-set-away": "cello_contact_set_away",
   "contact-set-moniker": "cello_contact_set_moniker",
@@ -312,7 +321,7 @@ export function sealedReceipt(celloDir: string, sessionId: string, opts: ParityO
 // One command, one contract. (Behavior change, journaled: contact failures now print JSON on stderr
 // rather than stdout; the exit codes were already correct.)
 
-/** `cello contact add <pubkey>` → cello_contact_add. */
+/** `cello contact <pubkey> add` → cello_contact_add. */
 export function contactAdd(celloDir: string, pubkey: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["contact-add"], { pubkey }, opts);
 }
@@ -322,9 +331,9 @@ export function contactRemove(celloDir: string, pubkey: string, opts: ParityOpti
   return ipcCommand(celloDir, IPC_METHODS["contact-remove"], { pubkey }, opts);
 }
 
-/** `cello contact list` → cello_contact_list. */
+/** `cello contacts` → cello_contact_list. */
 export function contactList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["contact-list"], {}, opts);
+  return ipcCommand(celloDir, IPC_METHODS.contacts, {}, opts);
 }
 
 /** `cello contact set-tier <pubkey> <tier>` → cello_contact_set_tier. */
@@ -344,9 +353,9 @@ export function contactSetMoniker(celloDir: string, pubkey: string, moniker: str
 
 // ─── Group B: live conversation (mirrors the MCP params EXACTLY) ───────────────────────────────
 
-/** `cello initiate <target-pubkey>` → cello_initiate_session. Prints the session_id. */
+/** `cello initiate-session <target-pubkey>` → cello_initiate_session. Prints the session_id. */
 export function initiate(celloDir: string, targetPubkey: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS.initiate, { target_pubkey: targetPubkey }, opts);
+  return ipcCommand(celloDir, IPC_METHODS["initiate-session"], { target_pubkey: targetPubkey }, opts);
 }
 
 /**
@@ -404,7 +413,7 @@ export function receiveSession(
 }
 
 /**
- * `cello close <session-id> [--force]` → cello_close_session. Normally triggers the bilateral seal
+ * `cello close-session <session-id> [--force]` → cello_close_session. Normally triggers the bilateral seal
  * ceremony. --force is passed ONLY when asked for (mirroring the shim), since it forfeits the seal.
  */
 export function closeSession(
@@ -413,7 +422,7 @@ export function closeSession(
   opts: ParityOptions & { force?: boolean },
 ): Promise<CliOutput> {
   const params = opts.force ? { session_id: sessionId, force: true } : { session_id: sessionId };
-  return ipcCommand(celloDir, IPC_METHODS.close, params, opts);
+  return ipcCommand(celloDir, IPC_METHODS["close-session"], params, opts);
 }
 
 /** `cello await-session [--timeout-ms N]` → cello_await_session. Blocks for an inbound doorbell. */

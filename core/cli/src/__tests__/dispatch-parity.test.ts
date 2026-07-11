@@ -91,22 +91,29 @@ async function run(name: string, args: string[]): Promise<void> {
   await spec.run(ctx, args);
 }
 
+/** As run(), but hands back the CliOutput — for asserting a command REFUSED (exit 1, no dispatch). */
+async function runOut(name: string, args: string[]) {
+  const spec = findCommand(name);
+  if (!spec) throw new Error(`no such command: ${name}`);
+  return spec.run(ctx, args);
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   delete process.env.CELLO_PREAUTH_TOKEN;
 });
 
 describe("T2: the registry forwards EXACTLY what the old switch forwarded", () => {
-  it("register: positional agent + token + phone stub, in order", async () => {
-    await run("register", ["alice", "CELLO-tok", "+15551234"]);
+  it("register-agent: positional agent + token + phone stub, in order", async () => {
+    await run("register-agent", ["alice", "CELLO-tok", "+15551234"]);
     expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-tok", "+15551234");
   });
 
-  it("register: falls back to CELLO_PREAUTH_TOKEN when the token argument is absent", async () => {
+  it("register-agent: falls back to CELLO_PREAUTH_TOKEN when the token argument is absent", async () => {
     // The env-var form is documented in help and keeps the token out of shell history. The
     // argv[3..5] → args[0..2] translation is precisely where this fallback could be lost.
     process.env.CELLO_PREAUTH_TOKEN = "CELLO-from-env";
-    await run("register", ["alice"]);
+    await run("register-agent", ["alice"]);
     expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-from-env", "");
   });
 
@@ -117,7 +124,7 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     expect(commands.removeAgent).toHaveBeenCalledWith(CELLO_DIR, "bob");
     await run("refresh", ["carol"]);
     expect(commands.refreshShares).toHaveBeenCalledWith(CELLO_DIR, "carol");
-    await run("receipts", ["dave"]);
+    await run("relay-receipts", ["dave"]);
     expect(commands.relayReceipts).toHaveBeenCalledWith(CELLO_DIR, "dave");
   });
 
@@ -142,22 +149,23 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     // Review F3: the whole address book now goes through the §3 parity path (one command, one
     // contract) — errors on stderr, --pretty available — instead of half legacy / half parity.
     const o = { agent: undefined, pretty: false };
-    await run("contact", ["add", "pk1", "--agent", "alice"]);
+    await run("contact", ["pk1", "add", "--agent", "alice"]);
     expect(parity.contactAdd).toHaveBeenCalledWith(CELLO_DIR, "pk1", { agent: "alice", pretty: false });
 
-    await run("contact", ["remove", "pk1"]);
+    await run("contact", ["pk1", "remove"]);
     expect(parity.contactRemove).toHaveBeenCalledWith(CELLO_DIR, "pk1", o);
 
-    await run("contact", ["list", "--agent", "alice"]);
+    // §3: listing the book is its OWN command now — `cello contacts`, not `cello contact list`.
+    await run("contacts", ["--agent", "alice"]);
     expect(parity.contactList).toHaveBeenCalledWith(CELLO_DIR, { agent: "alice", pretty: false });
 
-    await run("contact", ["tier", "pk1", "3"]);
+    await run("contact", ["pk1", "set-tier", "3"]);
     expect(parity.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 3, o);
 
-    await run("contact", ["away", "pk1", "back", "on", "Monday"]);
+    await run("contact", ["pk1", "set-away", "back", "on", "Monday"]);
     expect(parity.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "back on Monday", o);
 
-    await run("contact", ["away", "pk1"]); // empty message → CLEAR (null), not ""
+    await run("contact", ["pk1", "set-away"]); // empty message → CLEAR (null), not ""
     expect(parity.contactSetAway).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, o);
   });
 
@@ -251,14 +259,14 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
   });
 
   it("close: --force is passed ONLY when asked for (it forfeits the seal)", async () => {
-    await run("close", ["sid1"]);
+    await run("close-session", ["sid1"]);
     expect(parity.closeSession).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, force: false });
-    await run("close", ["sid1", "--force"]);
+    await run("close-session", ["sid1", "--force"]);
     expect(parity.closeSession).toHaveBeenLastCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, force: true });
   });
 
   it("initiate / await-session / receive-session / transcript", async () => {
-    await run("initiate", ["ab12"]);
+    await run("initiate-session", ["ab12"]);
     expect(parity.initiate).toHaveBeenCalledWith(CELLO_DIR, "ab12", { agent: undefined, pretty: false });
     await run("await-session", ["--timeout-ms", "900"]);
     expect(parity.awaitSession).toHaveBeenCalledWith(CELLO_DIR, { agent: undefined, pretty: false, timeoutMs: 900 });
@@ -271,20 +279,36 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
   it("contact set-moniker routes to the per-CONTACT moniker handler (NOT the agent's own moniker)", async () => {
     // These two are easy to conflate — conflating them would rename YOUR agent instead of tagging a
     // contact, and both "succeed". The registry must keep them apart.
-    await run("contact", ["set-moniker", "pk1", "Sup"]);
+    await run("contact", ["pk1", "set-moniker", "Sup"]);
     expect(parity.contactSetMoniker).toHaveBeenCalledWith(CELLO_DIR, "pk1", "Sup", { agent: undefined, pretty: false });
     expect(commands.monikerSet).not.toHaveBeenCalled();
 
-    await run("contact", ["set-moniker", "pk1"]); // empty → clear
+    await run("contact", ["pk1", "set-moniker"]); // empty → clear
     expect(parity.contactSetMoniker).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, { agent: undefined, pretty: false });
   });
 
-  it("set-tier / set-away are accepted, and the legacy tier / away verbs still work", async () => {
+  it("set-tier / set-away are accepted under the `<pubkey> <op>` shape", async () => {
     const o = { agent: undefined, pretty: false };
-    await run("contact", ["set-tier", "pk1", "4"]);
+    await run("contact", ["pk1", "set-tier", "4"]);
     expect(parity.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 4, o);
-    await run("contact", ["set-away", "pk1", "on", "leave"]);
+    await run("contact", ["pk1", "set-away", "on", "leave"]);
     expect(parity.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "on leave", o);
+  });
+
+  // DOD-ONBOARD-HELP-1 §2/§3: the legacy `tier` / `away` aliases and the old `contact <op> <pubkey>`
+  // arg ORDER are DELETED. This matters more than it looks: under the new shape the first positional
+  // is a PUBKEY, so the old `contact tier pk1 3` does not error — it would parse as pubkey="tier",
+  // op="pk1". It must fall through to usage + exit 1, never act on a contact named "tier".
+  it("the OLD contact shape is refused, not silently misread as a pubkey", async () => {
+    for (const argv of [["tier", "pk1", "3"], ["away", "pk1", "later"], ["list"], ["add", "pk1"]]) {
+      vi.clearAllMocks();
+      const out = await runOut("contact", argv);
+      expect(out.exitCode, `'contact ${argv.join(" ")}' must not succeed`).toBe(1);
+      expect(parity.contactSetTier).not.toHaveBeenCalled();
+      expect(parity.contactSetAway).not.toHaveBeenCalled();
+      expect(parity.contactAdd).not.toHaveBeenCalled();
+      expect(parity.contactList).not.toHaveBeenCalled();
+    }
   });
 
   it("sealed-receipt dispatches (review T1: it had NO behavioral coverage at all)", async () => {
@@ -319,11 +343,11 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
       cello_use_agent: "use-agent",
       cello_check_notifications: "inbox",
       cello_get_transcript: "transcript",
-      cello_initiate_session: "initiate",
+      cello_initiate_session: "initiate-session",
       cello_send: "send",
       cello_receive: "receive",
       cello_receive_session: "receive-session",
-      cello_close_session: "close",
+      cello_close_session: "close-session",
       cello_await_session: "await-session",
       // NOT in the brief's table — it claimed cello_get_sealed_receipt was "already covered" by
       // `cello receipts`. It is not: `receipts` calls cello_get_relay_receipts, a DIFFERENT handler.

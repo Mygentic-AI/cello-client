@@ -126,7 +126,12 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     const client = await connectAs("alice");
     const res = (await client.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
     expect(res).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
-    expect(String(res.guidance)).toContain("cello_get_transcript");
+    // DOD-ONBOARD-HELP-1 §5: assert the SUBSTANCE, not the spelling. The daemon now renders the
+    // remedy for the surface that asked (a CLI caller is told `cello transcript`, an MCP caller
+    // `cello_transcript`), so pinning one spelling here would pin the wrong one for half the
+    // callers. Both renderings are locked end-to-end in dod-onboard-help-1-vocabulary.test.ts.
+    expect(String(res.guidance)).toMatch(/transcript/);
+    expect(String(res.guidance)).toMatch(/unread/i);
   });
 
   it("C2: cello_get_transcript advances the cursor and unblocks the send", async () => {

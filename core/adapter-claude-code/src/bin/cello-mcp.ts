@@ -160,7 +160,7 @@ server.tool("cello_use_agent", "Set which online agent this connection routes to
   return jsonText(result);
 });
 
-server.tool("cello_list_agents", "List all agents with state from this connection's perspective", {}, async () => {
+server.tool("cello_agents", "List all agents with state from this connection's perspective", {}, async () => {
   const result = await proxy.call("cello_list_agents");
   return jsonText(result);
 });
@@ -171,7 +171,7 @@ server.tool("cello_list_agents", "List all agents with state from this connectio
 // (cello_contact_list/add/remove) so an agent driving via MCP can see and manage its own whitelist —
 // previously CLI-only (`cello contact …`). Per-agent: defaults to the current agent, or pass { agent }.
 
-server.tool("cello_contact_list", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from unknown-sender screening and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
+server.tool("cello_contacts", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from unknown-sender screening and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
   agent: z.string().optional().describe("Agent name whose whitelist to list (defaults to the current agent)"),
 }, async ({ agent }) => {
   const result = await proxy.call("cello_contact_list", agent ? { agent } : {});
@@ -230,7 +230,7 @@ server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an a
 
 // MONIKER-1: outbound-name override. Forward-only (D7 — validation and persistence live in the
 // daemon's cello_set_moniker; the shim adds no logic).
-server.tool("cello_set_moniker", "Set (or clear, by passing null) an agent's outbound display name — what a counterparty's doorbell shows. Defaults to the agent name; local-only, never sent to the directory. 1-64 chars: letters, digits, '-' or '_'. Defaults to the current agent.", {
+server.tool("cello_moniker", "Set (or clear, by passing null) an agent's outbound display name — what a counterparty's doorbell shows. Defaults to the agent name; local-only, never sent to the directory. 1-64 chars: letters, digits, '-' or '_'. Defaults to the current agent.", {
   moniker: z.string().nullable().describe("The outbound name to set, or null to clear the override (reverts to the agent name)"),
   agent: z.string().optional().describe("Agent name whose outbound name to set (defaults to the current agent)"),
 }, async ({ moniker, agent }) => {
@@ -306,7 +306,11 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
   return jsonText(result);
 });
 
-server.tool("cello_receive_session", "Receive messages from an active session (alias)", {
+// An ALIAS of cello_receive — the daemon registers the SAME handler for both
+// (`handlers.set("cello_receive_session", handleReceive)`). It does not accept or join anything;
+// inbound sessions are auto-accepted by the standing receiver. Described truthfully so no agent
+// calls it expecting a distinct accept step. Slated for removal (no-aliases doctrine).
+server.tool("cello_receive_session", "DEPRECATED alias of cello_receive — identical behavior (the daemon runs the same handler). It does NOT accept or join an inbound session; there is no separate accept step. Use cello_receive.", {
   session_id: z.string().describe("Session ID"),
   timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000)"),
 }, async ({ session_id, timeout_ms }) => {
@@ -322,7 +326,7 @@ server.tool("cello_close_session", "Close a session. Normally triggers the bilat
   return jsonText(result);
 });
 
-server.tool("cello_list_sessions", "List all sessions for the current agent", {}, async () => {
+server.tool("cello_sessions", "List all sessions for the current agent", {}, async () => {
   const result = await proxy.call("cello_list_sessions");
   return jsonText(result);
 });
@@ -334,7 +338,7 @@ server.tool("cello_status", "Get daemon and agent status", {}, async () => {
   return jsonText(result);
 });
 
-server.tool("cello_check_notifications", "Check for pending inbound session requests and unread messages (the push-loss reconciler — discovers anything missed while this session was away). scope 'current' (default) checks the current agent; 'all' checks every loaded agent.", {
+server.tool("cello_inbox", "Check for pending inbound session requests and unread messages (the push-loss reconciler — discovers anything missed while this session was away). scope 'current' (default) checks the current agent; 'all' checks every loaded agent.", {
   scope: z.enum(["current", "all"]).optional().describe("'current' (default) = current agent only; 'all' = every loaded agent, labelled"),
 }, async ({ scope }) => {
   const result = await proxy.call("cello_check_notifications", scope ? { scope } : {});
@@ -351,14 +355,14 @@ server.tool("cello_restore", "Restore agent state from backup", {}, async () => 
   return jsonText(result);
 });
 
-server.tool("cello_get_sealed_receipt", "Get the sealed receipt for a closed session", {
+server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session", {
   session_id: z.string().describe("Session ID"),
 }, async ({ session_id }) => {
   const result = await proxy.call("cello_get_sealed_receipt", { session_id });
   return jsonText(result);
 });
 
-server.tool("cello_get_transcript", "Get the durable, readable conversation transcript for a session (sent + received messages, in order) — recoverable after a daemon restart", {
+server.tool("cello_transcript", "Get the durable, readable conversation transcript for a session (sent + received messages, in order) — recoverable after a daemon restart", {
   session_id: z.string().describe("Session ID"),
 }, async ({ session_id }) => {
   const result = await proxy.call("cello_get_transcript", { session_id });

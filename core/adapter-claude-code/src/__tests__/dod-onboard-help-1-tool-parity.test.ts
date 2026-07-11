@@ -1,0 +1,88 @@
+/**
+ * DOD-ONBOARD-HELP-1 §2b — the connect shim's MCP tool names ARE the vocabulary.
+ *
+ * The rule: an MCP tool's name is `cello_` + the CLI command name. Humans and agents learn a
+ * capability ONCE. This test is what makes that structural rather than aspirational — the shim
+ * cannot register a tool the vocabulary does not know, and cannot silently drop one it does.
+ *
+ * The vocabulary lives in @cello-protocol/daemon and is imported here as a DEV dependency only:
+ * the shim is a thin proxy (no libp2p, no DB, no crypto) and must stay that way, so the daemon
+ * never enters its runtime dependency tree — only its test's.
+ *
+ * The shim's tool names must be string literals (the MCP SDK registers them alongside zod schemas),
+ * so they cannot be derived from the table at runtime. That is exactly why this audit exists: a
+ * literal that can drift, plus a test that will not let it.
+ */
+
+import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const SHIM_SRC = join(here, "..", "bin", "cello-mcp.ts");
+const source = readFileSync(SHIM_SRC, "utf8");
+
+/** Every tool the PUBLISHED shim actually registers. (server.ts is legacy and is not published.) */
+function registeredTools(): string[] {
+  return [...source.matchAll(/server\.tool\("(cello_[a-z_]+)"/g)].map((m) => m[1]).sort();
+}
+
+describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
+  it("registers at least the full known surface (guards against a vacuous pass)", () => {
+    expect(registeredTools().length).toBeGreaterThanOrEqual(25);
+  });
+
+  it("every registered tool name exists in the vocabulary", () => {
+    const known = knownToolNames();
+    const strangers = registeredTools().filter((t) => !known.has(t));
+    expect(
+      strangers,
+      `The shim registers tool(s) the vocabulary does not know. Either add them to ` +
+        `DUAL_SURFACE_VERBS (with their CLI command) or MCP_ONLY_TOOLS, or fix the name. A tool ` +
+        `outside the vocabulary is a capability with two names — the exact thing §2b abolishes.`,
+    ).toEqual([]);
+  });
+
+  it("every DUAL-surface capability is actually registered as a tool", () => {
+    const registered = new Set(registeredTools());
+    const missing = DUAL_SURFACE_VERBS.map((v) => v.mcp).filter((m) => !registered.has(m));
+    expect(
+      missing,
+      `The vocabulary promises these are reachable from MCP, but the shim never registers them. ` +
+        `A promise the binary does not keep is worse than an absent one.`,
+    ).toEqual([]);
+  });
+
+  it("the MCP-only custody stubs are registered (they are the ONLY non-dual tools)", () => {
+    const registered = new Set(registeredTools());
+    for (const t of MCP_ONLY_TOOLS) expect(registered.has(t), `${t} missing`).toBe(true);
+  });
+
+  it("the OLD, pre-rename tool names are gone from the shim", () => {
+    // A leftover here is not cosmetic: the daemon's error guidance now names the NEW tools, so a
+    // stale registration means the operator is told to call `cello_transcript` while the shim only
+    // offers `cello_get_transcript`. Half a rename is worse than none.
+    for (const stale of [
+      "cello_list_agents",
+      "cello_list_sessions",
+      "cello_check_notifications",
+      "cello_get_transcript",
+      "cello_get_sealed_receipt",
+      "cello_set_moniker",
+      "cello_contact_list",
+    ]) {
+      expect(source, `${stale} is still registered as a tool`).not.toContain(`server.tool("${stale}"`);
+    }
+  });
+
+  it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
+    // The tool renamed; the method it proxies to did not. This is deliberate: connect has no daemon
+    // dependency, so a new daemon must keep serving an OLD shim. Renaming the wire would break that
+    // pairing silently. Assert the mapping really is tool≠method for the renamed ones.
+    expect(source).toContain('proxy.call("cello_list_agents")');
+    expect(source).toContain('proxy.call("cello_get_transcript"');
+    expect(source).toContain('proxy.call("cello_check_notifications"');
+  });
+});
