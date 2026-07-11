@@ -77,6 +77,7 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { boundSettingKey, settableTierName } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode, Encoder } from "cbor-x";
@@ -970,6 +971,25 @@ export class SessionNodeManager {
     return this.getTier(agentName, pubkey) >= TIER.WHITELISTED;
   }
 
+  /** DOD-TIER-BOUNDS-SETTINGS: the effective bound for (agent, tier, field) — a per-agent SETTINGS
+   *  override if one is set and valid, else the hardcoded grid default (DEFAULT_TIER_BOUNDS). With no
+   *  settings this is byte-identical to Step 2 (the daemon runs on defaults alone). A stored value
+   *  that is somehow non-positive/non-finite (should be impossible — validated at SET time) falls back
+   *  to the grid default rather than removing the bound (INV-TIER-BOUND, defensive). BLOCKED is never
+   *  settable — it always returns the fixed grid value (0). */
+  resolveTierBound(agentName: string, tier: number, field: "max_sessions" | "max_bytes"): number {
+    const gridDefault = field === "max_sessions"
+      ? tierBoundsFor(tier).maxSessionsPerSender
+      : tierBoundsFor(tier).maxBytesPerSession;
+    const name = settableTierName(tier);
+    if (name === null) return gridDefault; // BLOCKED or out-of-range — fixed, not overridable
+    const raw = this.getSetting(agentName, boundSettingKey(name, field));
+    if (raw === null) return gridDefault; // unset → default
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return gridDefault; // corrupt → default, never unbounded
+    return parsed;
+  }
+
   /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
    *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an
    *  optional pet name; a NEW non-null moniker on re-add updates it, absence leaves it untouched.
@@ -1217,7 +1237,7 @@ export class SessionNodeManager {
    *  (counts reflect sessions already active, not yet counting this one). */
   checkUnknownSenderAcceptanceBound(agentName: string, counterpartyPubkey: string): { ok: true } | { ok: false; reason: string } {
     const tier = this.getTier(agentName, counterpartyPubkey);
-    const perSenderCap = tierBoundsFor(tier).maxSessionsPerSender;
+    const perSenderCap = this.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {
       return { ok: false, reason: "abuse_bound_sessions_per_sender" };
@@ -3197,7 +3217,7 @@ export class SessionNodeManager {
       // applied to EVERY sender — no tier is unbounded (INV-TIER-BOUND), so a contact is no longer
       // "exempt entirely". A stranger (no row → UNKNOWN) keeps the 25 MB cap; KNOWN+ get more.
       const senderTier = this.getTier(agentName, senderPubkey);
-      const cap = tierBoundsFor(senderTier).maxBytesPerSession;
+      const cap = this.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
@@ -3322,7 +3342,7 @@ export class SessionNodeManager {
       // sender — a contact is no longer exempt (INV-TIER-BOUND). Must mirror the primary gate exactly
       // so a sender can never pass one and fail the other.
       const senderTier = this.getTier(agentName, senderPubkey);
-      const cap = tierBoundsFor(senderTier).maxBytesPerSession;
+      const cap = this.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {

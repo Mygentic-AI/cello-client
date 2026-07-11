@@ -66,3 +66,28 @@ export function isValidSettingKey(key: string): boolean {
 export function allSettingKeys(): string[] {
   return [...VALID_KEYS];
 }
+
+/** True iff the key is a per-tier BOUND override (its value must be a positive integer). */
+export function isBoundKey(key: string): boolean {
+  return key.startsWith("bounds.");
+}
+
+/**
+ * Validate a setting's VALUE for its key (DOD-TIER-BOUNDS-SETTINGS AC2). A bound override may only be
+ * a FINITE POSITIVE INTEGER — INV-TIER-BOUND: a setting can RAISE or lower a bound within finite
+ * limits, never REMOVE one. So `Infinity`, negatives, zero, non-integers, and non-numeric strings are
+ * refused (an unbounded tier is exactly what the grid forbids). Away-text values are free-form strings.
+ */
+export function validateSettingValue(key: string, value: string): { ok: true } | { ok: false; reason: string } {
+  if (isBoundKey(key)) {
+    // `^[1-9][0-9]*$` — a positive integer with no sign, decimal, or `Infinity`/`NaN` spelling.
+    if (!/^[1-9][0-9]*$/.test(value)) {
+      return { ok: false, reason: "a bound must be a finite positive integer (no 0, negative, decimal, or Infinity)" };
+    }
+    // Number.MAX_SAFE_INTEGER guard — a value past it loses precision and is meaningless as a cap.
+    if (Number(value) > Number.MAX_SAFE_INTEGER) {
+      return { ok: false, reason: "a bound must be <= Number.MAX_SAFE_INTEGER" };
+    }
+  }
+  return { ok: true };
+}

@@ -197,6 +197,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const bad = (await client.send("cello_settings_set", { key: "random.key", value: "x" })) as Record<string, unknown>;
     expect(bad).toMatchObject({ ok: false, reason: "invalid_key" });
 
+    // DOD-TIER-BOUNDS-SETTINGS AC2: a bound value that would REMOVE the bound is refused (INV-TIER-BOUND).
+    for (const badVal of ["Infinity", "-5", "0", "8.5"]) {
+      const r = (await client.send("cello_settings_set", { key: "bounds.known.max_sessions", value: badVal })) as Record<string, unknown>;
+      expect(r, badVal).toMatchObject({ ok: false, reason: "invalid_value" });
+    }
+
     // Valid key → stored; get reflects it; an unset key returns null (AC3 default fallback).
     const ok = (await client.send("cello_settings_set", { key: "bounds.known.max_sessions", value: 8 })) as Record<string, unknown>;
     expect(ok).toMatchObject({ ok: true, key: "bounds.known.max_sessions", value: "8" });

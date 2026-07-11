@@ -45,7 +45,7 @@ import { acquireLock, removeLock } from "./lock-file.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { TIER, isKnownTierValue } from "./contacts-tier-migration.js";
-import { isValidSettingKey, allSettingKeys } from "./agent-settings-keys.js";
+import { isValidSettingKey, allSettingKeys, validateSettingValue } from "./agent-settings-keys.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
@@ -6076,6 +6076,12 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     if (!isValidSettingKey(key)) {
       return { ok: false, reason: "invalid_key", guidance: `Unknown setting key '${key}'. Valid keys: ${allSettingKeys().join(", ")}` };
+    }
+    // DOD-TIER-BOUNDS-SETTINGS AC2: a bound value must be a finite positive integer (INV-TIER-BOUND —
+    // a setting cannot REMOVE a bound). Away-text values are free-form.
+    const valueCheck = validateSettingValue(key, value);
+    if (!valueCheck.ok) {
+      return { ok: false, reason: "invalid_value", guidance: valueCheck.reason };
     }
     const resolved = resolveContactAgent(perConnectionState.get(connectionId), params);
     if (!resolved.ok) return resolved;
