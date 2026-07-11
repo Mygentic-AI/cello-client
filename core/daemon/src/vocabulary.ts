@@ -55,12 +55,6 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_close_session", cli: "cello close-session" },
   { mcp: "cello_send", cli: "cello send" },
   { mcp: "cello_receive", cli: "cello receive" },
-  // `receive_session` is a literal ALIAS of `receive` — the daemon registers the SAME handler
-  // object for both (`handlers.set("cello_receive_session", handleReceive)`). It does not accept
-  // or join anything; inbound sessions are auto-accepted by the standing receiver. Its help said
-  // "Accept / join an inbound session request", which was simply false. Pending Andre's ruling to
-  // DELETE it (no-aliases doctrine); until then it is described for what it actually is.
-  { mcp: "cello_receive_session", cli: "cello receive-session" },
   { mcp: "cello_inbox", cli: "cello inbox" },
   // Sessions & receipts
   { mcp: "cello_sessions", cli: "cello sessions" },
@@ -119,8 +113,8 @@ export function knownToolNames(): ReadonlySet<string> {
  * line all still said `cello register` / `cello receipts`). A user handed a command that does not
  * dispatch is worse off than one handed nothing.
  *
- * The trailing space matters: it anchors the verb so `cello close-session` does not match
- * `cello close `, and `cello register-agent` does not match `cello register `.
+ * Anchoring is by NEGATIVE LOOKAHEAD, not a trailing space — see deadCliVerbPattern() for why the
+ * space failed.
  */
 export const DEAD_CLI_VERBS: readonly string[] = [
   "cello register",
@@ -128,6 +122,10 @@ export const DEAD_CLI_VERBS: readonly string[] = [
   "cello receipts",
   "cello close",
   "cello initiate",
+  // DELETED outright (Andre, 2026-07-11), not renamed — there is no replacement to point at. It was
+  // a literal alias of `cello receive` (the daemon ran the SAME handler) whose help claimed an
+  // accept/join step CELLO does not have. Listed here so no string can quietly offer it again.
+  "cello receive-session",
 ];
 
 /**
@@ -172,6 +170,10 @@ export function deadCliVerbPattern(): RegExp {
  * had ceased to exist.
  */
 export const RENAMED_AWAY_TOOLS: readonly string[] = [
+  // DELETED outright (Andre, 2026-07-11), not renamed: cello_receive_session was a literal alias of
+  // cello_receive — the same daemon handler — whose help claimed an accept/join step that does not
+  // exist. There is no replacement to point at; the capability was never real.
+  "cello_receive_session",
   "cello_list_agents",
   "cello_list_sessions",
   "cello_check_notifications",

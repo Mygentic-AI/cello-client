@@ -688,25 +688,26 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     } finally { client.close(); }
   });
 
-  it("F1-a2: cello_receive_session is a LIVE alias (not the not_implemented stub) — returns buffered content", async () => {
+  it("DOD-ONBOARD-HELP-1: cello_receive_session is DELETED — the handler is GONE, not stubbed", async () => {
+    // It used to be a literal alias: `handlers.set("cello_receive_session", handleReceive)` — the SAME
+    // handler object as cello_receive. Its help claimed an "accept/join" step CELLO does not have
+    // (inbound sessions are auto-accepted by the standing receiver), so it was a command that did
+    // nothing distinct and described itself falsely. Andre ruled: delete it outright — no alias, no
+    // deprecated shim, NO DEAD HANDLER left behind.
+    //
+    // This test is the inversion of the one it replaces (which asserted the alias was live). A
+    // deletion that no test can see is a deletion that grows back.
     const { logger } = makeLogger();
     await makeAgentDir("alice");
     const node = new FakeNode();
-    const h = await start({ logger, node });
-    const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    const content = new TextEncoder().encode("via-alias");
-    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    await start({ logger, node });
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
       await client.send("ipc.connect", { clientType: "test" });
-      await client.send("cello_start_agent", { name: "alice" });
-      await client.send("cello_use_agent", { name: "alice" });
-      const res = await client.send("cello_receive_session", { session_id: SID, timeout_ms: 500 }) as Record<string, unknown>;
-      expect(res.reason).not.toBe("not_implemented");
-      expect(res.ok).toBe(true);
-      expect(res.content).toBe("via-alias");
+      await expect(
+        client.send("cello_receive_session", { session_id: SID, timeout_ms: 500 }),
+      ).rejects.toThrow(/method_not_found|Unknown method/i);
     } finally { client.close(); }
   });
 

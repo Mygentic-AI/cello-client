@@ -50,7 +50,6 @@ import {
   initiate,
   send,
   receive,
-  receiveSession,
   closeSession,
   awaitSession,
 } from "./parity-commands.js";
@@ -395,38 +394,6 @@ export const COMMANDS: readonly CommandSpec[] = [
       const timeout = takeValueFlag(positional, "--timeout-ms");
       try {
         return await awaitSession(ctx.celloDir, { agent, pretty, timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms") });
-      } catch (err: unknown) {
-        return flagError(err);
-      }
-    },
-  },
-  {
-    name: "receive-session",
-    group: "Messaging",
-    // TRUTH, not the old claim. The daemon registers the SAME handler for cello_receive_session and
-    // cello_receive (`handlers.set("cello_receive_session", handleReceive)`) — it does not accept or
-    // join anything; inbound sessions are auto-accepted by the standing receiver. The old summary
-    // ("Accept / join an inbound session request") described a step that does not exist. Slated for
-    // deletion under the no-aliases doctrine; until then it says what it is.
-    summary: "Alias of 'receive' — same behavior, no separate accept step. Prefer 'cello receive'.",
-    help:
-      "Usage: cello receive-session <session-id> [--timeout-ms N] [--agent <name>] [--pretty]\n" +
-      "  An ALIAS of 'cello receive' — the daemon runs the identical handler for both. It does NOT\n" +
-      "  'accept' or 'join' anything: an inbound session is auto-accepted for you, so there is no\n" +
-      "  separate accept step to run. Use 'cello receive'; this exists only for backward parity with\n" +
-      "  the cello_receive_session MCP tool and is expected to be removed.",
-    flags: AGENT_AND_TIMEOUT,
-    ipcMethod: IPC_METHODS["receive-session"],
-    jsonOut: true,
-    async run(ctx, args) {
-      const { agent, pretty, positional } = parityOpts(args);
-      const timeout = takeValueFlag(positional, "--timeout-ms");
-      try {
-        return await receiveSession(ctx.celloDir, timeout.rest[0] ?? "", {
-          agent,
-          pretty,
-          timeoutMs: numberOrUndefined(timeout.value, "--timeout-ms"),
-        });
       } catch (err: unknown) {
         return flagError(err);
       }

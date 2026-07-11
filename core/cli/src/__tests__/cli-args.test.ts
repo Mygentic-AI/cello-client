@@ -45,7 +45,7 @@ describe("F1: usage string lists every command", () => {
         // Agents
         "agents", "start-agent", "use-agent", "stop-agent", "refresh",
         // Messaging
-        "initiate-session", "await-session", "receive-session", "close-session", "send", "receive", "inbox",
+        "initiate-session", "await-session", "close-session", "send", "receive", "inbox",
         // Sessions & receipts
         "sessions", "transcript", "sealed-receipt", "relay-receipts",
         // Contacts
@@ -59,7 +59,7 @@ describe("F1: usage string lists every command", () => {
   // DOD-ONBOARD-HELP-1 §2: the renames are CLEAN. No aliases — one user, no install base, so an
   // alias would be permanent debt bought for nobody.
   it("the OLD command names are gone from the dispatchable set", () => {
-    for (const old of ["install", "register", "close", "initiate", "receipts"]) {
+    for (const old of ["install", "register", "close", "initiate", "receipts", "receive-session"]) {
       expect(KNOWN_COMMANDS.has(old), `'${old}' must be deleted, not aliased`).toBe(false);
     }
   });

@@ -86,6 +86,14 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     }
   });
 
+  it("cello_receive_session is DELETED — no registration, no proxy call, nowhere in the shim", () => {
+    // Andre, 2026-07-11: delete it fully. It was a literal alias of cello_receive (the daemon ran the
+    // SAME handler) whose description claimed an accept/join step CELLO does not have. The daemon
+    // handler is gone too, so a lingering registration here would proxy to a method that no longer
+    // exists — a tool that is guaranteed to fail. Assert the whole file, not just the registration.
+    expect(source).not.toContain("cello_receive_session");
+  });
+
   it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
     // The tool renamed; the method it proxies to did not. This is deliberate: connect has no daemon
     // dependency, so a new daemon must keep serving an OLD shim. Renaming the wire would break that

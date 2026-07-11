@@ -66,7 +66,6 @@ vi.mock("../parity-commands.js", async (importOriginal) => {
     initiate: stub(),
     send: stub(),
     receive: stub(),
-    receiveSession: stub(),
     closeSession: stub(),
     awaitSession: stub(),
   };
@@ -265,13 +264,11 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.closeSession).toHaveBeenLastCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, force: true });
   });
 
-  it("initiate / await-session / receive-session / transcript", async () => {
+  it("initiate-session / await-session / transcript", async () => {
     await run("initiate-session", ["ab12"]);
     expect(parity.initiate).toHaveBeenCalledWith(CELLO_DIR, "ab12", { agent: undefined, pretty: false });
     await run("await-session", ["--timeout-ms", "900"]);
     expect(parity.awaitSession).toHaveBeenCalledWith(CELLO_DIR, { agent: undefined, pretty: false, timeoutMs: 900 });
-    await run("receive-session", ["sid1", "--timeout-ms", "900"]);
-    expect(parity.receiveSession).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, timeoutMs: 900 });
     await run("transcript", ["sid1", "--agent", "alice"]);
     expect(parity.transcript).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: "alice", pretty: false });
   });
@@ -346,7 +343,6 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
       cello_initiate_session: "initiate-session",
       cello_send: "send",
       cello_receive: "receive",
-      cello_receive_session: "receive-session",
       cello_close_session: "close-session",
       cello_await_session: "await-session",
       // NOT in the brief's table — it claimed cello_get_sealed_receipt was "already covered" by

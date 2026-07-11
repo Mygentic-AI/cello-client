@@ -31,7 +31,6 @@ describe("§1 — the help is grouped and logically ordered", () => {
     expect(messaging).toEqual([
       "initiate-session",
       "await-session",
-      "receive-session",
       "close-session",
       "send",
       "receive",
@@ -63,7 +62,7 @@ describe("§2 — the renames are CLEAN (old names gone, no aliases)", () => {
 
   it("the OLD names are GONE — not aliased, not deprecated. Deleted.", () => {
     // One user, no install base: an alias would be permanent debt bought for nobody.
-    for (const old of ["install", "register", "close", "initiate", "receipts"]) {
+    for (const old of ["install", "register", "close", "initiate", "receipts", "receive-session"]) {
       expect(findCommand(old), `'${old}' must be deleted, not kept as an alias`).toBeUndefined();
     }
   });
@@ -138,18 +137,6 @@ describe("§4 — the wording is accurate and jargon-free", () => {
     expect(refresh.summary.toLowerCase()).toContain("rotate");
     expect(refresh.help.toLowerCase()).toContain("directory to be reachable");
     expect(refresh.help.toLowerCase()).toContain("does not change"); // public identity is stable
-  });
-
-  it("receive-session says it is an alias instead of claiming a step that does not exist", () => {
-    // The daemon registers the SAME handler for cello_receive_session and cello_receive. The old
-    // summary ("Accept / join an inbound session request") described a step CELLO does not have.
-    const rs = findCommand("receive-session")!;
-    expect(rs.summary.toLowerCase()).toContain("alias");
-    // It must not CLAIM to accept/join. Denying it ("no separate accept step") is the point, so
-    // assert on the claim shape, not the mere presence of the word.
-    expect(rs.summary).not.toMatch(/^Accept/i);
-    expect(rs.help).not.toContain("Joins an inbound session");
-    expect(rs.help.toLowerCase()).toContain("does not");
   });
 
   it("telegram does not over-claim — 'etc.' is deliberate", () => {

@@ -3163,8 +3163,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // NOTE: cello_await_session is NOT in this stub list — Seam 2 registers a real
   // handler for it below (inbound session establishment), with its own inline
   // no_current_agent guard.
-  // F1-a2: cello_receive_session is NO LONGER stubbed here — it is registered below as a true
-  // alias of the real (blocking) cello_receive handler. Kept as an (empty) extension point for
+  // DOD-ONBOARD-HELP-1: cello_receive_session is DELETED (Andre, 2026-07-11). It was a literal
+  // alias — the same handler object as cello_receive — that claimed an "accept/join" step CELLO
+  // does not have (inbound sessions are auto-accepted by the standing receiver). No alias, no
+  // deprecated shim, no dead handler. Kept as an (empty) extension point for
   // future tools that need the plain no_current_agent guard without their own handler.
   const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
 
@@ -5800,11 +5802,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
 
   // ─── CELLO-M7-DAEMON-004 / F1-a: cello_receive (BLOCKING, session-scoped) ────────
   // F1-a fix: the daemon port had dropped the blocking receive (the handler was a
-  // non-blocking buf.shift and cello_receive_session was a not_implemented stub). It now
-  // BLOCKS up to timeout_ms, polling the received-content buffer — resolved by the next
-  // arrival, a terminal seal answer (F1-b), or timeout. This is the "blocking receive
-  // variant" the guidance names. Registered under both cello_receive and cello_receive_session
-  // (F1-a2: one implementation, both names — the redundant tools are collapsed).
+  // non-blocking buf.shift). It now BLOCKS up to timeout_ms, polling the received-content
+  // buffer — resolved by the next arrival, a terminal seal answer (F1-b), or timeout. This is
+  // the "blocking receive variant" the guidance names.
+  //
+  // ONE name (DOD-ONBOARD-HELP-1, Andre 2026-07-11). This was briefly registered under
+  // `cello_receive_session` as well — one implementation behind two names. That alias is DELETED:
+  // it accepted or joined nothing (inbound sessions are auto-accepted by the standing receiver),
+  // so it was a second name for a step that does not exist, and its help said otherwise.
   const RECEIVE_DEFAULT_TIMEOUT_MS = 30000; // matches the cello-mcp shim's documented default
   const handleReceive: IpcHandler = async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
@@ -5944,7 +5949,6 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
   };
   handlers.set("cello_receive", handleReceive);
-  handlers.set("cello_receive_session", handleReceive);
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
   // Notifications are fire-and-forget (no ack, no redelivery); this is how a client discovers what

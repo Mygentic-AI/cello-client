@@ -238,7 +238,6 @@ export const IPC_METHODS = {
   "initiate-session": "cello_initiate_session",
   send: "cello_send",
   receive: "cello_receive",
-  "receive-session": "cello_receive_session",
   "close-session": "cello_close_session",
   "await-session": "cello_await_session",
   contacts: "cello_contact_list",
@@ -396,20 +395,6 @@ export function receive(
     celloDir,
     "cello_receive",
     defined({ session_id: sessionId, timeout_ms: opts.timeoutMs, since_seq: opts.sinceSeq }),
-    opts,
-  );
-}
-
-/** `cello receive-session <session-id> [--timeout-ms N]` → cello_receive_session. */
-export function receiveSession(
-  celloDir: string,
-  sessionId: string,
-  opts: ParityOptions & { timeoutMs?: number },
-): Promise<CliOutput> {
-  return ipcCommand(
-    celloDir,
-    "cello_receive_session",
-    defined({ session_id: sessionId, timeout_ms: opts.timeoutMs }),
     opts,
   );
 }

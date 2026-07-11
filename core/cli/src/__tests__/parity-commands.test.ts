@@ -34,7 +34,6 @@ import {
   receive,
   closeSession,
   awaitSession,
-  receiveSession,
   sealedReceipt,
   readCurrentAgent,
 } from "../parity-commands.js";
@@ -255,16 +254,12 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       if (!body.ok) expect(out.stdout).toBe("");
     });
 
-    it("`cello close` and `cello receive-session` reach their handlers and report verdicts", async () => {
+    it("`cello close-session` reaches its handler and reports the verdict", async () => {
       await createAgent(tempDir, "alice");
       await useAgent(tempDir, "alice", {});
       const closed = await closeSession(tempDir, "deadbeef", {});
       expect(closed.exitCode).toBe(1);
       expect(closed.stdout).toBe("");
-
-      const joined = await receiveSession(tempDir, "deadbeef", { timeoutMs: 500 });
-      const body = JSON.parse(joined.exitCode === 0 ? joined.stdout : joined.stderr);
-      expect(typeof body.ok).toBe("boolean");
     });
   });
 

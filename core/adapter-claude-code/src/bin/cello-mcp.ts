@@ -306,18 +306,6 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
   return jsonText(result);
 });
 
-// An ALIAS of cello_receive — the daemon registers the SAME handler for both
-// (`handlers.set("cello_receive_session", handleReceive)`). It does not accept or join anything;
-// inbound sessions are auto-accepted by the standing receiver. Described truthfully so no agent
-// calls it expecting a distinct accept step. Slated for removal (no-aliases doctrine).
-server.tool("cello_receive_session", "DEPRECATED alias of cello_receive — identical behavior (the daemon runs the same handler). It does NOT accept or join an inbound session; there is no separate accept step. Use cello_receive.", {
-  session_id: z.string().describe("Session ID"),
-  timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000)"),
-}, async ({ session_id, timeout_ms }) => {
-  const result = await proxy.call("cello_receive_session", { session_id, timeout_ms });
-  return jsonText(result);
-});
-
 server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list.", {
   session_id: z.string().describe("Session ID to close"),
   force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
