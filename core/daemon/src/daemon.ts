@@ -4559,6 +4559,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         });
         return;
       }
+      // DOD-RENAME-1 AC1 (review F1 / DEC-AB-4): record the offered name as the rename baseline the
+      // moment the offer passes the acceptance gate — an ALLOWED peer (the bound check let them
+      // through) is tracked even if session formation transiently fails below. Deliberately AFTER the
+      // bound check, not at the raw parse point: a BLOCKED or over-cap peer must NOT be able to drive
+      // the operator's rename baseline or push notices into their inbox. Guarded by offeredMoniker !==
+      // null so a silent offer never clears the baseline (AC5).
+      if (parsed.offeredMoniker !== null) {
+        sessionNodeManager.recordOfferedMoniker(agentName, parsed.participantAPubkeyHex, parsed.offeredMoniker);
+      }
       // M8B F14 (fix 2): KICK creation before polling — an inbound offer arriving while no
       // receiver exists and none is being created must trigger the ensure itself (the doc
       // comment's "retries on demand" made true), instead of polling a creation nobody
@@ -4654,11 +4663,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // DOD-MONIKER-6: scoped to `agentName` — the agent this offer was received FOR.
       if (parsed.offeredMoniker !== null) {
         offeredMonikers.set(offerKey(agentName, parsed.sessionIdHex), parsed.offeredMoniker);
-        // DOD-RENAME-1 (Option C): persist the offered name as the rename baseline and, if the peer is
-        // a contact the operator has named and this differs from the last seen name, queue an INBOX
-        // rename notice. Unconditional at offer-SEEN (idempotent on a repeat); the local pet name is
-        // never touched. Guarded by offeredMoniker !== null so a silent offer never clears the baseline.
-        sessionNodeManager.recordOfferedMoniker(agentName, parsed.participantAPubkeyHex, parsed.offeredMoniker);
+        // (DOD-RENAME-1's rename-baseline update runs earlier, right after the acceptance bound — see
+        // the recordOfferedMoniker call there. This map is only the session-scoped display material.)
       }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,
@@ -5897,9 +5903,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // command to adopt it — the daemon never auto-applies a self-declared name.
       const rename_notices = sessionNodeManager.getRenameNotices(agent).map((n) => ({
         pubkey: n.pubkey,
+        your_name_for_them: n.moniker,
         claimed_name: n.offered_name,
         noticed_at: n.noticed_at,
-        notice: `Contact ${n.pubkey.slice(0, 16)}… now calls themselves "${n.offered_name}" (self-declared — unverified). Adopt it with cello_contact_set_moniker, or ignore.`,
+        // Names the contact by the operator's OWN pet name (AC3); the self-declared name is a quoted,
+        // untrusted claim; the adopt command carries its arguments so it is copy-pasteable.
+        notice:
+          `Your contact ${n.moniker !== null ? `"${n.moniker}" ` : ""}(${n.pubkey.slice(0, 16)}…) now calls themselves ` +
+          `"${n.offered_name}" (self-declared — unverified). Adopt it: cello_contact_set_moniker ` +
+          `{ pubkey: "${n.pubkey}", moniker: "${n.offered_name}" }, or ignore.`,
       }));
       return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
     });
@@ -6008,7 +6020,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!sessionNodeManager.setContactTier(resolved.agent, pubkey, tier)) {
       return { ok: false, reason: "contact_not_found", guidance: `No contact ${pubkey.slice(0, 16)}… for agent '${resolved.agent}'. Add it first with cello_contact_add.` };
     }
-    logger.info("contact.tier.changed", { agentName: resolved.agent, pubkey, oldTier, newTier: tier });
+    // Only an actual change is an audit event — a no-op re-set must not pollute the trail (review F4).
+    if (oldTier !== tier) {
+      logger.info("contact.tier.changed", { agentName: resolved.agent, pubkey, oldTier, newTier: tier });
+    }
     return { ok: true, agent: resolved.agent, pubkey, tier };
   });
 

@@ -117,4 +117,16 @@ describe("DOD-RENAME-1 — Option C rename detection", () => {
     mgr.recordOfferedMoniker("alice", stranger, "Whoever");
     expect(mgr.getRenameNotices("alice")).toHaveLength(0);
   });
+
+  it("rename notices are per-agent — alice's notice never appears in bob's inbox", async () => {
+    const seed = openTestDb(join(tempDir, "sessions.db"));
+    await seedAgents(seed, ["bob"]);
+    seed.close();
+    // Trigger a notice for alice's contact.
+    mgr.recordOfferedMoniker("alice", pk, "Alice");
+    mgr.setContactMoniker("alice", pk, "Mum");
+    mgr.recordOfferedMoniker("alice", pk, "AliceCorp");
+    expect(mgr.getRenameNotices("alice")).toHaveLength(1);
+    expect(mgr.getRenameNotices("bob")).toHaveLength(0); // scoped by agent_id — no bleed
+  });
 });

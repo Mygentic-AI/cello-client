@@ -200,6 +200,49 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     expect(h.snm.getContactMoniker("bob", initiator)).toBe("Mum");
   });
 
+  it("DOD-RENAME-1 AC5: a NO-moniker offer fires nothing and does NOT clear the baseline", async () => {
+    const h = await startHarness();
+    const initiator = "d3".repeat(32);
+    const sid = (n: number): Uint8Array => Uint8Array.from(Array.from({ length: 16 }, (_, b) => (n * 16 + b) & 0xff));
+    h.snm.addContact("bob", initiator, undefined, "accepted", TIER.KNOWN);
+    h.snm.setContactMoniker("bob", initiator, "Mum");
+
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Alice", sessionId: sid(1) })); // baseline "Alice"
+    await wait(120);
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, sessionId: sid(2) })); // NO moniker → nothing
+    await wait(120);
+    // The baseline must have SURVIVED: a later DIFFERING name still fires exactly one notice (a bypass
+    // that let the null offer through would have NULLed the baseline, making this a silent first-offer).
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Bob", sessionId: sid(3) }));
+    await wait(120);
+
+    const bob = await connectAs(h.socketPath, "bob");
+    const inbox = (await bob.client.send("cello_check_notifications", {})) as {
+      agents: Array<{ agent: string; rename_notices: Array<{ pubkey: string; claimed_name: string }> }>;
+    };
+    const notices = inbox.agents.find((a) => a.agent === "bob")!.rename_notices;
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ pubkey: initiator, claimed_name: "Bob" }); // compared against surviving "Alice"
+  });
+
+  it("DOD-RENAME-1 / DEC-AB-4: a BLOCKED named contact's differing-name offer drives NO notice (a refused peer can't touch the baseline)", async () => {
+    const h = await startHarness();
+    const initiator = "d4".repeat(32);
+    const sid = (n: number): Uint8Array => Uint8Array.from(Array.from({ length: 16 }, (_, b) => (n * 16 + b) & 0xff));
+    h.snm.addContact("bob", initiator, undefined, "accepted", TIER.KNOWN);
+    h.snm.setContactMoniker("bob", initiator, "Mum");
+    h.snm.setContactTier("bob", initiator, TIER.BLOCKED); // blocked → offers are refused at the bound
+
+    h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "AliceEvil", sessionId: sid(1) }));
+    await wait(120);
+
+    const bob = await connectAs(h.socketPath, "bob");
+    const inbox = (await bob.client.send("cello_check_notifications", {})) as {
+      agents: Array<{ agent: string; rename_notices: unknown[] }>;
+    };
+    expect(inbox.agents.find((a) => a.agent === "bob")!.rename_notices).toHaveLength(0);
+  });
+
   it("AC2: a valid offered moniker survives the boundary and rides the await_session event", async () => {
     const h = await startHarness();
     const initiator = "cd".repeat(32);

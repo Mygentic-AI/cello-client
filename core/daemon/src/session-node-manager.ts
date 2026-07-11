@@ -1035,7 +1035,9 @@ export class SessionNodeManager {
    *  (AC5). Limitation: last_offered_moniker updates only on the RECEIVING side of an offer, so rename
    *  detection works only for peers who INITIATE to you — a property, not a bug. */
   recordOfferedMoniker(agentName: string, pubkey: string, offered: string): void {
-    if (!this.#db) return;
+    // Fail CLOSED like getTier/setContactTier: a silent skip here would drop a rename baseline update
+    // (and any notice) while the daemon reports healthy — the inbound path always has an open DB.
+    if (!this.#db) throw new Error(`recordOfferedMoniker('${agentName}'): database not initialized`);
     const agentId = this.#requireAgentId(agentName);
     const row = this.#db
       .prepare("SELECT last_offered_moniker, moniker FROM contacts WHERE agent_id = ? AND pubkey = ?")
@@ -1057,17 +1059,24 @@ export class SessionNodeManager {
 
   /** DOD-RENAME-1: pending rename notices for an agent, oldest first (surfaced in
    *  cello_check_notifications — an INBOX pull, never a real-time push). */
-  getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number }> {
+  getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }> {
     if (!this.#db) return [];
+    // JOIN the local pet name so the notice can NAME the contact (AC3) — a notice only ever fires for
+    // a personally-named contact, so moniker is expected non-null (LEFT JOIN is defensive).
     return this.#db
-      .prepare("SELECT pubkey, offered_name, noticed_at FROM contact_rename_notices WHERE agent_id = ? ORDER BY noticed_at ASC")
-      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; offered_name: string; noticed_at: number }>;
+      .prepare(
+        `SELECT n.pubkey, n.offered_name, n.noticed_at, c.moniker
+         FROM contact_rename_notices n
+         LEFT JOIN contacts c ON c.agent_id = n.agent_id AND c.pubkey = n.pubkey
+         WHERE n.agent_id = ? ORDER BY n.noticed_at ASC`,
+      )
+      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }>;
   }
 
   /** DOD-RENAME-1: clear a pending rename notice — the operator acted (adopted a name or removed the
-   *  contact). Idempotent (no notice → no-op). */
+   *  contact). Idempotent (no notice → no-op). Fail-closed on a missing DB, like the writes above. */
   clearRenameNotice(agentName: string, pubkey: string): void {
-    if (!this.#db) return;
+    if (!this.#db) throw new Error(`clearRenameNotice('${agentName}'): database not initialized`);
     this.#db
       .prepare("DELETE FROM contact_rename_notices WHERE agent_id = ? AND pubkey = ?")
       .run(this.#requireAgentId(agentName), pubkey);
