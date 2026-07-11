@@ -14,18 +14,22 @@
  * refused before any reply). So the settable tiers are unknown / known / whitelisted / vip.
  */
 
+import { TIER } from "./contacts-tier-migration.js";
+
 /** The tiers whose bounds and away texts are settable (BLOCKED is fixed, never overridable). */
 export const SETTABLE_TIER_NAMES = Object.freeze(["unknown", "known", "whitelisted", "vip"] as const);
 export type SettableTierName = (typeof SETTABLE_TIER_NAMES)[number];
 
-/** The tier NAME for a tier integer, or null for an unknown/unsettable value (e.g. BLOCKED=0). */
+/** The tier NAME for a tier integer, or null for an unknown/unsettable value (e.g. BLOCKED=0).
+ *  Keyed off the TIER constants (review F3) so a renumbering in contacts-tier-migration can never
+ *  silently desync the settings namespace from the grid. */
 export function settableTierName(tier: number): SettableTierName | null {
   switch (tier) {
-    case 1: return "unknown";
-    case 2: return "known";
-    case 3: return "whitelisted";
-    case 4: return "vip";
-    default: return null; // BLOCKED(0) or out-of-range — not settable
+    case TIER.UNKNOWN: return "unknown";
+    case TIER.KNOWN: return "known";
+    case TIER.WHITELISTED: return "whitelisted";
+    case TIER.VIP: return "vip";
+    default: return null; // BLOCKED or out-of-range — not settable
   }
 }
 

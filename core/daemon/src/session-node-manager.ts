@@ -986,7 +986,13 @@ export class SessionNodeManager {
     const raw = this.getSetting(agentName, boundSettingKey(name, field));
     if (raw === null) return gridDefault; // unset → default
     const parsed = Number(raw);
-    if (!Number.isFinite(parsed) || parsed <= 0) return gridDefault; // corrupt → default, never unbounded
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      // Should be impossible (validated at SET time) → a config-integrity failure. Surface it: this
+      // reverts a possibly-TIGHTENED bound to the looser default, so a silent revert would hide a real
+      // problem. Still fail SAFE (grid default, never unbounded — INV-TIER-BOUND).
+      this.#logger.warn("settings.bound.corrupt", { agentName, tier, field, raw });
+      return gridDefault;
+    }
     return parsed;
   }
 

@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER, DEFAULT_TIER_BOUNDS } from "../contacts-tier-migration.js";
@@ -112,5 +113,18 @@ describe("DOD-TIER-BOUNDS-SETTINGS — resolveTierBound + the override in effect
       .toMatchObject({ ok: false, reason: "abuse_bound_sessions_per_sender" }); // 8 >= 8 → 9th refused
     // Default (5) would have refused at the 5th — proving the override is in effect.
     expect(DEFAULT_TIER_BOUNDS[TIER.KNOWN].maxSessionsPerSender).toBe(5);
+  });
+
+  it("T1: a max_bytes override takes effect at the byte-cap gate — a KNOWN contact is refused past it", async () => {
+    const msgLeafHash = (c: Uint8Array): Uint8Array =>
+      new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(c).digest());
+    const SID = "dd".repeat(16);
+    const known = "ee".repeat(32);
+    setTier(db, alice, known, TIER.KNOWN);
+    mgr.setSetting("alice", boundSettingKey("known", "max_bytes"), "10"); // tiny override
+    await mgr.createSessionNode(SID, "alice", known, "peer", "corr");
+    const over = new Uint8Array(20); // 20 > 10 → refused at the OVERRIDE (default 100 MB would accept)
+    const res = await mgr.ingestReceivedContent("alice", SID, over, msgLeafHash(over), "c1");
+    expect(res).toMatchObject({ ok: false, reason: "session_size_limit_exceeded" });
   });
 });
