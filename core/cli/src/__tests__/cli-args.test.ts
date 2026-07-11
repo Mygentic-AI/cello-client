@@ -33,9 +33,20 @@ describe("F1: usage string lists every command", () => {
     expect(checkArgs("settings", ["set", "away.default", "-5"])).toEqual({ kind: "unknown_flag", flag: "-5" });
   });
 
+  // This hand-written list is deliberately INDEPENDENT of the registry — it is the outside anchor
+  // that the registry's own derive-lock tests cannot be (they would agree with any table, including
+  // a wrong one). Adding a command means updating this list on purpose.
+  // DOD-CLI-PARITY-1 added the 12 parity commands below the original 14.
   it("KNOWN_COMMANDS matches the dispatchable set", () => {
     expect([...KNOWN_COMMANDS].sort()).toEqual(
-      ["contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh", "register", "remove-agent", "sessions", "settings", "status", "telegram"].sort(),
+      [
+        // original surface
+        "contact", "create-agent", "install", "login", "logout", "moniker", "receipts", "refresh",
+        "register", "remove-agent", "sessions", "settings", "status", "telegram",
+        // DOD-CLI-PARITY-1 — Group A (operator control) and Group B (live conversation)
+        "agents", "start-agent", "stop-agent", "use-agent", "inbox", "transcript",
+        "initiate", "send", "receive", "receive-session", "close", "await-session", "sealed-receipt",
+      ].sort(),
     );
   });
 

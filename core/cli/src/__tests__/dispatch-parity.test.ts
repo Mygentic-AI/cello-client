@@ -1,0 +1,313 @@
+/**
+ * DOD-CLI-PARITY-1 — two locks the earlier tests were missing (unit-review T1/T2):
+ *
+ * T2. The Phase 0 prove-point is "every existing command still behaves identically". Nothing tested
+ *     that. The registry refactor MOVED each command's argument parsing out of a switch in
+ *     bin/cello.ts (which read process.argv[3..5] directly) into a run() that reads args[0..2] — an
+ *     index-translation refactor, the exact class of change that silently drops an argument. Without
+ *     these tests every run() body could be `async () => ({stdout:"",stderr:"",exitCode:0})` and the
+ *     suite would stay green. Here we drive spec.run() and assert the EXACT arguments forwarded to
+ *     the command layer.
+ *
+ * T1. The `--pretty` grant (registry.flagsFor) is what lets a bash user format any parity command's
+ *     output. It was only tested by a loop over jsonOut commands, which was vacuous while none
+ *     existed. It is exercised directly here.
+ *
+ * Plus: the MCP↔CLI parity claim (DoD §9) is asserted from the registry's own ipcMethod field, so
+ * "every cello_* tool has a CLI command calling the SAME handler" is checkable, not just asserted
+ * in prose.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { CommandContext } from "../registry.js";
+
+// Spy on the layer the registry delegates to. Both modules are mocked so no daemon is touched:
+// this file tests WIRING (which function, which arguments), not behavior.
+vi.mock("../commands.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../commands.js")>();
+  return {
+    ...actual,
+    login: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    register: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    createAgent: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    removeAgent: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    refreshShares: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    relayReceipts: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    sessions: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    contactAdd: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    contactRemove: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    contactList: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    contactSetTier: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    contactSetAway: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    settingsGet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    settingsSet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    monikerSet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    telegramSetToken: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+  };
+});
+
+vi.mock("../parity-commands.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../parity-commands.js")>();
+  const stub = () => vi.fn(async () => ({ stdout: "{}", stderr: "", exitCode: 0 }));
+  return {
+    ...actual,
+    listAgents: stub(),
+    startAgent: stub(),
+    stopAgent: stub(),
+    useAgent: stub(),
+    inbox: stub(),
+    transcript: stub(),
+    contactSetMoniker: stub(),
+    initiate: stub(),
+    send: stub(),
+    receive: stub(),
+    receiveSession: stub(),
+    closeSession: stub(),
+    awaitSession: stub(),
+  };
+});
+
+const commands = await import("../commands.js");
+const parity = await import("../parity-commands.js");
+const { findCommand, COMMANDS, flagsFor } = await import("../registry.js");
+const { checkArgs } = await import("../cli-args.js");
+
+const CELLO_DIR = "/tmp/cello-dispatch-test";
+const ctx: CommandContext = {
+  celloDir: CELLO_DIR,
+  daemonBin: "/nonexistent/daemon.js",
+  logger: { debug() {}, info() {}, warn() {}, error() {} },
+};
+
+/** Drive a command exactly as bin/cello.ts does: spec.run(ctx, argv.slice(3)). */
+async function run(name: string, args: string[]): Promise<void> {
+  const spec = findCommand(name);
+  if (!spec) throw new Error(`no such command: ${name}`);
+  await spec.run(ctx, args);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  delete process.env.CELLO_PREAUTH_TOKEN;
+});
+
+describe("T2: the registry forwards EXACTLY what the old switch forwarded", () => {
+  it("register: positional agent + token + phone stub, in order", async () => {
+    await run("register", ["alice", "CELLO-tok", "+15551234"]);
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-tok", "+15551234");
+  });
+
+  it("register: falls back to CELLO_PREAUTH_TOKEN when the token argument is absent", async () => {
+    // The env-var form is documented in help and keeps the token out of shell history. The
+    // argv[3..5] → args[0..2] translation is precisely where this fallback could be lost.
+    process.env.CELLO_PREAUTH_TOKEN = "CELLO-from-env";
+    await run("register", ["alice"]);
+    expect(commands.register).toHaveBeenCalledWith(CELLO_DIR, "alice", "CELLO-from-env", "");
+  });
+
+  it("create-agent / remove-agent / refresh / receipts: the name positional", async () => {
+    await run("create-agent", ["alice"]);
+    expect(commands.createAgent).toHaveBeenCalledWith(CELLO_DIR, "alice");
+    await run("remove-agent", ["bob"]);
+    expect(commands.removeAgent).toHaveBeenCalledWith(CELLO_DIR, "bob");
+    await run("refresh", ["carol"]);
+    expect(commands.refreshShares).toHaveBeenCalledWith(CELLO_DIR, "carol");
+    await run("receipts", ["dave"]);
+    expect(commands.relayReceipts).toHaveBeenCalledWith(CELLO_DIR, "dave");
+  });
+
+  it("sessions: filter precedence (all > closed > failed > open) and --limit parsing", async () => {
+    await run("sessions", []);
+    expect(commands.sessions).toHaveBeenCalledWith(CELLO_DIR, { filter: undefined, limit: undefined });
+
+    await run("sessions", ["--all", "--closed"]); // --all wins
+    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "all", limit: undefined });
+
+    await run("sessions", ["--closed", "--failed"]); // --closed wins over --failed
+    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "closed", limit: undefined });
+
+    await run("sessions", ["--open", "--limit", "5"]);
+    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "open", limit: 5 });
+
+    await run("sessions", ["--limit", "notanumber"]); // non-numeric → ignored, not NaN
+    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: undefined, limit: undefined });
+  });
+
+  it("contact: every sub-verb routes to its OWN function (not a neighbour)", async () => {
+    await run("contact", ["add", "pk1", "--agent", "alice"]);
+    expect(commands.contactAdd).toHaveBeenCalledWith(CELLO_DIR, "pk1", "alice");
+
+    await run("contact", ["remove", "pk1"]);
+    expect(commands.contactRemove).toHaveBeenCalledWith(CELLO_DIR, "pk1", undefined);
+
+    await run("contact", ["list", "--agent", "alice"]);
+    expect(commands.contactList).toHaveBeenCalledWith(CELLO_DIR, "alice");
+
+    await run("contact", ["tier", "pk1", "3"]);
+    expect(commands.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 3, undefined);
+
+    await run("contact", ["away", "pk1", "back", "on", "Monday"]);
+    expect(commands.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "back on Monday", undefined);
+
+    await run("contact", ["away", "pk1"]); // empty message → CLEAR (null), not ""
+    expect(commands.contactSetAway).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, undefined);
+  });
+
+  it("settings / moniker: sub-verbs and the clear path", async () => {
+    await run("settings", ["get", "away.default", "--agent", "alice"]);
+    expect(commands.settingsGet).toHaveBeenCalledWith(CELLO_DIR, "away.default", "alice");
+    await run("settings", ["get"]); // key omitted → list all
+    expect(commands.settingsGet).toHaveBeenLastCalledWith(CELLO_DIR, undefined, undefined);
+    await run("settings", ["set", "bounds.known.max_sessions", "8"]);
+    expect(commands.settingsSet).toHaveBeenCalledWith(CELLO_DIR, "bounds.known.max_sessions", "8", undefined);
+
+    await run("moniker", ["set", "Bob", "--agent", "alice"]);
+    expect(commands.monikerSet).toHaveBeenCalledWith(CELLO_DIR, "Bob", "alice");
+    await run("moniker", ["clear"]); // clear = null, and must not be confused with set
+    expect(commands.monikerSet).toHaveBeenLastCalledWith(CELLO_DIR, null, undefined);
+  });
+
+  it("telegram: set-token forwards both credentials", async () => {
+    await run("telegram", ["set-token", "123:abc", "999"]);
+    expect(commands.telegramSetToken).toHaveBeenCalledWith(CELLO_DIR, "123:abc", "999");
+  });
+
+  it("bad input still prints usage and exits 1 (never a silent success)", async () => {
+    for (const [name, args] of [
+      ["contact", ["bogus"]],
+      ["settings", ["bogus"]],
+      ["moniker", ["bogus"]],
+      ["telegram", ["bogus"]],
+    ] as Array<[string, string[]]>) {
+      const out = await findCommand(name)!.run(ctx, args);
+      expect(out.exitCode, `${name} bad input must exit 1`).toBe(1);
+      expect(out.stdout.length, `${name} must still explain itself`).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
+  it("agent lifecycle", async () => {
+    await run("agents", []);
+    expect(parity.listAgents).toHaveBeenCalledWith(CELLO_DIR, { pretty: false });
+    await run("start-agent", ["alice"]);
+    expect(parity.startAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
+    await run("stop-agent", ["alice"]);
+    expect(parity.stopAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
+    await run("use-agent", ["alice"]);
+    expect(parity.useAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
+  });
+
+  it("inbox: --scope is passed through; an unrecognized scope is not invented", async () => {
+    await run("inbox", ["--scope", "all"]);
+    expect(parity.inbox).toHaveBeenCalledWith(CELLO_DIR, { agent: undefined, pretty: false, scope: "all" });
+    await run("inbox", []);
+    expect(parity.inbox).toHaveBeenLastCalledWith(CELLO_DIR, { agent: undefined, pretty: false, scope: undefined });
+    await run("inbox", ["--scope", "sideways", "--agent", "alice"]);
+    expect(parity.inbox).toHaveBeenLastCalledWith(CELLO_DIR, { agent: "alice", pretty: false, scope: undefined });
+  });
+
+  it("send: message is the remaining args joined; --agent and --pretty are not part of it", async () => {
+    await run("send", ["sid1", "hello", "there", "--agent", "alice", "--pretty"]);
+    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello there", { agent: "alice", pretty: true });
+  });
+
+  it("receive: --since-seq and --timeout-ms reach the daemon as numbers, and neither eats the session id", async () => {
+    await run("receive", ["sid1", "--since-seq", "7", "--timeout-ms", "500"]);
+    expect(parity.receive).toHaveBeenCalledWith(CELLO_DIR, "sid1", {
+      agent: undefined, pretty: false, sinceSeq: 7, timeoutMs: 500,
+    });
+    // Flags BEFORE the positional must not shift it — the value-flag consumption has to be exact.
+    await run("receive", ["--timeout-ms", "500", "sid2"]);
+    expect(parity.receive).toHaveBeenLastCalledWith(CELLO_DIR, "sid2", {
+      agent: undefined, pretty: false, sinceSeq: undefined, timeoutMs: 500,
+    });
+  });
+
+  it("close: --force is passed ONLY when asked for (it forfeits the seal)", async () => {
+    await run("close", ["sid1"]);
+    expect(parity.closeSession).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, force: false });
+    await run("close", ["sid1", "--force"]);
+    expect(parity.closeSession).toHaveBeenLastCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, force: true });
+  });
+
+  it("initiate / await-session / receive-session / transcript", async () => {
+    await run("initiate", ["ab12"]);
+    expect(parity.initiate).toHaveBeenCalledWith(CELLO_DIR, "ab12", { agent: undefined, pretty: false });
+    await run("await-session", ["--timeout-ms", "900"]);
+    expect(parity.awaitSession).toHaveBeenCalledWith(CELLO_DIR, { agent: undefined, pretty: false, timeoutMs: 900 });
+    await run("receive-session", ["sid1", "--timeout-ms", "900"]);
+    expect(parity.receiveSession).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: undefined, pretty: false, timeoutMs: 900 });
+    await run("transcript", ["sid1", "--agent", "alice"]);
+    expect(parity.transcript).toHaveBeenCalledWith(CELLO_DIR, "sid1", { agent: "alice", pretty: false });
+  });
+
+  it("contact set-moniker routes to the per-CONTACT moniker handler (NOT the agent's own moniker)", async () => {
+    // These two are easy to conflate — conflating them would rename YOUR agent instead of tagging a
+    // contact, and both "succeed". The registry must keep them apart.
+    await run("contact", ["set-moniker", "pk1", "Sup"]);
+    expect(parity.contactSetMoniker).toHaveBeenCalledWith(CELLO_DIR, "pk1", "Sup", { agent: undefined });
+    expect(commands.monikerSet).not.toHaveBeenCalled();
+
+    await run("contact", ["set-moniker", "pk1"]); // empty → clear
+    expect(parity.contactSetMoniker).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, { agent: undefined });
+  });
+
+  it("set-tier / set-away are accepted, and the legacy tier / away verbs still work", async () => {
+    await run("contact", ["set-tier", "pk1", "4"]);
+    expect(commands.contactSetTier).toHaveBeenCalledWith(CELLO_DIR, "pk1", 4, undefined);
+    await run("contact", ["set-away", "pk1", "on", "leave"]);
+    expect(commands.contactSetAway).toHaveBeenCalledWith(CELLO_DIR, "pk1", "on leave", undefined);
+  });
+});
+
+describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () => {
+  it("every jsonOut command accepts --pretty (the grant is real, not decorative)", () => {
+    const jsonCommands = COMMANDS.filter((c) => c.jsonOut);
+    expect(jsonCommands.length).toBeGreaterThan(10); // the loop must not be vacuous
+    for (const spec of jsonCommands) {
+      expect(flagsFor(spec.name).has("--pretty"), `${spec.name} must grant --pretty`).toBe(true);
+      expect(checkArgs(spec.name, ["--pretty"]), `${spec.name} must accept --pretty`).toEqual({ kind: "ok" });
+    }
+  });
+
+  it("a command WITHOUT the JSON contract does not silently accept --pretty", () => {
+    expect(checkArgs("login", ["--pretty"])).toEqual({ kind: "unknown_flag", flag: "--pretty" });
+  });
+
+  it("DoD §9: every in-scope cello_* MCP tool has a CLI command calling the SAME IPC handler", () => {
+    // The parity claim, checkable from the registry itself. The three descoped tools
+    // (cello_backup / cello_restore / cello_get_inclusion_proof) are deliberately ABSENT: their
+    // daemon handlers are not_implemented stubs, so a CLI pass-through would ship a fake command.
+    // They are tracked as known-open under DOD-CUSTODY-DAEMON-1 — NOT silently dropped.
+    const expected: Record<string, string> = {
+      cello_list_agents: "agents",
+      cello_start_agent: "start-agent",
+      cello_stop_agent: "stop-agent",
+      cello_use_agent: "use-agent",
+      cello_check_notifications: "inbox",
+      cello_get_transcript: "transcript",
+      cello_initiate_session: "initiate",
+      cello_send: "send",
+      cello_receive: "receive",
+      cello_receive_session: "receive-session",
+      cello_close_session: "close",
+      cello_await_session: "await-session",
+      // NOT in the brief's table — it claimed cello_get_sealed_receipt was "already covered" by
+      // `cello receipts`. It is not: `receipts` calls cello_get_relay_receipts, a DIFFERENT handler.
+      // The notarized bilateral seal receipt had no CLI surface; this is it.
+      cello_get_sealed_receipt: "sealed-receipt",
+    };
+    for (const [tool, cliName] of Object.entries(expected)) {
+      const spec = findCommand(cliName);
+      expect(spec, `MCP tool ${tool} must have the CLI command '${cliName}'`).toBeDefined();
+      expect(spec!.ipcMethod, `'${cliName}' must call ${tool}, the same handler the MCP tool calls`).toBe(tool);
+      expect(spec!.jsonOut, `'${cliName}' must honor the bash contract`).toBe(true);
+    }
+  });
+
+  it("the three DESCOPED custody tools have no CLI command (a fake pass-through is worse than none)", () => {
+    for (const name of ["backup", "restore", "inclusion-proof"]) {
+      expect(findCommand(name), `'${name}' must NOT exist until the daemon handler is real`).toBeUndefined();
+    }
+  });
+});

@@ -1,0 +1,291 @@
+/**
+ * DOD-CLI-PARITY-1 Phases 1-2 — every daemon capability that was MCP-only, reachable from `cello`.
+ *
+ * Bash is the universal agent adapter: with these commands any bash-capable agent (not just Claude
+ * Code or Hermes) operates a CELLO node — connect, send, receive, seal — with no MCP dependency.
+ *
+ * Each command is a THIN PASS-THROUGH: parse args → call the SAME daemon IPC handler the
+ * corresponding cello_* MCP tool calls → emit the response under the §3 contract (json-out.ts).
+ * No daemon changes, no second IPC client, no logic that the daemon owns (validation, tier bounds,
+ * agent_id resolution) is duplicated here — the CLI surfaces the daemon's verdict, verbatim.
+ *
+ * ── The per-invocation current-agent problem (why `use-agent` persists) ──────────────────────
+ * The daemon's "current agent" is PER-CONNECTION state. The MCP shim holds one long-lived socket,
+ * so `cello_use_agent` sticks for the whole session. The CLI is the opposite: a fresh process and a
+ * fresh connection per invocation, torn down microseconds later. A naive `cello use-agent alice`
+ * pass-through would therefore set state on a dying socket and report ok:true while changing NOTHING
+ * for the next command — a fabricated success of exactly the kind §3 forbids.
+ *
+ * So the selection is DURABLE: `use-agent` calls the real handler (which validates the agent and
+ * auto-starts it — AUTOSTART-1) and, only if the daemon says ok, persists the name. Every
+ * agent-scoped command then REPLAYS `cello_use_agent` on its new connection before dispatching.
+ * That is not a parallel path — it is the same replay the MCP proxy performs after a reconnect
+ * (ipc-proxy.ts invariant 1), reusing the existing handler.
+ *
+ * Agent resolution, in order: explicit `--agent` > the persisted selection > (omitted, so the
+ * daemon applies its own sole-online-agent fallback, and stays ambiguous → no_current_agent when
+ * two or more are online). If a replay FAILS, the command STOPS and surfaces that error — it never
+ * shrugs and lets the daemon's fallback quietly run the work as a different agent.
+ */
+
+import { join } from "node:path";
+import { readFile, writeFile } from "node:fs/promises";
+import { connectToDaemon, readLock, type IpcClient } from "@cello-protocol/daemon";
+import { emitIpcResult, emitTransportError, type EmittedOutput, type EmitOptions } from "./json-out.js";
+
+export type CliOutput = EmittedOutput;
+
+/** Options every parity command accepts. */
+export interface ParityOptions extends EmitOptions {
+  /** `--agent <name>` — overrides the persisted selection for this invocation only. */
+  agent?: string;
+}
+
+/** Where `cello use-agent` records the selection: a plain text file the operator can read/delete. */
+function currentAgentPath(celloDir: string): string {
+  return join(celloDir, "current-agent");
+}
+
+/** The persisted agent selection, or undefined if none was ever made. */
+export async function readCurrentAgent(celloDir: string): Promise<string | undefined> {
+  try {
+    const raw = (await readFile(currentAgentPath(celloDir), "utf8")).trim();
+    return raw.length > 0 ? raw : undefined;
+  } catch {
+    return undefined; // never selected (ENOENT) — not an error
+  }
+}
+
+async function writeCurrentAgent(celloDir: string, name: string): Promise<void> {
+  await writeFile(currentAgentPath(celloDir), name + "\n", "utf8");
+}
+
+/**
+ * Open a daemon connection, establish the current agent (if one is selected), run `fn`, and always
+ * close. Transport failures come back as structured JSON on stderr — so a bash agent branches on
+ * the same shape whether the daemon rejected the call or never received it.
+ */
+async function withDaemon(
+  celloDir: string,
+  opts: ParityOptions,
+  agentScoped: boolean,
+  fn: (client: IpcClient) => Promise<Record<string, unknown>>,
+): Promise<CliOutput> {
+  const lock = await readLock(join(celloDir, "daemon.lock"));
+  if (!lock) {
+    return emitTransportError(
+      "daemon_not_running",
+      "No daemon is running. Start it with 'cello login', then retry.",
+      opts,
+    );
+  }
+
+  let client: IpcClient;
+  try {
+    client = await connectToDaemon(lock.socketPath);
+  } catch (err: unknown) {
+    return emitTransportError(
+      "daemon_unreachable",
+      `Could not connect to the daemon at ${lock.socketPath}: ${err instanceof Error ? err.message : String(err)}. It may be mid-shutdown — check 'cello status'.`,
+      opts,
+    );
+  }
+
+  try {
+    await client.send("ipc.connect", { clientType: "cli" });
+
+    if (agentScoped) {
+      const selected = opts.agent ?? (await readCurrentAgent(celloDir));
+      if (selected) {
+        // Replay the selection onto THIS connection. If the daemon refuses (retired/unknown agent),
+        // stop here and surface it — continuing would let the sole-online fallback silently run the
+        // command as a DIFFERENT agent than the operator named.
+        const used = (await client.send("cello_use_agent", { name: selected })) as Record<string, unknown>;
+        if (used.ok !== true) return emitIpcResult(used, opts);
+      }
+      // No selection at all → send nothing, and let the daemon apply its own documented fallback
+      // (sole online agent; ambiguous → no_current_agent). Guessing here would misroute.
+    }
+
+    const result = await fn(client);
+    return emitIpcResult(result, opts);
+  } catch (err: unknown) {
+    return emitTransportError(
+      "ipc_error",
+      `The daemon call failed: ${err instanceof Error ? err.message : String(err)}`,
+      opts,
+    );
+  } finally {
+    client.close();
+  }
+}
+
+/** The common case: one IPC call, agent-scoped unless stated otherwise. */
+function ipcCommand(
+  celloDir: string,
+  method: string,
+  params: Record<string, unknown>,
+  opts: ParityOptions,
+  agentScoped = true,
+): Promise<CliOutput> {
+  return withDaemon(celloDir, opts, agentScoped, async (client) => {
+    return (await client.send(method, params)) as Record<string, unknown>;
+  });
+}
+
+/** Drop undefined values so an omitted optional param is ABSENT, not an explicit `undefined`. */
+function defined(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(params).filter(([, v]) => v !== undefined));
+}
+
+// ─── Group A: agent lifecycle ──────────────────────────────────────────────────────────────────
+
+/** `cello agents` → cello_list_agents. Daemon-wide, not agent-scoped. */
+export function listAgents(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_list_agents", {}, opts, false);
+}
+
+/** `cello start-agent <name>` → cello_start_agent. Brings an agent online WITHOUT claiming current. */
+export function startAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_start_agent", { name }, opts, false);
+}
+
+/** `cello stop-agent <name>` → cello_stop_agent. */
+export function stopAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_stop_agent", { name }, opts, false);
+}
+
+/**
+ * `cello use-agent <name>` → cello_use_agent, and — only if the daemon accepts it — persists the
+ * selection so it survives this process. The handler auto-starts the agent if offline (AUTOSTART-1).
+ * A rejected selection is NEVER written: a later command must not silently act as an agent the
+ * daemon refused.
+ */
+export async function useAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
+  const out = await ipcCommand(celloDir, "cello_use_agent", { name }, opts, false);
+  if (out.exitCode === 0) await writeCurrentAgent(celloDir, name);
+  return out;
+}
+
+/** `cello inbox [--scope current|all]` → cello_check_notifications (the push-loss reconciler). */
+export function inbox(
+  celloDir: string,
+  opts: ParityOptions & { scope?: "current" | "all" },
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_check_notifications", defined({ scope: opts.scope }), opts);
+}
+
+/** `cello transcript <session-id>` → cello_get_transcript (durable, survives a daemon restart). */
+export function transcript(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_get_transcript", { session_id: sessionId }, opts);
+}
+
+/**
+ * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt.
+ *
+ * NOT in the brief's mapping table, which listed cello_get_sealed_receipt as "already covered by
+ * `receipts`". It is not: `cello receipts <name>` calls cello_get_relay_receipts — a DIFFERENT
+ * handler (relay ordering receipts). The notarized bilateral SEAL receipt — the artifact the whole
+ * close ceremony exists to produce, and the one an arbitrator reads — had no CLI surface at all.
+ * Added under the standing rule: a real, non-stub handler with no CLI command gets one.
+ */
+export function sealedReceipt(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_get_sealed_receipt", { session_id: sessionId }, opts);
+}
+
+/** `cello contact set-tier <pubkey> <tier>` → cello_contact_set_tier. */
+export function contactSetTier(celloDir: string, pubkey: string, tier: number, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_contact_set_tier", { pubkey, tier }, opts);
+}
+
+/** `cello contact set-away <pubkey> <message>` → cello_contact_set_away (empty message clears it). */
+export function contactSetAway(celloDir: string, pubkey: string, message: string | null, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_contact_set_away", { pubkey, message }, opts);
+}
+
+/** `cello contact set-moniker <pubkey> <moniker>` → cello_contact_set_moniker (per-CONTACT pet name). */
+export function contactSetMoniker(celloDir: string, pubkey: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_contact_set_moniker", { pubkey, moniker }, opts);
+}
+
+// ─── Group B: live conversation (mirrors the MCP params EXACTLY) ───────────────────────────────
+
+/** `cello initiate <target-pubkey>` → cello_initiate_session. Prints the session_id. */
+export function initiate(celloDir: string, targetPubkey: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_initiate_session", { target_pubkey: targetPubkey }, opts);
+}
+
+/**
+ * `cello send <session-id> <message>` → cello_send.
+ *
+ * Honors read-before-write exactly as the MCP tool does: if the daemon returns session_not_current
+ * (with its cursor), that verdict is surfaced VERBATIM and the command exits non-zero. It is never
+ * auto-fixed by silently reading the transcript first — the operator/agent must catch up explicitly,
+ * because a send that "worked" after a hidden read is a send whose ordering guarantees are a fiction.
+ */
+export function send(
+  celloDir: string,
+  sessionId: string,
+  content: string,
+  opts: ParityOptions & { governanceDecisions?: Record<string, string> },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    "cello_send",
+    defined({ session_id: sessionId, content, governance_decisions: opts.governanceDecisions }),
+    opts,
+  );
+}
+
+/**
+ * `cello receive <session-id> [--since-seq N] [--timeout-ms N]` → cello_receive.
+ * Mirrors the MCP semantics exactly: with since_seq it is a stateless catch-up BATCH (no replay
+ * race, timeout ignored); without it, it BLOCKS for the next live message until timeout_ms.
+ */
+export function receive(
+  celloDir: string,
+  sessionId: string,
+  opts: ParityOptions & { sinceSeq?: number; timeoutMs?: number },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    "cello_receive",
+    defined({ session_id: sessionId, timeout_ms: opts.timeoutMs, since_seq: opts.sinceSeq }),
+    opts,
+  );
+}
+
+/** `cello receive-session <session-id> [--timeout-ms N]` → cello_receive_session. */
+export function receiveSession(
+  celloDir: string,
+  sessionId: string,
+  opts: ParityOptions & { timeoutMs?: number },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    "cello_receive_session",
+    defined({ session_id: sessionId, timeout_ms: opts.timeoutMs }),
+    opts,
+  );
+}
+
+/**
+ * `cello close <session-id> [--force]` → cello_close_session. Normally triggers the bilateral seal
+ * ceremony. --force is passed ONLY when asked for (mirroring the shim), since it forfeits the seal.
+ */
+export function closeSession(
+  celloDir: string,
+  sessionId: string,
+  opts: ParityOptions & { force?: boolean },
+): Promise<CliOutput> {
+  const params = opts.force ? { session_id: sessionId, force: true } : { session_id: sessionId };
+  return ipcCommand(celloDir, "cello_close_session", params, opts);
+}
+
+/** `cello await-session [--timeout-ms N]` → cello_await_session. Blocks for an inbound doorbell. */
+export function awaitSession(
+  celloDir: string,
+  opts: ParityOptions & { timeoutMs?: number },
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_await_session", defined({ timeout_ms: opts.timeoutMs }), opts);
+}

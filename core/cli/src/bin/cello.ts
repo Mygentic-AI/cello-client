@@ -2,18 +2,21 @@
 /**
  * cello — the CELLO CLI binary.
  *
- * Commands:
- *   cello login    — Start the daemon (or connect to existing), exit 0
- *   cello logout   — Send shutdown command to daemon
- *   cello status   — Query daemon and print structured JSON response
- *   cello register — Register a loaded agent with the directory (ML-DSA + FROST DKG)
+ * DOD-CLI-PARITY-1 Phase 0: this file no longer contains a dispatch switch. Every command lives in
+ * the registry (src/registry.ts), which is also what renders `cello --help` and per-command help —
+ * so dispatch, the command table, and the help text cannot drift apart. Adding a command means
+ * adding one registry entry; this binary does not change.
+ *
+ * The bash-adapter contract (§3): a command's JSON result goes to stdout, a structured failure goes
+ * to stderr VERBATIM, and the exit code branches on it — so any bash-capable agent can drive a
+ * CELLO node with `cello <cmd> | jq` and `$?`, with no MCP dependency.
  */
 
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { login, logout, status, register, createAgent, removeAgent, refreshShares, relayReceipts, sessions, type SessionFilter, contactAdd, contactRemove, contactList, contactSetTier, contactSetAway, settingsGet, settingsSet, monikerSet, telegramSetToken } from "../commands.js";
-import { USAGE, KNOWN_COMMANDS, checkArgs, helpForCommand, splitAgentFlag } from "../cli-args.js";
+import { KNOWN_COMMANDS, USAGE, checkArgs, helpForCommand } from "../cli-args.js";
+import { findCommand, type CommandContext } from "../registry.js";
 import type { Logger } from "@cello-protocol/daemon";
 
 const logger: Logger = {
@@ -44,189 +47,44 @@ const daemonPkgPath = require.resolve("@cello-protocol/daemon/package.json");
 const daemonBin = join(dirname(daemonPkgPath), "dist/bin/cello-daemon.js");
 
 async function main(): Promise<void> {
-  let result: { exitCode: number; output: string };
+  const spec = command ? findCommand(command) : undefined;
 
-  // M8B F2: answer --help/-h on every subcommand and REJECT unknown flags before
-  // dispatch, so a flag can never be coerced into a positional argument (previously
-  // `cello register --help` tried to register an agent literally named "--help").
-  if (command && KNOWN_COMMANDS.has(command as never)) {
-    const check = checkArgs(command, process.argv.slice(3));
-    if (check.kind === "help") {
-      process.stdout.write(helpForCommand(command) + "\n");
-      process.exit(0);
-      return;
-    }
-    if (check.kind === "unknown_flag") {
-      process.stderr.write(`Unknown flag '${check.flag}' for 'cello ${command}'.\n`);
-      process.stdout.write(helpForCommand(command) + "\n");
-      process.exit(1);
-      return;
-    }
+  if (!spec || !KNOWN_COMMANDS.has(command)) {
+    // No command, or one we don't have: print the described command table.
+    process.stdout.write(USAGE + "\n");
+    process.exit(command ? 1 : 0);
+    return;
   }
 
-  switch (command) {
-    case "login":
-      result = await login(celloDir, daemonBin, logger);
-      break;
-    case "logout":
-      // DOD-LOGOUT-WAIT-1: logout now WAITS for the daemon to actually die before claiming
-      // "Daemon stopped." — the immediate progress line tells the operator the command
-      // activated and the short pause is expected.
-      result = await logout(celloDir, (line) => process.stdout.write(line + "\n"));
-      break;
-    case "status":
-      result = await status(celloDir);
-      break;
-    case "register": {
-      // cello register <agent> [preAuthToken]  (token falls back to CELLO_PREAUTH_TOKEN
-      // so it need not appear in shell history). Optional phone stub follows.
-      const agent = process.argv[3] ?? "";
-      const preAuthToken = process.argv[4] ?? process.env.CELLO_PREAUTH_TOKEN ?? "";
-      const phoneStub = process.argv[5] ?? "";
-      // M8C-ONBOARD-WARN-1 (revised 2026-07-06, Andre): the pre-auth exposure "note" is REMOVED
-      // entirely. A single-use, 24h, consumed-on-success token has no meaningful exposure risk, so
-      // the note only drew attention to a non-issue ("this thing you weren't worried about? don't
-      // worry about it") — pure noise on the core onboarding path. No warning at all is correct.
-      result = await register(celloDir, agent, preAuthToken, phoneStub);
-      break;
-    }
-    case "create-agent": {
-      // cello create-agent <name> — create a fresh local agent identity (PERSIST-002 AC-004).
-      const name = process.argv[3] ?? "";
-      result = await createAgent(celloDir, name);
-      break;
-    }
-    case "remove-agent": {
-      // cello remove-agent <name> — retire a local agent (one-way) and free its name (REMOVE-001).
-      const name = process.argv[3] ?? "";
-      result = await removeAgent(celloDir, name);
-      break;
-    }
-    case "refresh": {
-      // cello refresh <name> — proactive share refresh / epoch rollover (M8B DOD-REFRESH-1).
-      const name = process.argv[3] ?? "";
-      result = await refreshShares(celloDir, name);
-      break;
-    }
-    case "receipts": {
-      // cello receipts <name> — list the agent's stored relay ordering receipts (M8B DOD-RELAYSIG-1).
-      const name = process.argv[3] ?? "";
-      result = await relayReceipts(celloDir, name);
-      break;
-    }
-    case "sessions": {
-      // cello sessions [--open|--closed|--failed|--all] [--limit N] — the full session history.
-      // Defaults to open (live + resumable) so failed/closed don't flood it; the daemon caps the
-      // count. (`cello status` only ever shows live/resumable, never this full list.)
-      const args = process.argv.slice(3);
-      let filter: SessionFilter | undefined;
-      if (args.includes("--all")) filter = "all";
-      else if (args.includes("--closed")) filter = "closed";
-      else if (args.includes("--failed")) filter = "failed";
-      else if (args.includes("--open")) filter = "open";
-      const limitIdx = args.indexOf("--limit");
-      let limit: number | undefined;
-      if (limitIdx !== -1 && args[limitIdx + 1] !== undefined) {
-        const n = Number(args[limitIdx + 1]);
-        if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
-      }
-      result = await sessions(celloDir, { filter, limit });
-      break;
-    }
-    case "contact": {
-      // cello contact add <pubkey> [--agent <name>] | remove <pubkey> [--agent <name>] | list [--agent <name>]
-      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
-      const [sub, pubkey, tierArg] = positional;
-      if (sub === "add" && pubkey) {
-        result = await contactAdd(celloDir, pubkey, agent);
-      } else if (sub === "remove" && pubkey) {
-        result = await contactRemove(celloDir, pubkey, agent);
-      } else if (sub === "list") {
-        result = await contactList(celloDir, agent);
-      } else if (sub === "tier" && pubkey && tierArg !== undefined) {
-        // cello contact tier <pubkey> <0..4> — daemon validates the value; a non-numeric arg is
-        // surfaced as the daemon's invalid_tier verdict (NaN → rejected there).
-        result = await contactSetTier(celloDir, pubkey, Number(tierArg), agent);
-      } else if (sub === "away" && pubkey) {
-        // cello contact away <pubkey> <message…> — the rest of the args form the away text; empty → clear.
-        const message = positional.slice(2).join(" ");
-        result = await contactSetAway(celloDir, pubkey, message.length > 0 ? message : null, agent);
-      } else {
-        result = { exitCode: 1, output: "Usage: cello contact add|remove <pubkey> [--agent <name>] | cello contact list [--agent <name>] | cello contact tier <pubkey> <0..4> [--agent <name>] | cello contact away <pubkey> <message> [--agent <name>]" };
-      }
-      break;
-    }
-    case "settings": {
-      // cello settings get [key] [--agent] | set <key> <value> [--agent] (DOD-SETTINGS-SURFACE-1)
-      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
-      const [sub, key, value] = positional;
-      if (sub === "get") {
-        result = await settingsGet(celloDir, key, agent); // key optional → list all when absent
-      } else if (sub === "set" && key && value !== undefined) {
-        result = await settingsSet(celloDir, key, value, agent);
-      } else {
-        result = { exitCode: 1, output: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]" };
-      }
-      break;
-    }
-    case "moniker": {
-      // cello moniker set <name> [--agent <agent>] | cello moniker clear [--agent <agent>] (MONIKER-1)
-      const { agent, positional } = splitAgentFlag(process.argv.slice(3));
-      const [sub, name] = positional;
-      if (sub === "set" && name) {
-        result = await monikerSet(celloDir, name, agent);
-      } else if (sub === "clear" && !name) {
-        result = await monikerSet(celloDir, null, agent);
-      } else {
-        result = { exitCode: 1, output: helpForCommand("moniker") };
-      }
-      break;
-    }
-    case "telegram": {
-      // cello telegram set-token <bot_token> <allowlisted_chat_id>
-      const sub = process.argv[3];
-      const botToken = process.argv[4];
-      const chatId = process.argv[5];
-      if (sub === "set-token" && botToken && chatId) {
-        result = await telegramSetToken(celloDir, botToken, chatId);
-      } else {
-        result = { exitCode: 1, output: "Usage: cello telegram set-token <bot_token> <allowlisted_chat_id>" };
-      }
-      break;
-    }
-    case "install": {
-      // cello install hermes --agent <name> [--hermes-home <path>] (HERMES-001)
-      const args = process.argv.slice(3);
-      const agentIdx = args.indexOf("--agent");
-      const homeIdx = args.indexOf("--hermes-home");
-      // Find the target positional, excluding both flags AND their values — so
-      // `cello install --agent alice hermes` still resolves target=hermes (mirrors
-      // the `contact` case's positional filter).
-      const target = args.find(
-        (a, i) =>
-          !a.startsWith("-") &&
-          !(agentIdx !== -1 && i === agentIdx + 1) &&
-          !(homeIdx !== -1 && i === homeIdx + 1),
-      );
-      if (target !== "hermes") {
-        result = { exitCode: 1, output: helpForCommand("install") };
-        break;
-      }
-      const { installHermes } = await import("../hermes/install-hermes.js");
-      result = await installHermes({
-        agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",
-        hermesHome: homeIdx !== -1 ? args[homeIdx + 1] : undefined,
-      });
-      break;
-    }
-    default:
-      // M8B F1: the usage string lists EVERY command (refresh/receipts were missing).
-      process.stdout.write(USAGE + "\n");
-      process.exit(command ? 1 : 0);
-      return;
+  const args = process.argv.slice(3);
+
+  // M8B F2: answer --help/-h on every subcommand and REJECT unknown flags BEFORE dispatch, so a
+  // flag can never be coerced into a positional argument.
+  const check = checkArgs(command, args);
+  if (check.kind === "help") {
+    process.stdout.write(helpForCommand(command) + "\n");
+    process.exit(0);
+    return;
+  }
+  if (check.kind === "unknown_flag") {
+    process.stderr.write(`Unknown flag '${check.flag}' for 'cello ${command}'.\n`);
+    process.stdout.write(helpForCommand(command) + "\n");
+    process.exit(1);
+    return;
   }
 
-  process.stdout.write(result.output + "\n");
+  const ctx: CommandContext = {
+    celloDir,
+    daemonBin,
+    logger,
+    onProgress: (line) => process.stdout.write(line + "\n"),
+  };
+
+  const result = await spec.run(ctx, args);
+
+  // Report the outcome, never the intent: stdout carries the result, stderr the structured failure.
+  if (result.stdout.length > 0) process.stdout.write(result.stdout + "\n");
+  if (result.stderr.length > 0) process.stderr.write(result.stderr + "\n");
   process.exit(result.exitCode);
 }
 
