@@ -1,13 +1,14 @@
 {
   "totals": {
-    "all": 99,
-    "reachable": 65,
-    "dead": 34
+    "all": 168,
+    "reachable": 133,
+    "dead": 35
   },
   "roots": [
     "core/daemon/src/bin/cello-daemon.ts",
     "core/adapter-claude-code/src/bin/cello-mcp.ts",
-    "core/cli/src/bin/cello.ts"
+    "core/cli/src/bin/cello.ts",
+    "core/gateway/src/bin/cello-gateway.ts"
   ],
   "dead": [
     {
@@ -140,6 +141,10 @@
     },
     {
       "file": "core/crypto/src/frost/stubs.ts",
+      "tag": "orphan"
+    },
+    {
+      "file": "core/daemon/src/cello-node-transport-dialer.ts",
       "tag": "orphan"
     },
     {
