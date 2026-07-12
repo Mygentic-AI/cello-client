@@ -357,11 +357,13 @@ describe("AC-001: Bootstrap fetch produces correct progress messages", () => {
 describe("AC-009: Lazy startup architectural contract", () => {
   it("MCP server connect() precedes all background I/O", () => {
     // This test verifies the contract by inspecting the sequence in cello-mcp.ts:
-    // 1. createNode() — fast (opens TCP port)
-    // 2. createClient() — no I/O
-    // 3. createMcpSessionServer() — no I/O
-    // 4. server.connect(new StdioServerTransport()) — registers tools ← MUST BE HERE
-    // 5. void (async () => { /* background init */ })() ← runs concurrently
+    // 1. new McpServer(...) — no I/O
+    // 2. server.connect(new StdioServerTransport()) — registers tools ← MUST BE HERE
+    // 3. void (async () => { /* background init */ })() ← runs concurrently
+    //
+    // (This list used to name createNode/createClient/createMcpSessionServer — the M6-era in-process
+    // startup path. That path is gone: the shim is a stdio→IPC proxy and holds no node, client or
+    // crypto. DOD-LEGACY-MCP-1 deleted the last of it.)
 
     // Architectural invariant: server.connect() must be called synchronously before
     // the background init IIFE is dispatched. The subprocess test in

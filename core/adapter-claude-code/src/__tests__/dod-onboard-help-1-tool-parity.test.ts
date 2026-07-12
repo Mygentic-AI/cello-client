@@ -14,19 +14,26 @@
  * literal that can drift, plus a test that will not let it.
  *
  * SCOPE — read this before widening it. This audits `bin/cello-mcp.ts`, the PUBLISHED entrypoint.
- * `src/server.ts` (and `core/client/src/mcp-server.ts`) are the legacy M1 in-process servers. An
- * earlier version of this comment claimed they were "not published" — that was WRONG, and review
- * caught it: both are exported from their package roots and ship in `dist/`. Nothing drives them at
- * runtime (the shim proxies to the daemon), but they still register the pre-rename tool names, so
- * they are a SECOND vocabulary sitting on the public export surface — the exact thing §2b abolishes.
- * Tracked as DOD-LEGACY-MCP-1: delete the dead `createMcpServer` / `createMcpSessionServer` exports.
- * Not fixed here because deleting public exports is a separate, riskier change than a help pass.
+ *
+ * HISTORY, because the invariant below got STRONGER and the reason matters. `src/server.ts` and
+ * `core/client/src/mcp-server.ts` were the legacy M1 in-process MCP servers. An earlier version of
+ * this comment claimed they were "not published" — that was WRONG, and review caught it: both were
+ * exported from their package roots and shipped in `dist/`. Nothing drove them at runtime (the shim
+ * proxies to the daemon), but they still registered the pre-rename tool names, so the tarball
+ * carried a SECOND vocabulary — the exact thing §2b abolishes. This test could then only BOUND the
+ * damage: it asserted `server.ts` was the ONE file allowed to name a renamed-away tool, so the
+ * quarantine could not silently grow.
+ *
+ * DOD-LEGACY-MCP-1 (2026-07-12) DELETED both servers. The quarantine is now EMPTY, so the assertion
+ * is no longer "only server.ts may" — it is "NOBODY may." Do not weaken it back to an allowlist. If
+ * this test fails because some file names a renamed-away tool, the answer is to fix that file; there
+ * is no longer any such thing as a legitimately-quarantined second vocabulary.
  */
 
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { DUAL_SURFACE_VERBS, MCP_ONLY_TOOLS, knownToolNames } from "@cello-protocol/daemon";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -151,28 +158,90 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     }
   });
 
-  it("the LEGACY quarantine is exactly these files — it may not grow (DOD-LEGACY-MCP-1)", () => {
-    // HONESTY BOUND. `dist/server.js` — the legacy in-process MCP server — SHIPS in this tarball and
-    // still registers cello_receive_session, cello_list_sessions and cello_get_sealed_receipt: names
-    // that are renamed away or deleted. It is unreachable at runtime (bin/cello-mcp.ts never imports
-    // it) but it IS exported from the package root, so the tarball carries a SECOND vocabulary.
+  it("NOBODY may name a renamed-away tool — the legacy quarantine is empty (DOD-LEGACY-MCP-1)", () => {
+    // This assertion used to be an ALLOWLIST: `toEqual(["server.ts"])`. `dist/server.js` — the legacy
+    // in-process MCP server — really did ship in the tarball and really did still register
+    // cello_receive_session, cello_list_sessions and cello_get_sealed_receipt. It was unreachable at
+    // runtime, but exported from the package root, so the tarball carried a SECOND vocabulary. All
+    // this test could do was BOUND that: name the one quarantined file so it could not quietly grow.
     //
-    // I claimed "zero occurrences in the connect dist" after grepping only cello-mcp.js. That claim
-    // was false, and Ms_Chelly caught it. The fix is not to re-word the claim — it is to make the
-    // quarantine VISIBLE and BOUNDED, so it cannot quietly grow while an audit elsewhere reports
-    // green. Deleting it is DOD-LEGACY-MCP-1 (removing a public export is a riskier change than a
-    // help pass, and it takes its tests with it).
+    // DOD-LEGACY-MCP-1 deleted the file. The quarantine is empty, so the bound becomes an absolute:
+    // no source file may name a renamed-away tool. An allowlist that is empty is just a denylist —
+    // and this one has no exceptions left to grant.
     //
-    // If this test fails because a NEW file joined the list: do not add it here. Fix the file.
-    const legacy = readdirSync(join(here, ".."))
-      .filter((f) => f.endsWith(".ts"))
-      .filter((f) => /cello_(receive_session|list_sessions|get_sealed_receipt|list_agents|check_notifications|get_transcript|set_moniker|contact_list)/
-        .test(readFileSync(join(here, "..", f), "utf8")));
+    // If this fails: do NOT add the offending file to an exception list. There is no exception list.
+    // A live source file naming a dead tool is a surface handing an agent a tool that does not exist.
+    // Fix the file.
+    //
+    // The scan is RECURSIVE (it was top-level-only, which would have missed `bin/` and any subdir)
+    // and skips `__tests__`, since a test legitimately names dead tools in order to assert they are
+    // gone — including the test directly above this one.
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+        if (e.name === "__tests__" || e.name === "node_modules") return [];
+        const full = join(dir, e.name);
+        return e.isDirectory() ? walk(full) : e.name.endsWith(".ts") ? [full] : [];
+      });
+
+    const SRC = join(here, "..");
+    const scanned = walk(SRC);
+    // Guard against a vacuous pass: an empty scan would make the assertion below trivially true.
+    expect(scanned.length, "the recursive scan found no source files — this audit would be vacuous")
+      .toBeGreaterThan(3);
+
+    // WHAT THIS AUDITS: agent-facing surface. A renamed-away name is a defect when an AGENT can see
+    // it — a tool registration, a tool description, a guidance string ("Use `cello_list_sessions`
+    // to…"). That is what hands an agent a tool that does not exist. Two things are therefore
+    // stripped first, and each is a MECHANISM, not a file — a real `server.tool("cello_list_sessions"`
+    // in any file, including the shim, is still caught. Do not turn this back into a file allowlist.
+    //
+    //  1. IPC WIRE CALLS. `bin/cello-mcp.ts` really does contain `proxy.call("cello_list_agents")`.
+    //     The TOOL was renamed; the daemon METHOD it proxies to deliberately was NOT — connect has no
+    //     daemon dependency, so a new daemon must keep serving an OLD shim. Renaming the wire would
+    //     silently break that pairing. The last test in this file asserts those wire names are still
+    //     present, so this exemption is not a loophole: it is the other half of a stated contract.
+    //  2. COMMENTS. Developer prose never reaches an agent, and the comments in question exist
+    //     precisely to explain the tool↔wire divergence above.
+    // The comment strips are ANCHORED to line-leading comments. An unanchored `//` strip would kill
+    // everything after any `//` — including one inside a STRING, e.g. a URL in a tool description:
+    //   server.tool("cello_sessions", "See https://docs.cello.dev — replaces cello_list_sessions")
+    // …which would erase `cello_list_sessions` and turn the audit whose whole job is to catch that
+    // name GREEN. The stripper must never be able to destroy the evidence it is filtering around.
+    // Anchoring covers every real comment in these files and cannot eat a string literal.
+    const agentFacing = (text: string): string =>
+      text
+        .replace(/^\s*\/\*[\s\S]*?\*\//gm, "")            // block comments (line-leading)
+        .replace(/^\s*\*.*$/gm, "")                       // jsdoc continuation lines
+        .replace(/^\s*\/\/.*$/gm, "")                     // line comments (line-leading)
+        .replace(/proxy\.call\(\s*"cello_[a-z_]+"/g, ""); // IPC wire method names
+
+    const STALE = /cello_(receive_session|list_sessions|get_sealed_receipt|list_agents|check_notifications|get_transcript|set_moniker|contact_list)/;
+
+    // NEGATIVE CONTROL. `agentFacing()` is a stripper, and a stripper that strips too much turns this
+    // audit green by erasing the evidence. Prove it still bites: a registration and a guidance string
+    // must survive stripping and be caught, while a wire call and a comment must not.
+    expect(STALE.test(agentFacing('server.tool("cello_list_sessions", {...})')),
+      "a tool registration must still be caught").toBe(true);
+    expect(STALE.test(agentFacing('desc: "Use cello_get_sealed_receipt to fetch the receipt"')),
+      "an agent-facing guidance string must still be caught").toBe(true);
+    // THE ONE THAT MATTERS: a `//` inside a string must not let the stripper eat the evidence after
+    // it. This is the exact hole an unanchored comment-strip would open.
+    expect(STALE.test(agentFacing('server.tool("cello_sessions", "See https://x.dev — replaces cello_list_sessions")')),
+      "a stale name after a URL's // must STILL be caught — the stripper may not erase evidence").toBe(true);
+    expect(STALE.test(agentFacing('const r = await proxy.call("cello_list_agents");')),
+      "an IPC wire call is not a tool name").toBe(false);
+    expect(STALE.test(agentFacing('  // the daemon still exposes cello_set_moniker on the wire')),
+      "a developer comment is not agent-facing").toBe(false);
+
+    const offenders = scanned
+      .filter((f) => STALE.test(agentFacing(readFileSync(f, "utf8"))))
+      .map((f) => relative(SRC, f));
+
     expect(
-      legacy.sort(),
-      "Only the known-legacy server.ts may still name a renamed-away tool. Anything else is a live " +
-        "surface handing an agent a tool that does not exist.",
-    ).toEqual(["server.ts"]);
+      offenders.sort(),
+      "A source file names a renamed-away tool. The legacy in-process servers are DELETED, so there " +
+        "is no legitimate quarantine left — this is a live surface advertising a tool that does not exist.",
+    ).toEqual([]);
   });
 
   it("the IPC wire names are NOT renamed — the shim still calls the daemon's existing methods", () => {
