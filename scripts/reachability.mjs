@@ -6,8 +6,8 @@
  * "which source files are actually reachable from a live binary, and which are dead?"
  *
  * It walks the static import graph (import/export-from + dynamic/inline import())
- * starting from the live application entry points (the daemon, MCP adapter, and CLI
- * binaries), resolving both relative specifiers and cross-package @cello-protocol/*
+ * starting from the live application entry points (the daemon, MCP adapter, CLI,
+ * and gateway-sidecar binaries), resolving both relative specifiers and cross-package @cello-protocol/*
  * specifiers within this monorepo. Anything under core/<pkg>/src that the walk never
  * reaches is dead from the live runtime's perspective.
  *
@@ -120,10 +120,14 @@ function reachFrom(roots) {
 }
 
 // ── roots: the live application binaries ──
+// gateway is a REAL shipped binary: @cello-protocol/gateway is published with a
+// `cello-gateway` bin and the daemon spawns it as a sidecar process (see ci.yml).
+// Omitting it wrongly marks core/gateway/src/bin/cello-gateway.ts as dead.
 const appBins = [
   join(nameToSrc.get("@cello-protocol/daemon") ?? "", "bin/cello-daemon.ts"),
   join(nameToSrc.get("@cello-protocol/connect") ?? "", "bin/cello-mcp.ts"),
   join(nameToSrc.get("@cello-protocol/cli") ?? "", "bin/cello.ts"),
+  join(nameToSrc.get("@cello-protocol/gateway") ?? "", "bin/cello-gateway.ts"),
 ].filter((f) => existsSync(f));
 
 const roots = [...appBins];

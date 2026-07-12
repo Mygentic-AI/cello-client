@@ -13,23 +13,27 @@ became a thin stdio-to-IPC proxy in front of the `cello-daemon` process.
 
 ## Method
 
-Reachability was traced from the three real production entrypoints:
+Reachability was traced from the four real production entrypoints:
 
 - `core/daemon/src/bin/cello-daemon.ts`
 - `core/adapter-claude-code/src/bin/cello-mcp.ts`
 - `core/cli/src/bin/cello.ts`
+- `core/gateway/src/bin/cello-gateway.ts` — the security-gateway sidecar `@cello-protocol/gateway`
+  ships as a `cello-gateway` bin, and the daemon spawns it as a separate process. It has no
+  in-repo importer (nothing imports a bin), so it must be listed as a root or it is wrongly flagged
+  dead. `scripts/reachability.mjs` was corrected to include it.
 
-The full file-level result is checked in at `docs/reachability-baseline.json` (generated
-2026-07-10; re-verified 2026-07-12 against the two commits landed since — no drift). Of 99 tracked
-source files, **34 (34%) are unreachable from any entrypoint.**
+The full file-level result is checked in at `docs/reachability-baseline.json` (regenerated
+2026-07-12 against the current tree). Of 168 tracked source files, **35 (21%) are unreachable from
+any entrypoint.**
 
-This report groups those 34 files into the stories they belong to, explains *why* each is dead, and
+This report groups those 35 files into the stories they belong to, explains *why* each is dead, and
 cross-references the codebase's own history where the dead code has already been named and
 deliberately deferred.
 
 ---
 
-## 🔴 Headline finding — the entire `@cello-protocol/client` package is dead (22 files, ~13,000 LOC)
+## 🔴 Headline finding — the entire `@cello-protocol/client` package is dead (26 files, ~13,000 LOC)
 
 `@cello-protocol/client` was the M6-era in-process client: key material, libp2p node, SQLCipher
 store, session/seal state machines — everything the daemon now owns and runs as a single
@@ -72,7 +76,7 @@ silently grow. They did not delete it. **DOD-LEGACY-MCP-1 remains outstanding.**
 ### The rest of the dead `@cello-protocol/client` tree
 
 Everything below is dead as a consequence of the above — it's the implementation these two dead
-servers sit on top of. All 22 files in `core/client/src/` (excluding `__tests__/`) are unreachable
+servers sit on top of. All 26 files in `core/client/src/` (excluding `__tests__/`) are unreachable
 from production:
 
 ```
@@ -113,6 +117,8 @@ write-then-rename, PID + socket path + version, used by `daemon/src/index.ts`,
 | `core/adapter-claude-code/src/index.ts` | api | The package's public library export surface — dead because nothing consumes `@cello-protocol/connect` as a library; only the `cello-mcp` bin ships. |
 | `core/adapter-claude-code/src/notifications.ts` | api | `pushSessionRequestNotification`, used only by the dead `server.ts`. (`bin/cello-mcp.ts` has its own inline channel-notification forwarding.) |
 | `core/cli/src/index.ts` | api | CLI's library export (`login/logout/status/register/sessions`). The real `cello` binary goes through `registry.ts` + `cli-args.ts`, not this root export. Nothing in-repo imports `@cello-protocol/cli` as a library. |
+| `core/daemon/src/cello-node-transport-dialer.ts` | orphan | `CelloNodeTransportDialer` (CELLO-M7-TRANSPORT-001), introduced 2026-07-10. Its own header calls it "the REAL TransportDialer," but production wires `transport-selector.ts` instead and nothing imports this class outside its own test. Not migration-debris — it is scaffolding that was never hooked into the daemon (or was superseded before it was). Confirm whether it is meant to be wired before deleting. |
+| `core/test-fixtures/src/index.ts` | api | The public export of `@cello-protocol/test-fixtures`. Consumed only by other packages' tests, never by a shipped binary — so it is unreachable from the production roots by design. Listed here for completeness; likely *not* a deletion candidate (it is live test infrastructure). |
 | `core/client/src/encrypted-file-signing-key-provider.ts` | orphan | Referenced only by `__tests__/persist-010.test.ts`; no production caller even within the (already-dead) client package's own wiring. |
 | `core/crypto/src/frost/stubs.ts` | orphan | An in-process FROST directory-node stub for tests; lives in `src/` instead of `__tests__/`. Only used by `frost.test.ts`. Unrelated to the daemon migration — general test-scaffolding-in-src hygiene. |
 
@@ -151,7 +157,14 @@ is additive to work already landed, not duplicating it:
    export if no external library consumer is found.
 5. Move `core/crypto/src/frost/stubs.ts` into `core/crypto/src/__tests__/` (or a `__fixtures__/`
    dir) rather than deleting it — it's genuinely useful test scaffolding, just miscategorized.
-6. Each deletion above touches a **published `core/*` package** — per this repo's Publishing
+6. **Decide the fate of `core/daemon/src/cello-node-transport-dialer.ts`** (CELLO-M7-TRANSPORT-001).
+   It advertises itself as "the REAL TransportDialer" but is imported only by its own test — so it is
+   either scaffolding waiting to be wired into the daemon, or a superseded implementation to delete.
+   This is a live-daemon question, not a migration cleanup: resolve it with whoever owns
+   CELLO-M7-TRANSPORT-001 before either wiring or deleting. Do **not** touch
+   `core/test-fixtures/src/index.ts` — it is unreachable from the production roots by design (test
+   infrastructure), not dead weight.
+7. Each deletion above touches a **published `core/*` package** — per this repo's Publishing
    Invariants, any package whose source changes must have its version bumped and be re-published,
    and the whole `workspace:*` dependency cascade re-bumped. Treat this as a dedicated story with
    full SPARC (spec → pseudocode → interfaces → TDD → completion gate), not a quick cleanup PR.
