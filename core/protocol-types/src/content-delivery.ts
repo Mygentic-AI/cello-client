@@ -56,6 +56,50 @@ export function buildContentParkAuthMsg(nonce: Uint8Array, recipientPubkey: Uint
   return new Uint8Array(createHash("sha256").update(msg).digest());
 }
 
+/**
+ * SEC-1 — domain separator for the per-message PARK CONTENT signature.
+ *
+ * Distinct from CONTENT_PARK_AUTH_DOMAIN: that one proves "I am the recipient" to the RELAY on
+ * pull/confirm. This one proves "I, the sender, authored this exact message for this exact session
+ * and mailbox" to the RECIPIENT — and it rides INSIDE the seal, so the relay can neither read,
+ * strip, nor forge it. The relay is in the threat model (it is handed the session_id in plaintext
+ * on every deposit and holds the recipient pubkey as its mailbox key), which is precisely why this
+ * signature is end-to-end and not a deposit-time check.
+ */
+export const PARK_CONTENT_DOMAIN = "CELLO-PARK-CONTENT-v1";
+
+/**
+ * SEC-1 — canonical to-be-signed statement for a parked content entry:
+ *
+ *   SHA-256( utf8(PARK_CONTENT_DOMAIN) || len(session_id) || session_id
+ *            || recipient_pubkey(32) || content_hash(32) )
+ *
+ * The sender signs this with its Ed25519 K_local (RFC 8032); the recipient verifies it on recovery
+ * and REFUSES the entry unless the signer is that session's counterparty (fail closed).
+ *
+ * Every field is load-bearing, and each kills one replay:
+ *  - session_id      — a signature cannot be moved to a different session.
+ *  - recipient_pubkey— a signature cannot be moved to a different mailbox.
+ *  - content_hash    — a signature cannot be made to cover different bytes.
+ * The session id is LENGTH-PREFIXED because it is the one variable-length field; without the prefix
+ * the concatenation would be ambiguous against the fixed-width fields that follow it.
+ */
+export function buildParkContentTbs(
+  sessionIdHex: string,
+  recipientPubkey: Uint8Array,
+  contentHash: Uint8Array,
+): Uint8Array {
+  const domain = new TextEncoder().encode(PARK_CONTENT_DOMAIN);
+  const sessionId = Uint8Array.from(Buffer.from(sessionIdHex, "hex"));
+  const h = createHash("sha256");
+  h.update(domain);
+  h.update(new Uint8Array([sessionId.length]));
+  h.update(sessionId);
+  h.update(recipientPubkey);
+  h.update(contentHash);
+  return new Uint8Array(h.digest());
+}
+
 // ─── 1. Delivery ACK (D-c) ──────────────────────────────────────────────────
 
 /**

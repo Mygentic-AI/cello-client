@@ -68,7 +68,8 @@ import { upgradeAbsentToRecovered, hasAbsentParticipant } from "./seal-receipt-u
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker, buildParkContentTbs } from "@cello-protocol/protocol-types";
+import { encodeParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -1693,7 +1694,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // the session's relay endpoint; we seal the content to the recipient (E2E — the relay never sees
   // plaintext, INV-3) and deposit it to that relay's store-and-forward mailbox via the standing
   // receiver node. The recipient pulls + recovers it at the witnessed sequence (R1) on next online.
-  sessionNodeManager.setContentParkHook(async ({ sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
+  sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       const reason = "standing_receiver_unavailable";
@@ -1704,10 +1705,28 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       // parked when nothing was ever deposited.
       return { ok: false, reason };
     }
+    // SEC-1: sign the entry as the SENDING agent. Without a key we cannot produce an envelope the
+    // recipient will accept, so fail LOUD rather than depositing something that will be refused on
+    // recovery (a deposit the recipient must reject is worse than no deposit — it looks delivered).
+    const senderKp = keyProviders.get(agentName);
+    if (!senderKp) {
+      const reason = "signing_key_unavailable";
+      logger.warn("content.park.deposit.failed", { agentName, sessionId, contentHash: contentHashHex, reason });
+      return { ok: false, reason };
+    }
     const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
+    const contentHashBytes = Buffer.from(contentHashHex, "hex");
+    const senderPubkey = await senderKp.getPublicKey();
+    const parkSig = await senderKp.sign(buildParkContentTbs(sessionId, recipientPubkey, contentHashBytes));
+    logger.info("content.park.signed", { agentName, sessionId, contentHash: contentHashHex });
     // DOD-MSG-4 (2b): seal the ORDERING ENVELOPE (content + the relay's signed Structure2), not bare
     // content, so the parked entry is self-ordering on recover. The relay still holds only ciphertext.
-    const ciphertext = sealToRecipient(recipientPubkey, sessionNodeManager.encodeParkEnvelope(content, structure1Cbor, structure2Cbor));
+    // SEC-1: the envelope now also carries the sender's signature — INSIDE the seal, so the relay
+    // (the adversary this defends against) can neither read, strip, nor forge it.
+    const ciphertext = sealToRecipient(
+      recipientPubkey,
+      encodeParkEnvelope({ content, structure1Cbor, structure2Cbor, senderPubkey, parkSig }),
+    );
     const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -1755,11 +1774,24 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // only at pre-IPC startup when no agent is online yet.
     const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
     if (!node) return { parked: false, error: "standing_receiver_unavailable" };
+    // SEC-1: the crash backstop must sign too — an unsigned re-park would be REFUSED on recovery,
+    // which would turn the message-loss backstop into a message-loss cause. This is why the SEC-1
+    // signature binds to the sender's own K_local and NOT to the relay's ordering record: the
+    // ordering record is not persisted in retry_queue (see below) and so cannot be reproduced here,
+    // but the KEY can — the owning agent still holds it after a crash. Hence: NO schema migration.
+    const senderKp = keyProviders.get(ownerName);
+    if (!senderKp) return { parked: false, error: "signing_key_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
+    const contentHashBytes = Buffer.from(entry.contentHashHex, "hex");
+    const senderPubkey = await senderKp.getPublicKey();
+    const parkSig = await senderKp.sign(buildParkContentTbs(entry.sessionId, recipientPubkey, contentHashBytes));
     // DOD-MSG-4 (2b): seal the envelope shape too (content only — the durable awaiting queue does not
     // persist the ordering record, so a crash-backstop re-park recovers in arrival order; the common
     // live-park path above carries the full Structure2). Keeps ONE envelope format on the recover side.
-    const ciphertext = sealToRecipient(recipientPubkey, sessionNodeManager.encodeParkEnvelope(entry.contentBlob));
+    const ciphertext = sealToRecipient(
+      recipientPubkey,
+      encodeParkEnvelope({ content: entry.contentBlob, senderPubkey, parkSig }),
+    );
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -4020,16 +4052,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
         continue;
       }
-      // DOD-MSG-4 (2b): the unsealed blob is the ordering envelope (content + the relay's signed
-      // Structure2). Extract the content; if the record is present, verify it and feed the strict-in-
-      // order gate the canonical sequence BEFORE ingest — so recovered messages order the same way a
-      // direct frame does (closes review finding #3). Old/bare-content seals decode to content alone.
-      const env = sessionNodeManager.decodeParkEnvelope(unsealed);
+      // SEC-1: authenticate THEN ingest — fused in recoverParkedEntry, which is now the ONLY way
+      // parked content can enter the transcript. It verifies the sender's signature over
+      // (session_id, recipient_pubkey, content_hash) and that the signer is this session's
+      // counterparty, and it still verifies + records the DOD-MSG-4 ordering record when present.
+      // Relay deposit is unauthenticated and the seal is anonymous, so WITHOUT this gate anyone
+      // holding the recipient's public key — the relay above all — could inject content that gets
+      // attributed to the honest counterparty and then notarized by the bilateral seal.
       const contentHashBytes = Buffer.from(e.contentHashHex, "hex");
-      if (env.structure1Cbor && env.structure2Cbor) {
-        sessionNodeManager.recordOrderingRecord(recipientAgent.name, e.sessionIdHex, env.structure1Cbor, env.structure2Cbor, contentHashBytes);
-      }
-      const ingest = await sessionNodeManager.ingestReceivedContent(recipientAgent.name, e.sessionIdHex, env.content, contentHashBytes);
+      const ingest = await sessionNodeManager.recoverParkedEntry(
+        recipientAgent.name,
+        e.sessionIdHex,
+        Buffer.from(recipientPubkey, "hex"),
+        unsealed,
+        contentHashBytes,
+      );
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
         // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it

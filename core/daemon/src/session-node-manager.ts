@@ -90,6 +90,7 @@ import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAu
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
+import { decodeParkEnvelope, authenticateParkedEntry, type ParkEnvelope } from "./park-envelope.js";
 import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -368,7 +369,7 @@ export class SessionNodeManager {
    * ContentParkClient. Best-effort.
    */
   #contentParkHook:
-    | ((args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
     | null = null;
 
   constructor(opts: {
@@ -434,7 +435,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -455,6 +456,8 @@ export class SessionNodeManager {
     if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return false;
     try {
       const result = await hook({
+        // SEC-1: the hook must sign as the SENDING agent — it needs to know who that is.
+        agentName,
         sessionId,
         recipientPubkeyHex: entry.counterpartyPubkey,
         relayPeerId: entry.relayPeerId,
@@ -3847,37 +3850,80 @@ export class SessionNodeManager {
    * structure2_cbor = [seq, sender_pubkey, content_hash, sender_signature, scan_result, prev_root].
    */
   /**
-   * DOD-MSG-4 (2b): encode the pre-seal park envelope `[1, content, structure1_cbor|null,
-   * structure2_cbor|null]`. The daemon seals THIS (not the bare content) so a parked entry carries
-   * its own signed ordering record — recover then orders it the same way the direct frame does. The
-   * relay still only ever holds the sealed ciphertext (INV-3 preserved).
+   * DOD-MSG-4 (2b) / SEC-1: decode a park envelope. Legacy/unsigned shapes still DECODE so that
+   * `recoverParkedEntry` can refuse them BY NAME (`unsigned_envelope`) — decoding is not accepting.
+   * Encoding lives in park-envelope.ts and REQUIRES a sender signature (see SEC-1); it is not
+   * exposed here, so no caller can seal an unsigned envelope through this class.
    */
-  encodeParkEnvelope(content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Uint8Array {
-    return CBOR_ENC.encode([1, content, structure1Cbor ?? null, structure2Cbor ?? null]) as Uint8Array;
+  decodeParkEnvelope(plaintext: Uint8Array): ParkEnvelope {
+    return decodeParkEnvelope(plaintext);
   }
 
   /**
-   * DOD-MSG-4 (2b): decode a park envelope produced by encodeParkEnvelope. Falls back to treating the
-   * whole plaintext as raw content (no ordering record) for entries sealed the old way (e.g. test
-   * fixtures that seal bare content) — so recover stays backward-compatible.
+   * SEC-1 — THE ONLY WAY PARKED CONTENT ENTERS THE TRANSCRIPT.
+   *
+   * Authentication and ingest are fused here on purpose. Before SEC-1 the recover loop in daemon.ts
+   * did `decode → (maybe verify ordering) → ingest`, where the verify step was OPTIONAL (skipped
+   * entirely when the attacker simply omitted the ordering record) and could not reject anything
+   * even when it ran — it gated ORDERING, not INGEST. Splitting the check from the write is what
+   * made the downgrade possible, so they no longer live apart: a caller cannot ingest parked content
+   * without passing the signature gate, because there is no other entry point.
+   *
+   * FAILS CLOSED. No signature / bad signature / signer is not this session's counterparty / no
+   * session at all → REFUSED, nothing is appended, nothing is written, and the caller MUST NOT
+   * confirm-delete the entry from the relay (a forgery must not be able to evict itself, and a
+   * genuine bug must not silently eat mail).
    */
-  decodeParkEnvelope(plaintext: Uint8Array): { content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array } {
-    try {
-      const arr = decode(plaintext) as unknown[];
-      // Discriminator (review #2): a 4-element array tagged with version 1 + a byte-string content.
-      // The content-hash cross-check in ingestReceivedContent is the real safety net, but narrowing
-      // to length 4 makes a bare-content false-positive astronomically less likely still.
-      if (Array.isArray(arr) && arr.length === 4 && arr[0] === 1 && arr[1] instanceof Uint8Array) {
-        return {
-          content: arr[1],
-          structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
-          structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
-        };
-      }
-    } catch {
-      /* not an envelope — fall through to raw */
+  async recoverParkedEntry(
+    agentName: string,
+    sessionId: string,
+    recipientPubkey: Uint8Array,
+    unsealed: Uint8Array,
+    contentHash: Uint8Array,
+    correlationId?: string,
+  ): Promise<
+    | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
+    | { ok: false; reason: string }
+  > {
+    const env = decodeParkEnvelope(unsealed);
+    const verdict = authenticateParkedEntry({
+      env,
+      sessionIdHex: sessionId,
+      recipientPubkey,
+      contentHash,
+      counterpartyPubkeyHex: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
+    });
+
+    if (!verdict.ok) {
+      // SEC-1: loud, and specific about WHICH gate refused — a silent drop here would look
+      // identical to "no mail", which is how an injection attempt would go unnoticed.
+      this.#logger.warn("content.recover.unauthenticated", {
+        agentName,
+        sessionId,
+        contentHash: Buffer.from(contentHash).toString("hex"),
+        reason: verdict.reason,
+        envelopeVersion: env.version,
+        correlationId,
+      });
+      return { ok: false, reason: verdict.reason };
     }
-    return { content: plaintext };
+
+    // Authenticated. The ordering record (when present) is still verified independently by
+    // #recordFrameOrdering — it answers a different question (WHERE this message sits in the
+    // canonical sequence, per the relay) and is still best-effort: a bad record must not block a
+    // message whose AUTHORSHIP we have now proven.
+    if (env.structure1Cbor && env.structure2Cbor) {
+      this.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId);
+    }
+
+    this.#logger.info("content.recover.verified", {
+      agentName,
+      sessionId,
+      contentHash: Buffer.from(contentHash).toString("hex"),
+      correlationId,
+    });
+
+    return await this.ingestReceivedContent(agentName, sessionId, env.content, contentHash, correlationId);
   }
 
   /**

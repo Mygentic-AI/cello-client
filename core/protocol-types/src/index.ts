@@ -183,6 +183,8 @@ export {
   CONTENT_PARK_PROTOCOL_ID,
   CONTENT_PARK_AUTH_DOMAIN,
   buildContentParkAuthMsg,
+  PARK_CONTENT_DOMAIN,
+  buildParkContentTbs,
   isContentDeliveryAck,
   isContentResendRequest,
   isContentParkDeposit,
