@@ -143,10 +143,27 @@ is additive to work already landed, not duplicating it:
 
 ## Recommended Next Steps
 
-1. **Execute DOD-LEGACY-MCP-1** (already named in `9352b76`): delete
-   `core/adapter-claude-code/src/server.ts`, `core/adapter-claude-code/src/notifications.ts`,
-   `core/client/src/mcp-server.ts`, and their exports from both packages' `index.ts`. This is the
-   single change that collapses the rest of the dead tree.
+1. ~~**Execute DOD-LEGACY-MCP-1**~~ — **DONE 2026-07-12.** Deleted `adapter/server.ts`,
+   `adapter/notifications.ts`, `client/mcp-server.ts` and both package-root exports; verified against
+   the real tarball (`npm pack` → extract → grep) that connect's `dist/` no longer ships them or
+   registers any renamed-away tool.
+
+   **Two corrections to this step as it was written above** — recorded because both were traps:
+   - It said to delete `notifications.ts` outright. That file exported **two** functions, and
+     `pushChannelNotification` is a **separate published export** this report never mentions. Deleting
+     the file "as instructed" would have silently removed a public export nobody had decided to remove.
+     (It *was* correct to delete — the live shim inlines its own `buildChannelParams` call and never
+     imports the module — but that had to be an explicit decision, not a side effect.)
+   - It framed the work as "delete 3 files + exports." Those three files were the **test harness for
+     130 cases across 12 suites**, several of which MIXED dead-code assertions with live-code ones in
+     the same file. Deleting by file would have destroyed real coverage: `FileKeyProvider` 0o600 key
+     persistence, live `client.ts` send/receive, the `DOD-DIR-FAILCLOSED-1` cases, and the sole consumer
+     of `rfc6962-external-verify.json` — CELLO's only external RFC 6962 conformance vector. Every case
+     was triaged by subject-under-test: 95 deleted, 25 kept, 10 tightened.
+
+   The scope also crossed repos, which this report does not anticipate: `trustless-cello`'s
+   `packages/e2e-tests/src/session-fixture.ts` imported `createMcpSessionServer` and 15 e2e cases drove
+   it. 12 were real protocol coverage and were re-pointed at the live client; 3 were duplicates.
 2. Once (1) lands, remove the `@cello-protocol/client` dependency from `core/adapter-claude-code/package.json`
    and re-run reachability — the entire `core/client/src/*` list above should go to zero importers.
 3. Confirm no consumer *outside* this repo depends on `@cello-protocol/client` directly before
