@@ -521,7 +521,20 @@ export class RetryQueue {
       } catch (err: unknown) {
         result = { parked: false, error: err instanceof Error ? err.message : String(err) };
       }
-      if (!result.parked) continue; // keep for next reconnect / startup flush (AC-019)
+      if (!result.parked) {
+        // Review M3: `result.error` used to be DISCARDED here, so every failure branch of the park
+        // target (owning_agent_not_found, no_persisted_relay_endpoint, no_counterparty,
+        // standing_receiver_unavailable, and SEC-1's new signing_key_unavailable) failed in total
+        // silence — the only trace was `parkedCount: 0`, a number with no reason. The entry is still
+        // KEPT for the next flush (AC-019); it just no longer fails quietly.
+        this.#logger.warn("content.park.failed", {
+          agentId,
+          sessionId,
+          contentHash: entry.contentHashHex,
+          error: result.error,
+        });
+        continue; // keep for next reconnect / startup flush (AC-019)
+      }
       const idx = q.indexOf(entry);
       if (idx !== -1) q.splice(idx, 1);
       try {

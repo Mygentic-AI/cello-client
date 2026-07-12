@@ -61,15 +61,15 @@ import { DaemonRegistrationContext } from "./registration-context.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
-import { verify as ed25519Verify, sealToRecipient, generateKLocalSeed, InMemoryKeyProvider, hash as cryptoHash } from "@cello-protocol/crypto";
+import { verify as ed25519Verify, generateKLocalSeed, InMemoryKeyProvider, hash as cryptoHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { attemptSealUpgrade as attemptSealUpgradeImpl, verifyUpgradeConfirmedCert } from "./seal-upgrade.js";
 import { upgradeAbsentToRecovered, hasAbsentParticipant } from "./seal-receipt-upgrade.js";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
-import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker, buildParkContentTbs } from "@cello-protocol/protocol-types";
-import { encodeParkEnvelope } from "./park-envelope.js";
+import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
+import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -1716,17 +1716,21 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     }
     const recipientPubkey = Buffer.from(recipientPubkeyHex, "hex");
     const contentHashBytes = Buffer.from(contentHashHex, "hex");
-    const senderPubkey = await senderKp.getPublicKey();
-    const parkSig = await senderKp.sign(buildParkContentTbs(sessionId, recipientPubkey, contentHashBytes));
     logger.info("content.park.signed", { agentName, sessionId, contentHash: contentHashHex });
     // DOD-MSG-4 (2b): seal the ORDERING ENVELOPE (content + the relay's signed Structure2), not bare
     // content, so the parked entry is self-ordering on recover. The relay still holds only ciphertext.
-    // SEC-1: the envelope now also carries the sender's signature — INSIDE the seal, so the relay
-    // (the adversary this defends against) can neither read, strip, nor forge it.
-    const ciphertext = sealToRecipient(
+    // SEC-1: sealParkEnvelope is the SOLE producer — it signs (sender's K_local, over the
+    // session/recipient/content binding) and seals in one place, so the two park sites cannot drift
+    // apart on what gets signed.
+    const ciphertext = await sealParkEnvelope({
+      signer: senderKp,
+      sessionIdHex: sessionId,
       recipientPubkey,
-      encodeParkEnvelope({ content, structure1Cbor, structure2Cbor, senderPubkey, parkSig }),
-    );
+      contentHash: contentHashBytes,
+      content,
+      structure1Cbor,
+      structure2Cbor,
+    });
     const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -1783,15 +1787,19 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     if (!senderKp) return { parked: false, error: "signing_key_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
     const contentHashBytes = Buffer.from(entry.contentHashHex, "hex");
-    const senderPubkey = await senderKp.getPublicKey();
-    const parkSig = await senderKp.sign(buildParkContentTbs(entry.sessionId, recipientPubkey, contentHashBytes));
+    logger.info("content.park.signed", { agentName: ownerName, sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
     // DOD-MSG-4 (2b): seal the envelope shape too (content only — the durable awaiting queue does not
     // persist the ordering record, so a crash-backstop re-park recovers in arrival order; the common
     // live-park path above carries the full Structure2). Keeps ONE envelope format on the recover side.
-    const ciphertext = sealToRecipient(
+    // SEC-1: same sole producer as the live hook — the backstop signs from the persisted
+    // (sessionId, recipient, contentHash), which is why it survives a crash with NO schema migration.
+    const ciphertext = await sealParkEnvelope({
+      signer: senderKp,
+      sessionIdHex: entry.sessionId,
       recipientPubkey,
-      encodeParkEnvelope({ content: entry.contentBlob, senderPubkey, parkSig }),
-    );
+      contentHash: contentHashBytes,
+      content: entry.contentBlob,
+    });
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {
       recipientPubkey,
@@ -4036,7 +4044,10 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     recipientAgent: { name: string; pubkey?: string },
     relayPeerId: string,
     relayAddrs: string[],
-  ): Promise<{ ok: true; recovered: number; pulled: number } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; recovered: number; pulled: number; refused: number; refusals: Array<{ contentHash: string; sessionId: string; reason: string }> }
+    | { ok: false; reason: string }
+  > {
     const kp = keyProviders.get(recipientAgent.name);
     if (!kp) return { ok: false, reason: "signing_key_unavailable" };
     if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal" };
@@ -4046,6 +4057,13 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
     let recovered = 0;
+    // SEC-1 / review M2: a REFUSED entry must not vanish behind `ok:true`. Report it — an operator
+    // seeing {ok:true, pulled:3, recovered:0} would otherwise have three messages evaporate with the
+    // only explanation buried in the daemon log. This is both the injection signal and, given the
+    // deliberate no-tolerant-window rollout, the lagging-peer signal.
+    const refusals: Array<{ contentHash: string; sessionId: string; reason: string }> = [];
+    // AC7: one correlationId per recover flow, threaded through every event it emits.
+    const correlationId = randomUUID();
     for (const e of entries) {
       const unsealed = await kp.openContentSeal(e.ciphertext);
       if (!unsealed) {
@@ -4066,6 +4084,7 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
         Buffer.from(recipientPubkey, "hex"),
         unsealed,
         contentHashBytes,
+        correlationId,
       );
       if (ingest.ok && ingest.held) {
         // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
@@ -4098,10 +4117,14 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
           logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
         }
       } else {
-        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason });
+        // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
+        // NOT confirm-deleted — a forgery must not be able to evict itself from the mailbox, and a
+        // genuine v1-peer message must not be destroyed by our refusing it.
+        refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
+        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
       }
     }
-    return { ok: true, recovered, pulled: entries.length };
+    return { ok: true, recovered, pulled: entries.length, refused: refusals.length, refusals };
   }
 
   // DOD-MSG-4 (auto-recover-on-reconnect): when an agent comes online, drain its parked mailbox from

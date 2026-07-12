@@ -90,7 +90,7 @@ import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAu
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
-import { decodeParkEnvelope, authenticateParkedEntry, type ParkEnvelope } from "./park-envelope.js";
+import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -102,6 +102,9 @@ import {
 } from "@cello-protocol/gateway";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
+
+/** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
+const MAX_REFUSED_PARKED_ENTRIES = 512;
 
 // M8C-ABUSE-1 + DOD-TIER-2: persistence bounds. Formerly a binary "known contacts exempt entirely,
 // everyone else 3 sessions / 25 MB"; now TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-
@@ -368,6 +371,13 @@ export class SessionNodeManager {
    * (direct-fail or TTF expiry). The daemon's hook seals (sealToRecipient) + deposits via
    * ContentParkClient. Best-effort.
    */
+  /**
+   * SEC-1 / review M4: parked entries already refused by the authentication gate, keyed
+   * `${agent}:${session}:${contentHash}` → the refusal reason. Bounded (see
+   * #rememberRefusedParkedEntry) because its keys come from a REMOTE mailbox.
+   */
+  readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
+
   #contentParkHook:
     | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
     | null = null;
@@ -3885,6 +3895,28 @@ export class SessionNodeManager {
     | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
     | { ok: false; reason: string }
   > {
+    const contentHashHex = Buffer.from(contentHash).toString("hex");
+
+    // Review M4: a refused entry is deliberately NOT confirm-deleted (a forgery must not be able to
+    // evict itself), which means an adversary could otherwise make us unseal + Ed25519-verify the
+    // same forged entries on EVERY reconnect, forever — turning the mailbox into an amplification
+    // vector against our own recover path. Remember what we already refused and skip the crypto on
+    // re-pull. Still never confirmed, so nothing is destroyed. In-memory and BOUNDED: the cost of
+    // forgetting across a restart is one more verify, which is exactly the pre-existing behavior.
+    const refusalKey = `${this.#k(agentName, sessionId)}:${contentHashHex}`;
+    const remembered = this.#refusedParkedEntries.get(refusalKey);
+    if (remembered) {
+      this.#logger.warn("content.recover.unauthenticated", {
+        agentName,
+        sessionId,
+        contentHash: contentHashHex,
+        reason: remembered,
+        repeat: true,
+        correlationId,
+      });
+      return { ok: false, reason: remembered };
+    }
+
     const env = decodeParkEnvelope(unsealed);
     const verdict = authenticateParkedEntry({
       env,
@@ -3897,10 +3929,11 @@ export class SessionNodeManager {
     if (!verdict.ok) {
       // SEC-1: loud, and specific about WHICH gate refused — a silent drop here would look
       // identical to "no mail", which is how an injection attempt would go unnoticed.
+      this.#rememberRefusedParkedEntry(refusalKey, verdict.reason);
       this.#logger.warn("content.recover.unauthenticated", {
         agentName,
         sessionId,
-        contentHash: Buffer.from(contentHash).toString("hex"),
+        contentHash: contentHashHex,
         reason: verdict.reason,
         envelopeVersion: env.version,
         correlationId,
@@ -3919,11 +3952,26 @@ export class SessionNodeManager {
     this.#logger.info("content.recover.verified", {
       agentName,
       sessionId,
-      contentHash: Buffer.from(contentHash).toString("hex"),
+      contentHash: contentHashHex,
       correlationId,
     });
 
     return await this.ingestReceivedContent(agentName, sessionId, env.content, contentHash, correlationId);
+  }
+
+  /**
+   * Review M4: bounded memo of parked entries we have already refused, so a mailbox stuffed with
+   * forgeries cannot force an unbounded unseal+verify on every reconnect. FIFO-capped — the cap
+   * matters more than the retention: forgetting an entry only costs one extra verification, whereas
+   * an unbounded map would be a memory leak fed by a remote party (the exact class the DOD-MSG-4
+   * review already caught once in the offered-moniker map).
+   */
+  #rememberRefusedParkedEntry(key: string, reason: ParkAuthFailure): void {
+    if (this.#refusedParkedEntries.size >= MAX_REFUSED_PARKED_ENTRIES) {
+      const oldest = this.#refusedParkedEntries.keys().next();
+      if (!oldest.done) this.#refusedParkedEntries.delete(oldest.value);
+    }
+    this.#refusedParkedEntries.set(key, reason);
   }
 
   /**
@@ -3977,8 +4025,11 @@ export class SessionNodeManager {
       // key. FAIL CLOSED (review L) — if the counterparty pubkey is unknown we cannot prove the signer,
       // so we do NOT trust the framed ordering record (fall back to the witness stream / arrival). The
       // "B does not trust the counterparty for ordering" invariant is non-negotiable; never fail open.
+      // Review M1: compare BYTES, not hex strings — `counterparty_pubkey` is stored verbatim from the
+      // IPC param and is never case-normalized, so a string compare would fail for a mixed-case
+      // pubkey and silently strip the canonical ordering from every message in that session.
       const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-      if (!counterparty || Buffer.from(s1Pubkey).toString("hex") !== counterparty) {
+      if (!pubkeyMatchesHex(s1Pubkey, counterparty)) {
         this.#logger.warn("session.content.ordering.wrong_signer", {
           sessionId,
           reason: counterparty ? "signer_not_counterparty" : "counterparty_unknown",

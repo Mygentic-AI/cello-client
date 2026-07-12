@@ -25,9 +25,37 @@
  *
  * Crypto: Ed25519 (RFC 8032), SHA-256 (FIPS 180-4).
  */
+import { timingSafeEqual } from "node:crypto";
 import { encode as cborEncode, decode as cborDecode } from "cbor-x";
-import { verify } from "@cello-protocol/crypto";
+import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
+
+/**
+ * Compare an identity key (raw bytes) against a stored hex pubkey — on BYTES, never on the hex
+ * strings.
+ *
+ * Review M1: `sessions.counterparty_pubkey` is persisted VERBATIM from the IPC `target_pubkey`
+ * string with no normalization, so an uppercase or mixed-case pubkey is a perfectly functional
+ * session (Buffer.from(hex) is case-insensitive, so dialing, sealing and the direct content path all
+ * work) — but a `toString("hex") !== stored` comparison would then refuse EVERY parked recovery for
+ * that session as `signer_not_counterparty`, i.e. permanent store-and-forward mail loss reported as
+ * an attack. Comparing bytes makes the check independent of how the hex was cased on the way in.
+ *
+ * Length-guarded because timingSafeEqual throws on a length mismatch, and the input is
+ * attacker-controlled (a forged envelope can carry a short/long pubkey).
+ */
+export function pubkeyMatchesHex(pubkey: Uint8Array, storedHex: string | undefined): boolean {
+  if (!storedHex) return false;
+  let stored: Buffer;
+  try {
+    stored = Buffer.from(storedHex, "hex");
+  } catch {
+    return false;
+  }
+  // Buffer.from ignores trailing garbage rather than throwing, so a length check is the real guard.
+  if (stored.length === 0 || stored.length !== pubkey.length) return false;
+  return timingSafeEqual(Buffer.from(pubkey), stored);
+}
 
 /** Current envelope version. v1 (unsigned) is decodable but NEVER acceptable — see authenticate(). */
 export const PARK_ENVELOPE_VERSION = 2;
@@ -73,6 +101,43 @@ export function encodeParkEnvelope(args: {
     args.senderPubkey,
     args.parkSig,
   ]) as Uint8Array;
+}
+
+/**
+ * SEC-1 — THE ONLY PRODUCER. Sign the entry as the sending agent, wrap it in a v2 envelope, and seal
+ * it to the recipient. Both park sites (the live hook and the crash backstop) call THIS, so the
+ * to-be-signed arguments are constructed in exactly one place.
+ *
+ * Review (hollow-test finding): while the two call sites each built their own signature, a producer
+ * that signed the WRONG TBS arguments — e.g. its own pubkey where the recipient's belongs — would
+ * emit envelopes no recipient could ever accept, and every consumer-side test would still pass. The
+ * bug would only surface as mail that silently never arrives. One producer + a round-trip test
+ * against the real consumer removes that whole class: if this function signs the wrong statement,
+ * `authenticateParkedEntry` rejects its output and the test goes red.
+ */
+export async function sealParkEnvelope(args: {
+  signer: KeyProvider;
+  sessionIdHex: string;
+  recipientPubkey: Uint8Array;
+  contentHash: Uint8Array;
+  content: Uint8Array;
+  structure1Cbor?: Uint8Array;
+  structure2Cbor?: Uint8Array;
+}): Promise<Uint8Array> {
+  const senderPubkey = await args.signer.getPublicKey();
+  const parkSig = await args.signer.sign(
+    buildParkContentTbs(args.sessionIdHex, args.recipientPubkey, args.contentHash),
+  );
+  const envelope = encodeParkEnvelope({
+    content: args.content,
+    structure1Cbor: args.structure1Cbor,
+    structure2Cbor: args.structure2Cbor,
+    senderPubkey,
+    parkSig,
+  });
+  // The signature rides INSIDE the seal — the relay (the adversary) never sees it, so it can neither
+  // strip nor forge it. INV-3 is untouched: the relay still holds only ciphertext.
+  return sealToRecipient(args.recipientPubkey, envelope);
 }
 
 /**
@@ -145,8 +210,10 @@ export function authenticateParkedEntry(args: {
   }
 
   // 4. The signer MUST be this session's counterparty. A cryptographically valid signature by any
-  //    other key is still a forgery of THIS conversation.
-  if (Buffer.from(env.senderPubkey).toString("hex") !== counterpartyPubkeyHex) {
+  //    other key is still a forgery of THIS conversation. Compared on BYTES (review M1) — the stored
+  //    hex is un-normalized, so a string compare would turn a mixed-case pubkey into permanent
+  //    mail loss that looks exactly like an attack in the log.
+  if (!pubkeyMatchesHex(env.senderPubkey, counterpartyPubkeyHex)) {
     return { ok: false, reason: "signer_not_counterparty" };
   }
 

@@ -34,7 +34,7 @@ import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
-import { encodeParkEnvelope } from "../park-envelope.js";
+import { encodeParkEnvelope, sealParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -298,6 +298,111 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
 
     expect(res.ok).toBe(true);
     expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+  });
+
+  // ─── AC1 — THE PRODUCER, round-tripped against the REAL consumer ─────────────────────────────
+  // Review (hollow-test finding): every test above builds its own envelope, so a PRODUCER that signed
+  // the wrong to-be-signed arguments — e.g. its own pubkey where the recipient's belongs — would ship
+  // envelopes no recipient could ever accept, and all of them would still pass. Mail would simply
+  // stop arriving. These drive `sealParkEnvelope`, the SAME function both daemon park sites call,
+  // through the real seal and into the real gate. If the producer signs the wrong statement, this
+  // goes red.
+  it("AC1: sealParkEnvelope (the production producer, live-park shape) -> openContentSeal -> recoverParkedEntry is ACCEPTED", async () => {
+    const mgr = await makeSession("ac1-producer");
+    const content = new TextEncoder().encode("produced by the real park path");
+    const hash = msgLeafHash(content);
+    const s1 = new Uint8Array([0x01, 0x02, 0x03]);
+    const s2 = new Uint8Array([0x04, 0x05, 0x06]);
+
+    // Exactly what daemon.ts's content-park hook does — the counterparty is the SENDER here.
+    const ciphertext = await sealParkEnvelope({
+      signer: counterparty,
+      sessionIdHex: sid,
+      recipientPubkey: victimPub,
+      contentHash: hash,
+      content,
+      structure1Cbor: s1,
+      structure2Cbor: s2,
+    });
+
+    // …and exactly what the recover path does: unseal with the RECIPIENT's key, then gate it.
+    const unsealed = await victim.openContentSeal!(ciphertext);
+    expect(unsealed).not.toBeNull();
+
+    const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, unsealed!, hash);
+
+    expect(res.ok).toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+  });
+
+  it("AC1/AC5: the CRASH-BACKSTOP producer shape (no ordering record — retry_queue never persists one) round-trips and is ACCEPTED", async () => {
+    const mgr = await makeSession("ac5-producer");
+    const content = new TextEncoder().encode("re-parked by startupParkFn after a crash");
+    const hash = msgLeafHash(content);
+
+    // startupParkFn signs from ONLY what retry_queue persists: (sessionId, recipient, contentHash,
+    // contentBlob) + the owning agent's key. No Structure1/2 — that is the whole point of the §4
+    // falsification: had we required the ordering record, this message would be REFUSED and the
+    // crash backstop would become a message-loss CAUSE.
+    const ciphertext = await sealParkEnvelope({
+      signer: counterparty,
+      sessionIdHex: sid,
+      recipientPubkey: victimPub,
+      contentHash: hash,
+      content,
+    });
+
+    const unsealed = await victim.openContentSeal!(ciphertext);
+    const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, unsealed!, hash);
+
+    expect(res.ok).toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+  });
+
+  // ─── Review M1 — the signer check compares BYTES, not hex strings ────────────────────────────
+  it("M1: a MIXED-CASE stored counterparty pubkey still accepts genuine parked mail (byte compare, not string compare)", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "m1-case.db"));
+    await seedAgents(mgr.getDb(), [AGENT]);
+    // `sessions.counterparty_pubkey` is persisted VERBATIM from the IPC param — no normalization —
+    // so an uppercase pubkey is a perfectly functional session. A hex-STRING compare in the gate
+    // would refuse every parked message for it as `signer_not_counterparty`: permanent mail loss,
+    // logged as an attack.
+    await mgr.createSessionNode(sid, AGENT, counterpartyHex.toUpperCase(), "cp-peer", "corr-1");
+
+    const content = new TextEncoder().encode("genuine mail into an uppercase-keyed session");
+    const hash = msgLeafHash(content);
+    const ciphertext = await sealParkEnvelope({
+      signer: counterparty,
+      sessionIdHex: sid,
+      recipientPubkey: victimPub,
+      contentHash: hash,
+      content,
+    });
+    const unsealed = await victim.openContentSeal!(ciphertext);
+
+    const res = await mgr.recoverParkedEntry(AGENT, sid, victimPub, unsealed!, hash);
+
+    expect(res.ok).toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+  });
+
+  // ─── Review M4 — a refused entry is remembered, not re-verified forever ──────────────────────
+  it("M4: a repeat forgery is refused from the memo (not re-unsealed/re-verified on every reconnect)", async () => {
+    const mgr = await makeSession("m4-memo");
+    const forged = new TextEncoder().encode("the same forgery, re-pulled every reconnect");
+    const forgedHash = msgLeafHash(forged);
+    const adversaryPlaintext = cborEncode([1, forged, null, null]) as Uint8Array;
+
+    const first = await mgr.recoverParkedEntry(AGENT, sid, victimPub, adversaryPlaintext, forgedHash);
+    const second = await mgr.recoverParkedEntry(AGENT, sid, victimPub, adversaryPlaintext, forgedHash);
+
+    expect(first.ok).toBe(false);
+    expect(second.ok).toBe(false);
+    // Refused BOTH times (never silently accepted on the second look), and the second refusal is
+    // marked as a repeat — i.e. it short-circuited instead of re-doing the crypto.
+    expect(events.filter((e) => e.event === "content.recover.unauthenticated").length).toBe(2);
+    expect(events.some((e) => e.event === "content.recover.unauthenticated" && e.context["repeat"] === true)).toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(0);
   });
 
   // ─── AC2 — fail closed when the counterparty is unknowable ───────────────────────────────────
