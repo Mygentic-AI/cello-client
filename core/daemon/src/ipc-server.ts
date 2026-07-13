@@ -29,7 +29,7 @@
  */
 
 import { createServer, type Server, type Socket } from "node:net";
-import { chmod, unlink } from "node:fs/promises";
+import { chmod, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 
@@ -69,6 +69,36 @@ export function createIpcServer(
   let server: Server | null = null;
   const connections = new Map<string, ActiveConnection>();
   let stopping = false;
+
+  // DOD-DAEMON-CLEANUP-1 (AC2): the identity — not the path — of the socket THIS server created.
+  // dev+ino is the only thing that survives another daemon rebinding the same path.
+  let createdSocket: { dev: number; ino: number } | null = null;
+
+  /**
+   * What is sitting at socketPath right now?
+   *   "ours"    — the socket this server created; we may remove it.
+   *   "gone"    — nothing there; nothing to do.
+   *   "foreign" — a DIFFERENT socket. Another daemon rebound the path. Hands off.
+   *
+   * The distinction is by inode, not by path. A path tells you a file exists; only the inode tells
+   * you it is the same file you made.
+   */
+  async function socketOwnership(): Promise<"ours" | "gone" | "foreign"> {
+    let current: { dev: number; ino: number };
+    try {
+      current = await stat(socketPath);
+    } catch {
+      // Nothing at the path (ENOENT is the only realistic case) — there is nothing to own.
+      return "gone";
+    }
+    if (createdSocket === null) {
+      // Unreachable: stop() returns early unless the server is listening, and a listening server has
+      // been through start(), which sets this or throws. Say so rather than inventing an answer —
+      // guessing here is what the whole unit is about.
+      throw new Error("ipc server: socket identity unknown — stop() ran without a completed start()");
+    }
+    return current.dev === createdSocket.dev && current.ino === createdSocket.ino ? "ours" : "foreign";
+  }
   let disconnectHandler: IpcDisconnectHandler | null = null;
 
   function handleConnection(socket: Socket): void {
@@ -230,6 +260,19 @@ export function createIpcServer(
 
       // SI-001: Set socket permissions to owner-only
       await chmod(socketPath, 0o600);
+
+      // DOD-DAEMON-CLEANUP-1 (AC2): remember WHICH socket we created, by identity — not merely that
+      // a file exists at this path. If another daemon later rebinds the path, its listen() replaces
+      // the file with a different inode, and stop() must be able to tell the two apart so it does not
+      // unlink a socket it does not own.
+      //
+      // No fallback here, deliberately. Swallowing this stat and leaving the identity unknown would
+      // make stop() treat our OWN socket as foreign: it would then never close the server, so the
+      // daemon would go on accepting IPC connections into a torn-down handler stack after stop()
+      // returned, and would leave its socket behind. A daemon that cannot identify the socket it just
+      // bound has no business coming up — and startup failure is already handled cleanly.
+      const created = await stat(socketPath);
+      createdSocket = { dev: created.dev, ino: created.ino };
     },
 
     async stop(): Promise<void> {
@@ -267,19 +310,44 @@ export function createIpcServer(
         }
       }
 
-      // Close server and remove socket
-      await new Promise<void>((resolve) => {
-        server!.close(() => resolve());
-      });
+      // DOD-DAEMON-CLEANUP-1 (AC2): decide ownership BEFORE closing, because close() is itself a
+      // blind unlink.
+      //
+      // Node's server.close() removes the unix socket path it bound — by PATH, with no check on what
+      // is actually there now. If another daemon has since rebound this path, closing our server
+      // deletes THEIR socket, and they are left alive, serving, and unreachable. Guarding our own
+      // explicit unlink is not enough; the close would already have done the damage.
+      const ownership = await socketOwnership();
 
-      try {
-        await unlink(socketPath);
-      } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          logger.warn("daemon.ipc.socket.unlink.failed", {
-            socketPath,
-            error: err instanceof Error ? err.message : String(err),
-          });
+      if (ownership === "foreign") {
+        // We must not close: that would unlink the healthy daemon's socket out from under it. Drop
+        // the handle from the event loop instead and let process exit reclaim the fd. The listening
+        // socket is already inert — its path was taken from it, so nothing can reach it. Leaking an
+        // unreachable fd for the last moments of a dying process is a trade we make happily against
+        // disarming a live peer.
+        logger.info("daemon.ipc.socket.not_ours", { socketPath, ourIno: createdSocket?.ino ?? null });
+        server.unref();
+      } else {
+        await new Promise<void>((resolve) => {
+          server!.close(() => resolve());
+        });
+
+        // close() normally unlinks the path for us. Re-check rather than assume: only remove the file
+        // if it is STILL the socket we created. Between the close and here, the singleton lock is
+        // still held (the daemon releases it after this returns), so no successor can have bound the
+        // path — but the cost of re-checking is one stat, and the cost of being wrong is the bug this
+        // whole unit exists to kill.
+        if (await socketOwnership() === "ours") {
+          try {
+            await unlink(socketPath);
+          } catch (err: unknown) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+              logger.warn("daemon.ipc.socket.unlink.failed", {
+                socketPath,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
         }
       }
 

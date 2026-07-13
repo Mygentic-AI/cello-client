@@ -28,7 +28,11 @@ import {
   connectToDaemon,
   readLock,
   removeLock,
-  isProcessAlive,
+  // isProcessAlive is deliberately NOT imported any more. The CLI used to ask "is that pid alive?" to
+  // decide whether a daemon existed; a pid can be dead, or reused by an unrelated process, and the
+  // answer was wrong in both directions. The kernel's lock is the only thing that knows.
+  probeSingletonLock,
+  SINGLETON_LOCK_FILENAME,
   type DaemonStatusResponse,
   type IpcClient,
   type Logger,
@@ -114,33 +118,37 @@ const LOGOUT_WAIT_TIMEOUT_MS = 5_000;
 const LOGOUT_WAIT_POLL_MS = 50;
 
 /**
- * DOD-LOGOUT-WAIT-1: is the daemon behind `lock` actually GONE — judged by the same inputs
- * connectOrStart consults, so a completed logout GUARANTEES the next login starts fresh:
- *  - pid dead → login treats any remaining lock as stale and starts fresh; or
- *  - lock removed (the daemon's final shutdown cleanup) AND the socket refusing connections.
- * The pid check alone is not sufficient in-process (tests share the CLI's pid), and the lock
- * check alone is not sufficient for a crash that never cleaned up — together they cover both.
+ * DOD-LOGOUT-WAIT-1: is the daemon actually GONE — judged by the same evidence `connectOrStart`
+ * consults, so a completed logout GUARANTEES the next login starts fresh.
+ *
+ * Two facts, both required, neither of them a file:
+ *  1. nothing answers on the socket, and
+ *  2. no process holds the singleton lock.
+ *
+ * (1) alone is not enough: a daemon wedged mid-shutdown may have closed its IPC server while still
+ * holding the DB. (2) alone is not enough either, because a daemon from BEFORE this change holds no
+ * singleton lock at all — during the upgrade window "free" says nothing about whether it is alive, and
+ * only the socket can tell us. Together they are exactly the conditions under which the next daemon
+ * can safely start.
+ *
+ * The old version keyed off `isProcessAlive(lock.pid)` and the lock FILE. Both are unreliable in ways
+ * this story documents at length: a pid can be reused, and a lock file can be deleted by anyone.
  */
-async function daemonGone(lockFilePath: string, lock: { pid: number; socketPath: string }): Promise<boolean> {
-  if (!isProcessAlive(lock.pid)) return true;
-  const lockNow = await readLock(lockFilePath);
-  if (lockNow && lockNow.pid === lock.pid) return false; // daemon hasn't finished its cleanup
-  // Review F5: a lock re-acquired by a DIFFERENT pid means a new daemon already started — which
-  // proves the old daemon's cleanup completed (its lock had to be gone for login to spawn). The
-  // socket now belongs to the new daemon; probing it would wrongly report the OLD one alive.
-  if (lockNow && lockNow.pid !== lock.pid) return true;
+async function daemonGone(celloDir: string, socketPath: string, logger: Logger): Promise<boolean> {
   try {
     // Review F4: connectToDaemon has no connect timeout of its own — bound the probe so a
     // pathological hang cannot stall the poll loop past its deadline. On the expected path the
-    // lock is already gone, so this fails fast (ENOENT/ECONNREFUSED).
+    // socket is already gone, so this fails fast (ENOENT/ECONNREFUSED).
     const probe = await Promise.race([
-      connectToDaemon(lock.socketPath),
+      connectToDaemon(socketPath),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe_timeout")), 500)),
     ]);
     probe.close();
-    return false; // something still answers on the socket
+    return false; // something still answers — the daemon is up
   } catch {
-    return true;
+    // Nothing answers. Now make sure the process is really gone and not merely deaf: a daemon that
+    // still holds the kernel lock is still alive, and the next login would refuse to start beside it.
+    return probeSingletonLock(celloDir, logger) === "free";
   }
 }
 
@@ -152,34 +160,79 @@ export async function logout(
   waitOpts?: { timeoutMs?: number; pollMs?: number },
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
-  const lock = await readLock(lockFilePath);
   const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
   const timeoutMs = waitOpts?.timeoutMs ?? LOGOUT_WAIT_TIMEOUT_MS;
   const pollMs = waitOpts?.pollMs ?? LOGOUT_WAIT_POLL_MS;
 
-  if (!lock) {
-    return { exitCode: 0, output: "No daemon running." };
-  }
+  // The socket path is DETERMINISTIC. `daemon.lock`'s copy of it is metadata, and metadata is exactly
+  // what this unit learned not to trust.
+  const socketPath = join(celloDir, "daemon.sock");
+  const lock = await readLock(lockFilePath);
 
-  // DOD-LOGOUT-WAIT-1: a lock whose pid is dead is not a running daemon — say so (exit 0) and
-  // clean the stale lock up so the next login doesn't have to. Review F3: only CLAIM the removal
-  // when it actually happened — removeLock swallows non-ENOENT errors into a (here discarded)
-  // warn, and printing "Removed" for a lock still on disk would be this unit's own lie in
-  // miniature.
-  if (!isProcessAlive(lock.pid)) {
+  // DOD-SINGLE-DAEMON-1 (AC4) — the lock file does not get to decide whether a daemon exists.
+  //
+  // This used to open with `if (!lock) return "No daemon running."`. That is a KILL SWITCH REPORTING
+  // SUCCESS WITHOUT DOING ANYTHING, and the state that triggers it is the one DOD-DAEMON-CLEANUP-1 is
+  // named after: an exiting orphan unlinks a HEALTHY daemon's lock. The operator then runs `cello
+  // logout` to stop their agent, is told it was never running, and walks away — while the daemon is
+  // still online, still on the directory, still extending the hash chain. `rm ~/.cello/daemon.lock`
+  // did the same thing. A kill switch may not lie.
+  //
+  // So we ask the daemon itself. If something ANSWERS on the socket, a daemon is running — that is
+  // the strongest evidence available, it needs no file, and it holds for a daemon from BEFORE this
+  // change (which holds no singleton lock at all — every operator has one running at upgrade time).
+  let client: IpcClient;
+  try {
+    client = await connectToDaemon(socketPath);
+  } catch (err: unknown) {
+    // Nothing answered. Now the kernel decides — not the pid in the JSON, which may be dead, or
+    // REUSED by an unrelated process (in which case `isProcessAlive` says "alive" forever).
+    const probe = probeSingletonLock(celloDir, noopLogger);
+
+    if (probe === "held") {
+      // A daemon holds the lock but will not talk to us. We have NOT stopped it, and must not imply
+      // otherwise. Point at the authoritative holder rather than a pid we did not verify.
+      const named = lock ? ` (daemon.lock names pid ${lock.pid}, which may be stale)` : "";
+      return {
+        exitCode: 1,
+        output:
+          `A daemon is running${named} and holds the singleton lock, but is not answering on ` +
+          `${socketPath} (${err instanceof Error ? err.message : String(err)}). It has NOT been ` +
+          `stopped. Find the process that holds the lock with \`lsof ${join(celloDir, SINGLETON_LOCK_FILENAME)}\`, ` +
+          "stop it, then re-run 'cello logout' to clean up.",
+      };
+    }
+
+    if (probe === "unknown") {
+      // We could not ask. Reporting "no daemon running" on a guess is the whole failure mode.
+      return {
+        exitCode: 1,
+        output:
+          `Could not determine whether a daemon is running: the singleton lock at ` +
+          `${join(celloDir, SINGLETON_LOCK_FILENAME)} could not be checked. Refusing to report a ` +
+          "daemon stopped without proof.",
+      };
+    }
+
+    // probe === "free": nothing holds the lock and nothing answers. There is no daemon.
+    if (!lock) {
+      return { exitCode: 0, output: "No daemon running." };
+    }
+    // DOD-LOGOUT-WAIT-1 (Review F3): only CLAIM the removal when it actually happened — removeLock
+    // swallows non-ENOENT errors into a (here discarded) warn, and printing "Removed" for a lock
+    // still on disk would be this unit's own lie in miniature.
     const removed = await removeLock(lockFilePath, noopLogger)
       .then(async () => (await readLock(lockFilePath)) === null)
       .catch(() => false);
     return {
       exitCode: 0,
       output: removed
-        ? "No daemon running. (Removed a stale daemon.lock.)"
+        ? "No daemon running. (Removed a stale daemon.lock — no daemon holds the singleton lock.)"
         : `No daemon running. (A stale daemon.lock remains at ${lockFilePath} and could not be removed — check its permissions.)`,
     };
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
     await client.send("shutdown");
     client.close();
   } catch (err: unknown) {
@@ -198,18 +251,20 @@ export async function logout(
   // send (DOD-SENDRAW-1).
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await daemonGone(lockFilePath, lock)) {
+    if (await daemonGone(celloDir, socketPath, noopLogger)) {
       return { exitCode: 0, output: "Daemon stopped." };
     }
     await new Promise((r) => setTimeout(r, pollMs));
   }
+  const who = lock ? `pid ${lock.pid}, ` : "";
   return {
     exitCode: 1,
     output:
       `Daemon shutdown did not complete within ${timeoutMs / 1000}s ` +
-      `(pid ${lock.pid}, socket ${lock.socketPath}). The daemon acknowledged the request but is ` +
+      `(${who}socket ${socketPath}). The daemon acknowledged the request but is ` +
       `still running — it may be stuck closing sessions or its database. Check 'cello status'; ` +
-      `if it never exits, stop it manually (kill ${lock.pid}) and re-run 'cello logout' to clean up.`,
+      `if it never exits, find it with \`lsof ${join(celloDir, SINGLETON_LOCK_FILENAME)}\`, stop it, ` +
+      "and re-run 'cello logout' to clean up.",
   };
 }
 

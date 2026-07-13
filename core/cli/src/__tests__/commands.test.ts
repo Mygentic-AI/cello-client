@@ -10,11 +10,11 @@
  * - Status when no daemon running: exits 1 with {daemon: "stopped"}
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, acquireLock, readLock, connectToDaemon, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
 import { login, logout, status, register, createAgent, monikerSet, settingsGet, settingsSet } from "../commands.js";
@@ -128,6 +128,43 @@ describe("cli commands", () => {
         }
       }, 45_000);
 
+      // DOD-SINGLE-DAEMON-1 (AC4) — the kill switch may not lie.
+      //
+      // logout used to open with `if (!lock) return "No daemon running."` — the ABSENCE of a JSON file
+      // was taken as proof that no daemon exists. But an exiting orphan unlinks a healthy daemon's
+      // lock (that is DOD-DAEMON-CLEANUP-1's entire subject), and so does `rm ~/.cello/daemon.lock`,
+      // and so does any daemon still running the PRE-FIX binary — which is every daemon in the field
+      // during the upgrade. In that state the operator runs `cello logout` to stop their agent, is
+      // told it was never running, and walks away while it is still online, still on the directory,
+      // and still extending the hash chain.
+      //
+      // A real spawned daemon, its lock file deleted out from under it. logout must still kill it.
+      it("AC4: a live daemon whose daemon.lock was DELETED is still found and actually stopped", async () => {
+        const daemonBin = join(import.meta.dirname, "../../../daemon/dist/bin/cello-daemon.js");
+        const started = await login(tempDir, daemonBin, logger);
+        expect(started.exitCode).toBe(0);
+
+        const lockFilePath = join(tempDir, "daemon.lock");
+        const live = await readLock(lockFilePath);
+        expect(live).not.toBeNull();
+        const daemonPid = live!.pid;
+        expect(isProcessAlive(daemonPid)).toBe(true);
+
+        // The cascade: something removed the lock while the daemon runs on, healthy and serving.
+        await rm(lockFilePath);
+        await expect(readLock(lockFilePath)).resolves.toBeNull();
+
+        const result = await logout(tempDir);
+
+        // It must NOT report "No daemon running" — and, more to the point, the process must be dead.
+        expect(result.output).not.toContain("No daemon running");
+        expect(result.exitCode).toBe(0);
+        expect(result.output).toContain("Daemon stopped");
+
+        // The assertion that actually matters: the kill switch killed something.
+        await vi.waitFor(() => expect(isProcessAlive(daemonPid)).toBe(false), { timeout: 10_000 });
+      }, 45_000);
+
       it("emits an immediate 'Shutting down' progress line so the operator knows the command activated", async () => {
         const config = makeConfig();
         handle = await startDaemon(config);
@@ -148,6 +185,24 @@ describe("cli commands", () => {
         expect(result.exitCode).toBe(0);
         expect(result.output).toContain("No daemon running");
         expect(result.output).toContain("Removed a stale daemon.lock");
+        await expect(readLock(config.lockFilePath)).resolves.toBeNull();
+      });
+
+      // DOD-SINGLE-DAEMON-1: the REUSED-pid case, which the dead-pid test above cannot reach.
+      // After a crash the OS may hand the dead daemon's pid number to an unrelated process. The lock
+      // then names a pid that IS alive, so `isProcessAlive` says "a daemon is running", the socket
+      // does not answer, and logout used to return exit 1 "Failed to stop daemon" — forever, never
+      // cleaning the lock up. The operator's only way out was deleting the file by hand.
+      //
+      // The pid here is the test runner's: real, alive, and emphatically not a daemon. Nothing holds
+      // the singleton lock, and THAT is what settles it — not the pid, and not the file.
+      it("a stale lock naming a REUSED (live, non-daemon) pid → 'No daemon running.' exit 0, lock cleaned up", async () => {
+        const config = makeConfig();
+        await acquireLock(config.lockFilePath, { pid: process.pid, socketPath: config.socketPath, version: "0.0.1-test" });
+
+        const result = await logout(tempDir);
+        expect(result.exitCode).toBe(0);
+        expect(result.output).toContain("No daemon running");
         await expect(readLock(config.lockFilePath)).resolves.toBeNull();
       });
 

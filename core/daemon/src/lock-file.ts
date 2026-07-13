@@ -20,7 +20,7 @@
  *    - Unlink the file, ignoring ENOENT
  */
 
-import { readFile, writeFile, rename, unlink } from "node:fs/promises";
+import { readFile, writeFile, rename, stat, unlink } from "node:fs/promises";
 import type { LockFileContent, Logger } from "./types.js";
 
 export async function readLock(lockPath: string): Promise<LockFileContent | null> {
@@ -72,6 +72,47 @@ export async function removeLock(lockPath: string, logger: Logger): Promise<void
       });
     }
   }
+}
+
+/**
+ * DOD-DAEMON-CLEANUP-1 (AC1) — remove the lock ONLY if it is still ours.
+ *
+ * An exiting daemon must not disarm a daemon it does not own. By the time we shut down, a DIFFERENT
+ * daemon may have written this lock; deleting it would leave that healthy daemon unreachable
+ * (`cello logout` reports "No daemon running") and the next `cello login` would spawn a third beside
+ * it. That is the cascade — the obvious recovery action, killing the orphan, propagates the bug.
+ *
+ * `removeLock` (unconditional) is still correct for the CLI's stale-lock cleanup, where the lock
+ * belongs to a process that is provably gone. It is NOT correct on the way out of a live daemon.
+ */
+export async function removeLockIfOwned(
+  lockPath: string,
+  ownPid: number,
+  logger: Logger,
+): Promise<void> {
+  const lock = await readLock(lockPath);
+  if (lock === null) {
+    // readLock returns null for BOTH "absent" and "unparseable" — so this is the one place that
+    // cannot tell "nothing to do" from "something is wrong". Distinguish them: a lock file that
+    // exists but cannot be read (truncated by a full disk, a partial write) is left alone, because we
+    // cannot prove it is ours — but it is said out loud rather than passed over in silence.
+    try {
+      await stat(lockPath);
+      logger.warn("daemon.lock.unreadable", { ownPid, lockPath });
+    } catch {
+      // Genuinely absent. Nothing to remove, nothing to report.
+    }
+    return;
+  }
+
+  if (lock.pid !== ownPid) {
+    // SI: a daemon that declines to remove a lock says so. Silence here is what made the live
+    // incident so hard to see.
+    logger.info("daemon.lock.not_ours", { ownPid, lockPid: lock.pid, lockPath });
+    return;
+  }
+
+  await removeLock(lockPath, logger);
 }
 
 export function isProcessAlive(pid: number): boolean {

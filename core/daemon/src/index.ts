@@ -22,7 +22,14 @@ export type {
 export { ErrorCodes } from "./types.js";
 
 export { startDaemon, type DaemonHandle } from "./daemon.js";
-export { readLock, acquireLock, removeLock, isProcessAlive } from "./lock-file.js";
+export { readLock, acquireLock, removeLock, removeLockIfOwned, isProcessAlive } from "./lock-file.js";
+export {
+  acquireSingletonLock,
+  probeSingletonLock,
+  DaemonAlreadyRunningError,
+  SINGLETON_LOCK_FILENAME,
+  type SingletonLock,
+} from "./singleton-lock.js";
 export { loadAgents, type LoadedAgent, type FailedAgent, type AgentLoadResult } from "./agent-loader.js";
 export { createIpcServer, type IpcServer, type IpcHandler, type IpcServerConfig, type IpcDisconnectHandler } from "./ipc-server.js";
 export { connectToDaemon, type IpcClient, IpcError } from "./ipc-client.js";

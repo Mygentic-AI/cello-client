@@ -79,6 +79,11 @@ const ALLOW = [
   /^daemon\.lock$/,
   /^daemon\.log$/,
   /^daemon\.sock$/,
+  // DOD-SINGLE-DAEMON-1: the file the kernel takes the singleton lock on. Same category as
+  // daemon.lock and daemon.sock — process infrastructure, not state. It holds NO rows and never
+  // will (SQLite is only the vehicle for a portable fcntl lock), so it carries nothing that could
+  // want encrypting.
+  /^daemon\.singleton$/,
 ];
 
 describe("PERSIST-002 AC-009 — write-allow-list guard (DEC-4)", () => {

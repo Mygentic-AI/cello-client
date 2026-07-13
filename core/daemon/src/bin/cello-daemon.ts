@@ -15,6 +15,10 @@ import { join } from "node:path";
 import { startDaemon } from "../daemon.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { buildManifestDeps } from "../manifest-deps.js";
+// EXIT_ALREADY_RUNNING is distinct from 1 (generic startup failure) so a caller can tell "lost the
+// race" from "broken" — connectOrStart relies on exactly that distinction, so the constant is shared
+// rather than written down twice.
+import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lock.js";
 import type { Logger } from "../types.js";
 
 const MAX_CONNECTIONS = 16;
@@ -120,6 +124,15 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
+  // DOD-SINGLE-DAEMON-1 (AC2): losing the singleton race is not a crash — it is the system working.
+  // Say so in one plain line an operator can act on, name the pid that holds the lock, and exit
+  // non-zero without a stack trace. Two daemons is the silent, wrong outcome; this is the loud, right
+  // one.
+  if (err instanceof DaemonAlreadyRunningError) {
+    logger.info("daemon.start.refused", { reason: "already_running", holderPid: err.holderPid });
+    process.stderr.write(`${err.message}\n`);
+    process.exit(EXIT_ALREADY_RUNNING);
+  }
   logger.error("daemon.startup.failed", {
     error: err instanceof Error ? err.message : String(err),
   });

@@ -41,7 +41,8 @@ import type {
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
-import { acquireLock, removeLock } from "./lock-file.js";
+import { acquireLock, removeLockIfOwned } from "./lock-file.js";
+import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
@@ -298,7 +299,32 @@ class ProductionSessionNodeFactory implements ISessionNodeFactory {
 // per-agent configurability is PARKED on M9-CFG-001 (D17 — same pattern as D14/D15/D16).
 export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * DOD-SINGLE-DAEMON-1: take the singleton lock, and make sure it is released if startup fails
+ * ANYWHERE after that point — not just on the two failure paths that happened to think of it.
+ *
+ * The real binary exits on a startup failure and the kernel reclaims the lock regardless, so this is
+ * not a production-safety hole. It is a DIAGNOSTIC one, and a nasty kind: an in-process caller (every
+ * vitest daemon, any embedder) whose startup throws — a corrupt database, a bad key, an EACCES on the
+ * lock file — would leak the lock and then be told, on the next attempt in that process, "another
+ * daemon is already running". The true cause is replaced by a lie, and the directory is wedged for the
+ * life of the process.
+ */
 export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
+  await mkdir(config.celloDir, { recursive: true });
+  const singletonLock = acquireSingletonLock(config.celloDir, config.logger);
+  try {
+    return await startDaemonHoldingLock(config, singletonLock);
+  } catch (err: unknown) {
+    singletonLock.release();
+    throw err;
+  }
+}
+
+async function startDaemonHoldingLock(
+  config: DaemonConfig,
+  singletonLock: SingletonLock,
+): Promise<DaemonHandle> {
   const {
     celloDir, socketPath, lockFilePath, maxConnections, version, logger,
     manifestProvider, manifestRootKeys, manifestThreshold,
@@ -338,6 +364,15 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   // encrypted DB (AC-008), not a manifest-version.json file. ──
   await mkdir(celloDir, { recursive: true });
   await mkdir(dirname(socketPath), { recursive: true });
+
+  // DOD-SINGLE-DAEMON-1: the caller already took the kernel's exclusive lock (see startDaemon) —
+  // BEFORE this function touches anything that assumes a single writer. A daemon that loses that race
+  // never reaches here at all: it never opens the database, never registers an agent, never connects
+  // to the directory. Two daemons sharing an identity is how a hash chain gets two leaves at the same
+  // index, and the seal then attests to the damage.
+  //
+  // AC4: the advisory JSON keeps its metadata role (it is how the NEXT process learns our pid), but
+  // the OS lock is what decides whether a daemon may run. This file never gates startup.
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
 
   // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
@@ -469,7 +504,9 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
     // open for the anti-rollback check). Release both before rethrowing so an in-process caller does
     // not leak the DB handle / lock (in production the process exits, but be tidy).
     try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
-    await removeLock(lockFilePath, logger).catch(() => { /* best-effort */ });
+    await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
+    // The singleton lock is released by startDaemon's catch — every throw out of this function goes
+    // through it, so no failure path can leak the lock by forgetting.
     throw new Error(
       "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
       "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",
@@ -6407,7 +6444,8 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
   try {
     await ipcServer.start();
   } catch (err: unknown) {
-    await removeLock(lockFilePath, logger);
+    // As above: startDaemon's catch releases the singleton lock for us.
+    await removeLockIfOwned(lockFilePath, process.pid, logger);
     throw err;
   }
 
@@ -6492,14 +6530,29 @@ export async function startDaemon(config: DaemonConfig): Promise<DaemonHandle> {
       manifestPollScheduler.cancel();
     }
     logger.info("daemon.stopped", { pid: process.pid, reason });
-    // CONN-001 (code-review LOW): stopAllSignaling() stops the shared manager AND every per-agent
-    // manager (best-effort). The previously-separate per-agent stop loop here was redundant and
-    // unguarded (would abort the rest of shutdown if stop() ever threw on a second call) — removed.
-    await stopAllSignaling();
-    // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
-    await sessionNodeManager.gracefulShutdown();
-    await ipcServer.stop();
-    await removeLock(lockFilePath, logger);
+    try {
+      // CONN-001 (code-review LOW): stopAllSignaling() stops the shared manager AND every per-agent
+      // manager (best-effort). The previously-separate per-agent stop loop here was redundant and
+      // unguarded (would abort the rest of shutdown if stop() ever threw on a second call) — removed.
+      await stopAllSignaling();
+      // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
+      await sessionNodeManager.gracefulShutdown();
+      await ipcServer.stop();
+    } finally {
+      // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
+      // held. In the real binary the process exits and the kernel reclaims it — but an in-process
+      // caller (vitest, an embedder) whose shutdown throws would otherwise find every subsequent
+      // startDaemon in that process reporting "another daemon is already running", with the real
+      // cause thrown away. That is the same leak F2 fixed on the startup path.
+      //
+      // DOD-DAEMON-CLEANUP-1 (AC1): the lock file goes only if it is still OURS. Another daemon may
+      // have taken it over while we ran, and deleting a live daemon's lock is what makes `cello
+      // logout` say "No daemon running" and the next `cello login` spawn a third one.
+      await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
+      // Released LAST: while we hold it, no successor daemon can start, which is what lets
+      // ipcServer.stop()'s socket re-check above be race-free.
+      singletonLock.release();
+    }
   }
 
   function getSessionNodeManager(): SessionNodeManager {

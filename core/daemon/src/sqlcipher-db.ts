@@ -93,7 +93,7 @@ interface SignalStatement {
   get(params?: unknown[] | Record<string, unknown>): unknown;
   all(params?: unknown[] | Record<string, unknown>): unknown[];
 }
-interface SignalDatabase {
+export interface SignalDatabase {
   exec(sql: string): void;
   prepare(sql: string): SignalStatement;
   pragma(source: string, options?: { simple?: boolean }): unknown;
@@ -247,7 +247,12 @@ export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
 
 // ─── Open ────────────────────────────────────────────────────────────────────────
 
-function loadSignalModule(): SignalModule {
+/**
+ * Load the SQLCipher native module. Exported because the daemon's singleton lock
+ * (DOD-SINGLE-DAEMON-1) needs the same engine for its kernel-level file lock — one place that knows
+ * how to load the prebuilt, and one error when it will not load.
+ */
+export function loadSignalModule(): SignalModule {
   const require = createRequire(import.meta.url);
   try {
     return require("@signalapp/sqlcipher") as SignalModule;
