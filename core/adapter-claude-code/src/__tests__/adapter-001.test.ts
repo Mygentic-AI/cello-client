@@ -2,14 +2,21 @@
  * CELLO-ADAPTER-001 — Adapter unit and integration tests
  *
  * AC-001: key file generation and persistence
- * AC-002: inbound message → claude/channel notification (content-free)
- * AC-003: cello_receive_session after notification returns message
- * AC-004: factory produces identical wiring under InMemoryTransport and stdio
- * AC-005: cello_status returns correct fields
- * AC-006: server declares claude/channel capability
+ * AC-002: inbound message → claude/channel doorbell payload (content-free)
+ * AC-003: CelloClient.receive() after onMessageQueued fires
  * SI-001: notification payload never contains message content
  * SI-002: key file written with 0o600
- * SI-003: private key bytes never in any response
+ *
+ * DOD-LEGACY-MCP-1 (2026-07-12): AC-004, AC-005, AC-006 and SI-003 were DELETED. They asserted the
+ * tool registry, the `cello_status` response shape, and the capability declaration of
+ * `createMcpServer` — the legacy in-process MCP server, now gone. Their subject no longer exists.
+ * (The live `cello_status` is the daemon's, proxied by `bin/cello-mcp.ts`, and is tested there.)
+ *
+ * AC-002 was RE-POINTED, not deleted. It used to drive the dead server and assert on the MCP wire.
+ * What it actually guards is live: that `client.ts` fires `onMessageQueued` with the SENDER's pubkey,
+ * and that the doorbell payload `buildChannelParams` builds from it is CONTENT-FREE (INV-CONTENTFREE
+ * / SI-001 — the operator's message text must never ride the wake-up). Both survive; only the dead
+ * MCP delivery leg is gone, so the test now calls the live producer directly.
  */
 
 import {
@@ -29,21 +36,9 @@ import { stat, rm, mkdir } from "node:fs/promises";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { createClient } from "@cello-protocol/client";
-import { createMcpServer, pushChannelNotification } from "../index.js";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { Tool, Notification } from "@modelcontextprotocol/sdk/types.js";
+import { buildChannelParams } from "../channel-params.js";
 
 setupV3Tests();
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-function parseResult(result: Awaited<ReturnType<Client["callTool"]>>): unknown {
-  const text = (result.content as Array<{ type: string; text: string }>)
-    .find((c) => c.type === "text")?.text;
-  if (!text) throw new Error("No text content in tool result");
-  return JSON.parse(text);
-}
 
 let scope: TestScope;
 beforeEach(() => { scope = createTestScope(); });
@@ -82,170 +77,13 @@ describe("AC-001 + SI-002: key file generation and persistence", () => {
   });
 });
 
-// ─── AC-006: server declares claude/channel capability ─────────────────────────
+// ─── AC-002 / SI-001: inbound message → content-free doorbell payload ──────────
+// Two real libp2p nodes, two real CelloClients, a real send. The hook that fires is live
+// (`client.ts` → onMessageQueued) and the payload builder is live (`channel-params.ts`). The dead
+// MCP server used to sit between them; it added nothing this test asserts.
 
-describe("AC-006: server declares claude/channel experimental capability", () => {
-  it("AC-006: listTools response negotiation includes experimental.claude/channel", async () => {
-    const kp = generateKeypair();
-    const node = await createNode({ keyProvider: kp, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    await node.start();
-    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
-
-    const client = createClient(node, kp);
-    await client.registerHandler();
-
-    const server = createMcpServer(node, client, kp);
-    const [st, ct] = InMemoryTransport.createLinkedPair();
-    await server.connect(st);
-    const mcpClient = new Client({ name: "test", version: "0.0.1" });
-    await mcpClient.connect(ct);
-    scope.addCleanup(async () => { try { await mcpClient.close(); } catch {} });
-    scope.addCleanup(async () => { try { await server.close(); } catch {} });
-
-    // The server's capabilities are sent during initialization
-    const serverCapabilities = mcpClient.getServerCapabilities();
-    expect(serverCapabilities?.experimental?.["claude/channel"]).toBeDefined();
-  }, 10_000);
-});
-
-// ─── AC-004: factory identical wiring ─────────────────────────────────────────
-
-describe("AC-004: factory produces identical tool names, schemas, wiring under InMemoryTransport", () => {
-  it("AC-004: two instances from createMcpServer have identical tool names, descriptions, inputSchemas", async () => {
-    const kpA = generateKeypair();
-    const kpB = generateKeypair();
-    const nodeA = await createNode({ keyProvider: kpA, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    const nodeB = await createNode({ keyProvider: kpB, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    await nodeA.start();
-    await nodeB.start();
-    scope.addCleanup(async () => { try { await nodeA.stop(); } catch {} });
-    scope.addCleanup(async () => { try { await nodeB.stop(); } catch {} });
-
-    const clientA = createClient(nodeA, kpA);
-    const clientB = createClient(nodeB, kpB);
-    await clientA.registerHandler();
-    await clientB.registerHandler();
-
-    const serverA = createMcpServer(nodeA, clientA, kpA);
-    const serverB = createMcpServer(nodeB, clientB, kpB);
-
-    const [stA, ctA] = InMemoryTransport.createLinkedPair();
-    const [stB, ctB] = InMemoryTransport.createLinkedPair();
-    await serverA.connect(stA);
-    await serverB.connect(stB);
-
-    const mcpA = new Client({ name: "test-a", version: "0.0.1" });
-    const mcpB = new Client({ name: "test-b", version: "0.0.1" });
-    await mcpA.connect(ctA);
-    await mcpB.connect(ctB);
-    scope.addCleanup(async () => { try { await mcpA.close(); } catch {}; try { await mcpB.close(); } catch {} });
-    scope.addCleanup(async () => { try { await serverA.close(); } catch {}; try { await serverB.close(); } catch {} });
-
-    const sortByName = (tools: Tool[]) => [...tools].sort((a, b) => a.name.localeCompare(b.name));
-    const toolsA = sortByName((await mcpA.listTools()).tools);
-    const toolsB = sortByName((await mcpB.listTools()).tools);
-
-    expect(toolsA.map((t) => t.name)).toEqual(toolsB.map((t) => t.name));
-    expect(toolsA.map((t) => t.description)).toEqual(toolsB.map((t) => t.description));
-    expect(toolsA.map((t) => t.inputSchema)).toEqual(toolsB.map((t) => t.inputSchema));
-    // M1+ tool set: includes cello_backup/cello_restore added by PERSIST-022
-    expect(toolsA.map((t) => t.name)).toEqual([
-      "cello_await_session",
-      "cello_backup",
-      "cello_close_session",
-      "cello_get_inclusion_proof",
-      "cello_get_sealed_receipt",
-      "cello_initiate_session",
-      "cello_list_sessions",
-      "cello_receive",
-      "cello_receive_session",
-      "cello_restore",
-      "cello_send",
-      "cello_status",
-    ]);
-  }, 15_000);
-});
-
-// ─── AC-005: cello_status fields ─────────────────────────────────────────────
-
-describe("AC-005: cello_status returns expected fields", () => {
-  it("AC-005: transport_started, own_pubkey, listen_addresses, connected_peer_count, uptime_seconds", async () => {
-    const kp = generateKeypair();
-    const node = await createNode({ keyProvider: kp, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    await node.start();
-    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
-
-    const client = createClient(node, kp);
-    await client.registerHandler();
-    const server = createMcpServer(node, client, kp);
-    const [st, ct] = InMemoryTransport.createLinkedPair();
-    await server.connect(st);
-    const mcpClient = new Client({ name: "test", version: "0.0.1" });
-    await mcpClient.connect(ct);
-    scope.addCleanup(async () => { try { await mcpClient.close(); } catch {} });
-    scope.addCleanup(async () => { try { await server.close(); } catch {} });
-
-    const expectedPubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
-
-    const result = parseResult(
-      await mcpClient.callTool({ name: "cello_status", arguments: {} })
-    ) as Record<string, unknown>;
-
-    expect(result.transport_started).toBe(true);
-    expect(result.own_pubkey).toBe(expectedPubkey);
-    expect(Array.isArray(result.listen_addresses)).toBe(true);
-    expect((result.listen_addresses as string[]).length).toBeGreaterThan(0);
-    expect(typeof result.connected_peer_count).toBe("number");
-    expect(typeof result.uptime_seconds).toBe("number");
-  }, 10_000);
-});
-
-// ─── SI-003: no private key in tool responses ─────────────────────────────────
-
-describe("SI-003: no K_local private key bytes in any tool response", () => {
-  it("SI-003: own_pubkey in cello_status is the public key, not the private key", async () => {
-    const kp = generateKeypair();
-    const node = await createNode({ keyProvider: kp, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
-    await node.start();
-    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
-
-    const client = createClient(node, kp);
-    await client.registerHandler();
-    const server = createMcpServer(node, client, kp);
-    const [st, ct] = InMemoryTransport.createLinkedPair();
-    await server.connect(st);
-    const mcpClient = new Client({ name: "test", version: "0.0.1" });
-    await mcpClient.connect(ct);
-    scope.addCleanup(async () => { try { await mcpClient.close(); } catch {} });
-    scope.addCleanup(async () => { try { await server.close(); } catch {} });
-
-    const expectedPubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
-    const result = parseResult(
-      await mcpClient.callTool({ name: "cello_status", arguments: {} })
-    ) as Record<string, unknown>;
-
-    expect(result.own_pubkey).toBe(expectedPubkey);
-    const keys = Object.keys(result).sort();
-    // M1 (ADAPTER-002) extended status with active_session_count and directory_reachable
-    expect(keys).toEqual([
-      "active_session_count",
-      "connected_peer_count",
-      "directory_reachable",
-      "listen_addresses",
-      "own_pubkey",
-      "transport_started",
-      "uptime_seconds",
-    ]);
-  }, 10_000);
-});
-
-// ─── AC-002 / SI-001: inbound message → notification on MCP wire, content-free ──
-// NOTE (ADAPTER-002): cello_connect_peer and cello_send({peer_pubkey}) are removed from the M1
-// MCP tool surface. This test uses the CelloClient API directly to trigger the inbound message
-// path, verifying that pushChannelNotification still fires correctly via the onMessageQueued hook.
-
-describe("AC-002 + SI-001: inbound message pushes claude/channel notification via MCP wire without content", () => {
-  it("AC-002: notifications/claude/channel fires with {type:'cello_message', from:<pubkey>}; no content field", async () => {
+describe("AC-002 + SI-001: an inbound message produces a content-free claude/channel doorbell", () => {
+  it("AC-002: onMessageQueued fires with the SENDER's pubkey and builds {type:'cello_message', from}; no message text anywhere", async () => {
     const kpA = generateKeypair();
     const kpB = generateKeypair();
     const nodeA = await createNode({ keyProvider: kpA, listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
@@ -258,45 +96,26 @@ describe("AC-002 + SI-001: inbound message pushes claude/channel notification vi
     const ownPubkeyA = Buffer.from(await kpA.getPublicKey()).toString("hex");
     const ownPubkeyB = Buffer.from(await kpB.getPublicKey()).toString("hex");
 
-    // Capture MCP wire notifications received by B's MCP client
-    const wireNotifications: Notification[] = [];
+    // The doorbell payloads the live hook would push. This is exactly what `bin/cello-mcp.ts` sends
+    // on the wire — it calls buildChannelParams and hands the result to server.notification().
+    const doorbells: Array<ReturnType<typeof buildChannelParams>> = [];
 
-    // Create serverB with a real client that has onMessageQueued wired to pushChannelNotification
-    const serverB = createMcpServer(nodeB, /* placeholder; clientB wired below */ null as never, kpB);
-    const [stB, ctB] = InMemoryTransport.createLinkedPair();
-    await serverB.connect(stB);
-    const mcpB = new Client({ name: "test-b", version: "0.0.1" });
-    // Register fallback handler before connect so notifications aren't missed
-    (mcpB as unknown as { fallbackNotificationHandler: (n: Notification) => void }).fallbackNotificationHandler =
-      (n) => { wireNotifications.push(n); };
-    await mcpB.connect(ctB);
-    scope.addCleanup(async () => { try { await mcpB.close(); } catch {} });
-    scope.addCleanup(async () => { try { await serverB.close(); } catch {} });
-
-    // Wire clientB with notification push through the actual serverB MCP server
     const clientB = createClient(nodeB, kpB, {
-      onMessageQueued: (from) => { void pushChannelNotification(serverB, from); },
+      onMessageQueued: (from) => { doorbells.push(buildChannelParams({ type: "cello_message", from })); },
     });
     await clientB.registerHandler();
 
     const clientA = createClient(nodeA, kpA);
     await clientA.registerHandler();
 
-    // Use CelloClient API directly (M0 peer-to-peer path still works at client level)
-    clientA.addPeer(ownPubkeyB, nodeB.getConnections().length.toString(), nodeB.listenAddresses());
-    // Dial nodeB manually via node.dial, then add peer for A's registry
     const dialResult = await nodeA.dial(nodeB.listenAddresses()[0]!);
     clientA.addPeer(ownPubkeyB, dialResult.peerId, nodeB.listenAddresses());
 
     await clientA.send(ownPubkeyB, new TextEncoder().encode("hello"));
 
-    await waitFor(
-      () => wireNotifications.some((n) => n.method === "notifications/claude/channel"),
-      { timeout: 5000 }
-    );
+    await waitFor(() => doorbells.length > 0, { timeout: 5000 });
 
-    const notif = wireNotifications.find((n) => n.method === "notifications/claude/channel")!;
-    const params = notif.params as { content?: unknown; meta?: Record<string, unknown> };
+    const params = doorbells[0]!;
 
     // Claude Code channel contract: params MUST carry `content` (the <channel> tag body) — without
     // it the event is silently dropped and the doorbell never surfaces (BUILD-JOURNAL Entry 43).
@@ -304,7 +123,10 @@ describe("AC-002 + SI-001: inbound message pushes claude/channel notification vi
     expect((params.content as string).length).toBeGreaterThan(0);
     // Routing rides in `meta` (becomes <channel> attributes): exactly type + from here.
     expect(params.meta?.type).toBe("cello_message");
+    // The hook must report the SENDER, not the receiver. Getting this backwards would wake the agent
+    // pointing at itself.
     expect(params.meta?.from).toBe(ownPubkeyA);
+    expect(params.meta?.from).not.toBe(ownPubkeyB);
     expect(Object.keys(params.meta ?? {}).sort()).toEqual(["from", "type"]);
     // SI-001 / INV-CONTENTFREE: the announcement carries NO message text — the operator sent
     // "hello"; it must not appear anywhere in the pushed payload (content or meta).
@@ -314,8 +136,6 @@ describe("AC-002 + SI-001: inbound message pushes claude/channel notification vi
 });
 
 // ─── AC-003: CelloClient.receive() works after onMessageQueued fires ───────────
-// NOTE (ADAPTER-002): This test uses the CelloClient API directly since cello_connect_peer
-// and old cello_send({peer_pubkey}) are no longer in the M1 MCP tool surface.
 
 describe("AC-003: CelloClient.receive() returns message after onMessageQueued fires", () => {
   it("AC-003: receive after onMessageQueued fires returns message with correct sender pubkey", async () => {

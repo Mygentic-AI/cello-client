@@ -19,7 +19,6 @@ export type {
   RelayPredecessorUnknown,
 } from "./agent-hash-queue.js";
 export { NetworkDirectoryNode, bootstrapNetworkKeyShares, runNetworkDkg } from "./network-directory-node.js";
-export { createMcpSessionServer } from "./mcp-server.js";
 export { ClientBackup, BACKUP_WARNING } from "./client-backup.js";
 export type { ClientBackupOptions } from "./client-backup.js";
 export type {

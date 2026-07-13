@@ -27,8 +27,10 @@
  *           (different nonces per backup). Uses LocalCloudStorageProvider in a temp dir for storage.
  *           Assert blob bytes differ.
  *
- *   AC-007-dist-freshness: dist/mcp-server.js exists and contains both "cello_backup" and
- *           "cello_restore". Absence means the dist is stale or the registration is missing.
+ *   AC-007-dist-freshness: REMOVED by DOD-LEGACY-MCP-1 (2026-07-12). It asserted that
+ *           dist/mcp-server.js existed and named the backup/restore tools — i.e. it guarded the
+ *           continued shipping of the legacy in-process MCP server's build artifact, which is
+ *           precisely the defect that story removes. See the note at its former site below.
  *
  *   SI-001: All logger calls across backup() are inspected — none may contain the backup_key
  *           bytes, the backup_key hex, or any derived value. Verified by capturing all events
@@ -56,8 +58,6 @@
  *   - AC-006 uses LocalCloudStorageProvider to avoid any real S3 dependency in unit tests.
  *   - AC-003 uses LocalCloudStorageProvider (backed by a tmp dir) for the roundtrip — no AWS
  *     credentials needed, passes in CI.
- *   - AC-007-dist-freshness reads the pre-built dist/mcp-server.js. Run pnpm run typecheck
- *     from packages/client before running this test to ensure dist is current.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -500,30 +500,19 @@ describe("PERSIST-022 AC-006 — consecutive backups of same content produce dif
   });
 });
 
-// ─── AC-007-dist-freshness: dist/mcp-server.js contains tool registrations ───
+// ─── AC-007-dist-freshness — REMOVED (DOD-LEGACY-MCP-1, 2026-07-12) ──────────
 //
-// AC-007-dist-freshness: pnpm run typecheck rebuilds dist/; this test verifies
-// that dist/mcp-server.js contains the expected MCP tool names introduced by
-// PERSIST-022 (cello_backup and cello_restore). Absence means the dist is stale
-// or the registration is missing (lesson from M4 addendum 3).
-
-describe("PERSIST-022 AC-007-dist-freshness — dist/mcp-server.js contains backup/restore tool names", () => {
-  it("PERSIST-022 AC-007-dist-freshness: dist/mcp-server.js contains cello_backup and cello_restore", async () => {
-    const distPath = new URL("../../dist/mcp-server.js", import.meta.url);
-    const distFile = distPath.pathname;
-
-    if (!existsSync(distFile)) {
-      throw new Error(
-        "dist/mcp-server.js not found — run pnpm run typecheck from packages/client first",
-      );
-    }
-
-    const content = readFileSync(distFile, "utf8");
-    expect(content).toContain("cello_backup");
-    expect(content).toContain("cello_restore");
-  });
-});
-
+// This block asserted that `dist/mcp-server.js` EXISTED and still contained the strings
+// "cello_backup" and "cello_restore". Its subject was the compiled artifact of the legacy
+// in-process MCP server — the very artifact whose presence in the tarball WAS the defect
+// DOD-LEGACY-MCP-1 exists to remove. The test was, in effect, guarding that the dead second
+// vocabulary kept shipping. `mcp-server.ts` is deleted, so `dist/mcp-server.js` is no longer
+// emitted and the assertion is not just failing — it is meaningless.
+//
+// Nothing is lost: the backup/restore capability is LIVE and is exercised for real by AC-003
+// (full ClientBackup restore roundtrip) above, and its tools are registered by the live shim
+// `bin/cello-mcp.ts`, whose registrations are audited by dod-onboard-help-1-tool-parity.test.ts.
+// What died was a freshness check on a build artifact that should not exist.
 // ─── SI-001: No key material in any log context ───────────────────────────────
 
 describe("PERSIST-022 SI-001 — key material never appears in log events", () => {
