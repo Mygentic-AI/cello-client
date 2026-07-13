@@ -51,7 +51,17 @@ function sourceFiles(root: string): string[] {
 
 describe("DEAD-CODE PURGE — the M6 in-process stack is deleted", () => {
   it("the @cello-protocol/client package does not exist", () => {
-    expect(existsSync(join(CORE, "client")), "core/client is BACK — the M6 in-process client").toBe(false);
+    // Assert the PACKAGE is gone, not merely the directory. `git rm` removes tracked files; it cannot
+    // remove untracked detritus, so a warm checkout can keep an empty `core/client/` holding a stale
+    // node_modules and an old .tgz long after every source file is deleted. That husk ships nothing
+    // and compiles nothing — failing on it would be a false alarm that trains people to ignore this
+    // test. What must never come back is a real package: a manifest, sources, or a build output.
+    for (const marker of ["package.json", "src", "dist"]) {
+      expect(
+        existsSync(join(CORE, "client", marker)),
+        `core/client/${marker} is BACK — the M6 in-process client has been resurrected`,
+      ).toBe(false);
+    }
   });
 
   it("the orphaned M6 modules do not exist", () => {
