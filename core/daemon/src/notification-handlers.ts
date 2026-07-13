@@ -13,6 +13,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
+import type { InboundSessionEvent, ExpiredSessionRequest } from "./inbound-sessions.js";
 
 export interface NotificationHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -22,8 +23,8 @@ export interface NotificationHandlerDeps {
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string }>;
   reapExpiredInboundSessions: (agentName: string) => void;
-  inboundSessionQueues: Map<string, Array<{ sessionId: string; counterpartyPubkeyHex: string; [k: string]: unknown }>>;
-  expiredSessionRequests: Map<string, Array<{ sessionId: string; [k: string]: unknown }>>;
+  inboundSessionQueues: Map<string, InboundSessionEvent[]>;
+  expiredSessionRequests: Map<string, ExpiredSessionRequest[]>;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {

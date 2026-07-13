@@ -29,6 +29,13 @@ import type { RelayConnectParams } from "./session-node-manager.js";
 /** How long an un-accepted inbound session request stays claimable. */
 export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** A session request that expired before anyone claimed it. Surfaced by the push-loss reconciler. */
+export interface ExpiredSessionRequest {
+  sessionIdHex: string;
+  counterpartyPubkeyHex: string;
+  expiredAt: number;
+}
+
 export interface InboundSessionEvent {
   sessionIdHex: string;
   counterpartyPubkeyHex: string;
@@ -96,7 +103,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   const offerKey = (agentName: string, sessionIdHex: string): string => `${agentName}:${sessionIdHex}`;
   // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
   // cello_check_notifications so the operator can see what they missed, not just silence.
-  const expiredSessionRequests = new Map<string, Array<{ sessionIdHex: string; counterpartyPubkeyHex: string; expiredAt: number }>>();
+  const expiredSessionRequests = new Map<string, ExpiredSessionRequest[]>();
   // A blocked cello_await_session waiter. connectionId is carried so the disconnect
   // hook can evict waiters belonging to a dead connection (otherwise enqueue would hand
   // an inbound event to a closed connection and the event would be lost — review H2).

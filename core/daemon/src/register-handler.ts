@@ -6,9 +6,14 @@
  * roster, so a compromised directory cannot forge an identity. If the code below ever lets one node
  * produce a valid ceremony output, that is a security violation regardless of whether tests pass.
  *
- * registrationInProgress is a plain guard, not a lock: a second concurrent register for the same
- * agent would race two DKGs against the same slot.
+ * registrationInProgress is DAEMON-WIDE, and the reason matters: the directory's registration reply
+ * frames (dkg_ready / register_success / register_error) carry NO AGENT IDENTIFIER. Two concurrent
+ * registrations over the one shared signaling stream would each arm a resolver and both receive the
+ * same reply — CROSS-WIRING THE CEREMONIES. It is the registration analogue of the
+ * sealInterruptedInProgress guard, but global rather than per-key precisely because the frames are
+ * not agent-tagged. Do not "improve" it into a per-agent map.
  */
+import { Buffer } from "node:buffer";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -41,7 +46,13 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
     directoryEndpointResolver, loadedAgents, registrationGuidance, manifestProvider,
   } = deps;
 
-  // A second concurrent register for the same agent would race two DKGs against the same slot.
+  // Single-flight guard (M1): the directory's registration reply frames (dkg_ready /
+  // register_success / register_error) carry NO agent identifier, so two concurrent registrations
+  // over the one shared directory signaling stream would each arm a resolver and both receive the
+  // same reply — cross-wiring the ceremonies. Serialize registration daemon-wide (it is a rare,
+  // once-per-agent, human-initiated operation). This is the registration analogue of the
+  // sealInterruptedInProgress guard, but GLOBAL rather than per-key because the frames are not
+  // agent-tagged. A per-agent guard would reintroduce the cross-wiring it exists to prevent.
   let registrationInProgress = false;
 
   handlers.set("cello_register", async (params, _connectionId) => {

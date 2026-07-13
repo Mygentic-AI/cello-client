@@ -1859,8 +1859,8 @@ async function startDaemonHoldingLock(
     resolveCurrentAgent,
     loadedAgents,
     reapExpiredInboundSessions,
-    inboundSessionQueues: inboundSessionQueues as never,
-    expiredSessionRequests: expiredSessionRequests as never,
+    inboundSessionQueues,
+    expiredSessionRequests,
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now

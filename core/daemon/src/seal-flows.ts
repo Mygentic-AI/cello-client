@@ -1,4 +1,3 @@
-import { buildSignedSealInterruptedLeaf, verifyCounterpartySealLeaf } from "./seal-leaf.js";
 /**
  * The two seal-initiation flows that cello_close_session dispatches into.
  *
@@ -11,6 +10,7 @@ import { buildSignedSealInterruptedLeaf, verifyCounterpartySealLeaf } from "./se
  * functions only ever assemble and exchange leaves — the notarization happens at the directory.
  */
 import { randomUUID } from "node:crypto";
+import { buildSignedSealInterruptedLeaf, verifyCounterpartySealLeaf } from "./seal-leaf.js";
 import { SignalingManager } from "@cello-protocol/transport";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -63,7 +63,6 @@ export function createSealFlows(deps: SealFlowDeps) {
   //   Both sides bind over their OWN tree root + size (SI-001) whenever a non-empty tree exists —
   //   e.g. reloaded from session_tree_leaves after a restart. Only sessions with no persisted tree
   //   fall back to message_count plus the caller-supplied root.
-  // Result type for handleSealInterruptedFlow — maps to the MCP tool response shape.
 
   // M7-SESSION-001 / DAEMON-004: shared bilateral ack-await machinery. The
   // interrupted-seal flow AND the active-session seal flow both send a
