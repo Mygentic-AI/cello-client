@@ -176,6 +176,9 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     });
 
     expect(result.manifestVerified).toBe(true);
+    // Re-persisting the same version is the correct no-op, and pins that the accept branch is the
+    // one we took — not an early return that skipped the persist entirely.
+    expect(store.persisted).toEqual([7]);
   });
 
   it("a load that THROWS reports unverified — it never leaks the exception into startup", async () => {
@@ -267,6 +270,37 @@ describe("createConsortiumRouting", () => {
     // null ≠ [] here, and the difference is load-bearing: [] means "a consortium with no reachable
     // nodes" (refuse), null means "no consortium configured" (M6/M7 single-node back-compat).
     expect(await routing.resolveConsortiumRoster()).toBeNull();
+  });
+
+  it("resolveConsortiumRoster RE-RESOLVES the live roster at ceremony time, not the startup snapshot", async () => {
+    const logger = makeLogger();
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      logger,
+      fetchFn: bootstrapFetch(["n1", "n2"]),
+    });
+
+    expect(await routing.resolveConsortiumRoster()).toHaveLength(2);
+  });
+
+  it("resolveConsortiumRoster returns [] — NOT null — when a manifest IS configured but no node is reachable", async () => {
+    const logger = makeLogger();
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      logger,
+      fetchFn: bootstrapFetch([]), // the whole consortium is down
+    });
+
+    // The distinction the ceremony layer depends on: [] is "a consortium whose nodes are all
+    // unreachable" and MUST be refused against the threshold. Collapsing it to null here would
+    // silently downgrade a dead consortium into a single-node back-compat ceremony.
+    expect(await routing.resolveConsortiumRoster()).toEqual([]);
   });
 
   it("no manifestPollScheduler: no poll is started, and stopHttpManifestPoll is absent", () => {
