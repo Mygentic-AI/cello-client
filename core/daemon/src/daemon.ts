@@ -43,7 +43,6 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { TIER } from "./contacts-tier-migration.js";
 import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
@@ -51,8 +50,6 @@ import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
 import { createSignalingConnect } from "./signaling-connect.js";
-import { RegistrationManager } from "./registration-manager.js";
-import { DaemonRegistrationContext } from "./registration-context.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
@@ -67,12 +64,10 @@ import {
   isProductionVariant,
 } from "./transport-composition.js";
 import type { ITransportSelector } from "./transport-selector.js";
-import { selectAdvertisedAddress } from "./transport-selector.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { whoLabel } from "./who-label.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, runAgentRefresh } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
-import { manifestNodesToEndpoints } from "./directory-bootstrap.js";
 import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
@@ -84,6 +79,8 @@ import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
+import { registerRegisterHandler } from "./register-handler.js";
+import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
 import { buildSignedSealInterruptedLeaf } from "./seal-leaf.js";
 
 
@@ -1412,7 +1409,6 @@ async function startDaemonHoldingLock(
     waitForSignalingConnected,
     perAgentSignaling,
   });
-  let registrationInProgress = false;
 
   const registrationGuidance = (reason: string): string => {
     switch (reason) {
@@ -1429,152 +1425,21 @@ async function startDaemonHoldingLock(
     }
   };
 
-  handlers.set("cello_register", async (params, _connectionId) => {
-    const name = params?.agent as string | undefined;
-    const preAuthToken = params?.preAuthToken as string | undefined;
-    const phoneStub = (params?.phoneStub as string | undefined) ?? "";
-    if (!name) {
-      return { ok: false, reason: "missing_params", guidance: "Provide 'agent' (the agent name to register) and 'preAuthToken' (the pre-authorization ticket from the CELLO Operations Agent)." };
-    }
-    if (!preAuthToken) {
-      return { ok: false, reason: "missing_preauth_token", guidance: "Registration requires a 'preAuthToken' issued by the CELLO Operations Agent (Telegram). Obtain one, then retry 'cello register-agent'." };
-    }
-    const keyProvider = keyProviders.get(name);
-    if (!keyProvider) {
-      return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Create it first with 'cello create-agent ${name}', then retry 'cello register-agent'.` };
-    }
-    if (!directoryEndpointResolver) {
-      return { ok: false, reason: "directory_unreachable", guidance: "The daemon has no directory endpoint resolver configured, so it cannot reach the directory to register." };
-    }
-    // M1: claim the single-flight slot synchronously (no await between the check
-    // and the set) so two concurrent calls cannot both proceed.
-    if (registrationInProgress) {
-      return { ok: false, reason: "registration_already_in_progress", guidance: "Another agent registration is already in progress on this daemon. Registration runs one at a time because the directory's reply frames are not agent-tagged. Wait for it to finish (check the daemon logs for registration.succeeded/failed), then retry." };
-    }
-    registrationInProgress = true;
-    try {
-      // Resolve the directory endpoint once for this registration (the context's
-      // getDirectoryEndpoint is synchronous; the daemon's resolver is async).
-      // FINDING-4 scope note: this uses the PRIMARY resolver directly (not the roster-aware
-      // failover resolver — registration is deliberately out of FINDING-4's "signaling +
-      // ceremony" scope). Because that primary is now built with staleFallback:false (so the
-      // failover wrapper sees a dead primary as null), a transient /bootstrap blip here resolves
-      // to null → directory_unreachable rather than riding through on a stale last-known-good;
-      // registration is a rare, manual, retryable op, so failing fast (retry) is acceptable. With
-      // a manifest configured the DKG fans out over the independently-probed roster regardless of
-      // this endpoint. The endpoint is stable for one registration — if it changed mid-flow the
-      // DKG streams would break anyway.
-      const ep = await directoryEndpointResolver();
-      if (!ep || !ep.multiaddr) {
-        // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
-        // multiaddr is required (DirectoryEndpoint.multiaddr is optional for the
-        // already-connected signaling case, but registration needs to open streams).
-        return { ok: false, reason: "directory_unreachable", guidance: "Could not resolve a dialable directory bootstrap endpoint (GET /bootstrap). Check CELLO_DIRECTORY_URL and network connectivity, then retry." };
-      }
-      const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
-
-      // Multi-agent: register over THIS agent's own directory signaling stream (authed
-      // as this agent), so the directory routes its dkg_complete/register_success back
-      // to it. CONN-001: every agent has its own dedicated stream (no shared keystone). The
-      // DKG's FROST streams open on this agent's directory node.
-      const agentRecord = loadedAgents.find((a) => a.name === name);
-      const agentPubkeyHex = agentRecord?.pubkey ?? Buffer.from(await keyProvider.getPublicKey()).toString("hex");
-      const { signaling: agentSignaling, getNode: agentGetNode } = getAgentSignaling(name, keyProvider, agentPubkeyHex);
-
-      // A non-primary agent's stream connects lazily — wait for it before the DKG
-      // (RegistrationManager returns directory_unreachable if signaling isn't connected).
-      const signalingConnected = await waitForSignalingConnected(agentSignaling, 10_000);
-      if (!signalingConnected) {
-        // Distinct cause → distinct code (M7 error discipline): this is specifically the
-        // per-agent signaling stream failing to come up in time, not a missing/unresolvable
-        // directory endpoint. Drop the manager so it doesn't reconnect forever for an
-        // unregistered agent (it is re-created on the next cello_register).
-        await dropAgentSignaling(name);
-        return {
-          ok: false,
-          reason: "directory_signaling_timeout",
-          guidance: `Agent '${name}' could not establish its directory signaling stream within 10s. Check CELLO_DIRECTORY_URL and that the directory is reachable, then retry 'cello register-agent'.`,
-        };
-      }
-
-      const persistence = getPersistence(name);
-      // DOD-DKG-1: resolve the full consortium roster from the VERIFIED manifest so the DKG fans
-      // across all N directory nodes. Re-resolved here (ceremony time) for fresh failover
-      // coordinates. NULL when NO manifest is configured (→ single-node DKG, M6/M7 back-compat);
-      // a (possibly EMPTY) array when a manifest IS configured. The null-vs-empty distinction is
-      // load-bearing: an empty roster (consortium configured but unreachable) must REFUSE in
-      // registration-manager, NOT downgrade to single-node (code-reviewer B1 / fallback-finder).
-      const currentManifest = manifestProvider?.getCurrentManifest();
-      const consortiumRoster = currentManifest
-        ? await manifestNodesToEndpoints(currentManifest.nodes, { logger })
-        : null;
-      const ctx = new DaemonRegistrationContext({
-        signaling: agentSignaling,
-        getDirectoryNode: agentGetNode,
-        getDirectoryEndpoint: () => directoryEndpoint,
-        getConsortiumEndpoints: () => consortiumRoster,
-        keyProvider,
-        persistence,
-        logger,
-      });
-      try {
-        const result = await new RegistrationManager(ctx).register(phoneStub, preAuthToken);
-        if ("error" in result) {
-          logger.warn("registration.failed", { agentName: name, reason: result.error });
-          // Terminal failure for THIS agent — drop its dedicated signaling manager so it
-          // does not reconnect forever for an unregistered agent (re-created on retry).
-          await dropAgentSignaling(name);
-          return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
-        }
-        // PERSIST-002 (AC-013): the identity row (K_local + share + ML-DSA + registration) is durably
-        // committed at this point (RegistrationManager awaits the persist before returning success).
-        // SI-001: never log a secret — only the agent name + PUBLIC key.
-        logger.info("persist.identity.persisted", { agentName: name, agentPubkey: agentPubkeyHex });
-        // CC-2 (2026-07-07): registration succeeded — arm this agent's standing receiver NOW so a
-        // brand-new agent can receive inbound immediately. Without this the agent reports
-        // standing_receiver_ready:false and cannot receive until the operator restarts (logout/login),
-        // so a fresh registration looks broken. Uses the SAME idempotent path login and cello_use_agent
-        // arm through (startAgentInternal → onlineAgents + directory signaling + ensureStandingReceiver +
-        // agent_state_changed). A start failure must NOT fail the (already durably persisted)
-        // registration — surface it as a warning and let the operator recover via login.
-        const armResult = startAgentInternal(name);
-        if (!armResult.ok) {
-          logger.warn("registration.standing_receiver.arm_failed", { agentName: name, reason: armResult.reason });
-        } else {
-          // arm_INITIATED, not armed: startAgentInternal returns ok once the agent is online + signaling
-          // is up, but ensureStandingReceiverForAgent runs fire-and-forget (its own failure emits
-          // session.standing_receiver.ensure.failed) — so this event marks the start, not readiness.
-          logger.info("registration.standing_receiver.arm_initiated", { agentName: name });
-        }
-        // Capture-now-or-lose-it: persist the agent→user link (using it is future
-        // trust-layer work). L1: the agent is already registered at this point —
-        // a link-write failure must NOT be reported as a registration failure.
-        // Surface it as a non-fatal warning so the operator knows the link wasn't
-        // captured (re-registering with the same token re-attempts it).
-        try {
-          await persistence.persistAgentUserLink({ agentId: result.agent_id, preAuthToken, linkedAt: Date.now() });
-          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
-          return { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey };
-        } catch (linkErr: unknown) {
-          logger.warn("registration.user_link.capture_failed", {
-            agentName: name,
-            agentId: result.agent_id,
-            error: linkErr instanceof Error ? linkErr.message : String(linkErr),
-          });
-          logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
-          return {
-            ok: true,
-            agent_id: result.agent_id,
-            primary_pubkey: result.primary_pubkey,
-            warning: "agent_user_link_not_captured",
-          };
-        }
-      } finally {
-        ctx.dispose();
-      }
-    } finally {
-      registrationInProgress = false;
-    }
+  // cello_register (register-handler.ts): T-of-N DKG with the consortium. NO SINGLE NODE can
+  // complete it alone — that is the sovereign-node invariant, and it is the point of the protocol.
+  registerRegisterHandler({
+    handlers,
+    logger,
+    keyProviders,
+    getPersistence,
+    getAgentSignaling,
+    waitForSignalingConnected,
+    dropAgentSignaling,
+    startAgentInternal,
+    directoryEndpointResolver,
+    loadedAgents,
+    registrationGuidance,
+    manifestProvider,
   });
 
 
@@ -1684,156 +1549,20 @@ async function startDaemonHoldingLock(
     });
   }
 
-  // ─── CELLO-M7-TRANSPORT-001: cello_initiate_session ─────────────────────────
-  // Direct-P2P-by-default transport selection (AC-005/AC-006/AC-008/AC-010c).
-  // Flow:
-  //   1. Require a current agent.
-  //   2. Mint a correlationId for the whole session-establishment flow.
-  //   3. Read the standing receiver's AutoNAT dialability → choose the advertised
-  //      address (direct when dialable, relay circuit otherwise — AC-004/AC-019).
-  //   4. Negotiate the FROST-signed SessionAssignment via the directory
-  //      (sessionNegotiator — WIRE-001/SIGNAL-001). When no negotiator is wired,
-  //      return directory_signaling_not_configured (graceful — the transport
-  //      adapters ARE wired; this proves it does not crash with "adapter not wired").
-  //   5. Drive the transport selector to dial the counterparty using the
-  //      assignment's authoritative transport_mode (SI-001). Map the TransportResult
-  //      to the MCP response.
-  handlers.set("cello_initiate_session", async (params, connectionId) => {
-    const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
-    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
-    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
-    const correlationId = randomUUID();
-
-    // AC-004/AC-019: the advertised address is chosen from the standing receiver's
-    // current dialability. Not dialable (or AutoNAT unavailable) → relay circuit.
-    const dialability = autoNatService.getDialability();
-    const relayCircuitAddr = getRelayCircuitAddress ? getRelayCircuitAddress() : "";
-    const advertisedAddress = selectAdvertisedAddress(dialability, relayCircuitAddr);
-
-    // resolvedSessionNegotiator is always defined (the daemon builds a real internal
-    // negotiator when none is injected), so directory_signaling_not_configured no longer
-    // fires on the live binary — session_request is actually negotiated with the directory.
-    const negotiation = await resolvedSessionNegotiator.negotiate({
-      agentName,
-      correlationId,
-      advertisedAddress,
-      params: params ?? {},
-    });
-    if (!negotiation.ok) {
-      return { ok: false, reason: negotiation.reason, guidance: negotiation.guidance };
-    }
-
-    // SI-001: the selector consumes the assignment's signed transport_mode as the
-    // sole dial authority — never inferred from address format.
-    const assignment = negotiation.assignment;
-
-    // M8B F13: validate-what-you-receive at the trust boundary. When the responder cannot
-    // proceed it aborts SILENTLY (session-ceremony.ts wireSessionOfferHandler sends nothing)
-    // and the directory folds an EMPTY counterparty endpoint into the FROST-signed
-    // assignment. Accepting that assignment produced a false ok:true + a phantom session
-    // whose failure only surfaced on the first cello_send. Reject it HERE — before any
-    // local session state exists — covering every cause of a missing accept (abort,
-    // offline, crash, timeout) without needing a directory change.
-    if (!assignment.counterparty_session_peer_id) {
-      logger.warn("session.initiate.counterparty_unavailable", {
-        sessionId: Buffer.from(assignment.session_id).toString("hex"),
-        agentName,
-        correlationId,
-      });
-      return {
-        ok: false,
-        reason: "counterparty_unavailable",
-        guidance: "The counterparty did not accept the session offer (it may be offline or unable to receive). No session was established. Verify the counterparty agent is online (its operator can check cello_status), then retry cello_initiate_session.",
-      };
-    }
-
-    const result = await transportSelector.dial(assignment, { correlationId });
-    const sessionId = Buffer.from(assignment.session_id).toString("hex");
-
-    if (!result.ok) {
-      // Terminal: both direct and relay failed (AC-008). Pass the error through.
-      return { ok: false, reason: result.reason, guidance: result.guidance };
-    }
-
-    // SEAM (initiate → DAEMON-004 session-core): transport is now established, but the
-    // session does not yet exist in the daemon's session-core. Without this, initiate
-    // would set up a connection no session can use and a subsequent cello_send would
-    // report session_not_found. Create the DAEMON-004 session node + DB row, bound (via
-    // its connection gater) to the counterparty's negotiated session peer id, so the
-    // session is queryable and usable (cello_send / cello_receive / cello_close_session).
-    //
-    // NOTE (seam 1b, next): the session node N_A created here does NOT yet share the
-    // connection that transportSelector.dial established on the separate transportDialer
-    // node — so its content newStream cannot ride that link until the dial is routed
-    // THROUGH N_A. Tracked as the dialer/session-node reconciliation; this seam only
-    // establishes that initiate creates the session-core session.
-    // The initiator's session row must record WHO this session is with, so an interrupted
-    // initiator session surfaces its counterparty at next login (DOD-INT-1). The public
-    // tool param is `target_pubkey` (the counterparty's K_local) — the same field the
-    // negotiator reads above; `counterparty_pubkey` is the legacy fallback. Reading only
-    // the legacy field stored an EMPTY counterparty on every initiator session.
-    const counterpartyPubkey =
-      typeof params?.target_pubkey === "string"
-        ? params.target_pubkey
-        : typeof params?.counterparty_pubkey === "string"
-          ? params.counterparty_pubkey
-          : "";
-    const counterpartyPeerId = assignment.counterparty_session_peer_id ?? "";
-    // M7 DOD-SPINE-6 / MSG-001-3b: relay witness params from the FROST-signed assignment
-    // + this agent's K_local. N_A connects to the relay and submits message-leaf hashes.
-    const relayParams = await buildRelayConnectParams(agentName, assignment);
-    const created = await sessionNodeManager.createSessionNode(
-      sessionId,
-      agentName,
-      counterpartyPubkey,
-      counterpartyPeerId,
-      correlationId,
-      // Reuse the standing receiver as N_A so its peer id matches the session endpoint the
-      // negotiator advertised — the counterparty's gater admits the dial (WIRE-002).
-      true,
-      relayParams,
-    );
-    if (!created.ok) {
-      return { ok: false, reason: created.reason, guidance: created.guidance };
-    }
-
-    // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
-    // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
-    // the source of truth for dialability (a NATed node advertises a relay-circuit address; a
-    // directly-reachable one — localhost or a public addr — advertises a direct multiaddr), so
-    // attempt the dial whenever the assignment carries counterparty session addrs, regardless
-    // of the transport_mode LABEL (the local selector stub labels everything "relay" even when
-    // the addrs are directly dialable). A failure is NOT fatal: per the dead-channel contract,
-    // the session stays active and a later cello_send queues the content in the durable retry
-    // queue until a route exists (the relay-park path is MSG-001-3b).
-    const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
-    if (counterpartyAddrs.length > 0) {
-      const connected = await sessionNodeManager.connectToCounterparty(agentName, sessionId, counterpartyAddrs);
-      if (!connected.ok) {
-        logger.warn("session.initiate.connect.failed", {
-          sessionId,
-          reason: connected.reason,
-          error: connected.error,
-          transportMode: assignment.transport_mode,
-          correlationId,
-        });
-      }
-    }
-
-    // M8C-CONTACT-1 (D6): "initiating a session to X adds X" — pin at the pubkey the negotiator
-    // actually used (not re-resolved later). DOD-TIER-4 AC3: a deliberate outbound initiate makes the
-    // counterparty KNOWN, provenance 'initiated'. (Not WHITELISTED — auto-accept stays an explicit
-    // cello_contact_set_tier act, design §1.)
-    sessionNodeManager.addContact(agentName, counterpartyPubkey, undefined, "initiated", TIER.KNOWN);
-
-    // AC-007: the session is usable immediately upon (relay) connection — the dcutr
-    // upgrade runs in the background and is intentionally NOT awaited here.
-    return { ok: true, sessionId, transportMode: result.mode, correlationId };
+  // cello_initiate_session (initiate-session-handler.ts). The relay witness is BEST-EFFORT: a
+  // session with no relay still runs on the direct content path. Degraded, never blocked.
+  registerInitiateSessionHandler({
+    handlers,
+    logger,
+    sessionNodeManager,
+    getConnState: (connectionId) => perConnectionState.get(connectionId),
+    resolveCurrentAgent,
+    NO_CURRENT_AGENT_RESPONSE,
+    resolvedSessionNegotiator,
+    transportSelector,
+    autoNatService,
+    buildRelayConnectParams,
+    getRelayCircuitAddress,
   });
 
   // cello_close_session (close-session-handler.ts). Fifteen dependencies — a long list, but a KNOWN
