@@ -1,8 +1,8 @@
 /**
- * CELLO-M7-PERSIST-002 — the daemon's single encrypted store (DEC-1).
+ * The daemon's single encrypted store.
  *
  * The daemon DB is a SQLCipher database (whole-file AES-256 at rest). This module is the ONE
- * engine site: it loads @signalapp/sqlcipher (prebuilt — DEC-1; no compile), opens the DB with a
+ * engine site: it loads @signalapp/sqlcipher (prebuilt — never compiled from source), opens the DB with a
  * PRAGMA key, verifies the key, enables WAL, and presents a thin `DaemonDatabase` adapter so the
  * rest of the daemon (SessionNodeManager, RetryQueue, NonceDedupStore) keeps its node:sqlite-style
  * varargs call sites unchanged.
@@ -13,19 +13,18 @@
  * satisfies them too (used for in-memory test handles and for reading a legacy plaintext DB during
  * migration), and `SqlcipherDatabase` implements them by forwarding varargs as an array.
  *
- * Key custody (DEC-2/DEC-4): the SQLCipher key is a standalone random 32-byte 0600 key file beside
- * the DB. It is NOT derived from K_local (chicken-and-egg — K_local now lives inside the DB). It is
- * the single plaintext key file and replaces the old `sessions.db.transcript-key`.
+ * Key custody: the SQLCipher key is a standalone random 32-byte 0600 key file beside the DB. It is
+ * NOT derived from K_local — that is a chicken-and-egg, since K_local itself lives inside the DB. It
+ * is the ONE plaintext key file on disk.
  *
- * Fail closed (SI-002/AC-011): there is no plaintext fallback anywhere. A wrong/missing key on an
- * existing DB throws `db_encryption_key_mismatch`; the daemon never opens, creates, or migrates to a
- * plaintext store as a fallback.
+ * FAILS CLOSED: there is no plaintext fallback anywhere. A wrong/missing key on an existing DB throws
+ * `db_encryption_key_mismatch`; the daemon never opens, creates, or migrates to a plaintext store as
+ * a fallback.
  *
  * Security invariants:
- *   SI-001: the db key is NEVER logged, serialized, or placed in an error message — only the raw
- *           `PRAGMA key` string uses the hex, and that string is never logged.
- *   SI-003 (M6B-005 parity): WAL mode is enabled only AFTER key verification, so WAL files are
- *           encrypted at rest.
+ *   - The db key is NEVER logged, serialized, or placed in an error message — only the raw
+ *     `PRAGMA key` string uses the hex, and that string is never logged.
+ *   - WAL mode is enabled only AFTER key verification, so WAL files are encrypted at rest.
  */
 
 import { createRequire } from "node:module";
@@ -66,7 +65,7 @@ export interface DaemonDatabase {
   pragma?(source: string, options?: { simple?: boolean }): unknown;
 }
 
-// ─── Tagged error (AC-012 distinct codes) ───────────────────────────────────────
+// ─── Tagged error (distinct code per failure cause) ─────────────────────────────
 
 export type DbErrorCode = "db_encryption_key_mismatch" | "db_sqlcipher_unavailable" | "db_open_failed";
 
@@ -143,8 +142,8 @@ class SqlcipherDatabase implements DaemonDatabase {
 
 // ─── The raw SQLite magic — used to distinguish a plaintext DB from an encrypted one ──
 // A plaintext SQLite file begins with "SQLite format 3\0". A SQLCipher database encrypts the
-// header too, so its first bytes are ciphertext and never match. The migration path (PERSIST-002
-// Unit 6) uses this to detect a pre-story plaintext DB that must be migrated.
+// header too, so its first bytes are ciphertext and never match. The migration path uses this to
+// detect a legacy plaintext DB that must be migrated.
 const SQLITE_MAGIC = Buffer.concat([Buffer.from("SQLite format 3", "latin1"), Buffer.from([0x00])]);
 
 /** True when the file at `dbPath` exists and is an UNENCRYPTED node:sqlite database. */
@@ -166,17 +165,17 @@ export function isPlaintextSqliteFile(dbPath: string): boolean {
   return head.equals(SQLITE_MAGIC);
 }
 
-// ─── Key custody (DEC-2/DEC-4) ───────────────────────────────────────────────────
+// ─── Key custody ─────────────────────────────────────────────────────────────────
 
 /**
  * Resolve the SQLCipher key, generating it on a genuinely fresh install only.
  *
- * Fail-closed matrix (SI-002/AC-011):
+ * Fail-closed matrix:
  *   key present                      → load it (must be 32 bytes).
  *   key absent + DB absent           → generate + persist (0600), proceed (fresh install).
  *   key absent + DB present          → THROW db_encryption_key_mismatch (never overwrite an
  *                                      existing DB with a new key — that would be data loss; and
- *                                      a pre-story PLAINTEXT DB must be migrated first, not opened).
+ *                                      a legacy PLAINTEXT DB must be migrated first, not opened).
  */
 export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
   if (existsSync(keyPath)) {
@@ -209,8 +208,8 @@ export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
     writeSync(fd, key);
     fsyncSync(fd);
   } catch (err) {
-    // Never leave a stray plaintext key fragment on disk if the write/fsync failed partway
-    // (SI-001: the only plaintext key on disk is the one sanctioned key file).
+    // Never leave a stray plaintext key fragment on disk if the write/fsync failed partway — the
+    // only plaintext key on disk is the one sanctioned key file.
     closeSync(fd);
     try {
       unlinkSync(tmp);
@@ -248,9 +247,9 @@ export function resolveDbKey(dbPath: string, keyPath: string): Uint8Array {
 // ─── Open ────────────────────────────────────────────────────────────────────────
 
 /**
- * Load the SQLCipher native module. Exported because the daemon's singleton lock
- * (DOD-SINGLE-DAEMON-1) needs the same engine for its kernel-level file lock — one place that knows
- * how to load the prebuilt, and one error when it will not load.
+ * Load the SQLCipher native module. Exported because the daemon's singleton lock needs the same
+ * engine for its kernel-level file lock — one place that knows how to load the prebuilt, and one
+ * error when it will not load.
  */
 export function loadSignalModule(): SignalModule {
   const require = createRequire(import.meta.url);
@@ -269,7 +268,7 @@ export function loadSignalModule(): SignalModule {
 /**
  * Open `dbPath` as a SQLCipher database keyed by `dbKey`. Verifies the key (reads sqlite_master)
  * and enables WAL after verification. Throws DbEncryptionError on any failure — never returns a
- * plaintext handle (SI-002).
+ * plaintext handle.
  */
 export function openEncryptedDatabase(
   dbPath: string,
@@ -287,9 +286,10 @@ export function openEncryptedDatabase(
     throw new DbEncryptionError("db_open_failed", reason, `Could not open the database file at ${dbPath}.`);
   }
 
-  // SI-001: set the key OUTSIDE the message-bearing try below, so the key hex can never reach a
-  // thrown/logged error string even if a future SQLCipher build echoed the pragma source on error.
-  // A well-formed `key` pragma does not throw; a wrong key surfaces at the verify read instead.
+  // The key is set OUTSIDE the message-bearing try below — keep it there. The key hex must never be
+  // able to reach a thrown/logged error string, even if a future SQLCipher build echoed the pragma
+  // source on error. A well-formed `key` pragma does not throw; a wrong key surfaces at the verify
+  // read instead.
   const keyHex = Buffer.from(dbKey).toString("hex");
   inner.pragma(`key = "x'${keyHex}'"`);
 
@@ -302,8 +302,8 @@ export function openEncryptedDatabase(
     } catch {
       /* ignore */
     }
-    // Deliberately do NOT echo the underlying SQLITE message into guidance verbatim — but DO log
-    // nothing here (the caller logs). SI-001: no key material in the message.
+    // Do NOT echo the underlying SQLITE message into guidance verbatim, and log nothing here (the
+    // caller logs). No key material may appear in the message.
     const reason = err instanceof Error ? err.message : String(err);
     throw new DbEncryptionError(
       "db_encryption_key_mismatch",
@@ -312,7 +312,7 @@ export function openEncryptedDatabase(
     );
   }
 
-  // SI-003 (M6B-005 parity): WAL only AFTER key verification, so WAL/SHM files are encrypted.
+  // WAL only AFTER key verification, so WAL/SHM files are encrypted.
   try {
     const mode = inner.pragma("journal_mode=WAL", { simple: true });
     if (mode !== "wal") {
@@ -345,7 +345,7 @@ export function openEncryptedDatabaseAtPath(dbPath: string, keyPath?: string): D
   return openEncryptedDatabase(dbPath, new Uint8Array(key));
 }
 
-/** The key file path the daemon uses for a given DB path (DEC-2: one plaintext key file). */
+/** The key file path the daemon uses for a given DB path — the one plaintext key file. */
 export function dbKeyPathFor(dbPath: string): string {
   return `${dbPath}.key`;
 }

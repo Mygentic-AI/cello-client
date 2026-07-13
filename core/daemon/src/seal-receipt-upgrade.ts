@@ -1,5 +1,5 @@
 /**
- * M8B FINDING-6 (cascade-2) — client-side bilateral upgrade of a stored seal receipt.
+ * Client-side bilateral upgrade of a stored seal receipt.
  *
  * When the previously-absent party (B) ratifies a unilateral seal and the directory confirms the
  * upgrade to bilateral (seal_upgrade_confirmed, cryptographically verified via verifyUpgradeConfirmedCert),

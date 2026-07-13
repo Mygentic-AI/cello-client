@@ -1,10 +1,9 @@
 /**
  * Agent identity loader for the CELLO daemon.
  *
- * CELLO-M7-PERSIST-002 (AC-007): agents are enumerated from the encrypted `agents` table — ONE
- * loading path. The legacy flat-file paths (`~/.cello/agents/<name>/key` and the single-file
- * `~/.cello/key` "default" fallback) are gone; any pre-story key files are imported into the
- * `agents` table by the one-time migration (identity-migration.ts) before this loader runs.
+ * Agents are enumerated from the encrypted `agents` table — ONE loading path. There is no flat-file
+ * fallback: on-disk key files are imported into the `agents` table by the one-time migration
+ * (identity-migration.ts) before this loader runs.
  *
  * Each agent's K_local Ed25519 seed is stored as a BLOB column; the loader builds a sign-only
  * InMemoryKeyProvider from it (the private scalar never leaves the provider — only signatures and

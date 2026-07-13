@@ -1,10 +1,9 @@
 /**
  * IPC Proxy — thin client for connecting cello-mcp to the daemon.
  *
- * RECONNECT-001: the proxy survives a daemon restart. Previously a restart closed the socket, set
- * a permanent `#dead` flag, and every subsequent tool call returned `ipc_connection_lost` forever —
- * the operator's cello_* tools silently vanished behind an error that named no remedy. It orphaned
- * every connected agent at once (Claude Code and Hermes alike).
+ * RECONNECT-001: the proxy SURVIVES a daemon restart. A dropped socket reconnects with backoff; it
+ * must never latch a permanent dead flag, which would make every subsequent tool call return
+ * `ipc_connection_lost` forever and orphan every connected agent at once.
  *
  * Two invariants the reconnect must not break:
  *
@@ -17,15 +16,6 @@
  *  2. **Never replay an in-flight request.** `cello_send` is not idempotent; a silent retry would
  *     double-send a message. In-flight calls resolve as `ipc_connection_lost` and the caller retries
  *     explicitly. Only the handshake — which IS idempotent — is replayed.
- *
- * Pseudocode:
- * 1. connect(): open the socket; reject on ENOENT/ECONNREFUSED so startup still fails fast.
- * 2. call(method, params):
- *    a. closed by us → ipc_connection_lost immediately
- *    b. disconnected → await reconnection (bounded); on timeout → ipc_connection_lost
- *    c. write { id, method, params } + '\n'; await the response by id
- * 3. On unexpected close: fail every pending request, then reconnect with backoff and replay
- *    the handshake. On close(): stay dead.
  */
 
 import { createConnection, type Socket } from "node:net";
@@ -61,10 +51,10 @@ const IPC_DESERIALIZATION_ERROR = {
     "The daemon sent a malformed response — this may be transient. Retry your operation. If the error persists, run `cello-mcp --version` and `cello status` to check for a version mismatch between cello-mcp and the running daemon.",
 };
 
-// CELLO-M7-MSG-001: must stay in sync with ipc-server.ts MAX_BUFFER_SIZE. Raised to
-// 4 MB so a max-size (1 MB) cello_send content message + JSON envelope traverses IPC and
-// reaches the daemon's content_too_large check, instead of tripping a fatal buffer
-// overflow at the 1 MB content cap boundary.
+// CELLO-M7-MSG-001: must stay in sync with ipc-server.ts MAX_BUFFER_SIZE. It is 4 MB so that a
+// max-size (1 MB) cello_send content message + JSON envelope traverses IPC and reaches the daemon's
+// content_too_large check, instead of tripping a fatal buffer overflow at the 1 MB content cap
+// boundary.
 const MAX_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB — matches IPC server limit
 
 const RECONNECT_BASE_DELAY_MS = 200;

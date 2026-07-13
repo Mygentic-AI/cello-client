@@ -1,15 +1,13 @@
 /**
  * FROST Threshold Signing Abstraction — Type Definitions
  *
- * CELLO-CRYPTO-003
- *
  * Design decisions:
  * - `IThresholdSigner` is separate from `KeyProvider`. `KeyProvider` handles K_local
  *   envelope signing; `IThresholdSigner` handles the multi-party threshold ceremony.
  * - Domain context strings (one per message-type this ceremony machinery signs):
  *   - "cello-frost-session-establishment-v1" — session establishment TBS
  *   - "cello-frost-seal-v1"                 — conversation seal TBS
- *   - "cello-frost-primary-release-v1"      — M8C-PRIMARY-1 device-transfer release attestation
+ *   - "cello-frost-primary-release-v1"      — device-transfer release attestation
  * - Context is prepended to the TBS before signing to achieve domain separation.
  *   FROST over ed25519 does not support a native context parameter, so we use
  *   a framed encoding: `<context>\0<tbs>`.
@@ -23,13 +21,14 @@ export const CONTEXT_SESSION_ESTABLISHMENT =
   "cello-frost-session-establishment-v1" as const;
 export const CONTEXT_SEAL = "cello-frost-seal-v1" as const;
 /**
- * M8C-PRIMARY-1: the old Primary's "share released" attestation during a device-transfer, per
- * docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 3, Pass 3). Reuses the existing
- * ceremony machinery unchanged — only a new domain-separation string, so a signature produced for
- * this context can never be replayed as a real seal or session-establishment signature, and vice
- * versa. Requires the signer's OWN local FROST share to be loaded (participateInCeremony throws
- * otherwise) — this is exactly what distinguishes a genuine old Primary (which held the share)
- * from a Standby that received only K_local via pairing and never the share.
+ * The old Primary's "share released" attestation during a device-transfer, per
+ * docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 3). It rides the same ceremony
+ * machinery as the other contexts — the only difference is this domain-separation string, so a
+ * signature produced for this context can never be replayed as a real seal or session-establishment
+ * signature, and vice versa. Requires the signer's OWN local FROST share to be loaded
+ * (participateInCeremony throws otherwise) — this is exactly what distinguishes a genuine old
+ * Primary (which held the share) from a Standby that received only K_local via pairing and never
+ * the share.
  */
 export const CONTEXT_PRIMARY_RELEASE = "cello-frost-primary-release-v1" as const;
 

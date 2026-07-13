@@ -1,20 +1,10 @@
 #!/usr/bin/env node
 /**
- * cello-mcp — thin stdio-to-IPC proxy (M7)
+ * cello-mcp — thin stdio-to-IPC proxy.
  *
  * Connects to the running CELLO daemon via ~/.cello/daemon.sock and proxies
  * all MCP tool calls through IPC. Holds no key material, opens no database,
  * creates no libp2p node. Per-connection agent state is managed by the daemon.
- *
- * Startup:
- *   1. --version flag
- *   2. TTY detection (print "run cello login first")
- *   3. Connect to daemon IPC socket
- *   4. If ENOENT/ECONNREFUSED → exit 1 with daemon_not_running
- *   5. Send ipc.connect frame
- *   6. Open MCP stdio server
- *   7. Register IPC proxy for every tool
- *   8. On socket close → ipc_connection_lost for all subsequent calls
  */
 
 import { homedir } from "node:os";
@@ -23,7 +13,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 import { buildChannelParams } from "../channel-params.js";
 
-// AC-020 (1): --version flag — exit cleanly with the package version.
+// --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
 if (process.argv.includes("--version") || process.argv.includes("-v")) {
   const { createRequire: cr } = await import("node:module");
@@ -33,7 +23,7 @@ if (process.argv.includes("--version") || process.argv.includes("-v")) {
   process.exit(0);
 }
 
-// AC-020 (2): TTY detection — if stdin is a TTY, print instructions and exit.
+// TTY detection — if stdin is a TTY, print instructions and exit.
 if (process.stdin.isTTY) {
   const { createRequire: cr } = await import("node:module");
   const req = cr(import.meta.url);
@@ -53,12 +43,12 @@ if (process.stdin.isTTY) {
 
 // Resolve CELLO_DIR once (honored exactly as cello-daemon and the cello CLI do) and
 // ensure it exists. Used for BOTH the diagnostics log and the daemon socket below, so
-// every per-home isolation boundary CELLO_DIR establishes is respected — including the
-// stderr tee, which previously went to a single global /tmp file shared across homes.
+// every per-home isolation boundary CELLO_DIR establishes is respected — the stderr tee
+// included, which must never land in a single global file shared across homes.
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
 mkdirSync(celloDir, { recursive: true });
 
-// AC-020 (3): Tee stderr to a log file under the home for diagnostics.
+// Tee stderr to a log file under the home for diagnostics.
 const stderrLog = createWriteStream(join(celloDir, "cello-mcp-stderr.log"), { flags: "a" });
 const origWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write;
 process.stderr.write = (
@@ -133,7 +123,7 @@ const server = new McpServer(
   },
   // CELLO-M8C-WAKE-001 (channel stage 1): declare the claude/channel capability so a `--channels`
   // Claude Code session negotiates it and the daemon's doorbell notifications reach the model's
-  // context (mirrors the legacy in-process server.ts). Content never rides — see the bridge below.
+  // context. Content never rides — see the bridge below.
   { capabilities: { experimental: { "claude/channel": {} } } },
 );
 
@@ -384,8 +374,8 @@ proxy.onNotification((frame) => {
   const type = typeof data["type"] === "string" ? (data["type"] as string) : String(frame["notification"]);
   const agent = data["agent"];
   // Translate the raw daemon frame into Claude Code's channel contract: `{ content, meta }`.
-  // Forwarding the bare frame as `params` (no `content`) is why the doorbell never surfaced —
-  // Claude Code needs a `content` field to render the <channel> tag body (BUILD-JOURNAL Entry 43).
+  // Claude Code needs a `content` field to render the channel tag body — forwarding the bare frame
+  // as `params` (no `content`) means the doorbell never surfaces at all.
   // buildChannelParams synthesizes a content-free announcement; message content still never rides.
   const params = buildChannelParams(data);
   server.server

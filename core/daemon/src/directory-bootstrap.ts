@@ -1,12 +1,10 @@
 /**
- * M7 Keystone (Part 1) — directory endpoint bootstrap for the daemon.
+ * Directory endpoint bootstrap for the daemon.
  *
- * Ports the proven M6 bootstrap path from the cello-mcp adapter
- * (core/adapter-claude-code/src/config.ts) into the daemon, which is the cello
- * client going forward. The daemon must not depend on the adapter (the adapter
- * sits ABOVE the daemon as a thin IPC proxy), so the logic lives here.
+ * The logic lives here, not in the adapter: the daemon must not depend on the
+ * adapter, which sits ABOVE it as a thin IPC proxy.
  *
- * Mechanism (unchanged from M6):
+ * Mechanism:
  *   1. resolveDirectoryUrl(env): CELLO_DIRECTORY_URL or the production ALB URL.
  *   2. GET ${url}/bootstrap → { multiaddr } containing "/p2p/<peerId>".
  *   3. The peer ID is the segment after the final "/p2p/" in the multiaddr.
@@ -26,7 +24,7 @@ export const PRODUCTION_DIRECTORY_URL = "http://directory-us1.cello.mygentic.ai"
 
 /**
  * Resolve the directory URL from the environment, falling back to the production
- * endpoint when CELLO_DIRECTORY_URL is not set. Matches the M6 adapter contract.
+ * endpoint when CELLO_DIRECTORY_URL is not set.
  */
 export function resolveDirectoryUrl(env: Record<string, string | undefined> = process.env): string {
   return env["CELLO_DIRECTORY_URL"] ?? PRODUCTION_DIRECTORY_URL;
@@ -69,7 +67,7 @@ export function parsePeerIdFromMultiaddr(multiaddr: string): string | null {
   return peerId && peerId.length > 0 ? peerId : null;
 }
 
-// ─── DOD-MANIFEST-1: consortium manifest node set → N directory endpoints ──────
+// ─── Consortium manifest node set → N directory endpoints ──────
 
 /** A resolved consortium directory node: its manifest identity + live dial coordinate. */
 export interface ConsortiumEndpoint {
@@ -87,12 +85,12 @@ export interface ConsortiumEndpoint {
  * Validate + normalise a manifest node `endpoint` to the HTTP(S) base used for its
  * `/bootstrap` probe, or return `null` if it is not a usable bootstrap base.
  *
- * CONTRACT (M8B-DECISIONS): a manifest `endpoint` is the node's HTTP(S) `/bootstrap`
- * base — production directories serve `/bootstrap` over plaintext HTTP behind the ALB
- * (matching PRODUCTION_DIRECTORY_URL, which is `http://…:80`). The wss libp2p DIAL
- * address is returned BY `/bootstrap`; it is NOT the endpoint. So we deliberately do
- * NOT accept (or port-guess) a `wss://host:443` value — mapping that to
- * `http://host:443` would speak plaintext to the TLS port and silently fail. Anything
+ * CONTRACT: a manifest `endpoint` is the node's HTTP(S) `/bootstrap` base — production
+ * directories serve `/bootstrap` over plaintext HTTP behind the ALB (matching
+ * PRODUCTION_DIRECTORY_URL, which is `http://…:80`). The wss libp2p DIAL address is
+ * returned BY `/bootstrap`; it is NOT the endpoint. Do NOT accept (or port-guess) a
+ * `wss://host:443` value — mapping that to `http://host:443` speaks plaintext to the
+ * TLS port and silently fails. Anything
  * that is not `http(s)://` (a bare multiaddr, a wss dial address, a typo) is a config
  * error in officer-SIGNED data: return null so the caller logs it DISTINCTLY from a
  * transient outage and never dials a wrong port. A single trailing slash is stripped
@@ -114,7 +112,7 @@ export interface ManifestResolveOptions {
  * Resolve every consortium node in the manifest's node set to a live directory
  * endpoint by probing each node's `/bootstrap` (in parallel, order preserved).
  *
- * AVAILABILITY-AWARE (CLAUDE.md redundancy invariant): a node whose bootstrap is
+ * AVAILABILITY-AWARE (the sovereign-node redundancy invariant): a node whose bootstrap is
  * unreachable is SKIPPED with a warning — one node down must never strand the others,
  * because a T-of-N ceremony only needs T of the N. Returns the resolved subset
  * (possibly empty). The CALLER decides whether the resolved count meets the threshold;
@@ -167,12 +165,11 @@ export interface DirectoryEndpointResolverOptions {
   /**
    * Whether a fresh /bootstrap failure falls back to the last known-good endpoint (default true).
    *
-   * FINDING-4: set FALSE when this resolver is used as the PRIMARY probe inside
-   * createRosterAwareEndpointResolver. There, the stale-last-known-good fallback is HARMFUL — it
-   * masks a dead primary (a fresh failure returns the cached dead endpoint, so the wrapper never
-   * observes the primary as "down" and never fails over to the roster). With staleFallback:false a
-   * fresh failure returns null, and the roster becomes the real (and only) fallback. The default
-   * (true) preserves the M6/single-node backward-compat behavior for callers that are NOT wrapped.
+   * MUST be FALSE when this resolver is the PRIMARY probe inside createRosterAwareEndpointResolver.
+   * There, the stale-last-known-good fallback is HARMFUL — it masks a dead primary (a fresh failure
+   * returns the cached dead endpoint, so the wrapper never observes the primary as "down" and never
+   * fails over to the roster). With staleFallback:false a fresh failure returns null, and the roster
+   * becomes the real (and only) fallback. The default (true) is for unwrapped single-node callers.
    */
   staleFallback?: boolean;
 }
@@ -221,7 +218,7 @@ export function createDirectoryEndpointResolver(
   };
 }
 
-// ─── FINDING-4: roster-aware directory failover (bootstrap SPOF fix) ────────────
+// ─── Roster-aware directory failover (no bootstrap SPOF) ────────────
 
 export interface RosterAwareResolverOptions {
   /**
@@ -232,15 +229,15 @@ export interface RosterAwareResolverOptions {
   /**
    * Resolve the CURRENTLY-REACHABLE consortium roster. Each member returned has already
    * had its /bootstrap probed (manifestNodesToEndpoints skips unreachable nodes), so a
-   * member's presence in the returned array IS its reachability. NULL on the M6/M7
-   * back-compat path (no consortium manifest configured) → no failover, primary-only.
+   * member's presence in the returned array IS its reachability. NULL when no consortium
+   * manifest is configured → no failover, primary-only.
    */
   getConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
   logger: Logger;
   /**
    * Test seam: order the fallback candidates. Production defaults to a Fisher-Yates
-   * shuffle so clients don't stampede one node when the primary goes down (CLAUDE.md
-   * redundancy invariant). Tests inject an identity shuffle for deterministic ordering.
+   * shuffle so clients don't stampede one node when the primary goes down (the redundancy
+   * invariant). Tests inject an identity shuffle for deterministic ordering.
    */
   shuffle?: <T>(items: T[]) => T[];
 }
@@ -259,7 +256,7 @@ function fisherYatesShuffle<T>(items: T[]): T[] {
  * Wrap a single-node primary resolver with the consortium roster so the signaling
  * dialer (and the ceremony endpoint that shares this instance) route AROUND a down
  * primary directory node instead of retrying the single primary URL forever — the
- * FINDING-4 bootstrap SPOF fix, honoring the sovereign-node REDUNDANCY invariant.
+ * sovereign-node REDUNDANCY invariant.
  *
  * Selection policy, per getDirectoryEndpoint() call:
  *   1. Sticky-until-fail — while riding a non-primary fallback, KEEP it as long as it's
@@ -280,12 +277,11 @@ function fisherYatesShuffle<T>(items: T[]): T[] {
  * getDirectoryEndpoint so signaling + ceremonies stay on the SAME directory node and
  * fail over together (a coherent per-daemon directory selection).
  *
- * Scope note (FINDING-4 sufficiency, unproven): stickiness here is by ROSTER
- * REACHABILITY, not by observed connect success — the resolver is not told whether a
- * dial/auth against the returned endpoint actually succeeded. A node whose /bootstrap
- * resolves is served by that same node, so resolvable ≈ connectable in practice; the
- * live kill-primary failover test is the real proof that presence resolution, relay
- * assignment, and the FROST ceremony all work against a non-home directory.
+ * Scope note: stickiness here is by ROSTER REACHABILITY, not by observed connect success
+ * — the resolver is not told whether a dial/auth against the returned endpoint actually
+ * succeeded. A node whose /bootstrap resolves is served by that same node, so resolvable ≈
+ * connectable in practice; only a live kill-primary failover test proves that presence
+ * resolution, relay assignment, and the FROST ceremony all work against a non-home directory.
  */
 export function createRosterAwareEndpointResolver(
   opts: RosterAwareResolverOptions,

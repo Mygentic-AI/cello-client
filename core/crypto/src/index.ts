@@ -49,7 +49,9 @@ export {
   applyRefreshToLocalShare,
 } from "./frost/frost-threshold-signer.js";
 
-// REG-001: re-export ed25519_FROST for DKG coordinator in @cello-protocol/client
+// LIVE, load-bearing: core/daemon's network-directory-node imports ed25519_FROST FROM THIS RE-EXPORT
+// to run the client-side DKG (DKG.round1/round2/round3). It has no in-package caller, so a grep of
+// core/crypto alone makes it look dead. It is not. Do not remove it.
 export { ed25519_FROST } from "@noble/curves/ed25519.js";
 
 // FEDERATION-002: canonical checkpoint TBS serialization and hash computation

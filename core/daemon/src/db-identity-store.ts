@@ -1,20 +1,16 @@
 /**
- * CELLO-M7-PERSIST-002 — DB-backed identity store (the `agents` table).
+ * DB-backed identity store (the `agents` table).
  *
  * Every piece of an agent's persisted identity — the K_local Ed25519 seed, the ML-DSA keypair, the
  * FROST signing share, the registration record, and the agent↔user link — lives as ONE row of the
- * `agents` table in the SQLCipher-encrypted daemon DB. This replaces the per-agent plaintext flat
- * files (`agents/<name>/key`, `frost-share.json`, `ml-dsa-keypair.json`, `registration-state.json`,
- * `agent-user-link.json`).
+ * `agents` table in the SQLCipher-encrypted daemon DB. There is no flat-file home for any of it.
  *
- * `DbRegistrationPersistence` implements the SAME `DaemonRegistrationPersistence` interface the
- * daemon's RegistrationManager and the ceremony/seal signer-reconstruction already consume — so the
- * call sites change only their construction (a DB handle + agent name instead of an `agentDir`), not
- * their behaviour. Writes are AWAITED single-row UPSERTs (SI-003: a register-success implies a
- * durably committed row — fixing the old fire-and-forget at registration-manager.ts:229).
+ * `DbRegistrationPersistence` implements the `DaemonRegistrationPersistence` interface the daemon's
+ * RegistrationManager and the ceremony/seal signer-reconstruction consume. Writes are AWAITED
+ * single-row UPSERTs — never fire-and-forget — so a register-success implies a durably committed row.
  *
  * The K_local seed and FROST/ML-DSA secrets are stored as BLOB columns inside the encrypted DB; they
- * are NEVER written to a flat file and NEVER logged (SI-001). The row is the only home.
+ * are NEVER written to a flat file and NEVER logged. The row is the only home.
  */
 
 import { randomUUID } from "node:crypto";
@@ -32,26 +28,26 @@ import type {
 const ML_DSA_ALGORITHM = "ML-DSA-44";
 
 /**
- * The `agents` schema (CELLO-M7-REMOVE-001 DOD-REMOVE-1). The store is keyed by a STABLE `agent_id`,
- * not by `agent_name` — guardrail #1: durable identity hangs off agent_id; the human name and the
- * pubkey are mutable ATTRIBUTES. A partial unique index makes `agent_name` unique only among
- * NON-retired rows, so removal (state='retired') frees the name for reuse while the retired identity
- * survives for accountability (SI-002). `state`: 'created' | 'registered' | 'retired'.
+ * The `agents` schema. The store is keyed by a STABLE `agent_id`, never by `agent_name` — durable
+ * identity hangs off agent_id; the human name and the pubkey are mutable ATTRIBUTES. A partial unique
+ * index makes `agent_name` unique only among NON-retired rows, so removal (state='retired') frees the
+ * name for reuse while the retired identity survives for accountability.
+ * `state`: 'created' | 'registered' | 'retired'.
  */
 const CREATE_AGENTS_SQL = `
   CREATE TABLE IF NOT EXISTS agents (
     agent_id               TEXT PRIMARY KEY,
     agent_name             TEXT NOT NULL,
-    -- K_local Ed25519 identity (PERSIST-002: seed moves from agents/<name>/key into this BLOB).
+    -- K_local Ed25519 identity: the seed lives ONLY in this BLOB, never on the filesystem.
     k_local_seed           BLOB NOT NULL,
     k_local_pubkey         TEXT NOT NULL,
-    -- lifecycle: 'created' (K_local exists, not yet registered) | 'registered' | 'retired' (REMOVE-001).
+    -- lifecycle: 'created' (K_local exists, not yet registered) | 'registered' | 'retired'.
     state                  TEXT NOT NULL DEFAULT 'created',
-    -- ML-DSA keypair (was ml-dsa-keypair.json).
+    -- ML-DSA keypair.
     ml_dsa_pubkey          TEXT,
     ml_dsa_secret          BLOB,
     ml_dsa_algorithm       TEXT,
-    -- FROST signing share (was frost-share.json).
+    -- FROST signing share.
     frost_epoch_id         TEXT,
     frost_primary_pubkey   TEXT,
     frost_identifier       TEXT,
@@ -61,19 +57,19 @@ const CREATE_AGENTS_SQL = `
     frost_commitments      BLOB,
     frost_verifying_shares BLOB,
     frost_dkg_method       TEXT,
-    -- M8B quorum: JSON array of the directory nodeIds (Q) the DKG ran among, so a restored signer
-    -- targets the actual share-holders (not the full live roster). NULL for pre-quorum agents.
+    -- JSON array of the directory nodeIds (Q) the DKG ran among, so a restored signer targets the
+    -- actual share-holders, not the full live roster. NULL for agents registered before quorum DKG.
     frost_directory_node_ids TEXT,
-    -- MONIKER-1: optional outbound-name override. The outbound name defaults to agent_name; this
-    -- column only holds an explicit override. Local-only — never sent to the directory (AC4).
+    -- Optional outbound-name override. The outbound name defaults to agent_name; this column only
+    -- holds an explicit override. Local-only — never sent to the directory.
     moniker                TEXT,
-    -- registration record (was registration-state.json).
+    -- registration record.
     reg_agent_id           TEXT,
     reg_primary_pubkey     TEXT,
     reg_ml_dsa_pubkey      TEXT,
     reg_registered_at      INTEGER,
     reg_status             TEXT,
-    -- agent↔user link captured at registration (was agent-user-link.json).
+    -- agent↔user link captured at registration.
     link_agent_id          TEXT,
     link_pre_auth_token    TEXT,
     link_linked_at         INTEGER,
@@ -86,8 +82,8 @@ const CREATE_AGENTS_SQL = `
 const CREATE_ACTIVE_NAME_INDEX_SQL =
   "CREATE UNIQUE INDEX IF NOT EXISTS agents_active_name ON agents(agent_name) WHERE state != 'retired'";
 
-// The columns of the PRE-REMOVE-001 `agents` table (agent_name PK, no agent_id), in order. Used to
-// copy rows verbatim during the one-time re-key rebuild.
+// The columns of the legacy `agents` table (agent_name PK, no agent_id), in order. Used to copy rows
+// verbatim during the one-time re-key rebuild.
 const PRE_REKEY_COLUMNS = [
   "agent_name",
   "k_local_seed",
@@ -118,11 +114,11 @@ const PRE_REKEY_COLUMNS = [
 ] as const;
 
 /**
- * One-time re-key of a PRE-REMOVE-001 `agents` table (PRIMARY KEY agent_name, no agent_id) to the new
- * stable-agent_id shape. Rebuilds the table, backfilling a fresh agent_id per existing row. Runs at
- * most once — `ensureIdentitySchema` guards it behind a column-presence check — and is wrapped in a
- * transaction so a crash mid-rebuild leaves the original table intact. Works on node:sqlite (in-memory
- * test handles) and SQLCipher alike.
+ * One-time re-key of a legacy `agents` table (PRIMARY KEY agent_name, no agent_id) to the stable
+ * agent_id shape. Rebuilds the table, backfilling a fresh agent_id per existing row. Runs at most once
+ * — `ensureIdentitySchema` guards it behind a column-presence check — and is wrapped in a transaction
+ * so a crash mid-rebuild leaves the original table intact. Works on node:sqlite (in-memory test
+ * handles) and SQLCipher alike.
  */
 function rebuildAgentsToAgentIdPk(db: DaemonDatabase): void {
   const cols = PRE_REKEY_COLUMNS.join(", ");
@@ -145,26 +141,26 @@ function rebuildAgentsToAgentIdPk(db: DaemonDatabase): void {
 /**
  * Idempotent schema for the identity store. Called once at daemon init AND defensively by each
  * DbRegistrationPersistence constructor, so the store works whether or not the composition root has
- * run its own ensure. Creates the table on a fresh DB, re-keys a pre-REMOVE-001 table to the
- * stable-agent_id shape once, and (always) ensures the active-name partial unique index.
+ * run its own ensure. Creates the table on a fresh DB, re-keys a legacy table to the stable agent_id
+ * shape once, and (always) ensures the active-name partial unique index.
  */
 export function ensureIdentitySchema(db: DaemonDatabase): void {
   const cols = db.prepare("PRAGMA table_info(agents)").all() as Array<{ name: string }>;
   if (cols.length === 0) {
     db.exec(CREATE_AGENTS_SQL);
   } else if (!cols.some((c) => c.name === "agent_id")) {
-    // A pre-REMOVE-001 table exists (agent_name PK). Re-key it once to the stable-agent_id shape.
+    // A legacy table exists (agent_name PK). Re-key it once to the stable agent_id shape.
     rebuildAgentsToAgentIdPk(db);
   } else {
     // Additive columns on an existing agent_id table (fresh/rebuilt tables already have them via
     // CREATE_AGENTS_SQL). SQLite has no ADD COLUMN IF NOT EXISTS, so each is PRAGMA-guarded — and
     // each guard is an INDEPENDENT `if`: a table missing several must receive every ALTER.
     if (!cols.some((c) => c.name === "frost_directory_node_ids")) {
-      // M8B quorum. Nullable → pre-quorum agents keep the full-roster fallback; no data touched.
+      // Nullable → agents predating quorum DKG keep the full-roster fallback; no data touched.
       db.exec("ALTER TABLE agents ADD COLUMN frost_directory_node_ids TEXT");
     }
     if (!cols.some((c) => c.name === "moniker")) {
-      // MONIKER-1: outbound-name override. Nullable → existing agents keep the agent-name default.
+      // Outbound-name override. Nullable → existing agents keep the agent-name default.
       db.exec("ALTER TABLE agents ADD COLUMN moniker TEXT");
     }
   }
@@ -173,7 +169,7 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
 }
 
 /**
- * CELLO-M8-TRUST-001: received trust signals — the daemon's local copy of a signal it pulled from the
+ * Received trust signals — the daemon's local copy of a signal it pulled from the
  * directory pickup queue, opened (k_local), and HASH-VERIFIED against the directory anchor. Keyed by
  * signal_hash (the verification anchor) → storing the same signal twice is idempotent. The payload is
  * the recovered plaintext JSON — the ONLY plaintext copy of the signal (the server side holds only
@@ -194,9 +190,9 @@ const toBytes = (v: unknown): Uint8Array =>
   v instanceof Uint8Array ? new Uint8Array(v) : Buffer.isBuffer(v) ? new Uint8Array(v) : new Uint8Array(0);
 
 /**
- * Row CRUD for the K_local identity — used by the agent-creation path (AC-004) and the DB-backed
- * agent loader (AC-007). Separate from the registration-persistence seam because it owns the
- * seed/lifecycle, not the registration material.
+ * Row CRUD for the K_local identity — used by the agent-creation path and the DB-backed agent loader.
+ * Separate from the registration-persistence seam because it owns the seed/lifecycle, not the
+ * registration material.
  */
 export interface AgentRow {
   agentId: string;
@@ -217,7 +213,7 @@ export class DbIdentityStore {
   }
 
   /**
-   * CELLO-M8-TRUST-001: store a received + verified trust signal. Idempotent on signal_hash (the same
+   * Store a received + verified trust signal. Idempotent on signal_hash (the same
    * signal delivered/pulled twice stores once). `payload` is the recovered plaintext JSON.
    */
   storeTrustSignal(args: { signalHash: string; agentId: string | null; signalKind: string; payload: Uint8Array }): void {
@@ -229,7 +225,7 @@ export class DbIdentityStore {
       .run(args.signalHash, args.agentId, args.signalKind, toBuf(args.payload), Date.now());
   }
 
-  /** Read a stored trust signal back by its hash anchor (TRUST-001 — proves local storage). */
+  /** Read a stored trust signal back by its hash anchor. */
   getTrustSignal(signalHash: string): { signalKind: string; payload: Uint8Array } | null {
     const row = this.#db
       .prepare("SELECT signal_kind, payload FROM trust_signals WHERE signal_hash = ?")
@@ -246,10 +242,10 @@ export class DbIdentityStore {
   }
 
   /**
-   * Create a new agent row holding a fresh K_local seed (AC-004), keyed by a freshly-minted stable
-   * agent_id (REMOVE-001 DOD-REMOVE-1; guardrail #1). Explicit only — callers generate the seed
-   * (crypto) and pass it in. Throws if an ACTIVE agent already holds the name (no silent overwrite); a
-   * RETIRED row with the same name does NOT block — the name has been freed. Returns the new agent_id.
+   * Create a new agent row holding a fresh K_local seed, keyed by a freshly-minted stable agent_id.
+   * Explicit only — callers generate the seed (crypto) and pass it in. Throws if an ACTIVE agent
+   * already holds the name (no silent overwrite); a RETIRED row with the same name does NOT block —
+   * the name has been freed. Returns the new agent_id.
    */
   createAgent(agentName: string, kLocalSeed: Uint8Array, kLocalPubkeyHex: string): string {
     if (this.hasActiveAgent(agentName)) {
@@ -263,16 +259,16 @@ export class DbIdentityStore {
          VALUES (?, ?, ?, ?, 'created', ?, ?)`,
       )
       .run(agentId, agentName, toBuf(kLocalSeed), kLocalPubkeyHex, now, now);
-    // SI-001: the seed is NEVER logged — only the agent name, the agent_id, and the PUBLIC key.
+    // The seed is NEVER logged — only the agent name, the agent_id, and the PUBLIC key.
     this.#logger.info("persist.identity.created", { agentName, agentId, agentPubkey: kLocalPubkeyHex });
     return agentId;
   }
 
   /**
-   * Retire (REMOVE-001 DOD-REMOVE-1): flip the ACTIVE row for `agentName` to state='retired' WITHOUT
-   * deleting the row, its keys, or its history (SI-002 — accountability survives). One-way. The name
-   * is freed (the partial unique index excludes retired rows). Returns the retired agent_id, or null if
-   * there was no active agent with that name (fail-loud at the caller).
+   * Retire: flip the ACTIVE row for `agentName` to state='retired' WITHOUT deleting the row, its keys,
+   * or its history — accountability must survive a removal. One-way. The name is freed (the partial
+   * unique index excludes retired rows). Returns the retired agent_id, or null if there was no active
+   * agent with that name (fail-loud at the caller).
    */
   retireAgent(agentName: string): string | null {
     const active = this.#db
@@ -287,9 +283,9 @@ export class DbIdentityStore {
   }
 
   /**
-   * Read the row to act on for a removal / directory-revocation re-push (REMOVE-001 DOD-REMOVE-2): the
-   * ACTIVE row for the name if one exists (a fresh removal), else the MOST-RECENTLY-retired row (a
-   * re-push of an already-retired agent whose directory revocation did not land — DB-001). Includes the
+   * Read the row to act on for a removal / directory-revocation re-push: the ACTIVE row for the name if
+   * one exists (a fresh removal), else the MOST-RECENTLY-retired row (a re-push of an already-retired
+   * agent whose directory revocation did not land). Includes the
    * K_local seed (to re-sign the revocation) and the DIRECTORY-known reg_agent_id (what the directory is
    * asked to revoke; null if the agent was never registered). Returns null if no row with this name
    * exists at all.
@@ -315,7 +311,7 @@ export class DbIdentityStore {
   /**
    * Enumerate ACTIVE agents (agent_id + name + seed + pubkey + state) for the daemon's startup loader.
    * Retired rows are EXCLUDED — they must never be resurrected into the runtime — but remain in the DB
-   * and are readable directly for accountability (SI-002).
+   * and are readable directly for accountability.
    */
   listAgents(): AgentRow[] {
     const rows = this.#db
@@ -333,7 +329,7 @@ export class DbIdentityStore {
   }
 
   /**
-   * MONIKER-1 AC2/AC3: set (or clear, via null) the outbound-name override on the ACTIVE row.
+   * Set (or clear, via null) the outbound-name override on the ACTIVE row.
    * Returns false when no active agent holds the name (fail-loud at the caller — never a silent
    * no-op success). THROWS on an invalid moniker: callers validate first for a friendly error;
    * this is the backstop that makes "an invalid value can never be stored" true at the lowest layer.
@@ -348,7 +344,7 @@ export class DbIdentityStore {
     return Number(res.changes) > 0;
   }
 
-  /** MONIKER-1: the stored override for the ACTIVE agent, or null (no override / no such agent). */
+  /** The stored override for the ACTIVE agent, or null (no override / no such agent). */
   getMoniker(agentName: string): string | null {
     const row = this.#db
       .prepare("SELECT moniker FROM agents WHERE agent_name = ? AND state != 'retired'")
@@ -357,7 +353,7 @@ export class DbIdentityStore {
   }
 
   /**
-   * MONIKER-1 AC1: the agent's outbound name — the override when set, else the agent name itself.
+   * The agent's outbound name — the override when set, else the agent name itself.
    * There is no separate "self-moniker" concept; the default is valid by construction (the agent
    * name already satisfies MONIKER_RE at creation). Null only when no active agent holds the name.
    */
@@ -373,8 +369,8 @@ export class DbIdentityStore {
 /**
  * DB-backed `DaemonRegistrationPersistence`. Scoped to a single agent's row. All persist operations
  * are single-row UPSERTs that update the named agent's row; a register-success therefore implies the
- * material is durably committed (SI-003). A persist against a non-existent agent throws — the row is
- * created by the agent-creation path (AC-004) before registration runs.
+ * material is durably committed. A persist against a non-existent agent throws — the row is created by
+ * the agent-creation path before registration runs.
  */
 export class DbRegistrationPersistence implements DaemonRegistrationPersistence {
   readonly #db: DaemonDatabase;
@@ -390,7 +386,7 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
 
   #updateRow(setClause: string, params: unknown[]): void {
     const now = Date.now();
-    // REMOVE-001: target the ACTIVE row for this name. After name reuse a retired row and a new active
+    // Target the ACTIVE row for this name. After name reuse a retired row and a new active
     // row can share a name; the partial unique index guarantees at most one active row, so this is
     // unambiguous. A retired identity's registration material is never mutated.
     const res = this.#db
@@ -398,13 +394,13 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       .run(...params, now, this.#agentName);
     if (Number(res.changes) === 0) {
       // The agent row must exist (created by the agent-creation path before registration). A missing
-      // row is a real fault, not something to paper over — fail loud so registration fails (AC-012).
+      // row is a real fault, not something to paper over — FAIL LOUD so registration fails.
       throw new Error(`identity_persist_failed: no agent row for '${this.#agentName}'`);
     }
   }
 
   async persistMlDsaKeypair(opts: { mlDsaPubkey: string; secretKeyBlob: Uint8Array }): Promise<void> {
-    // SI-001: secretKeyBlob is written to the encrypted DB only — never logged.
+    // secretKeyBlob is written to the encrypted DB only — never logged.
     this.#updateRow("ml_dsa_pubkey = ?, ml_dsa_secret = ?, ml_dsa_algorithm = ?", [
       opts.mlDsaPubkey,
       toBuf(opts.secretKeyBlob),
@@ -439,10 +435,10 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     commitmentsCbor: Uint8Array;
     verifyingSharesCbor: Uint8Array;
     dkgMethod: "trusted_dealer" | "network_dkg";
-    /** M8B quorum: the directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
+    /** The directory nodeIds (Q) the DKG ran among; a restored signer targets these. */
     directoryNodeIds?: string[];
   }): Promise<void> {
-    // SI-001: signingShare is written to the encrypted DB only — never logged.
+    // signingShare is written to the encrypted DB only — never logged.
     this.#updateRow(
       `frost_epoch_id = ?, frost_primary_pubkey = ?, frost_identifier = ?, frost_signing_share = ?,
        frost_threshold = ?, frost_participants = ?, frost_commitments = ?, frost_verifying_shares = ?,
@@ -469,7 +465,7 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
   }
 
   async persistAgentUserLink(opts: { agentId: string; preAuthToken: string; linkedAt: number }): Promise<void> {
-    // SI: the preAuthToken is a bearer ticket — written to the encrypted DB only, never logged.
+    // The preAuthToken is a bearer ticket — written to the encrypted DB only, never logged.
     this.#updateRow("link_agent_id = ?, link_pre_auth_token = ?, link_linked_at = ?", [
       opts.agentId,
       opts.preAuthToken,
@@ -481,7 +477,7 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
   // ─── Load (restart rehydration) ──────────────────────────────────────────────
 
   #row(): Record<string, unknown> | undefined {
-    // REMOVE-001: load the ACTIVE row for this name (never a retired tombstone).
+    // Load the ACTIVE row for this name (never a retired tombstone).
     return this.#db.prepare("SELECT * FROM agents WHERE agent_name = ? AND state != 'retired'").get(this.#agentName) as
       | Record<string, unknown>
       | undefined;
@@ -512,8 +508,8 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
   async loadActiveFrostKeyShare(): Promise<FrostKeyShareRecord | null> {
     const r = this.#row();
     if (!r || r["frost_signing_share"] == null) return null;
-    // M8B quorum: the DKG's quorum Q (nodeIds). NULL for pre-quorum agents → undefined → seal falls
-    // back to the full roster. Defensive parse: malformed data must not break share loading.
+    // The DKG's quorum Q (nodeIds). NULL → undefined → the seal falls back to the full roster.
+    // Defensive parse: malformed data must not break share loading.
     let directoryNodeIds: string[] | undefined;
     const rawIds = r["frost_directory_node_ids"];
     if (rawIds != null) {

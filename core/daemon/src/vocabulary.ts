@@ -1,12 +1,12 @@
 /**
- * DOD-ONBOARD-HELP-1 §2b — the ONE vocabulary.
+ * The ONE vocabulary.
  *
  * A capability has exactly one name, and that name renders differently on each surface:
  *
  *     capability "agents"  →  MCP tool `cello_agents`  ·  CLI command `cello agents`
  *
- * The rule (Andre, 2026-07-11): **an MCP tool's name is `cello_` + the CLI command name**,
- * snake_cased, keeping any sub-verb. Humans and agents learn a capability ONCE.
+ * The rule: **an MCP tool's name is `cello_` + the CLI command name**, snake_cased, keeping any
+ * sub-verb. Humans and agents learn a capability ONCE.
  *
  * Why this table exists rather than three lists of string literals:
  *
@@ -74,9 +74,9 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
 ];
 
 /**
- * Tools that exist ONLY on the MCP surface. They are the DOD-CUSTODY-DAEMON-1 stubs — the daemon
- * handlers return `not_implemented`, so there is deliberately no CLI command to build a second
- * broken path to. Listed so the audit test can tell "known MCP-only" from "stale name".
+ * Tools that exist ONLY on the MCP surface. Their daemon handlers return `not_implemented`, so
+ * there is deliberately no CLI command to build a second broken path to. Listed so the audit test
+ * can tell "known MCP-only" from "stale name".
  */
 export const MCP_ONLY_TOOLS: readonly string[] = [
   "cello_backup",
@@ -104,17 +104,13 @@ export function knownToolNames(): ReadonlySet<string> {
 }
 
 /**
- * CLI verbs that NO LONGER EXIST (DOD-ONBOARD-HELP-1 §2, clean renames — no aliases).
+ * CLI verbs that DO NOT EXIST. No string anywhere may hand one of these to an operator.
  *
- * Why this list exists as well as the tool audit: the tool audit matches `cello_*` tokens, so it is
- * structurally BLIND to a dead *CLI* verb — `cello register` is just prose to it. That blindness is
- * exactly how three dead-command instructions survived a green build in the first cut of this story
- * (the missing-token onboarding error, an unregistered-agent warning, and relay-receipts' own usage
- * line all still said `cello register` / `cello receipts`). A user handed a command that does not
- * dispatch is worse off than one handed nothing.
+ * This list is needed IN ADDITION to the tool audit: that audit matches `cello_*` tokens, so it is
+ * structurally BLIND to a dead *CLI* verb — `cello register` is just prose to it. A user handed a
+ * command that does not dispatch is worse off than one handed nothing.
  *
- * Anchoring is by NEGATIVE LOOKAHEAD, not a trailing space — see deadCliVerbPattern() for why the
- * space failed.
+ * Anchoring is by NEGATIVE LOOKAHEAD, not a trailing space — see deadCliVerbPattern().
  */
 export const DEAD_CLI_VERBS: readonly string[] = [
   "cello register",
@@ -122,14 +118,13 @@ export const DEAD_CLI_VERBS: readonly string[] = [
   "cello receipts",
   "cello close",
   "cello initiate",
-  // DELETED outright (Andre, 2026-07-11), not renamed — there is no replacement to point at. It was
-  // a literal alias of `cello receive` (the daemon ran the SAME handler) whose help claimed an
-  // accept/join step CELLO does not have. Listed here so no string can quietly offer it again.
+  // No replacement to point at: this was an alias of `cello receive` (same daemon handler) whose
+  // help claimed an accept/join step CELLO does not have. Listed so no string can offer it again.
   "cello receive-session",
 ];
 
 /**
- * The pre-§3 flat contact shape: `cello contact <op> <pubkey>`. The arguments are REVERSED now
+ * Dead flat contact shape: `cello contact <op> <pubkey>`. The live shape REVERSES the arguments
  * (`cello contact <pubkey> <op>`), so these are not merely renamed — following one silently targets
  * a contact named "add". In the live shape an OP can never follow `contact` directly; a pubkey does.
  */
@@ -138,11 +133,10 @@ const DEAD_CONTACT_OPS = ["list", "add", "remove", "tier", "away", "set-tier", "
 /**
  * Match any dead CLI verb, wherever it is SPOKEN — the one regex both audits share.
  *
- * The negative lookahead `(?![-\w])` is what makes this work, and the first cut got it wrong: it
- * anchored on a trailing SPACE (`"cello register "`), which review broke immediately — a verb
- * followed by a quote, period, backtick, paren or comma slipped straight through, and a live string
- * (`'cello register'`, in the Hermes plugin scaffolded onto the operator's disk) was sailing past a
- * green audit. An audit defeated by a full stop is not an audit.
+ * The negative lookahead `(?![-\w])` is load-bearing; do NOT weaken it to a trailing SPACE. A verb
+ * followed by a quote, period, backtick, paren or comma would slip straight through, and dead verbs
+ * appear inside quotes and at end of sentence in real guidance strings. An audit defeated by a full
+ * stop is not an audit.
  *
  * The lookahead still lets the LIVE commands through, because each dead verb is a strict prefix of
  * its replacement: `cello register-agent`, `cello close-session`, `cello initiate-session` all have
@@ -155,7 +149,7 @@ export function deadCliVerbPattern(): RegExp {
 }
 
 /**
- * MCP tool names this story RENAMED AWAY. Nothing may hand one of these to an agent again.
+ * MCP tool names that DO NOT EXIST. Nothing may hand one of these to an agent.
  *
  * Distinct from `knownToolNames()` (an allowlist: "every cello_* token must be in the table"). That
  * allowlist works inside the daemon, where every `cello_*` token IS a tool name — but it cannot be
@@ -164,15 +158,13 @@ export function deadCliVerbPattern(): RegExp {
  * assets, plain config identifiers (`cello_socket_path`, `cello_dir`). An allowlist there would
  * either drown in false positives or be so riddled with exceptions it stopped meaning anything.
  *
- * So outside the daemon we assert the DENYLIST instead: whatever else a string says, it must not
- * name a tool we deleted. That is precisely the regression that shipped — the Hermes `platform_hint`
- * told the operator's agent to call `cello_check_notifications` and `cello_list_sessions` after both
- * had ceased to exist.
+ * So outside the daemon assert the DENYLIST instead: whatever else a string says, it must not name a
+ * deleted tool. The exposure is real — non-code assets ship to the operator's disk and instruct
+ * their agent (the Hermes `platform_hint` is a live example).
  */
 export const RENAMED_AWAY_TOOLS: readonly string[] = [
-  // DELETED outright (Andre, 2026-07-11), not renamed: cello_receive_session was a literal alias of
-  // cello_receive — the same daemon handler — whose help claimed an accept/join step that does not
-  // exist. There is no replacement to point at; the capability was never real.
+  // No replacement to point at: this was an alias of cello_receive — the same daemon handler —
+  // whose help claimed an accept/join step that does not exist. The capability was never real.
   "cello_receive_session",
   "cello_list_agents",
   "cello_list_sessions",
@@ -189,13 +181,6 @@ const CLI_BY_MCP: ReadonlyArray<DualSurfaceVerb> = [...DUAL_SURFACE_VERBS].sort(
 );
 
 /**
- * Rewrite MCP tool names in a guidance string into the CLI verbs an operator would type.
- *
- * Only `cello_*` tokens in DUAL_SURFACE_VERBS are rewritten. An MCP-only tool has no CLI verb to
- * offer, so it is left alone — inventing one would send the operator to a command that does not
- * exist, which is the exact failure this whole mechanism prevents.
- */
-/**
  * Instructions that carry ARGUMENTS, not just a name — rewritten whole, before the token pass.
  *
  * Renaming the tool is not enough when the instruction is a CALL. `cello inbox`'s rename notice ends
@@ -203,13 +188,13 @@ const CLI_BY_MCP: ReadonlyArray<DualSurfaceVerb> = [...DUAL_SURFACE_VERBS].sort(
  *
  *     Adopt it: cello_contact_set_moniker { pubkey: "abcd…", moniker: "Zoe" }, or ignore.
  *
- * Rewriting only the token gave a CLI operator `cello contact <pubkey> set-moniker { pubkey: "abcd…",
- * moniker: "Zoe" }` — the tool's name with the tool's JSON still bolted on, and a literal `<pubkey>`
- * placeholder next to the real key. It looks like a command and is not one; pasting it now trips the
- * invalid_pubkey gate. Half a translation is its own kind of wrong answer.
+ * Rewriting only the token would give a CLI operator the tool's name with the tool's JSON still
+ * bolted on, and a literal `<pubkey>` placeholder next to the real key — it looks like a command and
+ * is not one; pasting it trips the invalid_pubkey gate. Half a translation is its own kind of wrong
+ * answer.
  *
  * So the call form is translated as a unit, arguments and all, and the result is a line the operator
- * can actually paste. Run BEFORE the token pass, which would otherwise have already eaten the name.
+ * can actually paste. MUST run BEFORE the token pass, which would otherwise have eaten the name.
  */
 const CALL_FORMS: ReadonlyArray<{ re: RegExp; cli: (m: RegExpExecArray) => string }> = [
   {
@@ -218,6 +203,13 @@ const CALL_FORMS: ReadonlyArray<{ re: RegExp; cli: (m: RegExpExecArray) => strin
   },
 ];
 
+/**
+ * Rewrite MCP tool names in a guidance string into the CLI verbs an operator would type.
+ *
+ * Only `cello_*` tokens in DUAL_SURFACE_VERBS are rewritten. An MCP-only tool has no CLI verb to
+ * offer, so it is left alone — inventing one would send the operator to a command that does not
+ * exist, which is the exact failure this whole mechanism prevents.
+ */
 export function toCliGuidance(text: string): string {
   let out = text;
   for (const { re, cli } of CALL_FORMS) {
@@ -248,11 +240,10 @@ const INSTRUCTION_KEYS = new Set(["guidance", "warning_guidance", "notice"]);
  * cannot forget it and a new guidance string cannot drift. MCP callers get the response verbatim —
  * the source strings already hold the canonical MCP names.
  *
- * RECURSES into nested objects and arrays. The first cut only rewrote a TOP-LEVEL `guidance`, which
- * left real instructions per-surface-wrong: `cello inbox`'s rename notices live at
- * `agents[i].rename_notices[j].notice` and told a CLI operator to call `cello_contact_set_moniker`
- * with JSON arguments — a thing they cannot type. A choke point that only covers the easy shape is
- * not a choke point; it just moves the leak somewhere less visible.
+ * MUST RECURSE into nested objects and arrays; rewriting only a TOP-LEVEL `guidance` is not enough.
+ * Real instructions live deep — `cello inbox`'s rename notices sit at
+ * `agents[i].rename_notices[j].notice`. A choke point that only covers the easy shape is not a choke
+ * point; it just moves the leak somewhere less visible.
  */
 export function renderForSurface(result: unknown, surface: ClientSurface): unknown {
   if (surface === "mcp") return result;

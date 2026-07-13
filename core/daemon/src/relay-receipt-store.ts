@@ -8,8 +8,7 @@
  * (or dispute) the relay's ordering, and is the building block the client carries to the directory at seal
  * time (OPTIONB-SEAL-1) instead of the directory dialing the relay.
  *
- * Ported from the pre-REPOSPLIT dead `core/client/src/agent-hash-queue.ts` (+ its `relay_ack_receipts`
- * schema) into the LIVE daemon. The verification is the same Ed25519 check the relay's signer mirrors.
+ * Verification is an Ed25519 check that MUST stay byte-compatible with the relay's signer.
  *
  * IMMUTABILITY (SI-003): the unique unit of a relay attestation is a POSITION — (agent, session, sequence)
  * — not a content hash. The same plaintext ("ok") legitimately produces the same content hash at DIFFERENT

@@ -82,10 +82,9 @@ describe("DEAD-CODE PURGE — the M6 in-process stack is deleted", () => {
     // A dangling import fails the build — but that is a compile error, not a statement of intent.
     // This says it out loud, and it is what stops someone re-adding the dependency.
     //
-    // Match an actual IMPORT, not any mention. Two live files legitimately NAME the package in prose:
-    // `daemon.ts` ("we reimplement natively here — the daemon never imports @cello-protocol/client")
-    // and `crypto/index.ts`. Those comments are the historical record of why this package died; a
-    // bare substring check would flag them and push someone to delete the explanation.
+    // Match an actual IMPORT, not any mention: a live file may legitimately NAME the package in
+    // prose to state that it must never be imported. A bare substring check would flag that comment
+    // and push someone to delete the very rule it records.
     const IMPORTS_CLIENT = /(?:from|import)\s*\(?\s*["']@cello-protocol\/client["']/;
     const offenders: string[] = [];
     for (const pkg of ["adapter-claude-code", "cli", "daemon", "crypto", "transport", "protocol-types", "gateway"]) {

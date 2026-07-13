@@ -1,5 +1,5 @@
 /**
- * FROST proactive share resharing (PSS) — M8B DOD-REFRESH-1.
+ * FROST proactive share resharing (PSS).
  *
  * Zero-constant-term proactive secret sharing (Herzberg, Jarecki, Krawczyk, Yung — "Proactive Secret
  * Sharing", CRYPTO 1995), applied to the joint FROST/Ed25519 group key (RFC 9591 §C VSS commitments).
@@ -161,7 +161,7 @@ export function applyRefresh(
   const j = oldKey.secret.identifier;
   const xj = identifierScalar(j);
 
-  // COMPLETENESS GATE (fallback HIGH): a proactive refresh — like DKG — requires EVERY current shareholder
+  // COMPLETENESS GATE: a proactive refresh — like DKG — requires EVERY current shareholder
   // to contribute exactly one δ. The applying party MUST verify the contribution set is the full agreed
   // roster: no missing party (a partial set lands every party on a DIFFERENT polynomial Δ and silently
   // destroys the joint key), no extra/duplicate sender (double-counts a δ), and not empty (a no-op refresh

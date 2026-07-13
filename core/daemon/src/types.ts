@@ -101,16 +101,15 @@ export interface AgentInfo {
   pubkey?: string;
   error?: string;
   /**
-   * M8B F14: whether THIS agent currently has an armed standing receiver. Populated on the
+   * Whether THIS agent currently has an armed standing receiver. Populated on the
    * cello_status surface (getStatus) so a deaf agent — online but unable to accept inbound
    * sessions — is visible per-agent, not hidden behind the daemon-level ANY-agent aggregate.
    */
   standing_receiver_ready?: boolean;
   /**
-   * M8C-AUTOSTART-1 (F5): whether THIS agent is the current (selected) agent for the requesting
-   * connection. Split out from `state` so a selected agent reads `state: "online"` + `selected: true`
-   * — `state` no longer overloads the value "current", so two healthy agents don't read as
-   * different readiness levels.
+   * Whether THIS agent is the current (selected) agent for the requesting connection. Kept SEPARATE
+   * from `state` — `state` must not overload the value "current", or two equally healthy agents read
+   * as different readiness levels. A selected agent reads `state: "online"` + `selected: true`.
    */
   selected?: boolean;
 }
@@ -132,35 +131,34 @@ export interface DaemonStatusResponse {
   daemon: "running";
   directory_signaling: DirectorySignalingState;
   agents: AgentInfo[];
-  // CC-4 (2026-07-07): the `connections` field was an always-empty stub ("until connection validation
-  // is wired" — F9). An empty placeholder conveys nothing and reads as a mock, so it is dropped from the
-  // status surface. The ConnectionInfo type is kept (exported) as the shape F9 will populate when the
-  // connected-client-visibility feature lands; per-connection state still lives in perConnectionState.
+  // No `connections` field: an always-empty placeholder conveys nothing and reads as a mock. The
+  // ConnectionInfo type stays exported as the shape connected-client visibility will populate;
+  // per-connection state lives in perConnectionState.
   /**
    * True when the standing receiver node is listening and ready to accept the
    * next inbound session. Set to true by SessionNodeManager.initialize() during
-   * daemon startup (before the IPC socket opens). DAEMON-002 AC-002.
+   * daemon startup, before the IPC socket opens.
    */
   standing_receiver_ready: boolean;
   /**
    * Total count of retry_queue entries across all sessions.
-   * Always present as integer >= 0. DAEMON-003 AC-009.
+   * Always present as integer >= 0.
    */
   retryQueueDepth: number;
   /**
-   * M7-SESSION-001 AC-007: interrupted sessions from SQLite.
+   * Interrupted sessions from SQLite.
    * Always present (empty array if none). Never undefined or omitted.
    */
   interrupted_sessions: InterruptedSessionInfo[];
   /**
-   * M8B F16: ACTIVE sessions with their direct-path counterparty liveness, so a
+   * ACTIVE sessions with their direct-path counterparty liveness, so a
    * counterparty-gone session is visible to the operator instead of looking identical
    * to a quiet-but-healthy one. Always present (empty array if none).
    */
   active_sessions: ActiveSessionInfo[];
 }
 
-/** M8B F16: one active session's status row (see DaemonStatusResponse.active_sessions). */
+/** One active session's status row (see DaemonStatusResponse.active_sessions). */
 export interface ActiveSessionInfo {
   sessionId: string;
   agentName: string;
@@ -179,9 +177,9 @@ export interface DaemonConfig {
   version: string;
   logger: Logger;
   /**
-   * M7-MANIFEST-002: manifest loading and verification.
+   * Manifest loading and verification.
    * When provided, startDaemon() calls manifestProvider.loadAndVerify() at startup.
-   * When absent, manifest loading is skipped (backward compat for DAEMON-001 tests).
+   * When absent, manifest loading is skipped.
    *
    * Production: requires manifestRootKeys (non-empty array) and manifestThreshold (>= 1).
    * The bundled consortium-manifest.json is NOT shipped in the npm package — operators
@@ -189,39 +187,38 @@ export interface DaemonConfig {
    */
   manifestProvider?: IManifestProvider;
   /**
-   * M7-MANIFEST-002: officer root keys for manifest signature verification.
+   * Officer root keys for manifest signature verification.
    * Required when manifestProvider is provided.
    */
   manifestRootKeys?: readonly string[];
   /**
-   * M7-MANIFEST-002: officer threshold for manifest signature verification.
+   * Officer threshold for manifest signature verification.
    * Required when manifestProvider is provided.
    */
   manifestThreshold?: number;
   /**
-   * M7-MANIFEST-002: version store for monotonicity enforcement.
+   * Version store for monotonicity enforcement.
    * When absent, monotonicity check is skipped.
    */
   manifestVersionStore?: IManifestVersionStore;
   /**
-   * M7-MANIFEST-002: poll scheduler for background manifest refresh.
+   * Poll scheduler for background manifest refresh.
    * When absent, polling is disabled.
    */
   manifestPollScheduler?: IManifestPollScheduler;
   /**
-   * CELLO-M7-CONN-001 (DOD-CONN-3): base URL for the daemon-level HTTP manifest poll
-   * (`${directoryHttpUrl}/manifest`). The poll moved off the keystone signaling stream
-   * to unauthenticated HTTP and runs even with zero agents. Defaults to
-   * resolveDirectoryUrl(process.env). Tests inject an in-process server URL.
+   * Base URL for the daemon-level HTTP manifest poll (`${directoryHttpUrl}/manifest`). The poll runs
+   * over unauthenticated HTTP, NOT the keystone signaling stream, so it keeps running with zero
+   * agents. Defaults to resolveDirectoryUrl(process.env). Tests inject an in-process server URL.
    */
   directoryHttpUrl?: string;
   /**
-   * M7-MANIFEST-002: challenge verifier for directory step-5 identity proof.
+   * Challenge verifier for directory step-5 identity proof.
    * When absent, directory challenge verification is skipped.
    */
   challengeVerifier?: IDirectoryChallengeVerifier;
   /**
-   * M7-SIGNAL-001: injectable connect function for directory signaling stream.
+   * Injectable connect function for the directory signaling stream.
    * When absent, a stub that always rejects (directory_signaling_not_configured) is used.
    * Production: performs the full 7-step directory handshake.
    *
@@ -231,86 +228,78 @@ export interface DaemonConfig {
    */
   signalingConnect?: () => Promise<ConnectResult>;
   /**
-   * M7 Keystone (Part 1): resolves the directory endpoint to dial (GET /bootstrap).
+   * Resolves the directory endpoint to dial (GET /bootstrap).
    * When signalingConnect is absent and this is present, startDaemon builds the
    * production signalingConnect from this resolver + the daemon's primary agent
    * identity. Ignored when signalingConnect is provided directly.
    */
   directoryEndpointResolver?: () => Promise<DirectoryEndpoint | null>;
   /**
-   * CELLO-M7-DAEMON-004: injectable session-node factory for the composition root.
+   * Injectable session-node factory for the composition root.
    * When absent, the production factory (real libp2p via createNode) is used.
    * Tests inject a controllable factory to exercise the send/receive/tree path
-   * without the real transport stack — the same adapter-injection pattern
-   * DAEMON-002 established for ISessionNodeFactory.
+   * without the real transport stack.
    */
   sessionNodeFactory?: import("./session-node-manager.js").ISessionNodeFactory;
   /**
-   * CELLO-M7-MSG-001 (AC-004/AC-005): park target for the startup flush of un-acked
-   * content. On startup — BEFORE the IPC socket opens — the daemon drains retry_queue
-   * entries still awaiting a `persisted` delivery ACK and re-parks each to the relay
-   * store-and-forward queue via this function (the crash backstop, D-d). The function
-   * performs the encrypted relay deposit and is the natural emitter of
-   * content.park.deposited (it holds the recipient context).
+   * Park target for the startup flush of un-acked content. On startup — BEFORE the IPC
+   * socket opens — the daemon drains retry_queue entries still awaiting a `persisted`
+   * delivery ACK and re-parks each to the relay store-and-forward queue via this function
+   * (the crash backstop). The function performs the encrypted relay deposit and is the
+   * natural emitter of content.park.deposited (it holds the recipient context).
    *
-   * Re-home (Option A): this is supplied by the daemon's OWN send path — the daemon
-   * owns the session core, so it constructs the relay-deposit function natively (NOT a
-   * hosted CelloClient / RelayStreamManager). When absent (a daemon started without the
-   * content send path, or unit tests), the startup flush is a documented no-op
-   * (content.park.flush.deferred at WARN) and the durable awaiting entries remain queued
-   * for the next startup that has a park target.
+   * It is supplied by the daemon's OWN send path — the daemon owns the session core, so it
+   * constructs the relay-deposit function natively (never a hosted CelloClient /
+   * RelayStreamManager). When absent (a daemon started without the content send path, or
+   * unit tests), the startup flush is a no-op (content.park.flush.deferred at WARN) and the
+   * durable awaiting entries remain queued for the next startup that has a park target.
    */
   contentParkFn?: import("./retry-queue.js").ParkFn;
   /**
-   * CELLO-M7-MSG-001 (AC-001/AC-003): the TTF (time-to-flush) window, in ms, the
-   * sender waits for a `persisted` delivery ACK before handing un-acked content to the
-   * park backstop. Default 20_000 (Part-4 proposed 10–30s band). Tests inject a small
-   * value to drive TTF expiry deterministically.
+   * The TTF (time-to-flush) window, in ms, the sender waits for a `persisted` delivery ACK
+   * before handing un-acked content to the park backstop. Default 20_000. Tests inject a
+   * small value to drive TTF expiry deterministically.
    */
   contentTtfMs?: number;
   /**
-   * CELLO-M7-TRANSPORT-001: low-level dialer backing the transport selector in
+   * Low-level dialer backing the transport selector in
    * production environments (dev/staging/production). Wraps a CelloNode (direct +
    * relay circuit dial) and the daemon relay registry. Required for production
    * CELLO_ENV; for 'local'/'test' the composition root uses an in-process stub.
    */
   transportDialer?: TransportDialer;
   /**
-   * CELLO-M7-TRANSPORT-001: AutoNAT service adapter backing dialability detection
+   * AutoNAT service adapter backing dialability detection
    * in production environments. Wraps the standing-receiver node's libp2p AutoNAT
    * observable. For 'local'/'test' the composition root uses a stub (dialable=false).
    */
   autoNatService?: IAutoNatService;
   /**
-   * CELLO-M7-TRANSPORT-001: directory session negotiation adapter (WIRE-001/
-   * SIGNAL-001). cello_initiate_session calls negotiate() to obtain the
-   * FROST-signed SessionAssignment, then drives the transport selector to dial the
-   * counterparty (AC-005/AC-006/AC-008/AC-010c). When absent, cello_initiate_session
-   * reports directory_signaling_not_configured — it does NOT crash, proving the
-   * transport adapters are wired.
+   * Directory session negotiation adapter. cello_initiate_session calls negotiate() to
+   * obtain the FROST-signed SessionAssignment, then drives the transport selector to dial
+   * the counterparty. When absent, cello_initiate_session reports
+   * directory_signaling_not_configured — it does NOT crash.
    */
   sessionNegotiator?: SessionNegotiator;
   /**
-   * CELLO-M7-TRANSPORT-001: returns this daemon's relay circuit address (from the
-   * relay registry populated at directory connection) for the SessionAssignment
-   * advertised address when the standing receiver is NOT dialable (AC-004). When
-   * absent, an empty advertised relay address is used (the negotiator supplies the
-   * real one in production).
+   * Returns this daemon's relay circuit address (from the relay registry populated at
+   * directory connection) for the SessionAssignment advertised address when the standing
+   * receiver is NOT dialable. When absent, an empty advertised relay address is used (the
+   * negotiator supplies the real one in production).
    */
   getRelayCircuitAddress?: () => string;
   /**
-   * M8C-TGDOOR-1: injectable Telegram Bot API client (test override — production uses
-   * HttpTelegramBotClient, constructed from telegram_settings once configured via
-   * setTelegramSettings). Absent = TGDOOR is inert (no poller starts) until settings exist.
+   * Injectable Telegram Bot API client (test override — production uses HttpTelegramBotClient,
+   * constructed from telegram_settings once configured via setTelegramSettings). Absent = the
+   * Telegram doorbell is inert (no poller starts) until settings exist.
    */
   telegramBotClient?: TelegramBotClient;
   /**
-   * M9-CORE-001: the security gateway client. Every outbound message is screened in
-   * cello_send before sessionNodeManager.sendContent; every inbound message is screened
-   * in the inbound funnel before it enters the receive buffer. The daemon holds ONLY this
-   * narrow interface — all detection lives in the separate gateway program. When absent,
-   * the composition root falls back to a PassthroughGatewayClient (always-allow), so the
-   * seam still returns a verdict (SI-001) and pre-M9 daemons behave unchanged.
+   * The security gateway client. Every outbound message is screened in cello_send before
+   * sessionNodeManager.sendContent; every inbound message is screened in the inbound funnel
+   * before it enters the receive buffer. The daemon holds ONLY this narrow interface — all
+   * detection lives in the separate gateway program. When absent, the composition root falls
+   * back to a PassthroughGatewayClient (always-allow), so the seam still returns a verdict.
    */
   securityGateway?: SecurityGatewayClient;
 }
@@ -319,7 +308,6 @@ export interface DaemonConfig {
 
 /**
  * Maximum number of concurrent session nodes per daemon.
- * Outline.md §Resource Caps, DAEMON-002 AC-006.
  */
 export const MAX_SESSION_NODES = 32;
 
@@ -332,8 +320,8 @@ export const MAX_SESSION_NODES = 32;
  * - seal_interrupted_pending: both parties have produced and exchanged signed
  *   SEAL-INTERRUPTED leaves (a verified bilateral commitment), but the FROST
  *   threshold notarization has NOT been performed. This is a non-terminal state
- *   — it is explicitly NOT 'sealed'. See daemon.ts handleSealInterruptedFlow and
- *   the H-1 audit note for what blocks the threshold seal.
+ *   — it is explicitly NOT 'sealed'. See daemon.ts handleSealInterruptedFlow for what
+ *   blocks the threshold seal.
  * - sealed: a real FROST threshold notarization completed. Only the normal
  *   (non-interrupted) close path produces this today.
  */
@@ -342,16 +330,16 @@ export type SessionStatus =
   | "sealed"
   | "interrupted"
   | "seal_interrupted_pending"
-  // CC-5/F21 (2026-07-07): a locally-terminal state for a half-open session that can never be
-  // bilaterally sealed — set by a force-abandon (cello_close_session { force }) or the dead-half-open
-  // reaper. No FROST notarization (nothing to notarize on a dead handshake); it just leaves the open list.
+  // A locally-terminal state for a half-open session that can never be bilaterally sealed — set by a
+  // force-abandon (cello_close_session { force }) or the dead-half-open reaper. No FROST notarization
+  // (there is nothing to notarize on a dead handshake); it just leaves the open list.
   | "abandoned";
 
 export interface SessionRecord {
   session_id: string;
   /**
-   * DOD-AGENT-ID-JOINKEY-1: the STABLE key this row is scoped by. Every `sessions` query joins on
-   * this, never on `agent_name`.
+   * The STABLE key this row is scoped by. Every `sessions` query joins on this, never on
+   * `agent_name`.
    */
   agent_id: string;
   /**
@@ -365,19 +353,19 @@ export interface SessionRecord {
   status: SessionStatus;
   created_at: number;
   updated_at: number;
-  /** M7-SESSION-001: leaf count at interruption. 0 if not yet set. */
+  /** Leaf count at interruption. 0 if not yet set. */
   message_count: number;
-  /** M7-SESSION-001: ISO 8601 timestamp of interruption. Null if not yet set. */
+  /** ISO 8601 timestamp of interruption. Null if not yet set. */
   interrupted_at: string | null;
   /**
-   * M7 legibility-TBS-binding: the counterparty's FROST primary (group) pubkey hex, from the
+   * The counterparty's FROST primary (group) pubkey hex, from the
    * SessionAssignment's signer_pubkey. The responder verifies the bilateral seal signature against
    * it. Null when this party initiated (it verifies against its own primary).
    */
   counterparty_primary_pubkey?: string | null;
 }
 
-/** M7-SESSION-001: An interrupted session entry in the cello status response. */
+/** An interrupted session entry in the cello status response. */
 export interface InterruptedSessionInfo {
   sessionId: string;
   agentName: string;
@@ -387,11 +375,11 @@ export interface InterruptedSessionInfo {
 }
 
 /**
- * cello_list_sessions: one session in the discovery list for the current agent.
+ * cello_sessions: one session in the discovery list for the current agent.
  * Covers every status (active, sealed, interrupted, seal_interrupted_pending) so
- * the by-id reads (cello_get_transcript / cello_get_sealed_receipt) have a source
- * for their session ids. Timestamps are ISO 8601; interruptedAt is null unless the
- * session is/was interrupted.
+ * the by-id reads (cello_transcript / cello_sealed_receipt) have a source for their
+ * session ids. Timestamps are ISO 8601; interruptedAt is null unless the session
+ * is/was interrupted.
  */
 export interface SessionListEntry {
   sessionId: string;
@@ -404,13 +392,13 @@ export interface SessionListEntry {
   createdAt: string;
   updatedAt: string;
   interruptedAt: string | null;
-  /** MONIKER-5 AC1: the resolved display label (pet name ?? offered ?? fingerprint). */
+  /** The resolved display label (pet name ?? offered ?? fingerprint). */
   who: string;
   whoKnown: boolean;
 }
 
 /**
- * Result of a session listing (cello_list_sessions / the daemon-wide `list_sessions`). `sessions`
+ * Result of a session listing (cello_sessions / the daemon-wide `list_sessions`). `sessions`
  * is already filtered + capped at `limit`; `totalMatched` is how many matched the filter before the
  * cap, so the caller can tell the operator "showing 50 of 312".
  */

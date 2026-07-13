@@ -1,12 +1,12 @@
 /**
- * CELLO-M7-UPGRADE-001 (DOD-UP-1) — the returning-absent-party seal upgrade, extracted from the
- * daemon so the KERNEL (content-possession gate) and the AC-008 dual-attestation verify run under
- * adversarial unit tests with the REAL bodies (not just the happy path).
+ * The returning-absent-party seal upgrade. It lives outside daemon.ts so the KERNEL (content-
+ * possession gate) and the dual-attestation verify run under adversarial unit tests with the REAL
+ * bodies, not just the happy path.
  *
- * Model 2: when the previously-ABSENT party B returns, it RATIFIES the existing unilateral sealed
- * root R1 (does NOT re-seal a new root). B signs an ack over CBOR([SEAL_UPGRADE_ACK_DOMAIN,
- * session_id, sealed_root]) with its K_local. The directory verifies it and writes a SUPERSEDING
- * bilateral notarization. Both parties verify the dual-attestation cert before accepting bilateral.
+ * When the previously-ABSENT party B returns, it RATIFIES the existing unilateral sealed root R1 (it
+ * does NOT re-seal a new root). B signs an ack over CBOR([SEAL_UPGRADE_ACK_DOMAIN, session_id,
+ * sealed_root]) with its K_local. The directory verifies it and writes a SUPERSEDING bilateral
+ * notarization. Both parties verify the dual-attestation cert before accepting bilateral.
  */
 import { Encoder } from "cbor-x";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
@@ -17,8 +17,8 @@ import type { DaemonRegistrationPersistence } from "./registration-persistence.j
 
 /**
  * Domain separator for the upgrade-ack TBS. B's daemon and the directory MUST build byte-identical
- * bytes — same domain string, same cbor-x encoder options (tagUint8Array:false). Verified identical
- * across both repos (cbor-x 1.6.4). Domain separation prevents replay as any other CELLO signature.
+ * bytes — same domain string, same cbor-x encoder options (tagUint8Array:false); the directory side
+ * must be kept byte-identical. Domain separation prevents replay as any other CELLO signature.
  */
 export const SEAL_UPGRADE_ACK_DOMAIN = "cello-seal-upgrade-ack-v1";
 const UPGRADE_CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -32,14 +32,14 @@ function toU8(v: unknown): Uint8Array | null {
   return v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
 }
 
-/** Verifiability of a session for B to ratify a unilateral seal — the SAME bar as the UP-2 auto-ack. */
+/** Verifiability of a session for B to ratify a unilateral seal — the SAME bar as the auto-ack. */
 export interface SealUpgradeReadiness { known: boolean; tampered: boolean }
 
 /**
  * THE KERNEL DECISION. B may sign its ratification ONLY when it genuinely possesses + integrity-
- * verified the content behind R1. Pure + exhaustively unit-tested: a session B has no record of
- * (content_unrecoverable, AC-002) or whose content cross-check flagged tamper (content_tamper,
- * AC-003) is REFUSED. Verified-but-disliked content is NOT a refusal (disagreement ≠ unverifiable).
+ * verified the content behind R1. A session B has no record of (content_unrecoverable) or whose
+ * content cross-check flagged tamper (content_tamper) is REFUSED. Verified-but-disliked content is
+ * NOT a refusal — disagreement ≠ unverifiable.
  */
 export function evaluateSealUpgrade(
   readiness: SealUpgradeReadiness,
@@ -56,7 +56,7 @@ export interface AttemptSealUpgradeDeps {
   /** B's session verifiability for this session (SessionNodeManager.getSealUpgradeReadiness). */
   getReadiness: (agentName: string, sessionIdHex: string) => SealUpgradeReadiness;
   /**
-   * M1: the number of content leaves B holds for this session (SessionNodeManager.getSessionTree
+   * The number of content leaves B holds for this session (SessionNodeManager.getSessionTree
    * (...).size()). R1 has leaf_count leaves = content leaves + A's single SEAL ctrl leaf, so B's
    * content tree must hold at least leaf_count-1 leaves or B is missing content it would over-attest.
    */
@@ -104,11 +104,11 @@ export async function attemptSealUpgrade(
       return { sent: false, reason: decision.refuseReason };
     }
 
-    // M1 (KERNEL completeness): B must hold the FULL content behind R1, not merely a tamper-free
-    // subset. R1 = root over [content leaves..., A's SEAL ctrl leaf], so leaf_count counts the content
-    // leaves + 1; B's content tree must hold ≥ leaf_count-1. Refuse if B recovered an INCOMPLETE
-    // transcript — never over-attest to content B did not fully receive. (Exact root-reproduction is
-    // the deferred MSG-001-3b canonical-sequence reconciliation; this count gate is the interim bar.)
+    // KERNEL completeness: B must hold the FULL content behind R1, not merely a tamper-free subset.
+    // R1 = root over [content leaves..., A's SEAL ctrl leaf], so leaf_count counts the content leaves
+    // + 1; B's content tree must hold >= leaf_count-1. Refuse if B recovered an INCOMPLETE transcript —
+    // never over-attest to content B did not fully receive. This count gate is the bar until exact
+    // root-reproduction (canonical-sequence reconciliation) lands.
     const contentLeaves = deps.getContentLeafCount(deps.agentName, sessionIdHex);
     if (contentLeaves < leafCount - 1) {
       deps.logger.warn("session.seal.upgrade.refused", {
@@ -132,7 +132,7 @@ export async function attemptSealUpgrade(
       returning_pubkey: returningPubkey,
       ack_signature: ackSig,
       // forwarded (from the notification cert) so the directory relays it → the present party rebuilds
-      // the seal TBS and verifies its own attestation (AC-008).
+      // the seal TBS and verifies its own attestation.
       leaf_count: leafCount,
     });
     if (!sent.ok) {
@@ -154,10 +154,10 @@ export interface VerifyUpgradeConfirmedDeps {
   logger: Logger;
   agentName: string;
   agentPubkeyHex: string;
-  /** PERSIST-002: DB-backed identity persistence (the FROST share for cert verification). */
+  /** DB-backed identity persistence (the FROST share for cert verification). */
   persistence: DaemonRegistrationPersistence;
   /**
-   * H1: the counterparty pubkey (hex) of the LOCAL session record for sessionIdHex, or null if this
+   * The counterparty pubkey (hex) of the LOCAL session record for sessionIdHex, or null if this
    * agent has no such session. Binds the cert's present/returning pubkeys to the REAL participants so
    * a malicious directory cannot sign the ack with a throwaway key and force a state transition on a
    * session we are in (or push a confirmed frame for a session we never had).
@@ -166,7 +166,7 @@ export interface VerifyUpgradeConfirmedDeps {
 }
 
 /**
- * AC-008 dual-attestation verify, extracted. NEVER trust the directory's "bilateral" claim.
+ * Dual-attestation verify. NEVER trust the directory's "bilateral" claim.
  *
  *  - ALWAYS verify the RETURNING attestation (B's ack) over R1 — proves B genuinely ratified, catches
  *    a directory that fabricated or swapped B's signature. The load-bearing check (anyone can do it).
@@ -198,7 +198,7 @@ export async function verifyUpgradeConfirmedCert(
     return { ok: false, reason: "malformed_confirmed" };
   }
 
-  // H1: bind the cert's present/returning pubkeys to the REAL participants of OUR session record.
+  // Bind the cert's present/returning pubkeys to the REAL participants of OUR session record.
   // The pair {present, returning} must equal {self, our counterparty}; otherwise a single untrusted
   // directory could sign the ack with an attacker-chosen key and drive a B-side state transition, or
   // push a confirmed frame for a session we never had. We must hold the session locally to accept.
@@ -216,7 +216,7 @@ export async function verifyUpgradeConfirmedCert(
     return { ok: false, reason: "participant_mismatch" };
   }
 
-  // 1. Returning attestation (the returning party's ack) over R1 — the AC-008 kernel. returningPubkey
+  // 1. Returning attestation (the returning party's ack) over R1 — the kernel check. returningPubkey
   //    is now proven to be a real participant of this session (self or counterparty), not attacker-chosen.
   const ackTbs = buildSealUpgradeAckTbs(sessionId, sealedRoot);
   if (!ed25519Verify(returningPubkey, ackTbs, returningSig)) {

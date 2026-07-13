@@ -2,14 +2,14 @@
  * CLI argument handling — validation that runs BEFORE dispatch, kept out of src/bin/cello.ts so the
  * usage surface is testable without spawning the binary.
  *
- * M8B riders F1/F2 (原): USAGE lists EVERY dispatchable command; every subcommand answers --help/-h;
- * an unrecognized flag is REJECTED rather than coerced into a positional (previously
- * `cello register --help` tried to register an agent literally named "--help").
+ * The rules it enforces: USAGE lists EVERY dispatchable command; every subcommand answers
+ * --help/-h; an unrecognized flag is REJECTED rather than coerced into a positional (otherwise
+ * `cello register --help` tries to register an agent literally named "--help").
  *
- * DOD-CLI-PARITY-1 Phase 0: this module no longer OWNS the command list, the help text, or the flag
- * table — it DERIVES all three from the registry (registry.ts), the single source of truth. That is
- * what makes drift between dispatch, `cello --help`, and `cello <cmd> --help` structurally
- * impossible rather than merely discouraged.
+ * This module does not OWN the command list, the help text, or the flag table — it DERIVES all
+ * three from the registry (registry.ts), the single source of truth. That is what makes drift
+ * between dispatch, `cello --help`, and `cello <cmd> --help` structurally impossible rather than
+ * merely discouraged.
  */
 
 import { COMMANDS, commandNames, findCommand, flagsFor, renderCommandsTable } from "./registry.js";
@@ -26,10 +26,9 @@ export type KnownCommand = string;
 /**
  * The top-level `cello --help`.
  *
- * CC-7 (P2-5 / DOD-ONBOARD-HELP-1): opens with what CELLO is + the onboarding path a first-time
- * user needs. DOD-CLI-PARITY-1 §7 closes the remaining gap — the command list is now a DESCRIBED
- * table rendered from each registry entry's `summary` (it used to be a single pipe-delimited blob
- * with no per-command descriptions). Arguments stay in per-command `--help`.
+ * Opens with what CELLO is + the onboarding path a first-time user needs. The command list is a
+ * DESCRIBED table rendered from each registry entry's `summary`. Arguments stay in per-command
+ * `--help`.
  */
 export const USAGE =
   "CELLO — a peer-to-peer identity & trust layer for agent-to-agent communication.\n" +
@@ -62,7 +61,7 @@ export type ArgsCheck =
   | { kind: "unknown_flag"; flag: string };
 
 /**
- * F2: validate a subcommand's arguments BEFORE dispatch.
+ * Validate a subcommand's arguments BEFORE dispatch.
  *  - --help / -h ANYWHERE → help. This is a dedicated pre-scan so help wins even when it
  *    follows an unknown flag or sits where a value-consuming flag would swallow it — asking for
  *    help must never be masked by another argument error.

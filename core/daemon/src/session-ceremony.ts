@@ -8,10 +8,8 @@
  * awaits a `ceremony_result` {ceremony_id, signature}. The initiator (coordinator) runs
  * the FROST ceremony with its share + the directory's K_server_X shares, and replies.
  *
- * This wires that handler onto a PER-AGENT signaling stream (the same per-agent routing
- * SPINE-4 established for registration). It is a faithful port of
- * core/client `SealManager.handleCeremonyRequest` + `client-startup` signer
- * reconstruction — the daemon must NOT import the dead core/client stack.
+ * This wires that handler onto a PER-AGENT signaling stream (the same per-agent routing used for
+ * registration).
  *
  * The threshold signer is reconstructed lazily from the agent's persisted
  * `frost-share.json` (the daemon holds no FrostThresholdSigner after registration —
@@ -394,8 +392,7 @@ export async function runAgentRefresh(
  * directory's #processSealFrostSignature then completes notarization and delivers
  * `session_sealed` (the byte-identical sealed_root) to both parties.
  *
- * Faithful port of core/client `SealManager.handleSealVerified` (the dead stack); the daemon
- * must NOT import that stack. SI-001: tbs/signature never logged.
+ * SI-001: tbs/signature never logged.
  */
 export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
   return deps.signaling.registerInboundHandler((frame) => {

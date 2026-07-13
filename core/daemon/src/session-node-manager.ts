@@ -8,65 +8,16 @@
  *   2. Standing receiver node: pre-created, open gater, kept alive at all times.
  *      Handed to the first inbound session; immediately replaced.
  *   3. 32-node cap: enforced before any new node is created.
- *   4. Session status in SQLite: active → sealed (on close) or interrupted
+ *   4. Session status in the DB: active → sealed (on close) or interrupted
  *      (on graceful shutdown or SIGKILL-restart detection).
  *
- * Pseudocode (SPARC Phase P):
- *
- * initialize():
- *   1. Open SQLite (node:sqlite), create sessions table if not exists
- *   2. Detect interrupted sessions: SELECT * FROM sessions WHERE status='active'
- *      → batch-update to 'interrupted', log session.interrupted.detected for each
- *      (source: 'daemon_restart') — runs before IPC socket opens so no race
- *   3. Create standing receiver node (fresh libp2p, open gater, sentinel agentName)
- *   4. Start standing receiver, set standingReceiverReady=true
- *   5. Log session.node.created for the standing receiver
- *
- * createSessionNode(sessionId, agentName, counterpartyPubkey, counterpartyPeerId, correlationId):
- *   Pseudocode:
- *   1. Check activeNodes.size >= MAX_SESSION_NODES → log cap.reached, return error
- *   2. Create SessionConnectionGater(counterpartyPeerId) — restricted from birth
- *   3. nodeFactory.createNode({gater}) → fresh libp2p node
- *   4. node.start() — bind TCP ephemeral port
- *   5. Insert SQLite row status='active'
- *   6. Log session.node.created
- *   7. Add to activeNodes map
- *   8. Return {ok:true, peerId, addrs}
- *   On libp2p error: extract error.message (never ${error}), log create.failed, return error
- *
- * acceptSession(sessionId, agentName, counterpartyPubkey, initiatorPeerId, correlationId):
- *   Pseudocode:
- *   1. If !standingReceiverReady → return standing_receiver_unavailable
- *   2. Take standing receiver from slot (clear slot atomically)
- *   3. gater.setAllowedPeer(initiatorPeerId) ← BEFORE returning multiaddr (AC-015)
- *   4. Insert SQLite row status='active'
- *   5. Log session.node.created
- *   6. Add to activeNodes map
- *   7. Trigger async replacement of standing receiver (do NOT await)
- *   8. Return {ok:true, peerId, addrs}
- *
- * destroySessionNode(sessionId, reason):
- *   Pseudocode:
- *   1. Find node in activeNodes
- *   2. stop node
- *   3. Update SQLite status to sealed/interrupted/error
- *   4. Remove from activeNodes
- *   5. Log session.node.destroyed
- *
- * gracefulShutdown():
- *   Pseudocode:
- *   1. Get all activeNodes
- *   2. For each: update SQLite 'interrupted', log destroyed(reason:'interrupted')
- *   3. Stop all nodes
- *   4. Stop standing receiver
- *
- * getStatus(): { standingReceiverReady: boolean }
+ * Interrupted-session detection runs BEFORE the IPC socket opens, so a client cannot observe a
+ * stale 'active' row from a previous process.
  */
 
-// CELLO-M7-PERSIST-002 (DEC-1): the daemon DB is a SQLCipher database (whole-file AES-256 at rest).
-// `DaemonDatabase` is the thin varargs surface the daemon uses; `openEncryptedDatabase` opens with a
-// PRAGMA key and `resolveDbKey` manages the single plaintext key file (DEC-2). The whole-DB cipher
-// supersedes the old per-column transcript cipher (AC-010).
+// The daemon DB is SQLCipher (whole-file AES-256 at rest), never `node:sqlite`. `DaemonDatabase` is
+// the thin varargs surface; `openEncryptedDatabase` opens with a PRAGMA key and `resolveDbKey`
+// manages the single plaintext key file.
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -106,10 +57,9 @@ const CBOR_ENC = new Encoder({ tagUint8Array: false });
 /** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 const MAX_REFUSED_PARKED_ENTRIES = 512;
 
-// M8C-ABUSE-1 + DOD-TIER-2: persistence bounds. Formerly a binary "known contacts exempt entirely,
-// everyone else 3 sessions / 25 MB"; now TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-
-// migration). The two consts below are kept for back-compat but DERIVE from the grid's UNKNOWN row —
-// the grid is the single source (DOD-TIER-2 AC4), so these can never drift from it.
+// Persistence bounds are TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-migration). The two
+// consts below DERIVE from the grid's UNKNOWN row rather than restating it — the grid is the single
+// source (DOD-TIER-2 AC4), so these can never drift from it.
 /** Anti-drip-feed: cumulative RECEIVED bytes per session at the UNKNOWN tier (= the grid's UNKNOWN
  *  byte cap). Higher tiers get more (DEFAULT_TIER_BOUNDS); no tier is unbounded (INV-TIER-BOUND). */
 export const ABUSE_MAX_SESSION_RECEIVED_BYTES = DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxBytesPerSession; // 25 MB
@@ -349,12 +299,11 @@ export class SessionNodeManager {
     | ((agentName: string, sessionId: string, senderPubkey: string) => void)
     | null = null;
 
-  // CELLO-M7-MSG-001 (AC-001/AC-002/AC-003): the send is no longer fire-and-forget.
-  // After a content_frame is delivered over the direct session channel, the sender
-  // arms a TTF timer and waits for an unsigned, transport-authenticated `persisted`
-  // delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels
-  // the timer (content.delivery.acked); TTF expiry hands the content to the park
-  // backstop. Keyed sessionId → contentHashHex → entry.
+  // A send is NOT fire-and-forget. After a content_frame is delivered over the direct session
+  // channel, the sender arms a TTF timer and waits for an unsigned, transport-authenticated
+  // `persisted` delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels the
+  // timer (content.delivery.acked); TTF expiry hands the content to the park backstop.
+  // Keyed sessionId → contentHashHex → entry.
   #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }>>();
   // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
   // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
@@ -817,7 +766,7 @@ export class SessionNodeManager {
   /**
    * DOD-LOG-1 / PERSIST-002 (AC-010): append one readable message to the durable transcript, keyed
    * by the canonical leaf `sequence` so it joins to the committed hash chain. The blob is stored as
-   * plaintext bytes — the whole DB is SQLCipher-encrypted at rest, so the per-column cipher is gone.
+   * plaintext bytes: the whole DB is SQLCipher-encrypted at rest, so there is no per-column cipher.
    * Idempotent on replay (INSERT OR IGNORE). Never throws into the caller's content path: a
    * transcript-write failure is logged, not fatal.
    */
@@ -2868,10 +2817,9 @@ export class SessionNodeManager {
   }
 
   /**
-   * DAEMON-004: send content over the session node's direct P2P content stream.
-   * On a dead/missing stream this returns a NAMED, diagnosable failure — never a
-   * silent success and never a desync (closing the old silent fire-and-forget
-   * content catch in the retired in-process client send path).
+   * Send content over the session node's direct P2P content stream.
+   * On a dead/missing stream this returns a NAMED, diagnosable failure — never a silent success
+   * (which desyncs the two sides). Do not swallow a send error here.
    *
    * SCOPE / findings #3 + #4 — what this send path does and does NOT do today:
    *   - #4: it delivers the content over the direct /cello/content/1.0.0 P2P
@@ -2902,9 +2850,11 @@ export class SessionNodeManager {
     // canonical sequence from the hash whether or not the counterparty is reachable for direct
     // content. So an OFFLINE recipient still gets a sequence, and the parked content is later
     // recovered AT that sequence (DOD-MSG-4 recovery-not-desync). The relay only ever sees the
-    // hash (INV-3). Best-effort: a relay miss degrades to local-only sequencing. Previously this
-    // ran AFTER a successful direct send, so an offline recipient's content got NO sequence — the
-    // gap R1 closes.
+    // hash (INV-3). Best-effort: a relay miss degrades to local-only sequencing.
+    //
+    // This MUST run BEFORE the direct send, not after it: an offline recipient never completes a
+    // direct send, and sequencing after it would leave their content with no sequence at all.
+    //
     // DOD-MSG-4 (self-ordering content frame): the relay's committed ordering record for this leaf,
     // captured from the hash submit so it can be stamped into the content frame (and the parked
     // entry). Undefined if the relay is unreachable / an old relay — the receiver then falls back to
@@ -3408,14 +3358,15 @@ export class SessionNodeManager {
       ? inboundVerdict.content
       : content;
 
-    // B1 (review): screenInbound above is the ONLY suspension point in this method. Before M9 the
-    // dedup check (indexOfHash, above) and the leaf append (below) ran with no yield between them,
-    // so check-then-append was atomic under Node's single thread. The await reopened that window:
-    // two concurrent ingests of the SAME content hash — e.g. a direct retry and a park-recovery
-    // racing on reconnect — could BOTH pass the dedup check before either appends, producing two
-    // leaves for one hash (DOD-MSG-5 break → leafIndex≠canonicalSeq → root divergence). Re-check
-    // dedup now that we have resumed; everything from here to the append is synchronous (atomic),
-    // so the first to resume appends and the second sees its leaf and dedups.
+    // screenInbound above is the ONLY suspension point in this method, and it splits the dedup check
+    // (indexOfHash, above) from the leaf append (below). Across that await, two concurrent ingests of
+    // the SAME content hash — e.g. a direct retry and a park-recovery racing on reconnect — can BOTH
+    // pass the first dedup check before either appends, producing two leaves for one hash
+    // (DOD-MSG-5 break → leafIndex≠canonicalSeq → root divergence). So re-check dedup on resume.
+    // Everything from here to the append is synchronous (atomic under Node's single thread): the
+    // first to resume appends, and the second sees its leaf and dedups.
+    //
+    // Adding any further await between here and the append reopens the window.
     const dedupAfterScreen = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
     if (dedupAfterScreen >= 0) {
       this.#logger.info("session.content.deduplicated", {
@@ -3872,12 +3823,11 @@ export class SessionNodeManager {
   /**
    * SEC-1 — THE ONLY WAY PARKED CONTENT ENTERS THE TRANSCRIPT.
    *
-   * Authentication and ingest are fused here on purpose. Before SEC-1 the recover loop in daemon.ts
-   * did `decode → (maybe verify ordering) → ingest`, where the verify step was OPTIONAL (skipped
-   * entirely when the attacker simply omitted the ordering record) and could not reject anything
-   * even when it ran — it gated ORDERING, not INGEST. Splitting the check from the write is what
-   * made the downgrade possible, so they no longer live apart: a caller cannot ingest parked content
-   * without passing the signature gate, because there is no other entry point.
+   * Authentication and ingest are FUSED here on purpose, and must stay fused. A caller cannot ingest
+   * parked content without passing the signature gate, because this is the only entry point. Exposing
+   * a separate `decode → ingest` path — with the signature check as its own optional step — is a
+   * downgrade attack: an attacker omits the thing that triggers the check, and the check never runs.
+   * A gate the caller can skip by leaving a field out is not a gate.
    *
    * FAILS CLOSED. No signature / bad signature / signer is not this session's counterparty / no
    * session at all → REFUSED, nothing is appended, nothing is written, and the caller MUST NOT

@@ -7,11 +7,8 @@
  * heartbeat, reconnect (it calls connect() again on a fresh attempt), the outbound
  * queue, and optional manifest polling.
  *
- * It is a faithful port of the proven M6 client handshake in
- * `core/client/src/signaling-manager.ts` (`#doOpen`, ~lines 527-643). That path
- * connected the M6 client to the real directory, ran the full DKG ceremony, and
- * sealed sessions — so the 7-step handshake here is the known-good one, not new
- * protocol.
+ * The 7-step handshake below is the wire protocol the directory speaks. It is not negotiable from
+ * this side: change a step and registration, the DKG ceremony, and session sealing all break.
  *
  * Architecture note (2026-06-11 daemon-transport doc): this is the *directory-facing
  * node* — one per daemon, signaling only. A FRESH libp2p node (and therefore a fresh

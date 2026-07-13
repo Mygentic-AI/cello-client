@@ -1,13 +1,13 @@
 /**
- * M7-MANIFEST-001 / M7-MANIFEST-002 — Test fixture for consortium manifest creation.
+ * Test fixture for consortium manifest creation.
  *
  * Provides makeTestManifest() which creates a fully-signed ConsortiumManifest
  * using deterministic test officer keys. The manifest is signed with officer
  * indices 0, 1, 2 (meeting the threshold of 3).
  *
- * The private keys (TEST_OFFICER_SEEDS) are defined here and NOT exported from
- * the package index (AC-011). They are only available via direct import of this
- * file for internal test use.
+ * The private keys (TEST_OFFICER_SEEDS) are defined here and MUST NOT be exported
+ * from the package index. They are only available via direct import of this file
+ * for internal test use.
  *
  * Crypto reference: RFC 8032 (Ed25519).
  */
@@ -20,7 +20,7 @@ import type { ConsortiumManifestInput } from "./manifest.js";
  * Deterministic test officer seeds (private keys). Used to derive
  * TEST_CONSORTIUM_ROOT_KEYS and to sign test manifests.
  *
- * NOT exported from the package index — only from this file for internal use.
+ * MUST NOT be exported from the package index — only from this file for internal use.
  */
 export const TEST_OFFICER_SEEDS: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array, Uint8Array] = [
   new Uint8Array(32).fill(0x01),
@@ -46,13 +46,8 @@ export interface MakeTestManifestOpts {
 }
 
 /**
- * Create a test ConsortiumManifest signed by officers 0, 1, 2.
- *
- * Pseudocode:
- *   1. Build the manifest body with provided nodes and optional overrides.
- *   2. Compute canonical body bytes via canonicalManifestBody.
- *   3. Sign with TEST_OFFICER_SEEDS[0], [1], [2] using Ed25519 (RFC 8032).
- *   4. Return the complete manifest with 3 valid signatures.
+ * Create a test ConsortiumManifest signed by officers 0, 1, 2 with Ed25519 (RFC 8032)
+ * over the canonical body bytes from canonicalManifestBody.
  */
 export function makeTestManifest(
   nodes: TestConsortiumNode[],
@@ -79,7 +74,7 @@ export function makeTestManifest(
   return manifest;
 }
 
-// ─── M7-MANIFEST-002: Test directory node keypair ────────────────────────────
+// ─── Test directory node keypair ─────────────────────────────────────────────
 
 /**
  * Deterministic test directory node keypair for step-5 challenge signing tests.
