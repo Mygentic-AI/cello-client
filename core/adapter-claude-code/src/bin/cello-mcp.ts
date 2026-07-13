@@ -255,15 +255,17 @@ server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. 
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {
   target_pubkey: z.string().describe("Hex-encoded public key of the target agent"),
-}, async ({ target_pubkey }) => {
-  const result = await proxy.call("cello_initiate_session", { target_pubkey });
+  agent: z.string().optional().describe("Agent to act as for this call (defaults to the current agent)"),
+}, async ({ target_pubkey, agent }) => {
+  const result = await proxy.call("cello_initiate_session", agent ? { target_pubkey, agent } : { target_pubkey });
   return jsonText(result);
 });
 
 server.tool("cello_await_session", "Wait for an inbound session request", {
   timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000)"),
-}, async ({ timeout_ms }) => {
-  const result = await proxy.call("cello_await_session", { timeout_ms });
+  agent: z.string().optional().describe("Agent to wait as (defaults to the current agent)"),
+}, async ({ timeout_ms, agent }) => {
+  const result = await proxy.call("cello_await_session", agent ? { timeout_ms, agent } : { timeout_ms });
   return jsonText(result);
 });
 
@@ -278,11 +280,13 @@ server.tool("cello_send", "Send a message in an active session", {
       "with flags, re-send the SAME content plus this map of {flagId: \"redact\"|\"allow_once\"|" +
       "\"allow_always\"} to resolve each flagged item. Omitted flags default to redact.",
     ),
-}, async ({ session_id, content, governance_decisions }) => {
+  agent: z.string().optional().describe("Agent to send as (defaults to the current agent)"),
+}, async ({ session_id, content, governance_decisions, agent }) => {
   const result = await proxy.call("cello_send", {
     session_id,
     content,
     ...(governance_decisions !== undefined ? { governance_decisions } : {}),
+    ...(agent ? { agent } : {}),
   });
   return jsonText(result);
 });
@@ -291,21 +295,31 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
   session_id: z.string().describe("Session ID"),
   timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000). Ignored when since_seq is set."),
   since_seq: z.number().optional().describe("Catch-up mode: return all messages with sequence > since_seq as a batch, instead of waiting for the next live message."),
-}, async ({ session_id, timeout_ms, since_seq }) => {
-  const result = await proxy.call("cello_receive", { session_id, timeout_ms, since_seq });
+  agent: z.string().optional().describe("Agent to receive as (defaults to the current agent)"),
+}, async ({ session_id, timeout_ms, since_seq, agent }) => {
+  const result = await proxy.call("cello_receive", agent
+    ? { session_id, timeout_ms, since_seq, agent }
+    : { session_id, timeout_ms, since_seq });
   return jsonText(result);
 });
 
 server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list.", {
   session_id: z.string().describe("Session ID to close"),
   force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
-}, async ({ session_id, force }) => {
-  const result = await proxy.call("cello_close_session", force ? { session_id, force } : { session_id });
+  agent: z.string().optional().describe("Agent whose session to close (defaults to the current agent)"),
+}, async ({ session_id, force, agent }) => {
+  const result = await proxy.call("cello_close_session", {
+    session_id,
+    ...(force ? { force } : {}),
+    ...(agent ? { agent } : {}),
+  });
   return jsonText(result);
 });
 
-server.tool("cello_sessions", "List all sessions for the current agent", {}, async () => {
-  const result = await proxy.call("cello_list_sessions");
+server.tool("cello_sessions", "List all sessions for the current agent", {
+  agent: z.string().optional().describe("Agent whose sessions to list (defaults to the current agent)"),
+}, async ({ agent }) => {
+  const result = await proxy.call("cello_list_sessions", agent ? { agent } : {});
   return jsonText(result);
 });
 
@@ -335,15 +349,17 @@ server.tool("cello_restore", "Restore agent state from backup", {}, async () => 
 
 server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session", {
   session_id: z.string().describe("Session ID"),
-}, async ({ session_id }) => {
-  const result = await proxy.call("cello_get_sealed_receipt", { session_id });
+  agent: z.string().optional().describe("Agent whose receipt to read (defaults to the current agent)"),
+}, async ({ session_id, agent }) => {
+  const result = await proxy.call("cello_get_sealed_receipt", agent ? { session_id, agent } : { session_id });
   return jsonText(result);
 });
 
 server.tool("cello_transcript", "Get the durable, readable conversation transcript for a session (sent + received messages, in order) — recoverable after a daemon restart", {
   session_id: z.string().describe("Session ID"),
-}, async ({ session_id }) => {
-  const result = await proxy.call("cello_get_transcript", { session_id });
+  agent: z.string().optional().describe("Agent whose transcript to read (defaults to the current agent)"),
+}, async ({ session_id, agent }) => {
+  const result = await proxy.call("cello_get_transcript", agent ? { session_id, agent } : { session_id });
   return jsonText(result);
 });
 

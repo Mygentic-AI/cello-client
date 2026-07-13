@@ -326,25 +326,25 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(result.reason).toBe("no_current_agent");
     });
 
-    it("explicit { name } selects THAT agent even with two online (pins the selected agent, not just non-failure)", async () => {
+    it("explicit { agent } selects THAT agent even with two online (pins the selected agent, not just non-failure)", async () => {
       const config = await setupWithAgents("alice", "bob");
       handle = await startDaemon(config);
       const client = await connect(config.socketPath);
       await client.send("cello_start_agent", { name: "alice" });
       await client.send("cello_start_agent", { name: "bob" });
 
-      // A session owned by bob only — so the list result proves WHICH agent { name } selected, not
+      // A session owned by bob only — so the list result proves WHICH agent { agent } selected, not
       // merely that the call didn't fail (a resolver bug returning the wrong agent would still be ok:true).
       const bobSession = "b0".repeat(16);
       await handle.getSessionNodeManager().createSessionNode(bobSession, "bob", "cc".repeat(32), "peer-bob", "corr-bob");
 
-      const bobList = await client.send("cello_list_sessions", { name: "bob", filter: "all" }) as { ok: boolean; reason?: string; sessions: Array<{ sessionId: string }> };
+      const bobList = await client.send("cello_list_sessions", { agent: "bob", filter: "all" }) as { ok: boolean; reason?: string; sessions: Array<{ sessionId: string }> };
       expect(bobList.reason).not.toBe("no_current_agent");
       expect(bobList.ok).toBe(true);
       expect(bobList.sessions.some((s) => s.sessionId === bobSession)).toBe(true);
 
-      // alice must NOT see bob's session — proves { name: "alice" } selected alice, not "the first online agent".
-      const aliceList = await client.send("cello_list_sessions", { name: "alice", filter: "all" }) as { sessions: Array<{ sessionId: string }> };
+      // alice must NOT see bob's session — proves { agent: "alice" } selected alice, not "the first online agent".
+      const aliceList = await client.send("cello_list_sessions", { agent: "alice", filter: "all" }) as { sessions: Array<{ sessionId: string }> };
       expect(aliceList.sessions.some((s) => s.sessionId === bobSession)).toBe(false);
     });
   });

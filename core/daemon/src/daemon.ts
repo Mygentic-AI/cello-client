@@ -2102,15 +2102,15 @@ async function startDaemonHoldingLock(
     return { ok: true };
   }
 
-  // M8C-AUTOSTART-1 (F18): resolve which agent a name-defaulting tool should act on for this
-  // connection: an explicit name wins; else the connection's current agent; else — when EXACTLY one
+  // M8C-AUTOSTART-1 (F18): resolve which agent an agent-defaulting tool should act on for this
+  // connection: an explicit { agent } wins; else the connection's current agent; else — when EXACTLY one
   // agent is online daemon-wide — that sole agent (removes the "why did it forget my agent" moment
   // after a /mcp reconnect). Two-or-more online with none selected stays ambiguous → null (the
   // caller returns no_current_agent), because guessing between peers would misroute.
   /**
    * Which agent does this call act as?
    *
-   * Explicit name wins, then this connection's selection. Only with NEITHER does the daemon fall back
+   * An explicit { agent } wins, then this connection's selection. Only with NEITHER does the daemon fall back
    * to the sole online agent — a convenience for a caller that never chose, where "the online one"
    * cannot mean anyone else.
    *
@@ -2120,8 +2120,8 @@ async function startDaemonHoldingLock(
    * alice, alice was stopped, and the work lands on bob reporting success. A lost intent is not the
    * same as no intent, and it must fail loud (no_current_agent) rather than be guessed at.
    */
-  function resolveCurrentAgent(connState: { currentAgent: string | null; clearedAgent?: string } | undefined, explicitName?: string): string | null {
-    if (explicitName) return explicitName;
+  function resolveCurrentAgent(connState: { currentAgent: string | null; clearedAgent?: string } | undefined, explicitAgent?: string): string | null {
+    if (explicitAgent) return explicitAgent;
     if (connState?.currentAgent) return connState.currentAgent;
     if (connState?.clearedAgent) return null;
     if (onlineAgents.size === 1) return [...onlineAgents][0];
@@ -3179,9 +3179,9 @@ async function startDaemonHoldingLock(
   // ─── M8B DOD-REFRESH-1: cello_refresh_shares — proactive share refresh / epoch rollover ───
   handlers.set("cello_refresh_shares", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
+      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {
@@ -3213,9 +3213,9 @@ async function startDaemonHoldingLock(
   // ─── M8B DOD-RELAYSIG-1: cello_get_relay_receipts — the agent's stored relay ordering receipts ───
   handlers.set("cello_get_relay_receipts", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { name }." };
+      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {
@@ -3293,10 +3293,10 @@ async function startDaemonHoldingLock(
   //      to the MCP response.
   handlers.set("cello_initiate_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
     // connection's current agent, else the sole online agent (removes the no_current_agent papercut
     // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -3439,8 +3439,8 @@ async function startDaemonHoldingLock(
   // SI-001: no auto-seal on session_interrupted receipt; operator must call explicitly
   handlers.set("cello_close_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -3781,10 +3781,10 @@ async function startDaemonHoldingLock(
     }
     // DOD-LOOP-1: the certificate is keyed by (agent, session_id) — read the current agent's.
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
     // connection's current agent, else the sole online agent (removes the no_current_agent papercut
     // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -3840,8 +3840,8 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_sessions." };
     }
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -3924,8 +3924,8 @@ async function startDaemonHoldingLock(
   // the live ones. Read from persisted SQLite, so it survives a daemon restart / fresh connection.
   handlers.set("cello_list_sessions", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > this connection's current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -5074,10 +5074,10 @@ async function startDaemonHoldingLock(
   // blocks until one arrives or timeout_ms elapses.
   handlers.set("cello_await_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
     // connection's current agent, else the sole online agent (removes the no_current_agent papercut
     // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) {
       return NO_CURRENT_AGENT_RESPONSE;
     }
@@ -5607,8 +5607,8 @@ async function startDaemonHoldingLock(
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
   handlers.set("cello_send", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
 
     // round-2 BLOCKING: read the snake_case public field cello-mcp.ts actually sends.
@@ -5896,8 +5896,8 @@ async function startDaemonHoldingLock(
   const RECEIVE_DEFAULT_TIMEOUT_MS = 30000; // matches the cello-mcp shim's documented default
   const handleReceive: IpcHandler = async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { name } > current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.name as string | undefined);
+    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > current > sole online agent.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
     if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
 
     // Read the snake_case public field cello-mcp.ts actually sends.

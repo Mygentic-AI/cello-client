@@ -250,7 +250,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey, moniker: "Wonderland_Alice" }));
     await wait(120);
 
-    const res = (await h.client.send("cello_await_session", { name: "bob", timeout_ms: 2_000 })) as {
+    const res = (await h.client.send("cello_await_session", { agent: "bob", timeout_ms: 2_000 })) as {
       type?: string; session_id?: string; counterparty_pubkey?: string; offered_moniker?: string | null;
     };
     expect(res.type).toBe("new_session");
@@ -269,7 +269,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     await wait(120);
 
     // The session forms anyway — an invalid name is never grounds to refuse (DoS lever).
-    const res = (await h.client.send("cello_await_session", { name: "bob", timeout_ms: 2_000 })) as {
+    const res = (await h.client.send("cello_await_session", { agent: "bob", timeout_ms: 2_000 })) as {
       type?: string; offered_moniker?: string | null;
     };
     expect(res.type).toBe("new_session");
@@ -291,7 +291,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     h.inject(assignmentFrame({ initiatorPubkeyHex: initiator, counterpartyPubkeyHex: h.bobPubkey }));
     await wait(120);
 
-    const res = (await h.client.send("cello_await_session", { name: "bob", timeout_ms: 2_000 })) as {
+    const res = (await h.client.send("cello_await_session", { agent: "bob", timeout_ms: 2_000 })) as {
       type?: string; offered_moniker?: string | null;
     };
     expect(res.type).toBe("new_session");
@@ -361,7 +361,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
       });
       // cello_await_session reaps expired entries for the NAMED agent before reading the queue
       // (scope:"current" notifications would need a current agent this harness never selects).
-      await h.client.send("cello_await_session", { name: "bob", timeout_ms: 1_000 });
+      await h.client.send("cello_await_session", { agent: "bob", timeout_ms: 1_000 });
 
       const dropped = h.events.filter((e) => e.event === "moniker.offer.dropped");
       expect(dropped.length).toBeGreaterThanOrEqual(1);

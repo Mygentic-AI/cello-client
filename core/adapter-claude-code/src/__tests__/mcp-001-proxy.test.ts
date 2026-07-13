@@ -247,13 +247,26 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
 
   it("cello-mcp.ts forwards the snake_case session_id field for all three session tools", () => {
     const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+    // The defect this guards is a CAMEL-CASE key on the wire: the daemon reads snake_case, so a
+    // `sessionId` here produces missing_params on every real invocation. Assert the key each call
+    // carries, not the literal expression building it — the payloads now compose optional keys
+    // (governance_decisions, force, agent) and pinning their exact text made this fail on any
+    // addition, which is noise, not coverage.
+    for (const method of ["cello_send", "cello_receive", "cello_close_session"]) {
+      const start = src.indexOf(`proxy.call("${method}"`);
+      expect(start, `${method} is not proxied`).toBeGreaterThan(-1);
+      const call = src.slice(start, src.indexOf(");", start));
+      expect(call, `${method} must forward snake_case session_id`).toMatch(/\bsession_id\b/);
+      expect(call, `${method} must not forward camelCase sessionId`).not.toMatch(/\bsessionId\b/);
+    }
     // M9-FEED-001: cello_send also forwards the optional governance_decisions re-send map.
-    expect(src).toContain('proxy.call("cello_send", {\n    session_id,\n    content,');
-    expect(src).toContain("governance_decisions");
-    expect(src).toContain('proxy.call("cello_receive", { session_id, timeout_ms, since_seq })'); // M8C-SINCESEQ-1: + since_seq
-    // CC-5/F21: cello_close_session forwards snake_case session_id, plus the optional `force` flag
-    // (terminal-escape for an unsealable half-open session) only when set.
-    expect(src).toContain('proxy.call("cello_close_session", force ? { session_id, force } : { session_id })');
+    expect(src.slice(src.indexOf('proxy.call("cello_send"'))).toMatch(/governance_decisions/);
+    // M8C-SINCESEQ-1: cello_receive forwards the catch-up cursor.
+    expect(src.slice(src.indexOf('proxy.call("cello_receive"'))).toMatch(/since_seq/);
+    // CC-5/F21: cello_close_session forwards the optional `force` flag (terminal-escape for an
+    // unsealable half-open session) only when set — never unconditionally.
+    const close = src.slice(src.indexOf('proxy.call("cello_close_session"'));
+    expect(close).toMatch(/\.\.\.\(force \? \{ force \} : \{\}\)/);
   });
 });
 

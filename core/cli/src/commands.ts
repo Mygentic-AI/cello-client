@@ -409,7 +409,7 @@ export async function createAgent(celloDir: string, name: string): Promise<Comma
 
 /**
  * refreshShares(celloDir, name): M8B DOD-REFRESH-1.
- *  - Connect to the daemon, send 'cello_refresh_shares' with { name }.
+ *  - Connect to the daemon, send 'cello_refresh_shares' with { agent }.
  *  - The daemon runs a proactive share refresh across the consortium: every shareholder rotates its
  *    share to a new epoch, the group public key is unchanged, and old-epoch shares no longer sign.
  */
@@ -423,7 +423,7 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry refresh." };
   }
   try {
-    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_refresh_shares", { name }))) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_refresh_shares", { agent: name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
@@ -446,7 +446,7 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
 
 /**
  * relayReceipts(celloDir, name): M8B DOD-RELAYSIG-1.
- *  - Connect to the daemon, send 'cello_get_relay_receipts' with { name }.
+ *  - Connect to the daemon, send 'cello_get_relay_receipts' with { agent }.
  *  - Returns the agent's durably-stored, signature-verified relay ordering-record receipts.
  */
 export async function relayReceipts(celloDir: string, name: string): Promise<CommandResult> {
@@ -460,7 +460,7 @@ export async function relayReceipts(celloDir: string, name: string): Promise<Com
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry receipts." };
   }
   try {
-    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_get_relay_receipts", { name }))) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_get_relay_receipts", { agent: name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;

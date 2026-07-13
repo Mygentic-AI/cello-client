@@ -146,7 +146,7 @@ describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and witho
     h.inject(assignmentFrame(initiator, h.bobPubkey, sid(1), "Wonderland_Alice"));
     await wait(150);
 
-    const sessions = (await h.client.send("cello_list_sessions", { name: "bob" })) as {
+    const sessions = (await h.client.send("cello_list_sessions", { agent: "bob" })) as {
       sessions: Array<{ counterpartyPubkey: string; who: string; whoKnown: boolean }>;
     };
     const row = sessions.sessions.find((s) => s.counterpartyPubkey === initiator)!;
