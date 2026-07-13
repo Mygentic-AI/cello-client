@@ -1,13 +1,14 @@
 /**
- * CELLO-SESSION-002/MSG-004/SESSION-003/SESSION-004/SESSION-005 — session.ts
+ * session.ts — session wire types and their to-be-signed encodings.
  *
  * SessionAssignment: shared wire type used by directory (sender), client (receiver),
  * and relay (verifier). Lives here so client can import it without touching @cello-protocol/directory.
  *
- * SESSION-004 additions to SessionAssignment:
+ * SessionAssignment is a discriminated union on `signature_type`, so TypeScript enforces that
+ * `signer_pubkey` is present exactly when the signature is FROST:
  *   signature_type: 'frost' | 'single'
  *     - 'frost': the directory_signature field carries the 64-byte combined FROST output
- *     - 'single': M1-era single-key directory signature (refused by M2 clients)
+ *     - 'single': legacy single-key directory signature (refused by current clients)
  *   signer_pubkey?: Uint8Array (32 bytes, present when signature_type === 'frost')
  *     - The initiator's primary_pubkey (group FROST key). Embedded so the counterparty
  *       can verify without a separate directory round-trip.
@@ -19,11 +20,11 @@
  *   Note: signer_pubkey is NOT in the TBS — it is derived from DKG and embedded in the frame.
  *
  * SealPayload: canonical CBOR of [session_id, final_root, close_timestamp, "PENDING"].
- * Per SESSION-003. content_hash = SHA-256(0x00 || SealPayload) per MERKLE-001.
+ * content_hash = SHA-256(0x00 || SealPayload).
  *
  * computeGenesisPrevRoot: deterministic genesis prev_root for a two-party session.
  *
- * Formula (SI-004):
+ * Formula:
  *   SHA-256(min(A_pubkey, B_pubkey) || max(A_pubkey, B_pubkey) || session_id || timestamp_be8)
  *
  * Pubkeys are sorted bytewise-lexicographically (Buffer.compare).
@@ -31,46 +32,13 @@
  * (milliseconds since Unix epoch). Raw byte concatenation — no CBOR at this boundary,
  * which would introduce width ambiguity on the timestamp encoding.
  *
- * Per FIPS 180-4 (SHA-256) and SESSION-002 SI-004.
+ * Per FIPS 180-4 (SHA-256).
  *
- * ─── Phase P: SESSION-004 Pseudocode ─────────────────────────────────────────
+ * buildSessionEstablishmentTbs is exported from protocol-types so that BOTH the directory
+ * (signer) and the client (verifier) use identical canonical CBOR encoding. Any encoding
+ * drift causes silent verification failures.
  *
- * SessionAssignment type changes (MEDIUM-6: discriminated union enforces signer_pubkey):
- *   // Use a discriminated union so TypeScript enforces signer_pubkey is present for 'frost'
- *   type SessionAssignmentFrost = { ...common fields..., signature_type: 'frost', signer_pubkey: Uint8Array }
- *   type SessionAssignmentSingle = { ...common fields..., signature_type: 'single' }
- *   type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle
- *
- *   // Common fields (all existing SessionAssignment fields plus signature_type + signer_pubkey):
- *   session_id, participant_a, participant_b, relay_endpoint, directory_endpoint,
- *   session_timestamp, directory_pubkey, directory_signature
- *
- * buildSessionEstablishmentTbs(sessionId, pubA, pubB, genesisPrevRoot, timestamp):
- *   // HIGH-5: exported from protocol-types so both directory and client use identical CBOR encoding
- *   //         Any encoding drift would cause silent verification failures.
- *   // TBS = canonical CBOR([session_id, agent_A_pubkey, agent_B_pubkey, genesis_prev_root, timestamp])
- *   // Per CONTEXT.md: uses CBOR_ENC.encode() with tagUint8Array: false
- *   // timestamp is uint32 or BigInt depending on size (>0xffffffff → BigInt)
- *   return CBOR_ENC.encode([sessionId, pubA, pubB, genesisPrevRoot,
- *                           timestamp > 0xffffffff ? BigInt(timestamp) : timestamp])
- *
- * IMPORTANT-8: Existing test files that build SessionAssignment objects need updating to
- * include signature_type. Files affected (all M1 tests add signature_type: 'single'):
- *   - packages/client/src/__tests__/session.test.ts (makeDirectoryAssignment helper)
- *   - packages/client/src/__tests__/msg004.test.ts (makeDirectoryAssignment helper)
- *   - packages/client/src/__tests__/session003.test.ts (multiple construction sites)
- *   - packages/client/src/__tests__/session006.test.ts (makeDirectoryAssignment helper)
- *   - packages/e2e-tests/src/__tests__/mcp-002.test.ts (assignment construction)
- *   - packages/relay/src/__tests__/relay-node.test.ts (makeAssignment helper)
- *   - packages/relay/src/__tests__/relay-incremental.test.ts (makeAssignment helper)
- *   - packages/directory/src/directory-frames.ts (decodeOutboundSignalingFrame parser)
- *
- * IMPORTANT-9: ReceiveAssignmentResult in client/src/types.ts needs 'unsupported_signature_type'
- *   added to its reason union.
- *
- * ─── End Phase P Pseudocode ───────────────────────────────────────────────────
- *
- * buildSealTbs: FROST TBS for conversation seal (SESSION-005).
+ * buildSealTbs: FROST TBS for a conversation seal.
  * FROST TBS fields: [session_id, sealed_root, leaf_count, timestamp]
  * Context string: "cello-frost-seal-v1" (per CONTEXT.md)
  * Both sides (directory as signer, client as verifier) must use the same encoding.
@@ -82,7 +50,7 @@ import { Encoder, decode as cborDecode } from "cbor-x";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
-// ─── SessionAssignment (shared wire type — SESSION-002 / SESSION-004) ─────────
+// ─── SessionAssignment (shared wire type) ─────────────────────────────────────
 
 export interface ParticipantInfo {
   pubkey: Uint8Array;    // 32-byte K_local pubkey
@@ -101,19 +69,18 @@ interface SessionAssignmentCommon {
   participant_a: ParticipantInfo;
   participant_b: ParticipantInfo;
   relay_endpoint: RelayEndpointInfo;
-  directory_endpoint: RelayEndpointInfo; // SESSION-003: client dials directory for session_sealed events
+  directory_endpoint: RelayEndpointInfo; // client dials directory for session_sealed events
   session_timestamp: number;        // Unix ms
   directory_pubkey: Uint8Array;     // 32-byte directory identity pubkey
   directory_signature: Uint8Array;  // 64-byte threshold/single signature over TBS
-  // FED-OPTIONB-SETUP-001 (Option B, any-relay/any-directory): the per-node directory signature over
-  // the relay TBS ([session_id, participant_a, participant_b, session_timestamp, (initiator_peer_id,
-  // counterparty_peer_id)]). Distinct from `directory_signature` (the FROST session-establishment sig
-  // authorizing the peer↔peer session): this authorizes the RELAY ASSIGNMENT. The client carries it to
-  // its chosen relay (a `client_record_assignment` frame), which verifies it against any consortium
-  // directory pubkey — replacing the old directory→relay `recordAssignment` dial. Optional for pre-M8B
-  // assignments and direct-mode sessions (no relay).
+  // The per-node directory signature over the relay TBS ([session_id, participant_a, participant_b,
+  // session_timestamp, (initiator_peer_id, counterparty_peer_id)]). Distinct from
+  // `directory_signature` (the FROST session-establishment sig authorizing the peer↔peer session):
+  // this authorizes the RELAY ASSIGNMENT. The client carries it to its chosen relay (a
+  // `client_record_assignment` frame), which verifies it against any consortium directory pubkey.
+  // Absent on legacy assignments and on direct-mode sessions (no relay), hence optional.
   relay_directory_signature?: Uint8Array; // 64-byte per-node directory sig over the relay TBS
-  // M7 WIRE-001: session-layer transport peer IDs and mode (optional for pre-M7 backward compat)
+  // Session-layer transport peer IDs and mode (optional — absent on legacy assignments)
   initiator_session_peer_id?: string;       // libp2p session node Peer ID of initiator
   initiator_session_addrs?: string[];       // multiaddrs of initiator's session node
   counterparty_session_peer_id?: string;    // libp2p session node Peer ID of counterparty
@@ -122,9 +89,9 @@ interface SessionAssignmentCommon {
 }
 
 /**
- * SESSION-004: FROST-signed assignment. `signer_pubkey` is the initiator's
- * group public key (primary_pubkey from DKG / trustedDealer commitments[0]).
- * Embedded so the counterparty can verify without a directory round-trip.
+ * FROST-signed assignment. `signer_pubkey` is the initiator's group public key
+ * (primary_pubkey from DKG / trustedDealer commitments[0]). Embedded so the
+ * counterparty can verify without a directory round-trip.
  */
 export interface SessionAssignmentFrost extends SessionAssignmentCommon {
   signature_type: "frost";
@@ -132,23 +99,23 @@ export interface SessionAssignmentFrost extends SessionAssignmentCommon {
 }
 
 /**
- * M1-era single-key directory signature. Refused by M2+ clients.
+ * Legacy single-key directory signature. Refused by current clients.
  */
 export interface SessionAssignmentSingle extends SessionAssignmentCommon {
   signature_type: "single";
-  // signer_pubkey absent — M1 clients use directory_pubkey for verification
+  // signer_pubkey absent — a single-key assignment verifies against directory_pubkey
 }
 
 /**
  * Discriminated union. TypeScript enforces `signer_pubkey` is present only
  * when `signature_type === 'frost'`.
  *
- * SESSION-004: M2+ code should only handle 'frost'. M1 assignments with
- * 'single' are rejected with `unsupported_signature_type`.
+ * Only 'frost' is handled. A 'single' assignment is rejected with
+ * `unsupported_signature_type`.
  */
 export type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle;
 
-// ─── Session establishment TBS builder (SESSION-004 / HIGH-5) ─────────────────
+// ─── Session establishment TBS builder ────────────────────────────────────────
 
 /**
  * Build the FROST to-be-signed bytes for session establishment.
@@ -224,23 +191,22 @@ export function buildSessionEstablishmentTbs(
   ]) as Uint8Array;
 }
 
-// ─── SealPayload (SESSION-003) ────────────────────────────────────────────────
+// ─── SealPayload ──────────────────────────────────────────────────────────────
 
 /**
  * SEAL control payload carried as the content_bytes of a ctrl leaf.
  * Canonical CBOR encoding: [session_id, final_root, close_timestamp, "PENDING"].
- * Per SESSION-003 behavior spec.
  */
 export interface SealPayload {
   session_id: Uint8Array;   // 16 bytes — matches the session
   final_root: Uint8Array;   // 32-byte Merkle root at the time of SEAL signing
   close_timestamp: number;  // Unix ms
-  attestation: "PENDING";   // M1 placeholder; M7 replaces with CLEAN/FLAGGED
+  attestation: "PENDING";   // the only value the wire format admits today
 }
 
 /**
  * Encode a SealPayload as canonical CBOR: [session_id, final_root, close_timestamp, "PENDING"].
- * Per SESSION-003 behavior spec and RFC 8949 §4.2.1.
+ * Per RFC 8949 §4.2.1.
  */
 export function encodeSealPayload(payload: SealPayload): Uint8Array {
   return CBOR_ENC.encode([
@@ -275,7 +241,7 @@ export function decodeSealPayload(bytes: Uint8Array): SealPayload | null {
   return { session_id: sid, final_root: root, close_timestamp: ts, attestation: "PENDING" };
 }
 
-// ─── buildSealTbs (SESSION-005) ───────────────────────────────────────────────
+// ─── buildSealTbs ─────────────────────────────────────────────────────────────
 
 /**
  * Build the FROST to-be-signed bytes for a conversation seal ceremony.
@@ -316,9 +282,8 @@ export interface SessionAbandoned {
 }
 
 /**
- * M1 session_sealed frame (single-key directory signature).
- * Refused in M2 clients per SESSION-005 SI-003.
- * @deprecated Use SessionSealedFrost instead in M2+.
+ * Legacy session_sealed frame (single-key directory signature). Refused by current clients.
+ * @deprecated Use SessionSealedFrost.
  */
 export interface SessionSealedSingle {
   type: "session_sealed";
@@ -327,12 +292,12 @@ export interface SessionSealedSingle {
   sealed_root: Uint8Array;         // 32-byte final Merkle root
   directory_signature: Uint8Array; // 64-byte Ed25519 over canonical CBOR([session_id, sealed_root, close_timestamp])
   close_timestamp: number;         // Unix ms
-  legibility?: SealLegibility;     // M7-SESSION-004: receipt-not-assent + frontiers + final_message
+  legibility?: SealLegibility;     // receipt-not-assent + frontiers + final_message
 }
 
 /**
- * M2 session_sealed frame (FROST-notarized ceremony signature).
- * SESSION-005: seal_type is 'frost' when the FROST ceremony completes.
+ * session_sealed frame carrying the FROST-notarized ceremony signature.
+ * signature_type is 'frost' when the FROST ceremony completes.
  */
 export interface SessionSealedFrost {
   type: "session_sealed";
@@ -342,36 +307,36 @@ export interface SessionSealedFrost {
   frost_signature: Uint8Array;     // 64-byte combined FROST signature over seal TBS
   signer_pubkey: Uint8Array;       // 32-byte initiator primary_pubkey (group public key)
   close_timestamp: number;         // Unix ms
-  leaf_count?: number;             // total leaves in the sealed tree (SESSION-005 H-003)
-  legibility?: SealLegibility;     // M7-SESSION-004: receipt-not-assent + frontiers + final_message
+  leaf_count?: number;             // total leaves in the sealed tree
+  legibility?: SealLegibility;     // receipt-not-assent + frontiers + final_message
 }
 
-/** Discriminated union: M2 sends SessionSealedFrost; old M1 wire format is SessionSealedSingle. */
+/** Discriminated union: current senders emit SessionSealedFrost; SessionSealedSingle is the legacy wire format. */
 export type SessionSealed = SessionSealedSingle | SessionSealedFrost;
 
-// ─── Seal certificate legibility (M7-SESSION-004) ─────────────────────────────
+// ─── Seal certificate legibility ──────────────────────────────────────────────
 //
-// POSTMORTEM Part 3 (C-1 / C-2 / C-6, all SETTLED). The seal certificate gains a
-// first-class, machine-readable `legibility` object stating that its signatures
-// attest RECEIPT — not assent — and publishing each party's content-frontier, a
-// per-attestation live-vs-recovered marker, and whether the final message was
-// answered. A signature over a hash chain can prove exactly three things — these
-// bytes existed, in this order, delivered to/from me — and is cryptographically
-// INCAPABLE of proving agreement. "Sealed" must never be read as "agreed".
+// The seal certificate carries a first-class, machine-readable `legibility` object
+// stating that its signatures attest RECEIPT — not assent — and publishing each
+// party's content-frontier, a per-attestation live-vs-recovered marker, and whether
+// the final message was answered. A signature over a hash chain can prove exactly
+// three things — these bytes existed, in this order, delivered to/from me — and is
+// cryptographically INCAPABLE of proving agreement. "Sealed" must never be read as
+// "agreed".
 //
 // These properties are DERIVED by the directory at seal time from the leaves it
 // already verifies (the signed last_seen_seq, sender pubkeys, sequence numbers)
 // and the receipt-not-assent constant; they are carried on this wire frame and
-// persisted CLIENT-SIDE in SQLite. No new persisted directory column is added.
+// persisted CLIENT-SIDE in SQLite. No persisted directory column backs them.
 
 /**
  * Per-attestation marker.
  *   'live'      — the participant produced their SEAL acknowledgement leaf
  *                 contemporaneously in this ceremony (full-bilateral / present-party).
  *   'absent'    — the participant produced no acknowledgement (counterparty ABSENT;
- *                 populated by the unilateral-notarization flow, Workstream A).
- *   'recovered' — the acknowledgement was added post-hoc on return (populated by the
- *                 bilateral-upgrade flow, Workstream C).
+ *                 set by the unilateral-notarization flow).
+ *   'recovered' — the acknowledgement was added post-hoc on return (set by the
+ *                 bilateral-upgrade flow).
  */
 export type AttestationMode = "live" | "recovered" | "absent";
 
@@ -446,7 +411,6 @@ export interface SessionSealRejected {
 /**
  * seal_verified: directory → seal initiator, after all three verification passes pass.
  * Tells the initiator: "I've verified the tree — coordinate the FROST ceremony now."
- * Per SESSION-005 step 4 in the seal ceremony flow.
  */
 export interface SealVerified {
   type: "seal_verified";

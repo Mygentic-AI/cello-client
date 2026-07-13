@@ -1,18 +1,16 @@
 /**
- * CELLO Primary/Standby Transfer Wire Types — M8C-PRIMARY-1
+ * CELLO Primary/Standby Transfer Wire Types
  *
- * Design: docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 4, revised across 3
- * passes: adversarial security review, a code-level correction to the real client-coordinated-
- * per-node pattern, and a release-attestation crypto fix reusing the existing FROST ceremony).
+ * Design: docs/planning/user-stories/m8c/M8C-PRIMARY-DESIGN.md (Decision 4).
  * Mirrors registration.ts's DKG protocol shape exactly — CELLO has no cross-node RPC/consensus
  * anywhere; "exactly one Primary" is enforced by the SAME pattern DKG already uses: the daemon
  * (client) dials each of T-of-N directory nodes holding the agent's FROST shares directly, and
  * each node independently verifies + records the claim locally. There is no directory-to-directory
  * frame here — only client-to-directory, repeated per node.
  *
- * Phase P — Pseudocode
+ * Protocol flow
  * ─────────────────────────────────────────────────────────────────────────────
- * Primary-transfer flow (on the existing authenticated /cello/signaling/1.0.0 stream, once per
+ * Primary-transfer flow (on the authenticated /cello/signaling/1.0.0 stream, once per
  * directory node the daemon dials):
  *
  * CLIENT (new Primary) → DIRECTORY (one node):
@@ -82,7 +80,7 @@ export const PRIMARY_TRANSFER_DOMAIN = "CELLO-PRIMARY-TRANSFER-v1";
 
 /**
  * Canonical to-be-signed bytes for a primary-transfer release attestation (M8C-PRIMARY-DESIGN
- * Decision 3, Pass 3). Field order is LOAD-BEARING — both the signer (the old Primary daemon,
+ * Decision 3). Field order is LOAD-BEARING — both the signer (the old Primary daemon,
  * via participateInCeremony) and every verifier (each directory node, via verifySignature) must
  * produce IDENTICAL bytes, or verification never succeeds regardless of whether the ceremony
  * itself was genuine. Mirrors buildAgentRevocationTbs's exact structure (revocation.ts).

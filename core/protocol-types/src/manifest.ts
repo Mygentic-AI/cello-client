@@ -5,10 +5,8 @@
  * the CELLO consortium. It is threshold-signed by officer keys to prevent
  * unauthorized modification.
  *
- * Types defined here are consumed by:
- * - core/crypto (verification logic)
- * - core/client (manifest fetching and caching)
- * - core/adapter-claude-code (bootstrap)
+ * Types defined here are consumed by core/crypto (verification logic) and core/daemon (manifest
+ * fetching, caching, and bootstrap).
  */
 
 /** A single directory node in the consortium. */

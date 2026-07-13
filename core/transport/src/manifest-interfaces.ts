@@ -1,5 +1,5 @@
 /**
- * M7-MANIFEST-002 — Manifest-related interface definitions for the CELLO client daemon.
+ * Manifest-related interface definitions for the CELLO client daemon.
  *
  * These interfaces decouple the daemon and SignalingManager from their concrete
  * implementations. All interfaces are narrow by design.

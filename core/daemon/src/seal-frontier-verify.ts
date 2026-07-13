@@ -1,5 +1,5 @@
 /**
- * DOD-LEG-2 (SESSION-004 SI-002) — client-side content-frontier re-derivation.
+ * Client-side content-frontier re-derivation.
  *
  * The directory builds + signs the seal legibility, including each party's
  * `content_frontier_seq` ("the highest message the party provably received"). The client
@@ -95,7 +95,7 @@ export function findInflatedFrontier(
   return null;
 }
 
-// ─── M8B FINDING-5 (SI-002): attestation-aware UNILATERAL frontier check ────────
+// ─── Attestation-aware UNILATERAL frontier check ────────
 
 export interface UnilateralFrontierParticipant {
   pubkey: string;
@@ -108,12 +108,12 @@ export interface UnilateralFrontierCheck {
    *  - verified:           leaves present, no CLIENT-VERIFIABLE ('live') frontier exceeded its leaves.
    *  - corrected:          leaves present, one or more 'live' frontiers were inflated and overridden
    *                        DOWN to the re-derived value (see `corrections`).
-   *  - directory_attested: no frontier_leaves shipped (a pre-FINDING-5 directory) — the cert stays
-   *                        directory-attested (FINDING-3 behavior). No correction possible.
+   *  - directory_attested: no frontier_leaves shipped (an older directory) — the cert stays
+   *                        directory-attested. No correction possible.
    *  - leaves_invalid:     frontier_leaves are forged / cross-session (reDeriveFrontiers failed) — a
    *                        tamper signal; persist the directory-attested frontiers, log loudly. NEVER
-   *                        rejected (the unilateral dedup guard makes rejection an unrecoverable
-   *                        dead-end — cascade-2 reviewer Critical 2).
+   *                        rejected: the unilateral dedup guard makes rejection an unrecoverable
+   *                        dead-end.
    */
   status: "verified" | "corrected" | "directory_attested" | "leaves_invalid";
   /** lowercased pubkey → corrected content_frontier_seq, for inflated 'live' parties. The caller
@@ -123,14 +123,14 @@ export interface UnilateralFrontierCheck {
 }
 
 /**
- * FINDING-5 — the present party independently re-verifies (and CORRECTS) the UNILATERAL receipt's
- * frontiers. OVERRIDE, never reject.
+ * The present party independently re-verifies (and CORRECTS) the UNILATERAL receipt's frontiers.
+ * OVERRIDE, never reject.
  *
  * The unilateral legibility is FROST-notarized by the directory but the frontier VALUES are NOT bound
  * into the seal signature (unlike the bilateral seal, whose signer binds the legibility hash), so the
  * client must not trust them blindly. Because the directory-side dedup guard makes a client REJECTION
- * of a unilateral cert unrecoverable (a retry close is silently ignored — no receipt ever produced,
- * worse than FINDING-3), the client CORRECTS rather than rejects:
+ * of a unilateral cert unrecoverable (a retry close is silently ignored — no receipt is ever
+ * produced), the client CORRECTS rather than rejects:
  *   - CLIENT-VERIFIABLE ('live') party: the present (submitting) party carries all its own signed
  *     leaves, so its content_frontier_seq is fully re-derivable. The directory cannot forge signed
  *     leaves, so the re-derived value is the provable truth → an inflated published value is OVERRIDDEN
@@ -150,17 +150,16 @@ export function checkUnilateralFrontier(
 ): UnilateralFrontierCheck {
   const corrections = new Map<string, number>();
   const haveLeaves = Array.isArray(frontierLeaves) && frontierLeaves.length > 0;
-  // Pre-FINDING-5 directory (no leaves): keep FINDING-3's directory-attested behavior. Never reject —
-  // rejecting would regress the shipped FINDING-3 receipt and break unilateral seals against a
-  // not-yet-upgraded directory during rollout.
+  // A directory that ships no leaves leaves the cert directory-attested. Never reject — rejecting
+  // would break unilateral seals against a not-yet-upgraded directory during rollout.
   if (!haveLeaves) return { status: "directory_attested", corrections };
 
   const rederived = reDeriveFrontiers(frontierLeaves as SealFrontierLeaf[], sessionId);
   // Forged / cross-session leaves are the STRONGEST tamper evidence, so they get the strongest
-  // correction — treat them as ZERO trustworthy evidence (an empty derived map), which drives any
-  // 'live' frontier > 0 down to 0. (Leaving the published value untouched would make malformed leaves
-  // an EASIER inflation bypass than shipping none — cascade-2 re-review.) We still never REJECT
-  // (the directory dedup guard makes rejection an unrecoverable dead-end); the caller logs loudly.
+  // correction: treat them as ZERO trustworthy evidence (an empty derived map), which drives any
+  // 'live' frontier > 0 down to 0. Do NOT leave the published value untouched on invalid leaves —
+  // that would make malformed leaves an EASIER inflation bypass than shipping none. Still never
+  // REJECT (the directory dedup guard makes rejection an unrecoverable dead-end); the caller logs.
   const derived = rederived.ok ? rederived.frontiers : new Map<string, number>();
 
   // Only CLIENT-VERIFIABLE ('live') parties are re-derivable; override any value above the provable

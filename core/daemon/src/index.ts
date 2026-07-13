@@ -37,7 +37,7 @@ export { connectOrStart, type ConnectResult } from "./connect-or-start.js";
 export { RetryQueue, type RetryQueueEntry, type ResendFn, type ResendResult, RETRY_QUEUE_CAP } from "./retry-queue.js";
 export { NonceDedupStore, NONCE_DEDUP_CAP } from "./nonce-dedup.js";
 
-// CELLO-M7-TRANSPORT-001: direct-P2P transport selection with relay fallback + dcutr
+// Direct-P2P transport selection with relay fallback + dcutr
 export {
   TransportSelector,
   LocalTransportSelectorStub,
@@ -53,16 +53,16 @@ export type {
   AdvertisedAddress,
 } from "./transport-selector.js";
 
-// M7-MANIFEST-002: manifest loading, verification, and polling
+// Manifest loading, verification, and polling
 export { FileManifestProvider } from "./manifest-loader.js";
 export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll-scheduler.js";
 export { InMemoryManifestVersionStore } from "./manifest-version-store.js";
 export { DbManifestVersionStore } from "./manifest-version-store-db.js";
 export { ManifestDirectoryChallengeVerifier, TestDirectoryChallengeVerifier } from "./challenge-verifier.js";
 
-// DOD-ONBOARD-HELP-1 §2b — the ONE vocabulary (capability → {cli, mcp}). Exported so the CLI
-// registry and the connect shim's audit test derive their names from the SAME table the daemon
-// renders its guidance from, instead of three lists of literals that drift.
+// The ONE vocabulary (capability → {cli, mcp}). Exported so the CLI registry and the connect shim's
+// audit test derive their names from the SAME table the daemon renders its guidance from, instead of
+// three lists of literals that drift.
 export {
   DUAL_SURFACE_VERBS,
   MCP_ONLY_TOOLS,
@@ -77,11 +77,9 @@ export {
   type ClientSurface,
 } from "./vocabulary.js";
 
-// The FROST/DKG directory-node client. This lives in the daemon because the daemon is the only
-// process that runs a ceremony — it reimplements natively what the retired @cello-protocol/client
-// used to own (daemon.ts: "the daemon never imports @cello-protocol/client"). Exported so
-// trustless-cello's directory tests can drive a real DKG against a real directory without
-// resurrecting the dead client package they used to import this from.
+// The FROST/DKG directory-node client. It lives in the daemon because the daemon is the only process
+// that runs a ceremony, and the daemon never imports @cello-protocol/client. Exported so
+// trustless-cello's directory tests can drive a real DKG against a real directory.
 export {
   NetworkDirectoryNode,
   bootstrapNetworkKeyShares,

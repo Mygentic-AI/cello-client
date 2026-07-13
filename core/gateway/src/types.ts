@@ -1,16 +1,15 @@
 /**
  * @cello-protocol/gateway — the security gateway contract.
  *
- * The gateway is a SEPARATE program from the daemon (M9-CORE-001 / V3 split-deployment).
- * The daemon holds ONLY this interface and its two call sites; all detection lives in the
- * gateway program. The same interface backs both the local sidecar (Phase 1) and the
- * remote mTLS gateway (Phase 2) — Phase 2 is a transport swap behind `SecurityGatewayClient`,
- * not a rewrite.
+ * The gateway is a SEPARATE program from the daemon. The daemon holds ONLY this interface and
+ * its two call sites; all detection lives in the gateway program. The same interface backs both
+ * the local sidecar and the remote mTLS gateway — the remote form is a transport swap behind
+ * `SecurityGatewayClient`, not a rewrite.
  *
- * M9-CORE-001 implements the seam with a pass-through: every message is screened (the call
- * happens at the two fixed points) but the verdict is always `allow`, except the fail-closed
- * `block` a configured-but-unreachable gateway returns. Detectors and the redact/warn
- * dispositions arrive in later stories (M9-IN-*, M9-OUT-*, M9-FEED-001).
+ * TODAY the seam is a pass-through: every message is screened (the call happens at the two fixed
+ * points) but the verdict is always `allow`, except the fail-closed `block` a
+ * configured-but-unreachable gateway returns. No detector is wired yet, and the redact/warn
+ * dispositions are declared but never produced.
  */
 
 /** Which direction the content is flowing relative to the daemon. */
@@ -20,13 +19,13 @@ export type ScreenDirection = "outbound" | "inbound";
  * What the gateway decided to do with a message.
  *
  * - `allow`  — deliver/send as-is (or as transformed via `content`).
- * - `block`  — do not deliver/send. M9-CORE-001 uses this only for fail-closed
- *              (`gateway_unavailable`); detectors add real blocks later.
- * - `redact` — deliver/send a transformed `content` (M9-OUT-* / M9-FEED-001).
- * - `warn`   — held pending an explicit governance decision (M9-FEED-001).
+ * - `block`  — do not deliver/send. Today this is only ever fail-closed (`gateway_unavailable`);
+ *              detectors will produce real blocks.
+ * - `redact` — deliver/send a transformed `content`.
+ * - `warn`   — held pending an explicit governance decision.
  *
- * M9-CORE-001 only ever returns `allow` or `block`; `redact`/`warn` are declared here so the
- * seam code that switches on the disposition is complete from the start.
+ * The shipping gateway only ever returns `allow` or `block`; `redact`/`warn` are declared here so
+ * the seam code that switches on the disposition is exhaustive.
  */
 export type ScreenDisposition = "allow" | "block" | "redact" | "warn";
 
@@ -34,7 +33,7 @@ export type ScreenDisposition = "allow" | "block" | "redact" | "warn";
 export type GovernanceDisposition = "observe" | "redact" | "block" | "warn";
 
 /**
- * A governance decision the agent attaches to a re-send to resolve a warned item (M9-FEED-001 §6):
+ * A governance decision the agent attaches to a re-send to resolve a warned item (governance §6):
  *   - `redact`       — send with a typed placeholder. Always available (the agent's autonomous lever).
  *   - `allow_once`   — send the value verbatim THIS once. Honored ONLY when `autonomous_override` is
  *                      ON; OFF (default) → rejected + re-warned (the operator must whitelist).
@@ -46,8 +45,8 @@ export type GovernanceDecision = "redact" | "allow_once" | "allow_always";
 
 /**
  * One governance finding published by a screen stage (§6). The verdict aggregates these; the daemon
- * renders them to the agent (M9-FEED-001) — as the transformations on a redact, the reasons on a
- * block, or the flagged items (with `flagId`) on a warn.
+ * renders them to the agent — as the transformations on a redact, the reasons on a block, or the
+ * flagged items (with `flagId`) on a warn.
  */
 export interface GovernanceEvent {
   stage: string;
@@ -66,7 +65,7 @@ export interface ScreenContext {
   /** The async-flow correlation id, threaded through every event in this send/receive (INV-7). */
   correlationId?: string;
   /**
-   * The agent's per-item decisions on a governance RE-SEND (M9-FEED-001 §6), keyed by the `flagId`
+   * The agent's per-item decisions on a governance RE-SEND (governance §6), keyed by the `flagId`
    * the prior `warn` verdict returned. Stateless: the gateway re-scans the (full) content, re-derives
    * the same deterministic flagIds, and applies these decisions. A flagId that no longer matches
    * (content changed) is ignored and that item re-warns/redacts — a decision can never mis-apply to
@@ -88,7 +87,7 @@ export interface ScreenVerdict {
   content?: Uint8Array;
   reason?: string;
   guidance?: string;
-  /** The governance findings behind this verdict (M9-FEED-001 renders them to the agent). */
+  /** The governance findings behind this verdict — the daemon renders them to the agent. */
   events?: GovernanceEvent[];
   /**
    * Set on a `block` whose cause is the CONTENT itself — a detector rejected these exact bytes
@@ -119,7 +118,7 @@ export interface SecurityGatewayClient {
 /** The reason code a fail-closed verdict carries when the gateway cannot be reached. */
 export const GATEWAY_UNAVAILABLE = "gateway_unavailable";
 /** The reason a fail-closed verdict carries when the gateway is reachable but the screening
- *  deadline was exceeded — a timeout is a verdict, not a hang (INV-6 / FEED-001 AC-005). */
+ *  deadline was exceeded — a timeout is a verdict, not a hang (INV-6). */
 export const GOVERNANCE_TIMEOUT = "governance_timeout";
 
 /**

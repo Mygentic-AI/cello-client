@@ -3,13 +3,12 @@
  *
  * Each entry carries { name, summary, help, flags, run }. Everything derives from this one table:
  *  - dispatch (src/bin/cello.ts) — no switch to keep in sync,
- *  - the `cello --help` described `Commands:` table — rendered from each entry's `summary`
- *    (this is DOD-ONBOARD-HELP-1's remaining gap; the old surface was a pipe-delimited blob),
- *  - per-command `cello <cmd> --help` — the pre-existing help text, moved here VERBATIM,
+ *  - the `cello --help` described `Commands:` table — rendered from each entry's `summary`,
+ *  - per-command `cello <cmd> --help`,
  *  - the recognized-flag set used to reject unknown flags before dispatch.
  *
- * Consequence, and the reason for the refactor: the help table, per-command help, and dispatch
- * CANNOT DRIFT, and adding a command FORCES adding its one-line summary.
+ * Consequence: the help table, per-command help, and dispatch CANNOT DRIFT, and adding a command
+ * FORCES adding its one-line summary.
  */
 
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
@@ -143,11 +142,11 @@ function takeValueFlag(args: string[], flag: string): { value?: string; rest: st
 }
 
 /**
- * Review F5 — a numeric flag given a NON-NUMERIC value must fail loud, never be silently dropped.
+ * A numeric flag given a NON-NUMERIC value must fail loud, never be silently dropped.
  *
- * `--since-seq abc` used to parse to undefined, which `defined()` then removed, which turned a
- * stateless CATCH-UP into a 30-second BLOCKING live wait that returns `content: null` — so a script
- * asking "what did I miss?" was answered "nothing new" to a question it never asked. Silently
+ * If `--since-seq abc` parsed to undefined, `defined()` would strip it, turning a stateless
+ * CATCH-UP into a 30-second BLOCKING live wait that returns `content: null` — a script asking
+ * "what did I miss?" would be answered "nothing new" to a question it never asked. Silently
  * changing the meaning of a command is worse than refusing it.
  *
  * Throws a BadFlagValue, which run() converts to a structured error + exit 1.
@@ -191,11 +190,10 @@ function legacy(result: CommandResult): CliOutput {
 /**
  * `--agent <name>` — recognized by every agent-scoped command.
  *
- * `consumesValue: false` is deliberate and is what checkArgs PARITY requires: the pre-existing
- * checkArgs never skipped --agent's value (only `--limit` did), and flipping this to true would
- * change `cello contacts --agent --bogus` from a fail-loud unknown_flag into a silently
+ * `consumesValue: false` is deliberate: checkArgs must NOT skip --agent's value. Flipping this to
+ * true would turn `cello contacts --agent --bogus` from a fail-loud unknown_flag into a silently
  * accepted agent literally named "--bogus". The value is claimed by splitAgentFlag (arg-parse.ts),
- * which owns --agent parsing; checkArgs only needs to know the FLAG is legal. Same for install's
+ * which owns --agent parsing; checkArgs only needs to know the FLAG is legal. Same for bridge's
  * --agent / --hermes-home below.
  */
 const AGENT_FLAG: readonly FlagSpec[] = [{ name: "--agent", consumesValue: false }];
@@ -344,9 +342,6 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "refresh",
     group: "Agents",
-    // VERIFIED against the handler (cello_refresh_shares → runAgentRefresh), not guessed. It runs a
-    // resharing ceremony with the directory nodes and moves the agent to a NEW key epoch. Routine
-    // key hygiene — nothing is re-registered and the agent's public identity does not change.
     summary: "Rotate an agent's signing-key shares to a fresh epoch (routine key hygiene).",
     help:
       "Usage: cello refresh <name>  — rotate the agent's split signing-key shares to a new epoch.\n" +
@@ -425,8 +420,6 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "send",
     group: "Messaging",
-    // §4: "honors read-before-write" was jargon for a rule the operator meets as a REFUSAL. Say the
-    // rule, and say that the tool will tell you.
     summary: "Send a message. Any unread messages must be read first — you'll be told, and blocked until you do.",
     help:
       "Usage: cello send <session-id> <message…> [--stdin] [--agent <name>] [--pretty]\n" +
@@ -501,9 +494,9 @@ export const COMMANDS: readonly CommandSpec[] = [
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const { value } = takeValueFlag(positional, "--scope");
-      // Review F6: an UNRECOGNIZED scope must not silently become the default. A typo'd
-      // `--scope all` (e.g. "al") would have answered with `current`'s data and exit 0 — the
-      // operator reads "no notifications" while another agent's inbox is full.
+      // An UNRECOGNIZED scope must not silently become the default. A typo'd `--scope all` (e.g.
+      // "al") would answer with `current`'s data and exit 0 — the operator reads "no
+      // notifications" while another agent's inbox is full.
       if (value !== undefined && value !== "all" && value !== "current") {
         return {
           stdout: "",
@@ -590,10 +583,9 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "relay-receipts",
     group: "Sessions & receipts",
-    // VERIFIED against the handler (cello_get_relay_receipts → getRelayReceipts): per-MESSAGE
-    // signatures from a RELAY attesting it handled and ordered that message. Renamed from
-    // `receipts` because a name that differed from `sealed-receipt` by one plural could not be
-    // rescued by any description — Andre could not tell them apart, and he wrote the protocol.
+    // Per-MESSAGE signatures from a RELAY attesting it handled and ordered that message — NOT the
+    // session seal. The name must stay clearly distinct from `sealed-receipt`: two names differing
+    // by a single plural cannot be rescued by any description.
     summary: "Advanced/debug: per-message proofs signed by a relay. Not the session receipt — see 'sealed-receipt'.",
     help:
       "Usage: cello relay-receipts <name>  — ADVANCED / DEBUG. You almost certainly want\n" +
@@ -638,7 +630,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       "    remove                    remove them (they go back to being a stranger)\n" +
       "    set-tier <0..4>           how much they're trusted: 0=blocked, 1=stranger, 2=known,\n" +
       "                              3=trusted (reaches you even when you're away), 4=vip.\n" +
-      "                              A higher tier RAISES their limits; it never removes screening.\n" +
+      "                              A higher tier RAISES their limits; it never removes the caps.\n" +
+      "                              It does NOT change content screening — that is not yet active.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
       "    set-moniker <name>        YOUR pet name for THEM (empty clears it). Always wins over the\n" +
       "                              name they offer — the one thing they cannot spoof.\n" +
@@ -647,12 +640,11 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  Note: 'set-moniker' names a CONTACT. 'cello moniker' sets your OWN outbound name.\n" +
       "  Example:  cello contact 178d420b… set-tier 3 --agent alice",
     flags: AGENT_FLAG,
-    jsonOut: true, // review F3: the WHOLE address book honors §3 — one command, one contract
+    jsonOut: true, // the WHOLE address book honors §3 — one command, one contract
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
       const o = { agent, pretty };
-      // §3 SHAPE: `contact <pubkey> <op>` — the subject first, then what to do to them. (The old
-      // shape was `contact <op> <pubkey>`, which read like a verb table rather than an address book.)
+      // §3 SHAPE: `contact <pubkey> <op>` — the subject first, then what to do to them.
       const [pubkey, op, valueArg] = positional;
       if (!pubkey || !op) return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
       if (op === "add") return contactAdd(ctx.celloDir, pubkey, o);
@@ -742,8 +734,8 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "bridge",
     group: "Other",
-    // Renamed from `install`, which read as "install CELLO itself" and hardcoded Hermes — the
-    // runtime is a PARAMETER. More runtimes are coming; the description must not claim otherwise.
+    // The runtime is a PARAMETER, not hardcoded Hermes. More runtimes are coming; neither the name
+    // nor the description may claim otherwise.
     summary: "Bridge CELLO into a third-party agent runtime (Hermes, OpenClaw, …).",
     help:
       "Usage: cello bridge <runtime> --agent <name> [--hermes-home <path>]\n" +
@@ -794,9 +786,9 @@ export function findCommand(name: string): CommandSpec | undefined {
  * Internal: a spec's help by name, for commands that print their own usage on bad input.
  *
  * Called with hardcoded names that MUST resolve, so a miss is a programmer error (a rename typo),
- * not a runtime condition. Throwing beats the old `?? ""` default, which would have printed an
- * EMPTY string with exit 1 — silently swallowing the operator's only guidance, and doing it in the
- * one code path whose entire job is to explain what went wrong.
+ * not a runtime condition. It THROWS rather than defaulting to `""`: an empty string with exit 1
+ * would silently swallow the operator's only guidance, in the one code path whose entire job is to
+ * explain what went wrong.
  */
 function helpForSpec(name: string): string {
   const spec = findCommand(name);
@@ -820,10 +812,10 @@ export function flagsFor(name: string): ReadonlyMap<string, FlagSpec> {
 /**
  * DOD-ONBOARD-HELP-1 §1: render the `Commands:` table GROUPED and in logical order.
  *
- * Flat-and-arbitrary was the reopen: `register` appeared before `create-agent`, so the table
- * literally listed step 2 above step 1. Sections in GROUP_ORDER, commands in declaration order
- * within each — the order a reader would actually do them. Name column is padded across the WHOLE
- * table (not per group) so the summaries line up as one column down the page.
+ * Sections in GROUP_ORDER, commands in declaration order within each — the order a reader would
+ * actually do them. A flat/alphabetical table is wrong: it lists `register` (step 2) above
+ * `create-agent` (step 1). Name column is padded across the WHOLE table (not per group) so the
+ * summaries line up as one column down the page.
  */
 export function renderCommandsTable(): string {
   const width = Math.max(...COMMANDS.map((c) => c.name.length));

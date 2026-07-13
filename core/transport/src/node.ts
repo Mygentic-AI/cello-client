@@ -3,63 +3,9 @@
  *
  * createNode() and CelloNodeImpl: libp2p node bootstrap for the CELLO protocol.
  *
- * PSEUDOCODE (Phase P) — preserved as reference:
+ * createNode() returns the node in STOPPED state — start() is a separate call.
  *
- * createNode({ keyProvider, listenAddresses }):
- *   1. Generate a fresh Ed25519 keypair via @libp2p/crypto/keys generateKeyPair('Ed25519').
- *      This keypair is the libp2p transport identity (Peer ID + Noise handshake key).
- *      It is completely independent of keyProvider — ADR-0001 invariant.
- *      Noise spec reference: https://noiseprotocol.org/noise.html (XX pattern)
- *      libp2p Noise spec: https://github.com/libp2p/specs/tree/master/noise
- *   2. Call createLibp2p({
- *        privateKey: freshKeypair,
- *        addresses: { listen: listenAddresses },
- *        transports: [tcp(), webSockets()],
- *        connectionEncrypters: [noise()],   // ONLY Noise — no plaintext. SI-001.
- *        streamMuxers: [yamux()],
- *        services: {
- *          identify: identify(),
- *          relay: circuitRelayServer(),      // advertises HOP protocol
- *          dcutr: dcutr(),
- *        },
- *      })
- *   3. Do NOT start the libp2p node — return it in stopped state. AC-001 says
- *      start() is called separately.
- *   4. Wrap in CelloNodeImpl which stores keyProvider (for MSG-001 use) but
- *      never calls keyProvider.getPublicKey() or keyProvider.sign(). SI-002.
- *
- * node.start():
- *   - Call libp2p.start()
- *   - node is now listening on configured addresses
- *
- * node.stop():
- *   - Call libp2p.stop()
- *   - All connections/streams are closed
- *   - listenAddresses() will return []
- *
- * node.dial(multiaddr):
- *   - If stopped: throw { reason: 'node_stopped', message }
- *   - multiaddr string → multiaddr object via @multiformats/multiaddr
- *   - libp2p.dial(multiaddr) → Connection
- *   - Return { peerId: connection.remotePeer.toString() }
- *
- * node.handle(protocolId, handler):
- *   - libp2p.handle(protocolId, ({stream}) => handler(stream))
- *
- * node.newStream(peerId, protocolId):
- *   - If stopped: throw { reason: 'node_stopped', message }
- *   - Get existing connections to peerId
- *   - If no open connections: throw { reason: 'connection_lost', peerId, message }
- *   - connection.newStream(protocolId):
- *     - On protocol negotiation failure (UnsupportedProtocolError): throw { reason: 'protocol_not_supported', protocolId, message }
- *     - On connection error: throw { reason: 'connection_lost', peerId, message }
- *   - Return stream
- *
- * node.listenAddresses():
- *   - Return libp2p.getMultiaddrs().map(ma => ma.toString())
- *   - Returns [] when stopped (libp2p returns empty array)
- *
- * Stream framing: it-length-prefixed (unsigned varint prefix per multiformats spec)
+ * Stream framing: it-length-prefixed (unsigned varint prefix per multiformats spec).
  * Use lp.encode(source) / lp.decode(source) with it-pipe for composing pipelines.
  */
 
@@ -88,7 +34,7 @@ import {
   DEFAULT_DIALABILITY,
 } from "./autonat.js";
 
-// ─── Dialability helpers (CELLO-M7-TRANSPORT-001) ─────────────────────────────
+// ─── Dialability helpers ──────────────────────────────────────────────────────
 
 /**
  * Decide whether a multiaddr string represents a publicly-dialable address.
@@ -142,8 +88,8 @@ function extractHost(addr: string): string | null {
 /**
  * Derive dialability from the node's current self-reported multiaddrs.
  *
- * CELLO-M7-TRANSPORT-001 (review I5): dialability MUST reflect AutoNAT dial-back
- * confirmation, not mere configuration. A node configured to listen on / announce
+ * Dialability MUST reflect AutoNAT dial-back confirmation, not mere
+ * configuration. A node configured to listen on / announce
  * a public IP that is actually behind a firewall is NOT dialable — advertising
  * that unreachable direct address would deny service. We therefore exclude any
  * address whose host matches the node's own configured listen/announce hosts:
@@ -173,13 +119,13 @@ function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>
 class CelloNodeImpl implements CelloNode {
   readonly #libp2p: Libp2p;
   readonly keyProvider: KeyProvider;
-  // CELLO-M7-TRANSPORT-001: dialability observable, updated on each AutoNAT
-  // probe cycle (surfaced by libp2p as a 'self:peer:update' event).
+  // Dialability observable, updated on each AutoNAT probe cycle (surfaced by
+  // libp2p as a 'self:peer:update' event).
   #dialability: Dialability = { ...DEFAULT_DIALABILITY };
   readonly #dialabilityListeners = new Set<(d: Dialability) => void>();
-  // CELLO-M7-TRANSPORT-001 (I5): hosts this node was explicitly configured to
-  // listen on / announce. These are NOT dial-back-confirmed, so they are excluded
-  // from dialability — only AutoNAT-confirmed observed addresses count.
+  // Hosts this node was explicitly configured to listen on / announce. These are
+  // NOT dial-back-confirmed, so they are excluded from dialability — only
+  // AutoNAT-confirmed observed addresses count.
   readonly #configuredHosts: ReadonlySet<string>;
 
   constructor(libp2p: Libp2p, keyProvider: KeyProvider, configuredHosts: ReadonlySet<string>) {
@@ -402,20 +348,20 @@ function mapStreamError(
  *   - Muxer: Yamux
  *   - Services: identify, circuitRelayServer (advertises HOP), AutoNAT, DCuTR
  *
- * CELLO-M7-TRANSPORT-001:
+ * NAT traversal:
  *   - autoNAT() is added to ALL nodes. On client nodes (session / standing
  *     receiver) it probes connected directory nodes for dial-back to determine
  *     dialability; on directory nodes it serves the responder role, answering
- *     dial-back requests (AC-011). Protocol: /libp2p/autonat/1.0.0.
+ *     dial-back requests. Protocol: /libp2p/autonat/1.0.0.
  *   - dcutr() is included for session nodes (and the default/service nodes) so a
  *     relay-fallback connection can be hole-punch upgraded to direct, but is
  *     OMITTED for standing-receiver nodes (nodeType==='standing_receiver') — a
  *     standing receiver only needs to know its own dialability, not upgrade
- *     existing connections (AC-002).
+ *     existing connections.
  */
 export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // dcutr is for dialers upgrading relay-fallback connections. A standing
-  // receiver is a receiver, not a dialer — omit dcutr there (AC-002).
+  // receiver is a receiver, not a dialer — omit dcutr there.
   const includeDcutr = opts.nodeType !== "standing_receiver";
   // ADR-0001: generate a fresh keypair for libp2p transport identity.
   // keyProvider is intentionally NOT touched here — see SI-002.
@@ -467,8 +413,8 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       ...(includeDcutr ? { dcutr: dcutr() } : {}),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
-    // M7-SESSION-003 AC-005: configure the keepalive ping interval so a peer that
-    // vanished without a clean close is detected within a bounded window. A failed
+    // Keepalive ping interval, so a peer that vanished without a clean close is
+    // detected within a bounded window. A failed
     // ping aborts the connection (abortConnectionOnPingFailure default true),
     // firing peer:disconnect → counterparty_liveness drives to 'gone'.
     ...(opts.keepAliveIntervalMs !== undefined
@@ -476,9 +422,9 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       : {}),
   });
 
-  // CELLO-M7-TRANSPORT-001 (I5): record the hosts this node was configured to
-  // listen on / announce. deriveDialability excludes these so dialability reflects
-  // AutoNAT dial-back confirmation, not configuration.
+  // Record the hosts this node was configured to listen on / announce.
+  // deriveDialability excludes these so dialability reflects AutoNAT dial-back
+  // confirmation, not configuration.
   const configuredHosts = new Set<string>();
   for (const a of [...opts.listenAddresses, ...(opts.announceAddresses ?? [])]) {
     const host = extractHost(a);

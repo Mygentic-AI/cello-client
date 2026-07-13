@@ -1,25 +1,5 @@
 /**
  * CLI command implementations for the `cello` binary.
- *
- * Pseudocode:
- * 1. login(celloDir, daemonBin):
- *    - Call connectOrStart(celloDir) to either connect to existing or spawn new daemon
- *    - Print status (already running / started)
- *    - Close IPC connection and exit 0
- *
- * 2. logout(celloDir):
- *    - Read lock file to find socket path
- *    - Connect to daemon
- *    - Send 'shutdown' method
- *    - Wait for acknowledgement
- *    - Exit 0
- *
- * 3. status(celloDir):
- *    - Read lock file to find socket path
- *    - Connect to daemon
- *    - Send 'status' method
- *    - Print response as structured JSON
- *    - Exit 0
  */
 
 import { join } from "node:path";
@@ -28,9 +8,9 @@ import {
   connectToDaemon,
   readLock,
   removeLock,
-  // isProcessAlive is deliberately NOT imported any more. The CLI used to ask "is that pid alive?" to
-  // decide whether a daemon existed; a pid can be dead, or reused by an unrelated process, and the
-  // answer was wrong in both directions. The kernel's lock is the only thing that knows.
+  // isProcessAlive is deliberately NOT imported. "Is that pid alive?" is the wrong question in both
+  // directions — a pid can be dead, or reused by an unrelated process. The kernel's lock is the only
+  // thing that knows whether a daemon exists.
   probeSingletonLock,
   SINGLETON_LOCK_FILENAME,
   type DaemonStatusResponse,
@@ -40,10 +20,10 @@ import {
 
 /**
  * M8C-LOGINSTART-1 CORE: bring every loaded agent online. Called by `cello login` after the daemon
- * is up. login ALWAYS completes — a per-agent start failure is COLLECTED, never thrown (design-review
- * #8), so one bad agent can't abort login. `cello_start_agent` is idempotent, so re-login is safe.
- * The per-agent `autoStart: false` opt-out is PARKED until the M9 config store lands (D14).
- * Extracted (not inline in login) so it is unit-testable against an in-process daemon.
+ * is up. login ALWAYS completes — a per-agent start failure is COLLECTED, never thrown, so one bad
+ * agent can't abort login. `cello_start_agent` is idempotent, so re-login is safe. The per-agent
+ * `autoStart: false` opt-out is PARKED until the M9 config store lands (D14).
+ * Lives here rather than inline in login() so it is unit-testable against an in-process daemon.
  */
 export async function autoStartAllAgents(
   client: IpcClient,
@@ -96,7 +76,7 @@ export async function login(
 
 /**
  * M8C-LOGINSTART-1: compose the operator-facing auto-start summary — every failed agent enumerated
- * by name + reason (design-review #8). Pure + exported so the enumeration string is directly testable.
+ * by name + reason. Pure + exported so the enumeration string is directly testable.
  */
 export function formatLoginSummary(result: { started: string[]; failed: Array<{ name: string; reason: string }> }): string {
   const parts: string[] = [];
@@ -126,19 +106,19 @@ const LOGOUT_WAIT_POLL_MS = 50;
  *  2. no process holds the singleton lock.
  *
  * (1) alone is not enough: a daemon wedged mid-shutdown may have closed its IPC server while still
- * holding the DB. (2) alone is not enough either, because a daemon from BEFORE this change holds no
- * singleton lock at all — during the upgrade window "free" says nothing about whether it is alive, and
- * only the socket can tell us. Together they are exactly the conditions under which the next daemon
- * can safely start.
+ * holding the DB. (2) alone is not enough either, because a pre-singleton-lock daemon holds no
+ * singleton lock at all — for those, "free" says nothing about whether it is alive, and only the
+ * socket can tell us. Together they are exactly the conditions under which the next daemon can
+ * safely start.
  *
- * The old version keyed off `isProcessAlive(lock.pid)` and the lock FILE. Both are unreliable in ways
- * this story documents at length: a pid can be reused, and a lock file can be deleted by anyone.
+ * Neither `isProcessAlive(lock.pid)` nor the lock FILE may be substituted for these two facts: a pid
+ * can be reused, and a lock file can be deleted by anyone.
  */
 async function daemonGone(celloDir: string, socketPath: string, logger: Logger): Promise<boolean> {
   try {
-    // Review F4: connectToDaemon has no connect timeout of its own — bound the probe so a
-    // pathological hang cannot stall the poll loop past its deadline. On the expected path the
-    // socket is already gone, so this fails fast (ENOENT/ECONNREFUSED).
+    // connectToDaemon has no connect timeout of its own — bound the probe so a pathological hang
+    // cannot stall the poll loop past its deadline. On the expected path the socket is already gone,
+    // so this fails fast (ENOENT/ECONNREFUSED).
     const probe = await Promise.race([
       connectToDaemon(socketPath),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe_timeout")), 500)),
@@ -155,8 +135,8 @@ async function daemonGone(celloDir: string, socketPath: string, logger: Logger):
 export async function logout(
   celloDir: string,
   onProgress?: (line: string) => void,
-  // Review F1: injectable bounds so the timeout path is testable without a 5 s wait. Production
-  // (the bin) passes nothing and gets the named defaults.
+  // Injectable bounds so the timeout path is testable without a 5 s wait. Production (the bin)
+  // passes nothing and gets the named defaults.
   waitOpts?: { timeoutMs?: number; pollMs?: number },
 ): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
@@ -164,23 +144,22 @@ export async function logout(
   const timeoutMs = waitOpts?.timeoutMs ?? LOGOUT_WAIT_TIMEOUT_MS;
   const pollMs = waitOpts?.pollMs ?? LOGOUT_WAIT_POLL_MS;
 
-  // The socket path is DETERMINISTIC. `daemon.lock`'s copy of it is metadata, and metadata is exactly
-  // what this unit learned not to trust.
+  // The socket path is DETERMINISTIC. `daemon.lock`'s copy of it is metadata, and metadata is not
+  // to be trusted here.
   const socketPath = join(celloDir, "daemon.sock");
   const lock = await readLock(lockFilePath);
 
   // DOD-SINGLE-DAEMON-1 (AC4) — the lock file does not get to decide whether a daemon exists.
   //
-  // This used to open with `if (!lock) return "No daemon running."`. That is a KILL SWITCH REPORTING
-  // SUCCESS WITHOUT DOING ANYTHING, and the state that triggers it is the one DOD-DAEMON-CLEANUP-1 is
-  // named after: an exiting orphan unlinks a HEALTHY daemon's lock. The operator then runs `cello
-  // logout` to stop their agent, is told it was never running, and walks away — while the daemon is
-  // still online, still on the directory, still extending the hash chain. `rm ~/.cello/daemon.lock`
-  // did the same thing. A kill switch may not lie.
+  // Never short-circuit on `if (!lock) return "No daemon running."`. That is a KILL SWITCH REPORTING
+  // SUCCESS WITHOUT DOING ANYTHING, and the state that triggers it is real: an exiting orphan unlinks
+  // a HEALTHY daemon's lock (so does `rm ~/.cello/daemon.lock`). The operator then runs `cello logout`
+  // to stop their agent, is told it was never running, and walks away — while the daemon is still
+  // online, still on the directory, still extending the hash chain. A kill switch may not lie.
   //
   // So we ask the daemon itself. If something ANSWERS on the socket, a daemon is running — that is
-  // the strongest evidence available, it needs no file, and it holds for a daemon from BEFORE this
-  // change (which holds no singleton lock at all — every operator has one running at upgrade time).
+  // the strongest evidence available, it needs no file, and it holds even for a pre-singleton-lock
+  // daemon, which holds no singleton lock at all.
   let client: IpcClient;
   try {
     client = await connectToDaemon(socketPath);
@@ -218,9 +197,9 @@ export async function logout(
     if (!lock) {
       return { exitCode: 0, output: "No daemon running." };
     }
-    // DOD-LOGOUT-WAIT-1 (Review F3): only CLAIM the removal when it actually happened — removeLock
-    // swallows non-ENOENT errors into a (here discarded) warn, and printing "Removed" for a lock
-    // still on disk would be this unit's own lie in miniature.
+    // DOD-LOGOUT-WAIT-1: only CLAIM the removal when it actually happened — removeLock swallows
+    // non-ENOENT errors into a (here discarded) warn, and printing "Removed" for a lock still on
+    // disk would be this unit's own lie in miniature.
     const removed = await removeLock(lockFilePath, noopLogger)
       .then(async () => (await readLock(lockFilePath)) === null)
       .catch(() => false);
@@ -243,12 +222,12 @@ export async function logout(
   // The request is in — tell the operator NOW, then report "stopped" only when it is true.
   onProgress?.("Shutting down the daemon…");
 
-  // DOD-LOGOUT-WAIT-1: returning the instant the shutdown request was WRITTEN left a window
-  // where `cello logout && cello login` found the daemon mid-death — connectOrStart saw a live
-  // pid + connectable socket and printed "Daemon already running.", leaving the operator logged
-  // out while being told otherwise. Wait until the daemon is genuinely gone; "Daemon stopped."
-  // for a daemon that is still running is the same class of lie as a success log on a failed
-  // send (DOD-SENDRAW-1).
+  // DOD-LOGOUT-WAIT-1: do NOT return the instant the shutdown request is WRITTEN. That leaves a
+  // window where `cello logout && cello login` finds the daemon mid-death — connectOrStart sees a
+  // live pid + connectable socket and prints "Daemon already running.", leaving the operator logged
+  // out while being told otherwise. Wait until the daemon is genuinely gone; "Daemon stopped." for a
+  // daemon that is still running is the same class of lie as a success log on a failed send
+  // (DOD-SENDRAW-1).
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await daemonGone(celloDir, socketPath, noopLogger)) {
@@ -299,8 +278,8 @@ export async function register(
   // Checking just the "CELLO-" prefix catches the common typo (pasting the literal words
   // "CELLO_PREAUTH_TOKEN") without hard-coding the exact length/alphabet — the directory stays the
   // authority on the full format, so a future format bump can't strand a valid token behind a
-  // client-side "malformed" (reviewer F2 / D13). A wrong-length CELLO- token reaches the daemon and
-  // is rejected there with a structured reason.
+  // client-side "malformed". A wrong-length CELLO- token reaches the daemon and is rejected there
+  // with a structured reason.
   if (!preAuthToken.startsWith("CELLO-")) {
     return {
       exitCode: 1,
@@ -339,8 +318,8 @@ export async function register(
           null,
           2,
         ) +
-        // M8C-ONBOARD-NEXTSTEP-1 (R7): every command output carries the next step + state legibility.
-        // CC-6 (P2-1): broken onto multiple lines — the dense one-liner buried the three status cues.
+        // M8C-ONBOARD-NEXTSTEP-1: every command output carries the next step + state legibility.
+        // Broken onto multiple lines — a dense one-liner buries the three status cues.
         `\n\nNext: run  cello status  to confirm '${agent}' is registered.\n` +
         `  • it's normal for this to take a minute or two while registration settles.\n` +
         `  • ready = the agent shows state 'online' and directory_signaling 'connected'.\n` +

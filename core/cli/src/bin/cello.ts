@@ -2,10 +2,10 @@
 /**
  * cello — the CELLO CLI binary.
  *
- * DOD-CLI-PARITY-1 Phase 0: this file no longer contains a dispatch switch. Every command lives in
- * the registry (src/registry.ts), which is also what renders `cello --help` and per-command help —
- * so dispatch, the command table, and the help text cannot drift apart. Adding a command means
- * adding one registry entry; this binary does not change.
+ * There is no dispatch switch here. Every command lives in the registry (src/registry.ts), which is
+ * also what renders `cello --help` and per-command help — so dispatch, the command table, and the
+ * help text cannot drift apart. Adding a command means adding one registry entry; this binary does
+ * not change.
  *
  * The bash-adapter contract (§3): a command's JSON result goes to stdout, a structured failure goes
  * to stderr VERBATIM, and the exit code branches on it — so any bash-capable agent can drive a
@@ -58,8 +58,8 @@ async function main(): Promise<void> {
 
   const args = process.argv.slice(3);
 
-  // M8B F2: answer --help/-h on every subcommand and REJECT unknown flags BEFORE dispatch, so a
-  // flag can never be coerced into a positional argument.
+  // Answer --help/-h on every subcommand and REJECT unknown flags BEFORE dispatch, so a flag can
+  // never be coerced into a positional argument.
   const check = checkArgs(command, args);
   if (check.kind === "help") {
     process.stdout.write(helpForCommand(command) + "\n");

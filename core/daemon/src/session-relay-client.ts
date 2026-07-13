@@ -1,5 +1,5 @@
 /**
- * M7 DOD-SPINE-6 / MSG-001-3b — daemon-side relay witness client (PER AGENT).
+ * Daemon-side relay witness client (PER AGENT).
  *
  * In CELLO the relay is the ordering/witness authority (Structure 2): it never sees
  * plaintext (content is peer↔peer), only the SIGNED content-hash leaves. It assigns
@@ -21,10 +21,9 @@
  *
  * The stream is (re)dialed from whatever live session node is current at submit time, so it
  * survives individual session teardown (the relay treats a same-pubkey reconnect as a
- * reconnect, re-auths, and re-drains). Reuses only proven wire shapes:
- *   - auth: mirror of the retired client's relay challenge-response (proven against this relay)
- *   - Structure 1 + hash_submit: mirror of the retired client's seal-leaf submit path
- *   - server contract: `packages/relay/src/relay-node.ts`
+ * reconnect, re-auths, and re-drains).
+ *
+ * The server contract this must match: `packages/relay/src/relay-node.ts`.
  *
  * Crypto: Ed25519 RFC 8032. Relay auth domain: "CELLO-RELAY-AUTH-v1".
  */
@@ -83,7 +82,7 @@ export interface LeafDeliverFrame {
   structure1_cbor: Uint8Array;
   structure2_cbor: Uint8Array;
   /**
-   * M7-UPGRADE-002: true when the relay echoed back OUR OWN submitted leaf (sender_pubkey ===
+   * True when the relay echoed back OUR OWN submitted leaf (sender_pubkey ===
    * our K_local), false when it is a genuine COUNTERPARTY leaf. The auto-acknowledge gate uses
    * this to never auto-co-sign in response to its own SEAL ctrl leaf (which would loop). An
    * explicit field — the consumer must not have to re-decode structure1_cbor to learn it.
@@ -96,10 +95,10 @@ export type SubmitResult =
   | {
       ok: true;
       sequence_number: number;
-      // DOD-MSG-4 (self-ordering content frame): the signed ordering record for THIS leaf, so the
-      // sender can stamp it into the content frame. structure1_cbor is the sender-signed bytes
-      // (built locally); structure2_cbor is the relay's committed record (from hash_submit_ack).
-      // Both undefined against an OLD relay that does not yet return structure2_cbor.
+      // The signed ordering record for THIS leaf, so the sender can stamp it into the content frame.
+      // structure1_cbor is the sender-signed bytes (built locally); structure2_cbor is the relay's
+      // committed record (from hash_submit_ack). Both undefined against an OLD relay that does not
+      // return structure2_cbor.
       structure1_cbor?: Uint8Array;
       structure2_cbor?: Uint8Array;
     }
@@ -115,13 +114,13 @@ export interface AgentRelayClientOpts {
   senderPubkey: Uint8Array;
   logger: Logger;
   /**
-   * DOD-RELAYSIG-1: durable store for the relay's signed ordering-record receipts. When present, each
+   * Durable store for the relay's signed ordering-record receipts. When present, each
    * verified `hash_submit_ack` is recorded immutably (the client's evidence of the relay's sequence
    * attestation, carried to the directory at seal time). Optional — when absent, ACKs are not recorded.
    */
   receiptStore?: RelayReceiptStore;
   /**
-   * FED-OPTIONB-SEAL-001: the per-session leaf log a unilateral seal carries to the directory. When
+   * The per-session leaf log a unilateral seal carries to the directory. When
    * present, every leaf this client sees — its OWN submits (with the relay receipt) and the COUNTERPARTY's
    * delivered leaves (no receipt) — is recorded so a later unilateral seal presents the full chain for the
    * directory's OFFLINE tree rebuild. Optional — when absent, no leaf log is kept.
@@ -130,8 +129,8 @@ export interface AgentRelayClientOpts {
 }
 
 /**
- * FED-OPTIONB-SETUP-001 (Option B): the directory-signed relay assignment a client presents to its
- * chosen relay (a `client_record_assignment` frame), replacing the old directory→relay dial. The relay
+ * The directory-signed relay assignment a client presents to its chosen relay (a
+ * `client_record_assignment` frame). The relay
  * reconstructs the relay TBS from these fields and verifies `assignmentSignature` (the directory's
  * per-node relayDirSig) against any consortium directory pubkey. Field order/presence MUST match the
  * directory producer (directory-node.ts) and the relay verifier (relay-node.ts recordAssignment).
@@ -216,16 +215,16 @@ export class AgentRelayClient {
   readonly #lastSeen = new Map<string, number>();
   /** The one outstanding submit's resolver (global FIFO — ack carries no session_id). */
   #pendingAck: AckResolver | null = null;
-  // DOD-MSG-4: the sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
+  // The sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
   // SubmitResult can carry it (the ack itself only returns the relay's structure2_cbor).
   #pendingStructure1: Uint8Array | null = null;
-  // FED-OPTIONB-SEAL-001: the in-flight submit's leaf kind (0x00 msg / 0x02 ctrl), paired with its ack so
+  // The in-flight submit's leaf kind (0x00 msg / 0x02 ctrl), paired with its ack so
   // #captureReceipt can persist it alongside the Structure2/Structure1 carry bytes for the unilateral seal.
   #pendingLeafKind: number | null = null;
   /** The session_id hex of the in-flight submit, so its ack updates the right #lastSeen. */
   #pendingAckSessionHex: string | null = null;
   /**
-   * FED-OPTIONB-SETUP-001: resolver for the in-flight `client_record_assignment` ack. The ack carries
+   * Resolver for the in-flight `client_record_assignment` ack. The ack carries
    * no session_id (like hash_submit_ack), so at most one record is in flight; records are serialized on
    * the same `#submitChain` as submits, guaranteeing no overlap.
    */
@@ -236,13 +235,13 @@ export class AgentRelayClient {
   readonly #sessions = new Map<string, {
     node: CelloNode;
     onLeafDeliver: (frame: LeafDeliverFrame) => void;
-    /** FED-OPTIONB-SETUP-001: the directory-signed relay assignment to present (absent for direct/legacy). */
+    /** The directory-signed relay assignment to present (absent for direct/legacy sessions). */
     assignment?: RelayAssignmentCarry;
-    /** FED-OPTIONB-SETUP-001: true once the relay has acked this session's client_record_assignment. */
+    /** True once the relay has acked this session's client_record_assignment. */
     recorded: boolean;
     /**
-     * FED-OPTIONB-SETUP-001 (code-review M1): the relay cleanly REJECTED this assignment
-     * (assignment_invalid — e.g. not signed by any consortium directory). Terminal: stop re-presenting
+     * The relay cleanly REJECTED this assignment (assignment_invalid — e.g. not signed by any
+     * consortium directory). Terminal: stop re-presenting
      * it, so a misconfigured relay can't trigger a reconnect/re-present storm across sibling sessions.
      */
     recordRejected: boolean;
@@ -258,7 +257,7 @@ export class AgentRelayClient {
     this.#sealLeafStore = opts.sealLeafStore;
   }
 
-  /** The agent's K_local public key as hex — the responder identity for auto-acknowledge (UPGRADE-002). */
+  /** The agent's K_local public key as hex — the responder identity for auto-acknowledge. */
   get senderPubkeyHex(): string {
     return Buffer.from(this.#senderPubkey).toString("hex");
   }
@@ -266,7 +265,7 @@ export class AgentRelayClient {
   /**
    * Register a session's inbound leaf handler + a live node to (re)dial the relay from
    * (idempotent). Storing the node per session lets a pure-receiver session re-establish
-   * the shared stream if the node that originally dialed is torn down (L5).
+   * the shared stream if the node that originally dialed is torn down.
    */
   registerSession(
     sessionIdHex: string,
@@ -283,10 +282,10 @@ export class AgentRelayClient {
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
     });
-    // FED-OPTIONB-SETUP-001 (Option B): eagerly present the assignment so the relay records the session
-    // (binds peer IDs, creates the session entry) BEFORE the first hash_submit or the counterparty's
-    // leaves arrive — matching the timing the old directory→relay recordAssignment dial provided.
-    // Best-effort + serialized on the submit chain (the ack carries no session_id, so no overlap).
+    // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
+    // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay
+    // rejects frames for a session it has not recorded. Best-effort + serialized on the submit chain
+    // (the ack carries no session_id, so no overlap).
     if (assignment) {
       this.#submitChain = this.#submitChain
         .then(() => this.#doRecord(node, sessionIdHex))
@@ -295,7 +294,7 @@ export class AgentRelayClient {
   }
 
   /**
-   * FED-OPTIONB-SETUP-001: present the directory-signed assignment to the relay (Option B). Idempotent
+   * Present the directory-signed assignment to the relay. Idempotent
    * (no-op once `recorded`, or when the session has no assignment — direct/persisted/legacy sessions).
    * The relay reconstructs the TBS and verifies the per-node directory signature against any consortium
    * key. On success the session is recorded; the send/ack is single-in-flight (mirrors #doSubmit).
@@ -305,7 +304,7 @@ export class AgentRelayClient {
     const sess = this.#sessions.get(sessionIdHex);
     if (!sess || !sess.assignment) return true;
     if (sess.recorded) return true;
-    // Terminal rejection (code-review M1): a relay that cleanly rejected this assignment will reject it
+    // Terminal rejection: a relay that cleanly rejected this assignment will reject it
     // again — stop re-presenting so a misconfigured/forged case can't storm the shared stream.
     if (sess.recordRejected) return false;
     if (!(await this.#ensureConnected(node))) return false;
@@ -421,7 +420,7 @@ export class AgentRelayClient {
   }
 
   /**
-   * RELAYSIG-1: verify a relay `hash_submit_ack`'s signed ordering record and durably store the receipt.
+   * Verify a relay `hash_submit_ack`'s signed ordering record and durably store the receipt.
    * The relay signs TBS = SHA-256(content_hash || seq_BE4 || ts_BE8) with its ack-signing key, whose hex is
    * `relay_id`. We verify SELF-CONSISTENCY (the signature binds the sequence ⇒ a FORGED sequence fails) and
    * record the immutable receipt. The authoritative registered-relay check is the directory's at seal
@@ -452,8 +451,8 @@ export class AgentRelayClient {
     });
     switch (ev.kind) {
       case "unsigned":
-        // A relay that SHOULD sign (PERSIST-012) but didn't → no durable witness for this message. Not an
-        // error per the DoD (unsigned ACKs are optional), but make it diagnosable instead of invisible.
+        // A relay that SHOULD sign but didn't → no durable witness for this message. Unsigned ACKs are
+        // tolerated, but make it diagnosable instead of invisible.
         this.#logger.debug("relay.receipt.unsigned", { seq, hashShort: Buffer.from(contentHash).toString("hex").slice(0, 16) });
         return false;
       case "bad_relay_id":
@@ -462,7 +461,7 @@ export class AgentRelayClient {
       case "invalid_signature":
         // FORGED / corrupt ACK — the signature does not bind (hash, seq, ts). REJECT the submit so the send
         // does NOT settle ok on an unverified sequence (a forged ordering record must not drive ordering),
-        // and store nothing (DoD: "a forged sequence is rejected"). The send still completes via the direct
+        // and store nothing. The send still completes via the direct
         // content path — the relay witness simply degrades to absent for this leaf.
         this.#logger.warn("relay.receipt.signature_invalid", { seq });
         return true;
@@ -473,7 +472,7 @@ export class AgentRelayClient {
           if (wrote) {
             this.#logger.info("relay.receipt.stored", { seq, hashShort: ev.receipt.hashHex.slice(0, 16), relayShort: ev.receipt.relayId.slice(0, 16) });
           }
-          // FED-OPTIONB-SEAL-001: record this OWN leaf in the seal-leaf log WITH its relay receipt (the
+          // Record this OWN leaf in the seal-leaf log WITH its relay receipt (the
           // relay's signature pins content_hash→seq — the teeth that stop a supplier reordering its own
           // leaves). structure2_cbor rides the ack we just verified; structure1Cbor + the leaf kind are this
           // submit's paired in-flight values. Best-effort + separate from the receipt write.
@@ -492,7 +491,7 @@ export class AgentRelayClient {
           }
         } catch (err) {
           // A durable-evidence write failure must be LOUD — the relay will not re-emit this ack, so a
-          // swallowed write permanently loses a verified receipt (fallback #4).
+          // swallowed write permanently loses a verified receipt.
           this.#logger.error("relay.receipt.store_failed", { seq, error: err instanceof Error ? err.message : String(err) });
         }
         return false;
@@ -505,17 +504,17 @@ export class AgentRelayClient {
     if (type === "hash_submit_ack") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       // DO NOT advance #lastSeen here: the ack is for OUR OWN leaf. last_seen_seq must track
-      // the highest COUNTERPARTY sequence we've observed (the directory's causal check —
-      // SESSION-003 SI-003 — rejects a leaf whose last_seen_seq exceeds the max sequence of
-      // OTHER-sender leaves before it). Advancing on our own ack would inflate it and trip
-      // causal_chain_violated on a subsequent submit (e.g. the SEAL leaf after a sent message).
-      // DOD-MSG-4: pair the relay's committed structure2_cbor with our in-flight structure1_cbor so
+      // the highest COUNTERPARTY sequence we've observed — the directory's causal check rejects a leaf
+      // whose last_seen_seq exceeds the max sequence of OTHER-sender leaves before it. Advancing on our
+      // own ack would inflate it and trip causal_chain_violated on a subsequent submit (e.g. the SEAL
+      // leaf after a sent message).
+      // Pair the relay's committed structure2_cbor with our in-flight structure1_cbor so
       // the SubmitResult carries the full signed ordering record for the self-ordering content frame.
       // Captured BEFORE #settlePending clears #pendingStructure1.
       const s2 = frame["structure2_cbor"];
       const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
       const structure1Cbor = this.#pendingStructure1 ?? undefined;
-      // RELAYSIG-1: verify the relay's signed ordering record and durably store the receipt BEFORE
+      // Verify the relay's signed ordering record and durably store the receipt BEFORE
       // settling (which clears #pendingStructure1, the source of the content hash + session id). A
       // signed-but-INVALID ACK rejects the submit so the send does not settle ok on an unverified sequence.
       const rejectSubmit = this.#captureReceipt(frame, structure1Cbor, seq);
@@ -530,7 +529,7 @@ export class AgentRelayClient {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
       this.#settlePending({ ok: false, reason });
     } else if (type === "assignment_ok") {
-      // FED-OPTIONB-SETUP-001: the relay verified + recorded our client-presented assignment.
+      // The relay verified + recorded our client-presented assignment.
       const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
     } else if (type === "assignment_invalid") {
       // The relay rejected the assignment (e.g. directory_signature_invalid — not signed by any
@@ -545,7 +544,7 @@ export class AgentRelayClient {
       // leaf back as a leaf_deliver — that must NOT advance it (same reason as the ack above).
       const authoredByUs = this.#isOwnLeaf(s1);
       if (seq >= 0 && !authoredByUs) this.#bumpLastSeen(sidHex, seq);
-      // FED-OPTIONB-SEAL-001: record the COUNTERPARTY's delivered leaf in the seal-leaf log (no relay
+      // Record the COUNTERPARTY's delivered leaf in the seal-leaf log (no relay
       // receipt — the relay does not ack-sign a delivery to the recipient). It is pinned at seal by the
       // absent party's sender_signature (unforgeable) + sequence contiguity against our receipt-pinned own
       // leaves. Our OWN echoed leaf is skipped here (it is recorded WITH its receipt on the ack path).
@@ -577,7 +576,7 @@ export class AgentRelayClient {
           leaf_kind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
           structure1_cbor: s1,
           structure2_cbor: toU8(frame["structure2_cbor"]),
-          // M7-UPGRADE-002: tell the consumer whether this is our own echoed leaf (so the
+          // Tell the consumer whether this is our own echoed leaf (so the
           // auto-acknowledge gate never co-signs in response to its own SEAL ctrl leaf).
           authored_by_us: authoredByUs,
         });
@@ -725,11 +724,11 @@ export class AgentRelayClient {
         // Stream gone — clear it so the next submit re-dials, and fail any in-flight submit.
         if (this.#stream === stream) this.#stream = null;
         this.#settlePending({ ok: false, reason: "relay_stream_closed" });
-        // FED-OPTIONB-SETUP-001 (code-review L4): settle an in-flight record too, so #doRecord doesn't
+        // Settle an in-flight record too, so #doRecord doesn't
         // wait the full timeout on a dropped stream. "closed" is transient (not a directory rejection) ⇒
         // recorded stays false and it is retried after reconnect.
         { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
-        // L5: a pure-receiver session issues no submit, so it would never trigger a re-dial
+        // A pure-receiver session issues no submit, so it would never trigger a re-dial
         // after the node that owned the stream is torn down. If sessions remain, proactively
         // re-establish from any still-live registered session node so queued leaf_delivers
         // are drained (the relay queues by pubkey and re-delivers on reconnect).
@@ -758,7 +757,7 @@ export class AgentRelayClient {
 
   /**
    * Submit a leaf hash of a given kind (0x00 message / 0x02 control) to the relay. The SEAL
-   * ctrl leaf (DOD-SPINE-7) rides this path: two distinct-sender ctrl leaves in the relay's
+   * ctrl leaf rides this path: two distinct-sender ctrl leaves in the relay's
    * log trigger the directory's FROST notarization (relay `#maybeProcessSeal`).
    */
   async submitLeaf(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
@@ -775,10 +774,9 @@ export class AgentRelayClient {
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
 
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
-    // FED-OPTIONB-SETUP-001 (Option B): the relay records the session from the CLIENT-presented
-    // assignment (the directory no longer dials the relay). Ensure it is recorded BEFORE the first
-    // hash_submit — the relay rejects a submit for an unknown session. Idempotent + no-op when there is
-    // no assignment to present (direct/persisted/legacy). Runs inline on the submit chain (no re-chaining
+    // The relay records the session from the CLIENT-presented assignment. It MUST be recorded BEFORE
+    // the first hash_submit — the relay rejects a submit for an unknown session. Idempotent + no-op when
+    // there is no assignment to present (direct/persisted sessions). Runs inline on the submit chain (no re-chaining
     // — #doSubmit is already a chain link), and may reset the stream on failure, so capture #stream after.
     await this.#doRecord(node, sessionIdHex);
     const stream = this.#stream;
@@ -803,7 +801,7 @@ export class AgentRelayClient {
     const ackPromise = new Promise<SubmitResult>((r) => { resolveAck = r; });
     this.#pendingAck = resolveAck;
     this.#pendingAckSessionHex = sessionIdHex;
-    // DOD-MSG-4: remember this submit's sender-signed structure1_cbor so its ack can return the full
+    // Remember this submit's sender-signed structure1_cbor so its ack can return the full
     // ordering record (the ack itself carries only the relay's structure2_cbor).
     this.#pendingStructure1 = structure1;
     this.#pendingLeafKind = leafKind;
@@ -837,7 +835,7 @@ export class AgentRelayClient {
   close(): void {
     this.#closed = true;
     this.#settlePending({ ok: false, reason: "relay_client_closed" });
-    // FED-OPTIONB-SETUP-001 (code-review L4): settle any in-flight record so #doRecord resolves promptly.
+    // Settle any in-flight record so #doRecord resolves promptly.
     { const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("closed"); }
     const stream = this.#stream;
     this.#stream = null;

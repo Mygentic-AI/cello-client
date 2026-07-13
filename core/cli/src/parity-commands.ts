@@ -49,7 +49,7 @@ function currentAgentPath(celloDir: string): string {
 /**
  * The persisted agent selection, or undefined if none was ever made.
  *
- * ENOENT — never selected — is the ONLY swallowed error (review F4). A blanket catch here would let
+ * ENOENT — never selected — is the ONLY swallowed error. A blanket catch here would let
  * an unreadable file (EACCES, EISDIR, a corrupt mount) read as "no selection", after which the
  * daemon's sole-online fallback would quietly run the command as whatever agent happens to be up:
  * the operator's selection silently replaced by a different identity, exit 0. Anything that is not
@@ -66,9 +66,9 @@ export async function readCurrentAgent(celloDir: string): Promise<string | undef
 }
 
 /**
- * Forget the persisted selection. Called by `stop-agent` (review F1): the daemon clears an agent
- * from every connection's current-agent state when it is stopped, so the CLI's durable mirror of
- * that state must be cleared too. Leaving it behind was a genuine defect — see stopAgent().
+ * Forget the persisted selection. Called by `stop-agent`: the daemon clears an agent from every
+ * connection's current-agent state when it is stopped, so the CLI's durable mirror of that state
+ * must be cleared too.
  */
 async function clearCurrentAgent(celloDir: string): Promise<void> {
   try {
@@ -117,7 +117,7 @@ async function withDaemon(
     await client.send("ipc.connect", { clientType: "cli" });
 
     if (agentScoped) {
-      // Review F2 — an EMPTY --agent must never be treated as "no --agent". `--agent "$VAR"` with
+      // An EMPTY --agent must never be treated as "no --agent". `--agent "$VAR"` with
       // VAR unset yields "", which is not nullish: it would suppress the persisted selection, fail
       // the truthiness check below, run NO replay, and let the daemon's sole-online fallback execute
       // the command as whatever agent happened to be up — exit 0, wrong identity, silently. That is
@@ -132,9 +132,9 @@ async function withDaemon(
 
       const selected = opts.agent ?? (await readCurrentAgent(celloDir));
       if (selected) {
-        // Review F1 — the replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an
-        // offline agent (AUTOSTART-1), so replaying it blindly meant `cello stop-agent alice` could
-        // be silently undone by the very next read-only command (`cello inbox`), bringing alice back
+        // The replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an offline
+        // agent (AUTOSTART-1), so replaying it blindly would let `cello stop-agent alice` be
+        // silently undone by the very next read-only command (`cello inbox`), bringing alice back
         // online and reachable with no signal. Stopping an agent is kill-switch-adjacent; a command
         // that reads must never re-arm it. The MCP surface never does this — the daemon clears the
         // agent from every connection on stop, and later calls get no_current_agent.
@@ -182,9 +182,9 @@ async function withDaemon(
 
 /**
  * Is this agent currently ONLINE? Asked via cello_list_agents (a real handler, no new IPC path) so
- * the replay can refuse to auto-start a stopped agent (review F1). Fails CLOSED: any unexpected
- * shape reads as "not online", which fails the command loud rather than resurrecting an agent the
- * operator deliberately stopped.
+ * the replay can refuse to auto-start a stopped agent. Fails CLOSED: any unexpected shape reads as
+ * "not online", which fails the command loud rather than resurrecting an agent the operator
+ * deliberately stopped.
  */
 async function isAgentOnline(client: IpcClient, name: string): Promise<boolean> {
   const res = (await client.send("cello_list_agents")) as { agents?: Array<{ name?: string; state?: string }> };
@@ -210,16 +210,14 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * The ONE place a CLI command's daemon IPC method is named (review T2).
+ * CLI command name → the daemon IPC method it calls. The ONE place a CLI command's daemon IPC
+ * method is named.
  *
  * The registry's `ipcMethod` field is set FROM this map, and every function below dispatches FROM
  * this map — so the field that DoD §9's parity test audits is, by construction, the literal that is
- * actually sent. Previously the two were independent strings: the registry could say
- * `cello_contact_set_moniker` while the code called `cello_contact_set_away`, and the audit — which
- * only read the metadata — would happily pass. A comment-in-a-field is not a guarantee; this is.
- */
-/**
- * CLI command name → the daemon IPC method it calls.
+ * actually sent. Two independent strings would let the registry say `cello_contact_set_moniker`
+ * while the code calls `cello_contact_set_away`, and the audit — which only reads the metadata —
+ * would happily pass. A comment-in-a-field is not a guarantee; this is.
  *
  * The KEYS are the CLI/MCP capability names (DOD-ONBOARD-HELP-1 §2b: one vocabulary). The VALUES
  * are the daemon's IPC WIRE names, which deliberately do NOT move — the shim maps tool
@@ -301,26 +299,20 @@ export function transcript(celloDir: string, sessionId: string, opts: ParityOpti
 }
 
 /**
- * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt.
+ * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt: the notarized bilateral SEAL
+ * receipt, the artifact the whole close ceremony exists to produce and the one an arbitrator reads.
  *
- * NOT in the brief's mapping table, which listed cello_get_sealed_receipt as "already covered by
- * `receipts`". It is not: `cello relay-receipts <name>` calls cello_get_relay_receipts — a DIFFERENT
- * handler (per-message relay delivery proofs). The notarized bilateral SEAL receipt — the artifact
- * the whole close ceremony exists to produce, and the one an arbitrator reads — had no CLI surface
- * at all. Added under the standing rule: a real, non-stub handler with no CLI command gets one.
- * (DOD-ONBOARD-HELP-1 later renamed `receipts` → `relay-receipts` precisely because two names that
- * differed by a single plural could not be told apart — the very confusion this comment records.)
+ * NOT the same handler as `cello relay-receipts <name>`, which calls cello_get_relay_receipts
+ * (per-message relay delivery proofs). The two are routinely conflated; they are different
+ * artifacts and must keep distinct names.
  */
 export function sealedReceipt(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["sealed-receipt"], { session_id: sessionId }, opts);
 }
 
-// Review F3: the WHOLE address book now speaks the §3 contract, not just the three new sub-verbs.
-// Previously add/remove/list/tier/away went through the legacy path (errors pretty-printed to
-// STDOUT, no --pretty) while the new set-moniker used the parity path (errors to stderr) — so a
-// bash script branching on stderr got DIFFERENT conventions between sub-verbs of the same command.
-// One command, one contract. (Behavior change, journaled: contact failures now print JSON on stderr
-// rather than stdout; the exit codes were already correct.)
+// The WHOLE address book speaks the §3 contract — every sub-verb, not just some. A bash script
+// branching on stderr must not get DIFFERENT conventions between sub-verbs of the same command.
+// One command, one contract: contact failures print JSON on stderr, never stdout.
 
 /** `cello contact <pubkey> add` → cello_contact_add. */
 export function contactAdd(celloDir: string, pubkey: string, opts: ParityOptions): Promise<CliOutput> {

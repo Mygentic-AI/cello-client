@@ -1,12 +1,11 @@
 /**
- * Session assignment parsing — ported onto the daemon (DOD-SPINE-5).
+ * Session assignment parsing.
  *
  * Decodes a raw CBOR-decoded `assignment` object (from a directory
- * `session_assignment` frame) into a typed SessionAssignment. Shape-validates only;
+ * `session_assignment` frame) into a typed SessionAssignment. Shape-validates ONLY;
  * the FROST/single signature is verified downstream by the transport/session layer
- * against the directory's pinned key. This is a faithful port of
- * core/client/src/session-assignment-parser.ts — the daemon must NOT import the dead
- * core/client stack, so the proven logic lives here.
+ * against the directory's pinned key. The logic lives here in the daemon because the
+ * daemon must NOT import the core/client stack.
  */
 
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
@@ -59,10 +58,10 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
   const dirSig = toU8Safe(raw["directory_signature"]);
   if (!dirSig || dirSig.length !== 64) return null;
 
-  // FED-OPTIONB-SETUP-001: the per-node directory signature over the relay TBS (Option B). Optional —
-  // absent on pre-M8B assignments and direct-mode sessions. When present it must be a valid 64-byte sig;
-  // a malformed value is dropped to undefined (the session then has no relay assignment to present, which
-  // surfaces as a relay-witness gap, not a hard failure).
+  // The per-node directory signature over the relay TBS. Optional — absent on older assignments and on
+  // direct-mode sessions. When present it must be a valid 64-byte sig; a malformed value is dropped to
+  // undefined (the session then has no relay assignment to present, which surfaces as a relay-witness
+  // gap, not a hard failure).
   const relayDirSigRaw = toU8Safe(raw["relay_directory_signature"]);
   const relayDirSig = relayDirSigRaw && relayDirSigRaw.length === 64 ? relayDirSigRaw : undefined;
 
@@ -81,7 +80,7 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
 
   const sigType = typeof raw["signature_type"] === "string" ? raw["signature_type"] : "single";
 
-  // M7 WIRE-001: session peer IDs + transport mode (undefined when absent, pre-M7 compat).
+  // Session peer IDs + transport mode — undefined when absent (an older peer omits them).
   const initiatorSessionPeerId =
     typeof raw["initiator_session_peer_id"] === "string" && raw["initiator_session_peer_id"] !== ""
       ? raw["initiator_session_peer_id"]
@@ -121,11 +120,7 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
   return { ...common, signature_type: "single" as const };
 }
 
-/**
- * Map a raw `session_request_error` frame's reason to a stable negotiator reason code.
- * Distinct cause → distinct code (M7 error discipline); unknown → directory_unreachable.
- */
-// ─── Cross-node discovery (Story B, item 1 client mirror) ────────────────────
+// ─── Cross-node discovery ────────────────────
 
 export interface DiscoveryLookupResultParsed {
   state: "online" | "offline" | "unknown_agent";
@@ -156,6 +151,10 @@ export function discoveryLookupErrorReason(_frame: Record<string, unknown>): str
   return "lookup_failed";
 }
 
+/**
+ * Map a raw `session_request_error` frame's reason to a stable negotiator reason code.
+ * Distinct cause → distinct code; an unknown reason collapses to directory_unreachable.
+ */
 export function sessionRequestErrorReason(frame: Record<string, unknown>): string {
   const reason = frame["reason"];
   const known = new Set([
@@ -171,30 +170,29 @@ export function sessionRequestErrorReason(frame: Record<string, unknown>): strin
     "no_connection",
     "connection_id_required",
     "session_request_missing_peer_id",
-    "agent_revoked", // CELLO-M7-REMOVE-001 DOD-REMOVE-3: the target (or initiator) agent is revoked
-    "agent_suspended", // CELLO-M8-LEVER-001 DOD-INV-6: the target/initiator is PAUSED (reversible suspend)
-    // DOD-DIR-FAILCLOSED-1 (D2): the directory fails closed instead of FROST-signing an
-    // endpoint-less assignment — the target never accepted the session_offer. Distinct from
-    // target_offline: the target IS connected to the directory, it just cannot serve this session
-    // (e.g. its standing receiver has not come up). Omitting it here collapses the cause to
-    // `directory_unreachable`, blaming the DIRECTORY for a healthy directory and a COUNTERPARTY
-    // that declined — the wrong subsystem, which is what makes such bugs cost days.
+    "agent_revoked", // the target (or initiator) agent is revoked
+    "agent_suspended", // the target/initiator is PAUSED (reversible suspend)
+    // The directory fails closed instead of FROST-signing an endpoint-less assignment — the target
+    // never accepted the session_offer. Distinct from target_offline: the target IS connected to the
+    // directory, it just cannot serve this session (e.g. its standing receiver has not come up).
+    // Omitting it here collapses the cause to `directory_unreachable`, blaming the DIRECTORY for a
+    // healthy directory and a COUNTERPARTY that declined — the wrong subsystem, which is what makes
+    // such bugs cost days.
     "counterparty_did_not_accept",
   ]);
   return typeof reason === "string" && known.has(reason) ? reason : "directory_unreachable";
 }
 
-// ─── MONIKER-2: the offer-moniker validation seams ──────────────────────────
+// ─── The offer-moniker validation seams ──────────────────────────
 
 import { validateMoniker } from "@cello-protocol/protocol-types";
 
 /**
- * MONIKER-2 AC2 — the receiver's wire boundary, validated ONCE here so downstream
- * code can never observe an invalid moniker. Absent ≠ invalid (spec §3): an absent
- * field is an older client (silent, rejected: false); a present-but-invalid value
- * means the sender runs modified code (rejected: true — the caller logs
- * `moniker.rejected`, never the raw value). Reject, never strip: the value is
- * returned verbatim or null, never repaired.
+ * The receiver's wire boundary, validated ONCE here so downstream code can never
+ * observe an invalid moniker. Absent ≠ invalid: an absent field is an older client
+ * (silent, rejected: false); a present-but-invalid value means the sender runs
+ * modified code (rejected: true — the caller logs `moniker.rejected`, never the raw
+ * value). Reject, never strip: the value is returned verbatim or null, never repaired.
  */
 export function extractOfferedMoniker(raw: Record<string, unknown>): {
   offeredMoniker: string | null;
@@ -219,10 +217,9 @@ export function extractOfferedMoniker(raw: Record<string, unknown>): {
 }
 
 /**
- * MONIKER-2 AC1 / MONIKER-1 AC3 (offer-construction half) — defense-in-depth
- * re-validation of the initiator's own outbound name. Returns undefined (field
- * OMITTED from the wire, never an empty string) when there is no name or the
- * stored value somehow fails validation.
+ * Defense-in-depth re-validation of the initiator's own outbound name. Returns
+ * undefined (field OMITTED from the wire, never an empty string) when there is no
+ * name or the stored value somehow fails validation.
  */
 export function resolveOutboundMoniker(outboundName: string | null): string | undefined {
   if (outboundName === null) return undefined;

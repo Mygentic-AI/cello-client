@@ -1,33 +1,21 @@
 /**
- * CELLO Daemon — SessionTree (CELLO-M7-DAEMON-004, Option A)
+ * CELLO Daemon — SessionTree.
  *
- * The DAEMON-OWNED per-session Merkle tree. This is the authoritative running
- * transcript of every leaf (sent or received) for a session. Before this story,
- * the daemon "did not maintain the session Merkle tree — the client supplied it"
- * (daemon.ts:568). Option A re-homes ownership here: the daemon is the component
- * that sends and receives every message, so the transcript belongs where the
- * messages flow.
+ * The DAEMON-OWNED per-session Merkle tree: the authoritative running transcript
+ * of every leaf (sent or received) for a session. Ownership lives here because the
+ * daemon is the component that sends and receives every message — the transcript
+ * belongs where the messages flow, never supplied by a caller.
  *
- * Specification (SPARC Phase S):
  *   - A leaf is the 32-byte leaf hash of a message or control entry, in order.
  *     For a message leaf the leaf hash is content_hash = SHA-256(0x00 || content)
  *     (msgLeafHash, RFC 6962 §2.1 leaf hashing). For a control leaf (SEAL) the
  *     leaf hash is SHA-256(0x02 || canonical_bytes) (ctrlLeafHash). Both sides of
  *     a session compute the SAME leaf hash for the SAME message, so appending the
- *     SAME leaves in the SAME order yields the SAME root (AC-002).
+ *     SAME leaves in the SAME order yields the SAME root.
  *   - The root is recomputed over all leaves after every append (RFC 6962 §2.1,
  *     left-balanced binary Merkle tree). Empty tree root = SHA-256("").
  *   - The tree is serializable to/from an ordered list of leaf-hash hex strings so
- *     it can be persisted to SQLCipher and reloaded across a daemon restart (AC-007).
- *
- * Pseudocode (SPARC Phase P):
- *   appendLeafHash(kind, hashHex):
- *     1. push {kind, hashHex} onto leaves
- *     2. return { leafIndex: leaves.length - 1, newRootHex: rootHex() }
- *   rootHex():
- *     1. build = buildMerkleTree(leaves.map(l => {kind:"hash", data: bytes(l.hashHex)}))
- *     2. return hex(merkleRoot(build))   // empty → hex(SHA-256(""))
- *   fromLeaves(leaves): reconstruct from persisted ordered list.
+ *     it can be persisted to SQLCipher and reloaded across a daemon restart.
  *
  * Crypto refs: RFC 6962 §2.1 (Merkle hash trees), FIPS 180-4 (SHA-256).
  */
@@ -50,9 +38,9 @@ export interface SessionTreeLeaf {
  */
 export class SessionTree {
   readonly #leaves: SessionTreeLeaf[];
-  // O(1) content-hash -> first leaf index, so the inbound dedup check (DOD-MSG-5) is not a linear
-  // scan per message (review finding #5). Stores the FIRST occurrence to match findIndex semantics.
-  // Rebuilt from #leaves in the constructor, so it survives the fromLeaves() restart path for free.
+  // O(1) content-hash -> first leaf index, so the inbound dedup check is not a linear scan per
+  // message. Stores the FIRST occurrence to match findIndex semantics. Rebuilt from #leaves in the
+  // constructor, so it survives the fromLeaves() restart path for free.
   readonly #indexByHash: Map<string, number>;
 
   private constructor(leaves: SessionTreeLeaf[]) {
@@ -63,7 +51,7 @@ export class SessionTree {
     }
   }
 
-  /** O(1) index of the first leaf with this content-hash, or -1 if absent (DOD-MSG-5 dedup). */
+  /** O(1) index of the first leaf with this content-hash, or -1 if absent (inbound dedup). */
   indexOfHash(hashHex: string): number {
     return this.#indexByHash.get(hashHex) ?? -1;
   }
@@ -73,7 +61,7 @@ export class SessionTree {
     return new SessionTree([]);
   }
 
-  /** Reconstruct a tree from a persisted, ordered list of leaves (AC-007). */
+  /** Reconstruct a tree from a persisted, ordered list of leaves. */
   static fromLeaves(leaves: readonly SessionTreeLeaf[]): SessionTree {
     return new SessionTree(leaves.map((l) => ({ kind: l.kind, hashHex: l.hashHex })));
   }
@@ -116,8 +104,8 @@ export class SessionTree {
   }
 
   /**
-   * SESSION-002: the Merkle root this tree WOULD have if one more leaf (hashHex) were
-   * appended — WITHOUT mutating the tree. Used to compute the reported_root for a unilateral
+   * The Merkle root this tree WOULD have if one more leaf (hashHex) were appended —
+   * WITHOUT mutating the tree. Used to compute the reported_root for a unilateral
    * seal: the post-SEAL-ctrl-leaf root the directory rebuilds from the relay's content-hash
    * chain and verifies, without advancing the durable tree / message_count.
    */

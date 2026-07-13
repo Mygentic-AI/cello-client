@@ -3,11 +3,11 @@ import type { ScreenContext, ScreenVerdict, SecurityGatewayClient } from "./type
 /**
  * The null-object gateway client: screens nothing, always allows.
  *
- * This is the daemon's default when no gateway is configured (backward compatibility for the
- * many daemon/SNM tests written before M9, and for a deployment that has not enabled the
- * security layer). It still RETURNS a verdict (`allow`) — so SI-001 ("never act on content
- * without a verdict") holds even on the default path; "no gateway configured" means
- * "always-allow verdict", not "no verdict".
+ * This is the daemon's default when no gateway is configured — the case for a deployment that
+ * has not enabled the security layer, and for the daemon/SNM tests that construct no gateway.
+ * It still RETURNS a verdict (`allow`) — so SI-001 ("never act on content without a verdict")
+ * holds even on the default path; "no gateway configured" means "always-allow verdict", not
+ * "no verdict".
  *
  * It contains no detection logic. Real screening lives in the gateway PROGRAM (the server +
  * the local sidecar / remote client), never in the daemon.

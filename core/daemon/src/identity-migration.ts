@@ -1,11 +1,11 @@
 /**
- * CELLO-M7-PERSIST-002 — Unit 4/6: one-time migration of pre-story flat-file state and a plaintext
- * node:sqlite DB into the single SQLCipher-encrypted daemon DB (AC-006, DB-002).
+ * One-time migration of legacy flat-file state and a plaintext node:sqlite DB into the single
+ * SQLCipher-encrypted daemon DB.
  *
- * Before this story the daemon kept:
+ * The legacy on-disk layouts this reads:
  *   - identity as plaintext flat files: `agents/<name>/key` (37-byte CELLO seed), `frost-share.json`,
- *     `ml-dsa-keypair.json`, `registration-state.json`, `agent-user-link.json`, and the legacy
- *     single-file `~/.cello/key` (loaded as agent "default");
+ *     `ml-dsa-keypair.json`, `registration-state.json`, `agent-user-link.json`, and the single-file
+ *     `~/.cello/key` (loaded as agent "default");
  *   - sessions/transcript/etc. in a PLAINTEXT `sessions.db` (node:sqlite), with two columns
  *     (transcript.blob, retry_queue.content_blob) envelope-encrypted by a sibling
  *     `sessions.db.transcript-key`.
@@ -17,9 +17,9 @@
  * up the old plaintext DB to `<dbPath>.pre-sqlcipher.bak` and deleting the flat files. It is
  * idempotent: once the DB is encrypted and the flat files are gone, it is a no-op.
  *
- * Fail-closed (SI-002/DB-002): on ANY error it aborts cleanly — the original flat files / plaintext
- * DB are left in place, the partial `.migrating` DB is discarded, and the caller surfaces
- * `identity_migration_failed`. No identity is lost and no plaintext is left half-migrated.
+ * FAILS CLOSED: on ANY error it aborts cleanly — the original flat files / plaintext DB are left in
+ * place, the partial `.migrating` DB is discarded, and the caller surfaces `identity_migration_failed`.
+ * No identity is lost and no plaintext is left half-migrated.
  */
 
 import {
@@ -92,7 +92,7 @@ function readJson(path: string): Record<string, unknown> | null {
   return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 }
 
-/** Enumerate pre-story agent directories that hold a `key` file. */
+/** Enumerate legacy agent directories that hold a `key` file. */
 function discoverFlatAgents(celloDir: string): Array<{ name: string; dir: string; keyPath: string }> {
   const out: Array<{ name: string; dir: string; keyPath: string }> = [];
   const agentsDir = join(celloDir, "agents");
@@ -104,7 +104,7 @@ function discoverFlatAgents(celloDir: string): Array<{ name: string; dir: string
       if (existsSync(keyPath)) out.push({ name: entry.name, dir, keyPath });
     }
   }
-  // Legacy single-file ~/.cello/key → agent "default" (only when there's no agents/default already).
+  // Single-file ~/.cello/key → agent "default" (only when there's no agents/default already).
   const legacyKey = join(celloDir, "key");
   if (existsSync(legacyKey) && !out.some((a) => a.name === "default")) {
     out.push({ name: "default", dir: celloDir, keyPath: legacyKey });
@@ -112,7 +112,7 @@ function discoverFlatAgents(celloDir: string): Array<{ name: string; dir: string
   return out;
 }
 
-/** True if there is any pre-story flat-file identity to migrate. */
+/** True if there is any flat-file identity to migrate. */
 function hasFlatIdentity(celloDir: string): boolean {
   return discoverFlatAgents(celloDir).length > 0;
 }
@@ -121,10 +121,9 @@ const MANIFEST_FILE = "manifest-version.json";
 
 /**
  * Carry the legacy anti-rollback floor (`manifest-version.json`) into the encrypted `manifest_state`
- * table. CRITICAL (fallback-finder HIGH): without this, an upgraded operator's last-seen manifest
- * version resets to null on first start, re-opening a manifest-DOWNGRADE window for one cycle. The
- * upsert keeps the MAX of any existing floor, so it can never LOWER the floor. Returns true if a
- * value was imported.
+ * table. CRITICAL: without this, an upgraded operator's last-seen manifest version resets to null on
+ * first start, re-opening a manifest-DOWNGRADE window for one cycle. The upsert keeps the MAX of any
+ * existing floor, so it can never LOWER the floor. Returns true if a value was imported.
  */
 function importManifestVersion(celloDir: string, db: DaemonDatabase, logger: Logger): boolean {
   const obj = readJson(join(celloDir, MANIFEST_FILE));
@@ -148,9 +147,9 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
   const migratingPath = `${dbPath}.migrating`;
 
   // Resume a crash in the tiny window between the backup-rename and the swap-rename: a COMPLETED
-  // `.migrating` exists but `dbPath` is gone. Promote it (instead of the in-place branch rebuilding a
-  // fresh EMPTY DB and orphaning the migrated session/transcript history — code-review M1). Only if it
-  // decrypts with the key; otherwise discard the partial and let the originals drive a fresh attempt.
+  // `.migrating` exists but `dbPath` is gone. It MUST be promoted here — otherwise the in-place branch
+  // below rebuilds a fresh EMPTY DB and orphans the migrated session/transcript history. Promote only
+  // if it decrypts with the key; otherwise discard the partial and let the originals drive a retry.
   if (!existsSync(dbPath) && existsSync(migratingPath) && existsSync(keyPath)) {
     try {
       const k = new Uint8Array(readFileSync(keyPath));
@@ -197,7 +196,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       db = openEncryptedDatabase(dbPath, key, logger);
       ensureIdentitySchema(db);
       agentsMigrated = importFlatIdentity(celloDir, db, logger);
-      importManifestVersion(celloDir, db, logger); // carry the anti-rollback floor (HIGH)
+      importManifestVersion(celloDir, db, logger); // carry the anti-rollback floor
       db.close();
       db = null;
     } catch (err) {
@@ -297,9 +296,9 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
  * Copy every table + row from the old plaintext DB into the encrypted DB, decrypting the two
  * column-ciphered blobs to plaintext. A row whose transcript/retry blob CANNOT be decrypted (the old
  * transcript-key is missing or the blob fails GCM) is SKIPPED with a loud error — it is NEVER stored
- * as ciphertext-masquerading-as-plaintext (which the rest of the daemon would TextDecode into garbage;
- * fallback-finder HIGH). After each table, the copied count is VERIFIED against (old count − skipped);
- * a mismatch means INSERT OR IGNORE silently dropped a row → abort (the docstring's "verify" is real).
+ * as ciphertext-masquerading-as-plaintext, which the rest of the daemon would TextDecode into garbage.
+ * After each table, the copied count is VERIFIED against (old count − skipped); a mismatch means
+ * INSERT OR IGNORE silently dropped a row → abort.
  */
 function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, _celloDir: string, logger: Logger): number {
   const old = new DatabaseSync(dbPath);
@@ -363,7 +362,7 @@ function copyPlaintextDb(dbPath: string, encDb: DaemonDatabase, _celloDir: strin
   }
 }
 
-/** Quarantine an agent's flat files (key + sibling secrets) to `*.corrupt`. */
+/** Quarantine an agent's flat files (key + sibling secrets) by renaming them to `*.corrupt`. */
 function quarantineFlatAgent(a: { name: string; dir: string; keyPath: string }, logger: Logger): void {
   for (const f of [a.keyPath, ...Object.values(REG_FILES).map((n) => join(a.dir, n))]) {
     if (existsSync(f)) {
@@ -373,17 +372,17 @@ function quarantineFlatAgent(a: { name: string; dir: string; keyPath: string }, 
   logger.warn("persist.identity.migrate.agent.quarantined", { agentName: a.name });
 }
 
-/** Import each pre-story agent's flat files into one `agents` row. Returns the count imported. */
+/** Import each legacy agent's flat files into one `agents` row. Returns the count imported. */
 function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Logger): number {
   const agents = discoverFlatAgents(celloDir);
   let count = 0;
   for (const a of agents) {
     // Skip an agent whose name is held by an ACTIVE row in the encrypted DB (e.g. a prior in-place run
     // imported it but a cleanup unlink failed) — never overwrite live DB identity with stale flat-file
-    // values (fallback-finder / code-review LOW). REMOVE-001: a RETIRED tombstone does NOT occupy the
-    // name (it was freed for reuse), so qualify active-only — matching hasActiveAgent everywhere else —
-    // otherwise a genuinely different flat identity restored under a freed name would be silently
-    // skipped and then deleted. deleteFlatIdentity will remove the redundant files.
+    // values. The check MUST be active-only (matching hasActiveAgent everywhere else): a RETIRED
+    // tombstone does NOT occupy the name — it was freed for reuse — so counting it would silently skip
+    // a genuinely different flat identity restored under a freed name, and then delete it.
+    // deleteFlatIdentity will remove the redundant files.
     const exists = encDb
       .prepare("SELECT 1 AS one FROM agents WHERE agent_name = ? AND state != 'retired'")
       .get(a.name) as { one: number } | undefined;
@@ -391,8 +390,8 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
 
     // K_local seed from the 37-byte CELLO key file. A corrupt key SKIPS the WHOLE agent — its key AND
     // its sibling plaintext secrets (frost-share/ml-dsa/link) are quarantined to `*.corrupt` so no
-    // plaintext secret is left on disk (code-review HIGH). One unreadable agent must not down the
-    // daemon (availability); its identity is unrecoverable anyway, so the daemon starts without it.
+    // plaintext secret is left on disk. One unreadable agent must not down the daemon (availability);
+    // its identity is unrecoverable anyway, so the daemon starts without it.
     let seed: Uint8Array;
     try {
       seed = decodeKeyFileSeed(new Uint8Array(readFileSync(a.keyPath)));
@@ -413,7 +412,7 @@ function importFlatIdentity(celloDir: string, encDb: DaemonDatabase, logger: Log
     const state = reg ? "registered" : "created";
     const now = Date.now();
 
-    // REMOVE-001: the store is keyed by a stable agent_id — mint one for each imported flat agent.
+    // The store is keyed by a stable agent_id — mint one for each imported flat agent.
     encDb
       .prepare(
         `INSERT OR IGNORE INTO agents (agent_id, agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)

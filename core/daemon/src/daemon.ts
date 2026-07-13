@@ -700,10 +700,8 @@ async function startDaemonHoldingLock(
    *
    * CONN-001 (DOD-CONN-2): the per-agent manager wires BOTH registration AND inbound session
    * handlers (session_assignment / seal_interrupted_request) via wirePerAgentSessionInbound,
-   * so a non-primary agent RECEIVES inbound sessions on its own stream — closing the prior
-   * SPINE-5 gap where only the primary (keystone) received them. Earlier scope note (now
-   * resolved): inbound handlers used to be attached to the keystone only; they are now
-   * attached per-agent here via wirePerAgentSessionInbound.
+   * so a non-primary agent RECEIVES inbound sessions on its own stream. Attaching them to the
+   * primary (keystone) only would leave every other agent unable to receive.
    */
   function getAgentSignaling(
     agentName: string,
@@ -1029,12 +1027,12 @@ async function startDaemonHoldingLock(
     if (awayAckSent.has(dedupKey)) return;
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
-    // M8C-CONTACT-1 / CC-1: select the ack wording by whether the sender is a known contact —
-    // STRANGER_TEXT ("Dispatched.") for unknown, AWAY_TEXT[kind] for known. Post-CC-1 the inbound
-    // accept path no longer auto-adds the sender, so an unattended stranger STAYS unknown across
-    // every inbound interaction (promotion now requires operator engagement — an outbound initiate,
-    // a cello_send reply, or an explicit contact add). No subsequent add is coupled to this line's
-    // ordering anymore; it is a plain read of current contact state.
+    // Select the ack wording by whether the sender is a known contact — STRANGER_TEXT
+    // ("Dispatched.") for unknown, AWAY_TEXT[kind] for known. The inbound accept path does NOT
+    // auto-add the sender: an unattended stranger STAYS unknown across every inbound interaction.
+    // Promotion requires operator engagement — an outbound initiate, a cello_send reply, or an
+    // explicit contact add. This is a plain read of current contact state; nothing downstream
+    // depends on its ordering.
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
@@ -1224,14 +1222,12 @@ async function startDaemonHoldingLock(
   // Single long-lived getUpdates poller (DoD) — one in-flight loop per daemon; started once
   // settings exist, stopped on daemon shutdown. A network hiccup backs off and retries rather
   // than killing the poller (best-effort — the doorbell is a convenience, never load-bearing).
-  // Reviewer MEDIUM fix (a60d68ed): the loop previously read the SHARED, reassignable
-  // telegramBotClient/telegramUpdateOffset fresh each iteration — only myGeneration was truly
-  // loop-local. A settings update mid-await could let a stale response from the OLD client (1)
-  // still be processed once (the generation check only blocks the loop's NEXT iteration, not an
-  // in-flight call) and (2) stomp telegramUpdateOffset with the OLD bot's update_id numbering,
-  // which is meaningless to a new token (Telegram scopes update_id per bot). Fix: capture the
-  // client as a PARAMETER (never re-read from the shared variable) and re-check the generation
-  // immediately after every await before acting on its result or touching shared state.
+  // The client is a PARAMETER and must never be re-read from the shared, reassignable
+  // telegramBotClient: a settings update mid-await would otherwise let a stale response from the OLD
+  // client still be processed once (the generation check blocks the loop's NEXT iteration, not an
+  // in-flight call), and stomp telegramUpdateOffset with the OLD bot's update_id numbering, which is
+  // meaningless to a new token (Telegram scopes update_id per bot). Re-check the generation
+  // immediately after EVERY await, before acting on its result or touching shared state.
   async function runTelegramPollerLoop(myGeneration: number, myClient: TelegramBotClient): Promise<void> {
     let myOffset = telegramUpdateOffset;
     while (telegramPollerGeneration === myGeneration) {
@@ -1291,10 +1287,8 @@ async function startDaemonHoldingLock(
   // over the CURRENT agent's OWN signaling stream (so the directory routes the signed
   // assignment back to that agent — same per-agent routing SPINE-4 established), advertising
   // the standing receiver's session endpoint (WIRE-001: the directory rejects a request
-  // with no initiator session Peer ID), then parses the returned assignment. Ported from
-  // core/client `initiateSession` (NOT imported — that stack is dead). Tests still inject
-  // their own `sessionNegotiator`; the binary now gets a real one instead of
-  // directory_signaling_not_configured.
+  // with no initiator session Peer ID), then parses the returned assignment. Tests inject their own
+  // `sessionNegotiator`; the binary gets a real one.
   // M3: a `session_assignment` frame carries no echoed request id, so two overlapping
   // initiations on ONE agent's stream would race to resolve on whichever assignment
   // arrives first — request A could complete with B's assignment. Guard with a per-agent
@@ -1642,8 +1636,8 @@ async function startDaemonHoldingLock(
             return { ok: false, reason: "directory_unreachable", guidance: "The home directory stream is not connected, so the counterparty's location could not be looked up. Check cello status (directory_signaling), then retry." };
           }
           // NO REPLY: an old directory (predates discovery) OR a slow/dropped reply on a new one. Retry;
-          // fall back to today's local-only behavior ONLY as a last resort (after the retries), so a
-          // single dropped reply no longer misroutes a reachable cross-node peer to the home node.
+          // fall back to local-only behavior ONLY as a last resort (after the retries), so that a
+          // single dropped reply does not misroute a reachable cross-node peer to the home node.
           if (disc.kind === "timeout") {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
@@ -1908,9 +1902,9 @@ async function startDaemonHoldingLock(
     return agents
       .filter((a) => a.state !== "load_failed")
       .map((a) => {
-        // M8C-AUTOSTART-1 (F5): `state` reports readiness only (online vs registered); selection
-        // is a SEPARATE `selected` flag. Previously `state = "current"` overloaded the current
-        // agent, making it read as a different readiness level than a second healthy online agent.
+        // `state` reports READINESS only (online vs registered); selection is a SEPARATE `selected`
+        // flag. Never fold selection into `state` — a selected agent is not at a different level of
+        // readiness than a second healthy online agent.
         const online = onlineAgents.has(a.name);
         const state: AgentInfo["state"] = online ? "online" : "registered";
         const selected = online && a.name === currentAgent;
@@ -3240,13 +3234,11 @@ async function startDaemonHoldingLock(
   // NOTE: cello_await_session is NOT in this stub list — Seam 2 registers a real
   // handler for it below (inbound session establishment), with its own inline
   // no_current_agent guard.
-  // DOD-ONBOARD-HELP-1: cello_receive_session is DELETED (Andre, 2026-07-11). It was a literal
-  // alias — the same handler object as cello_receive — that claimed an "accept/join" step CELLO
-  // does not have (inbound sessions are auto-accepted by the standing receiver). No alias, no
-  // deprecated shim, no dead handler.
+  // The list below is an (empty) extension point: a tool that needs only the plain no_current_agent
+  // guard, with no handler of its own, is registered here.
   //
-  // The list below stays as an (empty) extension point: a future tool that needs only the plain
-  // no_current_agent guard, with no handler of its own, is registered here.
+  // Do not add an "accept" or "join" tool — CELLO has no such step. Inbound sessions are
+  // auto-accepted by the standing receiver.
   const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
 
   const NO_CURRENT_AGENT_RESPONSE = {
@@ -4192,8 +4184,8 @@ async function startDaemonHoldingLock(
         logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: err instanceof Error ? err.message : String(err) });
       }
     }
-    // Review #2: emit the completion event UNCONDITIONALLY (not only when total > 0) so a clean
-    // "nothing parked" run is observable and distinct from an all-failed run.
+    // Emit the completion event UNCONDITIONALLY — not only when total > 0 — so a clean "nothing
+    // parked" run is observable, and distinct from an all-failed run.
     logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length, failedRelays: failed });
   }
 
@@ -4431,11 +4423,6 @@ async function startDaemonHoldingLock(
   // SessionNodeManager.acceptSession (which hands off the standing receiver node bound
   // to A's session peer id), and enqueues an inbound session event that a blocked
   // cello_await_session call returns. This is the inbound mirror of cello_initiate_session.
-  //
-  // Reference (Option A native re-home): the dead client stack did this in
-  // core/client/src/frame-dispatch.ts (session_assignment → receiveSessionAssignment)
-  // and core/adapter-claude-code/src/server.ts (sessionEventQueue + cello_await_session).
-  // We reimplement natively here — the daemon never imports @cello-protocol/client.
   interface InboundSessionEvent {
     sessionIdHex: string;
     counterpartyPubkeyHex: string;
@@ -5065,8 +5052,7 @@ async function startDaemonHoldingLock(
 
   // cello_await_session — the counterparty's blocking pull for the next inbound session.
   // Returns immediately if one is already queued for the current agent (FIFO), otherwise
-  // blocks until one arrives or timeout_ms elapses. Response shape matches the established
-  // contract (core/adapter-claude-code/src/server.ts) so the E2E fixture migration is drop-in.
+  // blocks until one arrives or timeout_ms elapses.
   handlers.set("cello_await_session", async (params, connectionId) => {
     const connState = perConnectionState.get(connectionId);
     // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { name } wins, else this
@@ -5118,48 +5104,30 @@ async function startDaemonHoldingLock(
     return toResponse(event);
   });
 
-  // M7-SESSION-001 AC-008 (H-1): seal-interrupted bilateral INITIATOR flow.
+  // Seal-interrupted bilateral INITIATOR flow.
   //
-  // Pseudocode:
-  //   1. Check signaling status — if reconnecting, return signaling_reconnecting (DB-001).
-  //   2. K_local-sign our OWN SEAL-INTERRUPTED leaf.
-  //   3. Send SealInterruptedRequest (with nonce + merkleRoot) via directory signaling.
-  //   4. Wait for SealInterruptedAck or SealInterruptedRejection (timeout: 30s).
-  //   5. On ack: verify the echoed nonce (L-2); cross-check counterparty leafCount
-  //      and merkleRoot against our own (SI-002/AC-008); verify the counterparty's
-  //      Ed25519 leaf signature against the expected pubkey (SI-002).
-  //   6. On all verified: persist the bilateral commitment and mark the session
-  //      'seal_interrupted_pending' — NOT 'sealed'.
-  //   7. On any failure: log session.interrupted.seal.failed, leave status 'interrupted'.
+  // ⚠️ SCOPE — this flow does NOT complete a FROST-notarized seal, and must not pretend to.
   //
-  // ⚠️ H-1 SCOPE — what is and is NOT done here:
-  //   What IS done (real, verifiable): both parties produce and exchange real
-  //   K_local Ed25519-signed SEAL-INTERRUPTED leaves over an agreed {leafCount,
-  //   merkleRoot}; the initiator verifies the signature, nonce, and cross-checks;
-  //   the verified bilateral commitment is persisted; the session advances to the
-  //   NON-TERMINAL 'seal_interrupted_pending' state.
-  //   What is NOT done (the FROST threshold notarization) and WHY it is blocked:
-  //     - core/daemon does NOT depend on core/client, where SealManager and
-  //       FrostThresholdSigner live; adding that dependency risks a cycle and is
-  //       deep architectural surgery.
-  //     - the daemon holds no FrostThresholdSigner instance and no directory FROST
-  //       ceremony client.
-  //     - DAEMON-004 UPDATE: the daemon now DOES own a per-session Merkle tree
-  //       (SessionNodeManager / SessionTree). When a non-empty tree exists for the
-  //       session (e.g. reloaded from session_tree_leaves after a restart) BOTH the
-  //       initiator and the responder bind over their OWN tree root + size (SI-001),
-  //       and message_count is kept synced to the tree. Only legacy sessions with no
-  //       persisted tree fall back to message_count + the caller-supplied root.
-  //   Consequence for cross-checking (C-1): leafCount agreement (each side vs its own
-  //   tree size, or message_count when no tree exists) is the bilateral check at this
-  //   layer. Merkle-root agreement is still NOT compared here — under concurrent
-  //   bidirectional traffic the two sides' local append orders (and thus roots) can
-  //   diverge until the relay-assigned canonical sequence (MSG-001) exists; true
-  //   root agreement is the deferred FROST-seal step against the directory-held tree.
-  //   Per the audit instruction, we therefore STOP at the persisted bilateral
-  //   commitment under 'seal_interrupted_pending' rather than fake a completed seal.
-  //   Wiring the real FROST seal requires injecting a SealManager adapter from a
-  //   composition root that constructs the client alongside the daemon.
+  //   What it DOES: both parties produce and exchange real K_local Ed25519-signed SEAL-INTERRUPTED
+  //   leaves over an agreed {leafCount, merkleRoot}; the initiator verifies the signature, the
+  //   echoed nonce, and the cross-checks; the verified bilateral commitment is persisted; the
+  //   session advances to the NON-TERMINAL 'seal_interrupted_pending' state.
+  //
+  //   What it does NOT do: the FROST threshold notarization. The daemon holds no
+  //   FrostThresholdSigner and no directory FROST ceremony client, so it CANNOT produce a threshold
+  //   seal here. The session therefore STOPS at the persisted bilateral commitment rather than
+  //   claim a completed seal. Wiring the real seal means injecting a SealManager adapter.
+  //
+  //   Merkle-ROOT agreement is deliberately NOT compared at this layer. Under concurrent
+  //   bidirectional traffic the two sides' local append orders — and therefore their roots — can
+  //   legitimately diverge until the relay-assigned canonical sequence exists. Comparing roots here
+  //   would reject honest sessions. leafCount agreement (each side against its own tree size, or
+  //   message_count when no tree exists) is the bilateral check available at this layer; true root
+  //   agreement belongs to the FROST seal against the directory-held tree.
+  //
+  //   Both sides bind over their OWN tree root + size (SI-001) whenever a non-empty tree exists —
+  //   e.g. reloaded from session_tree_leaves after a restart. Only sessions with no persisted tree
+  //   fall back to message_count plus the caller-supplied root.
   // Result type for handleSealInterruptedFlow — maps to the MCP tool response shape.
   type SealFlowResult =
     | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
@@ -5648,32 +5616,29 @@ async function startDaemonHoldingLock(
     // finding #2), so it reflects EVERY message in the session regardless of which connection sent
     // or received it. If this connection hasn't read up to current_seq (e.g. a second attended
     // session on the same agent that hasn't polled since the other connection's last send), refuse
-    // rather than let it send blind — the WhatsApp-group-chat model. Runs BEFORE M9's
-    // governance-decisions parsing below — an access-control gate should short-circuit before any
-    // unrelated prep work for a send that may not even be allowed to proceed.
-    // DOD-CURSOR-DURABLE-1: the gate now consults TWO authorities and passes if EITHER says the
-    // caller is caught up.
+    // rather than let it send blind — the WhatsApp-group-chat model. Runs BEFORE the
+    // governance-decisions parsing below: an access-control gate must short-circuit before any
+    // unrelated prep work for a send that may not be allowed to proceed at all.
     //
-    //   1. the connection cursor (in-memory, per-connection) — today's rule, UNCHANGED. A
-    //      long-lived client (the MCP shim, one socket for the whole session) satisfies this
-    //      exactly as before, so the shipped single-connection path is byte-for-byte identical.
+    // The gate consults TWO authorities and passes if EITHER says the caller is caught up:
     //
-    //   2. the persisted per-(agent, session) read watermark — NEW. A STATELESS client (the `cello`
-    //      CLI runs a fresh process, and therefore a fresh connection, per command) always presents
-    //      cursor -1, so authority 1 can never be satisfied by it: after the counterparty spoke
-    //      once, every CLI send was refused forever, even though the agent had demonstrably read
-    //      the message. That made a two-way conversation impossible from bash — and it silently hit
-    //      any RECONNECTING MCP client too, whose fresh connectionId also resets the cursor to -1.
+    //   1. the connection cursor (in-memory, per-connection) — satisfied by a long-lived client
+    //      like the MCP shim, which holds one socket for the whole session.
+    //
+    //   2. the persisted per-(agent, session) read watermark. A STATELESS client CANNOT satisfy
+    //      authority 1: the `cello` CLI runs a fresh process, and therefore a fresh connection, per
+    //      command, so it always presents cursor -1. Without the watermark, every CLI send is
+    //      refused forever once the counterparty has spoken — as is every send from a RECONNECTING
+    //      MCP client, whose new connectionId also resets the cursor to -1. Do not remove it.
     //
     // What the gate protects, precisely: an agent must never reply to COUNTERPARTY content nobody
-    // on its side has seen. That guarantee is preserved and is now durable — it survives the socket.
+    // on its side has seen. That guarantee is durable — it survives the socket.
     //
-    // What it deliberately no longer protects (the approved trade — see
-    // 2026-07-11_cursor-durable-read-before-write-design.md §6, Andre's go): a message this agent
-    // SENT from a DIFFERENT local connection no longer blocks. Two attended windows on one agent
-    // used to gate each other; now they do not, because a locally-authored message is not "unread
-    // counterparty content" — the AGENT wrote it. The principal here is the agent, not the socket,
-    // and the daemon cannot referee which of an operator's own windows a human is looking at.
+    // What it deliberately does NOT protect: a message this agent SENT from a different local
+    // connection does not block. Two attended windows on one agent do not gate each other, because
+    // locally-authored content is not "unread counterparty content" — the AGENT wrote it. The
+    // principal is the agent, not the socket, and the daemon cannot referee which of an operator's
+    // own windows a human is looking at. This is deliberate; do not "fix" it.
     const currentSeq = record.message_count - 1;
     const connectionCursor = getConnectionCursor(connectionId, sessionId);
     const unreadReceived = sessionNodeManager.getUnreadReceivedCount(agentName, sessionId);
@@ -6531,9 +6496,9 @@ async function startDaemonHoldingLock(
     }
     logger.info("daemon.stopped", { pid: process.pid, reason });
     try {
-      // CONN-001 (code-review LOW): stopAllSignaling() stops the shared manager AND every per-agent
-      // manager (best-effort). The previously-separate per-agent stop loop here was redundant and
-      // unguarded (would abort the rest of shutdown if stop() ever threw on a second call) — removed.
+      // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
+      // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
+      // second stop() that throws would abort the rest of shutdown.
       await stopAllSignaling();
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();

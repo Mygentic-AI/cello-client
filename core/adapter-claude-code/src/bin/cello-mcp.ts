@@ -1,20 +1,10 @@
 #!/usr/bin/env node
 /**
- * cello-mcp — thin stdio-to-IPC proxy (M7)
+ * cello-mcp — thin stdio-to-IPC proxy.
  *
  * Connects to the running CELLO daemon via ~/.cello/daemon.sock and proxies
  * all MCP tool calls through IPC. Holds no key material, opens no database,
  * creates no libp2p node. Per-connection agent state is managed by the daemon.
- *
- * Startup:
- *   1. --version flag
- *   2. TTY detection (print "run cello login first")
- *   3. Connect to daemon IPC socket
- *   4. If ENOENT/ECONNREFUSED → exit 1 with daemon_not_running
- *   5. Send ipc.connect frame
- *   6. Open MCP stdio server
- *   7. Register IPC proxy for every tool
- *   8. On socket close → ipc_connection_lost for all subsequent calls
  */
 
 import { homedir } from "node:os";
@@ -23,7 +13,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 import { buildChannelParams } from "../channel-params.js";
 
-// AC-020 (1): --version flag — exit cleanly with the package version.
+// --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
 if (process.argv.includes("--version") || process.argv.includes("-v")) {
   const { createRequire: cr } = await import("node:module");
@@ -33,7 +23,7 @@ if (process.argv.includes("--version") || process.argv.includes("-v")) {
   process.exit(0);
 }
 
-// AC-020 (2): TTY detection — if stdin is a TTY, print instructions and exit.
+// TTY detection — if stdin is a TTY, print instructions and exit.
 if (process.stdin.isTTY) {
   const { createRequire: cr } = await import("node:module");
   const req = cr(import.meta.url);
@@ -53,12 +43,12 @@ if (process.stdin.isTTY) {
 
 // Resolve CELLO_DIR once (honored exactly as cello-daemon and the cello CLI do) and
 // ensure it exists. Used for BOTH the diagnostics log and the daemon socket below, so
-// every per-home isolation boundary CELLO_DIR establishes is respected — including the
-// stderr tee, which previously went to a single global /tmp file shared across homes.
+// every per-home isolation boundary CELLO_DIR establishes is respected — the stderr tee
+// included, which must never land in a single global file shared across homes.
 const celloDir = process.env.CELLO_DIR || join(homedir(), ".cello");
 mkdirSync(celloDir, { recursive: true });
 
-// AC-020 (3): Tee stderr to a log file under the home for diagnostics.
+// Tee stderr to a log file under the home for diagnostics.
 const stderrLog = createWriteStream(join(celloDir, "cello-mcp-stderr.log"), { flags: "a" });
 const origWrite = process.stderr.write.bind(process.stderr) as typeof process.stderr.write;
 process.stderr.write = (
@@ -133,7 +123,7 @@ const server = new McpServer(
   },
   // CELLO-M8C-WAKE-001 (channel stage 1): declare the claude/channel capability so a `--channels`
   // Claude Code session negotiates it and the daemon's doorbell notifications reach the model's
-  // context (mirrors the legacy in-process server.ts). Content never rides — see the bridge below.
+  // context. Content never rides — see the bridge below.
   { capabilities: { experimental: { "claude/channel": {} } } },
 );
 
@@ -166,19 +156,19 @@ server.tool("cello_agents", "List all agents with state from this connection's p
 });
 
 // ─── Contact whitelist tools (CC-9) ─────────────────────────────────────────
-// The per-agent whitelist is load-bearing after CC-1: a known contact is fast-tracked and exempt
-// from unknown-sender screening + the ABUSE-1 acceptance caps. These forward to the daemon handlers
-// (cello_contact_list/add/remove) so an agent driving via MCP can see and manage its own whitelist —
-// previously CLI-only (`cello contact …`). Per-agent: defaults to the current agent, or pass { agent }.
+// The per-agent whitelist is load-bearing: a known contact is fast-tracked and exempt from the
+// unknown-sender gate + the ABUSE-1 acceptance caps. Those caps ARE enforced. CONTENT screening
+// (prompt-injection defense) is NOT: the daemon runs PassthroughGatewayClient, so no tool
+// description here may tell the operator's agent that message text is screened.
 
-server.tool("cello_contacts", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from unknown-sender screening and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
+server.tool("cello_contacts", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from the unknown-sender gate and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
   agent: z.string().optional().describe("Agent name whose whitelist to list (defaults to the current agent)"),
 }, async ({ agent }) => {
   const result = await proxy.call("cello_contact_list", agent ? { agent } : {});
   return jsonText(result);
 });
 
-server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's address book — a deliberate add makes them a KNOWN contact (higher reachability and anti-spam caps than a stranger, but NOT auto-accepted when you're away, and always screened). Promote them to whitelisted/vip with cello_contact_set_tier to let them reach you unattended. Optionally set your own pet name (moniker). Defaults to the current agent.", {
+server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's address book — a deliberate add makes them a KNOWN contact (higher reachability and anti-spam caps than a stranger, but NOT auto-accepted when you're away). Promote them to whitelisted/vip with cello_contact_set_tier to let them reach you unattended. Optionally set your own pet name (moniker). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to add"),
   moniker: z.string().optional().describe("Optional pet name for this contact (1-64 chars: letters, digits, '-' or '_') — always wins over the name they offer"),
   agent: z.string().optional().describe("Agent name whose whitelist to add to (defaults to the current agent)"),
@@ -201,7 +191,7 @@ server.tool("cello_contact_set_moniker", "Set (or clear, by passing null) YOUR p
 });
 
 // DOD-CONTACT-VIEW-1: set a contact's reachability tier. Forward-only (D7).
-server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still screened and bounded — a higher tier only RAISES limits, never removes them. Defaults to the current agent.", {
+server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still bounded — a higher tier only RAISES limits, it never removes them. It does NOT change content screening, which is not yet active: message text currently passes through unscreened at every tier. Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),
   tier: z.number().int().min(0).max(4).describe("0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip"),
   agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
@@ -211,7 +201,7 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
 });
 
 // DOD-AWAY-TIER-1: per-contact away message. Forward-only (D7).
-server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom away message for a specific contact — the text they receive when they reach you and you're away. It is the most specific level of away-text resolution (per-contact → per-tier → agent default → system default) and is screened on the outbound path like any message. Defaults to the current agent.", {
+server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom away message for a specific contact — the text they receive when they reach you and you're away. It is the most specific level of away-text resolution (per-contact → per-tier → agent default → system default). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),
   message: z.string().nullable().describe("The away text to send this contact, or null to clear it"),
   agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
@@ -220,7 +210,7 @@ server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom 
   return jsonText(result);
 });
 
-server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's address book — they revert to unknown (stranger anti-spam caps; always screened). Defaults to the current agent.", {
+server.tool("cello_contact_remove", "Remove a peer (by hex public key) from an agent's address book — they revert to unknown (stranger anti-spam caps). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the peer to remove"),
   agent: z.string().optional().describe("Agent name whose whitelist to remove from (defaults to the current agent)"),
 }, async ({ pubkey, agent }) => {
@@ -384,8 +374,8 @@ proxy.onNotification((frame) => {
   const type = typeof data["type"] === "string" ? (data["type"] as string) : String(frame["notification"]);
   const agent = data["agent"];
   // Translate the raw daemon frame into Claude Code's channel contract: `{ content, meta }`.
-  // Forwarding the bare frame as `params` (no `content`) is why the doorbell never surfaced —
-  // Claude Code needs a `content` field to render the <channel> tag body (BUILD-JOURNAL Entry 43).
+  // Claude Code needs a `content` field to render the channel tag body — forwarding the bare frame
+  // as `params` (no `content`) means the doorbell never surfaces at all.
   // buildChannelParams synthesizes a content-free announcement; message content still never rides.
   const params = buildChannelParams(data);
   server.server

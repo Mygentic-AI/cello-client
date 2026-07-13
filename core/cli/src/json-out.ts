@@ -46,12 +46,11 @@ export function emitIpcResult(
   // conventions and only one of them carries `ok`:
   //   (a) ok-bearing  — { ok: true, … } / { ok: false, reason, guidance }
   //   (b) payload-only — a bare result with NO `ok` at all: cello_list_agents returns { agents: [] },
-  //       cello_await_session returns { type: "timeout" | … }. (Verified against daemon.ts, not
-  //       assumed.)
+  //       cello_await_session returns { type: "timeout" | … }.
   // `ok: false` is the daemon's ONE failure convention; a genuine transport/daemon failure THROWS
   // and is handled by the caller as a transport error. So a payload without `ok` is a result, and
-  // routing it to stderr (as an earlier draft of this contract did) would report working commands
-  // as broken — `cello agents` would exit 1 on success.
+  // routing it to stderr would report working commands as broken — `cello agents` would exit 1 on
+  // success.
   //
   // This does NOT weaken the no-fabricated-success rule: we never synthesize an ok:true, never
   // rewrite a body, and never swallow an ok:false. We report exactly what the daemon said.

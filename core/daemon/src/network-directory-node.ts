@@ -51,7 +51,7 @@ import type {
 const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
-// SEC-2: prove K_local possession on every /cello/frost/1.0.0 commit/sign request. The directory
+// Prove K_local possession on every /cello/frost/1.0.0 commit/sign request. The directory
 // verifies an Ed25519 signature, made with K_local priv, over SHA-256(FROST_AUTH_DOMAIN ||
 // agentPubkeyBytes || utf8(epochId) || tail): tail = utf8("commit") for a commit, the framedMsg for a
 // sign (binding the auth to the exact message signed). Without this the signing stream is a blind oracle
@@ -76,7 +76,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   // Set during bootstrapKeyShares — used to identify which agent's share to retrieve
   #agentPubkeyHex: string | null = null;
   #epochId: string | null = null;
-  // SEC-2: signs the K_local auth on commit/sign requests (set via setBootstrapContext).
+  // Signs the K_local auth on commit/sign requests (set via setBootstrapContext).
   #signAuth: FrostAuthSigner | null = null;
 
   // Stored during receiveShare — used by tests to get the FrostPublic for signRound calls
@@ -219,7 +219,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       commitmentList: params.commitmentList,
       ceremonyId: params.ceremonyId,
       peerIdString: params.ceremonyId,
-      // SEC-2: bound to THIS framedMsg, with the 0x01 sign-frame domain-separation prefix.
+      // Bound to THIS framedMsg, with the 0x01 sign-frame domain-separation prefix.
       authSig: await this.#buildAuthSig(Buffer.concat([Buffer.from([FROST_AUTH_SIGN_PREFIX]), Buffer.from(params.msg)])),
     });
 
@@ -255,16 +255,16 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
     return null;
   }
 
-  // Called by the network-aware bootstrapKeyShares before distributing shares. SEC-2: `signAuth`
-  // is the agent's K_local signer, used to authenticate every subsequent commit/sign request; every
-  // ceremony path (session/seal, DKG, refresh) passes it so the enforcing directory accepts the request.
+  // Called by the network-aware bootstrapKeyShares before distributing shares. `signAuth` is the
+  // agent's K_local signer, used to authenticate every subsequent commit/sign request; EVERY ceremony
+  // path (session/seal, DKG, refresh) must pass it or the enforcing directory refuses the request.
   setBootstrapContext(agentPubkeyHex: string, epochId: string, signAuth?: FrostAuthSigner): void {
     this.#agentPubkeyHex = agentPubkeyHex;
     this.#epochId = epochId;
     if (signAuth) this.#signAuth = signAuth;
   }
 
-  // SEC-2: hash bound by the directory's verifyFrostAuth. tail = utf8("commit") | framedMsg.
+  // Hash bound by the directory's verifyFrostAuth. tail = utf8("commit") | framedMsg.
   #frostAuthHash(tail: Uint8Array): Uint8Array {
     return new Uint8Array(
       createHash("sha256")
@@ -278,8 +278,8 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
     );
   }
 
-  // SEC-2: the K_local auth signature to attach, or undefined if no signer was threaded (which the
-  // enforcing directory then refuses AUTH_REQUIRED — surfacing an un-threaded path loudly, not silently).
+  // The K_local auth signature to attach, or undefined if no signer was threaded — which the enforcing
+  // directory then refuses with AUTH_REQUIRED, surfacing an un-threaded path loudly, not silently.
   async #buildAuthSig(tail: Uint8Array): Promise<Uint8Array | undefined> {
     if (!this.#signAuth) {
       this.#logger.warn("frost.directory.auth.no_signer", { agent: this.#agentPubkeyHex?.slice(0, 16), epochId: this.#epochId });
@@ -338,7 +338,7 @@ async function dkgRound1WithNode(
     agentPubkey: agentPubkeyHex,
     epochId,
     signers,
-    // OPS-AGENT-001: include preAuthToken when present (mandatory in M6+)
+    // Include preAuthToken when present.
     ...(preAuthToken !== undefined ? { preAuthToken } : {}),
   });
   const stream = await node.openStream();
@@ -451,7 +451,8 @@ function parseDkgRound1Response(bytes: Uint8Array): DkgRound1ParseResult {
   if (typeof obj !== "object" || obj === null) return { kind: "invalid" };
   const o = obj as Record<string, unknown>;
 
-  // Handle preauth_error frames from the directory (CRIT-1: previously silently dropped)
+  // preauth_error frames from the directory MUST be surfaced, never dropped as "invalid" — a silently
+  // discarded rejection reads to the caller as a malformed frame instead of a refused authorization.
   if (o["type"] === "preauth_error") {
     const reason = typeof o["reason"] === "string" ? o["reason"] : "PRE_AUTH_TOKEN_MISSING";
     return { kind: "preauth_error", reason };
@@ -550,8 +551,8 @@ function parseU8Array(v: unknown): Uint8Array[] | null {
  * /cello/frost/1.0.0 network protocol. Returns a FrostThresholdSigner configured
  * to use NetworkDirectoryNodes, plus the primaryPubkey.
  *
- * NODE_ENV=test guard is kept because this still uses the trustedDealer shortcut.
- * Real DKG (M3) will replace this entirely.
+ * TEST-ONLY: this uses the trustedDealer shortcut, so it is guarded by NODE_ENV=test. The production
+ * path is runNetworkDkg.
  */
 export async function bootstrapNetworkKeyShares(
   agentPubkey: Uint8Array,
@@ -561,8 +562,8 @@ export async function bootstrapNetworkKeyShares(
     directoryNodes: NetworkDirectoryNode[];
   },
 ): Promise<{ signer: FrostThresholdSigner; primaryPubkey: Uint8Array }> {
-  // bootstrapKeyShares uses trustedDealer — a test-harness shortcut, not real DKG (M3+).
-  // This function inherits that constraint. The caller (cello-mcp.ts) guards with NODE_ENV=test.
+  // bootstrapKeyShares uses trustedDealer — a test-harness shortcut, not a real DKG. This function
+  // inherits that constraint, so it must never run outside tests.
   if (process.env.NODE_ENV !== "test") {
     throw new Error("bootstrapNetworkKeyShares uses trustedDealer which is test-only. Real DKG (M3) required in production.");
   }
@@ -625,15 +626,15 @@ export async function runNetworkDkg(
     threshold: number;
     participants: number;
     directoryNodes: NetworkDirectoryNode[];
-    /** OPS-AGENT-001: Pre-authorization token to present in Round 1 frame. */
+    /** Pre-authorization token to present in the Round 1 frame. */
     preAuthToken?: string;
-    /** SEC-2: K_local signer for the DKG-time commit/sign requests' auth. */
+    /** K_local signer for the DKG-time commit/sign requests' auth. */
     signAuth?: FrostAuthSigner;
   },
 ): Promise<{
   signer: FrostThresholdSigner;
   primaryPubkey: Uint8Array;
-  /** PERSIST-024: serializable FROST share data for DB persistence. SI-001: never log signingShare. */
+  /** Serializable FROST share data for DB persistence. NEVER log signingShare. */
   signingShare: Uint8Array;
   identifier: string;
   commitments: Uint8Array[];
@@ -771,8 +772,8 @@ export async function runNetworkDkg(
   try { ed25519_FROST.DKG.clean(clientR1.secret); } catch { /* ignore */ }
 
   // Set signing context on each directory node so generateCommitment/signRound can
-  // identify which agent's share to use in future FROST signing ceremonies. SEC-2: thread the
-  // K_local signer so the DKG-time and later signing requests carry a valid auth.
+  // identify which agent's share to use in future FROST signing ceremonies. The K_local signer MUST be
+  // threaded here so the DKG-time and later signing requests carry a valid auth.
   for (const node of opts.directoryNodes) {
     node.setBootstrapContext(agentPubkeyHex, epochId, opts.signAuth);
   }
@@ -787,7 +788,7 @@ export async function runNetworkDkg(
     agentPubkey,
   );
 
-  // PERSIST-024: extract serializable FROST share data for DB persistence (SI-001: never log signingShare)
+  // Extract serializable FROST share data for DB persistence. NEVER log signingShare.
   const serializedSecret = clientKey.secret as unknown as { identifier: string; signingShare: Uint8Array };
   const serializedPub = clientKey.public as unknown as {
     commitments: Uint8Array[];
@@ -808,7 +809,7 @@ export async function runNetworkDkg(
   };
 }
 
-// ─── M8B DOD-REFRESH-1: proactive share resharing (PSS) orchestration ─────────
+// ─── Proactive share resharing (PSS) orchestration ─────────
 // A client-coordinated 2-round refresh that rotates every shareholder's share to a new epoch while keeping
 // the group public key unchanged (frost-resharing.ts). The client is the UNIFORM RELAY: it collects one
 // contribution per node (round 1) and distributes the agreed set — narrowed to each node's own sub-share
@@ -892,7 +893,7 @@ export async function runNetworkRefresh(
     participants: number;
     directoryNodes: NetworkDirectoryNode[];
     fromEpochN: number;
-    /** SEC-2: K_local signer for any commit/sign auth during the refresh. */
+    /** K_local signer for any commit/sign auth during the refresh. */
     signAuth?: FrostAuthSigner;
   },
 ): Promise<{
