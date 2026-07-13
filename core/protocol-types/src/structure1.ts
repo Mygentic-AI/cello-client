@@ -1,18 +1,14 @@
 /**
  * Structure 1 — the sender's signed ordering claim, canonical CBOR.
  *
- * The daemon does not BUILD Structure 1 today: it arrives from the relay (the ordering authority)
- * inside the content frame and inside a parked envelope, and the daemon parses and carries it. So
- * this encoder has no production caller.
+ * The daemon PARSES Structure 1 (it arrives from the relay, the ordering authority) but does not
+ * build one, so this encoder has no production caller. It is kept because it is the only written
+ * definition of the Structure 1 FIELD ORDER, and `structure1-canonical.json` is the only vector in
+ * either repo pinning the resulting bytes. Delete it and the wire format is defined solely by
+ * whatever the relay happens to emit, with nothing to catch a drift.
  *
- * It is kept anyway, and it is not dead code. It is the only place the Structure 1 FIELD ORDER is
- * written down, and `structure1-canonical.json` is the only vector in either repo that pins the
- * resulting bytes. A CELLO node must be able to parse what another implementation produced; if the
- * layout drifts, nothing else in the tree notices. Deleting this deletes the wire spec and the test
- * that guards it, and leaves the format defined only by whatever the relay happens to emit.
- *
- * Field order is LOAD-BEARING. It is signed over — reorder a field and every signature made by
- * another implementation fails to verify against ours.
+ * Field order is LOAD-BEARING: it is signed over. Reorder a field and signatures produced by any
+ * other implementation stop verifying against ours.
  */
 import { encodeCbor } from "./cbor.js";
 

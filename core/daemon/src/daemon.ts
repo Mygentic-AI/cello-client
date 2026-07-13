@@ -938,7 +938,10 @@ async function startDaemonHoldingLock(
 
   // Per-connection state: tracks which agent is "current" for each IPC connection.
   // Key = connectionId (assigned by IPC server), Value = current agent name or null.
-  const perConnectionState = new Map<string, { currentAgent: string | null; clientType: string }>();
+  // `clearedAgent` remembers a selection this connection ONCE made and that was taken away (the agent
+  // was stopped or retired). It is what stops resolveCurrentAgent from quietly re-targeting the next
+  // call at some other agent that happens to be online — see there.
+  const perConnectionState = new Map<string, { currentAgent: string | null; clearedAgent?: string; clientType: string }>();
 
   // Set of agents currently in "online" state (transitioned via cello_start_agent)
   const onlineAgents = new Set<string>();
@@ -2104,9 +2107,23 @@ async function startDaemonHoldingLock(
   // agent is online daemon-wide — that sole agent (removes the "why did it forget my agent" moment
   // after a /mcp reconnect). Two-or-more online with none selected stays ambiguous → null (the
   // caller returns no_current_agent), because guessing between peers would misroute.
-  function resolveCurrentAgent(connState: { currentAgent: string | null } | undefined, explicitName?: string): string | null {
+  /**
+   * Which agent does this call act as?
+   *
+   * Explicit name wins, then this connection's selection. Only with NEITHER does the daemon fall back
+   * to the sole online agent — a convenience for a caller that never chose, where "the online one"
+   * cannot mean anyone else.
+   *
+   * The fallback is REFUSED for a connection whose selection was taken away (`clearedAgent`): it
+   * chose an agent, that agent was stopped or retired, and the choice is gone. Falling back there
+   * silently re-targets the next call at whoever else happens to be online — the caller asked for
+   * alice, alice was stopped, and the work lands on bob reporting success. A lost intent is not the
+   * same as no intent, and it must fail loud (no_current_agent) rather than be guessed at.
+   */
+  function resolveCurrentAgent(connState: { currentAgent: string | null; clearedAgent?: string } | undefined, explicitName?: string): string | null {
     if (explicitName) return explicitName;
     if (connState?.currentAgent) return connState.currentAgent;
+    if (connState?.clearedAgent) return null;
     if (onlineAgents.size === 1) return [...onlineAgents][0];
     return null;
   }
@@ -2311,6 +2328,7 @@ async function startDaemonHoldingLock(
       for (const [connId, state] of perConnectionState) {
         if (state.currentAgent === name) {
           state.currentAgent = null;
+          state.clearedAgent = name; // this connection HAD an intent; do not guess a replacement
           notificationDispatcher.setCurrentAgent(connId, null);
           notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
         }
@@ -2359,6 +2377,7 @@ async function startDaemonHoldingLock(
     for (const [connId, state] of perConnectionState) {
       if (state.currentAgent === name) {
         state.currentAgent = null;
+        state.clearedAgent = name; // this connection HAD an intent; do not guess a replacement
         notificationDispatcher.setCurrentAgent(connId, null);
         notificationDispatcher.dispatchAgentCurrentChanged(connId, name, null);
         logger.info("agent.current.switched", { connectionId: connId, fromAgent: name, toAgent: null });
@@ -2410,6 +2429,10 @@ async function startDaemonHoldingLock(
     }
     const fromAgent = connState.currentAgent;
     connState.currentAgent = name;
+    // A fresh choice supersedes any earlier one that was taken away. Without this a connection that
+    // ever had an agent stopped under it would be refused the sole-online fallback forever, even
+    // after the operator selected again.
+    delete connState.clearedAgent;
     // M8C-AWAY-1: this agent just became attended — clear its away-ack dedup entries so the NEXT
     // away period (after this attended stretch ends) gets a fresh ack instead of staying silent.
     for (const key of Array.from(awayAckSent)) {

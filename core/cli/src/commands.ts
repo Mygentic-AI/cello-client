@@ -21,14 +21,16 @@ import {
 /**
  * Open an IPC connection, run `fn`, and ALWAYS close it.
  *
- * The close belongs in a `finally`, not after the send. The daemon enforces IPC_CONNECTION_LIMIT, so
- * a connection is a BOUNDED resource: a `client.close()` written after `client.send()` inside a try
- * is SKIPPED on any throw, and every failed command then leaks a socket the daemon never reclaims.
- * Leak enough and the daemon refuses new connections — a failure whose symptom looks nothing like
- * its cause.
+ * The close belongs in a `finally`, never after the send. The daemon enforces IPC_CONNECTION_LIMIT,
+ * so a connection is a BOUNDED resource: a `client.close()` written after `client.send()` inside a
+ * try is SKIPPED on any throw, and each failed command leaks a socket the daemon never reclaims.
+ * Leak enough and it refuses new connections — a failure whose symptom looks nothing like its cause.
  *
- * Every command that opens a connection goes through this. Calling connectToDaemon directly is how
- * the same leak came to be written in nine places.
+ * Every single-call command goes through this. The three that cannot are `login` (the connection is
+ * created by connectOrStart and handed to us), `logout` (it must outlive the send to poll for death),
+ * and `daemonGone` (it races the connect against a timeout). Each closes in a `finally` or reaps the
+ * abandoned promise explicitly — see them. Any NEW command that reaches for connectToDaemon directly
+ * is reintroducing the leak.
  */
 async function withIpc<T>(socketPath: string, fn: (client: IpcClient) => Promise<T>): Promise<T> {
   const client = await connectToDaemon(socketPath);
@@ -136,12 +138,25 @@ const LOGOUT_WAIT_POLL_MS = 50;
  * can be reused, and a lock file can be deleted by anyone.
  */
 async function daemonGone(celloDir: string, socketPath: string, logger: Logger): Promise<boolean> {
+  // connectToDaemon has no connect timeout of its own — bound the probe so a pathological hang
+  // cannot stall the poll loop past its deadline. On the expected path the socket is already gone,
+  // so this fails fast (ENOENT/ECONNREFUSED).
+  //
+  // The race LOSER must still be closed. If the timeout wins, the connect promise is abandoned — but
+  // it can still resolve afterwards into a live IpcClient that nobody holds and nobody closes. This
+  // runs in a POLL LOOP inside one process, against the daemon's bounded IPC_CONNECTION_LIMIT, so
+  // those accumulate. Of every connect in this file it is the only one that can genuinely exhaust the
+  // pool — everywhere else the process exits and the OS reclaims the fd. So: keep the promise, and
+  // close whatever it eventually yields.
+  const connecting = connectToDaemon(socketPath);
+  connecting.then(
+    (late) => { try { late.close(); } catch { /* already closed by the winner below */ } },
+    () => { /* never connected — nothing to reap */ },
+  );
+
   try {
-    // connectToDaemon has no connect timeout of its own — bound the probe so a pathological hang
-    // cannot stall the poll loop past its deadline. On the expected path the socket is already gone,
-    // so this fails fast (ENOENT/ECONNREFUSED).
     const probe = await Promise.race([
-      connectToDaemon(socketPath),
+      connecting,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe_timeout")), 500)),
     ]);
     probe.close();
@@ -234,10 +249,12 @@ export async function logout(
 
   try {
     await client.send("shutdown");
-    client.close();
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to stop daemon: ${message}` };
+  } finally {
+    // In the `finally`, not after the send: a throw from `shutdown` must not leak the connection.
+    client.close();
   }
 
   // The request is in — tell the operator NOW, then report "stopped" only when it is true.

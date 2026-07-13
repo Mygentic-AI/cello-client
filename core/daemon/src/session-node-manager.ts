@@ -3189,7 +3189,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean; witnessed?: boolean } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -3487,26 +3487,34 @@ export class SessionNodeManager {
     // hash rode in the same frame as the content, so the check is the sender's claim against the
     // sender's own claim. Say so. A sender who simply never submits to the relay is otherwise
     // indistinguishable from one the relay merely has not witnessed YET.
-    if (canonicalSeq === undefined) {
+    // The relay witness is an INDEPENDENT attestation: a (content_hash → sequence) binding derived
+    // from the sender's own signed leaf. Holding one, we check received content against a hash the
+    // sender committed to a THIRD PARTY. Holding none, the only hash available rode in the same frame
+    // as the content — the sender's claim checked against the sender's claim.
+    //
+    // Unwitnessed content is still ingested. Refusing it would make the relay a precondition for
+    // READING mail, so a relay outage would render the inbox unreadable — the redundancy the direct
+    // path and the park backstop exist to provide.
+    //
+    // Warn ONLY when a witness was EXPECTED. A session with no relay attached has no witness BY
+    // DESIGN, and warning on every message there would bury the one case that means something —
+    // a relay IS attached, so the sender's leaf should have been submitted and witnessed, and it
+    // was not. A signal that fires on the normal case is not a signal.
+    if (canonicalSeq === undefined && this.#activeNodes.get(key)?.relayClient) {
       this.#logger.warn("session.content.unwitnessed", {
+        agentName,
         sessionId,
         leafIndex,
         contentHash: contentHashHex,
         correlationId,
+        guidance: "a relay is attached to this session but no witness bound this content hash — it was ingested with no independent commitment from the sender",
       });
     }
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
     const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
-    return {
-      ok: true,
-      leafIndex,
-      sequenceNumber: leafIndex,
-      appendedCount: 1 + released,
-      witnessed: canonicalSeq !== undefined,
-      ...(terminalBlock ? { screenedOut: true } : {}),
-    };
+    return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
   }
 
   /**

@@ -175,6 +175,8 @@ The MCP shim holds no state — it proxies to the daemon. Run `cello login`, the
 **`no_current_agent`**
 No agent is selected on this connection. Call `cello_use_agent({ name })`, or `cello_agents()` to see what exists.
 
+The daemon only picks an agent for you when it knows exactly ONE. With several agents it refuses rather than guess — an unselected call would otherwise land on whichever agent happened to be online, which may not be the one you meant. Select one.
+
 **`session_not_current` on send**
 The other side has spoken and you have not read it. The refusal tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole history), then send again. This is deliberate — you cannot reply to something you never saw.
 

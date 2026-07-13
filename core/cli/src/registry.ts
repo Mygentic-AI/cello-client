@@ -678,7 +678,6 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
       "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
     flags: AGENT_FLAG,
-    ipcMethod: IPC_METHODS["settings-set"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
@@ -709,7 +708,6 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  override it with their own pet name for you. Never sent to the directory.\n" +
       "  Example:  cello moniker set Wonderland_Alice --agent alice",
     flags: AGENT_FLAG,
-    ipcMethod: IPC_METHODS["moniker-set"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);

@@ -1,37 +1,33 @@
 /**
- * The CBOR encoder. Singular, deliberately.
+ * The CBOR encoder. Singular — import it, never construct another.
  *
- * `tagUint8Array: false` makes byte fields encode as raw CBOR byte strings (major type 2) rather
- * than cbor-x's default tag-64 typed arrays. That is not a preference — it is the wire format the
- * DIRECTORY decodes, and the relay with it. An encoder configured any other way produces frames a
- * strict CBOR reader sees as a different shape.
+ * `no-multiple-cbor-encoders.test.ts` fails the build if any production file builds its own Encoder
+ * or imports cbor-x's bare `encode`. A second encoder is a second wire format written into the same
+ * columns and frames, and it takes a data migration to undo.
  *
- * WHY THIS MODULE EXISTS: this same `new Encoder({ tagUint8Array: false })` had been re-declared in
- * fourteen files, and two files skipped it entirely and used cbor-x's bare `encode`. Those two wrote
- * TAG-64 blobs into the SAME database columns (frost_commitments, frost_verifying_shares) that the
- * others wrote as raw byte strings — so an agent's persisted share blobs silently changed format the
- * first time it ran `cello_refresh_shares`. It "worked" only because cbor-x's own decoder happens to
- * accept both. Any reader that is not cbor-x — a Rust or Go client, an auditor verifying a seal
- * independently — sees one column with two encodings and no way to know which it will get.
+ * Two settings, both load-bearing:
  *
- * So: ONE encoder, imported. Do not construct another, and do not import `encode` from cbor-x
- * directly. `no-multiple-cbor-encoders.test.ts` fails the build if you do — deliberately, because a
- * second encoding is not a style question, it is a corrupt column that takes a migration to undo.
+ * `tagUint8Array: false` — byte fields encode as CBOR byte strings (major type 2), not cbor-x's
+ * tag-64 typed arrays. This is what the directory and the relay decode.
  *
- * Decoding stays cbor-x's `decode`, which reads both encodings. That tolerance is what let the
- * divergence hide; it is retained ONLY so already-migrated and in-flight data keeps decoding. It is
- * not a licence to write a second format.
+ * `useRecords: false` — objects encode as CBOR maps. cbor-x defaults this ON, which emits its own
+ * tag 57343 instead of a map: a private format that no other CBOR reader can parse. Signed TBS
+ * payloads are all ARRAYS and encode identically either way, so signatures do not depend on this;
+ * what depends on it is whether a non-cbor-x implementation can read our wire and our seals.
+ *
+ * Decoding uses cbor-x's `decode`, which reads byte strings, tag-64, and records alike. That
+ * tolerance is for data that predates this module — it is not a licence to write a second format.
  */
 import { Encoder, decode } from "cbor-x";
 
-const ENCODER = new Encoder({ tagUint8Array: false });
+const ENCODER = new Encoder({ tagUint8Array: false, useRecords: false });
 
-/** Encode to canonical CBOR (byte fields as raw byte strings, never tag-64). */
+/** Encode to canonical CBOR: byte strings for bytes, maps for objects. Plain RFC 8949. */
 export function encodeCbor(value: unknown): Uint8Array {
   return ENCODER.encode(value) as Uint8Array;
 }
 
-/** Decode CBOR. Tolerates tag-64 (pre-migration and in-flight data) as well as raw byte strings. */
+/** Decode CBOR. Tolerates the older tag-64 and record encodings so pre-migration data still reads. */
 export function decodeCbor(bytes: Uint8Array): unknown {
   return decode(bytes);
 }

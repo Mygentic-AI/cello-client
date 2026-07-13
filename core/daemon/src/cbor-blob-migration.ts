@@ -1,25 +1,19 @@
 /**
- * §1.1 — normalize the persisted FROST blobs to ONE CBOR encoding.
+ * Normalize the persisted FROST blobs to the canonical CBOR encoding.
  *
- * `frost_commitments` and `frost_verifying_shares` were written by two producers in two formats:
- * `registration-manager` used the canonical encoder (raw CBOR byte strings), while
- * `session-ceremony`'s refresh path used cbor-x's bare `encode` (TAG-64 typed arrays). So an agent's
- * share blobs CHANGED FORMAT the first time it ran `cello_refresh_shares`, and both formats are on
- * disk in the field right now. It only ever worked because cbor-x's decoder reads both.
+ * `frost_commitments` and `frost_verifying_shares` may hold an older encoding (cbor-x tag-64 or its
+ * record extension) alongside the canonical one; cbor-x decodes all three, which is why a mixed
+ * column reads correctly and can go unnoticed. This makes the column hold ONE encoding, so a reader
+ * that is not cbor-x can parse it.
  *
- * Both producers now use `encodeCbor`. This rewrites what is already stored so the column holds one
- * encoding, and a reader that is not cbor-x can rely on it.
+ * Decode, re-encode canonically, rewrite only if the bytes differ. Self-checking and idempotent: a
+ * canonical blob re-encodes to itself and is skipped, so there is no "have I run yet?" flag to get
+ * wrong and a second run is a no-op.
  *
- * HOW IT DECIDES: decode the blob (cbor-x reads both formats), re-encode canonically, and rewrite
- * ONLY if the bytes differ. That makes it self-checking and idempotent — a canonical blob re-encodes
- * to itself and is skipped, so a second run is a no-op and there is no "have I run yet?" flag to get
- * wrong. It also means the migration cannot be fooled by a blob that merely LOOKS tagged.
- *
- * FAILS SAFE, PER ROW: the blobs are FROST key material. A row we cannot decode is LEFT EXACTLY AS
- * IT WAS and logged — never dropped, never half-written, never "fixed" with a guess. A share we
- * cannot read is a share we must not touch: destroying it makes the agent permanently unable to sign
- * or seal, which is strictly worse than leaving it in an old-but-working encoding that cbor-x still
- * decodes. The whole point of the migration is that nobody ever loses a key to it.
+ * FAILS SAFE, PER ROW. These blobs are FROST key material. A row that cannot be decoded is LEFT
+ * EXACTLY AS IT WAS and reported — never dropped, never half-written, never guessed at. Destroying a
+ * share makes the agent permanently unable to sign or seal, which is strictly worse than leaving it
+ * in an old encoding that still decodes. Nobody may lose a key to this migration.
  */
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
@@ -37,10 +31,9 @@ function toBytes(v: unknown): Uint8Array | null {
 /**
  * Do two decoded CBOR values carry the same DATA?
  *
- * Compares byte content, not container class. cbor-x decodes a raw byte string to a Node Buffer and
- * a tag-64 to a Uint8Array — the same four bytes in two wrappers. Anything that compares by class
- * (`JSON.stringify`, `toEqual`) calls those different and would refuse every real migration, which
- * is exactly the bug this comment exists to stop someone re-introducing.
+ * Compares byte CONTENT, never container class. cbor-x decodes a byte string to a Node Buffer and a
+ * tag-64 to a Uint8Array — identical bytes, different wrapper. A class-sensitive compare
+ * (`JSON.stringify`, `toEqual`) calls those unequal and refuses every genuine migration.
  */
 function sameDecodedValue(a: unknown, b: unknown): boolean {
   const ab = toBytes(a);
@@ -93,7 +86,7 @@ export function migrateCborBlobsToCanonical(db: DaemonDatabase, logger: Logger):
       try {
         canonical = encodeCbor(decodeCbor(stored));
       } catch (err: unknown) {
-        // Undecodable key material. Leave it alone — see FAILS SAFE above.
+        // Undecodable key material — leave it alone.
         skipped++;
         logger.warn("daemon.cbor.migration.undecodable", {
           agentId,
@@ -106,14 +99,8 @@ export function migrateCborBlobsToCanonical(db: DaemonDatabase, logger: Logger):
 
       if (Buffer.from(canonical).equals(Buffer.from(stored))) continue; // already canonical
 
-      // Re-decode what we are about to write and compare it to what we read, BEFORE we write it.
-      // Re-encoding must preserve the VALUE, not merely produce bytes. If canonicalizing ever
-      // changed the decoded content, this refuses rather than persist a corrupted share — the one
-      // outcome that would leave an agent unable to sign.
-      //
-      // Compare BYTES, not containers. cbor-x hands a raw byte string back as a Node Buffer and a
-      // tag-64 back as a Uint8Array — identical bytes, different wrapper. A JSON.stringify compare
-      // sees those as different values and refuses every genuine migration.
+      // Verify BEFORE writing: re-encoding must preserve the VALUE, not merely produce bytes. If it
+      // ever altered the decoded content, refuse rather than persist a corrupted share.
       if (!sameDecodedValue(decodeCbor(canonical), decodeCbor(stored))) {
         skipped++;
         logger.error("daemon.cbor.migration.value_changed", {

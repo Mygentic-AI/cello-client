@@ -163,23 +163,26 @@ async function withDaemon(
           );
         }
       } else {
-        // NO selection. The daemon's fallback is "the sole ONLINE agent" — and it refuses as
-        // no_current_agent only when two or more are online. So with several agents REGISTERED and
-        // exactly one of them up, the daemon happily runs the command as that one. That is a silent
-        // misroute, and `cello stop-agent` walks straight into it: stopping the selected agent CLEARS
-        // the selection (above), so the very next command re-targets whoever else happens to be
-        // online. Observed: use-agent alice → stop-agent alice → `cello settings set` writes to BOB
-        // and exits 0.
+        // NO selection. The daemon's fallback is "the sole ONLINE agent", and it refuses only when
+        // two or more are online — so with several agents known and exactly one up, it runs the
+        // command as that one. `cello stop-agent <selected>` clears the selection, which walks
+        // straight into it: the next command silently re-targets whoever else happens to be online.
         //
-        // With ONE agent registered the fallback is unambiguous and genuinely useful (a fresh
-        // operator who never ran `use-agent` still works). With MORE than one it is a guess about
-        // intent, and a guess must not be made silently on the operator's behalf. Refuse and name the
-        // remedy.
-        const registered = await listRegisteredAgents(client);
-        if (registered.length > 1) {
+        // With ONE known agent the fallback is unambiguous and useful (a fresh operator who never ran
+        // `use-agent` still works). With more than one it is a guess about intent, and a guess must
+        // not be made silently on the operator's behalf.
+        const known = await listKnownAgents(client);
+        if (known === null) {
+          return emitTransportError(
+            "agent_list_unavailable",
+            "The daemon's agent list could not be read, so this command was not run — without it there is no way to tell whether an unselected command would target the agent you meant. Check 'cello status'.",
+            opts,
+          );
+        }
+        if (known.length > 1) {
           return emitTransportError(
             "no_agent_selected",
-            `No agent is selected and ${registered.length} are registered (${registered.join(", ")}), so this command was not run — it would otherwise have silently targeted whichever agent happened to be online. Choose one with 'cello use-agent <name>', or pass --agent <name>.`,
+            `No agent is selected and the daemon knows ${known.length} (${known.join(", ")}), so this command was not run — it would otherwise have silently targeted whichever agent happened to be online. Choose one with 'cello use-agent <name>', or pass --agent <name>.`,
             opts,
           );
         }
@@ -211,16 +214,24 @@ async function isAgentOnline(client: IpcClient, name: string): Promise<boolean> 
 }
 
 /**
- * Every agent the daemon knows about, online or not. Used to decide whether "no selection" is an
- * unambiguous situation (one agent) or a guess about intent (several).
+ * Every agent the daemon KNOWS — loaded, whether online or not. Used to decide whether "no
+ * selection" is unambiguous (one agent) or a guess about the operator's intent (several).
  *
- * Counts REGISTERED agents, not online ones. Counting only the online ones would reintroduce the
- * exact hole: stop the selected agent and the count drops to one, so the guess looks safe again
- * precisely when the operator has just said they do not want that agent.
+ * Counts KNOWN agents, not online ones. Counting only the online ones reopens the hole it exists to
+ * close: stopping the selected agent drops the count to one, so the guess looks safe again at
+ * exactly the moment the operator said they do not want that agent.
+ *
+ * FAILS CLOSED, like its sibling isAgentOnline. Returns null — never an empty list — when the daemon
+ * answers with a shape it does not recognize. An empty list would sail through a `length > 1` guard
+ * and hand the decision straight back to the daemon's sole-online fallback, which is the very thing
+ * the guard is there to prevent. A counter that cannot count must not answer "one".
  */
-async function listRegisteredAgents(client: IpcClient): Promise<string[]> {
-  const res = (await client.send("cello_list_agents")) as { agents?: Array<{ name?: string }> };
-  return (res.agents ?? []).map((a) => a.name).filter((n): n is string => typeof n === "string");
+async function listKnownAgents(client: IpcClient): Promise<string[] | null> {
+  const res = (await client.send("cello_list_agents")) as { agents?: unknown };
+  if (!Array.isArray(res.agents)) return null;
+  return (res.agents as Array<{ name?: unknown }>)
+    .map((a) => a.name)
+    .filter((n): n is string => typeof n === "string");
 }
 
 /** The common case: one IPC call, agent-scoped unless stated otherwise. */
@@ -381,12 +392,10 @@ export function contactSetMoniker(celloDir: string, pubkey: string, moniker: str
 
 // ─── Agent settings and outbound name ──────────────────────────────────────────────────────────
 //
-// These are AGENT-SCOPED: they write to one agent's row. They live here, and not on a private
-// connection helper of their own, for one reason — an agent-scoped command must resolve its agent
-// through withDaemon's replay, like every other one. A second connection path is a second
-// agent-resolution rule, and the two drift: these commands used to skip the replay and fall through
-// to the daemon's sole-online-agent fallback, so `cello use-agent alice` had no effect on them while
-// `cello contacts` honored it. One gesture must not mean two things.
+// AGENT-SCOPED: they write to one agent's row, so they resolve their agent through withDaemon's
+// use-agent replay like every other agent-scoped command. Do not give them a private connection
+// helper — a second connection path is a second agent-resolution rule, and one operator gesture must
+// not mean two different things depending on which command it reaches.
 
 /** `cello settings get [key]` → cello_settings_get. Omitted key returns the whole set. */
 export function settingsGet(celloDir: string, key: string | undefined, opts: ParityOptions): Promise<CliOutput> {

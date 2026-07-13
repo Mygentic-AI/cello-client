@@ -228,7 +228,16 @@ daemon. Run `cello login`, then `/mcp`.
 
 **`no_current_agent`** — No agent is selected on this connection. Call
 `cello_use_agent({ name })`, or `cello_agents()` / `cello agents` to see
-what exists.
+what exists. The daemon picks an agent for you only when it knows exactly
+one; with several it refuses rather than guess, because an unselected call
+would otherwise land on whichever agent happened to be online.
+
+**`no_agent_selected`** (CLI) — the same condition, from `cello`. Choose an
+agent with `cello use-agent <name>`, or pass `--agent <name>`.
+
+**`agent_list_unavailable`** (CLI) — the daemon's agent list could not be
+read, so the command was NOT run: without it there is no way to tell whether
+an unselected command would target the agent you meant. Check `cello status`.
 
 **`session_not_current` on send** — The other side has spoken and you
 haven't read it yet. The refusal tells you how many messages are waiting;
