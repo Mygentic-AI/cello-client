@@ -1,0 +1,701 @@
+/**
+ * Seam 2: inbound session establishment — the counterparty side.
+ *
+ * When agent A initiates a session, the directory FROST-signs a SessionAssignment and pushes it to
+ * B. This is everything B does with it: verify it, wait for B's standing receiver, accept the
+ * session, and park the event on a per-agent queue that a waiting cello_await_session drains.
+ *
+ * The accept path is SERIALIZED through one chain (inboundAcceptChain) on purpose — two assignments
+ * racing into acceptSession would both try to consume the single standing receiver.
+ *
+ * Everything here is keyed by (agentName, sessionId), NEVER sessionId alone: two of the operator's
+ * agents can hold both ends of the same session on one daemon (DOD-LOOP-1), and keying by session
+ * alone would let one agent's inbound event resolve the other's waiter.
+ */
+import { randomUUID } from "node:crypto";
+import { SignalingManager } from "@cello-protocol/transport";
+import type { KeyProvider } from "@cello-protocol/crypto";
+import type { IpcHandler } from "./ipc-server.js";
+import type { SessionNodeManager } from "./session-node-manager.js";
+import type { AgentInfo, Logger } from "./types.js";
+import type { ConnState } from "./contact-handlers.js";
+import { frameValueToHex } from "./frame-values.js";
+import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { hash as cryptoHash } from "@cello-protocol/crypto";
+import { DbIdentityStore } from "./db-identity-store.js";
+import { extractOfferedMoniker } from "./session-assignment-parser.js";
+import type { RelayConnectParams } from "./session-node-manager.js";
+
+/** How long an un-accepted inbound session request stays claimable. */
+export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface InboundSessionEvent {
+  sessionIdHex: string;
+  counterpartyPubkeyHex: string;
+  genesisPrevRootHex: string;
+  // MONIKER-2 AC2: the initiator's offered name — already validated at the wire boundary
+  // (extractInboundSessionAssignment), so downstream can never observe an invalid value.
+  // null = absent or rejected; an unverified display hint either way, never identity.
+  offeredMoniker?: string | null;
+  // M8C-TTL-1: when this event was queued (not set for events handed straight to a blocked
+  // waiter — those are delivered instantly and never sit in the queue this TTL governs).
+  enqueuedAt?: number;
+}
+
+export interface InboundSessionWaiter {
+  connectionId: string;
+  deliver: (e: InboundSessionEvent | null) => void; // clears its own timeout; null = evicted
+}
+
+
+export interface InboundSessionDeps {
+  handlers: Map<string, IpcHandler>;
+  logger: Logger;
+  sessionNodeManager: SessionNodeManager;
+  agents: AgentInfo[];
+  getConnState: (connectionId: string) => ConnState | undefined;
+  resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
+  NO_CURRENT_AGENT_RESPONSE: unknown;
+  getKeyProvider: (agentName: string) => KeyProvider | undefined;
+  sharedSignaling: SignalingManager | undefined;
+  handleInboundSealInterruptedRequest: (frame: Record<string, unknown>) => Promise<void>;
+  reapDeadHalfOpenSessions: (agentName?: string) => void;
+  /** AWAY-1: the auto-reply when nobody is attending this agent. */
+  sendAwayResponse: (agentName: string, sessionId: string, kind: "request" | "message") => Promise<void>;
+  dispatchSessionStateChangedWithTelegram: (agentName: string, sessionId: string, state: string, counterpartyPubkey: string | null) => void;
+  sendTelegramDoorbell: (agentName: string, sessionId: string, kind: "session_request" | "message_waiting" | "state_change", detail: string) => Promise<void>;
+}
+
+export function createInboundSessions(deps: InboundSessionDeps) {
+  const {
+    handlers, logger, sessionNodeManager, agents, getConnState, resolveCurrentAgent,
+    NO_CURRENT_AGENT_RESPONSE, getKeyProvider, sharedSignaling,
+    handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
+    sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
+  } = deps;
+
+  // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
+  //
+  // When agent A initiates a session, the directory FROST-signs a SessionAssignment
+  // and PUSHES it to the counterparty B over B's directory signaling stream (an
+  // unsolicited `session_assignment` frame). The daemon turns that frame into a live
+  // inbound session: it resolves which local agent is participant_b, calls
+  // SessionNodeManager.acceptSession (which hands off the standing receiver node bound
+  // to A's session peer id), and enqueues an inbound session event that a blocked
+  // cello_await_session call returns. This is the inbound mirror of cello_initiate_session.
+  // MONIKER-2 AC2b: the initiator's validated offered name. Session-scoped display material ONLY
+  // (spec: promotion to a stored pet name needs an explicit operator action). In-memory by design —
+  // a restart degrades the label to fingerprint, never worse.
+  //
+  // DOD-MONIKER-6 (spec §10): keyed by (agentName, sessionIdHex), NEVER sessionIdHex alone. A box
+  // is written by the RECEIVING side and holds the CALLER's name, so it is meaningful only to the
+  // agent it was written for. Keyed by session id alone, a daemon hosting both participants hands
+  // the initiator the box filled in for her counterparty — she is told she messaged herself — and
+  // either agent's state change or request expiry silently drops the other's name.
+  const offeredMonikers = new Map<string, string>();
+  const offerKey = (agentName: string, sessionIdHex: string): string => `${agentName}:${sessionIdHex}`;
+  // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
+  // cello_check_notifications so the operator can see what they missed, not just silence.
+  const expiredSessionRequests = new Map<string, Array<{ sessionIdHex: string; counterpartyPubkeyHex: string; expiredAt: number }>>();
+  // A blocked cello_await_session waiter. connectionId is carried so the disconnect
+  // hook can evict waiters belonging to a dead connection (otherwise enqueue would hand
+  // an inbound event to a closed connection and the event would be lost — review H2).
+  // Per-agent FIFO queue (events accepted while no cello_await_session is blocked) and
+  // the per-agent list of blocked waiters. Inbound sessions are addressed to a specific
+  // local agent (participant_b), so both are keyed by agent name.
+  const inboundSessionQueues = new Map<string, InboundSessionEvent[]>();
+  const inboundSessionWaiters = new Map<string, InboundSessionWaiter[]>();
+  // Session ids whose acceptInboundAssignment is in flight (the accept step is async
+  // because it may wait for the standing receiver to rebuild). Guards against two
+  // simultaneous frames for the SAME session both passing the getSessionRecord check
+  // before either has inserted the row (review M1, race half).
+  const inboundInFlight = new Set<string>();
+  // Inbound accepts are SERIALIZED through this chain. acceptSession synchronously
+  // consumes the single standing receiver and rebuilds a replacement asynchronously;
+  // running two accepts concurrently would let the second pass its readiness check on
+  // the receiver the first is about to consume, then fail on the consumed receiver
+  // (review M2, race). Serializing makes the second accept wait for the first's rebuild.
+  let inboundAcceptChain: Promise<void> = Promise.resolve();
+
+  function enqueueInboundSession(agentName: string, event: InboundSessionEvent): void {
+    const waiters = inboundSessionWaiters.get(agentName);
+    if (waiters && waiters.length > 0) {
+      // Hand straight to the oldest blocked waiter (deliver clears its own timeout).
+      const w = waiters.shift()!;
+      w.deliver(event);
+      return;
+    }
+    const q = inboundSessionQueues.get(agentName) ?? [];
+    q.push({ ...event, enqueuedAt: Date.now() }); // M8C-TTL-1: stamp queue entry time
+    inboundSessionQueues.set(agentName, q);
+  }
+
+  // M8C-TTL-1 (reviewer HIGH fix, aed2d71f, D19): expiredSessionRequests is a lasting log, not a
+  // consumed queue (unlike inboundSessionQueues, nothing ever drains it) — a whitelisted CONTACT-1
+  // contact is EXEMPT from ABUSE-1's acceptance bounds ("bounded only by disk"), so they can push
+  // unlimited accepted sessions the operator never claims, each becoming a permanent, unremovable
+  // entry every 24h for the life of the daemon process. Capped the same way STATUS_RESUMABLE_CAP
+  // bounds the interrupted-sessions list — keep only the MOST RECENT N per agent.
+  const EXPIRED_SESSION_REQUESTS_CAP = 20;
+  // M8C-TTL-1: move any queue entries past the TTL into expiredSessionRequests (visible via
+  // INBOX), instead of leaving them to sit forever or vanish silently. Called lazily on every
+  // read of the queue (cello_await_session's immediate-check, cello_check_notifications) rather
+  // than on a timer — no background sweep needed, and it's always correct-as-of-the-read.
+  function reapExpiredInboundSessions(agentName: string): void {
+    const q = inboundSessionQueues.get(agentName);
+    if (!q || q.length === 0) return;
+    const now = Date.now();
+    const live: InboundSessionEvent[] = [];
+    let expiredList = expiredSessionRequests.get(agentName);
+    for (const e of q) {
+      if (e.enqueuedAt !== undefined && now - e.enqueuedAt > INBOUND_SESSION_TTL_MS) {
+        if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
+        expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
+        if (expiredList.length > EXPIRED_SESSION_REQUESTS_CAP) {
+          expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
+        }
+        logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
+        // MONIKER-2 AC2b (review F1): the offer's display name expires with the offer.
+        if (offeredMonikers.delete(offerKey(agentName, e.sessionIdHex))) {
+          logger.debug("moniker.offer.dropped", { agentName, sessionId: e.sessionIdHex, state: "expired" });
+        }
+      } else {
+        live.push(e);
+      }
+    }
+    inboundSessionQueues.set(agentName, live);
+  }
+
+  // Pull the fields out of a pushed session_assignment frame. Returns null when the frame
+  // carries no usable assignment object / is missing the essential ids (the handler then
+  // ignores it rather than throwing). Field-level validity (peer id, signature type) is
+  // checked in the handler so it can emit a distinct, diagnosable event per failure.
+  function extractInboundSessionAssignment(frame: Record<string, unknown>):
+    | {
+        sessionIdHex: string;
+        participantAPubkeyHex: string;
+        participantBPubkeyHex: string;
+        initiatorPeerId: string;
+        // DOD-INBOUND-GUARD-1: the responder's accepted session endpoint. The directory omits
+        // this field when the offer was never accepted (offer-accept timeout → "empty defaults"),
+        // so null/"" here means NOBODY accepted — the initiator's F13 guard refuses the same
+        // assignment on its side, and the handler must refuse it here too. null when absent.
+        counterpartySessionPeerId: string | null;
+        sessionTimestamp: number;
+        signatureType: string | null;
+        signerPubkeyHex: string | null;
+        relayPeerId: string;
+        relayAddrs: string[];
+        // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
+        // boundary — downstream code can never observe an invalid moniker. null when
+        // absent (older client) or invalid; monikerRejected distinguishes the two so the
+        // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
+        offeredMoniker: string | null;
+        monikerRejected: boolean;
+        monikerRejectReason: "not_string" | "length" | "charset" | null;
+      }
+    | null {
+    const raw = frame["assignment"];
+    if (!raw || typeof raw !== "object") return null;
+    const a = raw as Record<string, unknown>;
+    const pa = a["participant_a"] as Record<string, unknown> | undefined;
+    const pb = a["participant_b"] as Record<string, unknown> | undefined;
+    const sessionIdHex = frameValueToHex(a["session_id"]);
+    const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
+    const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
+    if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
+    // M7 DOD-SPINE-6 / MSG-001-3b: relay endpoint so the receiver also connects to the
+    // relay witness (so the relay can deliver the initiator's witnessed leaves to it).
+    const relayEndpoint = a["relay_endpoint"] as Record<string, unknown> | undefined;
+    const relayPeerId =
+      relayEndpoint && typeof relayEndpoint["peer_id"] === "string" ? relayEndpoint["peer_id"] : "";
+    const relayAddrs =
+      relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
+        ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
+        : [];
+    // MONIKER-2 AC2: validate the offered name ONCE, at this wire boundary.
+    const monikerResult = extractOfferedMoniker(a);
+    return {
+      sessionIdHex,
+      participantAPubkeyHex,
+      participantBPubkeyHex,
+      initiatorPeerId:
+        typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
+      counterpartySessionPeerId:
+        typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
+      sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
+      signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+      // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
+      // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
+      // The responder stores it so it can verify the bilateral seal signature locally, not just
+      // accept it (session.ts: "embedded so the counterparty can verify").
+      signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
+      relayPeerId,
+      relayAddrs,
+      offeredMoniker: monikerResult.offeredMoniker,
+      monikerRejected: monikerResult.rejected,
+      monikerRejectReason: monikerResult.reason ?? null,
+    };
+  }
+
+  // Wait (bounded) for THIS AGENT's standing receiver to be ready. acceptSession consumes the
+  // agent's standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
+  // assignments for that agent would otherwise drop all but the first (review M2). Polling the
+  // per-agent readiness lets each accept proceed once the prior rebuild completes. Must check the
+  // OWNING agent — `getStandingReceiverReady()` with no arg returns true if ANY agent has one,
+  // which in the loopback case (alice + bob on one daemon) would falsely pass while bob's own SR
+  // is still mid-rebuild and drop bob's session (DOD-LOOP-1).
+  async function waitForStandingReceiver(agentName: string, maxWaitMs = 3_000, stepMs = 25): Promise<boolean> {
+    if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, stepMs));
+      if (sessionNodeManager.getStandingReceiverReady(agentName)) return true;
+    }
+    return sessionNodeManager.getStandingReceiverReady(agentName);
+  }
+
+  async function acceptInboundAssignment(
+    parsed: NonNullable<ReturnType<typeof extractInboundSessionAssignment>>,
+    agentName: string,
+    correlationId: string,
+  ): Promise<void> {
+    try {
+      // M8C-ABUSE-1 + DOD-TIER-2/3: bound acceptance by the sender's TIER — a per-sender cap that is
+      // the sender's tier cap (BLOCKED 0 → refused here, indistinguishably from an over-cap stranger),
+      // plus a global anti-swarm cap that applies only to the UNKNOWN-tier stranger pool. No tier is
+      // unbounded (INV-TIER-BOUND); KNOWN+ are exempt from the GLOBAL pool only, not from their own
+      // cap. Checked FIRST, before any standing-receiver work, so a refusal is cheap.
+      // CC-10: reap provably-dead ghosts for THIS agent before counting — otherwise invisible
+      // interrupted 0-received sessions (post-restart shape) consume the sender's budget forever
+      // and lock the stranger out with no list read ever clearing them. Safe here: abandonSession
+      // flips the DB status synchronously, so the bound query below sees the reaped state.
+      reapDeadHalfOpenSessions(agentName);
+      const bound = sessionNodeManager.checkUnknownSenderAcceptanceBound(agentName, parsed.participantAPubkeyHex);
+      if (!bound.ok) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: bound.reason,
+          correlationId,
+        });
+        return;
+      }
+      // DOD-RENAME-1 AC1 (review F1 / DEC-AB-4): record the offered name as the rename baseline the
+      // moment the offer passes the acceptance gate — an ALLOWED peer (the bound check let them
+      // through) is tracked even if session formation transiently fails below. Deliberately AFTER the
+      // bound check, not at the raw parse point: a BLOCKED or over-cap peer must NOT be able to drive
+      // the operator's rename baseline or push notices into their inbox. Guarded by offeredMoniker !==
+      // null so a silent offer never clears the baseline (AC5).
+      if (parsed.offeredMoniker !== null) {
+        sessionNodeManager.recordOfferedMoniker(agentName, parsed.participantAPubkeyHex, parsed.offeredMoniker);
+      }
+      // M8B F14 (fix 2): KICK creation before polling — an inbound offer arriving while no
+      // receiver exists and none is being created must trigger the ensure itself (the doc
+      // comment's "retries on demand" made true), instead of polling a creation nobody
+      // started and dropping the offer. Fire-and-forget: the poll below observes readiness.
+      void sessionNodeManager.ensureStandingReceiverForAgent(agentName).catch((err: unknown) => {
+        logger.warn("session.standing_receiver.ensure.failed", {
+          agentName,
+          reason: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
+      // M2: do not drop the session if this agent's standing receiver is mid-rebuild.
+      const ready = await waitForStandingReceiver(agentName);
+      if (!ready) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: "standing_receiver_unavailable",
+          correlationId,
+        });
+        return;
+      }
+      // M7 DOD-SPINE-6 / MSG-001-3b: relay witness for the receiver. Build from the
+      // inbound assignment's relay endpoint + this agent's K_local + the 16-byte session id.
+      const kp = getKeyProvider(agentName);
+      let relayParams: RelayConnectParams | undefined;
+      if (kp && parsed.relayPeerId && parsed.relayAddrs.length > 0) {
+        relayParams = {
+          relayPeerId: parsed.relayPeerId,
+          relayAddrs: parsed.relayAddrs,
+          keyProvider: kp,
+          senderPubkey: await kp.getPublicKey(),
+          sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
+        };
+      }
+      const result = await sessionNodeManager.acceptSession(
+        parsed.sessionIdHex,
+        agentName,
+        parsed.participantAPubkeyHex, // the initiator is OUR counterparty
+        parsed.initiatorPeerId,
+        correlationId,
+        relayParams,
+      );
+      if (!result.ok) {
+        logger.warn("session.inbound.accept.failed", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          reason: result.reason,
+          correlationId,
+        });
+        return;
+      }
+      // M7 legibility-TBS-binding (responder verify): store the initiator's primary (the seal
+      // signer, carried as signer_pubkey on the FROST-signed assignment) so the bilateral seal
+      // signature can be verified locally rather than accepted on faith.
+      if (parsed.signerPubkeyHex) {
+        sessionNodeManager.recordCounterpartyPrimary(agentName, parsed.sessionIdHex, parsed.signerPubkeyHex);
+      }
+
+      // H1: genesis_prev_root is the canonical two-party genesis value — the SAME value
+      // baked into the FROST-signed session-establishment TBS and derived by the initiator
+      // and directory — NOT the daemon's (empty) tree root. computeGenesisPrevRoot sorts
+      // the pubkeys internally, so natural (A, B) order is correct.
+      const genesisPrevRootHex = Buffer.from(
+        computeGenesisPrevRoot(
+          Buffer.from(parsed.participantAPubkeyHex, "hex"),
+          Buffer.from(parsed.participantBPubkeyHex, "hex"),
+          Buffer.from(parsed.sessionIdHex, "hex"),
+          parsed.sessionTimestamp,
+        ),
+      ).toString("hex");
+
+      logger.info("session.inbound.accepted", {
+        sessionId: parsed.sessionIdHex,
+        agentName,
+        sessionPeerId: result.peerId,
+        correlationId,
+      });
+      // MONIKER-2 AC2: a present-but-invalid moniker is a red flag (the sender runs modified
+      // code) — logged with the spec'd fields and NEVER the raw value. Not grounds to refuse
+      // the session (version skew is real; refusing hands strangers a DoS lever).
+      if (parsed.monikerRejected) {
+        logger.info("moniker.rejected", {
+          agentName,
+          pubkey: parsed.participantAPubkeyHex,
+          reason: parsed.monikerRejectReason ?? "invalid",
+          correlationId,
+        });
+      }
+      // MONIKER-2 AC2b: display material for THIS offer/session only (never persisted, never
+      // auto-written to contacts — AC3). Session-scoped: MONIKER-4's dispatcher resolves
+      // whoLabel from here; entries are dropped when the session's terminal state dispatches.
+      // DOD-MONIKER-6: scoped to `agentName` — the agent this offer was received FOR.
+      if (parsed.offeredMoniker !== null) {
+        offeredMonikers.set(offerKey(agentName, parsed.sessionIdHex), parsed.offeredMoniker);
+        // (DOD-RENAME-1's rename-baseline update runs earlier, right after the acceptance bound — see
+        // the recordOfferedMoniker call there. This map is only the session-scoped display material.)
+      }
+      enqueueInboundSession(agentName, {
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        genesisPrevRootHex,
+        offeredMoniker: parsed.offeredMoniker,
+      });
+      dispatchSessionStateChangedWithTelegram(
+        agentName,
+        parsed.sessionIdHex,
+        "created",
+        parsed.participantAPubkeyHex,
+      );
+      // M8C-TGDOOR-1: session requests ALWAYS ring (DoD) — no coalescing, unlike message-waiting.
+      void sendTelegramDoorbell(agentName, parsed.sessionIdHex, "session_request", "New session request");
+      // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
+      // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
+      void sendAwayResponse(agentName, parsed.sessionIdHex, "request");
+      // CC-1 (2026-07-07): do NOT auto-add the requester here. Accepting the *connection* must not
+      // grant *trust*. The old auto-add promoted any stranger who knocked once to "known" (Level-4
+      // fast-track), which defeated BOTH the screening layer AND the ABUSE-1 acceptance caps
+      // (a higher tier raises the per-sender cap, so auto-promoting a stranger would have let their
+      // sessions 2+ ride a larger bound — DOD-TIER-2). Promotion to "known" now requires operator engagement only:
+      // an outbound cello_initiate_session (below, ~3137), the operator replying INTO the session via
+      // cello_send, or an explicit cello_contact_add. An unattended stranger is never auto-whitelisted.
+      // See docs/planning/.../2026-07-07_1700_four-level-screening-policy.md (D21).
+    } finally {
+      inboundInFlight.delete(parsed.sessionIdHex);
+    }
+  }
+
+  function handleInboundSessionAssignment(frame: Record<string, unknown>): void {
+    // M4: one correlationId minted per inbound flow, threaded through EVERY event below.
+    const correlationId = randomUUID();
+    const parsed = extractInboundSessionAssignment(frame);
+    if (!parsed) {
+      logger.warn("session.inbound.assignment.malformed", {
+        reason: "missing_assignment_or_ids",
+        correlationId,
+      });
+      return;
+    }
+
+    // L1: refuse M1 single-key assignments outright (downgrade guard). Distinct from the
+    // deferred FROST verification below — track it so SESSION-004's re-home keeps it.
+    if (parsed.signatureType === "single") {
+      logger.warn("session.inbound.assignment.refused", {
+        sessionId: parsed.sessionIdHex,
+        reason: "unsupported_signature_type",
+        correlationId,
+      });
+      return;
+    }
+
+    // M3: the initiator session peer id is the AC-015 hand-off gate (acceptSession passes
+    // it to gater.setAllowedPeer). An empty value would gate the handed-off receiver to "",
+    // defeating "only the initiator may connect". The dead stack treated this as malformed.
+    if (!parsed.initiatorPeerId) {
+      logger.warn("session.inbound.assignment.malformed", {
+        sessionId: parsed.sessionIdHex,
+        reason: "missing_initiator_peer_id",
+        correlationId,
+      });
+      return;
+    }
+
+    // Resolve which local agent is participant_b. participant pubkeys are the agents'
+    // K_local identity pubkeys (same convention as the seal-interrupted responder's
+    // counterparty match above). If none of our agents is the counterparty, this
+    // assignment is not for this daemon — drop it.
+    const localAgent = agents.find((ag) => ag.pubkey === parsed.participantBPubkeyHex);
+    if (!localAgent) {
+      logger.debug("session.inbound.not_local", {
+        sessionId: parsed.sessionIdHex,
+        counterpartyPubkey: parsed.participantBPubkeyHex,
+        correlationId,
+      });
+      return;
+    }
+
+    // DOD-INBOUND-GUARD-1 (D3): the receive-side mirror of the initiator's F13 guard (~3189).
+    // An empty counterparty endpoint means the offer-accept never happened (this agent's standing
+    // receiver was not up when the directory's session_offer arrived) and the directory signed the
+    // assignment anyway, with "empty defaults". The initiator refuses that assignment and creates
+    // NO session — accepting it here builds a phantom session whose away-reply lands in the
+    // initiator's transcript with no session row: permanently unread AND unreadable. Refuse it
+    // loudly, before any session state exists. Nothing legitimate is lost — a session whose
+    // initiator has no address to dial is unusable by construction.
+    if (!parsed.counterpartySessionPeerId) {
+      logger.warn("session.inbound.assignment.incomplete", {
+        agentName: localAgent.name,
+        sessionId: parsed.sessionIdHex,
+        correlationId,
+      });
+      return;
+    }
+
+    // M1: idempotency — a retransmitted assignment for an already-known session (persisted
+    // row OR currently in flight) must not double-accept (orphaned node) or double-enqueue.
+    if (inboundInFlight.has(parsed.sessionIdHex) || sessionNodeManager.getSessionRecord(localAgent.name, parsed.sessionIdHex)) {
+      logger.info("session.inbound.duplicate.ignored", {
+        sessionId: parsed.sessionIdHex,
+        agentName: localAgent.name,
+        correlationId,
+      });
+      return;
+    }
+
+    // SECURITY — DEFERRED (SESSION-004 re-home): the directory's FROST threshold signature
+    // on the assignment (directory_signature over the TBS, verified against signer_pubkey)
+    // is NOT yet verified here. The old client's receiveSessionAssignment performed that
+    // check; it must be re-homed natively before this path faces a real (untrusted)
+    // directory. Until then we accept directory-pushed assignments on trust — the in-process
+    // seam tests inject trusted frames.
+    // M8B F15: logged at DEBUG with an "expected" note — it fires on EVERY healthy inbound
+    // session, and at WARN it read as a failure and actively misled live diagnosis. The
+    // deferred-verification state is a known, tracked gap (SESSION-004), not a per-session
+    // anomaly.
+    logger.debug("session.inbound.assignment.unverified", {
+      sessionId: parsed.sessionIdHex,
+      agentName: localAgent.name,
+      note: "FROST assignment signature verification deferred to SESSION-004 re-home (expected on every inbound session until SESSION-004)",
+      correlationId,
+    });
+
+    inboundInFlight.add(parsed.sessionIdHex);
+    // Serialize: the next accept does not begin until this one (and any standing-receiver
+    // rebuild it triggers) settles. A throw inside one accept must not break the chain.
+    const agentName = localAgent.name;
+    inboundAcceptChain = inboundAcceptChain
+      .then(() => acceptInboundAssignment(parsed, agentName, correlationId))
+      .catch((err: unknown) => {
+        inboundInFlight.delete(parsed.sessionIdHex);
+        logger.error("session.inbound.accept.error", {
+          sessionId: parsed.sessionIdHex,
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
+      });
+  }
+
+  // CELLO-M7-CONN-001 (DOD-CONN-2): wire the inbound session/seal responders onto a GIVEN
+  // signaling manager. Called for EVERY agent's own per-agent manager (via getAgentSignaling)
+  // so each agent receives inbound session_assignment + seal_interrupted_request on its OWN
+  // authenticated stream — closing the SPINE-5 gap where only the primary (whose stream WAS
+  // the keystone) received them. A frame arrives on exactly one agent's stream, so there is no
+  // double-dispatch; each handler resolves the local agent internally and that resolution
+  // matches the stream the directory routed the frame to.
+  // CELLO-M8-TRUST-001: open + verify + store + ACK a sealed trust signal pushed from the directory
+  // pickup queue. The daemon is the ONLY party that can open the seal (k_local — SI-001); it verifies
+  // the recomputed hash against the directory's anchor before storing, and ACKs only on success so the
+  // directory deletes the ciphertext (AC-001/AC-002). open-fail / hash-mismatch / store-fail → NO ACK
+  // (the directory keeps the pickup for a later retry; the signal is re-mintable).
+  async function handleTrustSignalPickup(
+    frame: Record<string, unknown>,
+    keyProvider: import("@cello-protocol/crypto").KeyProvider,
+    mgr: SignalingManager,
+    agentName: string,
+  ): Promise<void> {
+    const id = typeof frame["id"] === "string" ? frame["id"] : null;
+    const signalKind = typeof frame["signal_kind"] === "string" ? frame["signal_kind"] : null;
+    const signalHash = typeof frame["signal_hash"] === "string" ? frame["signal_hash"] : null;
+    const ciphertext = frame["ciphertext"];
+    if (!id || !signalKind || !signalHash || !(ciphertext instanceof Uint8Array)) {
+      // Neither stores nor ACKs → the directory retains the row and re-delivers. Log it: a PERMANENTLY
+      // malformed frame would otherwise be re-delivered forever with zero daemon-side signal (fallback-finder).
+      logger.warn("daemon.trust_signal.malformed", {
+        agentName,
+        hasId: !!id,
+        hasSignalKind: !!signalKind,
+        hasSignalHash: !!signalHash,
+        ciphertextOk: ciphertext instanceof Uint8Array,
+      });
+      return;
+    }
+    if (!keyProvider.openContentSeal) {
+      // A session-node stub key cannot open content seals. No ACK → the directory re-delivers; log so a
+      // pickup persistently routed to a stub-key agent is visible rather than a silent forever-retry.
+      logger.warn("daemon.trust_signal.no_content_key", { agentName, signalKind, correlationId: id });
+      return;
+    }
+    // The pickup id correlates the directory's deliver/ack with the daemon's receive (TRUST-001 obs).
+    const correlationId = id;
+
+    let recovered: Uint8Array | null;
+    try {
+      recovered = await keyProvider.openContentSeal(ciphertext);
+    } catch {
+      recovered = null;
+    }
+    if (!recovered) {
+      logger.warn("daemon.trust_signal.open_failed", { agentName, signalKind, correlationId });
+      return;
+    }
+    const recomputed = Buffer.from(cryptoHash(recovered)).toString("hex");
+    if (recomputed !== signalHash) {
+      logger.error("daemon.trust_signal.hash_mismatch", { agentName, signalKind, correlationId });
+      return;
+    }
+    try {
+      const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
+      store.storeTrustSignal({ signalHash, agentId: null, signalKind, payload: recovered });
+    } catch (err) {
+      logger.error("daemon.trust_signal.store_failed", {
+        agentName,
+        signalKind,
+        correlationId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    logger.info("daemon.trust_signal.received", { agentName, signalKind, verified: true, correlationId });
+    // DOD-SENDRAW-1: sendRaw never throws — a discarded result hid every failed ack, leaving the
+    // sender to retransmit against a daemon that believed it had answered.
+    const ackRes = await mgr.sendRaw({ type: "trust_signal_ack", id });
+    if (!ackRes.ok) {
+      logger.warn("daemon.trust_signal.ack_send_failed", {
+        agentName,
+        signalKind,
+        correlationId,
+        detail: ackRes.reason ?? "send_not_ok",
+        ...(ackRes.guidance ? { guidance: ackRes.guidance } : {}),
+      });
+    }
+  }
+
+  function wirePerAgentSessionInbound(mgr: SignalingManager): void {
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "seal_interrupted_request") return;
+      void handleInboundSealInterruptedRequest(frame as Record<string, unknown>);
+    });
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_assignment") return;
+      handleInboundSessionAssignment(frame as Record<string, unknown>);
+    });
+  }
+  // CONN-001: test path only — the shared manager's inbound session/seal responders. Production
+  // wires them per-agent in getAgentSignaling (each agent receives on its own stream).
+  if (sharedSignaling) wirePerAgentSessionInbound(sharedSignaling);
+
+  // M7 DOD-SPINE-7 / CELLO-M7-CONN-001: the seal-completion listeners (session_sealed /
+  // seal_unilateral_confirmed / seal_unilateral_notification) are registered PER-AGENT inside
+  // getAgentSignaling (the directory routes each over the session-owning agent's authenticated
+  // stream), and on the shared manager for the test path via wireSharedHandlers. No keystone, no
+  // runtime election — a fresh-install agent gets them when it comes online (create/start).
+
+  // cello_await_session — the counterparty's blocking pull for the next inbound session.
+  // Returns immediately if one is already queued for the current agent (FIFO), otherwise
+  // blocks until one arrives or timeout_ms elapses.
+  handlers.set("cello_await_session", async (params, connectionId) => {
+    const connState = getConnState(connectionId);
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    if (!agentName) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
+
+    const toResponse = (e: InboundSessionEvent) => ({
+      type: "new_session",
+      session_id: e.sessionIdHex,
+      counterparty_pubkey: e.counterpartyPubkeyHex,
+      genesis_prev_root: e.genesisPrevRootHex,
+      // MONIKER-2: validated-at-boundary display hint; null = absent or rejected.
+      offered_moniker: e.offeredMoniker ?? null,
+    });
+
+    reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
+    const queued = inboundSessionQueues.get(agentName);
+    if (queued && queued.length > 0) {
+      return toResponse(queued.shift()!);
+    }
+
+    const event = await new Promise<InboundSessionEvent | null>((resolve) => {
+      const waiters = inboundSessionWaiters.get(agentName) ?? [];
+      const waiter: InboundSessionWaiter = {
+        connectionId,
+        deliver: (e) => {
+          clearTimeout(timer);
+          resolve(e);
+        },
+      };
+      waiters.push(waiter);
+      inboundSessionWaiters.set(agentName, waiters);
+      const timer = setTimeout(() => {
+        const list = inboundSessionWaiters.get(agentName);
+        if (list) {
+          const idx = list.indexOf(waiter);
+          if (idx !== -1) list.splice(idx, 1);
+        }
+        resolve(null);
+      }, timeoutMs);
+    });
+
+    if (event === null) return { type: "timeout" };
+    return toResponse(event);
+  });
+  return {
+    wirePerAgentSessionInbound,
+    handleTrustSignalPickup,
+    enqueueInboundSession,
+    reapExpiredInboundSessions,
+    inboundSessionQueues,
+    inboundSessionWaiters,
+    expiredSessionRequests,
+    offeredMonikers,
+    offerKey,
+  };
+}
