@@ -587,13 +587,41 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       void attemptSealUpgrade(signaling, agentName, agentPubkeyHex, sidHex, frame);
     });
   }
+  /**
+   * Wire the WHOLE seal listener set onto an authenticated signaling stream.
+   *
+   * A BUNDLE, deliberately — the three listeners are NOT exported individually, because being able
+   * to register two of the three is what caused the bug this replaced. The daemon's VISITING stream
+   * registered `session_sealed` + `seal_unilateral_confirmed` but not the upgrade listener, and that
+   * looked intentional. It was not: the directory drains its DURABLE notification queue on any
+   * stream that authenticates — visiting included — and DELETES each row once sent. So a
+   * `seal_unilateral_notification` pushed down a visiting stream hit no handler, was dropped, and
+   * its durable row was gone. The absent party never ratified, and the seal stayed unilateral
+   * forever: silent, permanent loss of a notarized receipt.
+   *
+   * Every stream that can carry a seal frame gets every seal listener. Making the partial case
+   * impossible to express is the fix; a comment asking future callers to remember all three is not.
+   *
+   * Safe to call on any stream, including transient ones: `attemptSealUpgrade` holds a per-session
+   * in-flight guard, the receipt persist is behind the one-way ratchet, and the directory dedups a
+   * repeated ratification with `already_bilateral`.
+   */
+  function registerSealListeners(signaling: SignalingManager, agentName: string, agentPubkeyHex: string): () => void {
+    const unregisterSealed = registerSessionSealedListener(signaling, agentName, agentPubkeyHex);
+    const unregisterUnilateral = registerUnilateralConfirmedListener(signaling, agentName, agentPubkeyHex);
+    const unregisterUpgrade = registerUnilateralUpgradeListener(signaling, agentName, agentPubkeyHex);
+    return () => {
+      unregisterSealed();
+      unregisterUnilateral();
+      unregisterUpgrade();
+    };
+  }
+
   return {
     sealKey,
     sealInterruptedInProgress,
     pendingSealWaiters,
     pendingUnilateralWaiters,
-    registerSessionSealedListener,
-    registerUnilateralConfirmedListener,
-    registerUnilateralUpgradeListener,
+    registerSealListeners,
   };
 }

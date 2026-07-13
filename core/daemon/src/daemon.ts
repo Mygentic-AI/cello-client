@@ -472,9 +472,7 @@ async function startDaemonHoldingLock(
     sealInterruptedInProgress,
     pendingSealWaiters,
     pendingUnilateralWaiters,
-    registerSessionSealedListener,
-    registerUnilateralConfirmedListener,
-    registerUnilateralUpgradeListener,
+    registerSealListeners,
   } = createSealCoordinator({
     logger,
     sessionNodeManager,
@@ -675,13 +673,7 @@ async function startDaemonHoldingLock(
       logger,
     });
     // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
-    registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
-    // SESSION-002: resolve seal_unilateral_confirmed (verify the cert) on this agent's stream.
-    registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
-    // DOD-UP-1: as the ABSENT party, react to seal_unilateral_notification on reconnect — recover +
-    // verify the content, then ratify the unilateral seal (upgrade to bilateral). Also handles the
-    // seal_upgrade_confirmed / seal_upgrade_rejected responses.
-    registerUnilateralUpgradeListener(mgr, agentName, agentPubkeyHex);
+    registerSealListeners(mgr, agentName, agentPubkeyHex);
     // WIRE-002: answer the directory's session_offer on this agent's stream (advertise the
     // standing-receiver session endpoint so the assignment carries a reachable counterparty).
     wireSessionOfferHandler({
@@ -760,9 +752,7 @@ async function startDaemonHoldingLock(
       signaling: mgr,
       logger,
     });
-    registerSessionSealedListener(mgr, agent.name, agent.pubkey);
-    registerUnilateralConfirmedListener(mgr, agent.name, agent.pubkey);
-    registerUnilateralUpgradeListener(mgr, agent.name, agent.pubkey);
+    registerSealListeners(mgr, agent.name, agent.pubkey);
   }
 
   // CONN-001: the directory signaling manager that OWNS operations for `agentName`. In production
@@ -1290,8 +1280,14 @@ async function startDaemonHoldingLock(
       signaling: mgr,
       logger,
     });
-    registerSessionSealedListener(mgr, agentName, agentPubkeyHex);
-    registerUnilateralConfirmedListener(mgr, agentName, agentPubkeyHex);
+    // FIX (Seam B review): this VISITING stream used to register only the sealed + unilateral-confirmed
+    // listeners. That silently lost seal receipts — the directory drains its DURABLE notification queue
+    // on ANY stream that authenticates, visiting included, and deletes each row once sent. A
+    // seal_unilateral_notification pushed down here hit no handler, was dropped, and its row was gone;
+    // the absent party never ratified and the seal stayed unilateral forever. Every stream that can
+    // carry a seal frame now gets every seal listener — and the coordinator no longer lets it be
+    // wired any other way.
+    registerSealListeners(mgr, agentName, agentPubkeyHex);
     logger.info("signaling.visiting.connected", { agentName, node: nodeId, correlationId });
     return {
       mgr,
