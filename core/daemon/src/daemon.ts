@@ -35,9 +35,6 @@ import type {
   AgentInfo,
   InterruptedSessionInfo,
   ActiveSessionInfo,
-  SessionListEntry,
-  SessionListResponse,
-  SessionRecord,
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
@@ -47,7 +44,6 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { TIER } from "./contacts-tier-migration.js";
-import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
@@ -65,7 +61,6 @@ import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto"
 // at the send point here (the receive point lives in the transport content decode).
 import { buildAgentRevocationTbs, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { sealParkEnvelope } from "./park-envelope.js";
-import { validateSessionName } from "./session-name.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -89,6 +84,7 @@ import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
+import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { buildSignedSealInterruptedLeaf } from "./seal-leaf.js";
 
 
@@ -2206,252 +2202,21 @@ async function startDaemonHoldingLock(
     });
   }
 
-  // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
-  // The cert-read surface: returns the receipt-not-assent certificate for a sealed session —
-  // per-party content frontiers, attestation modes, and whether the final message was answered.
-  // Reads the PERSISTED record, so it works after a daemon restart and from a DIFFERENT process
-  // than the one that built the certificate (an arbitrator reading the receiving side). The
-  // legibility states, as a first-class machine-readable property, that a signature attests
-  // receipt — never assent (implies_assent: false); a malicious unanswered tail reads as
-  // delivered-but-unanswered (final_message.answered: false), never agreed.
-  handlers.set("cello_get_sealed_receipt", async (params, connectionId) => {
-    // cello-mcp forwards this as { session_id } (snake_case, matching the other session tools).
-    const sessionId = params?.["session_id"] as string | undefined;
-    if (!sessionId || typeof sessionId !== "string") {
-      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) of the sealed session. Check cello_sessions for sealed sessions." };
-    }
-    // DOD-LOOP-1: the certificate is keyed by (agent, session_id) — read the current agent's.
-    const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
-    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
-    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
-    const cert = sessionNodeManager.getSealCertificate(agentName, sessionId);
-    if (cert) {
-      // DOD-SESSION-NAME-1 (AC-A12): echo the name so the output is self-describing — you already
-      // hold the id, so the name is free context. It is display only: nothing in the certificate,
-      // the sealed root, or the legibility object is derived from it.
-      const sessionName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-      return { ok: true, session_id: sessionId, session_name: sessionName, sealed_root: cert.sealed_root, legibility: cert.legibility };
-    }
-    // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
-    // caller could not tell a typo from a not-sealed-yet session from a wrong-agent selection.
-    // Split them (full session ids on cello_list_sessions / cello_status already let a pasted id match).
-    if (sessionNodeManager.getSessionRecord(agentName, sessionId)) {
-      // The session is THIS agent's — it simply has no seal certificate yet.
-      return {
-        ok: false,
-        reason: "not_sealed_yet",
-        guidance: "This session exists but is not sealed yet. Close it with cello_close_session and confirm it reports sealed (or wait for the counterparty to co-seal), then retry.",
-      };
-    }
-    // Owned by a DIFFERENT loaded agent → the caller has the wrong current agent selected.
-    const owner = loadedAgents.find((a) => a.name !== agentName && sessionNodeManager.getSessionRecord(a.name, sessionId));
-    if (owner) {
-      return {
-        ok: false,
-        reason: "wrong_agent",
-        guidance: `This session belongs to agent '${owner.name}', not the current agent '${agentName}'. Call cello_use_agent('${owner.name}') then retry cello_sealed_receipt.`,
-      };
-    }
-    // A truncated paste: the id is a strict prefix of one of this agent's real session ids.
-    const truncated = sessionNodeManager
-      .getSessionsForAgent(agentName)
-      .some((s) => s.session_id.startsWith(sessionId) && s.session_id.length > sessionId.length);
-    if (truncated) {
-      return {
-        ok: false,
-        reason: "session_id_too_short",
-        guidance: "That looks like a truncated session id. cello_sessions and cello status show the FULL id — copy the complete id and retry.",
-      };
-    }
-    return {
-      ok: false,
-      reason: "unknown_session",
-      guidance: "No session with this id belongs to the current agent. Run cello_sessions to see the full ids of this agent's sessions.",
-    };
+  // The session READ surface (session-read-handlers.ts): sealed receipt, transcript, list, name.
+  // All four read the PERSISTED store, so they survive a restart and a fresh connection.
+  registerSessionReadHandlers({
+    handlers,
+    logger,
+    sessionNodeManager,
+    loadedAgents,
+    getConnState: (connectionId) => perConnectionState.get(connectionId),
+    resolveCurrentAgent,
+    NO_CURRENT_AGENT_RESPONSE,
+    resolveWho,
+    safeCursorAdvance,
+    safeWatermarkAdvance,
+    reapDeadHalfOpenSessions,
   });
-
-  // DOD-LOG-1 (PERSIST-LOG-001): read the durable, decrypted conversation transcript for a session —
-  // the readable sent+received messages in canonical-sequence order, recovered AFTER a daemon restart
-  // (not just the opaque hash chain). The plaintext is decrypted from the encrypted-at-rest store here,
-  // in the daemon; the relay/directory never held it (INV-3).
-  handlers.set("cello_get_transcript", async (params, connectionId) => {
-    const sessionId = params?.["session_id"] as string | undefined;
-    if (!sessionId || typeof sessionId !== "string") {
-      return { ok: false, reason: "missing_session_id", guidance: "Provide the session_id (hex) whose transcript to read. See cello_sessions." };
-    }
-    const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
-    const { messages, undecryptable } = sessionNodeManager.readTranscript(agentName, sessionId);
-    // undecryptable > 0 means some rows failed GCM auth (tamper / wrong key) — surfaced, not hidden,
-    // so the reader can tell a real gap from an empty transcript.
-    // M8C-CURSOR-1: this is the ONLY reader that covers BOTH directions (sent + received), so it's
-    // the correct general catch-up path — e.g. a second attended connection on the same agent
-    // catching up on a message a DIFFERENT local connection sent (since_seq is received-only and
-    // would never surface it). Route through safeCursorAdvance rather than trusting the raw max —
-    // reviewer HIGH finding (aa5928e2/a9099571): recordTranscriptMessage swallows a DB write
-    // failure without rolling back the tree's leaf count, so a hole in `messages` is possible in
-    // principle; the contiguous-run walk refuses to vault the cursor past such a hole even here.
-    const deliveredSeqs = new Set(messages.map((m) => m.sequence));
-    safeCursorAdvance(connectionId, sessionId, deliveredSeqs);
-    // DOD-CURSOR-DURABLE-1 (AC3): reading the full history IS reading — so this must advance the
-    // PERSISTED watermark too, not just this connection's in-memory cursor. Previously it advanced
-    // only the cursor, which made the gate's own guidance ("call cello_get_transcript, then retry")
-    // a dead end for any stateless client: a fresh process reads the transcript, exits, and the next
-    // process still presents an unread count. Same contiguous-run safety as the cursor — never vault
-    // past a gap (an undecryptable row is absent from `messages`, so the walk stops there and those
-    // messages correctly stay unread).
-    safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
-    // DOD-SESSION-NAME-1 (AC-A12): the name rides along so a transcript dump says what it is of.
-    const transcriptName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable };
-  });
-
-  // cello_list_sessions: the discovery surface — every persisted session for the
-  // current agent (active, interrupted, sealed, seal_interrupted_pending), newest
-  // updated first. This is where cello_get_transcript / cello_get_sealed_receipt
-  // get their session ids; without it those by-id reads have no starting point,
-  // and the guidance strings that point here ("See cello_list_sessions") dead-end.
-  // Read from the persisted SQLite store, so it works after a daemon restart and
-  // from a fresh MCP connection (no in-memory session-node required).
-  // Classify → filter → cap a set of session rows into a SessionListResponse. Shared by the
-  // per-agent MCP surface (cello_list_sessions) and the daemon-wide CLI surface (list_sessions),
-  // so the operator-facing categories (open/closed/failed) and the default cap never drift.
-  // Default filter = "open" (live/resumable only — the common case); default limit bounds the
-  // response so a long-lived agent's history can't balloon it. `all` includes failed/closed.
-  const DEFAULT_LIST_LIMIT = 50;
-  const MAX_LIST_LIMIT = 500;
-  function selectSessions(
-    rows: SessionRecord[],
-    params: Record<string, unknown> | undefined,
-  ): SessionListResponse {
-    const rawFilter = typeof params?.filter === "string" ? params.filter : "open";
-    const filter: SessionListResponse["filter"] =
-      rawFilter === "closed" || rawFilter === "failed" || rawFilter === "all" ? rawFilter : "open";
-    let limit = Number(params?.limit);
-    if (!Number.isFinite(limit) || limit < 1) limit = DEFAULT_LIST_LIMIT;
-    limit = Math.min(Math.floor(limit), MAX_LIST_LIMIT);
-
-    const classified = rows.map((row) => {
-      const messageCount = row.message_count ?? 0;
-      const category: SessionCategory = classifySession(row.status, messageCount);
-      return { row, messageCount, category };
-    });
-    const matched =
-      filter === "all" ? classified : classified.filter((c) => c.category === filter);
-    const sessions: SessionListEntry[] = matched.slice(0, limit).map(({ row, messageCount, category }) => ({
-      sessionId: row.session_id,
-      // DOD-SESSION-NAME-1 (AC-A13): SECOND, immediately after the id — not last. Every list surface
-      // renders as JSON, and JSON.stringify preserves insertion order, so key position IS layout: at
-      // the end of the entry the name prints ~11 lines below the id it belongs to, and scanning a
-      // 50-session dump for "which one was the deploy" is the exact problem this column exists to
-      // solve. Alongside the id, never instead of it — the id is what you paste into the next command.
-      sessionName: row.session_name ?? null,
-      agentName: row.agent_name,
-      counterpartyPubkey: row.counterparty_pubkey,
-      // MONIKER-5 AC1: the same resolution the doorbell uses — pet name ?? offered ?? fingerprint.
-      ...resolveWho(row.agent_name, row.counterparty_pubkey, row.session_id),
-      status: row.status,
-      category,
-      messageCount,
-      createdAt: new Date(row.created_at).toISOString(),
-      updatedAt: new Date(row.updated_at).toISOString(),
-      // interrupted_at is the canonical ISO interruption stamp; null for any
-      // session that was never interrupted (active/sealed).
-      interruptedAt: row.interrupted_at ?? null,
-    }));
-    return { ok: true, filter, limit, totalMatched: matched.length, sessions };
-  }
-
-  // cello_list_sessions (MCP, per current agent): the discovery surface for the by-id reads
-  // (cello_get_transcript / cello_get_sealed_receipt). Accepts { filter?: open|closed|failed|all,
-  // limit?: number } — defaults to open + DEFAULT_LIST_LIMIT so failed/dead handshakes don't drown
-  // the live ones. Read from persisted SQLite, so it survives a daemon restart / fresh connection.
-  handlers.set("cello_list_sessions", async (params, connectionId) => {
-    const connState = perConnectionState.get(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
-    reapDeadHalfOpenSessions(agentName); // CC-5/F21: drop provably-dead half-open sessions before listing
-    return selectSessions(
-      sessionNodeManager.getSessionsForAgent(agentName),
-      params as Record<string, unknown> | undefined,
-    );
-  });
-
-  // ─── DOD-SESSION-NAME-1: cello_name_session — set or clear THIS agent's label for a session ───
-  // Set-or-clear-by-null, mirroring cello_contact_set_moniker. Works in ANY status: naming a
-  // long-sealed session for archival clarity is the point of the tool, not an edge case. The only
-  // scope is ownership — the (agent_id, session_id) row must be this agent's, which for the loopback
-  // case correctly means each of the operator's two agents renames only its OWN row.
-  handlers.set("cello_name_session", async (params, connectionId) => {
-    const connState = perConnectionState.get(connectionId);
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
-
-    const sessionId = params?.session_id as string | undefined;
-    // `session_name` must be PRESENT (null is how you clear it) — an omitted key is a caller that
-    // forgot the argument, not a caller asking to clear. Same distinction cello_contact_set_moniker
-    // draws with its `"moniker" in params` check.
-    if (!sessionId || !params || !("session_name" in params)) {
-      return {
-        ok: false,
-        reason: "missing_params",
-        guidance: "Provide 'session_id' (hex) and 'session_name' — a string to name the session, or null to clear it.",
-      };
-    }
-
-    const check = validateSessionName(params.session_name);
-    if (!check.ok) {
-      logger.warn("session.name.rejected", {
-        agentId: sessionNodeManager.resolveAgentId(agentName), sessionId, reason: check.reason, source: "rename",
-        nameLength: typeof params.session_name === "string" ? params.session_name.length : null,
-      });
-      return { ok: false, reason: check.reason, guidance: check.guidance };
-    }
-
-    const written = sessionNodeManager.setSessionName(agentName, sessionId, check.value);
-    if (!written) {
-      // The UPDATE matched no row: this agent holds no session with that id. Fail loud rather than
-      // report a success for a write that landed nowhere.
-      return {
-        ok: false,
-        reason: "session_not_found",
-        guidance: "No session with this ID belongs to this agent. Check cello_sessions for its sessions and their IDs.",
-      };
-    }
-
-    // AC-A16: the LENGTH, never the text. A session name carries the subject of a private
-    // conversation ("Acquisition of Northwind Traders"), and daemon logs are not confidential.
-    const agentId = sessionNodeManager.getSessionRecord(agentName, sessionId)?.agent_id;
-    if (check.value === null) {
-      logger.info("session.name.cleared", { agentId, sessionId, source: "rename" });
-    } else {
-      logger.info("session.name.set", { agentId, sessionId, nameLength: check.value.length, source: "rename" });
-    }
-    return { ok: true, session_id: sessionId, session_name: check.value };
-  });
-
-  // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same
-  // filter/limit semantics, across ALL agents.
-  handlers.set("list_sessions", async (params) => {
-    return selectSessions(
-      sessionNodeManager.getAllSessions(),
-      params as Record<string, unknown> | undefined,
-    );
-  });
-
-  // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const nonceHex = params?.nonce as string | undefined;
