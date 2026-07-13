@@ -51,7 +51,6 @@ import { classifySession, type SessionCategory } from "./session-category.js";
 import { PassthroughGatewayClient, GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
-import { HttpTelegramBotClient, type TelegramBotClient } from "./telegram-bot-client.js";
 import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
 import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
@@ -87,6 +86,7 @@ import { verifyStartupManifest, createConsortiumRouting } from "./consortium-boo
 import { registerContactHandlers } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
 import { createSealCoordinator, type SealCompletion, type UnilateralResult } from "./seal-coordinator.js";
+import { createTelegramDoorbell } from "./telegram-doorbell.js";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -977,56 +977,19 @@ async function startDaemonHoldingLock(
     }
   }
 
-  // M8C-TGDOOR-1: Telegram Mode 1 doorbell — a daemon-owned bot pushes discrete, content-free
-  // events (session request / message-waiting / state change) to one allowlisted operator chat.
-  // "NO channel machinery" (DoD) — this talks to the Telegram Bot API directly, unrelated to the
-  // claude/channel MCP capability from Tiers 1-2. Inert until telegram_settings exist.
-  let telegramBotClient: TelegramBotClient | null = injectedTelegramBotClient ?? null;
-  let telegramChatId: string | null = null;
-  let telegramBotToken: string | null = null; // tracked only to detect an actual token CHANGE
-  // Generation counter, NOT a shared boolean — a boolean flip-to-false-then-true-again (e.g. a
-  // settings update that restarts the poller) would let the OLD loop's `while` condition still
-  // read true on its next check, running TWO concurrent loops. Each loop instance captures its
-  // OWN generation at start and exits the instant the counter no longer matches (a new start, or
-  // shutdown, both just bump it).
-  let telegramPollerGeneration = 0;
-  let telegramUpdateOffset = 0;
-  // Coalescing: ring once for the FIRST message-waiting event since a session was last fully
-  // read; cleared on read (cello_receive/since_seq advancing that session's watermark). Session
-  // requests and state changes bypass this Set entirely — DoD says they always ring.
-  const telegramRungUnread = new Set<string>();
-
-  async function sendTelegramDoorbell(
-    agentName: string,
-    sessionId: string,
-    kind: "session_request" | "message_waiting" | "state_change",
-    detail: string,
-  ): Promise<void> {
-    if (!telegramBotClient || !telegramChatId) return; // TGDOOR not configured — inert, not an error
-    if (kind === "message_waiting") {
-      const rungKey = `${agentName}:${sessionId}`;
-      if (telegramRungUnread.has(rungKey)) return; // already rung, still unread — coalesced
-      telegramRungUnread.add(rungKey);
-    }
-    // DOD-INV-CONTENTFREE: `detail` is a fixed, content-free label per kind — NEVER message text.
-    const text = `[${agentName} · ${sessionId.slice(0, 8)}] ${detail}`;
-    try {
-      const result = await telegramBotClient.sendMessage(telegramChatId, text);
-      if (!result.ok) {
-        logger.warn("telegram.doorbell.send.failed", { agentName, sessionId, kind, reason: result.error });
-        return;
-      }
-      logger.info("telegram.doorbell.sent", { agentName, sessionId, kind });
-    } catch (err: unknown) {
-      logger.warn("telegram.doorbell.send.failed", { agentName, sessionId, kind, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  // Read clears the ring (DoD: "ring-once-until-read") — called wherever a receive advances a
-  // session's read watermark, mirroring AWAY-1's own dedup-clear-on-attend pattern.
-  function clearTelegramRung(agentName: string, sessionId: string): void {
-    telegramRungUnread.delete(`${agentName}:${sessionId}`);
-  }
+  // M8C-TGDOOR-1: the Telegram doorbell (telegram-doorbell.ts). Content-free by construction — the
+  // module is never handed message text, so it cannot leak any (DOD-INV-CONTENTFREE), and it has no
+  // session-send seam, so nothing from Telegram can enter a CELLO content path (D6).
+  const {
+    sendTelegramDoorbell,
+    clearTelegramRung,
+    startTelegramPollerIfConfigured,
+    stopTelegramPoller,
+  } = createTelegramDoorbell({
+    logger,
+    getTelegramSettings: () => sessionNodeManager.getTelegramSettings(),
+    injectedClient: injectedTelegramBotClient,
+  });
 
   // Wraps notificationDispatcher.dispatchSessionStateChanged so every call site gets the
   // Telegram state-change doorbell for free (DoD: state changes ALWAYS ring, never coalesced) —
@@ -1094,74 +1057,7 @@ async function startDaemonHoldingLock(
     }
   }
 
-  async function handleInboundTelegramUpdate(
-    update: { message?: { chat: { id: number | string }; message_id: number } },
-    client: TelegramBotClient,
-  ): Promise<void> {
-    const chatId = update.message?.chat?.id !== undefined ? String(update.message.chat.id) : undefined;
-    if (!chatId) return;
-    if (chatId !== telegramChatId) {
-      // D6: any other chat is silently dropped — nothing enters CELLO content paths.
-      logger.info("telegram.inbound.rejected", { chatId });
-      return;
-    }
-    logger.info("telegram.inbound.acknowledged", { chatId });
-    try {
-      await client.sendMessage(
-        chatId,
-        "CELLO doesn't process messages here — this channel only sends you notifications. Use your CELLO client to reply.",
-      );
-    } catch (err: unknown) {
-      logger.warn("telegram.inbound.ack.failed", { chatId, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
 
-  // Single long-lived getUpdates poller (DoD) — one in-flight loop per daemon; started once
-  // settings exist, stopped on daemon shutdown. A network hiccup backs off and retries rather
-  // than killing the poller (best-effort — the doorbell is a convenience, never load-bearing).
-  // The client is a PARAMETER and must never be re-read from the shared, reassignable
-  // telegramBotClient: a settings update mid-await would otherwise let a stale response from the OLD
-  // client still be processed once (the generation check blocks the loop's NEXT iteration, not an
-  // in-flight call), and stomp telegramUpdateOffset with the OLD bot's update_id numbering, which is
-  // meaningless to a new token (Telegram scopes update_id per bot). Re-check the generation
-  // immediately after EVERY await, before acting on its result or touching shared state.
-  async function runTelegramPollerLoop(myGeneration: number, myClient: TelegramBotClient): Promise<void> {
-    let myOffset = telegramUpdateOffset;
-    while (telegramPollerGeneration === myGeneration) {
-      try {
-        const updates = await myClient.getUpdates(myOffset, 25);
-        if (telegramPollerGeneration !== myGeneration) break; // superseded while awaiting — drop stale results
-        for (const u of updates) {
-          myOffset = u.update_id + 1;
-          telegramUpdateOffset = myOffset;
-          if (u.message) void handleInboundTelegramUpdate(u, myClient);
-        }
-      } catch (err: unknown) {
-        if (telegramPollerGeneration !== myGeneration) break; // superseded — don't retry under a dead generation
-        logger.warn("telegram.poller.error", { error: err instanceof Error ? err.message : String(err) });
-        await new Promise((r) => setTimeout(r, 2000)); // back off before retrying
-      }
-    }
-  }
-
-  // Always bumps the generation (invalidating any prior loop, which exits on its next check) and
-  // starts a fresh one — correct both for the first start AND a settings-change restart.
-  function startTelegramPollerIfConfigured(): void {
-    const settings = sessionNodeManager.getTelegramSettings();
-    if (!settings) return; // not configured — TGDOOR stays inert
-    // Reviewer MEDIUM fix: reset the offset on an actual token/chat CHANGE — a prior bot's
-    // update_id numbering is meaningless to a new one (Telegram scopes it per bot token).
-    if (telegramBotToken !== settings.botToken || telegramChatId !== settings.allowlistedChatId) {
-      telegramUpdateOffset = 0;
-    }
-    telegramBotToken = settings.botToken;
-    telegramChatId = settings.allowlistedChatId;
-    const client = injectedTelegramBotClient ?? new HttpTelegramBotClient(settings.botToken);
-    telegramBotClient = client;
-    telegramPollerGeneration += 1;
-    void runTelegramPollerLoop(telegramPollerGeneration, client);
-    logger.info("telegram.poller.started", {});
-  }
 
   // SessionNodeManager was constructed + initialized at the top of startDaemon (PERSIST-002 — the
   // encrypted store must open before agents load from the `agents` table). Its standing receiver +
@@ -5552,7 +5448,7 @@ async function startDaemonHoldingLock(
   async function stop(reason: string): Promise<void> {
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
-    telegramPollerGeneration += 1;
+    stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
     // CELLO-M7-CONN-001: stop the HTTP manifest poll (sets the stopped flag so an in-flight
     // tick cannot re-arm, and cancels the scheduler). Belt-and-suspenders cancel for the
     // no-poll case (scheduler present but poll not started).
