@@ -292,8 +292,13 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       return { ok: true };
     }
     onlineAgents.delete(name);
-    // DOD-LOOP-1: tear down this agent's standing receiver (fire-and-forget, never throws out).
-    void sessionNodeManager.removeStandingReceiverForAgent(name).catch(() => { /* best-effort */ });
+    // DOD-LOOP-1: tear down this agent's standing receiver. AWAITED and LOGGED, matching
+    // cello_remove_agent — a teardown that did not happen must be VISIBLE. Fire-and-forget with a
+    // swallowed catch reported the agent offline while its receiver could still be live and bound
+    // to it: a stopped agent that can still be handed an inbound session, with nothing in the log.
+    await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
+      logger.warn("agent.stop.receiver_teardown_failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
+    });
     logger.info("agent.offline", { agentName: name, reason: "stopped" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "stopped");

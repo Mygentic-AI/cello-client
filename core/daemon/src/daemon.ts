@@ -1158,6 +1158,71 @@ async function startDaemonHoldingLock(
     });
   }
 
+  const NO_CURRENT_AGENT_RESPONSE = {
+    ok: false,
+    reason: "no_current_agent",
+    guidance: "No current agent is set for this connection. Call cello_start_agent to bring an agent online, then call cello_use_agent to set it as the current agent for this connection.",
+  };
+
+  // The inbound seal-interrupted REQUEST (inbound-seal-request.ts): the counterparty asks us to
+  // co-sign the seal of a session neither side can finish normally. We answer with our own signed
+  // leaf, or a rejection naming the exact mismatch — never a leaf we cannot corroborate.
+  const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
+    logger,
+    sessionNodeManager,
+    agents,
+    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
+    sendOver,
+  });
+
+  // ORDER IS LOAD-BEARING, in BOTH directions — and I got it wrong once already.
+  //
+  // The eager per-agent connect must run BEFORE `await flushAwaitingContent()`. That await does
+  // real relay network I/O for every parked item, sequentially. Put the connect loop after it and
+  // every agent's directory handshake is serialized behind the flush: on a daemon booting with
+  // parked content and a slow relay, `agent.online` is delayed by the whole drain and NOTHING in
+  // the log says the relay is the reason. Originally the two overlapped; they must keep doing so.
+  //
+  // But the loop's signaling wiring calls into the inbound-session module, which is a `const` now
+  // (it was a hoisted function declaration, which is what silently made the old ordering work). So
+  // the module is CONSTRUCTED here, immediately above the loop, rather than the loop being pushed
+  // down below the module. Construction is synchronous and its deps are all ready — the handlers
+  // it registers are fine this early because the handler map already exists.
+
+  // Seam 2: inbound session establishment — the counterparty side (inbound-sessions.ts).
+  const {
+    registerHandlers: registerInboundSessionHandlers,
+    wirePerAgentSessionInbound,
+    handleTrustSignalPickup,
+    enqueueInboundSession,
+    reapExpiredInboundSessions,
+    inboundSessionQueues,
+    inboundSessionWaiters,
+    expiredSessionRequests,
+    offeredMonikers,
+    offerKey,
+  } = createInboundSessions({
+    logger,
+    sessionNodeManager,
+    agents,
+    getConnState: (connectionId) => perConnectionState.get(connectionId),
+    resolveCurrentAgent,
+    NO_CURRENT_AGENT_RESPONSE,
+    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
+    sharedSignaling,
+    handleInboundSealInterruptedRequest,
+    reapDeadHalfOpenSessions,
+    sendAwayResponse,
+    dispatchSessionStateChangedWithTelegram,
+    sendTelegramDoorbell,
+  });
+
+  if (!sharedSignaling) {
+    for (const agent of loadedAgents) {
+      getAgentSignaling(agent.name, agent.keyProvider, agent.pubkey);
+    }
+  }
+
   await flushAwaitingContent();
 
   const nonceDedupStore = new NonceDedupStore(sessionNodeManager.getDb(), logger);
@@ -1545,11 +1610,6 @@ async function startDaemonHoldingLock(
   // auto-accepted by the standing receiver.
   const SESSION_TOOLS_REQUIRING_AGENT: string[] = [];
 
-  const NO_CURRENT_AGENT_RESPONSE = {
-    ok: false,
-    reason: "no_current_agent",
-    guidance: "No current agent is set for this connection. Call cello_start_agent to bring an agent online, then call cello_use_agent to set it as the current agent for this connection.",
-  };
 
   for (const tool of SESSION_TOOLS_REQUIRING_AGENT) {
     handlers.set(tool, async (_params, connectionId) => {
@@ -1707,6 +1767,7 @@ async function startDaemonHoldingLock(
   });
 
   contentPark.registerHandlers(handlers);
+  registerInboundSessionHandlers(handlers);
 
   // MCP-002: Test-only handler to emit session lifecycle events.
   // Guarded by CELLO_ENV=test — never available in production.
@@ -1773,61 +1834,13 @@ async function startDaemonHoldingLock(
   });
   } // end CELLO_ENV=test guard
 
-  // The inbound seal-interrupted REQUEST (inbound-seal-request.ts): the counterparty asks us to
-  // co-sign the seal of a session neither side can finish normally. We answer with our own signed
-  // leaf, or a rejection naming the exact mismatch — never a leaf we cannot corroborate.
-  const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
-    logger,
-    sessionNodeManager,
-    agents,
-    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
-    sendOver,
-  });
 
   // CELLO-M7-CONN-001 (DOD-CONN-2): the inbound seal_interrupted_request responder is now
   // wired PER-AGENT (wirePerAgentSessionInbound, below) onto each agent's own signaling
   // manager — not once on the keystone — so every agent (not just the primary) receives it
   // on its own authenticated stream.
 
-  // Seam 2: inbound session establishment — the counterparty side (inbound-sessions.ts).
-  const {
-    wirePerAgentSessionInbound,
-    handleTrustSignalPickup,
-    enqueueInboundSession,
-    reapExpiredInboundSessions,
-    inboundSessionQueues,
-    inboundSessionWaiters,
-    expiredSessionRequests,
-    offeredMonikers,
-    offerKey,
-  } = createInboundSessions({
-    handlers,
-    logger,
-    sessionNodeManager,
-    agents,
-    getConnState: (connectionId) => perConnectionState.get(connectionId),
-    resolveCurrentAgent,
-    NO_CURRENT_AGENT_RESPONSE,
-    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
-    sharedSignaling,
-    handleInboundSealInterruptedRequest,
-    reapDeadHalfOpenSessions,
-    sendAwayResponse,
-    dispatchSessionStateChangedWithTelegram,
-    sendTelegramDoorbell,
-  });
 
-  // MOVED (2026-07-13): this eager per-agent connect used to run HERE, ~2,600 lines before the
-  // inbound-session module that its signaling wiring calls into. That worked only because the
-  // wiring was a hoisted function declaration; the moment it became a const, every loaded agent
-  // crashed the daemon at boot with a temporal-dead-zone error. Its contract is "every loaded
-  // agent has a directory connection by the time the daemon is UP" — not "at this line" — so it
-  // now runs after the inbound module exists, still well before daemon.started.
-  if (!sharedSignaling) {
-    for (const agent of loadedAgents) {
-      getAgentSignaling(agent.name, agent.keyProvider, agent.pubkey);
-    }
-  }
 
 
   // cello_send + cello_receive — the content path (session-content-handlers.ts). Two halves of one

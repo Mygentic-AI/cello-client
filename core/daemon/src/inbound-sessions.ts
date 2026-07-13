@@ -56,7 +56,6 @@ export interface InboundSessionWaiter {
 
 
 export interface InboundSessionDeps {
-  handlers: Map<string, IpcHandler>;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
   agents: AgentInfo[];
@@ -75,7 +74,7 @@ export interface InboundSessionDeps {
 
 export function createInboundSessions(deps: InboundSessionDeps) {
   const {
-    handlers, logger, sessionNodeManager, agents, getConnState, resolveCurrentAgent,
+    logger, sessionNodeManager, agents, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, sharedSignaling,
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
@@ -116,6 +115,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   // because it may wait for the standing receiver to rebuild). Guards against two
   // simultaneous frames for the SAME session both passing the getSessionRecord check
   // before either has inserted the row (review M1, race half).
+  // DOD-LOOP-1: keyed by (agentName, sessionId), like every other structure here — NOT by session
+  // id alone. Two of the operator's agents can hold both ends of the same session on one daemon, and
+  // a bare session key would let one agent's in-flight accept suppress the other's.
   const inboundInFlight = new Set<string>();
   // Inbound accepts are SERIALIZED through this chain. acceptSession synchronously
   // consumes the single standing receiver and rebuilds a replacement asynchronously;
@@ -421,7 +423,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       // cello_send, or an explicit cello_contact_add. An unattended stranger is never auto-whitelisted.
       // See docs/planning/.../2026-07-07_1700_four-level-screening-policy.md (D21).
     } finally {
-      inboundInFlight.delete(parsed.sessionIdHex);
+      inboundInFlight.delete(offerKey(agentName, parsed.sessionIdHex));
     }
   }
 
@@ -493,7 +495,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
 
     // M1: idempotency — a retransmitted assignment for an already-known session (persisted
     // row OR currently in flight) must not double-accept (orphaned node) or double-enqueue.
-    if (inboundInFlight.has(parsed.sessionIdHex) || sessionNodeManager.getSessionRecord(localAgent.name, parsed.sessionIdHex)) {
+    if (inboundInFlight.has(offerKey(localAgent.name, parsed.sessionIdHex)) || sessionNodeManager.getSessionRecord(localAgent.name, parsed.sessionIdHex)) {
       logger.info("session.inbound.duplicate.ignored", {
         sessionId: parsed.sessionIdHex,
         agentName: localAgent.name,
@@ -519,14 +521,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       correlationId,
     });
 
-    inboundInFlight.add(parsed.sessionIdHex);
+    inboundInFlight.add(offerKey(localAgent.name, parsed.sessionIdHex));
     // Serialize: the next accept does not begin until this one (and any standing-receiver
     // rebuild it triggers) settles. A throw inside one accept must not break the chain.
     const agentName = localAgent.name;
     inboundAcceptChain = inboundAcceptChain
       .then(() => acceptInboundAssignment(parsed, agentName, correlationId))
       .catch((err: unknown) => {
-        inboundInFlight.delete(parsed.sessionIdHex);
+        inboundInFlight.delete(offerKey(localAgent.name, parsed.sessionIdHex));
         logger.error("session.inbound.accept.error", {
           sessionId: parsed.sessionIdHex,
           agentName,
@@ -641,60 +643,73 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   // stream), and on the shared manager for the test path via wireSharedHandlers. No keystone, no
   // runtime election — a fresh-install agent gets them when it comes online (create/start).
 
-  // cello_await_session — the counterparty's blocking pull for the next inbound session.
-  // Returns immediately if one is already queued for the current agent (FIFO), otherwise
-  // blocks until one arrives or timeout_ms elapses.
-  handlers.set("cello_await_session", async (params, connectionId) => {
-    const connState = getConnState(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
-    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
-    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
-    const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
+  /**
+   * Phase 2: register the IPC handler, once the handler map exists.
+   *
+   * Split from construction because this module is constructed EARLY — the per-agent signaling
+   * wiring calls into it at boot, before the handler map is built. Fusing the two would force
+   * construction after the map, which pushes the eager per-agent connect below
+   * `await flushAwaitingContent()` and serializes every agent's directory handshake behind a
+   * relay drain. Same pattern as content-park.ts.
+   */
+  function registerHandlers(handlers: Map<string, IpcHandler>): void {
+    // cello_await_session — the counterparty's blocking pull for the next inbound session.
+    // Returns immediately if one is already queued for the current agent (FIFO), otherwise
+    // blocks until one arrives or timeout_ms elapses.
+    handlers.set("cello_await_session", async (params, connectionId) => {
+      const connState = getConnState(connectionId);
+      // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
+      // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+      // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+      const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+      if (!agentName) {
+        return NO_CURRENT_AGENT_RESPONSE;
+      }
+      const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
 
-    const toResponse = (e: InboundSessionEvent) => ({
-      type: "new_session",
-      session_id: e.sessionIdHex,
-      counterparty_pubkey: e.counterpartyPubkeyHex,
-      genesis_prev_root: e.genesisPrevRootHex,
-      // MONIKER-2: validated-at-boundary display hint; null = absent or rejected.
-      offered_moniker: e.offeredMoniker ?? null,
+      const toResponse = (e: InboundSessionEvent) => ({
+        type: "new_session",
+        session_id: e.sessionIdHex,
+        counterparty_pubkey: e.counterpartyPubkeyHex,
+        genesis_prev_root: e.genesisPrevRootHex,
+        // MONIKER-2: validated-at-boundary display hint; null = absent or rejected.
+        offered_moniker: e.offeredMoniker ?? null,
+      });
+
+      reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
+      const queued = inboundSessionQueues.get(agentName);
+      if (queued && queued.length > 0) {
+        return toResponse(queued.shift()!);
+      }
+
+      const event = await new Promise<InboundSessionEvent | null>((resolve) => {
+        const waiters = inboundSessionWaiters.get(agentName) ?? [];
+        const waiter: InboundSessionWaiter = {
+          connectionId,
+          deliver: (e) => {
+            clearTimeout(timer);
+            resolve(e);
+          },
+        };
+        waiters.push(waiter);
+        inboundSessionWaiters.set(agentName, waiters);
+        const timer = setTimeout(() => {
+          const list = inboundSessionWaiters.get(agentName);
+          if (list) {
+            const idx = list.indexOf(waiter);
+            if (idx !== -1) list.splice(idx, 1);
+          }
+          resolve(null);
+        }, timeoutMs);
+      });
+
+      if (event === null) return { type: "timeout" };
+      return toResponse(event);
     });
+  }
 
-    reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
-    const queued = inboundSessionQueues.get(agentName);
-    if (queued && queued.length > 0) {
-      return toResponse(queued.shift()!);
-    }
-
-    const event = await new Promise<InboundSessionEvent | null>((resolve) => {
-      const waiters = inboundSessionWaiters.get(agentName) ?? [];
-      const waiter: InboundSessionWaiter = {
-        connectionId,
-        deliver: (e) => {
-          clearTimeout(timer);
-          resolve(e);
-        },
-      };
-      waiters.push(waiter);
-      inboundSessionWaiters.set(agentName, waiters);
-      const timer = setTimeout(() => {
-        const list = inboundSessionWaiters.get(agentName);
-        if (list) {
-          const idx = list.indexOf(waiter);
-          if (idx !== -1) list.splice(idx, 1);
-        }
-        resolve(null);
-      }, timeoutMs);
-    });
-
-    if (event === null) return { type: "timeout" };
-    return toResponse(event);
-  });
   return {
+    registerHandlers,
     wirePerAgentSessionInbound,
     handleTrustSignalPickup,
     enqueueInboundSession,
