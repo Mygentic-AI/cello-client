@@ -87,13 +87,8 @@ import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHa
 import type { LegibilityForHash } from "./seal-legibility-tbs.js";
 import { reDeriveFrontiers, findInflatedFrontier, checkUnilateralFrontier, type SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
-import { startHttpManifestPoll } from "./http-manifest-poll.js";
-import {
-  resolveDirectoryUrl,
-  manifestNodesToEndpoints,
-  createRosterAwareEndpointResolver,
-  type ConsortiumEndpoint,
-} from "./directory-bootstrap.js";
+import { manifestNodesToEndpoints } from "./directory-bootstrap.js";
+import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
 
 /**
  * M7-SESSION-001 (H-1): canonical byte encoding of a SEAL-INTERRUPTED leaf for
@@ -392,107 +387,23 @@ async function startDaemonHoldingLock(
   const manifestVersionStore: IManifestVersionStore =
     injectedManifestVersionStore ?? new DbManifestVersionStore(sessionNodeManager.getDb(), logger);
 
-  // M7-MANIFEST-002: Load and verify consortium manifest BEFORE any directory connection.
-  //
-  // Pseudocode for manifest loading:
-  //   1. If manifestProvider is configured:
-  //      a. Call manifestProvider.loadAndVerify(rootKeys, threshold).
-  //      b. Check validity window: not_before <= now < expires.
-  //      c. Check version monotonicity (if manifestVersionStore is provided).
-  //      d. On success: log directory.auth.manifest.verified.
-  //      e. On failure: log error event, set directory_signaling to 'reconnecting'.
-  //   2. If manifestProvider is absent: skip (backward compat for DAEMON-001 tests).
-  let manifestVerified = false;
-  // M7 Keystone: the version of the verified manifest, surfaced in ConnectResult.
-  // Stays 0 when no manifestProvider is configured (the M6 backward-compat path).
-  let verifiedManifestVersion = 0;
-  // DOD-MANIFEST-1: the consortium node set resolved to live directory endpoints from
-  // the VERIFIED manifest — the N-node roster a T-of-N ceremony (DOD-DKG-1) fans out to.
-  // Empty in the M6 backward-compat path (no manifest) or if no node resolves.
-  let consortiumEndpoints: ConsortiumEndpoint[] = [];
+  // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
+  // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
+  // because only we hold the DB handle and the singleton lock a refusal has to release.
+  const { manifestVerified, verifiedManifestVersion } = await verifyStartupManifest({
+    manifestProvider,
+    manifestRootKeys,
+    manifestThreshold,
+    manifestVersionStore,
+    logger,
+  });
 
-  if (manifestProvider && manifestRootKeys && manifestThreshold !== undefined) {
-    try {
-      const manifest = await manifestProvider.loadAndVerify(manifestRootKeys, manifestThreshold);
-
-      // Check validity window: not_before <= now < expires
-      const now = new Date();
-      const notBefore = new Date(manifest.not_before);
-      const expiresAt = new Date(manifest.expires);
-
-      if (now < notBefore) {
-        logger.error("directory.auth.manifest.not.yet.valid", {
-          manifestVersion: manifest.version,
-          notBefore: manifest.not_before,
-        });
-      } else if (expiresAt <= now) {
-        logger.error("directory.auth.manifest.expired", {
-          manifestVersion: manifest.version,
-          expiresAt: manifest.expires,
-        });
-      } else {
-        // Anti-rollback monotonicity (manifestVersionStore is always present now — DB-backed default).
-        const lastSeen = await manifestVersionStore.getLastSeenVersion();
-        if (lastSeen !== null && manifest.version < lastSeen) {
-          logger.error("directory.auth.manifest.version.rollback", {
-            manifestVersion: manifest.version,
-            lastSeenVersion: lastSeen,
-          });
-        } else {
-          await manifestVersionStore.persistVersion(manifest.version);
-          manifestVerified = true;
-          verifiedManifestVersion = manifest.version;
-          logger.info("directory.auth.manifest.verified", {
-            manifestVersion: manifest.version,
-            signerCount: manifest.signatures.length,
-          });
-
-          // DOD-MANIFEST-1: resolve the FULL verified node set to live directory
-          // endpoints (replaces the implicit single-endpoint assumption). This is the
-          // roster T-of-N ceremonies fan out to. Availability-aware — a node that is
-          // down is skipped, the rest still resolve (redundancy invariant: a ceremony
-          // needs only T of N). The resolved count is logged so an operator sees the
-          // real reachable consortium at startup; the ceremony layer (DOD-DKG-1)
-          // re-checks the threshold against this roster and never silently falls back
-          // to the single hardcoded endpoint for a missing/forged node.
-          consortiumEndpoints = await manifestNodesToEndpoints(manifest.nodes, { logger });
-          const declaredNodes = manifest.nodes.length;
-          const resolvedNodes = consortiumEndpoints.length;
-          // Carry the nodeId↔peerId pairing (not just peerIds) so a consumer/test can verify
-          // each manifest identity bound to the right live directory, not merely the set.
-          const consortiumLog = {
-            manifestVersion: manifest.version,
-            declaredNodes,
-            resolvedNodes,
-            nodes: consortiumEndpoints.map((e) => ({ nodeId: e.nodeId, peerId: e.peerId })),
-          };
-          // Degraded ≠ healthy: a verified manifest whose nodes don't all resolve must NOT
-          // log at the same severity as a full roster. Threshold-REFUSAL (refusing to run a
-          // ceremony below T) is DOD-DKG-1's gate; here we make the health signal loud so a
-          // shrunken/empty roster is visible and never buried at info.
-          if (resolvedNodes === 0) {
-            logger.error("directory.consortium.none", consortiumLog);
-          } else if (resolvedNodes < declaredNodes) {
-            logger.warn("directory.consortium.partial", consortiumLog);
-          } else {
-            logger.info("directory.consortium.resolved", consortiumLog);
-          }
-        }
-      }
-    } catch (err: unknown) {
-      logger.error("directory.auth.manifest.load.failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  // ADV-002: When manifestProvider is configured (opt-in mode) and verification
-  // failed, the daemon must refuse to proceed. Operators who configure
-  // manifestProvider have opted into manifest enforcement.
+  // ADV-002: an operator who configures manifestProvider has opted INTO manifest enforcement, so a
+  // failed verification is fatal — never a warning we start anyway on.
   if (manifestProvider && !manifestVerified) {
-    // code-review MED: this refuse now runs AFTER the DB is open + the lock is held (the DB had to
-    // open for the anti-rollback check). Release both before rethrowing so an in-process caller does
-    // not leak the DB handle / lock (in production the process exits, but be tidy).
+    // This refuse runs AFTER the DB is open and the lock is held (the DB had to open for the
+    // anti-rollback check), so release both before rethrowing — an in-process caller must not be
+    // left holding the DB handle. (In production the process exits, but be tidy.)
     try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
     await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
     // The singleton lock is released by startDaemon's catch — every throw out of this function goes
@@ -503,54 +414,18 @@ async function startDaemonHoldingLock(
     );
   }
 
-  // DOD-SIGN-1: resolve the consortium roster for a session/seal FROST ceremony (same source as
-  // registration's DOD-DKG-1 path — the verified manifest, re-resolved at ceremony time). NULL when
-  // no consortium manifest is configured → single-node ceremony (M6/M7 back-compat). Shared by all
-  // wireSessionCeremonyHandler / wireSealCeremonyHandler call sites below.
-  const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {
-    const m = manifestProvider?.getCurrentManifest();
-    return m ? await manifestNodesToEndpoints(m.nodes, { logger }) : null;
-  };
-
-  // FINDING-4: roster-aware directory failover (bootstrap SPOF fix). The injected
-  // directoryEndpointResolver only ever probes the single configured node (CELLO_DIRECTORY_URL),
-  // so a down primary stranded the client at startup even though it held the other nodes'
-  // addresses. Wrap it with the consortium roster so the signaling dialer — and the ceremony
-  // endpoint that shares this same instance — route AROUND a down primary (primary-first,
-  // sticky-until-fail, randomized fallback), honoring the sovereign-node REDUNDANCY invariant.
-  // ONE instance → shared sticky state so signaling + ceremonies stay on the SAME directory node
-  // and fail over together. Undefined on the in-process test path (no directoryEndpointResolver),
-  // where the shared manager uses an injected signalingConnect instead.
-  const failoverEndpointResolver = directoryEndpointResolver
-    ? createRosterAwareEndpointResolver({
-        primaryResolver: directoryEndpointResolver,
-        getConsortiumRoster: resolveConsortiumRoster,
-        logger,
-      })
-    : undefined;
-  // Null-safe accessor for the ceremony/handler getDirectoryEndpoint sites (mirrors the old
-  // `directoryEndpointResolver ? ... : null` wrapper, now routed through the failover resolver).
-  const getFailoverEndpoint = async (): Promise<DirectoryEndpoint | null> =>
-    failoverEndpointResolver ? await failoverEndpointResolver() : null;
-
-  // CELLO-M7-CONN-001 (DOD-CONN-3): start the daemon-level HTTP manifest poll. It fetches
-  // ${directoryHttpUrl}/manifest, verifies the threshold signature against the locally-pinned
-  // root keys, applies anti-rollback + expiry, and adopts a newer manifest — independent of any
-  // agent identity, running even with ZERO agents (the deleted keystone could not). Gated on the
-  // same manifest deps as the old signaling poll; off on the M6 backward-compat path (no scheduler).
-  let stopHttpManifestPoll: (() => void) | undefined;
-  if (manifestPollScheduler && manifestProvider && manifestRootKeys && manifestRootKeys.length > 0 && manifestThreshold && manifestThreshold >= 1) {
-    stopHttpManifestPoll = startHttpManifestPoll({
-      scheduler: manifestPollScheduler,
-      directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+  // The manifest poll starts only AFTER the refuse above — a refused startup must not leak a timer.
+  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, stopHttpManifestPoll } =
+    createConsortiumRouting({
       manifestProvider,
+      manifestRootKeys,
+      manifestThreshold,
       manifestVersionStore,
-      rootKeys: manifestRootKeys,
-      threshold: manifestThreshold,
+      manifestPollScheduler,
+      directoryHttpUrl,
+      directoryEndpointResolver,
       logger,
-      mintCorrelationId: () => randomUUID(),
     });
-  }
 
   // Load agent identities from the encrypted `agents` table (PERSIST-002 AC-007 — one path).
   // (The encrypted store + lock were established above, before manifest verification.)
