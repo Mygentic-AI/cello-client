@@ -35,7 +35,7 @@ import {
 } from "../frost/types.js";
 // createInProcessStubs is test-only infrastructure — imported directly from stubs,
 // not through the frost/index.ts production barrel.
-import { createInProcessStubs } from "../frost/stubs.js";
+import { createInProcessStubs } from "./frost-stubs.js";
 
 setupV3Tests();
 

@@ -76,3 +76,16 @@ export {
   type DualSurfaceVerb,
   type ClientSurface,
 } from "./vocabulary.js";
+
+// The FROST/DKG directory-node client. This lives in the daemon because the daemon is the only
+// process that runs a ceremony — it reimplements natively what the retired @cello-protocol/client
+// used to own (daemon.ts: "the daemon never imports @cello-protocol/client"). Exported so
+// trustless-cello's directory tests can drive a real DKG against a real directory without
+// resurrecting the dead client package they used to import this from.
+export {
+  NetworkDirectoryNode,
+  bootstrapNetworkKeyShares,
+  runNetworkDkg,
+  runNetworkRefresh,
+} from "./network-directory-node.js";
+export type { FrostAuthSigner } from "./network-directory-node.js";

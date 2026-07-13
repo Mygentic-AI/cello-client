@@ -52,7 +52,7 @@ jobs:
       # Tarball check 1: no server files leaked across all five publishable packages.
       - name: Tarball check — no server files leaked
         run: |
-          for pkg in core/protocol-types core/crypto core/transport core/client core/daemon core/cli core/adapter-claude-code core/gateway; do
+          for pkg in core/protocol-types core/crypto core/transport core/daemon core/cli core/adapter-claude-code core/gateway; do
             echo "--- Checking $pkg ---"
             OUTPUT=$(cd "$pkg" && npm pack --dry-run 2>&1)
             echo "$OUTPUT"
@@ -285,7 +285,6 @@ jobs:
           pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
-          pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/gateway --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
@@ -310,7 +309,7 @@ jobs:
             return 1
           }
           FAILED=0
-          for pkg in protocol-types crypto transport client daemon cli gateway; do
+          for pkg in protocol-types crypto transport daemon cli gateway; do
             check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
           check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
@@ -493,7 +492,6 @@ jobs:
           pnpm publish --filter @cello-protocol/crypto --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/protocol-types --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/transport --access public --no-git-checks --tag "$TAG" || true
-          pnpm publish --filter @cello-protocol/client --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/gateway --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/daemon --access public --no-git-checks --tag "$TAG" || true
           pnpm publish --filter @cello-protocol/cli --access public --no-git-checks --tag "$TAG" || true
@@ -518,7 +516,7 @@ jobs:
             return 1
           }
           FAILED=0
-          for pkg in protocol-types crypto transport client daemon cli gateway; do
+          for pkg in protocol-types crypto transport daemon cli gateway; do
             check "$pkg" "$(node -p "require('./core/$pkg/package.json').version")" || FAILED=1
           done
           check "connect" "$(node -p "require('./core/adapter-claude-code/package.json').version")" || FAILED=1
@@ -576,7 +574,6 @@ jobs:
           # Load the module graphs — triggers every static import (the exact thing that threw
           # on the stale-crypto skew). A skew or empty dist fails here.
           node --input-type=module -e "await import('@cello-protocol/daemon'); console.log('OK: @cello-protocol/daemon module graph loads')"
-          node --input-type=module -e "await import('@cello-protocol/client'); console.log('OK: @cello-protocol/client module graph loads')"
 
           # Lifecycle regression guard (2026-06-24): the daemon must SURVIVE the cli exiting.
           # The old spawn piped daemon stdout to the cli; when the cli exited the pipe broke

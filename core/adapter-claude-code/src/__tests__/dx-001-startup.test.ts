@@ -23,7 +23,6 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fetchBootstrapMultiaddr } from "../config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -302,46 +301,14 @@ describe("AC-001: Startup progress line format", () => {
   });
 });
 
-// ─── AC-001: fetchBootstrapMultiaddr integration ──────────────────────────────
-
-describe("AC-001: Bootstrap fetch produces correct progress messages", () => {
-  it("successful bootstrap fetch produces 'ok (shortPeerId...)' suffix", async () => {
-    const fullPeerId = "12D3KooWTestPeerIdForStartupProgressTest0000";
-    const multiaddr = `/dns4/localhost/tcp/9090/ws/p2p/${fullPeerId}`;
-    const mockFetch = async () => new Response(
-      JSON.stringify({ multiaddr }),
-      { status: 200, headers: { "Content-Type": "application/json" } }
-    );
-
-    const result = await fetchBootstrapMultiaddr("http://localhost:9090", mockFetch as typeof fetch);
-    expect(result).toBe(multiaddr);
-
-    // Simulate how cello-mcp.ts builds the ok suffix:
-    const parts = multiaddr.split("/");
-    const p2pIndex = parts.findIndex((p) => p === "p2p");
-    const peerId = p2pIndex !== -1 ? parts[p2pIndex + 1] : null;
-    const shortPeerId = peerId ? peerId.slice(0, 20) + "..." : "(unknown)";
-    const line = `cello: fetching directory address... ok (${shortPeerId})\n`;
-
-    expect(line).toContain("ok");
-    expect(line).toContain("...");
-    expect(line.split("\n").length).toBe(2); // one line + trailing empty
-  });
-
-  it("failed bootstrap fetch produces 'failed: ...' suffix", async () => {
-    const mockFetch = async (): Promise<Response> => {
-      throw new Error("ECONNREFUSED");
-    };
-
-    const result = await fetchBootstrapMultiaddr("http://unreachable.example.com", mockFetch as typeof fetch);
-    expect(result).toBeNull();
-
-    // Simulate how cello-mcp.ts builds the failed suffix when result is null:
-    const failLine = "cello: fetching directory address... failed: bootstrap endpoint unreachable\n";
-    expect(failLine).toContain("failed:");
-    expect(failLine.split("\n").length).toBe(2); // one line + trailing empty
-  });
-});
+// ─── AC-001: Bootstrap fetch — REMOVED (dead-code purge, 2026-07-13) ──────────
+//
+// This block drove `fetchBootstrapMultiaddr` from `../config.js`. That module was the ADAPTER's
+// copy of directory-URL/bootstrap resolution — and the shim never called it: `bin/cello-mcp.ts`
+// resolves no directory URL at all, because it is a stdio→IPC proxy and the DAEMON owns bootstrap.
+// The daemon has its own `resolveDirectoryUrl`/`fetchBootstrapMultiaddr` in `directory-bootstrap.ts`,
+// covered by 33 cases in `core/daemon/src/__tests__/directory-bootstrap.test.ts`. The adapter copy was
+// a duplicate of live logic, reachable only through a package index nothing imported. Both are gone.
 
 // ─── AC-009: Lazy startup — tools available before background init ─────────────
 
