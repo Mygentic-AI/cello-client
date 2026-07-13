@@ -48,10 +48,15 @@ describe("DOD-AGENT-PARAM-1 AC-B2: `agent` on the session tools", () => {
     expect(block).toContain("defaults to the current agent");
   });
 
-  it.each(SESSION_TOOLS)("%s FORWARDS the agent it was given to the daemon", (tool, method) => {
+  it.each(SESSION_TOOLS)("%s FORWARDS the agent under the KEY the daemon reads", (tool, method) => {
     const block = blockFor(tool);
     const call = block.slice(block.indexOf(`proxy.call("${method}"`));
-    expect(call, `${tool} declares \`agent\` but never sends it`).toMatch(/\bagent\b/);
+    // The key, in shorthand position — NOT merely the token `agent` somewhere in the payload. A bare
+    // /\bagent\b/ matches the VALUE, so `{ agentName: agent }` would sail through it: the shim would
+    // declare the param, the operator's agent would be told it works, the daemon would read
+    // params?.agent → undefined, and the call would silently act as the sole online agent instead.
+    // That is the exact defect this file exists to catch, so the assertion has to see the key.
+    expect(call, `${tool} declares \`agent\` but never sends it under that key`).toMatch(/[{,]\s*agent\s*[,}]/);
   });
 
   it("no tool sends the dead `name` spelling as a selector", () => {

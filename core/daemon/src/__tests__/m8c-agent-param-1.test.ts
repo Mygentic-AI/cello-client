@@ -132,15 +132,28 @@ describe("DOD-AGENT-PARAM-1: the agent selector is `agent`, on all ten handlers"
     expect(res.guidance).toContain("ghost");
   });
 
-  it("the refusal tells the caller to pass the word that WORKS — guidance cannot outlive the rename", async () => {
+  it("the refusal names a gesture the caller can actually make — never a dead parameter", async () => {
     const client = await startWithTwoAgents();
     // These two own their own guidance string (the other eight share NO_CURRENT_AGENT_RESPONSE,
-    // which names cello_use_agent and no param at all). Both told the caller to "pass { name }".
-    for (const method of ["cello_refresh_shares", "cello_get_relay_receipts"]) {
+    // which names cello_use_agent and no param at all). Both told the caller to "pass { name }" —
+    // a word that no longer works.
+    //
+    // The replacement is NOT "{ agent }". Neither handler is an MCP tool: the CLI is their only
+    // caller, and its gesture is the positional `cello refresh <name>`, not a JSON param. Telling a
+    // shell operator to pass an object is pointing them at a surface they do not have. So the
+    // assertion is on the SHAPE of the advice, not on the new spelling.
+    for (const [method, gesture] of [
+      ["cello_refresh_shares", "cello refresh <name>"],
+      ["cello_get_relay_receipts", "cello relay-receipts <name>"],
+    ]) {
       const res = await client.send(method, {}) as { reason?: string; guidance?: string };
       expect(res.reason).toBe("no_current_agent");
-      expect(res.guidance, `${method} still advertises the dead spelling`).toContain("{ agent }");
+      expect(res.guidance, `${method} must name the gesture its caller has`).toContain(gesture);
       expect(res.guidance, `${method} still advertises the dead spelling`).not.toContain("{ name }");
+      expect(res.guidance, `${method} still advertises a param this surface cannot pass`).not.toContain("{ agent }");
+      // The OTHER remedy survives: DOD-ONBOARD-HELP-1's renderForSurface rewrites this to
+      // `cello use-agent` for a CLI caller, so dropping it would silently cost that rendering.
+      expect(res.guidance).toContain("cello_use_agent");
     }
   });
 });

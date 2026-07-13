@@ -303,16 +303,31 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
   return jsonText(result);
 });
 
-server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list.", {
+server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list. Name the session while you close it: you have just had the conversation, so this is the moment you know what it was.", {
   session_id: z.string().describe("Session ID to close"),
   force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
+  session_name: z.string().nullable().optional().describe("A short human-readable label for this conversation, e.g. 'Q3 budget review with Bob'. PRIVATE TO YOU: never sent to the counterparty, the relay, or the directory. Optional — leave it out if you cannot describe the session accurately; an unnamed session is a signal it did not close cleanly, so do not invent one."),
   agent: z.string().optional().describe("Agent whose session to close (defaults to the current agent)"),
-}, async ({ session_id, force, agent }) => {
+}, async ({ session_id, force, session_name, agent }) => {
   const result = await proxy.call("cello_close_session", {
     session_id,
     ...(force ? { force } : {}),
+    // `session_name` is forwarded whenever the key is PRESENT, including an explicit null — the
+    // truthiness shortcut used for `force`/`agent` would silently drop it.
+    ...(session_name !== undefined ? { session_name } : {}),
     ...(agent ? { agent } : {}),
   });
+  return jsonText(result);
+});
+
+server.tool("cello_name_session", "Name (or rename) one of your sessions so you can tell it apart from the others. Works on ANY session — active, interrupted, or long sealed — because naming an old conversation for the record is the point. Pass null to clear the name. PRIVATE TO YOU: the name is never sent to the counterparty, the relay, or the directory, and it cannot change anything the protocol does.", {
+  session_id: z.string().describe("Session ID to name"),
+  session_name: z.string().nullable().describe("The label, e.g. 'The deploy postmortem' — or null to clear it"),
+  agent: z.string().optional().describe("Agent whose session to name (defaults to the current agent)"),
+}, async ({ session_id, session_name, agent }) => {
+  const result = await proxy.call("cello_name_session", agent
+    ? { session_id, session_name, agent }
+    : { session_id, session_name });
   return jsonText(result);
 });
 
@@ -347,7 +362,7 @@ server.tool("cello_restore", "Restore agent state from backup", {}, async () => 
   return jsonText(result);
 });
 
-server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session", {
+server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session. NOTE: the response echoes `session_name` — that is YOUR private label for the session, not part of the receipt. If you share this receipt with the counterparty or a third party (comparing sealed_root is the normal reason to), strip it: they have never seen it and it may describe the conversation in terms you did not say to them.", {
   session_id: z.string().describe("Session ID"),
   agent: z.string().optional().describe("Agent whose receipt to read (defaults to the current agent)"),
 }, async ({ session_id, agent }) => {

@@ -281,6 +281,7 @@ export const IPC_METHODS = {
   receive: "cello_receive",
   "close-session": "cello_close_session",
   "await-session": "cello_await_session",
+  "name-session": "cello_name_session",
   contacts: "cello_contact_list",
   "contact-add": "cello_contact_add",
   "contact-remove": "cello_contact_remove",
@@ -468,10 +469,30 @@ export function receive(
 export function closeSession(
   celloDir: string,
   sessionId: string,
-  opts: ParityOptions & { force?: boolean },
+  opts: ParityOptions & { force?: boolean; sessionName?: string },
 ): Promise<CliOutput> {
-  const params = opts.force ? { session_id: sessionId, force: true } : { session_id: sessionId };
+  const params: Record<string, unknown> = { session_id: sessionId };
+  if (opts.force) params.force = true;
+  // DOD-SESSION-NAME-1 (AC-A14): only sent when the operator asked for it. Omitted means "no name",
+  // which is a meaningful state — never fill it in for them.
+  if (opts.sessionName !== undefined) params.session_name = opts.sessionName;
   return ipcCommand(celloDir, IPC_METHODS["close-session"], params, opts);
+}
+
+/**
+ * `cello name-session <session-id> <name...>` (or --clear) → cello_name_session.
+ *
+ * DOD-SESSION-NAME-1 (AC-A15). The name is taken from the remaining positionals and joined, so
+ * multi-word names work without quoting: `cello name-session ab12… the deploy postmortem`.
+ * `--clear` sends null, which is how you un-name a session.
+ */
+export function nameSession(
+  celloDir: string,
+  sessionId: string,
+  sessionName: string | null,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["name-session"], { session_id: sessionId, session_name: sessionName }, opts);
 }
 
 /** `cello await-session [--timeout-ms N]` → cello_await_session. Blocks for an inbound doorbell. */

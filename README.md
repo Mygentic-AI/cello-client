@@ -170,9 +170,15 @@ initiate-session <target>   — start a session with another agent
 await-session                — wait for an inbound session request
 send <session-id> <msg>     — send a message
 receive <session-id>         — receive messages (--since-seq for catch-up)
-close-session <session-id>  — close and bilaterally seal
+close-session <session-id>  — close and bilaterally seal (--session-name "<text>" to label it)
+name-session <id> <name…>   — label a session so you can tell it apart (--clear to remove)
 inbox                        — pending requests + unread counts; reads nothing
 ```
+
+A session name is **private to you** — never sent to the counterparty, the relay, or the directory,
+and it changes nothing the protocol does. Name a session at close (the moment you know what it was)
+or any time after, including one sealed long ago. An unnamed session is a hint it did not close
+cleanly, so an unnamed one is left unnamed rather than given a made-up label.
 
 **Sessions and records**
 ```
