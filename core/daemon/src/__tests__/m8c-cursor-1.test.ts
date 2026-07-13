@@ -409,4 +409,76 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     const sendB = (await client.send("cello_send", { session_id: SID_B, content: "reply B" })) as Record<string, unknown>;
     expect(sendB).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
   });
+
+  // §1.5 — the read-before-write gate FAILS CLOSED when it cannot count.
+  //
+  // getUnreadReceivedCount answers one question for the send gate: "is there counterparty content
+  // this agent has not read?" A 0 means "caught up" and UNBLOCKS a send. So every path that cannot
+  // actually answer must return a POSITIVE count, never 0 — a 0 guessed from a broken DB silently
+  // defeats the gate, which is the one thing the gate exists to prevent.
+  //
+  // This pins the reachable half of that contract. The other half (the query returning no row) is
+  // unreachable — SELECT COUNT(*) with no GROUP BY always yields exactly one row — so it cannot be
+  // driven from a test without inventing a DB seam that exists only for the test. It is still fixed,
+  // because a fail-OPEN default sitting inside a gate documented as FAILS CLOSED is a defect whether
+  // or not today's SQL happens to spare us. Both branches now answer the same way.
+  it("§1.5: a gate that cannot count refuses the send — it never guesses 'caught up'", async () => {
+    await makeAgentDir("alice");
+    const h = await start(noopLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const inbound = new TextEncoder().encode("unread counterparty content");
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
+    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+
+    // Tear the DB out from under the gate. It can no longer count anything.
+    await snm.gracefulShutdown();
+
+    // It must STILL refuse — "I don't know" is not "you're caught up".
+    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+  });
+
+  // §1.9 — content ingested with NO relay witness must SAY SO.
+  //
+  // The relay is an independent attestation: it delivers B a (content_hash -> canonical sequence)
+  // binding derived from the sender's own signed leaf. When B holds that witness, B can check the
+  // content it received against a hash the sender committed to a THIRD PARTY. When B holds no
+  // witness, the only hash B can compare against is the one riding in the same frame as the content
+  // — i.e. B is checking the sender's claim against the sender's claim.
+  //
+  // We do NOT refuse unwitnessed content: the relay may legitimately be unreachable or merely slow,
+  // and making the relay a hard precondition for READING mail would trade the redundancy invariant
+  // away — a relay outage would render the inbox unreadable. That is the wrong trade.
+  //
+  // What we refuse is the SILENCE. An unwitnessed append is a materially weaker guarantee than a
+  // witnessed one, and today the two are indistinguishable from the outside. It must be visible.
+  it("§1.9: an append with no relay witness is announced, not silently treated as verified", async () => {
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const spyLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(event: string, ctx?: Record<string, unknown>) { events.push({ event, ctx: ctx ?? {} }); },
+    };
+
+    await makeAgentDir("alice");
+    const h = await start(spyLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    // No recordWitnessedSequence() for this hash — the relay never witnessed it.
+    const unwitnessed = new TextEncoder().encode("no relay witness for this one");
+    await snm.ingestReceivedContent("alice", SID, unwitnessed, msgLeafHash(unwitnessed), "corr-unwitnessed");
+
+    const warned = events.filter((e) => e.event === "session.content.unwitnessed");
+    expect(warned, "an unwitnessed append must emit session.content.unwitnessed").toHaveLength(1);
+    expect(warned[0].ctx).toMatchObject({ sessionId: SID, leafIndex: 0 });
+
+    // ...and a WITNESSED append must NOT cry wolf, or the signal is worthless.
+    const witnessed = new TextEncoder().encode("this one is witnessed");
+    const hashHex = Buffer.from(msgLeafHash(witnessed)).toString("hex");
+    snm.recordWitnessedSequence("alice", SID, hashHex, 1);
+    await snm.ingestReceivedContent("alice", SID, witnessed, msgLeafHash(witnessed), "corr-witnessed");
+
+    expect(events.filter((e) => e.event === "session.content.unwitnessed")).toHaveLength(1);
+  });
 });

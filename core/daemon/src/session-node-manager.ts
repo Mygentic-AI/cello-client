@@ -924,7 +924,11 @@ export class SessionNodeManager {
            AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}`,
       )
       .get(this.#requireAgentId(agentName), sessionId) as { unread_count: number } | undefined;
-    return row ? row.unread_count : 0;
+    // Absent row → "I cannot count", which is NOT "you are caught up". Answer the same way the
+    // #db guard above does. Unreachable today (SELECT COUNT(*) with no GROUP BY always yields a
+    // row), but a fail-OPEN default inside a fail-CLOSED gate is a defect that only needs the query
+    // to change once. The two branches must never disagree about what "unknown" means.
+    return row ? row.unread_count : 1;
   }
 
   /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
@@ -3175,7 +3179,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean; witnessed?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -3464,11 +3468,35 @@ export class SessionNodeManager {
     const leafIndex = terminalBlock
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
       : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
+
+    // NO relay witness for this hash. We appended it anyway — refusing would make the relay a hard
+    // precondition for reading mail, so a relay outage would render the inbox unreadable, and the
+    // direct path and park backstop exist precisely to survive that. But this append is a WEAKER
+    // guarantee and must not masquerade as the stronger one: with a witness, the received content is
+    // checked against a hash the sender committed to a third party; without one, the only available
+    // hash rode in the same frame as the content, so the check is the sender's claim against the
+    // sender's own claim. Say so. A sender who simply never submits to the relay is otherwise
+    // indistinguishable from one the relay merely has not witnessed YET.
+    if (canonicalSeq === undefined) {
+      this.#logger.warn("session.content.unwitnessed", {
+        sessionId,
+        leafIndex,
+        contentHash: contentHashHex,
+        correlationId,
+      });
+    }
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
     const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
-    return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
+    return {
+      ok: true,
+      leafIndex,
+      sequenceNumber: leafIndex,
+      appendedCount: 1 + released,
+      witnessed: canonicalSeq !== undefined,
+      ...(terminalBlock ? { screenedOut: true } : {}),
+    };
   }
 
   /**
