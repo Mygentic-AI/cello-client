@@ -234,16 +234,6 @@ export interface DaemonHandle {
    */
   getSessionNodeManager(): SessionNodeManager;
   /**
-   * M7 Action 2: the live directory-facing libp2p node (or null when signaling is not
-   * connected). Registration's FROST DKG and future ceremonies open streams to the
-   * directory on this node. Consumers must gate use on signaling being connected AND
-   * always null-check the result: there is a brief window during stream death where the
-   * reference is already cleared (null) while signalingManager.status still reads
-   * "connected". Null is the safe direction (never a tearing-down node); do not assume
-   * non-null just because status is connected.
-   */
-  getDirectoryNode(): CelloNode | null;
-  /**
    * CELLO-M7-TRANSPORT-001 (AC-010): exposes the composition-root transport
    * selector so integration tests can confirm the adapter is wired (not dead
    * code) and exercise the selection path without "adapter not wired".
@@ -661,11 +651,17 @@ async function startDaemonHoldingLock(
   // exists ONLY for the in-process test / backward-compat path (a single injected signalingConnect,
   // no per-agent isolation) — in production it is undefined.
   //
-  // M7 Action 2: the daemon holds a reference to a live directory-facing node so registration's
-  // FROST DKG can open streams on the SAME node. In production each per-agent manager publishes its
-  // OWN node (getAgentSignaling); this shared ref is the test-path node only.
-  let directoryNode: CelloNode | null = null;
-  const getDirectoryNode = (): CelloNode | null => directoryNode;
+  // The SHARED (in-process test / pre-resolver) signaling path has no directory-facing node of its
+  // own: nodes are per-agent, published by each agent's manager (getAgentSignaling → `nodeRef`).
+  // There is nothing to return here, and saying so explicitly is the point.
+  //
+  // Consequence, and it is load-bearing: session-ceremony's hydrateShareAndStubs leaves
+  // `directoryNodeStubs` UNDEFINED when getNode() is null, so FrostThresholdSigner runs with an
+  // EMPTY set of counterparties and its pre-check (reachable < threshold-1) REFUSES. That is the
+  // sovereign-node invariant holding — a daemon with no directory nodes must never sign alone. Do
+  // NOT "fix" an empty stub set by substituting in-process stubs; that converts a refusal into a
+  // forged seal. Pinned by frost.test.ts, "SOVEREIGN-NODE INVARIANT".
+  const noSharedDirectoryNode = (): CelloNode | null => null;
 
   // H1: a long-running daemon must ride out directory outages — notably the 25-30 min multi-region
   // directory deploy. Use an effectively-unbounded reconnect budget with a capped backoff so each
@@ -712,7 +708,7 @@ async function startDaemonHoldingLock(
     // a single injected signalingConnect). In production sharedSignaling is undefined and every
     // agent builds its own dedicated manager below.
     if (sharedSignaling) {
-      return { signaling: sharedSignaling, getNode: getDirectoryNode };
+      return { signaling: sharedSignaling, getNode: noSharedDirectoryNode };
     }
     const existing = perAgentSignaling.get(agentName);
     if (existing) return existing;
@@ -843,7 +839,7 @@ async function startDaemonHoldingLock(
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       keyProvider: agent.keyProvider,
-      getNode: getDirectoryNode,
+      getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
@@ -854,7 +850,7 @@ async function startDaemonHoldingLock(
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
       keyProvider: agent.keyProvider,
-      getNode: getDirectoryNode,
+      getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
@@ -6536,5 +6532,5 @@ async function startDaemonHoldingLock(
   // prior run, without waiting for any agent to come online or any client to attach.
   startTelegramPollerIfConfigured();
 
-  return { stop, getStatus, getSessionNodeManager, getDirectoryNode, getTransportSelector, getAutoNatService };
+  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService };
 }
