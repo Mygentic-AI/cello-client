@@ -118,6 +118,8 @@ It is **private to you**: never sent to the counterparty, never to the relay or 
 
 **Do not invent a name you are not sure of.** An unnamed session is a useful signal that it did not close cleanly, so leaving it out is a real answer — a made-up label destroys that signal. If a name is refused (control characters, over 200 characters), the close does NOT happen: fix the name and call again, and the seal is untouched.
 
+**If you share a sealed receipt, strip the name.** `cello_sealed_receipt` echoes `session_name` for your convenience, but comparing `sealed_root` with the counterparty is the normal reason to hand a receipt over — and they have never seen your label. It is the one place your private name can walk across the boundary.
+
 ## Tools
 
 **Agents**

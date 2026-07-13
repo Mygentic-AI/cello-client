@@ -422,4 +422,81 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     // The invariant with teeth: exactly ONE relay SEAL ctrl leaf was submitted.
     expect(relay.ctrlSubmits().length).toBe(1);
   }, 40_000);
+
+  // ─── DOD-SESSION-NAME-1 — the two clauses only a REAL seal can prove ─────────────────────────
+  //
+  // These live here, on this harness, deliberately. The unit's own test file closes every session
+  // with `force: true`, and that covers exactly one of AC-A7's three terminal paths. Move the name
+  // write inside the `if (force)` block and every test in that file still passes, the whole gate
+  // stays green, and the name silently stops being persisted on a HEALTHY close — the majority
+  // case. A clause named for three paths, tested on one, is not covered.
+  //
+  // The same harness answers the constraint that actually matters. A grep proving the string
+  // `session_name` is absent from the wire packages cannot see a leak built in `daemon.ts`, which
+  // is where the frames are CONSTRUCTED — and it is blind to a leak under a different key. So the
+  // name here is a NONCE, and the assertion is behavioural: after a real seal ceremony, that string
+  // appears in no signaling frame and in no byte the relay received.
+
+  /** A string that cannot occur by accident, so finding it anywhere on the wire is proof of a leak. */
+  const NONCE_NAME = "Zorblat-9271 acquisition notes";
+
+  /** Every frame the daemon put on a wire: the signaling channel, and the relay. */
+  function wireBytes(
+    sig: { outbound: Record<string, unknown>[] },
+    relay: ReturnType<typeof makeFakeRelayServer>,
+  ): string {
+    const frames = [...sig.outbound, ...relay.submits];
+    // Byte-level, not key-level: JSON.stringify of a frame carrying the name under ANY key — or
+    // buried inside an encoded structure — still contains the substring.
+    const asJson = JSON.stringify(frames, (_k, v) =>
+      v instanceof Uint8Array ? Buffer.from(v).toString("utf8") : v);
+    return asJson;
+  }
+
+  it("AC-A7 (bilateral): a name given to a NON-force close survives the real seal — and reaches no wire", async () => {
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "5000";
+    const { h, client, sig, relay } = await setupSessionWithDeadCounterparty();
+
+    // Drive the counterparty's SEAL leaf in so the close seals BILATERALLY (not force, not unilateral).
+    const counterpartyKp = generateKeypair();
+    const counterpartyPub = await counterpartyKp.getPublicKey();
+    const s1 = encodeStructure1(new Uint8Array(32).fill(0xcd), counterpartyPub, SID_BYTES, 0, TS);
+    relay.push({
+      type: "leaf_deliver", sequence_number: 1, leaf_kind: 2, session_id: SID_BYTES,
+      structure1_cbor: s1, structure2_cbor: new Uint8Array([1, 2, 3, 4]),
+    });
+    await waitFor(() => (relay.ctrlSubmits().length >= 1 ? true : undefined), 10_000);
+
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME }) as Promise<Record<string, unknown>>;
+    await wait(100);
+    const bilateralRoot = "ab".repeat(32);
+    sig.inject!({ type: "session_sealed", session_id: SID_BYTES, sealed_root: new Uint8Array(Buffer.from(bilateralRoot, "hex")) });
+    const res = await closeP;
+
+    expect(res.ok, "the close must actually seal — a name must not change that").toBe(true);
+    expect(res.sealed_root).toBe(bilateralRoot);
+
+    const record = h.getSessionNodeManager().getSessionRecord("alice", SID_HEX);
+    expect(record?.status).toBe("sealed");
+    expect(record?.session_name, "the name must survive a BILATERAL close, not just a forced one").toBe(NONCE_NAME);
+
+    expect(wireBytes(sig, relay), "the session name reached the wire").not.toContain("Zorblat");
+  }, 40_000);
+
+  it("AC-A7 (unilateral): the name persists on the escalation path too, and rides no seal_unilateral frame", async () => {
+    const { h, client, sig, relay } = await setupSessionWithDeadCounterparty();
+
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME }) as Promise<Record<string, unknown>>;
+    const uni = await waitFor(() => sig.outbound.find((f) => f["type"] === "seal_unilateral"), 10_000);
+    expect(uni, "close must escalate to a seal_unilateral frame").not.toBeNull();
+
+    // Persisted on the way in, before the ceremony resolves — which is the point: the name must not
+    // depend on the seal succeeding, and the seal must not depend on the name.
+    expect(h.getSessionNodeManager().getSessionRecord("alice", SID_HEX)?.session_name).toBe(NONCE_NAME);
+
+    sig.inject!({ type: "seal_unilateral_too_early", session_id: SID_BYTES, remaining_seconds: 42 });
+    await closeP;
+
+    expect(wireBytes(sig, relay), "the session name reached the wire").not.toContain("Zorblat");
+  }, 40_000);
 });

@@ -448,6 +448,16 @@ export const COMMANDS: readonly CommandSpec[] = [
       const clear = positional.includes("--clear");
       const rest = positional.filter((a) => a !== "--clear");
       const [sessionId, ...words] = rest;
+      // An empty name is NOT a clear. `cello name-session <id>` — a half-typed command, or one whose
+      // "$NAME" was an unset shell variable — would otherwise join to "", which the daemon trims to
+      // null and stores as a CLEAR: the operator wipes the label off a session while trying to read
+      // the usage. Clearing is what --clear is for, and it has to be asked for.
+      if (!clear && words.length === 0) {
+        return legacy({
+          exitCode: 1,
+          output: "Usage: cello name-session <session-id> <name...>  — or --clear to remove the name.",
+        });
+      }
       // The name is every remaining positional, joined — so quoting is optional, which is the whole
       // point of taking it positionally rather than as a flag.
       const name = clear ? null : words.join(" ");

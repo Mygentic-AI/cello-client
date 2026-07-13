@@ -3352,7 +3352,9 @@ async function startDaemonHoldingLock(
     const nameCheck = validateSessionName(params?.session_name);
     if (!nameCheck.ok) {
       logger.warn("session.name.rejected", {
-        agentName, sessionId, reason: nameCheck.reason, source: "close",
+        // agentId, not agentName — session.name.set/.cleared key on agentId (AC-A16), and an
+        // operator correlating rejections against sets on two different keys gets nothing.
+        agentId: sessionNodeManager.resolveAgentId(agentName), sessionId, reason: nameCheck.reason, source: "close",
         nameLength: typeof params?.session_name === "string" ? (params.session_name as string).length : null,
       });
       return { ok: false, reason: nameCheck.reason, guidance: nameCheck.guidance };
@@ -3381,30 +3383,56 @@ async function startDaemonHoldingLock(
       };
     }
 
-    // AC-010: already sealed
-    if (record.status === "sealed") {
-      return {
-        ok: false,
-        reason: "session_already_sealed",
-        guidance: "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
-      };
-    }
-
     // DOD-SESSION-NAME-1 (AC-A7): the name is written HERE — once, on the way in — rather than at
-    // each of the three terminal exits (bilateral seal, unilateral seal, force-abandon). Threading
-    // it through all three is how one of them silently ends up without it, and a name dropped on the
-    // very path where it is most useful (a force-abandoned ghost is the session you most want to
-    // identify later) is a defect nothing would fail on.
+    // each of the terminal exits (bilateral seal, unilateral seal, force-abandon). Threading it
+    // through all of them is how one silently ends up without it, and a name dropped on the very
+    // path where it is most useful (a force-abandoned ghost is the session you most want to identify
+    // later) is a defect nothing would fail on.
     //
-    // Writing it before the close COMPLETES is safe precisely because a name is not close-scoped: a
-    // rename is legal in any status (AC-A9). So if the seal below fails and the session stays open,
-    // the operator simply has a named open session — which they could have produced with
-    // cello_name_session anyway. Nothing about the name gates, delays, or alters the ceremony.
+    // It sits ABOVE the status gates deliberately. A name is not close-scoped: renaming is legal in
+    // ANY status (AC-A9), sealed included. Below the already-sealed gate, a RETRIED close carrying a
+    // name — the seal completed but the agent's call was interrupted, so it calls again — would be
+    // answered "already sealed, no further action is needed" and the name would be silently dropped,
+    // on exactly the path where the agent believes it just named the session.
+    //
+    // Writing it before the close COMPLETES is safe for the same reason: if the seal below fails, the
+    // operator has a named open session — a state they could produce with cello_name_session anyway.
+    // Nothing about the name gates, delays, or alters the ceremony.
     if (nameCheck.value !== null) {
       sessionNodeManager.setSessionName(agentName, sessionId, nameCheck.value);
       logger.info("session.name.set", {
         agentId: record.agent_id, sessionId, nameLength: nameCheck.value.length, source: "close",
       });
+    }
+
+    // AC-010: already sealed
+    if (record.status === "sealed") {
+      return {
+        ok: false,
+        reason: "session_already_sealed",
+        // A name given here WAS applied (above) — say so, rather than let "no further action is
+        // needed" imply the name went nowhere.
+        ...(nameCheck.value !== null ? { session_name: nameCheck.value } : {}),
+        guidance: nameCheck.value !== null
+          ? "This session is already sealed, so it was not closed again — but the name you gave WAS applied. Check cello_sessions to view its sealed record and the FROST notarization."
+          : "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
+      };
+    }
+
+    // An ABANDONED session is TERMINAL, and a close without --force must say so rather than try to
+    // seal it. The already-abandoned early-return below lives INSIDE the force branch, so a plain
+    // `cello close-session <abandoned-id>` fell through to the seal flow and fired a bilateral seal
+    // ceremony at a counterparty that, by definition, was never there — the exact unsealable hang
+    // that force exists to escape, re-entered from the other side. Found by the unit reviewer on this
+    // diff; pre-existing, fixed here rather than left for someone to hit in the dark.
+    // Scoped to the NON-force path: `force` on an already-abandoned session stays idempotent
+    // (ok:true / already_abandoned, below) — that contract is tested and must not change.
+    if (record.status === "abandoned" && params?.force !== true) {
+      return {
+        ok: false,
+        reason: "session_abandoned",
+        guidance: "This session was force-abandoned — it is terminal and has no counterparty to seal with, so it cannot be closed. It is already off the open list; check cello_sessions.",
+      };
     }
 
     // CC-5/F21 terminal-escape: force-abandon a session that can never be bilaterally sealed — a
@@ -3824,6 +3852,12 @@ async function startDaemonHoldingLock(
       filter === "all" ? classified : classified.filter((c) => c.category === filter);
     const sessions: SessionListEntry[] = matched.slice(0, limit).map(({ row, messageCount, category }) => ({
       sessionId: row.session_id,
+      // DOD-SESSION-NAME-1 (AC-A13): SECOND, immediately after the id — not last. Every list surface
+      // renders as JSON, and JSON.stringify preserves insertion order, so key position IS layout: at
+      // the end of the entry the name prints ~11 lines below the id it belongs to, and scanning a
+      // 50-session dump for "which one was the deploy" is the exact problem this column exists to
+      // solve. Alongside the id, never instead of it — the id is what you paste into the next command.
+      sessionName: row.session_name ?? null,
       agentName: row.agent_name,
       counterpartyPubkey: row.counterparty_pubkey,
       // MONIKER-5 AC1: the same resolution the doorbell uses — pet name ?? offered ?? fingerprint.
@@ -3836,10 +3870,6 @@ async function startDaemonHoldingLock(
       // interrupted_at is the canonical ISO interruption stamp; null for any
       // session that was never interrupted (active/sealed).
       interruptedAt: row.interrupted_at ?? null,
-      // DOD-SESSION-NAME-1: alongside sessionId, never instead of it — the id is what the caller
-      // pastes into the next command. `?? null` because the column is absent on rows written before
-      // the migration, and "unnamed" must read as null, not undefined.
-      sessionName: row.session_name ?? null,
     }));
     return { ok: true, filter, limit, totalMatched: matched.length, sessions };
   }
@@ -3887,7 +3917,7 @@ async function startDaemonHoldingLock(
     const check = validateSessionName(params.session_name);
     if (!check.ok) {
       logger.warn("session.name.rejected", {
-        agentName, sessionId, reason: check.reason, source: "rename",
+        agentId: sessionNodeManager.resolveAgentId(agentName), sessionId, reason: check.reason, source: "rename",
         nameLength: typeof params.session_name === "string" ? params.session_name.length : null,
       });
       return { ok: false, reason: check.reason, guidance: check.guidance };

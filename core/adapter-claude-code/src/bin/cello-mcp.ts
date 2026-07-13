@@ -362,7 +362,7 @@ server.tool("cello_restore", "Restore agent state from backup", {}, async () => 
   return jsonText(result);
 });
 
-server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session", {
+server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session. NOTE: the response echoes `session_name` — that is YOUR private label for the session, not part of the receipt. If you share this receipt with the counterparty or a third party (comparing sealed_root is the normal reason to), strip it: they have never seen it and it may describe the conversation in terms you did not say to them.", {
   session_id: z.string().describe("Session ID"),
   agent: z.string().optional().describe("Agent whose receipt to read (defaults to the current agent)"),
 }, async ({ session_id, agent }) => {

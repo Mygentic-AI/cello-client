@@ -210,6 +210,56 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     expect((await listOne(client)).sessionName).toBeNull();
   });
 
+  it("AC-A5: a name on a RETRIED close of an already-sealed session is APPLIED, not silently dropped", async () => {
+    const client = await setup();
+    const snm = handle!.getSessionNodeManager();
+
+    // The realistic path this guards: the seal COMPLETED but the agent's call was interrupted (a
+    // relay blip, a tool timeout), so the agent closes again with the name it had just decided on.
+    // Being told "already sealed, no further action is needed" while the name silently goes nowhere
+    // loses it at exactly the moment the agent believes it was saved.
+    await snm.destroySessionNode("alice", SID, "sealed");
+    snm.recordSealCertificate("alice", SID, "fa".repeat(32), JSON.stringify({ ok: true }));
+
+    const res = await client.send("cello_close_session", {
+      session_id: SID, session_name: "the one that got interrupted",
+    }) as { ok: boolean; reason?: string; session_name?: string; guidance?: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("session_already_sealed");
+    // The name landed anyway, and the response SAYS SO rather than letting "no further action is
+    // needed" imply otherwise.
+    expect(res.session_name).toBe("the one that got interrupted");
+    expect(res.guidance).toContain("WAS applied");
+    expect((await listOne(client)).sessionName).toBe("the one that got interrupted");
+  });
+
+  it("a plain close of an ABANDONED session refuses — it does not fire a seal at a counterparty that was never there", async () => {
+    const client = await setup();
+    await client.send("cello_close_session", { session_id: SID, force: true });
+
+    const res = await client.send("cello_close_session", { session_id: SID }) as { ok: boolean; reason?: string };
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("session_abandoned");
+
+    // force stays idempotent — that contract predates this and must not move.
+    const forced = await client.send("cello_close_session", { session_id: SID, force: true }) as { ok: boolean; reason?: string };
+    expect(forced.ok).toBe(true);
+    expect(forced.reason).toBe("already_abandoned");
+  });
+
+  it("AC-A13: the name renders NEXT TO the id — key order is the layout in a JSON list", async () => {
+    const client = await setup();
+    await client.send("cello_name_session", { session_id: SID, session_name: "next to the id" });
+    const res = await client.send("cello_list_sessions", { filter: "all" }) as { sessions: SessionListEntry[] };
+    const entry = res.sessions.find((s) => s.sessionId === SID)!;
+    const keys = Object.keys(entry);
+    // Scanning a 50-session dump for "which one was the deploy" is the problem the name exists to
+    // solve; eleven fields below the id it does not solve it.
+    expect(keys[0]).toBe("sessionId");
+    expect(keys[1]).toBe("sessionName");
+  });
+
   it("AC-A6: an INVALID name is refused BEFORE the close — the session is untouched, not half-closed", async () => {
     const client = await setup();
     const res = await client.send("cello_close_session", {
