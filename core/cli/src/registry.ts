@@ -638,7 +638,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       "    remove                    remove them (they go back to being a stranger)\n" +
       "    set-tier <0..4>           how much they're trusted: 0=blocked, 1=stranger, 2=known,\n" +
       "                              3=trusted (reaches you even when you're away), 4=vip.\n" +
-      "                              A higher tier RAISES their limits; it never removes screening.\n" +
+      "                              A higher tier RAISES their limits; it never removes the caps.\n" +
+      "                              It does NOT change content screening — that is not yet active.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
       "    set-moniker <name>        YOUR pet name for THEM (empty clears it). Always wins over the\n" +
       "                              name they offer — the one thing they cannot spoof.\n" +

@@ -138,7 +138,7 @@ cello_transcript({ session_id })    — the full conversation, sent and received
 cello_sealed_receipt({ session_id })— the notarized bilateral seal
 ```
 
-**Contacts** — the per-agent address book. Tiers raise a peer's limits; they never remove screening.
+**Contacts** — the per-agent address book. Tiers raise a peer's limits. Content screening is **planned, not yet active** — the daemon currently passes messages through unscreened, so a tier is a limits setting, not a safety boundary.
 ```
 cello_contacts({ agent? })
 cello_contact_add({ pubkey, moniker?, agent? })

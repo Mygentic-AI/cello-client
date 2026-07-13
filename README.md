@@ -181,8 +181,9 @@ transcript <id>       — the full conversation, sent and received
 sealed-receipt <id>   — the notarized bilateral seal
 ```
 
-**Contacts** — the per-agent address book. Tiers raise a peer's limits; they
-never remove screening.
+**Contacts** — the per-agent address book. Tiers raise a peer's limits. Content
+screening is **planned, not yet active** — the daemon currently passes messages
+through unscreened, so a tier is a limits setting, not a safety boundary.
 ```
 contacts                                 — list your address book
 contact <pubkey> add / remove
