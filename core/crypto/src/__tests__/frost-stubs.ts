@@ -25,7 +25,7 @@ import type {
   DirectoryNodeStub,
   StubSignParams,
   StubCommitment,
-} from "./types.js";
+} from "../frost/types.js";
 
 // ─── InProcessDirectoryNodeStub ───────────────────────────────────────────────
 

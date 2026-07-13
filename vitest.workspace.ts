@@ -5,7 +5,6 @@ export default defineWorkspace([
   "core/crypto",
   "core/transport",
   "core/test-fixtures",
-  "core/client",
   "core/adapter-claude-code",
   // daemon + cli were missing since REPOSPLIT-002 — the root `pnpm run test` (and therefore
   // CI's Test step) silently skipped both suites. Their tests are self-contained

@@ -187,7 +187,7 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     const scanned = walk(SRC);
     // Guard against a vacuous pass: an empty scan would make the assertion below trivially true.
     expect(scanned.length, "the recursive scan found no source files — this audit would be vacuous")
-      .toBeGreaterThan(3);
+      .toBeGreaterThan(2);
 
     // WHAT THIS AUDITS: agent-facing surface. A renamed-away name is a defect when an AGENT can see
     // it — a tool registration, a tool description, a guidance string ("Use `cello_list_sessions`

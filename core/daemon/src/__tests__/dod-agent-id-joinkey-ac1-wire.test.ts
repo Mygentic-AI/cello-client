@@ -61,7 +61,6 @@ const WIRE_SOURCE_DIRS = [
 
 /** Frame parsers that live outside the two wire packages but decode directory frames. */
 const WIRE_SOURCE_FILES = [
-  join(REPO_ROOT, "core", "client", "src", "session-assignment-parser.ts"),
   join(REPO_ROOT, "core", "daemon", "src", "session-assignment-parser.ts"),
 ];
 

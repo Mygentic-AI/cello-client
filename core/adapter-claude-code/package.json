@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/connect",
-  "version": "0.0.69",
+  "version": "0.0.70",
   "private": false,
   "type": "module",
   "engines": {
@@ -9,16 +9,8 @@
   "publishConfig": {
     "access": "public"
   },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "bin": {
     "cello-mcp": "./dist/bin/cello-mcp.js"
-  },
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    }
   },
   "files": [
     "dist/",
@@ -30,7 +22,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/client": "workspace:*",
     "@cello-protocol/crypto": "workspace:*",
     "@cello-protocol/interfaces": "0.0.3",
     "@cello-protocol/transport": "workspace:*",
