@@ -32,6 +32,10 @@ describe("§1 — the help is grouped and logically ordered", () => {
       "initiate-session",
       "await-session",
       "close-session",
+      // DOD-SESSION-NAME-1: naming sits with the lifecycle verbs and directly after close, because
+      // close is when you name a session — you have just had the conversation, so that is the moment
+      // you know what it was.
+      "name-session",
       "send",
       "receive",
       "inbox",

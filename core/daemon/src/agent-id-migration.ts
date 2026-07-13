@@ -78,6 +78,7 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         seal_legibility TEXT,
         sealed_root_hex TEXT,
         counterparty_primary_pubkey TEXT,
+        session_name TEXT,
         PRIMARY KEY (agent_id, session_id)
       )`,
     indexSql: () => [],

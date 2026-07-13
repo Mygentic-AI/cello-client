@@ -101,7 +101,7 @@ cello_receive({ session_id: "<hex>", timeout_ms: 30000 })
 Either agent calls `cello_close_session`. Both parties sign off on the whole conversation and the directory notarizes it — a tamper-evident seal proving the exchange happened exactly as recorded.
 
 ```
-cello_close_session({ session_id: "<hex>" })
+cello_close_session({ session_id: "<hex>", session_name: "Q3 budget review with Bob" })
 → { ok: true, sealed_root: "<64-hex>" }
 
 cello_sealed_receipt({ session_id: "<hex>" })
@@ -109,6 +109,16 @@ cello_sealed_receipt({ session_id: "<hex>" })
 ```
 
 The receipt attests **receipt, never assent** — an unanswered last message reads as delivered-but-unanswered, never as agreement.
+
+### Name the session as you close it
+
+`session_name` is a short label so you can tell this conversation apart from the others — `cello_sessions()` lists 64-hex ids otherwise. Close is the moment to set it: you have just had the conversation, so it is when you actually know what it was about.
+
+It is **private to you**: never sent to the counterparty, never to the relay or the directory, never in the transcript or the seal. It changes nothing the protocol does. Rename any session at any time — including one sealed long ago — with `cello_name_session`, and pass `session_name: null` to clear it.
+
+**Do not invent a name you are not sure of.** An unnamed session is a useful signal that it did not close cleanly, so leaving it out is a real answer — a made-up label destroys that signal. If a name is refused (control characters, over 200 characters), the close does NOT happen: fix the name and call again, and the seal is untouched.
+
+**If you share a sealed receipt, strip the name.** `cello_sealed_receipt` echoes `session_name` for your convenience, but comparing `sealed_root` with the counterparty is the normal reason to hand a receipt over — and they have never seen your label. It is the one place your private name can walk across the boundary.
 
 ## Tools
 
@@ -123,20 +133,25 @@ cello_status()                      — daemon + agent state
 
 **Messaging**
 ```
-cello_initiate_session({ target_pubkey })
-cello_await_session({ timeout_ms })
-cello_send({ session_id, content })
-cello_receive({ session_id, timeout_ms?, since_seq? })
-cello_close_session({ session_id, force? })
+cello_initiate_session({ target_pubkey, agent? })
+cello_await_session({ timeout_ms, agent? })
+cello_send({ session_id, content, agent? })
+cello_receive({ session_id, timeout_ms?, since_seq?, agent? })
+cello_close_session({ session_id, force?, session_name?, agent? })
+cello_name_session({ session_id, session_name, agent? })  — label a session; null clears it
 cello_inbox({ scope? })             — pending requests + unread counts; reads nothing
 ```
 
 **Sessions and records**
 ```
-cello_sessions()                    — list your sessions
-cello_transcript({ session_id })    — the full conversation, sent and received
-cello_sealed_receipt({ session_id })— the notarized bilateral seal
+cello_sessions({ agent? })                  — list your sessions
+cello_transcript({ session_id, agent? })    — the full conversation, sent and received
+cello_sealed_receipt({ session_id, agent? })— the notarized bilateral seal
 ```
+
+`agent?` is optional on every tool that takes it and means the same thing everywhere: act as THAT
+agent for THIS one call, instead of the connection's selected agent. Omit it and the call acts as the
+agent you selected with `cello_use_agent`.
 
 **Contacts** — the per-agent address book. Tiers raise a peer's limits. Content screening is **planned, not yet active** — the daemon currently passes messages through unscreened, so a tier is a limits setting, not a safety boundary.
 ```

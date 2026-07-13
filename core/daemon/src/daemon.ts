@@ -70,6 +70,7 @@ import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 // at the send point here (the receive point lives in the transport content decode).
 import { MAX_CONTENT_BYTES, computeGenesisPrevRoot, buildAgentRevocationTbs, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { sealParkEnvelope } from "./park-envelope.js";
+import { validateSessionName } from "./session-name.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import {
@@ -1815,6 +1816,9 @@ async function startDaemonHoldingLock(
         counterpartyPubkey: row.counterparty_pubkey,
         messageCount: row.message_count ?? 0,
         interruptedAt: row.interrupted_at ?? new Date(row.updated_at).toISOString(),
+        // DOD-SESSION-NAME-1 (AC-A11): an interrupted session is one you may want to resume or seal
+        // — the name is how you tell which one it was.
+        sessionName: row.session_name ?? null,
       }));
   }
 
@@ -1866,6 +1870,7 @@ async function startDaemonHoldingLock(
       agentName: row.agent_name,
       counterpartyPubkey: row.counterparty_pubkey,
       liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
+      sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
     }));
   }
 
@@ -3056,7 +3061,11 @@ async function startDaemonHoldingLock(
     const connState = perConnectionState.get(connectionId);
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
+      // Not an MCP tool — the CLI is the only real caller, and its gesture is the POSITIONAL
+      // `cello refresh <name>`, not a JSON param. The old text said "pass { name }", which stopped
+      // working at the rename and never worked on this surface anyway. cello_use_agent stays: it is
+      // the other real remedy, and renderForSurface rewrites it to `cello use-agent` for a CLI caller.
+      return { ok: false, reason: "no_current_agent", guidance: "Name the agent: cello refresh <name>. Or select one for this connection with cello_use_agent." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {
@@ -3090,7 +3099,8 @@ async function startDaemonHoldingLock(
     const connState = perConnectionState.get(connectionId);
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
+      // Not an MCP tool either — same reasoning as cello_refresh_shares above.
+      return { ok: false, reason: "no_current_agent", guidance: "Name the agent: cello relay-receipts <name>. Or select one for this connection with cello_use_agent." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {
@@ -3334,6 +3344,22 @@ async function startDaemonHoldingLock(
       };
     }
 
+    // DOD-SESSION-NAME-1 (AC-A6): THE NAME MUST NEVER BREAK THE CLOSE. A close is a seal ceremony
+    // and the seal is the valuable thing — a notarized receipt both parties keep. So a bad name is
+    // refused HERE, before any of it starts: not half-closed-then-failed, and not silently dropped
+    // and sealed anyway. Validate, then close. The name is a sticky note; it does not get a vote on
+    // whether the notarization happens.
+    const nameCheck = validateSessionName(params?.session_name);
+    if (!nameCheck.ok) {
+      logger.warn("session.name.rejected", {
+        // agentId, not agentName — session.name.set/.cleared key on agentId (AC-A16), and an
+        // operator correlating rejections against sets on two different keys gets nothing.
+        agentId: sessionNodeManager.resolveAgentId(agentName), sessionId, reason: nameCheck.reason, source: "close",
+        nameLength: typeof params?.session_name === "string" ? (params.session_name as string).length : null,
+      });
+      return { ok: false, reason: nameCheck.reason, guidance: nameCheck.guidance };
+    }
+
     // DOD-LOOP-1: scope the lookup to the current agent — the composite (agent, session_id) key IS
     // the ownership scope. A session_id owned only by a DIFFERENT agent does not exist in this
     // agent's namespace (returns null → session_not_found), which is correct for loopback (two
@@ -3357,12 +3383,55 @@ async function startDaemonHoldingLock(
       };
     }
 
+    // DOD-SESSION-NAME-1 (AC-A7): the name is written HERE — once, on the way in — rather than at
+    // each of the terminal exits (bilateral seal, unilateral seal, force-abandon). Threading it
+    // through all of them is how one silently ends up without it, and a name dropped on the very
+    // path where it is most useful (a force-abandoned ghost is the session you most want to identify
+    // later) is a defect nothing would fail on.
+    //
+    // It sits ABOVE the status gates deliberately. A name is not close-scoped: renaming is legal in
+    // ANY status (AC-A9), sealed included. Below the already-sealed gate, a RETRIED close carrying a
+    // name — the seal completed but the agent's call was interrupted, so it calls again — would be
+    // answered "already sealed, no further action is needed" and the name would be silently dropped,
+    // on exactly the path where the agent believes it just named the session.
+    //
+    // Writing it before the close COMPLETES is safe for the same reason: if the seal below fails, the
+    // operator has a named open session — a state they could produce with cello_name_session anyway.
+    // Nothing about the name gates, delays, or alters the ceremony.
+    if (nameCheck.value !== null) {
+      sessionNodeManager.setSessionName(agentName, sessionId, nameCheck.value);
+      logger.info("session.name.set", {
+        agentId: record.agent_id, sessionId, nameLength: nameCheck.value.length, source: "close",
+      });
+    }
+
     // AC-010: already sealed
     if (record.status === "sealed") {
       return {
         ok: false,
         reason: "session_already_sealed",
-        guidance: "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
+        // A name given here WAS applied (above) — say so, rather than let "no further action is
+        // needed" imply the name went nowhere.
+        ...(nameCheck.value !== null ? { session_name: nameCheck.value } : {}),
+        guidance: nameCheck.value !== null
+          ? "This session is already sealed, so it was not closed again — but the name you gave WAS applied. Check cello_sessions to view its sealed record and the FROST notarization."
+          : "This session is already sealed. No further action is needed — check cello_sessions to view its sealed record and the FROST notarization.",
+      };
+    }
+
+    // An ABANDONED session is TERMINAL, and a close without --force must say so rather than try to
+    // seal it. The already-abandoned early-return below lives INSIDE the force branch, so a plain
+    // `cello close-session <abandoned-id>` fell through to the seal flow and fired a bilateral seal
+    // ceremony at a counterparty that, by definition, was never there — the exact unsealable hang
+    // that force exists to escape, re-entered from the other side. Found by the unit reviewer on this
+    // diff; pre-existing, fixed here rather than left for someone to hit in the dark.
+    // Scoped to the NON-force path: `force` on an already-abandoned session stays idempotent
+    // (ok:true / already_abandoned, below) — that contract is tested and must not change.
+    if (record.status === "abandoned" && params?.force !== true) {
+      return {
+        ok: false,
+        reason: "session_abandoned",
+        guidance: "This session was force-abandoned — it is terminal and has no counterparty to seal with, so it cannot be closed. It is already off the open list; check cello_sessions.",
       };
     }
 
@@ -3665,7 +3734,11 @@ async function startDaemonHoldingLock(
     }
     const cert = sessionNodeManager.getSealCertificate(agentName, sessionId);
     if (cert) {
-      return { ok: true, session_id: sessionId, sealed_root: cert.sealed_root, legibility: cert.legibility };
+      // DOD-SESSION-NAME-1 (AC-A12): echo the name so the output is self-describing — you already
+      // hold the id, so the name is free context. It is display only: nothing in the certificate,
+      // the sealed root, or the legibility object is derived from it.
+      const sessionName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
+      return { ok: true, session_id: sessionId, session_name: sessionName, sealed_root: cert.sealed_root, legibility: cert.legibility };
     }
     // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
     // caller could not tell a typo from a not-sealed-yet session from a wrong-agent selection.
@@ -3740,7 +3813,9 @@ async function startDaemonHoldingLock(
     // past a gap (an undecryptable row is absent from `messages`, so the walk stops there and those
     // messages correctly stay unread).
     safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
-    return { ok: true, session_id: sessionId, messages, undecryptable };
+    // DOD-SESSION-NAME-1 (AC-A12): the name rides along so a transcript dump says what it is of.
+    const transcriptName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
+    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable };
   });
 
   // cello_list_sessions: the discovery surface — every persisted session for the
@@ -3777,6 +3852,12 @@ async function startDaemonHoldingLock(
       filter === "all" ? classified : classified.filter((c) => c.category === filter);
     const sessions: SessionListEntry[] = matched.slice(0, limit).map(({ row, messageCount, category }) => ({
       sessionId: row.session_id,
+      // DOD-SESSION-NAME-1 (AC-A13): SECOND, immediately after the id — not last. Every list surface
+      // renders as JSON, and JSON.stringify preserves insertion order, so key position IS layout: at
+      // the end of the entry the name prints ~11 lines below the id it belongs to, and scanning a
+      // 50-session dump for "which one was the deploy" is the exact problem this column exists to
+      // solve. Alongside the id, never instead of it — the id is what you paste into the next command.
+      sessionName: row.session_name ?? null,
       agentName: row.agent_name,
       counterpartyPubkey: row.counterparty_pubkey,
       // MONIKER-5 AC1: the same resolution the doorbell uses — pet name ?? offered ?? fingerprint.
@@ -3809,6 +3890,59 @@ async function startDaemonHoldingLock(
       sessionNodeManager.getSessionsForAgent(agentName),
       params as Record<string, unknown> | undefined,
     );
+  });
+
+  // ─── DOD-SESSION-NAME-1: cello_name_session — set or clear THIS agent's label for a session ───
+  // Set-or-clear-by-null, mirroring cello_contact_set_moniker. Works in ANY status: naming a
+  // long-sealed session for archival clarity is the point of the tool, not an edge case. The only
+  // scope is ownership — the (agent_id, session_id) row must be this agent's, which for the loopback
+  // case correctly means each of the operator's two agents renames only its OWN row.
+  handlers.set("cello_name_session", async (params, connectionId) => {
+    const connState = perConnectionState.get(connectionId);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
+
+    const sessionId = params?.session_id as string | undefined;
+    // `session_name` must be PRESENT (null is how you clear it) — an omitted key is a caller that
+    // forgot the argument, not a caller asking to clear. Same distinction cello_contact_set_moniker
+    // draws with its `"moniker" in params` check.
+    if (!sessionId || !params || !("session_name" in params)) {
+      return {
+        ok: false,
+        reason: "missing_params",
+        guidance: "Provide 'session_id' (hex) and 'session_name' — a string to name the session, or null to clear it.",
+      };
+    }
+
+    const check = validateSessionName(params.session_name);
+    if (!check.ok) {
+      logger.warn("session.name.rejected", {
+        agentId: sessionNodeManager.resolveAgentId(agentName), sessionId, reason: check.reason, source: "rename",
+        nameLength: typeof params.session_name === "string" ? params.session_name.length : null,
+      });
+      return { ok: false, reason: check.reason, guidance: check.guidance };
+    }
+
+    const written = sessionNodeManager.setSessionName(agentName, sessionId, check.value);
+    if (!written) {
+      // The UPDATE matched no row: this agent holds no session with that id. Fail loud rather than
+      // report a success for a write that landed nowhere.
+      return {
+        ok: false,
+        reason: "session_not_found",
+        guidance: "No session with this ID belongs to this agent. Check cello_sessions for its sessions and their IDs.",
+      };
+    }
+
+    // AC-A16: the LENGTH, never the text. A session name carries the subject of a private
+    // conversation ("Acquisition of Northwind Traders"), and daemon logs are not confidential.
+    const agentId = sessionNodeManager.getSessionRecord(agentName, sessionId)?.agent_id;
+    if (check.value === null) {
+      logger.info("session.name.cleared", { agentId, sessionId, source: "rename" });
+    } else {
+      logger.info("session.name.set", { agentId, sessionId, nameLength: check.value.length, source: "rename" });
+    }
+    return { ok: true, session_id: sessionId, session_name: check.value };
   });
 
   // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same

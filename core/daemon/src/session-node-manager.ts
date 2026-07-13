@@ -507,6 +507,14 @@ export class SessionNodeManager {
       // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
       // primary), not just accept it. NULL when this party initiated (it uses its own primary).
       "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
+      // DOD-SESSION-NAME-1: the operator's own human-readable label for this session. LOCAL AND
+      // COSMETIC — it is never sent to the relay or directory, never in a wire frame, never in the
+      // transcript, never in the seal or a Merkle leaf, and the counterparty never sees it. It
+      // cannot influence protocol behaviour.
+      // NULL MEANS SOMETHING: a session closed through an agent usually carries a name, so an
+      // unnamed closed session is a hint it did not close cleanly. Never auto-generate a default —
+      // a fabricated name destroys that signal.
+      "ALTER TABLE sessions ADD COLUMN session_name TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -2661,6 +2669,27 @@ export class SessionNodeManager {
     // `agent_name` is display-only and no longer stored on the row; stamp back the name whose
     // agent_id scoped this lookup (~50 daemon call sites read `record.agent_name`).
     return row ? { ...row, agent_name: agentName } : null;
+  }
+
+  /**
+   * DOD-SESSION-NAME-1: set (string) or clear (null) THIS agent's name for a session.
+   *
+   * Returns false when the (agent_id, session_id) row does not exist — i.e. the session is not this
+   * agent's — so the caller refuses with session_not_found rather than reporting a silent success on
+   * a write that landed nowhere. Same contract as setContactMoniker.
+   *
+   * Ownership is the ONLY scope: the composite key IS the ownership check, and status is deliberately
+   * not consulted. A sealed session can be named — naming one long after the fact is the point — and
+   * a name is a local column, so writing it cannot touch the seal, a Merkle leaf, or the wire.
+   *
+   * The caller validates (validateSessionName) before calling; this stores what it is given.
+   */
+  setSessionName(agentName: string, sessionId: string, sessionName: string | null): boolean {
+    if (!this.#db) throw new Error(`setSessionName('${agentName}'): database not initialized`);
+    const res = this.#db
+      .prepare("UPDATE sessions SET session_name = ? WHERE agent_id = ? AND session_id = ?")
+      .run(sessionName, this.#requireAgentId(agentName), sessionId);
+    return res.changes > 0;
   }
 
   /**
