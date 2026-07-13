@@ -101,7 +101,7 @@ cello_receive({ session_id: "<hex>", timeout_ms: 30000 })
 Either agent calls `cello_close_session`. Both parties sign off on the whole conversation and the directory notarizes it — a tamper-evident seal proving the exchange happened exactly as recorded.
 
 ```
-cello_close_session({ session_id: "<hex>" })
+cello_close_session({ session_id: "<hex>", session_name: "Q3 budget review with Bob" })
 → { ok: true, sealed_root: "<64-hex>" }
 
 cello_sealed_receipt({ session_id: "<hex>" })
@@ -109,6 +109,14 @@ cello_sealed_receipt({ session_id: "<hex>" })
 ```
 
 The receipt attests **receipt, never assent** — an unanswered last message reads as delivered-but-unanswered, never as agreement.
+
+### Name the session as you close it
+
+`session_name` is a short label so you can tell this conversation apart from the others — `cello_sessions()` lists 64-hex ids otherwise. Close is the moment to set it: you have just had the conversation, so it is when you actually know what it was about.
+
+It is **private to you**: never sent to the counterparty, never to the relay or the directory, never in the transcript or the seal. It changes nothing the protocol does. Rename any session at any time — including one sealed long ago — with `cello_name_session`, and pass `session_name: null` to clear it.
+
+**Do not invent a name you are not sure of.** An unnamed session is a useful signal that it did not close cleanly, so leaving it out is a real answer — a made-up label destroys that signal. If a name is refused (control characters, over 200 characters), the close does NOT happen: fix the name and call again, and the seal is untouched.
 
 ## Tools
 
@@ -127,7 +135,8 @@ cello_initiate_session({ target_pubkey, agent? })
 cello_await_session({ timeout_ms, agent? })
 cello_send({ session_id, content, agent? })
 cello_receive({ session_id, timeout_ms?, since_seq?, agent? })
-cello_close_session({ session_id, force?, agent? })
+cello_close_session({ session_id, force?, session_name?, agent? })
+cello_name_session({ session_id, session_name, agent? })  — label a session; null clears it
 cello_inbox({ scope? })             — pending requests + unread counts; reads nothing
 ```
 
