@@ -81,7 +81,9 @@ import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
 import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
-import { buildSignedSealInterruptedLeaf } from "./seal-leaf.js";
+import { createContentPark } from "./content-park.js";
+import { createInboundSealRequestHandler } from "./inbound-seal-request.js";
+import { registerNotificationHandlers } from "./notification-handlers.js";
 
 
 export interface DaemonHandle {
@@ -324,6 +326,17 @@ async function startDaemonHoldingLock(
   for (const a of loadedAgents) {
     keyProviders.set(a.name, a.keyProvider);
   }
+
+  // Constructed HERE, before ANY boot-time caller. autoRecoverForAgent is invoked from an agent's
+  // onConnected and from the seal-upgrade content gate — both of which run long before the IPC
+  // handler map exists. Its handlers register later (phase 2), which is what lets this sit up here.
+  const contentPark = createContentPark({
+    logger,
+    sessionNodeManager,
+    agents,
+    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
+  });
+  const autoRecoverForAgent = (agentName: string): Promise<void> => contentPark.autoRecoverForAgent(agentName);
 
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
   // are wired into every signaling manager below — and the originals were FUNCTION DECLARATIONS,
@@ -1693,206 +1706,7 @@ async function startDaemonHoldingLock(
     return { pendingCount: depth, nonces: entries.map(e => e.nonceHex) };
   });
 
-  // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
-  // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
-  // proven (J-CONTENT increment 1) before the send/receive-path integration. The relay
-  // multiaddr (with /p2p/<peerId>) comes from the session assignment's relay endpoint;
-  // dials run from the standing receiver (open-gater) node.
-  const parseRelayPeer = (multiaddr: string | undefined): { peerId: string; addr: string } | null => {
-    if (!multiaddr) return null;
-    const peerId = multiaddr.split("/p2p/")[1];
-    return peerId ? { peerId, addr: multiaddr } : null;
-  };
-
-  handlers.set("content_park_deposit", async (params, _connectionId) => {
-    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
-    const recipientPubkey = params?.recipientPubkey as string | undefined;
-    const contentHash = params?.contentHash as string | undefined;
-    const sessionId = params?.sessionId as string | undefined;
-    const ciphertext = params?.ciphertext as string | undefined;
-    if (!relay || !recipientPubkey || !contentHash || !sessionId || !ciphertext) {
-      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId, ciphertext — all hex." };
-    }
-    const node = sessionNodeManager.getStandingReceiverNode();
-    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
-    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
-    return await client.deposit(node, {
-      recipientPubkey: Buffer.from(recipientPubkey, "hex"),
-      contentHash: Buffer.from(contentHash, "hex"),
-      sessionId: Buffer.from(sessionId, "hex"),
-      ciphertext: Buffer.from(ciphertext, "hex"),
-    });
-  });
-
-  handlers.set("content_park_pull", async (params, _connectionId) => {
-    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
-    const recipientPubkey = params?.recipientPubkey as string | undefined;
-    if (!relay || !recipientPubkey) {
-      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
-    }
-    // The recipient must be a local agent — its K_local signs the relay's auth challenge.
-    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
-    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey; only the recipient can pull its own parked content." };
-    const kp = keyProviders.get(recipientAgent.name);
-    if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
-    const node = sessionNodeManager.getStandingReceiverNode();
-    if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
-    const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
-    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
-    return {
-      ok: true,
-      entries: entries.map((e) => ({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, ciphertext: Buffer.from(e.ciphertext).toString("hex") })),
-    };
-  });
-
-  // MSG-001-3b (increment 3): RECOVER parked content. Pulls the recipient's parked entries,
-  // decrypts each IN-DAEMON (openContentSeal — the relay never sees plaintext), and routes the
-  // plaintext through ingestReceivedContent — the SAME inbound chokepoint as a direct receive
-  // (M9 single-funnel AC). The content completes the recipient's transcript view of an already-
-  // witnessed message so it can be read (cello_receive) and the session bilaterally sealed
-  // (DOD-INT-2). This is content-completion, NOT a resumption — the session stays interrupted.
-  // DOD-MSG-4: pull a recipient agent's parked mailbox from ONE relay and recover each entry through
-  // the inbound funnel (decode envelope → verify+order the signed Structure2 → ingest). Shared by the
-  // explicit IPC handler and the auto-recover-on-reconnect trigger below.
-  async function recoverParkedFromRelay(
-    recipientAgent: { name: string; pubkey?: string },
-    relayPeerId: string,
-    relayAddrs: string[],
-  ): Promise<
-    | { ok: true; recovered: number; pulled: number; refused: number; refusals: Array<{ contentHash: string; sessionId: string; reason: string }> }
-    | { ok: false; reason: string }
-  > {
-    const kp = keyProviders.get(recipientAgent.name);
-    if (!kp) return { ok: false, reason: "signing_key_unavailable" };
-    if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal" };
-    const node = sessionNodeManager.getStandingReceiverNode();
-    if (!node) return { ok: false, reason: "standing_receiver_unavailable" };
-    const recipientPubkey = recipientAgent.pubkey ?? "";
-    const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
-    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
-    let recovered = 0;
-    // SEC-1 / review M2: a REFUSED entry must not vanish behind `ok:true`. Report it — an operator
-    // seeing {ok:true, pulled:3, recovered:0} would otherwise have three messages evaporate with the
-    // only explanation buried in the daemon log. This is both the injection signal and, given the
-    // deliberate no-tolerant-window rollout, the lagging-peer signal.
-    const refusals: Array<{ contentHash: string; sessionId: string; reason: string }> = [];
-    // AC7: one correlationId per recover flow, threaded through every event it emits.
-    const correlationId = randomUUID();
-    for (const e of entries) {
-      const unsealed = await kp.openContentSeal(e.ciphertext);
-      if (!unsealed) {
-        logger.warn("content.recover.unseal_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex });
-        continue;
-      }
-      // SEC-1: authenticate THEN ingest — fused in recoverParkedEntry, which is now the ONLY way
-      // parked content can enter the transcript. It verifies the sender's signature over
-      // (session_id, recipient_pubkey, content_hash) and that the signer is this session's
-      // counterparty, and it still verifies + records the DOD-MSG-4 ordering record when present.
-      // Relay deposit is unauthenticated and the seal is anonymous, so WITHOUT this gate anyone
-      // holding the recipient's public key — the relay above all — could inject content that gets
-      // attributed to the honest counterparty and then notarized by the bilateral seal.
-      const contentHashBytes = Buffer.from(e.contentHashHex, "hex");
-      const ingest = await sessionNodeManager.recoverParkedEntry(
-        recipientAgent.name,
-        e.sessionIdHex,
-        Buffer.from(recipientPubkey, "hex"),
-        unsealed,
-        contentHashBytes,
-        correlationId,
-      );
-      if (ingest.ok && ingest.held) {
-        // DOD-MSG-4 (review finding #4): a held entry is NOT yet an appended leaf — its sequence is
-        // the FUTURE canonical index, not a completed recovery. Do not count it as recovered; log it
-        // distinctly so the tally reflects leaves actually written, not content still queued in memory.
-        logger.info("content.recover.held", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, canonicalSeq: ingest.sequenceNumber });
-      } else if (ingest.ok && ingest.screenedOut) {
-        // M9 (code-review LOW-3): a terminal-screened recovered entry IS durably leafed (so it must be
-        // confirm-deleted, below) but was NEVER delivered to the agent — do not count it as a delivered
-        // recovery, and log it distinctly so observability separates "delivered" from "leafed-but-screened".
-        logger.info("content.recover.screened_out", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
-        try {
-          await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
-        } catch (err: unknown) {
-          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
-        }
-      } else if (ingest.ok) {
-        // DOD-MSG-4 (review #3): count leaves ACTUALLY written — the directly-ingested leaf PLUS any
-        // held out-of-order entries this ingest unblocked (appendedCount), not just 1.
-        recovered += ingest.appendedCount ?? 1;
-        logger.info("content.recovered", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, sequenceNumber: ingest.sequenceNumber });
-        // Delete-on-confirm (review #1): the entry is now durably ingested (a fresh leaf, or a dedup
-        // of one already present), so confirm-delete it from the relay mailbox. The relay is
-        // delete-on-CONFIRM, not delete-on-pull — without this the queue never drains and every
-        // reconnect re-pulls the whole history. Held entries are deliberately NOT confirmed (not yet
-        // durable). Best-effort: a failed confirm leaves the entry to be re-pulled + deduped next time.
-        try {
-          await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
-        } catch (err: unknown) {
-          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
-        }
-      } else {
-        // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
-        // NOT confirm-deleted — a forgery must not be able to evict itself from the mailbox, and a
-        // genuine v1-peer message must not be destroyed by our refusing it.
-        refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
-        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
-      }
-    }
-    return { ok: true, recovered, pulled: entries.length, refused: refusals.length, refusals };
-  }
-
-  // DOD-MSG-4 (auto-recover-on-reconnect): when an agent comes online, drain its parked mailbox from
-  // every relay it has sessions on — symmetric to the SENDER's flushAwaitingContent. Without this,
-  // nothing in production pulls a recipient's store-and-forward mailbox and parked content is never
-  // delivered. Best-effort; a relay miss is retried on the next agent-online.
-  async function autoRecoverForAgent(agentName: string): Promise<void> {
-    const agent = agents.find((a) => a.name === agentName);
-    if (!agent?.pubkey) return;
-    const relays = sessionNodeManager.getAgentRelayEndpoints(agentName);
-    if (relays.length === 0) return;
-    let total = 0;
-    let failed = 0;
-    for (const r of relays) {
-      try {
-        const res = await recoverParkedFromRelay(agent, r.relayPeerId, r.relayAddrs);
-        if (res.ok) {
-          total += res.recovered;
-        } else {
-          // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal /
-          // standing_receiver_unavailable) was previously silent — log the reason so a run where
-          // every relay failed is distinguishable from "nothing was parked".
-          failed++;
-          logger.warn("content.recover.auto.relay_failed", { agentName, relayPeerId: r.relayPeerId, reason: res.reason });
-        }
-      } catch (err: unknown) {
-        failed++;
-        logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: err instanceof Error ? err.message : String(err) });
-      }
-    }
-    // Emit the completion event UNCONDITIONALLY — not only when total > 0 — so a clean "nothing
-    // parked" run is observable, and distinct from an all-failed run.
-    logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length, failedRelays: failed });
-  }
-
-  handlers.set("content_park_recover", async (params, _connectionId) => {
-    const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
-    const recipientPubkey = params?.recipientPubkey as string | undefined;
-    if (!relay || !recipientPubkey) {
-      return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>) and recipientPubkey (hex)." };
-    }
-    const recipientAgent = agents.find((a) => a.pubkey === recipientPubkey);
-    if (!recipientAgent) return { ok: false, reason: "agent_not_found", guidance: "No local agent matches recipientPubkey." };
-    const res = await recoverParkedFromRelay(recipientAgent, relay.peerId, [relay.addr]);
-    if (!res.ok) {
-      const guidanceByReason: Record<string, string> = {
-        signing_key_unavailable: `Signing key for '${recipientAgent.name}' is not loaded.`,
-        cannot_unseal: `Agent '${recipientAgent.name}' key provider cannot open content seals.`,
-        standing_receiver_unavailable: "The daemon's standing receiver is not ready yet; retry after startup.",
-      };
-      return { ok: false, reason: res.reason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
-    }
-    return { ok: true, recovered: res.recovered, pulled: res.pulled };
-  });
+  contentPark.registerHandlers(handlers);
 
   // MCP-002: Test-only handler to emit session lifecycle events.
   // Guarded by CELLO_ENV=test — never available in production.
@@ -1959,140 +1773,16 @@ async function startDaemonHoldingLock(
   });
   } // end CELLO_ENV=test guard
 
-  // ─── M7-SESSION-001 (H-1): seal-interrupted bilateral RESPONDER ────────────
-  //
-  // A PERSISTENT inbound handler (registered once, below) that reacts to inbound
-  // `seal_interrupted_request` frames from a counterparty. It validates local
-  // state, K_local-signs this node's SEAL-INTERRUPTED leaf (co-signing the same
-  // Merkle root the initiator sent), echoes the nonce, includes initiatorPubkey
-  // for directory routing, persists the responder side of the commitment, moves
-  // the session to 'seal_interrupted_pending', and returns a seal_interrupted_ack.
-  // On any inconsistent local state it returns a seal_interrupted_rejection.
-  async function handleInboundSealInterruptedRequest(frame: Record<string, unknown>): Promise<void> {
-    const correlationId = randomUUID();
-    const sessionId = typeof frame["sessionId"] === "string" ? frame["sessionId"] : null;
-    const initiatorPubkey = typeof frame["initiatorPubkey"] === "string" ? frame["initiatorPubkey"] : null;
-    const counterpartyPubkey = typeof frame["counterpartyPubkey"] === "string" ? frame["counterpartyPubkey"] : null;
-    const leafCountReq = typeof frame["leafCountAtInterruption"] === "number" ? frame["leafCountAtInterruption"] : null;
-    const merkleRootReq = typeof frame["merkleRootAtInterruption"] === "string" ? frame["merkleRootAtInterruption"] : "";
-    const nonce = typeof frame["nonce"] === "string" ? frame["nonce"] : null;
-
-    // Cannot even route a rejection without sessionId + initiatorPubkey.
-    if (!sessionId || !initiatorPubkey || !counterpartyPubkey || nonce === null || leafCountReq === null) {
-      logger.warn("session.interrupted.request.malformed", {
-        correlationId,
-        hasSessionId: sessionId !== null,
-        hasInitiatorPubkey: initiatorPubkey !== null,
-      });
-      return;
-    }
-
-    const reject = async (reason: string): Promise<void> => {
-      // CONN-001: send the rejection over the LOCAL responder agent's own stream (the agent whose
-      // pubkey is counterpartyPubkey — the stream this request arrived on). If unresolved, sendOver
-      // reports a send failure rather than throwing.
-      const sent = await sendOver(agents.find((a) => a.pubkey === counterpartyPubkey)?.name ?? "", {
-        type: "seal_interrupted_rejection",
-        sessionId,
-        initiatorPubkey,
-        reason,
-      });
-      // fallback-finder LOW: don't log the rejection as delivered when the send failed (e.g. no local
-      // agent for counterpartyPubkey, or a transient send error) — the counterparty would otherwise
-      // appear rejected but only ever see a timeout.
-      if (sent.ok) {
-        logger.warn("session.interrupted.request.rejected", { sessionId, reason, correlationId });
-      } else {
-        logger.warn("session.interrupted.request.rejection.send.failed", { sessionId, reason, sendReason: sent.reason, correlationId });
-      }
-    };
-
-    // DOD-LOOP-1: resolve the addressed local agent FIRST — the composite (agent, session_id) key
-    // needs it. The request must be addressed to one of our agents (counterpartyPubkey is OUR
-    // pubkey from the initiator's perspective).
-    const localAgent = agents.find((a) => a.pubkey === counterpartyPubkey);
-    if (!localAgent) { await reject("unknown_counterparty"); return; }
-
-    const localRecord = sessionNodeManager.getSessionRecord(localAgent.name, sessionId);
-    if (!localRecord) { await reject("session_not_found"); return; }
-    // DAEMON-004: an 'active' session is eligible too (the active-session seal
-    // reuses this exchange). We still never re-process a terminal 'sealed' row or
-    // an already-pending one.
-    if (localRecord.status !== "interrupted" && localRecord.status !== "active") {
-      await reject("session_not_interrupted");
-      return;
-    }
-    // From our perspective the initiator is our counterparty.
-    if (localRecord.counterparty_pubkey !== initiatorPubkey) { await reject("initiator_mismatch"); return; }
-
-    // DAEMON-004 (SI-001): we sign over OUR OWN daemon-owned tree, never the
-    // initiator-supplied root.
-    //
-    // round-2 finding #6: for an ACTIVE session the daemon ALWAYS binds its own tree
-    // root — even the canonical EMPTY-tree root when no content has flowed — never the
-    // initiator-supplied `merkleRootReq`. Echoing the caller's root would let an
-    // initiator dictate the root a responder signs (the SI-001 trust hole). Only a
-    // LEGACY 'interrupted' session that predates DAEMON-004 (no tree ever persisted)
-    // falls back to message_count + the supplied root (SESSION-001 behavior).
-    const ownTree = sessionNodeManager.getSessionTree(localAgent.name, sessionId);
-    const isActive = localRecord.status === "active";
-    const useOwnTree = isActive || ownTree.size() > 0;
-    const ownLeafCount = useOwnTree ? ownTree.size() : (localRecord.message_count ?? 0);
-    const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId) : merkleRootReq;
-
-    // SI-002/AC-008: leaf-count agreement against our own state.
-    if (ownLeafCount !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
-
-    const kp = keyProviders.get(localAgent.name);
-    if (!kp) { await reject("signing_key_unavailable"); return; }
-
-    // Co-sign our SEAL-INTERRUPTED leaf. When we hold our own tree the root is
-    // ours (SI-001); otherwise we echo the initiator-supplied root unchanged.
-    const ownLeaf = await buildSignedSealInterruptedLeaf(kp, {
-      sessionId,
-      leafCount: ownLeafCount,
-      merkleRootAtInterruption: ownRoot,
-      signerPubkeyHex: counterpartyPubkey,
-    });
-
-    // Persist the responder side of the bilateral commitment. The responder never
-    // receives the initiator's leaf in this request→ack protocol, so it records
-    // only its own signed leaf plus the agreed root; the full both-leaves artifact
-    // lives on the initiator side. Advances status interrupted → seal_interrupted_pending.
-    sessionNodeManager.persistSealInterruptedCommitment({
-      agentName: localAgent.name,
-      sessionId,
-      role: "responder",
-      ownLeaf,
-      counterpartyLeaf: null,
-      merkleRoot: ownRoot,
-      nonce,
-    });
-
-    const ack = {
-      type: "seal_interrupted_ack",
-      sessionId,
-      initiatorPubkey,
-      nonce,
-      sealInterruptedLeaf: ownLeaf,
-    };
-    const sendResult = await sendOver(localAgent.name, ack);
-    if (!sendResult.ok) {
-      logger.error("session.interrupted.ack.send.failed", {
-        sessionId,
-        agentName: localAgent.name,
-        reason: sendResult.reason,
-        correlationId,
-      });
-      return;
-    }
-    logger.info("session.interrupted.responder.acked", {
-      sessionId,
-      agentName: localAgent.name,
-      leafCount: ownLeafCount,
-      correlationId,
-    });
-  }
+  // The inbound seal-interrupted REQUEST (inbound-seal-request.ts): the counterparty asks us to
+  // co-sign the seal of a session neither side can finish normally. We answer with our own signed
+  // leaf, or a rejection naming the exact mismatch — never a leaf we cannot corroborate.
+  const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
+    logger,
+    sessionNodeManager,
+    agents,
+    getKeyProvider: (agentName: string) => keyProviders.get(agentName),
+    sendOver,
+  });
 
   // CELLO-M7-CONN-001 (DOD-CONN-2): the inbound seal_interrupted_request responder is now
   // wired PER-AGENT (wirePerAgentSessionInbound, below) onto each agent's own signaling
@@ -2158,77 +1848,19 @@ async function startDaemonHoldingLock(
     clearTelegramRung,
   });
 
-  // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
-  // Notifications are fire-and-forget (no ack, no redelivery); this is how a client discovers what
-  // it missed while its shim was down/busy, and the primary inbox for poll-only clients (Bedrock,
-  // cron). Content-free: pending session requests (from the in-memory queue, READ non-destructively —
-  // cello_await_session owns draining) + unread message counts (derived from the persisted read
-  // watermark, N2). No separate notification store; no ack verb (N4).
-  handlers.set("cello_check_notifications", async (params, connectionId) => {
-    const connState = perConnectionState.get(connectionId);
-    const scope = params?.scope === "all" ? "all" : "current";
-
-    let agentNames: string[];
-    if (scope === "all") {
-      agentNames = loadedAgents.map((a) => a.name);
-    } else {
-      // F18: an explicit current agent, else the sole-online agent; ambiguous → no_current_agent.
-      const current = resolveCurrentAgent(connState);
-      if (!current) {
-        return {
-          ok: false,
-          reason: "no_current_agent",
-          guidance: "No current agent for this connection. Call cello_use_agent to select one, or use scope:\"all\" to check every loaded agent.",
-        };
-      }
-      agentNames = [current];
-    }
-
-    const agents = agentNames.map((agent) => {
-      reapExpiredInboundSessions(agent); // M8C-TTL-1: expired ones surface below, not as "pending"
-      const pending = (inboundSessionQueues.get(agent) ?? []).map((e) => ({
-        session_id: e.sessionIdHex,
-        from: e.counterpartyPubkeyHex,
-      }));
-      // M8C-TTL-1: expired requests stay VISIBLE (not silently dropped) — the operator can see
-      // what they missed rather than a request just vanishing from the pending list.
-      const expired = (expiredSessionRequests.get(agent) ?? []).map((e) => ({
-        session_id: e.sessionIdHex,
-        from: e.counterpartyPubkeyHex,
-        expired_at: e.expiredAt,
-      }));
-      const unread = sessionNodeManager.getUnreadSummary(agent);
-      const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
-      // DOD-RENAME-1 AC3: pending rename notices surface HERE (the INBOX pull), never as a real-time
-      // push. The offered name is rendered as an untrusted CLAIM (quoted, with the pubkey) plus the
-      // command to adopt it — the daemon never auto-applies a self-declared name.
-      const rename_notices = sessionNodeManager.getRenameNotices(agent).map((n) => ({
-        pubkey: n.pubkey,
-        your_name_for_them: n.moniker,
-        claimed_name: n.offered_name,
-        noticed_at: n.noticed_at,
-        // Names the contact by the operator's OWN pet name (AC3); the self-declared name is a quoted,
-        // untrusted claim; the adopt command carries its arguments so it is copy-pasteable.
-        // The MCP call form below is translated WHOLE (arguments and all) for a CLI caller by
-        // vocabulary.ts's CALL_FORMS — rewriting only the tool name would leave the tool's JSON
-        // bolted onto a CLI verb, which looks like a command and is not one. `claimed_name` above
-        // carries the peer's self-declared name UNTOUCHED, so the operator always has the raw value
-        // even though the prose copy passes through the renderer.
-        notice:
-          `Your contact ${n.moniker !== null ? `"${n.moniker}" ` : ""}(${n.pubkey.slice(0, 16)}…) now calls themselves ` +
-          `"${n.offered_name}" (self-declared — unverified). Adopt it: cello_contact_set_moniker ` +
-          `{ pubkey: "${n.pubkey}", moniker: "${n.offered_name}" }, or ignore.`,
-      }));
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
-    });
-
-    const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);
-    const totalPending = agents.reduce((sum, a) => sum + a.pending_session_requests.length, 0);
-    // M8C-TTL-1 (reviewer finding, D19): surface expired-log size so unbounded growth (were the
-    // cap ever removed or misconfigured) would be visible here, not just in an internal Map.
-    const totalExpired = agents.reduce((sum, a) => sum + a.expired_session_requests.length, 0);
-    logger.info("inbox.checked", { connectionId, scope, agentCount: agents.length, totalUnread, totalPending, totalExpired });
-    return { ok: true, scope, agents };
+  // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are
+  // fire-and-forget, so a client that was away can miss one entirely — this is how it finds out, by
+  // ASKING from persisted state rather than trusting that a push arrived.
+  registerNotificationHandlers({
+    handlers,
+    logger,
+    sessionNodeManager,
+    getConnState: (connectionId) => perConnectionState.get(connectionId),
+    resolveCurrentAgent,
+    loadedAgents,
+    reapExpiredInboundSessions,
+    inboundSessionQueues: inboundSessionQueues as never,
+    expiredSessionRequests: expiredSessionRequests as never,
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now
