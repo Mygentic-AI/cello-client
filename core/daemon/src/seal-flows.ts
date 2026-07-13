@@ -17,6 +17,14 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 
+export type SealFlowResult =
+  | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
+  | { ok: false; reason: string; guidance: string };
+
+export type ActiveSealResult =
+  | { ok: true; sessionId: string; status: "seal_interrupted_pending"; rootHex: string }
+  | { ok: false; reason: string; guidance: string };
+
 export interface SealFlowDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
@@ -56,9 +64,6 @@ export function createSealFlows(deps: SealFlowDeps) {
   //   e.g. reloaded from session_tree_leaves after a restart. Only sessions with no persisted tree
   //   fall back to message_count plus the caller-supplied root.
   // Result type for handleSealInterruptedFlow — maps to the MCP tool response shape.
-  type SealFlowResult =
-    | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
-    | { ok: false; reason: string; guidance: string };
 
   // M7-SESSION-001 / DAEMON-004: shared bilateral ack-await machinery. The
   // interrupted-seal flow AND the active-session seal flow both send a
@@ -329,9 +334,6 @@ export function createSealFlows(deps: SealFlowDeps) {
   // non-terminal bilateral-commitment state the interrupted flow uses); returning
   // a distinct 'seal_initiated' here meant the close response and a subsequent
   // cello_status / cello_list_sessions showed two names for one state. One name.
-  type ActiveSealResult =
-    | { ok: true; sessionId: string; status: "seal_interrupted_pending"; rootHex: string }
-    | { ok: false; reason: string; guidance: string };
 
   async function handleActiveSealFlow(
     sessionId: string,
