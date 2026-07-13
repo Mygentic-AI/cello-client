@@ -34,8 +34,11 @@ import {
   CONTEXT_PRIMARY_RELEASE,
 } from "../frost/types.js";
 // createInProcessStubs is test-only infrastructure — imported directly from stubs,
-// not through the frost/index.ts production barrel.
-import { createInProcessStubs } from "./frost-stubs.js";
+// not through the frost/index.ts production barrel. It is also a genuine cross-repo
+// public export (@cello-protocol/crypto/frost/stubs.js) consumed by trustless-cello's
+// directory test suite — restored here after DEAD-CODE PURGE incorrectly moved it into
+// __tests__/ on the assumption it was internal-only (never checked against the other repo).
+import { createInProcessStubs } from "../frost/stubs.js";
 
 setupV3Tests();
 
