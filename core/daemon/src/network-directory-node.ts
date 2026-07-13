@@ -11,7 +11,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { Encoder, decode as cborDecode } from "cbor-x";
+import { decode as cborDecode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 import { ed25519_FROST, FrostThresholdSigner } from "@cello-protocol/crypto";
 import {
@@ -49,7 +50,6 @@ import type {
 } from "@cello-protocol/protocol-types";
 
 const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 // Prove K_local possession on every /cello/frost/1.0.0 commit/sign request. The directory
 // verifies an Ed25519 signature, made with K_local priv, over SHA-256(FROST_AUTH_DOMAIN ||
@@ -126,7 +126,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       verifyingShares: (pub as unknown as { verifyingShares: Record<string, Uint8Array> }).verifyingShares,
     };
 
-    const frame = CBOR_ENC.encode({
+    const frame = encodeCbor({
       type: "frost_bootstrap",
       agentPubkey: this.#agentPubkeyHex,
       epochId: this.#epochId,
@@ -161,7 +161,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       throw new Error("NetworkDirectoryNode: setBootstrapContext must be called before generateCommitment");
     }
 
-    const frame = CBOR_ENC.encode({
+    const frame = encodeCbor({
       type: "frost_commit_request",
       agentPubkey: this.#agentPubkeyHex,
       epochId: this.#epochId,
@@ -211,7 +211,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       throw new Error("NetworkDirectoryNode: setBootstrapContext must be called before signRound");
     }
 
-    const frame = CBOR_ENC.encode({
+    const frame = encodeCbor({
       type: "frost_sign_request",
       agentPubkey: this.#agentPubkeyHex,
       epochId: this.#epochId,
@@ -333,7 +333,7 @@ async function dkgRound1WithNode(
   signers: { min: number; max: number },
   preAuthToken?: string,
 ): Promise<DkgRound1Broadcast> {
-  const frame = CBOR_ENC.encode({
+  const frame = encodeCbor({
     type: "frost_dkg_round1_request",
     agentPubkey: agentPubkeyHex,
     epochId,
@@ -369,7 +369,7 @@ async function dkgRound2WithNode(
   epochId: string,
   othersRound1: DkgRound1Broadcast[],
 ): Promise<DkgRound2Share[]> {
-  const frame = CBOR_ENC.encode({
+  const frame = encodeCbor({
     type: "frost_dkg_round2_request",
     agentPubkey: agentPubkeyHex,
     epochId,
@@ -406,7 +406,7 @@ async function dkgRound3WithNode(
   sharesForMe: DkgRound2Share[],
   allRound1: DkgRound1Broadcast[],
 ): Promise<Uint8Array> {
-  const frame = CBOR_ENC.encode({
+  const frame = encodeCbor({
     type: "frost_dkg_round3_request",
     agentPubkey: agentPubkeyHex,
     epochId,
@@ -823,7 +823,7 @@ async function refreshRound1WithNode(
   signers: { min: number; max: number },
   participantIds: string[],
 ): Promise<FrostRefreshContribution> {
-  const frame = CBOR_ENC.encode({
+  const frame = encodeCbor({
     type: "frost_refresh_round1_request",
     agentPubkey: agentPubkeyHex,
     fromEpochId,
@@ -856,7 +856,7 @@ async function refreshRound2WithNode(
   participantIds: string[],
   contributions: FrostRefreshContribution[],
 ): Promise<Uint8Array> {
-  const frame = CBOR_ENC.encode({
+  const frame = encodeCbor({
     type: "frost_refresh_round2_request",
     agentPubkey: agentPubkeyHex,
     fromEpochId,

@@ -22,9 +22,9 @@
  *                 'unknown', not 'gone').
  */
 
-import { Encoder, decode as cborDecode } from "cbor-x";
+import { decode as cborDecode } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 export type SessionLiveness = "alive" | "gone" | "unknown";
 
@@ -56,7 +56,7 @@ function isLiveness(v: unknown): v is SessionLiveness {
 }
 
 export function encodeSessionLivenessQuery(frame: SessionLivenessQuery): Uint8Array {
-  return CBOR_ENC.encode({
+  return encodeCbor({
     type: "session_liveness_query",
     session_id: frame.session_id,
     counterparty_pubkey: frame.counterparty_pubkey,
@@ -81,7 +81,7 @@ export function decodeSessionLivenessQuery(bytes: Uint8Array): SessionLivenessQu
 }
 
 export function encodeSessionLivenessResponse(frame: SessionLivenessResponse): Uint8Array {
-  return CBOR_ENC.encode({
+  return encodeCbor({
     type: "session_liveness_response",
     session_id: frame.session_id,
     counterparty_pubkey: frame.counterparty_pubkey,

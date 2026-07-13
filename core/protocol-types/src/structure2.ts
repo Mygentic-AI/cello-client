@@ -16,11 +16,10 @@
  * plus the session_id, last_seen_seq, and timestamp carried through the relay path.
  */
 
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 import { verify } from "@cello-protocol/crypto";
 import type { EnvelopeError } from "./types.js";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -142,11 +141,11 @@ export function encodeStructure2(s2: Structure2): Uint8Array {
   // We must embed the pre-encoded sentinel bytes as raw CBOR, not re-encode the object.
   // Construct the 6-element array manually to preserve canonical byte representation.
   const arrayHeader = new Uint8Array([0x86]); // 6-element CBOR array
-  const seqBytes = CBOR_ENC.encode(s2.sequence_number) as Uint8Array;
-  const pubBytes = CBOR_ENC.encode(s2.sender_pubkey) as Uint8Array;
-  const hashBytes = CBOR_ENC.encode(s2.content_hash) as Uint8Array;
-  const sigBytes = CBOR_ENC.encode(s2.sender_signature) as Uint8Array;
-  const prevBytes = CBOR_ENC.encode(s2.prev_root) as Uint8Array;
+  const seqBytes = encodeCbor(s2.sequence_number) as Uint8Array;
+  const pubBytes = encodeCbor(s2.sender_pubkey) as Uint8Array;
+  const hashBytes = encodeCbor(s2.content_hash) as Uint8Array;
+  const sigBytes = encodeCbor(s2.sender_signature) as Uint8Array;
+  const prevBytes = encodeCbor(s2.prev_root) as Uint8Array;
 
   return new Uint8Array(
     Buffer.concat([arrayHeader, seqBytes, pubBytes, hashBytes, sigBytes, sentinelBytes, prevBytes])
@@ -175,7 +174,7 @@ export function verifyStructure2Signature(
   timestamp: number | bigint
 ): boolean {
   const tsEncoded = typeof timestamp === "bigint" ? timestamp : timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
-  const tbs = CBOR_ENC.encode([
+  const tbs = encodeCbor([
     1,
     s2.content_hash,
     s2.sender_pubkey,

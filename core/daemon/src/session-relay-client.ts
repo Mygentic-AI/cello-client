@@ -29,7 +29,8 @@
  */
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { Encoder, decode } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -37,7 +38,6 @@ import type { Logger } from "./types.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
@@ -73,7 +73,7 @@ export function encodeStructure1(
   lastSeenSeq: number,
   timestamp: number,
 ): Uint8Array {
-  return CBOR_ENC.encode([1, contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp]) as Uint8Array;
+  return encodeCbor([1, contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp]) as Uint8Array;
 }
 
 export interface LeafDeliverFrame {
@@ -311,7 +311,7 @@ export class AgentRelayClient {
     const stream = this.#stream;
     if (!stream) return false;
     const a = sess.assignment;
-    const frame = CBOR_ENC.encode({
+    const frame = encodeCbor({
       type: "client_record_assignment",
       session_id: new Uint8Array(Buffer.from(sessionIdHex, "hex")),
       participant_a: a.participantA,
@@ -673,7 +673,7 @@ export class AgentRelayClient {
     }
     const authSig = await this.#keyProvider.sign(buildRelayAuthPayload(nonce, this.#senderPubkey));
     try {
-      stream.send(lp.encode.single(CBOR_ENC.encode({ type: "relay_auth_response", pubkey: this.#senderPubkey, signature: authSig }) as Uint8Array));
+      stream.send(lp.encode.single(encodeCbor({ type: "relay_auth_response", pubkey: this.#senderPubkey, signature: authSig }) as Uint8Array));
     } catch (err: unknown) {
       this.#logger.warn("session.relay.auth.failed", { relayPeerId: this.#relayPeerId, reason: "response_send", error: extractErrorMessage(err) });
       return false;
@@ -787,7 +787,7 @@ export class AgentRelayClient {
     const lastSeenForSession = this.#lastSeen.get(sessionIdHex) ?? 0;
     const structure1 = encodeStructure1(contentHash, this.#senderPubkey, sessionId, lastSeenForSession, Date.now());
     const signature = await this.#keyProvider.sign(structure1);
-    const frame = CBOR_ENC.encode({
+    const frame = encodeCbor({
       type: "hash_submit",
       session_id: sessionId,
       leaf_kind: leafKind,

@@ -197,6 +197,33 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     expect(res["reason"]).toBe("no_current_agent");
   });
 
+  // A connection that CHOSE an agent, and had it stopped underneath, must not be silently
+  // re-targeted at whoever else is online.
+  //
+  // The sole-online fallback above (N1) is a convenience for a caller that NEVER chose. It must not
+  // apply to a caller whose choice was taken away: it asked for alice, alice was stopped, and the
+  // next call would land on bob — reporting success, as a different identity. A lost intent is not
+  // the same as no intent.
+  it("N1b: a SELECTION that was stopped does not fall back to another online agent — it refuses", async () => {
+    const config = await setupWithAgents("alice", "bob");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "alice" });   // an explicit choice (auto-starts alice)
+    await client.send("cello_stop_agent", { name: "alice" });  // ...taken away. bob is now sole-online.
+
+    // The dangerous outcome is ok:true carrying BOB's inbox.
+    const res = (await client.send("cello_check_notifications", {})) as R;
+    expect(res["reason"], "a stopped selection must not silently become another agent").toBe("no_current_agent");
+
+    // ...and choosing again must restore normal service — the refusal is not a permanent state.
+    await client.send("cello_use_agent", { name: "bob" });
+    const after = (await client.send("cello_check_notifications", {})) as R;
+    expect(after["ok"]).toBe(true);
+    expect(agentsOf(after)[0].agent).toBe("bob");
+  });
+
   // ─── N4: INBOX reads the pending queue non-destructively ───
   it("N4: check_notifications shows pending session requests WITHOUT draining them", async () => {
     const config = await setupWithAgents("alice");

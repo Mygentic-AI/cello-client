@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { MAX_CONTENT_BYTES } from "../envelope.js";
+import { MAX_CONTENT_BYTES } from "../limits.js";
 import {
   IT_LENGTH_PREFIX_DEFAULT_MAX,
   isContentDeliveryAck,

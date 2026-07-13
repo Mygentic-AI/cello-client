@@ -28,10 +28,12 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { decode, Encoder } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
@@ -52,7 +54,6 @@ import {
   type SecurityGatewayClient,
 } from "@cello-protocol/gateway";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 const MAX_REFUSED_PARKED_ENTRIES = 512;
@@ -624,6 +625,15 @@ export class SessionNodeManager {
     // read below. Idempotent, no column DEFAULT, grandfathers existing contacts to WHITELISTED once.
     migrateContactsAddTierMetadata(this.#db, this.#logger);
 
+    // §1.1: normalize frost_commitments / frost_verifying_shares to ONE CBOR encoding. Registration
+    // wrote them with the shared encoder; the refresh path wrote them with cbor-x's bare `encode`,
+    // so an agent's share blobs changed format the first time it ran `cello_refresh_shares` and both
+    // formats are on disk. Both producers now use encodeCbor; this rewrites what is already stored.
+    // Idempotent (a canonical blob re-encodes to itself and is skipped) and per-row fail-safe (an
+    // undecodable share is LEFT ALONE, never dropped — losing key material is worse than an old
+    // encoding cbor-x still reads).
+    migrateCborBlobsToCanonical(this.#db, this.#logger);
+
     // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
     // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
     // token has no sensible default (a required credential, unlike AWAY/TTL/CONTACT's real
@@ -924,7 +934,11 @@ export class SessionNodeManager {
            AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}`,
       )
       .get(this.#requireAgentId(agentName), sessionId) as { unread_count: number } | undefined;
-    return row ? row.unread_count : 0;
+    // Absent row → "I cannot count", which is NOT "you are caught up". Answer the same way the
+    // #db guard above does. Unreachable today (SELECT COUNT(*) with no GROUP BY always yields a
+    // row), but a fail-OPEN default inside a fail-CLOSED gate is a defect that only needs the query
+    // to change once. The two branches must never disagree about what "unknown" means.
+    return row ? row.unread_count : 1;
   }
 
   /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
@@ -2903,7 +2917,7 @@ export class SessionNodeManager {
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
       this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2);
-      const frame = CBOR_ENC.encode({
+      const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,
         content_hash: contentHash,
@@ -3464,6 +3478,38 @@ export class SessionNodeManager {
     const leafIndex = terminalBlock
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
       : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
+
+    // NO relay witness for this hash. We appended it anyway — refusing would make the relay a hard
+    // precondition for reading mail, so a relay outage would render the inbox unreadable, and the
+    // direct path and park backstop exist precisely to survive that. But this append is a WEAKER
+    // guarantee and must not masquerade as the stronger one: with a witness, the received content is
+    // checked against a hash the sender committed to a third party; without one, the only available
+    // hash rode in the same frame as the content, so the check is the sender's claim against the
+    // sender's own claim. Say so. A sender who simply never submits to the relay is otherwise
+    // indistinguishable from one the relay merely has not witnessed YET.
+    // The relay witness is an INDEPENDENT attestation: a (content_hash → sequence) binding derived
+    // from the sender's own signed leaf. Holding one, we check received content against a hash the
+    // sender committed to a THIRD PARTY. Holding none, the only hash available rode in the same frame
+    // as the content — the sender's claim checked against the sender's claim.
+    //
+    // Unwitnessed content is still ingested. Refusing it would make the relay a precondition for
+    // READING mail, so a relay outage would render the inbox unreadable — the redundancy the direct
+    // path and the park backstop exist to provide.
+    //
+    // Warn ONLY when a witness was EXPECTED. A session with no relay attached has no witness BY
+    // DESIGN, and warning on every message there would bury the one case that means something —
+    // a relay IS attached, so the sender's leaf should have been submitted and witnessed, and it
+    // was not. A signal that fires on the normal case is not a signal.
+    if (canonicalSeq === undefined && this.#activeNodes.get(key)?.relayClient) {
+      this.#logger.warn("session.content.unwitnessed", {
+        agentName,
+        sessionId,
+        leafIndex,
+        contentHash: contentHashHex,
+        correlationId,
+        guidance: "a relay is attached to this session but no witness bound this content hash — it was ingested with no independent commitment from the sender",
+      });
+    }
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
@@ -3717,7 +3763,7 @@ export class SessionNodeManager {
     if (!entry) return;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      const frame = CBOR_ENC.encode({
+      const frame = encodeCbor({
         type: "content_delivery_ack",
         session_id: sessionId,
         content_hash: contentHash,

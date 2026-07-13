@@ -1098,3 +1098,61 @@ describe("M8C-PRIMARY-1: participateInCeremony — primary-release context", () 
     ).rejects.toThrow(/not bootstrapped/i);
   });
 });
+
+// ─── The sovereign-node invariant: a signer with NO directory nodes must REFUSE ───────────────
+//
+// CLAUDE.md, non-negotiable: "no single node can complete a threshold ceremony alone… Any
+// implementation that allows a single node to produce a valid ceremony output is a security
+// violation, regardless of whether tests pass."
+//
+// This is the code path that enforces it, and it was reachable by accident. session-ceremony's
+// hydrateShareAndStubs leaves `directoryNodeStubs` UNDEFINED whenever `getNode()` returns null —
+// and the daemon's shared/back-compat path handed it a getter that could only ever return null
+// (`directoryNode` was declared and never assigned; §1.4). FrostThresholdSigner then does
+// `config.directoryNodeStubs ?? []` and proceeds with an EMPTY set of counterparties.
+//
+// What saves us is the pre-check: reachable (0) < threshold - 1 (1) → refuse before signing. So the
+// daemon fails closed and cannot forge a seal by itself. Nothing pinned that. Pin it, because the
+// tempting "fix" for an empty stub set — fall back to the in-process stubs that are RIGHT THERE in
+// this file — would turn a refusal into exactly the forge-alone hole the invariant forbids.
+describe("SOVEREIGN-NODE INVARIANT: no directory nodes → refuse, never sign alone", () => {
+  let scope: ReturnType<typeof createTestScope>;
+  beforeEach(() => { scope = createTestScope(); });
+  afterEach(async () => { await scope.run(async () => {}); });
+
+  for (const [label, stubs] of [
+    ["undefined (what a null getNode() produces)", undefined],
+    ["an empty array", []],
+  ] as const) {
+    it(`refuses to produce a threshold signature with ${label}`, async () => {
+      const agentPubkey = makeAgentPubkey(7);
+      // Bootstrap legitimately (3 real nodes) so the LOCAL share exists and is valid — this proves
+      // the refusal comes from having no counterparties, not from a missing share.
+      await bootstrapKeyShares(agentPubkey, {
+        threshold: 2,
+        participants: 3,
+        directoryNodeStubs: createInProcessStubs(3),
+      });
+
+      // ...then sign with nobody to sign WITH.
+      const alone = new FrostThresholdSigner(
+        { threshold: 2, participants: 3, directoryNodeStubs: stubs },
+        agentPubkey,
+      );
+
+      // It refuses by RESULT, not by throwing — so assert on the result, and assert the thing that
+      // actually matters: no signature came out. A test that only checked `ok === false` would still
+      // pass if a future change returned ok:false alongside a usable signature.
+      // NB: the signature is (ceremonyId, tbs, context) — tbs SECOND.
+      const result = await alone.participateInCeremony(
+        "ceremony-alone",
+        makeTbs("seal:forged-alone"),
+        CONTEXT_SEAL,
+      );
+      expect(result.ok).toBe(false);
+      expect(result).not.toHaveProperty("signature");
+      if (result.ok) return;
+      expect(result.error.reason).toBe("DIRECTORY_BELOW_THRESHOLD");
+    });
+  }
+});

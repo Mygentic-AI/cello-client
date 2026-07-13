@@ -66,11 +66,8 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 
-// Same config as session.ts/revocation.ts's own TBS builders — tagUint8Array:false so byte
-// strings encode as definite-length CBOR byte strings (stable, encoder-independent layout).
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** Domain separation tag — bound as the first TBS field so a primary-transfer release signature
  *  can never be replayed as any other CELLO signature (and vice-versa) even before FROST's own
@@ -92,7 +89,7 @@ export function buildPrimaryTransferTbs(
   nonce: string,
   timestamp: number,
 ): Uint8Array {
-  return CBOR_ENC.encode([
+  return encodeCbor([
     PRIMARY_TRANSFER_DOMAIN,
     kLocalPubkeyHex,
     newDaemonId,

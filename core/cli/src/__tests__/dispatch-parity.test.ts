@@ -33,15 +33,10 @@ vi.mock("../commands.js", async (importOriginal) => {
     refreshShares: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
     relayReceipts: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
     sessions: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    contactAdd: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    contactRemove: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    contactList: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    contactSetTier: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    contactSetAway: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    settingsGet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    settingsSet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
-    monikerSet: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
     telegramSetToken: vi.fn(async () => ({ exitCode: 0, output: "ok" })),
+    // NB: contact*, settings*, and moniker* are NOT here. They live in parity-commands (below), and
+    // that is the point of §1.3 — there is one agent-resolution path, not two. A stub left here would
+    // pass whether or not the command actually routes through the replay.
   };
 });
 
@@ -68,6 +63,9 @@ vi.mock("../parity-commands.js", async (importOriginal) => {
     receive: stub(),
     closeSession: stub(),
     awaitSession: stub(),
+    settingsGet: stub(),
+    settingsSet: stub(),
+    monikerSet: stub(),
   };
 });
 
@@ -168,18 +166,22 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     expect(parity.contactSetAway).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, o);
   });
 
+  // §1.3: these now dispatch to PARITY, so they carry ParityOptions ({ agent, pretty }) rather than a
+  // bare agent string — which is what puts them on the same use-agent replay as every other
+  // agent-scoped command. Asserting against `parity.*` here is deliberate: if someone re-adds a
+  // settings/moniker implementation to commands.js, this test fails rather than silently passing.
   it("settings / moniker: sub-verbs and the clear path", async () => {
     await run("settings", ["get", "away.default", "--agent", "alice"]);
-    expect(commands.settingsGet).toHaveBeenCalledWith(CELLO_DIR, "away.default", "alice");
+    expect(parity.settingsGet).toHaveBeenCalledWith(CELLO_DIR, "away.default", { agent: "alice", pretty: false });
     await run("settings", ["get"]); // key omitted → list all
-    expect(commands.settingsGet).toHaveBeenLastCalledWith(CELLO_DIR, undefined, undefined);
+    expect(parity.settingsGet).toHaveBeenLastCalledWith(CELLO_DIR, undefined, { agent: undefined, pretty: false });
     await run("settings", ["set", "bounds.known.max_sessions", "8"]);
-    expect(commands.settingsSet).toHaveBeenCalledWith(CELLO_DIR, "bounds.known.max_sessions", "8", undefined);
+    expect(parity.settingsSet).toHaveBeenCalledWith(CELLO_DIR, "bounds.known.max_sessions", "8", { agent: undefined, pretty: false });
 
     await run("moniker", ["set", "Bob", "--agent", "alice"]);
-    expect(commands.monikerSet).toHaveBeenCalledWith(CELLO_DIR, "Bob", "alice");
+    expect(parity.monikerSet).toHaveBeenCalledWith(CELLO_DIR, "Bob", { agent: "alice", pretty: false });
     await run("moniker", ["clear"]); // clear = null, and must not be confused with set
-    expect(commands.monikerSet).toHaveBeenLastCalledWith(CELLO_DIR, null, undefined);
+    expect(parity.monikerSet).toHaveBeenLastCalledWith(CELLO_DIR, null, { agent: undefined, pretty: false });
   });
 
   it("telegram: set-token forwards both credentials", async () => {
@@ -278,7 +280,7 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     // contact, and both "succeed". The registry must keep them apart.
     await run("contact", ["pk1", "set-moniker", "Sup"]);
     expect(parity.contactSetMoniker).toHaveBeenCalledWith(CELLO_DIR, "pk1", "Sup", { agent: undefined, pretty: false });
-    expect(commands.monikerSet).not.toHaveBeenCalled();
+    expect(parity.monikerSet).not.toHaveBeenCalled();
 
     await run("contact", ["pk1", "set-moniker"]); // empty → clear
     expect(parity.contactSetMoniker).toHaveBeenLastCalledWith(CELLO_DIR, "pk1", null, { agent: undefined, pretty: false });

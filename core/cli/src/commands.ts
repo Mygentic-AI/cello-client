@@ -19,6 +19,29 @@ import {
 } from "@cello-protocol/daemon";
 
 /**
+ * Open an IPC connection, run `fn`, and ALWAYS close it.
+ *
+ * The close belongs in a `finally`, never after the send. The daemon enforces IPC_CONNECTION_LIMIT,
+ * so a connection is a BOUNDED resource: a `client.close()` written after `client.send()` inside a
+ * try is SKIPPED on any throw, and each failed command leaks a socket the daemon never reclaims.
+ * Leak enough and it refuses new connections — a failure whose symptom looks nothing like its cause.
+ *
+ * Every single-call command goes through this. The three that cannot are `login` (the connection is
+ * created by connectOrStart and handed to us), `logout` (it must outlive the send to poll for death),
+ * and `daemonGone` (it races the connect against a timeout). Each closes in a `finally` or reaps the
+ * abandoned promise explicitly — see them. Any NEW command that reaches for connectToDaemon directly
+ * is reintroducing the leak.
+ */
+async function withIpc<T>(socketPath: string, fn: (client: IpcClient) => Promise<T>): Promise<T> {
+  const client = await connectToDaemon(socketPath);
+  try {
+    return await fn(client);
+  } finally {
+    client.close();
+  }
+}
+
+/**
  * M8C-LOGINSTART-1 CORE: bring every loaded agent online. Called by `cello login` after the daemon
  * is up. login ALWAYS completes — a per-agent start failure is COLLECTED, never thrown, so one bad
  * agent can't abort login. `cello_start_agent` is idempotent, so re-login is safe. The per-agent
@@ -115,12 +138,25 @@ const LOGOUT_WAIT_POLL_MS = 50;
  * can be reused, and a lock file can be deleted by anyone.
  */
 async function daemonGone(celloDir: string, socketPath: string, logger: Logger): Promise<boolean> {
+  // connectToDaemon has no connect timeout of its own — bound the probe so a pathological hang
+  // cannot stall the poll loop past its deadline. On the expected path the socket is already gone,
+  // so this fails fast (ENOENT/ECONNREFUSED).
+  //
+  // The race LOSER must still be closed. If the timeout wins, the connect promise is abandoned — but
+  // it can still resolve afterwards into a live IpcClient that nobody holds and nobody closes. This
+  // runs in a POLL LOOP inside one process, against the daemon's bounded IPC_CONNECTION_LIMIT, so
+  // those accumulate. Of every connect in this file it is the only one that can genuinely exhaust the
+  // pool — everywhere else the process exits and the OS reclaims the fd. So: keep the promise, and
+  // close whatever it eventually yields.
+  const connecting = connectToDaemon(socketPath);
+  connecting.then(
+    (late) => { try { late.close(); } catch { /* already closed by the winner below */ } },
+    () => { /* never connected — nothing to reap */ },
+  );
+
   try {
-    // connectToDaemon has no connect timeout of its own — bound the probe so a pathological hang
-    // cannot stall the poll loop past its deadline. On the expected path the socket is already gone,
-    // so this fails fast (ENOENT/ECONNREFUSED).
     const probe = await Promise.race([
-      connectToDaemon(socketPath),
+      connecting,
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error("probe_timeout")), 500)),
     ]);
     probe.close();
@@ -213,10 +249,12 @@ export async function logout(
 
   try {
     await client.send("shutdown");
-    client.close();
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { exitCode: 1, output: `Failed to stop daemon: ${message}` };
+  } finally {
+    // In the `finally`, not after the send: a throw from `shutdown` must not leak the connection.
+    client.close();
   }
 
   // The request is in — tell the operator NOW, then report "stopped" only when it is true.
@@ -294,15 +332,13 @@ export async function register(
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("cello_register", { agent, preAuthToken, phoneStub })) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_register", { agent, preAuthToken, phoneStub }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
       agent_id?: string;
       primary_pubkey?: string;
     };
-    client.close();
 
     if (!result.ok) {
       return {
@@ -349,8 +385,7 @@ export async function createAgent(celloDir: string, name: string): Promise<Comma
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("cello_create_agent", { name })) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_create_agent", { name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
@@ -358,7 +393,6 @@ export async function createAgent(celloDir: string, name: string): Promise<Comma
       pubkey?: string;
       agentId?: string;
     };
-    client.close();
 
     if (!result.ok) {
       return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
@@ -389,8 +423,7 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry refresh." };
   }
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("cello_refresh_shares", { name })) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_refresh_shares", { name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
@@ -398,7 +431,6 @@ export async function refreshShares(celloDir: string, name: string): Promise<Com
       primary_pubkey?: string;
       verifying_shares_digest?: string;
     };
-    client.close();
     if (!result.ok) {
       return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
     }
@@ -428,14 +460,12 @@ export async function relayReceipts(celloDir: string, name: string): Promise<Com
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry receipts." };
   }
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("cello_get_relay_receipts", { name })) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_get_relay_receipts", { name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
       receipts?: unknown[];
     };
-    client.close();
     if (!result.ok) {
       return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
     }
@@ -464,8 +494,7 @@ export async function removeAgent(celloDir: string, name: string): Promise<Comma
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("cello_remove_agent", { name })) as {
+    const result = (await withIpc(lock.socketPath, (client) => client.send("cello_remove_agent", { name }))) as {
       ok: boolean;
       reason?: string;
       guidance?: string;
@@ -474,7 +503,6 @@ export async function removeAgent(celloDir: string, name: string): Promise<Comma
       oneWay?: boolean;
       directoryRevocation?: string;
     };
-    client.close();
 
     if (!result.ok) {
       return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
@@ -515,9 +543,7 @@ export async function status(celloDir: string): Promise<CommandResult> {
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    const result = (await client.send("status")) as DaemonStatusResponse;
-    client.close();
+    const result = (await withIpc(lock.socketPath, (client) => client.send("status"))) as DaemonStatusResponse;
     return { exitCode: 0, output: JSON.stringify(result, null, 2) };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -549,12 +575,10 @@ export async function sessions(
   }
 
   try {
-    const client = await connectToDaemon(lock.socketPath);
     const params: Record<string, unknown> = {};
     if (opts.filter) params.filter = opts.filter;
     if (opts.limit !== undefined) params.limit = opts.limit;
-    const result = await client.send("list_sessions", params);
-    client.close();
+    const result = (await withIpc(lock.socketPath, (client) => client.send("list_sessions", params)));
     return { exitCode: 0, output: JSON.stringify(result, null, 2) };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -563,89 +587,6 @@ export async function sessions(
       output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2),
     };
   }
-}
-
-/** M8C-CONTACT-1: `cello contact add/remove/list [--agent <name>]`. Shared connect+dispatch. */
-async function contactCommand(
-  celloDir: string,
-  method: "cello_contact_add" | "cello_contact_remove" | "cello_contact_list" | "cello_contact_set_tier" | "cello_contact_set_away" | "cello_set_moniker" | "cello_settings_get" | "cello_settings_set",
-  params: Record<string, unknown>,
-): Promise<CommandResult> {
-  const lockFilePath = join(celloDir, "daemon.lock");
-  const lock = await readLock(lockFilePath);
-  if (!lock) {
-    return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
-  }
-  try {
-    const client = await connectToDaemon(lock.socketPath);
-    await client.send("ipc.connect", { clientType: "cli" });
-    const result = (await client.send(method, params)) as { ok: boolean };
-    client.close();
-    return { exitCode: result.ok ? 0 : 1, output: JSON.stringify(result, null, 2) };
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { exitCode: 1, output: JSON.stringify({ daemon: "unreachable", error: message }, null, 2) };
-  }
-}
-
-export async function contactAdd(celloDir: string, pubkey: string, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { pubkey };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_contact_add", params);
-}
-
-export async function contactRemove(celloDir: string, pubkey: string, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { pubkey };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_contact_remove", params);
-}
-
-export async function contactList(celloDir: string, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = {};
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_contact_list", params);
-}
-
-/** DOD-CONTACT-VIEW-1: `cello contact tier <pubkey> <tier> [--agent <name>]`. Validation (a known
- *  0..4 constant) lives daemon-side; the CLI surfaces the verdict verbatim. */
-export async function contactSetTier(celloDir: string, pubkey: string, tier: number, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { pubkey, tier };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_contact_set_tier", params);
-}
-
-/** DOD-AWAY-TIER-1: `cello contact away <pubkey> <message> [--agent <name>]` — set a per-contact away
- *  message (or clear it with an empty message → null). */
-export async function contactSetAway(celloDir: string, pubkey: string, message: string | null, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { pubkey, message };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_contact_set_away", params);
-}
-
-/** DOD-SETTINGS-SURFACE-1: `cello settings get [key] [--agent <name>]` — a single key, or all set
- *  values when no key. Validation lives daemon-side; the CLI surfaces the verdict verbatim. */
-export async function settingsGet(celloDir: string, key: string | undefined, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = {};
-  if (key !== undefined) params.key = key;
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_settings_get", params);
-}
-
-/** DOD-SETTINGS-SURFACE-1: `cello settings set <key> <value> [--agent <name>]` — the daemon validates
- *  the key (known) and, for bound keys, a finite positive integer (rejects Infinity/negative/0). */
-export async function settingsSet(celloDir: string, key: string, value: string, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { key, value };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_settings_set", params);
-}
-
-/** MONIKER-1: `cello moniker set <name>` / `cello moniker clear` — set (string) or clear (null)
- *  the agent's outbound-name override via cello_set_moniker. Validation lives daemon-side
- *  (shared MONIKER-0 rule); the CLI surfaces the daemon's verdict verbatim. */
-export async function monikerSet(celloDir: string, moniker: string | null, agent?: string): Promise<CommandResult> {
-  const params: Record<string, unknown> = { moniker };
-  if (agent) params.agent = agent;
-  return contactCommand(celloDir, "cello_set_moniker", params);
 }
 
 /** M8C-TGDOOR-1: `cello telegram set-token <bot_token> <allowlisted_chat_id>` — persists the
@@ -658,10 +599,10 @@ export async function telegramSetToken(celloDir: string, botToken: string, chatI
     return { exitCode: 1, output: JSON.stringify({ daemon: "stopped" }, null, 2) };
   }
   try {
-    const client = await connectToDaemon(lock.socketPath);
-    await client.send("ipc.connect", { clientType: "cli" });
-    const result = (await client.send("cello_telegram_set_token", { bot_token: botToken, allowlisted_chat_id: chatId })) as { ok: boolean };
-    client.close();
+    const result = (await withIpc(lock.socketPath, async (client) => {
+      await client.send("ipc.connect", { clientType: "cli" });
+      return client.send("cello_telegram_set_token", { bot_token: botToken, allowlisted_chat_id: chatId });
+    })) as { ok: boolean };
     return { exitCode: result.ok ? 0 : 1, output: JSON.stringify(result, null, 2) };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);

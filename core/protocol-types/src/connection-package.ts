@@ -61,7 +61,7 @@
  *   NIST FIPS 204 — Module-Lattice-Based Digital Signature Standard (ML-DSA)
  */
 
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 import { decode as cborDecode } from "cbor-x";
 
 /**
@@ -291,7 +291,6 @@ export type BuildPseudonymBindingResult =
  * Canonical CBOR encoder per RFC 8949 §4.2.1.
  * tagUint8Array: false — encode Uint8Array as CBOR byte strings (major type 2).
  */
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** Maximum pseudonym_label size in UTF-8 bytes (AC-007, AC-008). */
 export const MAX_PSEUDONYM_LABEL_BYTES = 64;
@@ -320,7 +319,7 @@ function buildPseudonymBindingTbs(
   created_at: number
 ): Uint8Array {
   const tsEncoded = created_at > 0xffffffff ? BigInt(created_at) : created_at;
-  return new Uint8Array(CBOR_ENC.encode([
+  return new Uint8Array(encodeCbor([
     pseudonym_label,
     k_local_pubkey,
     primary_pubkey,
@@ -340,7 +339,7 @@ function buildPseudonymBindingTbs(
 function buildEndorsementTbs(e: Omit<Endorsement, "endorser_ml_dsa_signature">): Uint8Array {
   const createdEncoded = e.created_at > 0xffffffff ? BigInt(e.created_at) : e.created_at;
   const expiresEncoded = e.expires_at > 0xffffffff ? BigInt(e.expires_at) : e.expires_at;
-  return new Uint8Array(CBOR_ENC.encode([
+  return new Uint8Array(encodeCbor([
     e.endorser_pubkey,
     e.endorser_ml_dsa_pubkey,
     e.target_pubkey,
@@ -361,7 +360,7 @@ function buildEndorsementTbs(e: Omit<Endorsement, "endorser_ml_dsa_signature">):
 function buildAttestationTbs(a: Omit<Attestation, "attester_ml_dsa_signature">): Uint8Array {
   const createdEncoded = a.created_at > 0xffffffff ? BigInt(a.created_at) : a.created_at;
   const expiresEncoded = a.expires_at > 0xffffffff ? BigInt(a.expires_at) : a.expires_at;
-  return new Uint8Array(CBOR_ENC.encode([
+  return new Uint8Array(encodeCbor([
     a.attester_pubkey,
     a.attester_ml_dsa_pubkey,
     a.attestation_type,
@@ -575,7 +574,7 @@ export function validateConnectionPackage(
  * Timestamps use minimal encoding per RFC 8949 §4.2.1.
  */
 export function encodeConnectionPackage(pkg: ConnectionPackage): Uint8Array {
-  return CBOR_ENC.encode({
+  return encodeCbor({
     pseudonym_binding: encodePseudonymBindingMap(pkg.pseudonym_binding),
     endorsements: pkg.endorsements.map(encodeEndorsementMap),
     attestations: pkg.attestations.map(encodeAttestationMap),

@@ -16,7 +16,8 @@
  * the registration-time signer was on the disposed RegistrationContext).
  */
 
-import { decode, encode } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import { createHash } from "node:crypto";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
 import { bindLegibilityToTbs, type LegibilityForHash } from "./seal-legibility-tbs.js";
@@ -352,8 +353,8 @@ export async function runAgentRefresh(
       signingShare: result.signingShare,
       threshold: h.share.threshold,
       participants: h.share.participants,
-      commitmentsCbor: encode(result.commitments),
-      verifyingSharesCbor: encode(result.verifyingShares),
+      commitmentsCbor: encodeCbor(result.commitments),
+      verifyingSharesCbor: encodeCbor(result.verifyingShares),
       dkgMethod: "network_dkg",
       // M8B quorum: a proactive refresh re-randomizes shares among the SAME membership — carry the
       // quorum Q forward, else this UPDATE wipes frost_directory_node_ids to NULL and the next restart's

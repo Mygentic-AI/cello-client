@@ -24,9 +24,6 @@ import {
   relayReceipts,
   sessions,
   type SessionFilter,
-  settingsGet,
-  settingsSet,
-  monikerSet,
   telegramSetToken,
   type CommandResult,
 } from "./commands.js";
@@ -51,6 +48,9 @@ import {
   receive,
   closeSession,
   awaitSession,
+  settingsGet,
+  settingsSet,
+  monikerSet,
 } from "./parity-commands.js";
 
 /** Read the whole of stdin — `cello send <id> --stdin` for message text with newlines/quotes. */
@@ -678,12 +678,14 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
       "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
     flags: AGENT_FLAG,
+    jsonOut: true,
     async run(ctx, args) {
-      const { agent, positional } = splitAgentFlag(args);
+      const { agent, pretty, positional } = parityOpts(args);
+      const opts = { agent, pretty };
       const [sub, key, value] = positional;
-      if (sub === "get") return legacy(await settingsGet(ctx.celloDir, key, agent)); // key optional → all
+      if (sub === "get") return settingsGet(ctx.celloDir, key, opts); // key optional → all
       if (sub === "set" && key && value !== undefined) {
-        return legacy(await settingsSet(ctx.celloDir, key, value, agent));
+        return settingsSet(ctx.celloDir, key, value, opts);
       }
       return {
         stdout: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]",
@@ -706,11 +708,13 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  override it with their own pet name for you. Never sent to the directory.\n" +
       "  Example:  cello moniker set Wonderland_Alice --agent alice",
     flags: AGENT_FLAG,
+    jsonOut: true,
     async run(ctx, args) {
-      const { agent, positional } = splitAgentFlag(args);
+      const { agent, pretty, positional } = parityOpts(args);
+      const opts = { agent, pretty };
       const [sub, name] = positional;
-      if (sub === "set" && name) return legacy(await monikerSet(ctx.celloDir, name, agent));
-      if (sub === "clear" && !name) return legacy(await monikerSet(ctx.celloDir, null, agent));
+      if (sub === "set" && name) return monikerSet(ctx.celloDir, name, opts);
+      if (sub === "clear" && !name) return monikerSet(ctx.celloDir, null, opts);
       return { stdout: helpForSpec("moniker"), stderr: "", exitCode: 1 };
     },
   },

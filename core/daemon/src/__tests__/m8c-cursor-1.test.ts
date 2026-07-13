@@ -409,4 +409,77 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     const sendB = (await client.send("cello_send", { session_id: SID_B, content: "reply B" })) as Record<string, unknown>;
     expect(sendB).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
   });
+
+  // The read-before-write gate FAILS CLOSED when it cannot count.
+  //
+  // getUnreadReceivedCount answers one question for the send gate: "is there counterparty content
+  // this agent has not read?" A 0 means "caught up" and UNBLOCKS a send. So every path that cannot
+  // actually answer must return a POSITIVE count, never 0 — a 0 guessed from a broken DB silently
+  // defeats the gate, which is the one thing the gate exists to prevent.
+  //
+  // SCOPE — read this before trusting it as coverage. This pins ONLY the reachable branch (a closed
+  // DB). The other absent-input branch (the query returning no row) is UNREACHABLE — SELECT COUNT(*)
+  // with no GROUP BY always yields exactly one row — so it cannot be driven without inventing a DB
+  // seam that exists only for the test. That branch was still corrected (a fail-OPEN default inside a
+  // gate documented as FAILS CLOSED is a defect whether or not today's SQL spares us), but this test
+  // does NOT cover it: revert that line and this still passes. It guards the branch beside it.
+  it("a closed DB refuses the send — the gate never guesses 'caught up' (reachable branch only)", async () => {
+    await makeAgentDir("alice");
+    const h = await start(noopLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const inbound = new TextEncoder().encode("unread counterparty content");
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
+    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+
+    // Tear the DB out from under the gate. It can no longer count anything.
+    await snm.gracefulShutdown();
+
+    // It must STILL refuse — "I don't know" is not "you're caught up".
+    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+  });
+
+  // An unwitnessed append is announced ONLY when a witness was expected.
+  //
+  // The relay witness is an independent attestation — a (content_hash → sequence) binding derived
+  // from the sender's own signed leaf. With it, received content is checked against a hash the sender
+  // committed to a third party; without it, the only hash available rode in the same frame as the
+  // content, so the check is the sender's claim against the sender's claim.
+  //
+  // Unwitnessed content is still INGESTED: refusing it would make the relay a precondition for
+  // reading mail, and a relay outage would render the inbox unreadable.
+  //
+  // But a session with NO relay attached has no witness BY DESIGN. Warning there would fire on every
+  // message of a normal no-relay session and bury the one case that means something. A signal that
+  // fires on the normal case is not a signal.
+  it("a no-relay session does NOT warn — the signal must not fire on a designed benign state", async () => {
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const spyLogger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(event: string, ctx?: Record<string, unknown>) { events.push({ event, ctx: ctx ?? {} }); },
+    };
+
+    await makeAgentDir("alice");
+    const h = await start(spyLogger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    // createSessionNode attaches NO relay client — the no-relay session, exactly as designed.
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const content = new TextEncoder().encode("no relay on this session");
+    const res = await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-norelay");
+    expect(res.ok).toBe(true); // ingested, not refused — availability is preserved
+
+    // Teeth: drop the "was a witness expected?" guard and this fires, once per message, forever.
+    expect(
+      events.filter((e) => e.event === "session.content.unwitnessed"),
+      "a session with no relay must not warn about a witness it was never going to get",
+    ).toHaveLength(0);
+  });
+
+  // NOT COVERED HERE, deliberately: the case the warn EXISTS for — a relay IS attached, so the
+  // sender's leaf should have been submitted and witnessed, and it was not. Reaching it means
+  // attaching a live relay client to the session (#activeNodes is private, and a seam added purely
+  // to fake one would test the seam). It belongs in the live spine, against a real relay.
+
 });

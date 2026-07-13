@@ -25,7 +25,7 @@ import {
   expect,
 } from "@claude-flow/testing";
 import { generateKeypair } from "@cello-protocol/crypto";
-import { extractStructure1, buildEnvelopeV1 } from "../envelope.js";
+import { encodeStructure1 } from "../structure1.js";
 import {
   buildStructure2,
   encodeStructure2,
@@ -75,10 +75,29 @@ async function makeStructure2(seq = 1, lastSeenSeq = 0) {
   const sessionId = new Uint8Array(16).fill(0x10);
   const ts = 1_700_000_000_000;
 
-  const envResult = await buildEnvelopeV1(content, kp, ts, sessionId, lastSeenSeq);
-  if (!envResult.ok) throw new Error("buildEnvelopeV1 failed");
+  // Mint the three sender-side inputs Structure 2 binds — content hash, pubkey, and the sender's
+  // signature over the canonical Structure 1 — directly. This used to be driven through
+  // buildEnvelopeV1 (the M6 MessageEnvelope module, now deleted); the SUBJECT here was always
+  // buildStructure2, never the envelope.
+  const senderPubkey = await kp.getPublicKey();
+  const contentHash = new Uint8Array(await crypto.subtle.digest("SHA-256", content));
+  const structure1 = encodeStructure1({
+    contentHash,
+    senderPubkey,
+    sessionId,
+    lastSeenSeq,
+    timestamp: ts,
+  });
+  const senderSignature = await kp.sign(structure1);
 
-  const env = envResult.envelope;
+  const env = {
+    sender_pubkey: senderPubkey,
+    content_hash: contentHash,
+    sender_signature: senderSignature,
+    session_id: sessionId,
+    last_seen_seq: lastSeenSeq,
+    timestamp: ts,
+  };
   const prevRoot = new Uint8Array(32).fill(0x00);
 
   const s2Result = buildStructure2(
@@ -103,7 +122,7 @@ async function makeStructure2(seq = 1, lastSeenSeq = 0) {
 // ─── AC-001: Structure 1 canonical CBOR fixture (regression guard) ───────────
 
 describe("AC-001: Structure 1 canonical CBOR fixture (regression guard from MSG-003)", () => {
-  it("AC-001: extractStructure1 bytes still match structure1-canonical.json", () => {
+  it("AC-001: Structure 1 canonical bytes still match structure1-canonical.json", () => {
     const fixture = JSON.parse(
       readFileSync(join(__dirname, "../../test/vectors/structure1-canonical.json"), "utf8")
     ) as {
@@ -117,18 +136,13 @@ describe("AC-001: Structure 1 canonical CBOR fixture (regression guard from MSG-
       expected_cbor_hex: string;
     };
 
-    const fakeEnvelope = {
-      protocol_version: 1 as const,
-      sender_pubkey: fromHex(fixture.inputs.sender_pubkey_hex),
-      content: new Uint8Array(0),
-      content_hash: fromHex(fixture.inputs.content_hash_hex),
-      session_id: fromHex(fixture.inputs.session_id_hex),
-      last_seen_seq: fixture.inputs.last_seen_seq,
+    const bytes = encodeStructure1({
+      contentHash: fromHex(fixture.inputs.content_hash_hex),
+      senderPubkey: fromHex(fixture.inputs.sender_pubkey_hex),
+      sessionId: fromHex(fixture.inputs.session_id_hex),
+      lastSeenSeq: fixture.inputs.last_seen_seq,
       timestamp: fixture.inputs.timestamp,
-      sender_signature: new Uint8Array(64),
-    };
-
-    const bytes = extractStructure1(fakeEnvelope);
+    });
     expect(toHex(bytes)).toBe(fixture.expected_cbor_hex);
   });
 });

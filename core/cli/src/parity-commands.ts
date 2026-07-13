@@ -162,9 +162,31 @@ async function withDaemon(
             opts,
           );
         }
+      } else {
+        // NO selection. The daemon's fallback is "the sole ONLINE agent", and it refuses only when
+        // two or more are online — so with several agents known and exactly one up, it runs the
+        // command as that one. `cello stop-agent <selected>` clears the selection, which walks
+        // straight into it: the next command silently re-targets whoever else happens to be online.
+        //
+        // With ONE known agent the fallback is unambiguous and useful (a fresh operator who never ran
+        // `use-agent` still works). With more than one it is a guess about intent, and a guess must
+        // not be made silently on the operator's behalf.
+        const known = await listKnownAgents(client);
+        if (known === null) {
+          return emitTransportError(
+            "agent_list_unavailable",
+            "The daemon's agent list could not be read, so this command was not run — without it there is no way to tell whether an unselected command would target the agent you meant. Check 'cello status'.",
+            opts,
+          );
+        }
+        if (known.length > 1) {
+          return emitTransportError(
+            "no_agent_selected",
+            `No agent is selected and the daemon knows ${known.length} (${known.join(", ")}), so this command was not run — it would otherwise have silently targeted whichever agent happened to be online. Choose one with 'cello use-agent <name>', or pass --agent <name>.`,
+            opts,
+          );
+        }
       }
-      // No selection at all → send nothing, and let the daemon apply its own documented fallback
-      // (sole online agent; ambiguous → no_current_agent). Guessing here would misroute.
     }
 
     const result = await fn(client);
@@ -189,6 +211,27 @@ async function withDaemon(
 async function isAgentOnline(client: IpcClient, name: string): Promise<boolean> {
   const res = (await client.send("cello_list_agents")) as { agents?: Array<{ name?: string; state?: string }> };
   return (res.agents ?? []).some((a) => a.name === name && a.state === "online");
+}
+
+/**
+ * Every agent the daemon KNOWS — loaded, whether online or not. Used to decide whether "no
+ * selection" is unambiguous (one agent) or a guess about the operator's intent (several).
+ *
+ * Counts KNOWN agents, not online ones. Counting only the online ones reopens the hole it exists to
+ * close: stopping the selected agent drops the count to one, so the guess looks safe again at
+ * exactly the moment the operator said they do not want that agent.
+ *
+ * FAILS CLOSED, like its sibling isAgentOnline. Returns null — never an empty list — when the daemon
+ * answers with a shape it does not recognize. An empty list would sail through a `length > 1` guard
+ * and hand the decision straight back to the daemon's sole-online fallback, which is the very thing
+ * the guard is there to prevent. A counter that cannot count must not answer "one".
+ */
+async function listKnownAgents(client: IpcClient): Promise<string[] | null> {
+  const res = (await client.send("cello_list_agents")) as { agents?: unknown };
+  if (!Array.isArray(res.agents)) return null;
+  return (res.agents as Array<{ name?: unknown }>)
+    .map((a) => a.name)
+    .filter((n): n is string => typeof n === "string");
 }
 
 /** The common case: one IPC call, agent-scoped unless stated otherwise. */
@@ -244,6 +287,9 @@ export const IPC_METHODS = {
   "contact-set-tier": "cello_contact_set_tier",
   "contact-set-away": "cello_contact_set_away",
   "contact-set-moniker": "cello_contact_set_moniker",
+  "settings-get": "cello_settings_get",
+  "settings-set": "cello_settings_set",
+  "moniker-set": "cello_set_moniker",
 } as const;
 
 // ─── Group A: agent lifecycle ──────────────────────────────────────────────────────────────────
@@ -342,6 +388,30 @@ export function contactSetAway(celloDir: string, pubkey: string, message: string
 /** `cello contact set-moniker <pubkey> <moniker>` → cello_contact_set_moniker (per-CONTACT pet name). */
 export function contactSetMoniker(celloDir: string, pubkey: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["contact-set-moniker"], { pubkey, moniker }, opts);
+}
+
+// ─── Agent settings and outbound name ──────────────────────────────────────────────────────────
+//
+// AGENT-SCOPED: they write to one agent's row, so they resolve their agent through withDaemon's
+// use-agent replay like every other agent-scoped command. Do not give them a private connection
+// helper — a second connection path is a second agent-resolution rule, and one operator gesture must
+// not mean two different things depending on which command it reaches.
+
+/** `cello settings get [key]` → cello_settings_get. Omitted key returns the whole set. */
+export function settingsGet(celloDir: string, key: string | undefined, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["settings-get"], defined({ key }), opts);
+}
+
+/** `cello settings set <key> <value>` → cello_settings_set. The DAEMON validates the key and, for
+ *  bound keys, that the value is a finite positive integer; the CLI surfaces its verdict verbatim. */
+export function settingsSet(celloDir: string, key: string, value: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
+}
+
+/** `cello moniker set <name>` / `cello moniker clear` → cello_set_moniker. Null clears the override.
+ *  This is the agent's OWN outbound name — not `contact set-moniker`, which names a COUNTERPARTY. */
+export function monikerSet(celloDir: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["moniker-set"], { moniker }, opts);
 }
 
 // ─── Group B: live conversation (mirrors the MCP params EXACTLY) ───────────────────────────────
