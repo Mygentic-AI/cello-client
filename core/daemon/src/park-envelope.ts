@@ -26,7 +26,8 @@
  * Crypto: Ed25519 (RFC 8032), SHA-256 (FIPS 180-4).
  */
 import { timingSafeEqual } from "node:crypto";
-import { encode as cborEncode, decode as cborDecode } from "cbor-x";
+import { decode as cborDecode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
 
@@ -93,7 +94,7 @@ export function encodeParkEnvelope(args: {
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
 }): Uint8Array {
-  return cborEncode([
+  return encodeCbor([
     PARK_ENVELOPE_VERSION,
     args.content,
     args.structure1Cbor ?? null,

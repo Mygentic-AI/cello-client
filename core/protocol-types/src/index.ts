@@ -1,3 +1,5 @@
+export { encodeCbor, decodeCbor } from "./cbor.js";
+
 export type {
   MessageEnvelope,
   MessageEnvelopeV1,
@@ -10,18 +12,8 @@ export type {
   DeserializeResultV1,
 } from "./types.js";
 
-export {
-  MAX_CONTENT_BYTES,
-  buildEnvelope,
-  serializeEnvelope,
-  deserializeEnvelope,
-  validateEnvelope,
-  buildEnvelopeV1,
-  serializeEnvelopeV1,
-  deserializeEnvelopeV1,
-  validateEnvelopeV1,
-  extractStructure1,
-} from "./envelope.js";
+export { MAX_CONTENT_BYTES } from "./limits.js";
+export { encodeStructure1, STRUCTURE1_VERSION } from "./structure1.js";
 
 export type { ScanResultSentinel, Structure2, BuildStructure2Result } from "./structure2.js";
 export {

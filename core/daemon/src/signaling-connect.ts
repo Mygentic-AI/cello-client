@@ -26,7 +26,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { Encoder, decode } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 import type { Stream } from "@libp2p/interface";
 import {
@@ -43,9 +44,6 @@ import type { Logger } from "./types.js";
 const SIGNALING_PROTOCOL_ID = "/cello/signaling/1.0.0";
 const AUTH_DOMAIN_DIR = "CELLO-DIR-AUTH-v1";
 const AUTH_TIMEOUT_MS = 5_000;
-// tagUint8Array:false — match the M6 client encoder so the directory decodes bytes
-// fields (pubkey, signature, nonce) as raw byte strings, not CBOR-tagged values.
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 function toU8(v: unknown): Uint8Array {
   if (v instanceof Uint8Array) return v;
@@ -195,7 +193,7 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
       const authMsg = new Uint8Array(Buffer.concat([domain, nonce, myPubkey]));
       const msgHash = new Uint8Array(createHash("sha256").update(authMsg).digest());
       const sig = await identity.keyProvider.sign(msgHash);
-      const authResponse = CBOR_ENC.encode({
+      const authResponse = encodeCbor({
         type: "signaling_auth_response",
         pubkey: myPubkey,
         signature: sig,
@@ -240,7 +238,7 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
       }
 
       // ── Step 7: announce our peer info so the directory can broker sessions ──
-      const peerInfo = CBOR_ENC.encode({
+      const peerInfo = encodeCbor({
         type: "peer_info_announce",
         peer_id: node.getPeerId(),
         multiaddrs: node.listenAddresses(),
@@ -297,7 +295,7 @@ function wrapSignalingStream(
   let closed = false;
   return {
     async send(frame: unknown): Promise<void> {
-      const encoded = CBOR_ENC.encode(frame) as Uint8Array;
+      const encoded = encodeCbor(frame) as Uint8Array;
       sigStream.send(lp.encode.single(encoded));
     },
     onMessage(handler: (frame: unknown) => void): void {

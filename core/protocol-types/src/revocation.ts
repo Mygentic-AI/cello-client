@@ -16,11 +16,8 @@
  * (sign here / verify there) catch any divergence.
  */
 
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 
-// Same config as session.ts buildSessionEstablishmentTbs — tagUint8Array:false so byte strings encode
-// as definite-length CBOR byte strings (stable, encoder-independent layout).
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** Domain separation tag — bound as the first TBS field so a revocation signature can never be
  *  replayed as any other CELLO signature (and vice-versa). */
@@ -40,7 +37,7 @@ export function buildAgentRevocationTbs(
   revokedAt: number | bigint,
 ): Uint8Array {
   const tsEncoded = typeof revokedAt === "bigint" || revokedAt > 0xffffffff ? BigInt(revokedAt) : revokedAt;
-  return CBOR_ENC.encode([
+  return encodeCbor([
     AGENT_REVOCATION_DOMAIN,
     agentId,
     kLocalPubkeyHex,

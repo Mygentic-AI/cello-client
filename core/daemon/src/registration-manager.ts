@@ -12,16 +12,13 @@
  * otherwise unchanged.
  */
 
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
-// CBOR encoder for serializing FROST commitments/verifyingShares before
-// persistence (not signaling frames — those go through SignalingManager).
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { Logger } from "./types.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -336,8 +333,8 @@ export class RegistrationManager {
           signingShare: dkgResult.signingShare,
           threshold: dkgResult.threshold,
           participants: dkgResult.participants,
-          commitmentsCbor: CBOR_ENC.encode(dkgResult.commitments) as Uint8Array,
-          verifyingSharesCbor: CBOR_ENC.encode(dkgResult.verifyingShares) as Uint8Array,
+          commitmentsCbor: encodeCbor(dkgResult.commitments) as Uint8Array,
+          verifyingSharesCbor: encodeCbor(dkgResult.verifyingShares) as Uint8Array,
           dkgMethod: "network_dkg",
           // M8B quorum: persist the quorum Q (nodeIds the DKG ran among) so a restored signer targets the
           // actual share-holders, not the full live roster. null on the single-node back-compat path.

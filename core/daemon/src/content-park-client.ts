@@ -24,14 +24,14 @@
  * stranger cannot drain another recipient's mailbox (the recipient pubkey is public).
  */
 import * as lp from "it-length-prefixed";
-import { Encoder, decode } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { CONTENT_PARK_PROTOCOL_ID, buildContentParkAuthMsg } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 const FRAME_TIMEOUT_MS = 8_000;
 
 function toU8(chunk: unknown): Uint8Array {
@@ -87,7 +87,7 @@ export class ContentParkClient {
       const iter = this.#iter(stream);
       stream.send(
         lp.encode.single(
-          CBOR_ENC.encode({
+          encodeCbor({
             type: "content_park_deposit",
             recipient_pubkey: args.recipientPubkey,
             content_hash: args.contentHash,
@@ -123,7 +123,7 @@ export class ContentParkClient {
       const iter = this.#iter(stream);
       stream.send(
         lp.encode.single(
-          CBOR_ENC.encode({ type: "content_park_pull_request", recipient_pubkey: recipientPubkey }) as Uint8Array,
+          encodeCbor({ type: "content_park_pull_request", recipient_pubkey: recipientPubkey }) as Uint8Array,
         ),
       );
 
@@ -137,7 +137,7 @@ export class ContentParkClient {
       if (!nonce) return [];
       const signature = await signer.sign(buildContentParkAuthMsg(nonce, recipientPubkey));
       stream.send(
-        lp.encode.single(CBOR_ENC.encode({ type: "content_park_auth_response", signature }) as Uint8Array),
+        lp.encode.single(encodeCbor({ type: "content_park_auth_response", signature }) as Uint8Array),
       );
 
       // Count header, then N responses.
@@ -182,7 +182,7 @@ export class ContentParkClient {
       const iter = this.#iter(stream);
       stream.send(
         lp.encode.single(
-          CBOR_ENC.encode({ type: "content_park_confirm", recipient_pubkey: recipientPubkey, content_hash: contentHash }) as Uint8Array,
+          encodeCbor({ type: "content_park_confirm", recipient_pubkey: recipientPubkey, content_hash: contentHash }) as Uint8Array,
         ),
       );
       const challenge = await this.#read(iter);
@@ -194,7 +194,7 @@ export class ContentParkClient {
       if (!nonce) return false;
       const signature = await signer.sign(buildContentParkAuthMsg(nonce, recipientPubkey));
       stream.send(
-        lp.encode.single(CBOR_ENC.encode({ type: "content_park_auth_response", signature }) as Uint8Array),
+        lp.encode.single(encodeCbor({ type: "content_park_auth_response", signature }) as Uint8Array),
       );
       const ack = await this.#read(iter);
       const ok = !!ack && ack["type"] === "content_park_confirm_ack" && ack["ok"] === true;

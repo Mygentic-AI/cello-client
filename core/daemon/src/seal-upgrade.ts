@@ -8,7 +8,7 @@
  * sealed_root]) with its K_local. The directory verifies it and writes a SUPERSEDING bilateral
  * notarization. Both parties verify the dual-attestation cert before accepting bilateral.
  */
-import { Encoder } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
@@ -21,11 +21,10 @@ import type { DaemonRegistrationPersistence } from "./registration-persistence.j
  * must be kept byte-identical. Domain separation prevents replay as any other CELLO signature.
  */
 export const SEAL_UPGRADE_ACK_DOMAIN = "cello-seal-upgrade-ack-v1";
-const UPGRADE_CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** The exact upgrade-ack TBS B signs / the directory + present party verify. */
 export function buildSealUpgradeAckTbs(sessionId: Uint8Array, sealedRoot: Uint8Array): Uint8Array {
-  return UPGRADE_CBOR_ENC.encode([SEAL_UPGRADE_ACK_DOMAIN, sessionId, sealedRoot]);
+  return encodeCbor([SEAL_UPGRADE_ACK_DOMAIN, sessionId, sealedRoot]);
 }
 
 function toU8(v: unknown): Uint8Array | null {

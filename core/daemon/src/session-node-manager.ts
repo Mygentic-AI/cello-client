@@ -28,10 +28,12 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { decode, Encoder } from "cbor-x";
+import { decode } from "cbor-x";
+import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
@@ -52,7 +54,6 @@ import {
   type SecurityGatewayClient,
 } from "@cello-protocol/gateway";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 /** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 const MAX_REFUSED_PARKED_ENTRIES = 512;
@@ -623,6 +624,15 @@ export class SessionNodeManager {
     // agent-id re-key above (it never needs to appear in that migration's pinned DDL) and BEFORE any
     // read below. Idempotent, no column DEFAULT, grandfathers existing contacts to WHITELISTED once.
     migrateContactsAddTierMetadata(this.#db, this.#logger);
+
+    // §1.1: normalize frost_commitments / frost_verifying_shares to ONE CBOR encoding. Registration
+    // wrote them with the shared encoder; the refresh path wrote them with cbor-x's bare `encode`,
+    // so an agent's share blobs changed format the first time it ran `cello_refresh_shares` and both
+    // formats are on disk. Both producers now use encodeCbor; this rewrites what is already stored.
+    // Idempotent (a canonical blob re-encodes to itself and is skipped) and per-row fail-safe (an
+    // undecodable share is LEFT ALONE, never dropped — losing key material is worse than an old
+    // encoding cbor-x still reads).
+    migrateCborBlobsToCanonical(this.#db, this.#logger);
 
     // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
     // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
@@ -2907,7 +2917,7 @@ export class SessionNodeManager {
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
       this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2);
-      const frame = CBOR_ENC.encode({
+      const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,
         content_hash: contentHash,
@@ -3745,7 +3755,7 @@ export class SessionNodeManager {
     if (!entry) return;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      const frame = CBOR_ENC.encode({
+      const frame = encodeCbor({
         type: "content_delivery_ack",
         session_id: sessionId,
         content_hash: contentHash,

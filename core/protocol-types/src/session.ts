@@ -46,9 +46,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { Encoder, decode as cborDecode } from "cbor-x";
+import { decode as cborDecode } from "cbor-x";
+import { encodeCbor } from "./cbor.js";
 
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
 // ─── SessionAssignment (shared wire type) ─────────────────────────────────────
 
@@ -167,7 +167,7 @@ export function buildSessionEstablishmentTbs(
     counterpartySessionAddrs !== undefined &&
     transportMode !== undefined
   ) {
-    return CBOR_ENC.encode([
+    return encodeCbor([
       sessionId,
       pubA,
       pubB,
@@ -182,7 +182,7 @@ export function buildSessionEstablishmentTbs(
   }
 
   // Legacy (M1–M6): encode only the original 5 fields
-  return CBOR_ENC.encode([
+  return encodeCbor([
     sessionId,
     pubA,
     pubB,
@@ -209,7 +209,7 @@ export interface SealPayload {
  * Per RFC 8949 §4.2.1.
  */
 export function encodeSealPayload(payload: SealPayload): Uint8Array {
-  return CBOR_ENC.encode([
+  return encodeCbor([
     payload.session_id,
     payload.final_root,
     payload.close_timestamp > 0xffffffff
@@ -264,7 +264,7 @@ export function buildSealTbs(
   leafCount: number,
   timestamp: number,
 ): Uint8Array {
-  return CBOR_ENC.encode([
+  return encodeCbor([
     sessionId,
     sealedRoot,
     leafCount,
