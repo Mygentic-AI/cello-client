@@ -10,9 +10,18 @@
  * NOTHING about sessions, seals, transport or ceremonies. Inside startDaemon's closure that claim
  * was unfalsifiable; every handler could reach all 73 shared locals whether it needed them or not.
  *
- * These tests make it falsifiable. They register the handlers against stubs, with NO daemon, NO
- * database, NO libp2p node — and drive them. If someone later reaches back into session or transport
- * state from an address-book handler, this file stops compiling or throws, and that is the point.
+ * These tests make it falsifiable AT RUNTIME: they register the handlers against stubs — no daemon,
+ * no database, no libp2p node — and drive EVERY ONE of the ten. Reach back into session or transport
+ * state from any of them and the call throws here, because there is nothing there to reach.
+ *
+ * Be precise about what this does NOT catch, because the first draft of this comment overclaimed it
+ * (reviewer F1) and an overclaimed test is worse than no test: it does NOT fail at compile time.
+ * Every core/*!/tsconfig.json excludes src/__tests__, so `pnpm typecheck` never looks at a test file
+ * and vitest's esbuild strips types without checking them. Add a required field to ContactHandlerDeps
+ * and this file's call is a type error THAT NOTHING IN THE GATE SEES — the field arrives undefined
+ * and the test still passes. That is why every handler below is actually INVOKED: the runtime half is
+ * the only half that works today. The compile-time half needs the tests typechecked at all, which is
+ * 209 errors across 45 files of pre-existing debt — its own item (DOD-TYPECHECK-TESTS-1), not a rider.
  */
 import { describe, it, expect, vi } from "vitest";
 import { registerContactHandlers, invalidPubkey, type ConnState } from "../contact-handlers.js";
@@ -43,6 +52,7 @@ function harness(opts: { connState?: ConnState } = {}) {
   const store = makeStubStore();
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const startTelegramPollerIfConfigured = vi.fn();
+  const setAgentMoniker = vi.fn(() => true);
   const connState: ConnState = opts.connState ?? { currentAgent: "alice" };
 
   registerContactHandlers({
@@ -51,6 +61,7 @@ function harness(opts: { connState?: ConnState } = {}) {
     getConnState: () => connState,
     // The daemon's real rule, in miniature: explicit wins, else the connection's selection.
     resolveCurrentAgent: (cs, explicit) => explicit ?? cs?.currentAgent ?? null,
+    setAgentMoniker,
     logger,
     startTelegramPollerIfConfigured,
   });
@@ -58,7 +69,7 @@ function harness(opts: { connState?: ConnState } = {}) {
   const call = (name: string, params?: Record<string, unknown>) =>
     handlers.get(name)!(params, "conn-1");
 
-  return { handlers, store, logger, startTelegramPollerIfConfigured, call };
+  return { handlers, store, logger, setAgentMoniker, startTelegramPollerIfConfigured, call };
 }
 
 describe("the address book runs with NO daemon — the seam is real", () => {
@@ -77,6 +88,34 @@ describe("the address book runs with NO daemon — the seam is real", () => {
       "cello_settings_set",
       "cello_telegram_set_token",
     ]);
+  });
+
+  // The load-bearing test in this file. Every handler is INVOKED against stubs alone — not merely
+  // registered. A handler that reaches for a session node, a libp2p dial, a seal or a ceremony finds
+  // nothing there and throws, and this goes red. Registration alone would prove nothing; six of these
+  // were never invoked in the first draft, and six re-couplings could have slipped through (F1).
+  const EVERY_HANDLER: Array<[string, Record<string, unknown>]> = [
+    ["cello_contact_add", { pubkey: PUBKEY }],
+    ["cello_contact_set_moniker", { pubkey: PUBKEY, moniker: "alice" }],
+    ["cello_contact_set_tier", { pubkey: PUBKEY, tier: 3 }],
+    ["cello_contact_set_away", { pubkey: PUBKEY, message: "back later" }],
+    ["cello_contact_remove", { pubkey: PUBKEY }],
+    ["cello_contact_list", {}],
+    ["cello_settings_get", {}],
+    ["cello_settings_set", { key: "away.default", value: "back later" }],
+    ["cello_set_moniker", { moniker: "alice" }],
+    ["cello_telegram_set_token", { bot_token: "123:abc", allowlisted_chat_id: "42" }],
+  ];
+
+  it.each(EVERY_HANDLER)("%s runs to completion with NO session, transport or ceremony state", async (name, params) => {
+    const { call } = harness();
+
+    const res = await call(name, params) as { ok: boolean; reason?: string };
+
+    // ok:true, or a structured refusal — but never a throw. A throw here means the handler reached
+    // for daemon state that the address book is not supposed to need.
+    expect(res).toBeDefined();
+    expect(typeof res.ok).toBe("boolean");
   });
 
   it("adds a contact end-to-end through the stub store", async () => {
@@ -119,6 +158,19 @@ describe("the address book runs with NO daemon — the seam is real", () => {
     expect(res.reason).toBe("no_current_agent");
     // The point of refusing: a guess would write someone else's address book.
     expect(store.addContact).not.toHaveBeenCalled();
+  });
+
+  it("cello_set_moniker goes through the injected capability — NOT the raw SQLite handle", async () => {
+    const { store, setAgentMoniker, call } = harness();
+
+    const res = await call("cello_set_moniker", { moniker: "alice" }) as { ok: boolean; moniker: string };
+
+    expect(res.ok).toBe(true);
+    expect(setAgentMoniker).toHaveBeenCalledWith("alice", "alice");
+    // The finding this test exists for: set_moniker used to reach past the store for
+    // sessionNodeManager.getDb() — the only address-book handler that did. The stub store has no
+    // getDb at all, so if anyone reinstates that reach, this goes red instead of quietly working.
+    expect(store).not.toHaveProperty("getDb");
   });
 
   it("the telegram token handler restarts the poller through the INJECTED callback", async () => {

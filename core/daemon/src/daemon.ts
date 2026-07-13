@@ -5990,6 +5990,10 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
+    // cello_set_moniker was the one address-book handler reaching past the store for the raw SQLite
+    // handle. Same construction, same behavior — the daemon owns the DB, so the daemon builds it.
+    setAgentMoniker: (agentName, moniker) =>
+      new DbIdentityStore(sessionNodeManager.getDb(), logger).setMoniker(agentName, moniker),
     logger,
     startTelegramPollerIfConfigured,
   });

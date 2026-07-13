@@ -16,7 +16,6 @@ import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
-import { DbIdentityStore } from "./db-identity-store.js";
 import { whoLabel } from "./who-label.js";
 import { isKnownTierValue, TIER } from "./contacts-tier-migration.js";
 import {
@@ -43,6 +42,17 @@ export interface ContactHandlerDeps {
   getConnState: (connectionId: string) => ConnState | undefined;
   /** The daemon's single agent-selection rule. Injected, never re-implemented here. */
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
+  /**
+   * Set (or clear, with null) an agent's outbound-name override. False when no such agent exists.
+   *
+   * Injected as a capability rather than reached for, because `cello_set_moniker` was the ONE
+   * address-book handler that bypassed the store interface entirely and grabbed the raw SQLite
+   * handle (`sessionNodeManager.getDb()`) to build a DbIdentityStore. Every other handler goes
+   * through a store method. Inside the closure that asymmetry was invisible; the extraction made it
+   * the single thing standing between this module and "needs no database". Same call, same
+   * behavior — the daemon still constructs the DbIdentityStore. It just says so out loud now.
+   */
+  setAgentMoniker: (agentName: string, moniker: string | null) => boolean;
   logger: Logger;
   /** M8C-TGDOOR-1: restart the poller after a token change, with no daemon restart. */
   startTelegramPollerIfConfigured: () => void;
@@ -76,7 +86,7 @@ export function invalidPubkey(pubkey: string | undefined): Refusal | null {
 export function registerContactHandlers(deps: ContactHandlerDeps): void {
   const {
     handlers, sessionNodeManager, getConnState, resolveCurrentAgent,
-    logger, startTelegramPollerIfConfigured,
+    setAgentMoniker, logger, startTelegramPollerIfConfigured,
   } = deps;
 
   // M8C-CONTACT-1: every address-book handler resolves the target agent the SAME way — an explicit
@@ -163,6 +173,8 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
     return { ok: true, agent: resolved.agent, pubkey, moniker };
   });
 
+  // DOD-CONTACT-VIEW-1 AC1: set a contact's reachability tier. Validates the tier is a known constant
+  // (0..4) — an unknown value is REFUSED, never coerced. Emits contact.tier.changed (old→new).
   handlers.set("cello_contact_set_tier", async (params, connectionId) => {
     const pubkey = typeof params?.pubkey === "string" ? params.pubkey : undefined;
     const badPubkey = invalidPubkey(pubkey);
@@ -313,8 +325,7 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
         guidance: `A moniker is 1-64 chars: letters, digits, '-' or '_' (regex ${MONIKER_RE.source}). Pass null to clear the override.`,
       };
     }
-    const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
-    if (!store.setMoniker(resolved.agent, moniker)) {
+    if (!setAgentMoniker(resolved.agent, moniker)) {
       return { ok: false, reason: "agent_not_found", guidance: `No active agent named '${resolved.agent}'. See cello_agents.` };
     }
     logger.info("agent.moniker.set", { agentName: resolved.agent, cleared: moniker === null });
