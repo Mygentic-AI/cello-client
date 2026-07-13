@@ -17,7 +17,8 @@ import { tmpdir } from "node:os";
 import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, type DaemonHandle } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
-import { login, logout, status, register, createAgent, monikerSet, settingsGet, settingsSet } from "../commands.js";
+import { login, logout, status, register, createAgent } from "../commands.js";
+import { monikerSet, settingsGet, settingsSet, startAgent } from "../parity-commands.js";
 
 describe("cli commands", () => {
   let tempDir: string;
@@ -261,38 +262,50 @@ describe("cli commands", () => {
   });
 
   // MONIKER-1 AC2/AC3: `cello moniker set|clear` round-trips to the daemon's cello_set_moniker.
+  //
+  // These now live on the PARITY path (§1.3): settings/moniker are agent-scoped, so they resolve
+  // their agent through withDaemon's use-agent replay like every other agent-scoped command, instead
+  // of a private connection helper that skipped it. That also puts them on the §3 bash contract —
+  // JSON to stdout, the daemon's structured error VERBATIM to stderr, exit code branching on ok —
+  // which is what these assertions changed to. The DAEMON behavior they pin is unchanged.
   describe("moniker", () => {
     it("sets and clears the outbound-name override against a live daemon", async () => {
       const config = makeConfig();
       handle = await startDaemon(config);
       const create = await createAgent(tempDir, "alice");
       expect(create.exitCode).toBe(0);
+      // The parity replay refuses to act as an OFFLINE agent (it will not silently resurrect one),
+      // so an agent-scoped command needs her online — which is the production shape anyway.
+      await startAgent(tempDir, "alice", {});
 
-      const set = await monikerSet(tempDir, "Wonderland_Alice", "alice");
+      const set = await monikerSet(tempDir, "Wonderland_Alice", { agent: "alice" });
       expect(set.exitCode).toBe(0);
-      expect(JSON.parse(set.output)).toMatchObject({ ok: true, agent: "alice", moniker: "Wonderland_Alice" });
+      expect(JSON.parse(set.stdout)).toMatchObject({ ok: true, agent: "alice", moniker: "Wonderland_Alice" });
 
-      const cleared = await monikerSet(tempDir, null, "alice");
+      const cleared = await monikerSet(tempDir, null, { agent: "alice" });
       expect(cleared.exitCode).toBe(0);
-      expect(JSON.parse(cleared.output)).toMatchObject({ ok: true, agent: "alice", moniker: null });
+      expect(JSON.parse(cleared.stdout)).toMatchObject({ ok: true, agent: "alice", moniker: null });
     });
 
     it("surfaces the daemon's invalid_moniker rejection verbatim", async () => {
       const config = makeConfig();
       handle = await startDaemon(config);
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {});
 
-      const bad = await monikerSet(tempDir, "not a valid name", "alice");
+      const bad = await monikerSet(tempDir, "not a valid name", { agent: "alice" });
       expect(bad.exitCode).toBe(1);
-      const parsed = JSON.parse(bad.output);
+      expect(bad.stdout).toBe(""); // a failure never lands on stdout
+      const parsed = JSON.parse(bad.stderr);
       expect(parsed.ok).toBe(false);
       expect(parsed.reason).toBe("invalid_moniker");
     });
 
-    it("returns {daemon: stopped} when no daemon is running", async () => {
-      const result = await monikerSet(tempDir, "Bob", "alice");
+    it("fails loud when no daemon is running", async () => {
+      const result = await monikerSet(tempDir, "Bob", { agent: "alice" });
       expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("stopped");
+      expect(result.stdout).toBe("");
+      expect(JSON.parse(result.stderr).reason).toBe("daemon_not_running");
     });
   });
 
@@ -301,39 +314,43 @@ describe("cli commands", () => {
       const config = makeConfig();
       handle = await startDaemon(config);
       expect((await createAgent(tempDir, "alice")).exitCode).toBe(0);
+      await startAgent(tempDir, "alice", {});
 
-      const set = await settingsSet(tempDir, "bounds.known.max_sessions", "8", "alice");
+      const set = await settingsSet(tempDir, "bounds.known.max_sessions", "8", { agent: "alice" });
       expect(set.exitCode).toBe(0);
-      expect(JSON.parse(set.output)).toMatchObject({ ok: true, key: "bounds.known.max_sessions", value: "8" });
+      expect(JSON.parse(set.stdout)).toMatchObject({ ok: true, key: "bounds.known.max_sessions", value: "8" });
 
-      const get = await settingsGet(tempDir, "bounds.known.max_sessions", "alice");
+      const get = await settingsGet(tempDir, "bounds.known.max_sessions", { agent: "alice" });
       expect(get.exitCode).toBe(0);
-      expect(JSON.parse(get.output)).toMatchObject({ ok: true, value: "8" });
+      expect(JSON.parse(get.stdout)).toMatchObject({ ok: true, value: "8" });
 
       // An unset key returns null (the built-in default is used).
-      const unset = await settingsGet(tempDir, "away.default", "alice");
-      expect(JSON.parse(unset.output)).toMatchObject({ ok: true, value: null });
+      const unset = await settingsGet(tempDir, "away.default", { agent: "alice" });
+      expect(JSON.parse(unset.stdout)).toMatchObject({ ok: true, value: null });
     });
 
     it("surfaces the daemon's invalid_value / invalid_key rejections verbatim (INV-TIER-BOUND at the surface)", async () => {
       const config = makeConfig();
       handle = await startDaemon(config);
       await createAgent(tempDir, "alice");
+      await startAgent(tempDir, "alice", {});
 
       for (const bad of ["Infinity", "-5", "0"]) {
-        const r = await settingsSet(tempDir, "bounds.known.max_sessions", bad, "alice");
+        const r = await settingsSet(tempDir, "bounds.known.max_sessions", bad, { agent: "alice" });
         expect(r.exitCode).toBe(1);
-        expect(JSON.parse(r.output).reason).toBe("invalid_value");
+        expect(r.stdout).toBe("");
+        expect(JSON.parse(r.stderr).reason).toBe("invalid_value");
       }
-      const badKey = await settingsSet(tempDir, "bounds.knwon.max_sessions", "8", "alice");
+      const badKey = await settingsSet(tempDir, "bounds.knwon.max_sessions", "8", { agent: "alice" });
       expect(badKey.exitCode).toBe(1);
-      expect(JSON.parse(badKey.output).reason).toBe("invalid_key");
+      expect(JSON.parse(badKey.stderr).reason).toBe("invalid_key");
     });
 
-    it("returns {daemon: stopped} when no daemon is running", async () => {
-      const result = await settingsGet(tempDir, "away.default", "alice");
+    it("fails loud when no daemon is running", async () => {
+      const result = await settingsGet(tempDir, "away.default", { agent: "alice" });
       expect(result.exitCode).toBe(1);
-      expect(result.output).toContain("stopped");
+      expect(result.stdout).toBe("");
+      expect(JSON.parse(result.stderr).reason).toBe("daemon_not_running");
     });
   });
 

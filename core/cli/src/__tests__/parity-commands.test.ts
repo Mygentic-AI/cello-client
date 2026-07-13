@@ -36,6 +36,9 @@ import {
   awaitSession,
   sealedReceipt,
   readCurrentAgent,
+  settingsGet,
+  settingsSet,
+  monikerSet,
 } from "../parity-commands.js";
 import { createAgent } from "../commands.js";
 
@@ -363,6 +366,92 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect(out.exitCode).toBe(0);
       expect(out.stdout).toContain("\n  ");
       expect(JSON.parse(out.stdout).agents).toBeDefined();
+    });
+  });
+  // ─── §1.3: ONE operator gesture, ONE agent-resolution rule ────────────────────────────────
+  //
+  // `cello use-agent alice` persists a selection. Every agent-scoped command must REPLAY it, because
+  // the CLI opens a fresh connection per invocation and the daemon's per-connection current-agent is
+  // gone the moment the socket closes.
+  //
+  // `cello contacts` replayed it. `cello settings set` and `cello moniker set` did NOT — they went
+  // through a second, hand-rolled connection path that skipped the replay and fell through to the
+  // daemon's sole-online-agent fallback. Same gesture, two rules. On a MULTI-AGENT machine that
+  // fallback is ambiguous, so the command the operator explicitly scoped fails (or, with exactly one
+  // agent online, silently runs as whoever happened to be up — which is worse).
+  //
+  // These commands are agent-scoped and MUST resolve the agent the same way as every other one.
+  describe("§1.3 — settings/moniker honor `use-agent` like every other agent-scoped command", () => {
+    it("`cello settings set` applies to the SELECTED agent when several are online", async () => {
+      await createAgent(tempDir, "alice");
+      await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "alice", {});
+      await startAgent(tempDir, "bob", {});
+      await useAgent(tempDir, "alice", {});
+
+      // Two agents online → the daemon's sole-online fallback CANNOT resolve this. Only a replayed
+      // selection can. If the command skips the replay, the daemon answers no_current_agent.
+      const set = await settingsSet(tempDir, "away.default", "at lunch", {});
+      expect(set.exitCode, `settings set must honor use-agent, got: ${set.stderr}`).toBe(0);
+      expect(JSON.parse(set.stdout).ok).toBe(true);
+
+      // ...and it landed on ALICE, not bob.
+      const got = await settingsGet(tempDir, "away.default", { agent: "alice" });
+      expect(JSON.parse(got.stdout).ok).toBe(true);
+      const bobs = await settingsGet(tempDir, "away.default", { agent: "bob" });
+      expect(JSON.parse(bobs.stdout)).not.toMatchObject({ value: "at lunch" });
+    });
+
+    it("`cello moniker set` applies to the SELECTED agent when several are online", async () => {
+      await createAgent(tempDir, "alice");
+      await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "alice", {});
+      await startAgent(tempDir, "bob", {});
+      await useAgent(tempDir, "alice", {});
+
+      const out = await monikerSet(tempDir, "ali", {});
+      expect(out.exitCode, `moniker set must honor use-agent, got: ${out.stderr}`).toBe(0);
+      expect(JSON.parse(out.stdout).ok).toBe(true);
+    });
+
+    // Found while fixing the above, and it is the more dangerous half.
+    //
+    // `cello stop-agent <selected>` CLEARS the persisted selection (parity-commands stopAgent) — on
+    // its own, reasonable. But the daemon's fallback for "no selection" is "the sole ONLINE agent",
+    // and it only refuses when TWO OR MORE are online. So with several agents registered and exactly
+    // one up, the next command silently runs as that one.
+    //
+    // Observed before the fix, verbatim:
+    //   use-agent alice → stop-agent alice → `cello settings set away.default …`
+    //   → {"ok":true,"agent":"bob", …}, exit 0.
+    // The operator selected alice; the write landed on BOB and reported success.
+    it("no selection + several agents registered → REFUSE, never silently target whoever is online", async () => {
+      await createAgent(tempDir, "alice");
+      await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "bob", {});
+      await useAgent(tempDir, "alice", {});   // use-agent AUTO-STARTS alice (AUTOSTART-1)...
+      await stopAgent(tempDir, "alice", {});  // ...so stop her. This also clears the selection.
+
+      const out = await settingsSet(tempDir, "away.default", "must not land on bob", {});
+      expect(out.exitCode, "a write with no selection must not silently pick an agent").toBe(1);
+      expect(out.stdout).toBe("");
+      const err = JSON.parse(out.stderr);
+      expect(err.ok).toBe(false);
+      expect(err.reason).toBe("no_agent_selected");
+
+      // The proof it is not merely a different error: bob must be UNTOUCHED.
+      const bobs = await settingsGet(tempDir, "away.default", { agent: "bob" });
+      expect(bobs.stdout).not.toContain("must not land on bob");
+    });
+
+    // ...but the fallback must SURVIVE for the case it exists to serve: one agent, never selected.
+    it("no selection + exactly ONE agent registered → still works (the fallback is unambiguous there)", async () => {
+      await createAgent(tempDir, "solo");
+      await startAgent(tempDir, "solo", {});
+      // No use-agent, ever. A fresh operator with one agent must not be forced to select it.
+      const out = await settingsSet(tempDir, "away.default", "fine", {});
+      expect(out.exitCode, `the single-agent fallback must not regress: ${out.stderr}`).toBe(0);
+      expect(JSON.parse(out.stdout).ok).toBe(true);
     });
   });
 });
