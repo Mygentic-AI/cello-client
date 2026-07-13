@@ -47,6 +47,7 @@ import {
   send,
   receive,
   closeSession,
+  nameSession,
   awaitSession,
   settingsGet,
   settingsSet,
@@ -399,14 +400,18 @@ export const COMMANDS: readonly CommandSpec[] = [
     group: "Messaging",
     summary: "End a session. Both sides sign off and get a tamper-proof receipt.",
     help:
-      "Usage: cello close-session <session-id> [--force] [--agent <name>] [--pretty]\n" +
+      "Usage: cello close-session <session-id> [--session-name \"<text>\"] [--force] [--agent <name>] [--pretty]\n" +
       "  Both parties sign off on the whole conversation and each gets a notarized receipt\n" +
       "  ('cello sealed-receipt <session-id>' prints it).\n" +
+      "  --session-name labels the session so you can tell it apart later ('cello sessions' shows it).\n" +
+      "  It is PRIVATE — never sent to the counterparty, the relay, or the directory. Optional: leave\n" +
+      "  it out rather than invent one, since an unnamed session is a hint it did not close cleanly.\n" +
       "  --force abandons a half-open session that can never be sealed (a handshake the counterparty\n" +
       "  never joined). It FORFEITS the receipt — never use it on a healthy session.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--force", consumesValue: false },
+      { name: "--session-name", consumesValue: true },
     ],
     ipcMethod: IPC_METHODS["close-session"],
     jsonOut: true,
@@ -414,7 +419,39 @@ export const COMMANDS: readonly CommandSpec[] = [
       const { agent, pretty, positional } = parityOpts(args);
       const force = positional.includes("--force");
       const rest = positional.filter((a) => a !== "--force");
-      return closeSession(ctx.celloDir, rest[0] ?? "", { agent, pretty, force });
+      const nameIdx = rest.indexOf("--session-name");
+      const sessionName = nameIdx === -1 ? undefined : rest[nameIdx + 1];
+      const ids = nameIdx === -1 ? rest : rest.filter((_, i) => i !== nameIdx && i !== nameIdx + 1);
+      return closeSession(ctx.celloDir, ids[0] ?? "", { agent, pretty, force, sessionName });
+    },
+  },
+  {
+    name: "name-session",
+    group: "Messaging",
+    summary: "Name a session so you can tell it apart from the others.",
+    help:
+      "Usage: cello name-session <session-id> <name...>   |   cello name-session <session-id> --clear\n" +
+      "  Labels one of YOUR sessions. Works on any session — active, interrupted, or long sealed;\n" +
+      "  naming an old conversation for the record is the point, not an edge case.\n" +
+      "  The name is PRIVATE: never sent to the counterparty, the relay, or the directory, and it\n" +
+      "  cannot change anything the protocol does. Renaming a sealed session does not touch its seal.\n" +
+      "  Multi-word names need no quotes:  cello name-session ab12… the deploy postmortem\n" +
+      "  --clear removes the name (an unnamed session is a hint it did not close cleanly).",
+    flags: [
+      { name: "--agent", consumesValue: false },
+      { name: "--clear", consumesValue: false },
+    ],
+    ipcMethod: IPC_METHODS["name-session"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const clear = positional.includes("--clear");
+      const rest = positional.filter((a) => a !== "--clear");
+      const [sessionId, ...words] = rest;
+      // The name is every remaining positional, joined — so quoting is optional, which is the whole
+      // point of taking it positionally rather than as a flag.
+      const name = clear ? null : words.join(" ");
+      return nameSession(ctx.celloDir, sessionId ?? "", name, { agent, pretty });
     },
   },
   {

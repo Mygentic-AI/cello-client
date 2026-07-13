@@ -165,6 +165,8 @@ export interface ActiveSessionInfo {
   counterpartyPubkey: string;
   /** Direct-path counterparty liveness; 'unknown' before any session-node observation. */
   liveness: "alive" | "gone" | "unknown";
+  /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
+  sessionName: string | null;
 }
 
 // --- Daemon configuration ---
@@ -363,6 +365,12 @@ export interface SessionRecord {
    * it. Null when this party initiated (it verifies against its own primary).
    */
   counterparty_primary_pubkey?: string | null;
+  /**
+   * DOD-SESSION-NAME-1: this agent's own human-readable label for the session. Null when unnamed,
+   * and unnamed MEANS something (see the column comment in session-node-manager). Local and
+   * cosmetic — it reaches no wire structure.
+   */
+  session_name?: string | null;
 }
 
 /** An interrupted session entry in the cello status response. */
@@ -372,6 +380,8 @@ export interface InterruptedSessionInfo {
   counterpartyPubkey: string;
   messageCount: number;
   interruptedAt: string;
+  /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
+  sessionName: string | null;
 }
 
 /**
@@ -395,6 +405,14 @@ export interface SessionListEntry {
   /** The resolved display label (pet name ?? offered ?? fingerprint). */
   who: string;
   whoKnown: boolean;
+  /**
+   * DOD-SESSION-NAME-1: this agent's own label for the session, or null when unnamed.
+   *
+   * Returned ALONGSIDE sessionId, never instead of it — the id is what you paste into the next
+   * command. Null is a value with meaning: a session that closed cleanly through an agent usually
+   * has a name, so an unnamed closed one is a hint it did not.
+   */
+  sessionName: string | null;
 }
 
 /**
