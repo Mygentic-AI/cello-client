@@ -81,6 +81,19 @@ describe("DOD-AGENT-PARAM-1: the CLI sends the selector the daemon actually read
     expect(result.exitCode).toBe(0);
   });
 
+  it("an OMITTED agent name refuses locally — it never becomes an empty selector the daemon guesses past", async () => {
+    await startWithTwoAgents();
+    // registry.ts passes `args[0] ?? ""`, so a missing positional arrives here as "". If that reached
+    // the daemon, resolveCurrentAgent would find "" falsy, skip the explicit branch, and fall through
+    // to the sole-online agent — `cello refresh` with no name rotating SOMEONE's FROST shares, exit 0.
+    // The guard in refreshShares/relayReceipts is what stops that, and it is one deletion away from
+    // being a live key-material bug. So it is pinned here rather than trusted.
+    for (const result of [await refreshShares(tempDir, ""), await relayReceipts(tempDir, "")]) {
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("Usage:");
+    }
+  });
+
   it("`cello refresh <name>` names the agent it was given — a typo is a typo, not a misroute", async () => {
     await startWithTwoAgents();
     // A name nobody holds: the daemon must refuse THAT name. If the selector were dropped, the

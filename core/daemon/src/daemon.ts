@@ -3056,7 +3056,11 @@ async function startDaemonHoldingLock(
     const connState = perConnectionState.get(connectionId);
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
+      // Not an MCP tool — the CLI is the only real caller, and its gesture is the POSITIONAL
+      // `cello refresh <name>`, not a JSON param. The old text said "pass { name }", which stopped
+      // working at the rename and never worked on this surface anyway. cello_use_agent stays: it is
+      // the other real remedy, and renderForSurface rewrites it to `cello use-agent` for a CLI caller.
+      return { ok: false, reason: "no_current_agent", guidance: "Name the agent: cello refresh <name>. Or select one for this connection with cello_use_agent." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {
@@ -3090,7 +3094,8 @@ async function startDaemonHoldingLock(
     const connState = perConnectionState.get(connectionId);
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback
     if (!agentName) {
-      return { ok: false, reason: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass { agent }." };
+      // Not an MCP tool either — same reasoning as cello_refresh_shares above.
+      return { ok: false, reason: "no_current_agent", guidance: "Name the agent: cello relay-receipts <name>. Or select one for this connection with cello_use_agent." };
     }
     const loaded = loadedAgents.find((a) => a.name === agentName);
     if (!loaded) {

@@ -123,20 +123,24 @@ cello_status()                      — daemon + agent state
 
 **Messaging**
 ```
-cello_initiate_session({ target_pubkey })
-cello_await_session({ timeout_ms })
-cello_send({ session_id, content })
-cello_receive({ session_id, timeout_ms?, since_seq? })
-cello_close_session({ session_id, force? })
+cello_initiate_session({ target_pubkey, agent? })
+cello_await_session({ timeout_ms, agent? })
+cello_send({ session_id, content, agent? })
+cello_receive({ session_id, timeout_ms?, since_seq?, agent? })
+cello_close_session({ session_id, force?, agent? })
 cello_inbox({ scope? })             — pending requests + unread counts; reads nothing
 ```
 
 **Sessions and records**
 ```
-cello_sessions()                    — list your sessions
-cello_transcript({ session_id })    — the full conversation, sent and received
-cello_sealed_receipt({ session_id })— the notarized bilateral seal
+cello_sessions({ agent? })                  — list your sessions
+cello_transcript({ session_id, agent? })    — the full conversation, sent and received
+cello_sealed_receipt({ session_id, agent? })— the notarized bilateral seal
 ```
+
+`agent?` is optional on every tool that takes it and means the same thing everywhere: act as THAT
+agent for THIS one call, instead of the connection's selected agent. Omit it and the call acts as the
+agent you selected with `cello_use_agent`.
 
 **Contacts** — the per-agent address book. Tiers raise a peer's limits. Content screening is **planned, not yet active** — the daemon currently passes messages through unscreened, so a tier is a limits setting, not a safety boundary.
 ```
