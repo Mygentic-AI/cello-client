@@ -15,7 +15,9 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
-    }
+    },
+    "./test/vectors/*": "./test/vectors/*",
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",

@@ -114,6 +114,23 @@
       },
       "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626b63616e6172795f746573740145d840009fff1a69618a00f6f6",
       "signal_hash_hex": "5dc67366d7b8fc515a6d638b432d90e29a2f9841101a3ac1745ca7b602e2f837"
+    },
+    {
+      "name": "FAR-FUTURE expiry past 2^32 — must hash as a CBOR uint64 (1b...), NEVER a float64 (fb...)",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "aabb",
+        "type": "phone",
+        "schema_version": 1,
+        "payload": "01020304",
+        "issued_at": 1768000000,
+        "expires_at": 4920000000,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a69618a001b0000000125413e00f6",
+      "signal_hash_hex": "3c95520077ca1bb25f360c886008691bab1114e1ecad43ba90558df5d5a0b79e"
     }
   ]
 }

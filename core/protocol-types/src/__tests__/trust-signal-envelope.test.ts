@@ -112,6 +112,58 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       expect(hex(encodeCbor(1_000_000_000))).toBe("1a3b9aca00");     // minimal uint
       expect(hex(encodeCbor(null))).toBe("f6");
     });
+
+    it("PINS THE TRAP: a plain JS number above 2^32 encodes as a FLOAT64, a BigInt as a uint64", () => {
+      // This is the premise the encoder ACTUALLY has, and the one the first version of this unit got
+      // wrong. cbor-x emits any `number` > 0xffffffff as major type 7 float64 (`fb`), never a uint64.
+      // A conforming CBOR implementation in Rust/Go/Python emits `1b` — so the two disagree on the
+      // preimage bytes, and therefore on the hash, permanently.
+      //
+      // The envelope must therefore NEVER hand a raw number > 2^32 to the encoder. Pinned here so
+      // that if cbor-x ever changes this behavior, we find out from a red test rather than from a
+      // signal that stops verifying.
+      expect(hex(encodeCbor(4_920_000_000))).toBe("fb41f25413e0000000");        // FLOAT64 — the trap
+      expect(hex(encodeCbor(BigInt(4_920_000_000)))).toBe("1b0000000125413e00"); // uint64 — the fix
+      expect(hex(encodeCbor(0xffff_ffff))).toBe("1affffffff");                   // last safe number
+    });
+  });
+
+  describe("integers past 2^32 — the float64 trap (a 100-year expiry reaches it TODAY)", () => {
+    // An expires_at a century out is 1.768e9 + 3.15e9 = 4.92e9, well past 2^32. This is not a 2106
+    // problem; it is the first long-dated signal the portal mints.
+    const farFuture = 4_920_000_000;
+
+    it("hashes a far-future expires_at as a CBOR uint64, never a float64", () => {
+      const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), expires_at: farFuture });
+      expect(hex(bytes)).toContain("1b0000000125413e00"); // uint64
+      expect(hex(bytes)).not.toContain("fb");             // no float, anywhere in the preimage
+    });
+
+    it("hashes a far-future issued_at as a CBOR uint64, never a float64", () => {
+      const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: farFuture });
+      expect(hex(bytes)).toContain("1b0000000125413e00");
+      expect(hex(bytes)).not.toContain("fb");
+    });
+
+    it("NO preimage, for any legal envelope, ever contains a float64 marker", () => {
+      // The property, stated directly. If a float ever enters the preimage the signal is
+      // unreproducible by any other language's CBOR library — so assert its total absence.
+      for (const t of [0, 1, 0xffff_ffff, 0xffff_ffff + 1, farFuture, 99_999_999_999]) {
+        const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: t, expires_at: t });
+        expect(hex(bytes).match(/fb[0-9a-f]{16}/), `issued_at=${t} encoded a float64`).toBeNull();
+      }
+    });
+
+    it("REJECTS a schema_version large enough to float-encode, rather than hashing a float", () => {
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), schema_version: 1e300 })).toThrow(/schema_version/i);
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), schema_version: 0xffff_ffff + 1 })).toThrow(/schema_version/i);
+    });
+
+    it("REJECTS an integer past MAX_SAFE_INTEGER rather than hashing an approximation", () => {
+      // Past 2^53 a JS number cannot represent consecutive integers, so the value the caller MEANT
+      // and the value we would hash may already differ. There is no honest hash to produce.
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: 2 ** 53 + 2 })).toThrow(/MAX_SAFE_INTEGER|out of range/i);
+    });
   });
 
   describe("cross-party agreement — the reason this unit exists", () => {
@@ -149,24 +201,61 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
         return seed % n;
       };
       for (let i = 0; i < 200; i++) {
+        // Timestamps are drawn ACROSS the 2^32 boundary, deliberately. The original property test
+        // drew rnd(2_000_000_000) — strictly below 0xffffffff — so it could never have caught the
+        // float64 defect no matter how many iterations it ran. A property test that cannot reach the
+        // failing band is not testing the property.
+        const ts = (): number => (rnd(2) === 0 ? rnd(2_000_000_000) : 0xffff_ffff + rnd(2_000_000_000));
         const env: TrustSignalEnvelope = {
           subject_kind: rnd(2) === 0 ? "account" : "agent",
           subject: `s-${rnd(1e6)}`,
           issuer_kind: rnd(2) === 0 ? "portal" : "agent",
-          issuer_pubkey: rnd(1e9).toString(16),
+          issuer_pubkey: rnd(1e9).toString(16).padStart(16, "0"),
           type: `type_${rnd(1e4)}`,
           schema_version: rnd(8) + 1,
           payload: new Uint8Array(Array.from({ length: rnd(64) }, () => rnd(256))),
-          issued_at: rnd(2_000_000_000),
-          expires_at: rnd(2) === 0 ? null : rnd(2_000_000_000),
+          issued_at: ts(),
+          expires_at: rnd(2) === 0 ? null : ts(),
           supersedes_hash: rnd(2) === 0 ? null : new Uint8Array(Array.from({ length: 32 }, () => rnd(256))),
         };
         // Rebuilding the object with keys in reverse insertion order must not move a single byte.
         const reversed = Object.fromEntries(
           Object.entries(env).reverse(),
         ) as unknown as TrustSignalEnvelope;
-        expect(hex(encodeTrustSignalEnvelope(env))).toBe(hex(encodeTrustSignalEnvelope(reversed)));
+        const encoded = hex(encodeTrustSignalEnvelope(env));
+        expect(encoded).toBe(hex(encodeTrustSignalEnvelope(reversed)));
+        // ...and no envelope, anywhere in the random space, may hash a float.
+        expect(encoded.match(/fb[0-9a-f]{16}/), `float64 in preimage for issued_at=${env.issued_at}`).toBeNull();
       }
+    });
+  });
+
+  describe("string canonicalization — the other cross-language hash-breakers (spec §5)", () => {
+    it("REJECTS a non-NFC string rather than silently normalizing it", () => {
+      // "é" is c3a9 in NFC and 65cc81 in NFD — same logical string, different preimage, different
+      // hash. We refuse rather than normalize: silently normalizing would make two DIFFERENT inputs
+      // hash to the SAME signal, a collision we manufactured ourselves.
+      const nfd = "café"; // "café" decomposed
+      expect(nfd.normalize("NFC")).not.toBe(nfd); // guard the guard: this really is non-NFC
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), type: nfd })).toThrow(/NFC/i);
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), subject: nfd })).toThrow(/NFC/i);
+    });
+
+    it("ACCEPTS the same string in NFC", () => {
+      const nfc = "café";
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), type: nfc })).not.toThrow();
+    });
+
+    it("REJECTS an UPPERCASE hex issuer_pubkey — hex has a case, and case changes the bytes", () => {
+      // "AABB" and "aabb" are the same key. A portal storing it uppercase and a directory
+      // lowercasing it on read would mint two different hashes for one signal.
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), issuer_pubkey: "AABB" })).toThrow(/lowercase hex/i);
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), issuer_pubkey: "aaBB" })).toThrow(/lowercase hex/i);
+    });
+
+    it("REJECTS a non-hex or odd-length issuer_pubkey", () => {
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), issuer_pubkey: "zzzz" })).toThrow(/lowercase hex/i);
+      expect(() => encodeTrustSignalEnvelope({ ...referenceEnvelope(), issuer_pubkey: "aab" })).toThrow(/lowercase hex/i);
     });
   });
 

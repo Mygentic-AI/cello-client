@@ -87,15 +87,25 @@ export function buildPrimaryTransferTbs(
   newDaemonId: string,
   oldDaemonId: string,
   nonce: string,
-  timestamp: number,
+  timestamp: number | bigint,
 ): Uint8Array {
+  // Past 0xffffffff, cbor-x encodes a JS `number` as an IEEE float64 (`fb`), not a uint64 (`1b`) —
+  // so a MILLISECOND timestamp (Date.now() ≈ 1.77e12, which is what a caller will reach for) would
+  // be hashed as a float, and any non-cbor-x verifier would compute different TBS bytes and reject a
+  // genuine transfer. buildSealTbs (session.ts:160,271) and buildAgentRevocationTbs
+  // (revocation.ts:39) both carry this coercion; this builder shipped without it.
+  //
+  // Safe to add now: there is no client-side sender yet (`primary_transfer_request` has no producer
+  // in cello-client), so no signature exists over these bytes, and every timestamp below 2^32
+  // encodes byte-identically to before.
+  const tsEncoded = typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
   return encodeCbor([
     PRIMARY_TRANSFER_DOMAIN,
     kLocalPubkeyHex,
     newDaemonId,
     oldDaemonId,
     nonce,
-    timestamp,
+    tsEncoded,
   ]) as Uint8Array;
 }
 

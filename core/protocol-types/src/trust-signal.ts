@@ -98,20 +98,92 @@ const PREIMAGE_FIELDS = [
  *  signal that expires roughly thirty thousand years from now. Refuse it at the door. */
 const MAX_EPOCH_SECONDS = 100_000_000_000; // ~year 5138
 
+/** Above this, a JS `number` is encoded by cbor-x as an IEEE **float64** (major type 7), not as a
+ *  uint64 — see `asCborInteger`. Anything hashed must cross this boundary as a BigInt. */
+const CBOR_UINT32_MAX = 0xffff_ffff;
+
+/** SHA-256. Named separately from SUPERSEDES_HASH_BYTES even though both are 32 today: they are
+ *  independent sizes, and coupling them means a future change to one silently breaks the other. */
+const SIGNAL_HASH_BYTES = 32;
 const SUPERSEDES_HASH_BYTES = 32;
 
-function requireEpochSeconds(name: string, value: unknown): number {
+/**
+ * Integers above 2³² MUST cross into CBOR as BigInt, or they are hashed as a FLOAT.
+ *
+ * Measured with this package's encoder:
+ *
+ *   encode(1768000000)          -> 1a 69618a00           uint32   (fine)
+ *   encode(4920000000)          -> fb 41f25413e0000000   FLOAT64  (WRONG)
+ *   encode(BigInt(4920000000))  -> 1b 0000000125413e00   uint64   (what RFC 8949 requires)
+ *
+ * cbor-x emits any JS `number` above 0xffffffff as major type 7 float64. A conforming CBOR
+ * implementation in Rust, Go, or Python emits a uint64 — so the two disagree on the preimage, and
+ * therefore on the hash, permanently and unfixably (spec §5: retrofitting the canonical form breaks
+ * every hash already minted).
+ *
+ * This is NOT hypothetical and NOT a 2106 problem: an `expires_at` a hundred years out is
+ * 1.768e9 + 3.15e9 = 4.92e9, well past 2³², and reachable by the first long-dated signal the portal
+ * mints. `buildSealTbs` (session.ts) and `buildAgentRevocationTbs` (revocation.ts) both carry this
+ * coercion. The trust-signal envelope shipped without it and a reviewer caught it.
+ */
+function asCborInteger(value: number): number | bigint {
+  return value > CBOR_UINT32_MAX ? BigInt(value) : value;
+}
+
+/** A non-negative integer safe to hash — rejected if it is a float, NaN, Infinity, or negative, and
+ *  coerced to BigInt past 2³² so it never encodes as a float64. */
+function requireHashableInteger(name: string, value: unknown, max: number, hint: string): number | bigint {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new Error(`trust-signal envelope: ${name} must be a finite integer (epoch seconds), got ${String(value)}`);
+    throw new Error(`trust-signal envelope: ${name} must be a finite integer, got ${String(value)}`);
   }
   if (!Number.isInteger(value)) {
-    throw new Error(`trust-signal envelope: ${name} must be an integer (epoch seconds) — no floating point is hashable across implementations, got ${value}`);
+    throw new Error(`trust-signal envelope: ${name} must be an integer — no floating point is hashable across implementations, got ${value}`);
   }
   if (value < 0) {
     throw new Error(`trust-signal envelope: ${name} must not be negative, got ${value}`);
   }
-  if (value >= MAX_EPOCH_SECONDS) {
-    throw new Error(`trust-signal envelope: ${name} is out of range for epoch seconds (${value}) — this looks like a millisecond timestamp; the contract is SECONDS`);
+  if (value > Number.MAX_SAFE_INTEGER) {
+    // Past 2^53 a JS number cannot even represent consecutive integers, so the value the caller
+    // meant and the value we hash may already differ. Refuse rather than hash an approximation.
+    throw new Error(`trust-signal envelope: ${name} exceeds Number.MAX_SAFE_INTEGER (${value}) — it cannot be hashed exactly`);
+  }
+  if (value >= max) {
+    throw new Error(`trust-signal envelope: ${name} is out of range (${value}) — ${hint}`);
+  }
+  return asCborInteger(value);
+}
+
+const requireEpochSeconds = (name: string, value: unknown): number | bigint =>
+  requireHashableInteger(
+    name,
+    value,
+    MAX_EPOCH_SECONDS,
+    "this looks like a millisecond timestamp; the contract is epoch SECONDS",
+  );
+
+/**
+ * Every hashed STRING must be NFC-normalized, and we REFUSE a string that is not — we never
+ * normalize it silently.
+ *
+ * Spec §5's list of cross-language hash-breakers names Unicode normalization explicitly. The same
+ * logical string differs on the wire: "é" is `62 c3a9` in NFC and `63 65cc81` in NFD. CBOR does not
+ * normalize, and RFC 8949's deterministic profile does not require NFC, so nothing downstream saves
+ * us.
+ *
+ * Refusing rather than normalizing is deliberate: silently normalizing would make two DIFFERENT
+ * inputs hash to the SAME signal — a collision we manufactured ourselves, which is strictly worse
+ * than refusing the odd one at the door.
+ */
+function requireNfcString(name: string, value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`trust-signal envelope: ${name} must be a non-empty string, got ${String(value)}`);
+  }
+  if (value.normalize("NFC") !== value) {
+    throw new Error(
+      `trust-signal envelope: ${name} must be Unicode NFC-normalized — the same logical string hashes ` +
+      `differently in NFD ("é" is c3a9 in NFC, 65cc81 in NFD), so a non-NFC value would produce a ` +
+      `signal no other implementation can reproduce. Normalize it before minting.`,
+    );
   }
   return value;
 }
@@ -153,14 +225,28 @@ function toPreimage(envelope: TrustSignalEnvelope): unknown[] {
   if (issuer_kind !== "portal" && issuer_kind !== "agent") {
     throw new Error(`trust-signal envelope: issuer_kind must be "portal" or "agent", got ${String(issuer_kind)}`);
   }
-  for (const [name, value] of [["subject", subject], ["issuer_pubkey", issuer_pubkey], ["type", type]] as const) {
-    if (typeof value !== "string" || value.length === 0) {
-      throw new Error(`trust-signal envelope: ${name} must be a non-empty string, got ${String(value)}`);
-    }
+  requireNfcString("subject", subject);
+  requireNfcString("type", type);
+  // issuer_pubkey is hex, and hex has a CASE. "AABB" and "aabb" are the same key and DIFFERENT bytes,
+  // so a portal that stores it uppercase and a directory that lowercases it on read would produce
+  // two different signal_hashes for one signal — a false hash_mismatch, per-node and per-version.
+  // Lowercase-only removes the ambiguity at zero cost. (Length/validity is NOT checked here: this
+  // component's job is byte-agreement, and the key's validity is the directory's to judge when it
+  // checks it against the authorized-issuer set.)
+  requireNfcString("issuer_pubkey", issuer_pubkey);
+  if (!/^[0-9a-f]+$/.test(issuer_pubkey) || issuer_pubkey.length % 2 !== 0) {
+    throw new Error(
+      `trust-signal envelope: issuer_pubkey must be LOWERCASE hex with an even length, got "${issuer_pubkey}". ` +
+      `Hex has a case, and "AABB" and "aabb" are the same key but different preimage bytes — which would ` +
+      `mint two different hashes for one signal.`,
+    );
   }
-  if (!Number.isInteger(schema_version) || schema_version < 0) {
-    throw new Error(`trust-signal envelope: schema_version must be a non-negative integer, got ${String(schema_version)}`);
-  }
+  const schemaVersion = requireHashableInteger(
+    "schema_version",
+    schema_version,
+    CBOR_UINT32_MAX + 1,
+    "a schema version is a small counter, not an identifier",
+  );
   // The payload must be RAW BYTES. An object here would be encoded as a CBOR map — the one
   // non-deterministic shape in the encoder — and the hash would silently depend on key insertion
   // order. Callers serialize their own payload and hand us the bytes.
@@ -193,7 +279,7 @@ function toPreimage(envelope: TrustSignalEnvelope): unknown[] {
     issuer_kind,
     issuer_pubkey,
     type,
-    schema_version,
+    schemaVersion,
     payload,
     issuedAt,
     expiresAt,
@@ -214,14 +300,22 @@ export function hashTrustSignalEnvelope(envelope: TrustSignalEnvelope): Uint8Arr
 
 /**
  * Does this envelope actually hash to `expected`? Length is checked first, so a truncated hash can
- * never pass by matching a prefix. The comparison is constant-time in the length of the input:
- * a signal hash is public, but the habit is cheap and the alternative invites a timing oracle the
- * day one of these becomes secret.
+ * never pass by matching a prefix. The comparison is constant-time in the length of the input: a
+ * signal hash is public, but the habit is cheap and the alternative invites a timing oracle the day
+ * one of these stops being public.
+ *
+ * ⚠️ THIS RETURNS `false` FOR A WRONG HASH BUT **THROWS** FOR A MALFORMED ENVELOPE, AND THAT
+ * ASYMMETRY IS DELIBERATE. A wrong hash is a normal, expected answer ("no, this doesn't match"). A
+ * malformed envelope is not an answer at all — it is an envelope that cannot be canonicalized, so
+ * there is no hash to compare and any boolean would be a lie.
+ *
+ * The directory calls this on hostile input. DO NOT wrap it in `try { … } catch { return false }`:
+ * that converts "this envelope is unhashable garbage" into "this envelope simply didn't match",
+ * which is the silent swallow that hides the attack. Let it throw, and log the cause.
  */
 export function verifyTrustSignalHash(envelope: TrustSignalEnvelope, expected: Uint8Array): boolean {
-  if (!(expected instanceof Uint8Array) || expected.length !== SUPERSEDES_HASH_BYTES) return false;
+  if (!(expected instanceof Uint8Array) || expected.length !== SIGNAL_HASH_BYTES) return false;
   const actual = hashTrustSignalEnvelope(envelope);
-  if (actual.length !== expected.length) return false;
   let diff = 0;
   for (let i = 0; i < actual.length; i++) diff |= actual[i] ^ expected[i];
   return diff === 0;

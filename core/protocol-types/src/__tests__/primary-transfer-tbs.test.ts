@@ -21,6 +21,32 @@ const OLD_DAEMON = "22222222-2222-2222-2222-222222222222";
 const NONCE = "nonce-abc-123";
 const TIMESTAMP = 1700000000000;
 
+describe("M8C-PRIMARY-1: buildPrimaryTransferTbs integer encoding", () => {
+  it("encodes a MILLISECOND timestamp as a CBOR uint64, never a float64", () => {
+    // Found while reviewing DOD-CBOR-1 (M10). Past 0xffffffff, cbor-x emits a JS number as an IEEE
+    // float64 (`fb`), not a uint64 (`1b`). Date.now() is ~1.77e12 — far past it — so the first caller
+    // to pass milliseconds would have the TBS hashed as a float, and any non-cbor-x verifier would
+    // compute different bytes and reject a GENUINE primary transfer. Its two sibling builders
+    // (buildSealTbs, buildAgentRevocationTbs) both guard; this one did not.
+    const ms = 1_768_000_000_000;
+    const tbs = Buffer.from(buildPrimaryTransferTbs(K_LOCAL, NEW_DAEMON, OLD_DAEMON, NONCE, ms)).toString("hex");
+    expect(tbs).toContain("1b0000019ba5031000"); // uint64: 0x19ba5031000 == 1_768_000_000_000
+    expect(tbs).not.toMatch(/fb[0-9a-f]{16}/);   // no float64 anywhere
+  });
+
+  it("a number and the same value as a BigInt produce IDENTICAL bytes", () => {
+    const ms = 1_768_000_000_000;
+    expect(Buffer.from(buildPrimaryTransferTbs(K_LOCAL, NEW_DAEMON, OLD_DAEMON, NONCE, ms))).toEqual(
+      Buffer.from(buildPrimaryTransferTbs(K_LOCAL, NEW_DAEMON, OLD_DAEMON, NONCE, BigInt(ms))),
+    );
+  });
+
+  it("timestamps below 2^32 encode exactly as before — the fix moves no existing byte", () => {
+    const tbs = Buffer.from(buildPrimaryTransferTbs(K_LOCAL, NEW_DAEMON, OLD_DAEMON, NONCE, 1_768_000_000)).toString("hex");
+    expect(tbs).toContain("1a69618a00"); // uint32, unchanged
+  });
+});
+
 describe("M8C-PRIMARY-1: buildPrimaryTransferTbs determinism", () => {
   it("same logical inputs produce byte-identical TBS across two independent calls", () => {
     const tbs1 = buildPrimaryTransferTbs(K_LOCAL, NEW_DAEMON, OLD_DAEMON, NONCE, TIMESTAMP);
