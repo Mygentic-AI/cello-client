@@ -416,3 +416,66 @@ describe("R9+R10: directory-supplied endpoints are untrusted input", () => {
     }
   }, 20_000);
 });
+
+// ─── R11: THE LIVE REGRESSION — creation must never be gated on relay reachability ──
+//
+// Found in production, not in a test: the directory handed out THREE relays; one did
+// not answer from this network; libp2p's circuit listener awaits a live connection to
+// each relay before start() resolves and has NO timeout of its own — so start() hung
+// forever. No created event, no failure, no retry, no alarm. Every agent on the daemon
+// ended up with NO standing receiver: deaf to ALL inbound, including the direct path
+// that worked before reservations existed. Strictly worse than the NAT defect itself.
+
+describe("R11: an unreachable relay must NOT prevent the standing receiver from coming up", () => {
+  let tempDir = "";
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-nat-hang-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+  });
+  afterEach(async () => {
+    delete process.env["CELLO_LISTEN_ADDR"];
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  /** A factory whose circuit-listen node NEVER finishes starting — the live failure. */
+  class HangingCircuitFactory extends ProductionSessionNodeFactory {
+    override async createNode(config: Parameters<ProductionSessionNodeFactory["createNode"]>[0]) {
+      const node = await super.createNode({ ...config, circuitRelayListenAddrs: undefined });
+      if (config.circuitRelayListenAddrs && config.circuitRelayListenAddrs.length > 0) {
+        // Mimic libp2p: start() parks forever waiting on a relay that never answers.
+        return { ...node, start: () => new Promise<void>(() => {}) } as typeof node;
+      }
+      return node;
+    }
+  }
+
+  it("a relay whose listener never resolves → the receiver still comes up (TCP-only), loudly degraded", async () => {
+    const { logger, events } = makeLogger();
+    const dbPath = join(tempDir, "sessions.db");
+    const manager = new SessionNodeManager({
+      factory: new HangingCircuitFactory(),
+      logger,
+      dbPath,
+      standingReceiverReservationTimeoutMs: 300, // don't make the suite wait 8s
+    });
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: DEAD_RELAY_PEER_ID, relayAddrs: ["/ip4/127.0.0.1/tcp/59986"] },
+      ]);
+
+      await manager.ensureStandingReceiverForAgent("alice");
+
+      // THE ASSERTION THAT MATTERS: the agent has a receiver. It is reachable.
+      const info = manager.getStandingReceiverInfo("alice");
+      expect(info).not.toBeNull();
+      expect(info!.addrs.length).toBeGreaterThan(0);
+      // Degraded, and it says so — never a silent "healthy".
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.timeout" && e.level === "warn")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 20_000);
+});

@@ -223,6 +223,8 @@ export class SessionNodeManager {
   #agentsWantingReceiver = new Set<string>();
   // M8B F14: standing-receiver create retry schedule (see constructor opts).
   #srRetryDelaysMs: number[];
+  /** DOD-NAT-REACHABILITY-1: reservation deadline — see #startReceiverNode. */
+  #srReservationTimeoutMs: number;
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -361,6 +363,13 @@ export class SessionNodeManager {
      */
     standingReceiverRetryDelaysMs?: number[];
     /**
+     * DOD-NAT-REACHABILITY-1: how long a standing receiver may wait for its
+     * circuit-relay reservations before coming up WITHOUT them. libp2p's circuit
+     * listener has no timeout of its own — an unreachable relay would park start()
+     * forever and leave the agent with no receiver at all. See #startReceiverNode.
+     */
+    standingReceiverReservationTimeoutMs?: number;
+    /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
      * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
      */
@@ -374,6 +383,7 @@ export class SessionNodeManager {
     }
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
+    this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 8_000;
     this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
   }
 
@@ -4430,6 +4440,77 @@ export class SessionNodeManager {
     return { addrs, relayPeerIds };
   }
 
+  /**
+   * Start the standing receiver's libp2p node, with reservations if they can be had
+   * QUICKLY, and without them if they cannot.
+   *
+   * THE INVARIANT — learned the hard way, live: **standing-receiver creation must
+   * NEVER be gated on relay reachability.** libp2p's circuit listener awaits a live
+   * connection to each relay before start() resolves, and it does not time out. Put
+   * three relays in the initial listen set, have one of them not answer from this
+   * network, and start() hangs FOREVER: no created event, no failure, no retry, no
+   * alarm — the agent simply has no receiver and is deaf to ALL inbound, including
+   * the direct path that worked before reservations existed. That is strictly worse
+   * than the NAT defect this whole line exists to fix.
+   *
+   * So the reservation attempt is RACED against a deadline. If it wins, we get a
+   * node that is both directly dialable and reachable through the relays. If it does
+   * not, we fall back to a plain TCP receiver — the agent is reachable on the direct
+   * path immediately — and the standing receiver is rebuilt with reservations later,
+   * when the directory next hands us endpoints (setDirectoryRelayEndpoints → the
+   * rebuild-if-deaf path). Degraded, loud, and never deaf.
+   */
+  async #startReceiverNode(
+    agentName: string,
+    sessionId: string,
+    gater: SessionConnectionGater,
+    circuitAddrs: string[],
+    correlationId: string,
+  ): Promise<CelloNode> {
+    if (circuitAddrs.length > 0) {
+      const withReservations = await this.#factory.createNode({
+        sessionId,
+        connectionGater: gater,
+        nodeType: "standing_receiver",
+        circuitRelayListenAddrs: circuitAddrs,
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = Symbol("reservation_timeout");
+      try {
+        const outcome = await Promise.race([
+          withReservations.start().then(() => "started" as const),
+          new Promise<typeof timedOut>((resolve) => {
+            timer = setTimeout(() => resolve(timedOut), this.#srReservationTimeoutMs);
+          }),
+        ]);
+        if (outcome === "started") return withReservations;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      // The deadline passed with start() still pending — at least one relay is not
+      // answering. Abandon this node (its start may still be parked on a dial; stop()
+      // is best-effort and must not itself block the fallback) and come up TCP-only.
+      this.#logger.warn("session.standing_receiver.reservation.timeout", {
+        agentName,
+        relayCount: circuitAddrs.length,
+        timeoutMs: this.#srReservationTimeoutMs,
+        reason: "at_least_one_relay_did_not_answer_in_time",
+        correlationId,
+      });
+      void Promise.resolve()
+        .then(() => withReservations.stop())
+        .catch(() => { /* best-effort: the node never finished starting */ });
+    }
+
+    const plain = await this.#factory.createNode({
+      sessionId,
+      connectionGater: gater,
+      nodeType: "standing_receiver",
+    });
+    await plain.start();
+    return plain;
+  }
+
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
   async #tryCreateStandingReceiver(
     agentName: string,
@@ -4453,13 +4534,7 @@ export class SessionNodeManager {
 
     let node: CelloNode;
     try {
-      node = await this.#factory.createNode({
-        sessionId,
-        connectionGater: gater,
-        nodeType: "standing_receiver",
-        ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
-      });
-      await node.start();
+      node = await this.#startReceiverNode(agentName, sessionId, gater, reservations.addrs, correlationId);
     } catch (err: unknown) {
       // extractErrorMessage, NOT String(err): the transport throws structured
       // plain objects ({ reason, message }), and String() destroys both into
