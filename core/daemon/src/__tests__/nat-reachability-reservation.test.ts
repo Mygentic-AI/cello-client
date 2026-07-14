@@ -146,20 +146,23 @@ describe("R2: ProductionSessionNodeFactory listen defaults", () => {
 describe("R3: the factory forwards circuit-relay listen addresses", () => {
   it("a standing receiver created with circuitRelayListenAddrs reserves with the relay", async () => {
     const relay = await startHopRelay();
-    const factory = new ProductionSessionNodeFactory();
     process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
-    const node = await factory.createNode({
-      sessionId: "sr-circuit",
-      nodeType: "standing_receiver",
-      circuitRelayListenAddrs: [`${relay.addr}/p2p-circuit`],
-    });
-    delete process.env["CELLO_LISTEN_ADDR"];
-    await node.start();
     try {
-      const ok = await waitUntil(() => node.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000);
-      expect(ok).toBe(true);
+      const factory = new ProductionSessionNodeFactory();
+      const node = await factory.createNode({
+        sessionId: "sr-circuit",
+        nodeType: "standing_receiver",
+        circuitRelayListenAddrs: [`${relay.addr}/p2p-circuit`],
+      });
+      await node.start();
+      try {
+        const ok = await waitUntil(() => node.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000);
+        expect(ok).toBe(true);
+      } finally {
+        await node.stop();
+      }
     } finally {
-      await node.stop();
+      delete process.env["CELLO_LISTEN_ADDR"];
       await relay.node.stop();
     }
   }, 20_000);
@@ -206,6 +209,10 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
       }, 10_000);
       expect(ok).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.reachability")).toBe(true);
+      // The reservation settles INSIDE node.start() (the circuit listener awaits
+      // openConnection + reserve), so the healthy path must never fire the
+      // degradation warn — pins the timing against future libp2p upgrades.
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.none")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();
@@ -256,4 +263,88 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
       await relay.node.stop();
     }
   }, 30_000);
+});
+
+describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () => {
+  let tempDir = "";
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-nat-dirteps-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+  });
+  afterEach(async () => {
+    delete process.env["CELLO_LISTEN_ADDR"];
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function makeManager() {
+    const { logger, events } = makeLogger();
+    const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const manager = new SessionNodeManager({ factory: new ProductionSessionNodeFactory(), logger, dbPath });
+    await manager.initialize();
+    return { manager, events };
+  }
+
+  it("R7: endpoints set BEFORE ensure — a fresh agent with no session history still reserves", async () => {
+    const relay = await startHopRelay();
+    const { manager } = await makeManager();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]); // agent exists; NO sessions rows
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      const ok = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      expect(ok).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 20_000);
+
+  it("R8: endpoints arriving AFTER a deaf ensure rebuild the receiver (agent-online races auth_ok)", async () => {
+    const relay = await startHopRelay();
+    const { manager, events } = await makeManager();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      await manager.ensureStandingReceiverForAgent("alice"); // no endpoints known yet → deaf to NAT'd initiators
+      const before = manager.getStandingReceiverInfo("alice");
+      expect(before).not.toBeNull();
+      expect(before!.addrs.every((a) => !a.includes("/p2p-circuit"))).toBe(true);
+
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      const ok = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      expect(ok).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.rebuild")).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 20_000);
+
+  it("R8b: endpoints arriving when the receiver ALREADY has a reservation do NOT rebuild it", async () => {
+    const relay = await startHopRelay();
+    const { manager, events } = await makeManager();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await wait(300);
+      expect(manager.getStandingReceiverInfo("alice")!.peerId).toBe(peerBefore);
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.rebuild")).toBe(false);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 20_000);
 });

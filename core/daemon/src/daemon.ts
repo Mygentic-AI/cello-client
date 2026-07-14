@@ -524,6 +524,16 @@ async function startDaemonHoldingLock(
       publishNode: (n) => {
         nodeRef = n;
       },
+      // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool arrives with
+      // signaling_auth_ok — feed it to the session node manager so this agent's
+      // standing receiver reserves with those relays (and rebuilds if it came up
+      // deaf because agent-online raced ahead of this connect).
+      onRelayEndpoints: (endpoints) => {
+        sessionNodeManager.setDirectoryRelayEndpoints(
+          agentName,
+          endpoints.map((e) => ({ relayPeerId: e.peerId, relayAddrs: e.addrs })),
+        );
+      },
     });
     const mgr = new SignalingManager({
       connect,

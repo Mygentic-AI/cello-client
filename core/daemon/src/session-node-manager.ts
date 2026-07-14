@@ -44,7 +44,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
-import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
@@ -2863,8 +2863,11 @@ export class SessionNodeManager {
         });
         return { ok: true };
       } catch (err: unknown) {
-        // error.message extracted — never [object Object]; try the next addr.
-        lastError = err instanceof Error ? err.message : String(err);
+        // extractErrorMessage handles the transport's structured plain-object
+        // throws (dial() never throws Error instances) — the old
+        // `instanceof Error` idiom logged "[object Object]" on every dial
+        // failure; try the next addr.
+        lastError = extractErrorMessage(err);
       }
     }
     this.#logger.warn("session.transport.connect.failed", {
@@ -4307,24 +4310,70 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-NAT-REACHABILITY-1 (Phase 2): relay endpoints the DIRECTORY handed this
+   * agent at signaling-auth time — the freshest, health-filtered view of the
+   * relay pool, and the only source a FRESH agent (no session history) has.
+   */
+  readonly #directoryRelayEndpoints = new Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>();
+
+  /**
+   * DOD-NAT-REACHABILITY-1 (Phase 2): accept the directory's relay-pool endpoints
+   * for an agent (arrives with signaling_auth_ok, i.e. on every connect AND every
+   * reconnect). If the agent's standing receiver is up but holds NO reservation —
+   * the agent-online ensure raced ahead of auth_ok, or every relay was down at
+   * create time — rebuild it now so the agent becomes dialable without waiting
+   * for a session handoff that (being unreachable) would never come.
+   */
+  setDirectoryRelayEndpoints(agentName: string, endpoints: Array<{ relayPeerId: string; relayAddrs: string[] }>): void {
+    this.#directoryRelayEndpoints.set(agentName, endpoints);
+    if (endpoints.length === 0 || this.#shuttingDown) return;
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return; // not ensured yet — the coming ensure reads the map
+    if (sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) return; // already reserved
+    this.#logger.info("session.standing_receiver.reservation.rebuild", {
+      agentName,
+      relayPeerIds: endpoints.map((e) => e.relayPeerId),
+    });
+    void this.removeStandingReceiverForAgent(agentName)
+      .then(() => this.ensureStandingReceiverForAgent(agentName))
+      .catch((err: unknown) => {
+        this.#logger.warn("session.standing_receiver.reservation.rebuild.failed", {
+          agentName,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  }
+
+  /**
    * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses for an agent's known
    * relays, so its standing receiver takes reservations and becomes dialable
-   * behind NAT. Source: the persisted relay endpoints of past sessions
-   * (getAgentRelayEndpoints). A fresh agent with no session history gets none —
-   * the directory-provided endpoint at agent-online (Phase 2) closes that gap.
+   * behind NAT. Sources, merged and deduped by relay peer id: the directory's
+   * auth-time relay pool (freshest — first), then the persisted relay endpoints
+   * of past sessions (getAgentRelayEndpoints — covers a directory that predates
+   * the auth_ok extension).
    */
   #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
-    let endpoints: Array<{ relayPeerId: string; relayAddrs: string[] }>;
+    let persisted: Array<{ relayPeerId: string; relayAddrs: string[] }>;
     try {
-      endpoints = this.getAgentRelayEndpoints(agentName);
-    } catch {
-      // No DB / unknown agent — no reservations to take. The receiver still
-      // installs; reachability is degraded, not broken (public agents are fine).
-      return { addrs: [], relayPeerIds: [] };
+      persisted = this.getAgentRelayEndpoints(agentName);
+    } catch (err: unknown) {
+      // No DB / unknown agent — persisted source unavailable. The directory
+      // source may still serve; reachability degrades only if both are empty.
+      // Logged (not swallowed): a genuine DB failure must be distinguishable
+      // from "fresh agent, no history" in the reachability trail.
+      this.#logger.debug("session.standing_receiver.persisted_relays.unavailable", {
+        agentName,
+        error: extractErrorMessage(err),
+      });
+      persisted = [];
+    }
+    const merged = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
+    for (const ep of [...(this.#directoryRelayEndpoints.get(agentName) ?? []), ...persisted]) {
+      if (!merged.has(ep.relayPeerId)) merged.set(ep.relayPeerId, ep);
     }
     const addrs: string[] = [];
     const relayPeerIds: string[] = [];
-    for (const ep of endpoints) {
+    for (const ep of merged.values()) {
       const base = ep.relayAddrs[0];
       if (!base) continue;
       addrs.push(base.includes("/p2p/") ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`);
@@ -4364,7 +4413,10 @@ export class SessionNodeManager {
       });
       await node.start();
     } catch (err: unknown) {
-      const error = err instanceof Error ? err.message : String(err);
+      // extractErrorMessage, NOT String(err): the transport throws structured
+      // plain objects ({ reason, message }), and String() destroys both into
+      // "[object Object]" — the loud failure must carry its cause.
+      const error = extractErrorMessage(err);
       this.#logger.error("session.node.create.failed", {
         sessionId,
         agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,

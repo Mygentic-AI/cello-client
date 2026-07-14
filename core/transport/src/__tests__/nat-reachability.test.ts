@@ -31,9 +31,10 @@ import {
   beforeEach,
   afterEach,
 } from "@claude-flow/testing";
+import { networkInterfaces } from "node:os";
 import * as lp from "it-length-prefixed";
 import { generateKeypair } from "@cello-protocol/crypto";
-import { createNode } from "../node.js";
+import { createNode, buildConfiguredHosts } from "../node.js";
 import { CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID } from "../protocols.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { CelloNode } from "../types.js";
@@ -237,6 +238,41 @@ describe("T4: circuit listen addresses do not break plain nodes", () => {
     expect(node.listenAddresses().length).toBeGreaterThan(0);
     expect(node.listenAddresses().every((a) => !a.includes("/p2p-circuit"))).toBe(true);
   });
+
+  it("buildConfiguredHosts expands a wildcard listen host to EVERY local interface address", () => {
+    // The deterministic pin for review F1: the failure case (dialable:true on a
+    // firewalled public-IP host) needs a public interface IP that CI machines
+    // don't have, so pin the pure expansion directly — every interface address
+    // must land in configuredHosts, which deriveDialability excludes.
+    const hosts = buildConfiguredHosts(["/ip4/0.0.0.0/tcp/0"]);
+    expect(hosts.has("0.0.0.0")).toBe(true);
+    for (const iface of Object.values(networkInterfaces())) {
+      for (const addr of iface ?? []) {
+        expect(hosts.has(addr.address.toLowerCase())).toBe(true);
+      }
+    }
+    // No wildcard → no interface expansion (loopback-only nodes keep the tight set).
+    const loopbackOnly = buildConfiguredHosts(["/ip4/127.0.0.1/tcp/0"]);
+    expect(loopbackOnly).toEqual(new Set(["127.0.0.1"]));
+  });
+
+  it("0.0.0.0 listen does NOT make interface addresses count as dialable — configured is not confirmed", async () => {
+    // Review F1: the wildcard expands to real interface addrs in getMultiaddrs().
+    // Without wildcard→interface expansion in configuredHosts, a firewalled
+    // public-IP host would read dialable:true with zero AutoNAT dial-back and
+    // its advertised address would suppress the working relay circuit address.
+    const node = await startNode({
+      nodeType: "standing_receiver",
+      listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
+    });
+    scope.addCleanup(async () => { try { await node.stop(); } catch { /* cleanup */ } });
+    // Interface (non-loopback) addrs are present — the raw material for the false positive…
+    expect(node.listenAddresses().some((a) => a.startsWith("/ip4/") && !a.startsWith("/ip4/127."))).toBe(true);
+    // …but none of them is AutoNAT-confirmed, so dialability must stay false.
+    const d = node.getDialability();
+    expect(d.dialable).toBe(false);
+    expect(d.publicAddr).toBeNull();
+  }, 15_000);
 
   it("a dead relay in the listen set does not kill the node — TCP survives, no circuit addr", async () => {
     const node = await startNode({

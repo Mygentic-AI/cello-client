@@ -9,6 +9,7 @@
  * Use lp.encode(source) / lp.decode(source) with it-pipe for composing pipelines.
  */
 
+import { networkInterfaces } from "node:os";
 import { createLibp2p } from "libp2p";
 import { FaultTolerance } from "@libp2p/interface";
 import { tcp } from "@libp2p/tcp";
@@ -77,6 +78,37 @@ function isPubliclyDialable(addr: string): boolean {
   return false; // no IP transport component — not directly dialable
 }
 
+/**
+ * The set of hosts a node was CONFIGURED to listen on / announce — excluded from
+ * dialability because configuration is not dial-back confirmation.
+ *
+ * DOD-NAT-REACHABILITY-1 (review F1): a WILDCARD listen host (0.0.0.0 / ::)
+ * expands to every local interface address in getMultiaddrs(), so those
+ * interface addresses are configured-not-confirmed too. Without this expansion a
+ * firewalled public-IP host (VPS class) would read dialable:true with zero
+ * AutoNAT dial-back, and its advertised direct address would suppress the
+ * working relay circuit address — recreating the unreachable-agent defect.
+ * Exported for direct unit-testing (the failure case needs a public interface
+ * IP, which CI machines don't have).
+ */
+export function buildConfiguredHosts(listenAddresses: string[], announceAddresses?: string[]): Set<string> {
+  const configuredHosts = new Set<string>();
+  let sawWildcard = false;
+  for (const a of [...listenAddresses, ...(announceAddresses ?? [])]) {
+    const host = extractHost(a);
+    if (host !== null) configuredHosts.add(host);
+    if (host === "0.0.0.0" || host === "::") sawWildcard = true;
+  }
+  if (sawWildcard) {
+    for (const iface of Object.values(networkInterfaces())) {
+      for (const addr of iface ?? []) {
+        configuredHosts.add(addr.address.toLowerCase());
+      }
+    }
+  }
+  return configuredHosts;
+}
+
 /** Extract the IPv4/IPv6 host component of a multiaddr string, or null. */
 function extractHost(addr: string): string | null {
   const ip4 = addr.match(/\/ip4\/([0-9.]+)/);
@@ -98,10 +130,13 @@ function extractHost(addr: string): string | null {
  * dynamically (an AutoNAT-confirmed `observed` address — its host is not one we
  * configured) counts toward dialable:true.
  *
- * CELLO session and standing-receiver nodes listen on loopback
- * (/ip4/127.0.0.1/tcp/0), so in practice the only public address that can appear
- * in getMultiaddrs() is one AutoNAT confirmed — this exclusion simply makes the
- * invariant explicit and robust for any future public-bound node.
+ * DOD-NAT-REACHABILITY-1: standing receivers listen on 0.0.0.0 by default, so
+ * every LOCAL INTERFACE address appears in getMultiaddrs() as configured-not-
+ * confirmed. createNode expands wildcard listen hosts (0.0.0.0 / ::) to the
+ * machine's interface addresses when building configuredHosts, so a public IP
+ * that is merely ON the interface (a firewalled VPS) never counts as dialable
+ * without an AutoNAT dial-back — advertising it would suppress the working
+ * relay circuit address and recreate the unreachable-agent defect.
  */
 function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>): Dialability {
   const publicAddr =
@@ -133,17 +168,22 @@ class CelloNodeImpl implements CelloNode {
   // start() re-checks that the non-circuit listeners actually materialised —
   // NO_FATAL must not silently absorb a real EADDRINUSE.
   readonly #expectsDirectListener: boolean;
+  // Whether ANY circuit listen entry was configured (drives the circuit-only
+  // zero-listener refusal in start()).
+  readonly #hasCircuitListen: boolean;
 
   constructor(
     libp2p: Libp2p,
     keyProvider: KeyProvider,
     configuredHosts: ReadonlySet<string>,
     expectsDirectListener: boolean,
+    hasCircuitListen: boolean,
   ) {
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
     this.#configuredHosts = configuredHosts;
     this.#expectsDirectListener = expectsDirectListener;
+    this.#hasCircuitListen = hasCircuitListen;
     // Recompute dialability whenever libp2p updates its self-reported addresses.
     // AutoNAT verification of an external address triggers a 'self:peer:update'.
     this.#libp2p.addEventListener("self:peer:update", () => {
@@ -187,6 +227,16 @@ class CelloNodeImpl implements CelloNode {
       throw {
         reason: "listen_failed",
         message: "no direct (non-circuit) listener materialised for the configured listen addresses",
+      };
+    }
+    // Circuit-ONLY listen set (no direct addr configured): NO_FATAL applies and
+    // the direct-listener check above is vacuous, so a dead relay would yield a
+    // running node with ZERO listeners — indistinguishable from healthy. Refuse.
+    if (!this.#expectsDirectListener && this.#hasCircuitListen && this.#libp2p.getMultiaddrs().length === 0) {
+      await this.#libp2p.stop();
+      throw {
+        reason: "listen_failed",
+        message: "no listener of any kind materialised for a circuit-only listen set (every relay unreachable)",
       };
     }
   }
@@ -485,14 +535,10 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // Record the hosts this node was configured to listen on / announce.
   // deriveDialability excludes these so dialability reflects AutoNAT dial-back
   // confirmation, not configuration.
-  const configuredHosts = new Set<string>();
-  for (const a of [...opts.listenAddresses, ...(opts.announceAddresses ?? [])]) {
-    const host = extractHost(a);
-    if (host !== null) configuredHosts.add(host);
-  }
+  const configuredHosts = buildConfiguredHosts(opts.listenAddresses, opts.announceAddresses);
 
   // Return node in STOPPED state — caller must call start()
   const expectsDirectListener =
     hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
-  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener);
+  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen);
 }
