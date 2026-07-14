@@ -470,17 +470,25 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       const info = manager.getStandingReceiverInfo("alice");
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
-      expect(events.some((e) => e.event === "session.standing_receiver.relay.unreachable")).toBe(true);
+      // The probe rejected it — either it never answered, or it answered and granted
+      // no reservation. Both are "do not listen on this relay"; both are logged.
+      expect(
+        events.some(
+          (e) =>
+            e.event === "session.standing_receiver.relay.unreachable" ||
+            e.event === "session.standing_receiver.relay.no_reservation",
+        ),
+      ).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
     }
   }, 20_000);
 
-  it("R11b: a relay that ANSWERS but whose reservation never completes → receiver still comes up, loudly degraded", async () => {
-    // The probe cannot catch this one: the relay is dialable, so the circuit listener
-    // is attempted — and libp2p's start() then parks on it forever. The deadline is
-    // the only thing between this and a permanently deaf agent.
+  it("R11b: a relay whose RESERVATION never completes is rejected by the probe → receiver still comes up, loudly degraded", async () => {
+    // The relay is dialable, so a dial-only probe would wave it through. The probe
+    // attempts the REAL reservation, so it catches the hang here — on a throwaway
+    // node — instead of on the standing receiver, where it would leave the agent deaf.
     const relay = await startHopRelay();
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
@@ -488,21 +496,22 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       logger,
       dbPath: join(tempDir, "sessions-b.db"),
       standingReceiverReservationTimeoutMs: 400,
-      standingReceiverRelayProbeTimeoutMs: 3_000,
+      standingReceiverRelayProbeTimeoutMs: 400,
     });
     await manager.initialize();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
       manager.setDirectoryRelayEndpoints("alice", [
-        { relayPeerId: relay.peerId, relayAddrs: [relay.addr] }, // dialable → probe passes
+        { relayPeerId: relay.peerId, relayAddrs: [relay.addr] }, // dialable, but the reservation hangs
       ]);
 
       await manager.ensureStandingReceiverForAgent("alice");
 
+      // THE ASSERTION THAT MATTERS: the agent HAS a receiver.
       const info = manager.getStandingReceiverInfo("alice");
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
-      expect(events.some((e) => e.event === "session.standing_receiver.reservation.timeout" && e.level === "warn")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.relay.unreachable")).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
@@ -541,4 +550,129 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       await relay.node.stop();
     }
   }, 25_000);
+});
+
+// ─── W: the reservation WATCHDOG — a silently lost reservation must be noticed ──
+//
+// libp2p refreshes a circuit reservation before it expires. If the relay has died,
+// the refresh fails and the /p2p-circuit address simply VANISHES. Nothing throws.
+// The receiver is still up and still directly dialable, so it looks perfectly
+// healthy — while no NAT'd peer can reach the agent at all. That is the silent
+// loss of inbound this whole story exists to kill; it cannot be left to chance.
+
+describe("W: a standing receiver that LOSES its reservation gets another one", () => {
+  let tempDir = "";
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-nat-watchdog-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+  });
+  afterEach(async () => {
+    delete process.env["CELLO_LISTEN_ADDR"];
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  function makeManager(dbName: string) {
+    const { logger, events } = makeLogger();
+    const manager = new SessionNodeManager({
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath: join(tempDir, dbName),
+      standingReceiverRelayProbeTimeoutMs: 3_000,
+      standingReceiverWatchdogIntervalMs: 250,
+    });
+    return { manager, events };
+  }
+
+  it("W1: the relay dies → the circuit address vanishes → the watchdog re-picks a live relay and the agent is reachable again", async () => {
+    const dying = await startHopRelay();
+    const survivor = await startHopRelay();
+    const { manager, events } = makeManager("w1.db");
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      // The dying relay is FIRST, so it is the one selected.
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: dying.peerId, relayAddrs: [dying.addr] },
+        { relayPeerId: survivor.peerId, relayAddrs: [survivor.addr] },
+      ]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      expect(
+        await waitUntil(() => {
+          const i = manager.getStandingReceiverInfo("alice");
+          return i !== null && i.addrs.some((a) => a.includes("/p2p-circuit"));
+        }, 10_000),
+      ).toBe(true);
+
+      const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      // The relay dies. NOTE: libp2p does NOT drop the /p2p-circuit address here — it
+      // keeps it until the reservation's own refresh, hours away. So "still advertising
+      // a circuit address" proves nothing, and a test that only checked for one would
+      // pass while the agent was unreachable. The watchdog must DETECT the loss.
+      await dying.node.stop();
+
+      const detected = await waitUntil(
+        () => events.some((e) => e.event === "session.standing_receiver.reservation.lost" && e.level === "warn"),
+        20_000,
+      );
+      expect(detected).toBe(true);
+
+      // …and having detected it, re-probe (the dead relay now fails), pick the
+      // survivor, and rebuild — WITHOUT anyone asking. A NEW node, holding a real
+      // reservation with the relay that is still alive.
+      const recovered = await waitUntil(() => {
+        const i = manager.getStandingReceiverInfo("alice");
+        return i !== null && i.peerId !== peerBefore && i.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 20_000);
+      expect(recovered).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      await survivor.node.stop();
+      try { await dying.node.stop(); } catch { /* already stopped */ }
+    }
+  }, 40_000);
+
+  it("W2: a receiver that NEVER had a reservation is not rebuilt on a timer — no thrash against relays we know refuse", async () => {
+    const { manager, events } = makeManager("w2.db");
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: DEAD_RELAY_PEER_ID, relayAddrs: ["/ip4/127.0.0.1/tcp/59985"] },
+      ]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      await wait(1_200); // several watchdog ticks
+      // Still up, still the SAME node — degraded (and already loud), never thrashing.
+      expect(manager.getStandingReceiverInfo("alice")!.peerId).toBe(peerBefore);
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.lost")).toBe(false);
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 25_000);
+
+  it("W3: the watchdog never resurrects a receiver for an agent that went offline", async () => {
+    const relay = await startHopRelay();
+    const { manager } = makeManager("w3.db");
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      await waitUntil(() => {
+        const i = manager.getStandingReceiverInfo("alice");
+        return i !== null && i.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+
+      await manager.removeStandingReceiverForAgent("alice"); // agent goes dark
+      await relay.node.stop();                                // and the relay dies
+
+      await wait(1_500); // several ticks
+      expect(manager.getStandingReceiverInfo("alice")).toBeNull();
+    } finally {
+      await manager.gracefulShutdown();
+      try { await relay.node.stop(); } catch { /* already stopped */ }
+    }
+  }, 30_000);
 });

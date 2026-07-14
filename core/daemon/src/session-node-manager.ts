@@ -222,7 +222,10 @@ export class SessionNodeManager {
   // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
   // would contend for a single node and thrash. Keyed by agentName. A creation-in-flight guard set
   // prevents two concurrent ensure() calls from building two nodes for the same agent.
-  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService }>();
+  // `hasReservation`: this receiver came up holding a /p2p-circuit address. The
+  // watchdog uses it to tell "lost its reservation" (must recover) apart from
+  // "never had one" (already degraded, and already loud) — see #reservationWatchdogTick.
+  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
   // M8B F14: agents that SHOULD have a standing receiver — marked by
   // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
@@ -238,6 +241,9 @@ export class SessionNodeManager {
   /** Shared relay-reachability result (all agents are offered the same pool). */
   #relayReachability: { at: number; reachable: Set<string> } | null = null;
   #relayProbeInFlight: Promise<Set<string>> | null = null;
+  /** DOD-NAT-REACHABILITY-1: watchdog for a SILENTLY lost reservation. */
+  #srWatchdogIntervalMs: number;
+  #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -385,6 +391,12 @@ export class SessionNodeManager {
     /** DOD-NAT-REACHABILITY-1: per-relay dial deadline for the reachability probe. */
     standingReceiverRelayProbeTimeoutMs?: number;
     /**
+     * DOD-NAT-REACHABILITY-1: how often to check that a standing receiver still HOLDS
+     * the reservation it came up with. A dead relay makes the /p2p-circuit address
+     * vanish silently — the agent looks healthy and is unreachable to every NAT'd peer.
+     */
+    standingReceiverWatchdogIntervalMs?: number;
+    /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
      * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
      */
@@ -400,6 +412,7 @@ export class SessionNodeManager {
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srRelayProbeTimeoutMs = opts.standingReceiverRelayProbeTimeoutMs ?? 5_000;
+    this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
     this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
   }
 
@@ -2240,6 +2253,13 @@ export class SessionNodeManager {
    * SQLite writes complete before this method returns.
    */
   async gracefulShutdown(): Promise<void> {
+    // DOD-NAT-REACHABILITY-1: stop the reservation watchdog before anything is torn
+    // down — a tick landing mid-shutdown would try to rebuild a receiver we are in
+    // the middle of stopping.
+    if (this.#reservationWatchdog !== null) {
+      clearInterval(this.#reservationWatchdog);
+      this.#reservationWatchdog = null;
+    }
     // Signal any in-flight standing-receiver replacement to self-stop (review M2).
     this.#shuttingDown = true;
 
@@ -4457,6 +4477,65 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-NAT-REACHABILITY-1: notice when a standing receiver has SILENTLY LOST its
+   * reservation, and get it another one.
+   *
+   * libp2p refreshes a circuit reservation before it expires. If the relay has died,
+   * that refresh fails and the /p2p-circuit address simply DISAPPEARS from the node's
+   * addresses. Nothing throws. The receiver is still up, still directly dialable, and
+   * still looks perfectly healthy — but no NAT'd peer can reach the agent any more.
+   * That is precisely the silent-loss-of-inbound failure this whole story exists to
+   * kill, so it cannot be left to chance: we watch for it and re-pick a relay.
+   *
+   * Only receivers that HAD a reservation are watched. One that never got one is
+   * already degraded and already loud (reservation.none / reservation.timeout);
+   * rebuilding it on a timer would just thrash against relays we know are refusing.
+   */
+  #reservationWatchdogTick(): void {
+    if (this.#shuttingDown) return;
+    for (const [agentName, sr] of this.#standingReceivers) {
+      if (!sr.hasReservation || sr.relayPeerId === undefined) continue; // never had one — not a LOSS
+      if (!this.#agentsWantingReceiver.has(agentName)) continue;        // agent went offline
+
+      // Watch the CONNECTION to the relay, not the circuit address.
+      //
+      // Killing the relay does NOT make the /p2p-circuit address disappear: libp2p
+      // keeps the listen address until the reservation's own refresh, up to two hours
+      // away. Watching the address would therefore miss a dead relay for hours — the
+      // agent would advertise a circuit address that routes through a relay that no
+      // longer exists, which is exactly the silent unreachability we are hunting. The
+      // live connection to the relay is the honest signal: no connection, no relay,
+      // no reservation.
+      const stillConnected = sr.node.getConnections().some((c) => c.peerId === sr.relayPeerId);
+      const stillAdvertising = sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"));
+      if (stillConnected && stillAdvertising) continue;
+
+      this.#logger.warn("session.standing_receiver.reservation.lost", {
+        agentName,
+        relayPeerId: sr.relayPeerId,
+        reason: stillConnected ? "circuit_address_vanished" : "relay_connection_gone",
+      });
+      // Force a fresh probe: the cached verdict still says the dead relay is fine.
+      this.#relayReachability = null;
+      void this.#rebuildStandingReceiver(agentName);
+    }
+  }
+
+  /** Start the reservation watchdog (idempotent). Stopped by gracefulShutdown. */
+  #startReservationWatchdog(): void {
+    if (this.#reservationWatchdog !== null) return;
+    this.#reservationWatchdog = setInterval(() => {
+      try {
+        this.#reservationWatchdogTick();
+      } catch (err: unknown) {
+        this.#logger.warn("session.standing_receiver.watchdog.failed", { error: extractErrorMessage(err) });
+      }
+    }, this.#srWatchdogIntervalMs);
+    // Never hold the process open on account of the watchdog.
+    this.#reservationWatchdog.unref?.();
+  }
+
+  /**
    * Which of these circuit addresses point at a relay that is actually answering
    * RIGHT NOW, from this network?
    *
@@ -4472,14 +4551,19 @@ export class SessionNodeManager {
    */
   async #reachableCircuitAddrs(circuitAddrs: string[], correlationId: string): Promise<string[]> {
     if (circuitAddrs.length === 0) return [];
+    // Pick ONE — the first candidate that proved it grants a reservation. See the
+    // note in #startReceiverNode for why more than one is worse than useless here.
+    const pickOne = (reachable: ReadonlySet<string>): string[] => {
+      const winner = circuitAddrs.find((a) => reachable.has(a));
+      return winner === undefined ? [] : [winner];
+    };
     const now = Date.now();
     const fresh = this.#relayReachability;
     if (fresh && now - fresh.at < RELAY_PROBE_CACHE_MS) {
-      return circuitAddrs.filter((a) => fresh.reachable.has(a));
+      return pickOne(fresh.reachable);
     }
     if (this.#relayProbeInFlight) {
-      const reachable = await this.#relayProbeInFlight;
-      return circuitAddrs.filter((a) => reachable.has(a));
+      return pickOne(await this.#relayProbeInFlight);
     }
 
     this.#relayProbeInFlight = (async (): Promise<Set<string>> => {
@@ -4487,31 +4571,49 @@ export class SessionNodeManager {
       let probe: CelloNode | undefined;
       try {
         // A throwaway dialer: loopback listen, open gater. It never accepts inbound.
-        probe = await this.#factory.createNode({
-          sessionId: `relay_probe_${randomUUID()}`,
-          connectionGater: new SessionConnectionGater({ sessionId: "relay_probe", allowedPeerId: null, logger: this.#logger }),
-          nodeType: "session",
-        });
-        await probe.start();
-        const node = probe;
+        // Probe each relay INDEPENDENTLY, and probe the thing we actually need: a
+        // RESERVATION, not a dial. A dial only proves the host answers. Live, two of
+        // three production relays answered the dial and then failed the reservation
+        // (their advertised peer id did not match the peer actually at that address,
+        // so Noise rejected the handshake) — a dial-only probe passed them straight
+        // into the listen set, where they cost every agent its reservations.
         await Promise.all(
           circuitAddrs.map(async (circuitAddr) => {
-            // Dial the RELAY itself — strip the /p2p-circuit suffix (and anything after).
-            const relayAddr = circuitAddr.slice(0, circuitAddr.indexOf("/p2p-circuit"));
+            let one: CelloNode | undefined;
             try {
+              one = await this.#factory.createNode({
+                sessionId: `relay_probe_${randomUUID()}`,
+                connectionGater: new SessionConnectionGater({ sessionId: "relay_probe", allowedPeerId: null, logger: this.#logger }),
+                nodeType: "standing_receiver",
+                circuitRelayListenAddrs: [circuitAddr],
+              });
+              const node = one;
               await Promise.race([
-                node.dial(relayAddr),
+                node.start(),
                 new Promise((_, reject) =>
                   setTimeout(() => reject(new Error("relay_probe_timeout")), this.#srRelayProbeTimeoutMs),
                 ),
               ]);
-              reachable.add(circuitAddr);
+              // The only proof that counts: the relay actually granted a reservation.
+              if (node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+                reachable.add(circuitAddr);
+              } else {
+                this.#logger.info("session.standing_receiver.relay.no_reservation", {
+                  circuitAddr,
+                  reason: "relay_answered_but_granted_no_reservation",
+                  correlationId,
+                });
+              }
             } catch (err: unknown) {
               this.#logger.info("session.standing_receiver.relay.unreachable", {
-                relayAddr,
+                circuitAddr,
                 error: extractErrorMessage(err),
                 correlationId,
               });
+            } finally {
+              if (one) {
+                try { await one.stop(); } catch { /* best-effort */ }
+              }
             }
           }),
         );
@@ -4533,8 +4635,7 @@ export class SessionNodeManager {
       return reachable;
     })();
 
-    const reachable = await this.#relayProbeInFlight;
-    return circuitAddrs.filter((a) => reachable.has(a));
+    return pickOne(await this.#relayProbeInFlight);
   }
 
   /**
@@ -4564,11 +4665,16 @@ export class SessionNodeManager {
     requestedCircuitAddrs: string[],
     correlationId: string,
   ): Promise<CelloNode> {
-    // Listen ONLY on relays that just answered. libp2p's start() waits for EVERY
-    // circuit listener, so a single black-holed relay drags the whole set past the
-    // deadline and costs the reservations of the healthy ones too — live, that left
-    // 3 of 4 agents with no reservation while one relay was unreachable. Probing is
-    // bounded and shared across agents, so it never becomes the new hang.
+    // ONE relay, proven to grant a reservation. Not all of them — measured, against
+    // the real relays:
+    //   * libp2p reserves with concurrency 1 (DEFAULT_RESERVATION_CONCURRENCY), and
+    //     start() awaits EVERY circuit listener, so N relays serialize into
+    //     N × (connect + reserve) ≈ N × 3-4s before the node is usable at all;
+    //   * and it yields exactly ONE relay's addresses anyway.
+    // So asking for three bought no redundancy and cost the agent its reachability:
+    // live, 3 of 4 agents blew the deadline and came up with NO reservation at all.
+    // If the chosen relay later dies, its reservation refresh fails and the
+    // rebuild-if-deaf path re-runs this and picks another.
     const circuitAddrs = await this.#reachableCircuitAddrs(requestedCircuitAddrs, correlationId);
     if (circuitAddrs.length > 0) {
       const withReservations = await this.#factory.createNode({
@@ -4679,7 +4785,17 @@ export class SessionNodeManager {
     });
     autoNat.emitInitialResult();
 
-    this.#standingReceivers.set(agentName, { node, gater, autoNat });
+    const circuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length;
+    // The relay we actually reserved with — the watchdog watches our connection to it.
+    const reservedRelayPeerId =
+      circuitAddrs > 0 ? reservations.addrs[0]?.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1] : undefined;
+    this.#standingReceivers.set(agentName, {
+      node,
+      gater,
+      autoNat,
+      hasReservation: circuitAddrs > 0,
+      ...(reservedRelayPeerId !== undefined ? { relayPeerId: reservedRelayPeerId } : {}),
+    });
     this.#logger.info("session.node.created", {
       sessionId,
       agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
@@ -4691,7 +4807,6 @@ export class SessionNodeManager {
     // up? circuitAddrs === 0 with reservations requested means every relay
     // refused/was unreachable — the agent is deaf to NAT'd initiators (public
     // ones can still connect directly). That must be LOUD, not a quiet shrug.
-    const circuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length;
     this.#logger.info("session.standing_receiver.reachability", {
       agentName,
       circuitAddrs,
@@ -4717,6 +4832,7 @@ export class SessionNodeManager {
    */
   async ensureStandingReceiverForAgent(agentName: string): Promise<void> {
     this.#agentsWantingReceiver.add(agentName);
+    this.#startReservationWatchdog();
     await this.#ensureStandingReceiver(agentName);
   }
 
