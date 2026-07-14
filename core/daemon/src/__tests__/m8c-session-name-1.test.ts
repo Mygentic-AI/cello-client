@@ -293,11 +293,14 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     await client.send("cello_name_session", { session_id: SID, session_name: null });
     expect(logEvents.some((e) => e.event === "session.name.cleared")).toBe(true);
 
-    await client.send("cello_name_session", { session_id: SID, session_name: "bad\nname" });
+    // The probe string must not be spellable in hex: the context carries a random UUID
+    // agentId, and a name like "bad" collides with UUIDs such as "…-badf-…", failing
+    // this assertion at random. "zqxw" cannot appear in a UUID.
+    await client.send("cello_name_session", { session_id: SID, session_name: "zqxw\nname" });
     const rejected = logEvents.find((e) => e.event === "session.name.rejected");
     expect(rejected).toBeDefined();
     expect(rejected!.context.reason).toBe("session_name_control_chars");
-    expect(JSON.stringify(rejected!.context)).not.toContain("bad");
+    expect(JSON.stringify(rejected!.context)).not.toContain("zqxw");
   });
 
   it("AC-A16/close: a name set at close is logged with source 'close'", async () => {
