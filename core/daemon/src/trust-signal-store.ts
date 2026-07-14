@@ -67,10 +67,33 @@ export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
 }
 
-export interface ReceivedSignalInput extends WalletSignalInput {
+/**
+ * A signal a contact PRESENTED to one of my agents, as it is stored after verification.
+ *
+ * ⚠️ NOTE WHAT IS ABSENT: there is no `status` field, and this type deliberately does NOT extend
+ * `WalletSignalInput`.
+ *
+ * `status` is outside the hash preimage — that is what makes it mutable, and it also means it is
+ * **NOT AUTHENTICATED BY THE SIGNAL HASH**. A presenter can claim any status they like. If this type
+ * simply extended the wallet's, the peer's claimed `status` would ride in the same struct as the
+ * envelope fields and the natural call site would pass it straight through to the database.
+ *
+ * The attack that permits: Bob presents signal H; we verify it, find it REVOKED at the directory,
+ * and store that as evidence. Next session Bob re-presents the same hash claiming `status: active`.
+ * An upsert on the peer's value overwrites the one durable record that says we caught it — the party
+ * a revocation indicts gets to erase the indictment. Evidence an adversary can rewrite is not
+ * evidence.
+ *
+ * So the stored status is OUR verification verdict (`verdict`), produced by the verification seam
+ * (DOD-VERIFY-1) from what the DIRECTORY said — never a field the peer controls. Removing `status`
+ * from the input type makes that structural: there is no pass-through to forget to block.
+ */
+export interface ReceivedSignalInput extends Omit<WalletSignalInput, "status"> {
   agentId: string;
   contactPubkey: string;
   verifiedAt: number;
+  /** OUR verdict from re-checking the directory — never the presenter's claim. */
+  verdict: SignalStatus;
 }
 
 export interface ReceivedSignalRow extends ReceivedSignalInput {
@@ -140,8 +163,26 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
-const toBytes = (v: unknown): Uint8Array =>
-  v instanceof Uint8Array ? new Uint8Array(v) : Buffer.isBuffer(v) ? new Uint8Array(v) : new Uint8Array(0);
+
+/**
+ * The payload column is `BLOB NOT NULL`, so an unrecognized shape coming back from the driver means
+ * something is wrong — NOT that the payload is empty.
+ *
+ * Returning `new Uint8Array(0)` here (the previous behavior) is the silent-fallback pattern: a signal
+ * whose payload failed to materialise would flow on to presentation and verification looking like a
+ * perfectly valid signal that simply has no content. Its hash would then not match, and the operator
+ * would be sent to hunt a canonicalization bug that does not exist. ABSENT IS NOT FINE — refuse, and
+ * name the actual cause.
+ */
+const toBytes = (v: unknown): Uint8Array => {
+  if (v instanceof Uint8Array) return new Uint8Array(v);
+  if (Buffer.isBuffer(v)) return new Uint8Array(v);
+  throw new Error(
+    `signal_payload_not_bytes: the payload column returned ${v === null ? "null" : typeof v}` +
+    `${v && typeof v === "object" ? ` (${v.constructor?.name})` : ""}, but the column is BLOB NOT NULL. ` +
+    "This is a storage-layer fault, not an empty payload — an empty payload would be a zero-length BLOB.",
+  );
+};
 
 interface EnvelopeDbRow {
   signal_hash: string;
@@ -157,7 +198,13 @@ interface EnvelopeDbRow {
   supersedes_hash: string | null;
   status: string;
   received_at: number;
-  verified_at?: number;
+}
+
+/** The received table's row. `verified_at` is `NOT NULL` in the schema, so it is REQUIRED here — an
+ *  optional type would only invite a `?? 0` default, and "verified at the epoch" is indistinguishable
+ *  from a real, absurd timestamp. */
+interface ReceivedDbRow extends EnvelopeDbRow {
+  verified_at: number;
 }
 
 function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
@@ -182,10 +229,16 @@ export class TrustSignalStore {
   readonly #db: DaemonDatabase;
   readonly #logger: Logger;
 
+  /**
+   * Does NOT create the schema. `SessionNodeManager.initialize()` owns it, and must — the received
+   * table's FK parent is `contacts`, which that init creates. A store that created its own schema
+   * would happily build `contact_trust_signals` on any handle lacking `contacts`, producing a
+   * dangling FK that then fails on the first INSERT with `no such table: main.contacts` — an error
+   * that names the wrong subsystem, at the wrong time, far from the cause.
+   */
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
-    ensureTrustSignalSchema(db, logger);
   }
 
   /**
@@ -223,12 +276,42 @@ export class TrustSignalStore {
     return row ? toWalletRow(row) : null;
   }
 
-  /** Status is the ONE mutable field — it lives outside the hash precisely so this is possible. */
+  /**
+   * Status is the ONE mutable field — it lives outside the hash precisely so this is possible.
+   *
+   * REVOCATION IS TERMINAL. A revoked signal can never go back to `active`. Without that guard this
+   * is a blind UPDATE, and a stale or replayed directory read reporting `active` for a hash we
+   * already revoked would resurrect it — and `listPresentable` would start offering it again. The
+   * directory is the authority on revocation, but a LATE answer from it is not a NEW answer; the
+   * monotonic rule makes out-of-order responses harmless instead of dangerous.
+   *
+   * `superseded` may still be overtaken by `revoked` (a superseded signal can also be revoked), but
+   * never the reverse, and never back to `active`.
+   */
   setWalletStatus(signalHash: string, status: SignalStatus): void {
     const res = this.#db
-      .prepare("UPDATE wallet_trust_signals SET status = ? WHERE signal_hash = ?")
-      .run(status, signalHash);
-    if (res.changes > 0) this.#logger.info("signal.wallet.status.changed", { signalHash, status });
+      .prepare(
+        `UPDATE wallet_trust_signals SET status = ?
+          WHERE signal_hash = ?
+            AND status != 'revoked'
+            AND NOT (status = 'superseded' AND ? = 'active')`,
+      )
+      .run(status, signalHash, status);
+    if (res.changes > 0) {
+      this.#logger.info("signal.wallet.status.changed", { signalHash, status });
+      return;
+    }
+    // No change is not necessarily an error (the row may already hold this status), but a REFUSED
+    // downgrade is worth surfacing — it means something tried to resurrect a dead signal.
+    const current = this.#db
+      .prepare("SELECT status FROM wallet_trust_signals WHERE signal_hash = ?")
+      .get(signalHash) as { status: string } | undefined;
+    if (current && current.status !== status) {
+      this.#logger.warn("signal.wallet.status.change_refused", {
+        signalHash, current: current.status, attempted: status,
+        reason: "revocation is terminal — a revoked or superseded signal is never returned to active",
+      });
+    }
   }
 
   /**
@@ -277,15 +360,24 @@ export class TrustSignalStore {
             verified_at, received_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (agent_id, contact_pubkey, signal_hash)
-           DO UPDATE SET verified_at = excluded.verified_at, status = excluded.status`,
+           DO UPDATE SET
+             verified_at = excluded.verified_at,
+             -- OUR verdict may only ever get WORSE, never better. A re-presentation cannot launder a
+             -- signal we already caught as revoked/superseded back to active: the party a revocation
+             -- indicts does not get to erase the indictment. (The envelope fields are not updated at
+             -- all — they are hashed, so an identical signal_hash means identical envelope bytes; a
+             -- differing value under the same hash is a liar and must not win.)
+             status = CASE WHEN contact_trust_signals.status = 'active' THEN excluded.status
+                           ELSE contact_trust_signals.status END`,
       )
       .run(
         s.agentId, s.contactPubkey, s.signalHash, s.subjectKind, s.subject, s.issuerKind,
         s.issuerPubkey, s.type, s.schemaVersion, toBuf(s.payload), s.issuedAt, s.expiresAt,
-        s.supersedesHash, s.status, s.verifiedAt, Date.now(),
+        s.supersedesHash, s.verdict, s.verifiedAt, Date.now(),
       );
     this.#logger.info("signal.received.stored", {
       agentId: s.agentId, signalHash: s.signalHash, type: s.type, issuerKind: s.issuerKind,
+      verdict: s.verdict,
     });
   }
 
@@ -295,12 +387,16 @@ export class TrustSignalStore {
       .prepare(
         `SELECT * FROM contact_trust_signals WHERE agent_id = ? AND contact_pubkey = ?`,
       )
-      .all(opts.agentId, opts.contactPubkey) as unknown as EnvelopeDbRow[];
-    return rows.map((r) => ({
-      ...toWalletRow(r),
-      agentId: opts.agentId,
-      contactPubkey: opts.contactPubkey,
-      verifiedAt: r.verified_at ?? 0,
-    }));
+      .all(opts.agentId, opts.contactPubkey) as unknown as ReceivedDbRow[];
+    return rows.map((r) => {
+      const { status, ...envelope } = toWalletRow(r);
+      return {
+        ...envelope,
+        agentId: opts.agentId,
+        contactPubkey: opts.contactPubkey,
+        verifiedAt: r.verified_at,
+        verdict: status as SignalStatus,
+      };
+    });
   }
 }

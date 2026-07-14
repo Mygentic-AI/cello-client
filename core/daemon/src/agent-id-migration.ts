@@ -41,7 +41,7 @@
  */
 
 import type { Logger } from "./types.js";
-import type { DaemonDatabase } from "./sqlcipher-db.js";
+import { withForeignKeysOff, type DaemonDatabase } from "./sqlcipher-db.js";
 
 /** A table that must be re-keyed, with the exact shape it is re-keyed TO. */
 interface RekeyTarget {
@@ -287,101 +287,116 @@ export function migrateSessionTablesToAgentId(db: DaemonDatabase, logger: Logger
 
   const rowCounts: Record<string, number> = {};
 
-  db.exec("BEGIN");
-  try {
-    for (const target of pending) {
-      const oldCols = columnsOf(db, target.table);
-      const tmp = `${target.table}_rekey_new`;
+  // FOREIGN KEYS OFF, OUTSIDE THE TRANSACTION — and it must be outside, or it does nothing.
+  //
+  // `contacts` is one of the tables rebuilt below, and it is the FK PARENT of
+  // `contact_trust_signals` (M10 / DOD-STORE-CLIENT-1). Since M10-D19 turned FK enforcement ON,
+  // `DROP TABLE contacts` is an implicit DELETE that fires ON DELETE CASCADE and silently empties
+  // every received trust signal on every agent. The row-count guards below would not notice: they
+  // count `contacts`, not its children.
+  //
+  // And `PRAGMA foreign_keys` is a NO-OP inside a transaction — SQLite ignores it without a word —
+  // so disabling FKs after `BEGIN` (the intuitive place) would look correct and cascade anyway.
+  // `withForeignKeysOff` toggles it here, VERIFIES it took effect, and runs `PRAGMA
+  // foreign_key_check` on the way out so a rebuild that leaves a dangling reference fails loudly
+  // instead of surfacing as a mystery insert failure days later.
+  return withForeignKeysOff(db, logger, () => {
+    db.exec("BEGIN");
+    try {
+      for (const target of pending) {
+        const oldCols = columnsOf(db, target.table);
+        const tmp = `${target.table}_rekey_new`;
 
-      db.exec(target.createSql(tmp));
+        db.exec(target.createSql(tmp));
 
-      // Copy every column the OLD table has that the NEW table also has (minus agent_name, which is
-      // replaced by agent_id). A pre-DOD-LOOP-1 retry_queue lacks agent_name/awaiting_ack entirely;
-      // taking the intersection handles every historical shape without a per-version special case.
-      const newCols = columnsOf(db, tmp);
-      const carried = oldCols.filter((c) => c !== "agent_name" && c !== "id" && newCols.includes(c));
+        // Copy every column the OLD table has that the NEW table also has (minus agent_name, which is
+        // replaced by agent_id). A pre-DOD-LOOP-1 retry_queue lacks agent_name/awaiting_ack entirely;
+        // taking the intersection handles every historical shape without a per-version special case.
+        const newCols = columnsOf(db, tmp);
+        const carried = oldCols.filter((c) => c !== "agent_name" && c !== "id" && newCols.includes(c));
 
-      const hasName = oldCols.includes("agent_name");
-      if (hasName) {
-        // Resolve through a JOIN on the parent so the mapping is the database's, not this process's.
-        // An unresolvable row is DROPPED by the inner join and caught by the count check below —
-        // for `strict` tables. For `nullable` (retry_queue), a NULL name must survive, so LEFT JOIN.
-        const join = target.backfill === "strict" ? "JOIN" : "LEFT JOIN";
-        db.exec(
-          `INSERT INTO ${tmp} (agent_id${carried.length ? ", " + carried.join(", ") : ""})
-           SELECT a.agent_id${carried.length ? ", " + carried.map((c) => `t.${c}`).join(", ") : ""}
-           FROM ${target.table} t ${join} agents a ON a.agent_name = t.agent_name`,
-        );
-      } else {
-        // No name to resolve (pre-DOD-LOOP-1 retry_queue): agent_id stays NULL — "not agent-scoped".
-        if (target.backfill === "strict") {
-          throw new Error(
-            `agent_id_backfill_impossible: table '${target.table}' has neither agent_name nor agent_id`,
+        const hasName = oldCols.includes("agent_name");
+        if (hasName) {
+          // Resolve through a JOIN on the parent so the mapping is the database's, not this process's.
+          // An unresolvable row is DROPPED by the inner join and caught by the count check below —
+          // for `strict` tables. For `nullable` (retry_queue), a NULL name must survive, so LEFT JOIN.
+          const join = target.backfill === "strict" ? "JOIN" : "LEFT JOIN";
+          db.exec(
+            `INSERT INTO ${tmp} (agent_id${carried.length ? ", " + carried.join(", ") : ""})
+             SELECT a.agent_id${carried.length ? ", " + carried.map((c) => `t.${c}`).join(", ") : ""}
+             FROM ${target.table} t ${join} agents a ON a.agent_name = t.agent_name`,
+          );
+        } else {
+          // No name to resolve (pre-DOD-LOOP-1 retry_queue): agent_id stays NULL — "not agent-scoped".
+          if (target.backfill === "strict") {
+            throw new Error(
+              `agent_id_backfill_impossible: table '${target.table}' has neither agent_name nor agent_id`,
+            );
+          }
+          db.exec(
+            `INSERT INTO ${tmp} (${carried.join(", ")}) SELECT ${carried.map((c) => `t.${c}`).join(", ")} FROM ${target.table} t`,
           );
         }
-        db.exec(
-          `INSERT INTO ${tmp} (${carried.join(", ")}) SELECT ${carried.map((c) => `t.${c}`).join(", ")} FROM ${target.table} t`,
-        );
+
+        const after = (db.prepare(`SELECT COUNT(*) AS n FROM ${tmp}`).get() as { n: number }).n;
+        const expected = before.get(target.table)!;
+        if (after !== expected) {
+          throw new Error(
+            `agent_id_backfill_row_count_mismatch: table '${target.table}' had ${expected} row(s) before and ` +
+              `${after} after the copy. A row failed to resolve to an agent_id (orphaned ${target.table}.agent_name ` +
+              `with no matching agents row), or a name matched more than one agent. Refusing to commit.`,
+          );
+        }
+
+        // Completeness. `strict` → every row must carry an agent_id. `nullable` → only rows that HAD a
+        // name must; a row that was always agent-less legitimately stays NULL.
+        const unresolved =
+          target.backfill === "strict"
+            ? (db.prepare(`SELECT COUNT(*) AS n FROM ${tmp} WHERE agent_id IS NULL`).get() as { n: number }).n
+            : hasName
+              ? (
+                  db
+                    .prepare(
+                      `SELECT COUNT(*) AS n FROM ${target.table} t WHERE t.agent_name IS NOT NULL
+                       AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.agent_name = t.agent_name)`,
+                    )
+                    .get() as { n: number }
+                ).n
+              : 0;
+        if (unresolved > 0) {
+          throw new Error(
+            `agent_id_backfill_incomplete: table '${target.table}' has ${unresolved} row(s) whose agent could not ` +
+              `be resolved to a stable agent_id. Refusing to commit a table with an unattributable row.`,
+          );
+        }
+
+        db.exec(`DROP TABLE ${target.table}`);
+        db.exec(`ALTER TABLE ${tmp} RENAME TO ${target.table}`);
+        for (const sql of target.indexSql(target.table)) db.exec(sql);
+
+        rowCounts[target.table] = after;
       }
-
-      const after = (db.prepare(`SELECT COUNT(*) AS n FROM ${tmp}`).get() as { n: number }).n;
-      const expected = before.get(target.table)!;
-      if (after !== expected) {
-        throw new Error(
-          `agent_id_backfill_row_count_mismatch: table '${target.table}' had ${expected} row(s) before and ` +
-            `${after} after the copy. A row failed to resolve to an agent_id (orphaned ${target.table}.agent_name ` +
-            `with no matching agents row), or a name matched more than one agent. Refusing to commit.`,
-        );
+      db.exec("COMMIT");
+    } catch (err) {
+      // SQLite may have already aborted the transaction; a failing ROLLBACK must not mask the real error.
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        /* the failing statement may have already aborted the txn */
       }
-
-      // Completeness. `strict` → every row must carry an agent_id. `nullable` → only rows that HAD a
-      // name must; a row that was always agent-less legitimately stays NULL.
-      const unresolved =
-        target.backfill === "strict"
-          ? (db.prepare(`SELECT COUNT(*) AS n FROM ${tmp} WHERE agent_id IS NULL`).get() as { n: number }).n
-          : hasName
-            ? (
-                db
-                  .prepare(
-                    `SELECT COUNT(*) AS n FROM ${target.table} t WHERE t.agent_name IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM agents a WHERE a.agent_name = t.agent_name)`,
-                  )
-                  .get() as { n: number }
-              ).n
-            : 0;
-      if (unresolved > 0) {
-        throw new Error(
-          `agent_id_backfill_incomplete: table '${target.table}' has ${unresolved} row(s) whose agent could not ` +
-            `be resolved to a stable agent_id. Refusing to commit a table with an unattributable row.`,
-        );
-      }
-
-      db.exec(`DROP TABLE ${target.table}`);
-      db.exec(`ALTER TABLE ${tmp} RENAME TO ${target.table}`);
-      for (const sql of target.indexSql(target.table)) db.exec(sql);
-
-      rowCounts[target.table] = after;
+      logger.error("daemon.migration.agent_id_backfill.failed", {
+        tables: pending.map((t) => t.table),
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
     }
-    db.exec("COMMIT");
-  } catch (err) {
-    // SQLite may have already aborted the transaction; a failing ROLLBACK must not mask the real error.
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      /* the failing statement may have already aborted the txn */
-    }
-    logger.error("daemon.migration.agent_id_backfill.failed", {
-      tables: pending.map((t) => t.table),
-      reason: err instanceof Error ? err.message : String(err),
+
+    logger.info("daemon.migration.agent_id_backfill", {
+      tables: Object.keys(rowCounts),
+      rowCounts,
+      agentsMapped: nameToId.size,
     });
-    throw err;
-  }
 
-  logger.info("daemon.migration.agent_id_backfill", {
-    tables: Object.keys(rowCounts),
-    rowCounts,
-    agentsMapped: nameToId.size,
+    return { migrated: true, rowCounts };
   });
-
-  return { migrated: true, rowCounts };
 }

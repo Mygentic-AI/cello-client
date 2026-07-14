@@ -29,6 +29,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
+import { withForeignKeysOff } from "../sqlcipher-db.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -189,12 +190,35 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
 
     it("does not present a REVOKED or SUPERSEDED signal", () => {
       store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
-      store.setWalletStatus(HASH("2"), "revoked");
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
       store.setWalletStatus(HASH("2"), "superseded");
       expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+
+      store.putWalletSignal(envelope({ signalHash: HASH("5"), subjectKind: "agent", subject: alice }));
+      store.setWalletStatus(HASH("5"), "revoked");
+      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+    });
+
+    it("REVOCATION IS TERMINAL — a revoked signal can never be resurrected to active (F5)", () => {
+      // Without this guard setWalletStatus is a blind UPDATE, and a stale or replayed directory read
+      // reporting `active` for a hash we already revoked would flip it back — and listPresentable
+      // would start offering a revoked signal to counterparties again. The directory is the authority
+      // on revocation, but a LATE answer from it is not a NEW answer.
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.setWalletStatus(HASH("2"), "revoked");
+
+      store.setWalletStatus(HASH("2"), "active"); // the stale/replayed read
+
+      expect(store.getWalletSignal(HASH("2"))!.status).toBe("revoked");
+      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+    });
+
+    it("a SUPERSEDED signal may still be revoked, but never returned to active", () => {
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.setWalletStatus(HASH("2"), "superseded");
       store.setWalletStatus(HASH("2"), "active");
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toHaveLength(1);
+      expect(store.getWalletSignal(HASH("2"))!.status).toBe("superseded"); // not resurrected
+      store.setWalletStatus(HASH("2"), "revoked");
+      expect(store.getWalletSignal(HASH("2"))!.status).toBe("revoked");    // but may still worsen
     });
   });
 
@@ -206,7 +230,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     });
 
     it("stores a verified signal against the contact row", () => {
-      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 123, ...envelope() });
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 123, verdict: "active", ...envelope() });
       const got = store.listReceived({ agentId: alice, contactPubkey: PEER });
       expect(got).toHaveLength(1);
       expect(got[0].type).toBe("phone");
@@ -218,7 +242,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // with it off SQLite silently accepts the orphan row — INV-AGENT-SCOPED would then be enforced
       // by nothing but good intentions, and the schema would LIE about it.
       expect(() =>
-        store.putReceivedSignal({ agentId: alice, contactPubkey: HASH("9"), verifiedAt: 1, ...envelope() }),
+        store.putReceivedSignal({ agentId: alice, contactPubkey: HASH("9"), verifiedAt: 1, verdict: "active", ...envelope() }),
       ).toThrow(/FOREIGN KEY|constraint/i);
     });
 
@@ -235,7 +259,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
 
     it("is INVISIBLE to a co-resident agent — the whole point of INV-AGENT-SCOPED", () => {
       mgr.addContact("bob", PEER, undefined, "accepted"); // Bob has the SAME peer as a contact
-      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, ...envelope() });
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, verdict: "active", ...envelope() });
 
       // Same daemon, same DB, same peer — and Bob still sees nothing.
       expect(store.listReceived({ agentId: bob, contactPubkey: PEER })).toEqual([]);
@@ -243,14 +267,42 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     });
 
     it("removing a contact takes their signals with it (consent withdrawn ⇒ evidence gone)", () => {
-      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, ...envelope() });
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, verdict: "active", ...envelope() });
       mgr.removeContact("alice", PEER);
       expect(store.listReceived({ agentId: alice, contactPubkey: PEER })).toEqual([]);
     });
 
+    it("a peer CANNOT launder our REVOKED verdict back to active by re-presenting (F2)", () => {
+      // The attack: `status` is outside the hash preimage — that is what makes it mutable, and it
+      // also means it is NOT AUTHENTICATED by the signal hash. A presenter can claim anything.
+      //
+      // Bob presents signal H. We check the directory, find it REVOKED, and store that as evidence.
+      // Next session Bob re-presents the SAME hash while we record a fresh verdict. If a later
+      // verdict could overwrite the earlier one unconditionally, the party a revocation indicts
+      // would get to erase the indictment. Evidence an adversary can rewrite is not evidence.
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, verdict: "revoked", ...envelope() });
+      expect(store.listReceived({ agentId: alice, contactPubkey: PEER })[0].verdict).toBe("revoked");
+
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 2, verdict: "active", ...envelope() });
+
+      const got = store.listReceived({ agentId: alice, contactPubkey: PEER })[0];
+      expect(got.verdict, "revocation is terminal — a re-presentation must not resurrect it").toBe("revoked");
+      expect(got.verifiedAt, "but we DID re-check it, and that is recorded").toBe(2);
+    });
+
+    it("the received input type carries no peer-controlled `status` — only OUR verdict", () => {
+      // Structural, not a runtime check: ReceivedSignalInput omits `status` and requires `verdict`.
+      // There is no pass-through for a call site to forget to block. This test documents the intent
+      // so the field is not quietly re-added later "for symmetry with the wallet".
+      const input = { agentId: alice, contactPubkey: PEER, verifiedAt: 1, verdict: "active" as const, ...envelope() };
+      expect(Object.prototype.hasOwnProperty.call(input, "verdict")).toBe(true);
+      store.putReceivedSignal(input);
+      expect(store.listReceived({ agentId: alice, contactPubkey: PEER })[0].verdict).toBe("active");
+    });
+
     it("re-presenting the same signal is idempotent (a peer may present it every session)", () => {
-      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, ...envelope() });
-      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 2, ...envelope() });
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 1, verdict: "active", ...envelope() });
+      store.putReceivedSignal({ agentId: alice, contactPubkey: PEER, verifiedAt: 2, verdict: "active", ...envelope() });
       const got = store.listReceived({ agentId: alice, contactPubkey: PEER });
       expect(got).toHaveLength(1);
       // verified_at is re-stamped: it records when WE last re-verified, and freshness is re-checked
@@ -322,23 +374,82 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
         const fresh = mgr2.getDb();
         ensureTrustSignalSchema(fresh, silent); // applied again, exactly as an upgrade would
 
-        const shape = (d: DaemonDatabase, t: string): string[] =>
-          (d.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string; type: string; notnull: number }>)
-            .map((c) => `${c.name}:${c.type}:${c.notnull}`);
+        // Compare the actual DDL, not just the column list. `PRAGMA table_info` reports names, types
+        // and NOT NULL — it says NOTHING about the FOREIGN KEY, the PRIMARY KEY, or the indexes. A
+        // migrated database that had lost the FK entirely would have sailed through a table_info
+        // comparison, which is precisely the constraint this whole unit is built on.
+        const ddl = (d: DaemonDatabase, t: string): string =>
+          ((d.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(t) as { sql: string }).sql)
+            .replace(/\s+/g, " ").trim();
 
         for (const t of ["wallet_trust_signals", "contact_trust_signals"]) {
-          expect(shape(fresh, t), t).toEqual(shape(db, t));
+          expect(ddl(fresh, t), t).toEqual(ddl(db, t));
         }
+        // ...and the FK is actually in there, in both.
+        expect(ddl(fresh, "contact_trust_signals")).toMatch(/FOREIGN KEY.*REFERENCES contacts/i);
+        expect(ddl(db, "contact_trust_signals")).toMatch(/FOREIGN KEY.*REFERENCES contacts/i);
         await mgr2.stop?.();
       } finally {
         await rm(dir2, { recursive: true, force: true });
       }
     });
 
-    it("the M8 scaffold table is STILL STANDING — the drop travels with the backfill (M10-D18)", () => {
+    it("a `contacts` TABLE REBUILD does not cascade-wipe the received signals (the armed landmine)", () => {
+      // THE BUG THIS EXISTS TO PREVENT, and it is a data-loss bug, not a correctness one.
+      //
+      // With PRAGMA foreign_keys = ON (M10-D19), SQLite treats `DROP TABLE contacts` as an implicit
+      // DELETE — which fires ON DELETE CASCADE and SILENTLY empties contact_trust_signals. The
+      // rebuild's own row-count guards do not notice: they count `contacts`, not its children. And
+      // `contacts` is one of the seven tables agent-id-migration.ts rebuilds with exactly this
+      // create-copy-drop-rename recipe.
+      //
+      // Worse, the intuitive mitigation is a no-op: `PRAGMA foreign_keys = OFF` is SILENTLY IGNORED
+      // inside a transaction, and every rebuild here runs inside one BEGIN...COMMIT. So a migration
+      // that "disabled" foreign keys would look correct and cascade anyway.
+      //
+      // This test drives the real recipe through the real helper. If someone rebuilds `contacts`
+      // without withForeignKeysOff, every received trust signal on every agent disappears at next
+      // boot and nothing logs it — this is the only thing that will catch that.
+      mgr.addContact("alice", HASH("e"), undefined, "accepted");
+      store.putReceivedSignal({ agentId: alice, contactPubkey: HASH("e"), verifiedAt: 1, verdict: "active", ...envelope() });
+      expect(store.listReceived({ agentId: alice, contactPubkey: HASH("e") })).toHaveLength(1);
+
+      withForeignKeysOff(db, silent, () => {
+        db.exec("BEGIN");
+        db.exec("CREATE TABLE contacts_rebuild (agent_id TEXT NOT NULL, pubkey TEXT NOT NULL, added_at INTEGER NOT NULL, moniker TEXT, PRIMARY KEY (agent_id, pubkey))");
+        db.exec("INSERT INTO contacts_rebuild (agent_id, pubkey, added_at, moniker) SELECT agent_id, pubkey, added_at, moniker FROM contacts");
+        db.exec("DROP TABLE contacts");
+        db.exec("ALTER TABLE contacts_rebuild RENAME TO contacts");
+        db.exec("COMMIT");
+      });
+
+      // The signal SURVIVED the parent's rebuild.
+      expect(store.listReceived({ agentId: alice, contactPubkey: HASH("e") })).toHaveLength(1);
+      // ...and the FK still points at a real `contacts`, not at a renamed ghost.
+      expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    });
+
+    it("withForeignKeysOff REFUSES to run inside a transaction, where the pragma is a silent no-op", () => {
+      // The failure is silent by nature, so the helper must verify the toggle took effect rather than
+      // assume it. Called inside a BEGIN, `PRAGMA foreign_keys = OFF` is ignored and FKs stay live —
+      // so it must refuse loudly rather than proceed and cascade.
+      db.exec("BEGIN");
+      try {
+        expect(() => withForeignKeysOff(db, silent, () => undefined)).toThrow(/NO-OP inside a transaction|did not take effect/i);
+      } finally {
+        db.exec("ROLLBACK");
+      }
+    });
+
+    it("the M8 scaffold table is STILL STANDING — this guards against a PREMATURE drop (M10-D18)", () => {
       // Deliberate, and load-bearing. Dropping it here would leave the M8 delivery arm
       // (inbound-sessions.ts:601) writing to columns that no longer exist, and the j-trust spine test
       // red, across four units until MINT-INTERNAL-1 replaced it.
+      //
+      // BE CLEAR ABOUT WHAT THIS DOES AND DOES NOT GUARD. It fails if someone drops the scaffold
+      // EARLY. It does NOT force the drop to ever happen: if MINT-INTERNAL-1 never lands, this stays
+      // green forever and the M8 `agent_id = null` defect survives with it. The forcing function for
+      // the drop is DOD-MINT-INTERNAL-1's own DoD clause and its own test — not this one.
       const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get();
       expect(row, "M10-D18: drop `trust_signals` in DOD-MINT-INTERNAL-1, together with its replacement").toBeDefined();
     });
