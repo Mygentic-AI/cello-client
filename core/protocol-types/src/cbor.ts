@@ -22,7 +22,27 @@ import { Encoder, decode } from "cbor-x";
 
 const ENCODER = new Encoder({ tagUint8Array: false, useRecords: false });
 
-/** Encode to canonical CBOR: byte strings for bytes, maps for objects. Plain RFC 8949. */
+/**
+ * Encode to CBOR: byte strings for bytes, maps for objects. Valid RFC 8949.
+ *
+ * NOT RFC 8949 §4.2 deterministic FOR MAPS, and anything hashed or signed must account for that.
+ * Measured (M10 / DOD-CBOR-1, journal Entry 4):
+ *
+ *   encode({b:1, a:2})  ->  b9 0002 6162 01 6161 02
+ *   encode({a:2, b:1})  ->  b9 0002 6161 02 6162 01     <- different bytes, same object
+ *
+ * Two departures from Core Deterministic Encoding, both map-only: keys follow INSERTION ORDER
+ * rather than bytewise sort, and the map header is not minimal-length (`b9 0002` for a 2-entry map
+ * where CDE requires `a2`).
+ *
+ * ARRAYS, text strings, byte strings, integers and null ARE minimal and order-fixed. That is why
+ * every to-be-signed structure in CELLO is an ARRAY with a domain tag in slot 0 —
+ * buildAgentRevocationTbs, buildPrimaryTransferTbs, buildSealTbs, buildParkContentTbs,
+ * encodeTrustSignalEnvelope. Two parties encoding the same array always produce the same bytes;
+ * two parties encoding the same MAP do not, if they built it in a different field order.
+ *
+ * So: never hash or sign a CBOR map produced by this encoder. Put the fields in a fixed-order array.
+ */
 export function encodeCbor(value: unknown): Uint8Array {
   return ENCODER.encode(value) as Uint8Array;
 }

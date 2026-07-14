@@ -1,5 +1,20 @@
 export { encodeCbor, decodeCbor } from "./cbor.js";
 
+// M10 / DOD-CBOR-1 — the canonical trust-signal envelope. ONE implementation, consumed by the
+// portal (mint), the directory (submission + presentation), and both daemons (receipt +
+// verification) — M10-D16.
+export {
+  TRUST_SIGNAL_DOMAIN,
+  encodeTrustSignalEnvelope,
+  hashTrustSignalEnvelope,
+  verifyTrustSignalHash,
+} from "./trust-signal.js";
+export type {
+  TrustSignalEnvelope,
+  SignalSubjectKind,
+  SignalIssuerKind,
+} from "./trust-signal.js";
+
 export type {
   MessageEnvelope,
   MessageEnvelopeV1,

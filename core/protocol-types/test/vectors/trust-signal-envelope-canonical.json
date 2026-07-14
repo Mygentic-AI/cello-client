@@ -1,0 +1,119 @@
+{
+  "_comment": [
+    "DOD-CBOR-1 / DOD-INV-CANONICAL — FROZEN cross-party vectors for the trust-signal envelope.",
+    "Every party that derives a signal_hash — the portal at mint, the directory at submission and at",
+    "presentation, the holder and recipient daemons — MUST reproduce these bytes exactly. All three",
+    "repos check their SHIPPED @cello-protocol/protocol-types against this file, so a version skew",
+    "between repos fails loud here instead of silently forking the hash in production.",
+    "Preimage (array, fixed order, domain tag in slot 0 — M10-D15/D17):",
+    "  [ 'CELLO-TSIG-v1', subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,",
+    "    payload, issued_at, expires_at|null, supersedes_hash|null ]",
+    "payload and supersedes_hash are hex-encoded HERE for legibility only; they are RAW BYTES in the",
+    "preimage. status/class/verified_at are deliberately NOT hashed (mutable after minting).",
+    "CHANGING A BYTE IN THIS FILE IS A PROTOCOL BREAK — it invalidates every signal ever minted."
+  ],
+  "vectors": [
+    {
+      "name": "reference — agent subject, portal issuer, no expiry, first mint",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "aabb",
+        "type": "phone",
+        "schema_version": 1,
+        "payload": "01020304",
+        "issued_at": 1000000000,
+        "expires_at": null,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a3b9aca00f6f6",
+      "signal_hash_hex": "760af64a292f96bffde522e21a8fcae0c31fc7826c4e2c947939a2da50803672"
+    },
+    {
+      "name": "account subject — one envelope, every agent under the account presents it (M10-D5)",
+      "envelope": {
+        "subject_kind": "account",
+        "subject": "acct_7f3a",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "3d4f6a2b8c1e",
+        "type": "email",
+        "schema_version": 1,
+        "payload": "a1646b696e64",
+        "issued_at": 1768000000,
+        "expires_at": 1799536000,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631676163636f756e7469616363745f3766336166706f7274616c6c33643466366132623863316565656d61696c0146a1646b696e641a69618a001a6b42bd80f6",
+      "signal_hash_hex": "2b7ace095f07efbd1c8f5efef701a8969d2c6c8efb3f6291b27eefcd287fba16"
+    },
+    {
+      "name": "supersession — a re-minted track-record signal replacing an earlier one",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "aabb",
+        "type": "session_count",
+        "schema_version": 2,
+        "payload": "deadbeef",
+        "issued_at": 1768000123,
+        "expires_at": 1768604923,
+        "supersedes_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626d73657373696f6e5f636f756e740244deadbeef1a69618a7b1a696ac4fb58201111111111111111111111111111111111111111111111111111111111111111",
+      "signal_hash_hex": "0184ae76433d9c4caf892d438bff3f64d44f0eed57470f0c141fee86b18e0bbb"
+    },
+    {
+      "name": "agent issuer — quoted-untrusted framing at the LLM (INV-FRAMING)",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-2",
+        "issuer_kind": "agent",
+        "issuer_pubkey": "ff00ff00",
+        "type": "endorsement",
+        "schema_version": 1,
+        "payload": "",
+        "issued_at": 1768000000,
+        "expires_at": null,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d32656167656e746866663030666630306b656e646f7273656d656e7401401a69618a00f6f6",
+      "signal_hash_hex": "39d148391745fa3ea26b8fe57b5633c4bec7064a896527abb9300355b02ec5a6"
+    },
+    {
+      "name": "UNKNOWN type — a type this code has never seen must hash identically (INV-TYPE-CARRY)",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "aabb",
+        "type": "some_type_invented_next_year",
+        "schema_version": 1,
+        "payload": "00",
+        "issued_at": 1768000000,
+        "expires_at": null,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c6461616262781c736f6d655f747970655f696e76656e7465645f6e6578745f796561720141001a69618a00f6f6",
+      "signal_hash_hex": "9a637f2ca5b4fbb0f78c9eb2d33cfc433706290a7c4a4e6bf2628d258b90f1c9"
+    },
+    {
+      "name": "payload that LOOKS like CBOR — embedded verbatim, never parsed",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "portal",
+        "issuer_pubkey": "aabb",
+        "type": "canary_test",
+        "schema_version": 1,
+        "payload": "d840009fff",
+        "issued_at": 1768000000,
+        "expires_at": null,
+        "supersedes_hash": null
+      },
+      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626b63616e6172795f746573740145d840009fff1a69618a00f6f6",
+      "signal_hash_hex": "5dc67366d7b8fc515a6d638b432d90e29a2f9841101a3ac1745ca7b602e2f837"
+    }
+  ]
+}
