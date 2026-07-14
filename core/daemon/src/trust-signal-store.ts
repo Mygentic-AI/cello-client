@@ -36,6 +36,7 @@
  * presents exactly like a known one. Adding a signal type must require no change to this file.
  */
 
+import { verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
@@ -267,6 +268,45 @@ export class TrustSignalStore {
         signalHash: s.signalHash, type: s.type, subjectKind: s.subjectKind, issuerKind: s.issuerKind,
       });
     }
+  }
+
+  /**
+   * Accept a trust-signal envelope delivered to this holder: RE-VERIFY its hash, then store it.
+   *
+   * This is the holder's own chokepoint (INV-CANONICAL / M10-D4): the daemon does not trust the
+   * `claimedHash` the delivery frame carried — it re-derives the hash from the envelope with the SAME
+   * canonical component every party uses, and REFUSES a mismatch. A delivered envelope whose bytes do
+   * not hash to the claim is a corrupted or tampered delivery; storing it would let the wallet present
+   * a signal the directory never notarized.
+   *
+   * Storage is idempotent (content-addressed PK) — a re-delivery is a no-op (§14.11). Returns whether
+   * a new row was stored, so the caller can ACK only a genuinely-accepted delivery.
+   */
+  deliverWalletSignal(envelope: TrustSignalEnvelope, claimedHash: string): { stored: boolean } {
+    const claimedBytes = /^[0-9a-f]{64}$/.test(claimedHash) ? new Uint8Array(Buffer.from(claimedHash, "hex")) : new Uint8Array(0);
+    if (!verifyTrustSignalHash(envelope, claimedBytes)) {
+      // Loud refusal, naming the cause — a delivery that fails the holder's re-hash is never stored.
+      this.#logger.warn("signal.delivery.hash_mismatch", {
+        claimedHash, type: envelope.type, subjectKind: envelope.subject_kind,
+      });
+      throw new Error(`signal_delivery_hash_mismatch: delivered envelope does not hash to the claimed ${claimedHash}`);
+    }
+    const before = this.getWalletSignal(claimedHash) !== null;
+    this.putWalletSignal({
+      signalHash: claimedHash,
+      subjectKind: envelope.subject_kind,
+      subject: envelope.subject,
+      issuerKind: envelope.issuer_kind,
+      issuerPubkey: envelope.issuer_pubkey,
+      type: envelope.type,
+      schemaVersion: envelope.schema_version,
+      payload: envelope.payload,
+      issuedAt: envelope.issued_at,
+      expiresAt: envelope.expires_at,
+      supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
+      status: "active",
+    });
+    return { stored: !before };
   }
 
   getWalletSignal(signalHash: string): WalletSignalRow | null {

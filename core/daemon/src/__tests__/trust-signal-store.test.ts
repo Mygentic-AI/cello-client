@@ -30,6 +30,7 @@ import { seedAgents } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
 import { withForeignKeysOff } from "../sqlcipher-db.js";
+import { hashTrustSignalEnvelope as hashTrustSignalEnvelopeFn } from "@cello-protocol/protocol-types";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
@@ -308,6 +309,46 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // verified_at is re-stamped: it records when WE last re-verified, and freshness is re-checked
       // on use (M10-D4) — a stale verified_at would be worse than useless, it would look fresh.
       expect(got[0].verifiedAt).toBe(2);
+    });
+  });
+
+  describe("delivery — the holder re-verifies the hash before storing (M10-D4)", () => {
+    // A composed envelope + its true hash, built with the SAME protocol-types the directory uses.
+    function deliverable(over: Partial<import("@cello-protocol/protocol-types").TrustSignalEnvelope> = {}) {
+      const env = {
+        subject_kind: "account" as const, subject: "acct-x", issuer_kind: "portal" as const,
+        issuer_pubkey: "aabb", type: "phone", schema_version: 1, payload: new Uint8Array([1, 2, 3]),
+        issued_at: 1_768_000_000, expires_at: null, supersedes_hash: null, ...over,
+      };
+      return { env, hash: Buffer.from(hashTrustSignalEnvelopeFn(env)).toString("hex") };
+    }
+
+    it("accepts a delivery whose bytes hash to the claim, storing it in the wallet", () => {
+      const { env, hash } = deliverable();
+      const res = store.deliverWalletSignal(env, hash);
+      expect(res.stored).toBe(true);
+      const got = store.getWalletSignal(hash);
+      expect(got).not.toBeNull();
+      expect(got!.type).toBe("phone");
+      expect(new Uint8Array(got!.payload)).toEqual(new Uint8Array([1, 2, 3]));
+    });
+
+    it("REFUSES a delivery whose envelope does not hash to the claimed hash — never stored", () => {
+      // The holder's own chokepoint: a tampered/corrupted delivery must not enter the wallet, or it
+      // would present a signal the directory never notarized.
+      const { env } = deliverable();
+      expect(() => store.deliverWalletSignal(env, "f".repeat(64))).toThrow(/hash_mismatch/i);
+      expect(store.getWalletSignal("f".repeat(64))).toBeNull();
+      // ...and the tampered ENVELOPE (right claimed hash, wrong bytes) is also refused.
+      const { hash } = deliverable();
+      expect(() => store.deliverWalletSignal(deliverable({ type: "email" }).env, hash)).toThrow(/hash_mismatch/i);
+    });
+
+    it("re-delivery is idempotent — stored:false the second time, no duplicate", () => {
+      const { env, hash } = deliverable({ subject: "acct-redeliver" });
+      expect(store.deliverWalletSignal(env, hash).stored).toBe(true);
+      expect(store.deliverWalletSignal(env, hash).stored).toBe(false);
+      expect(db.prepare("SELECT COUNT(*) AS n FROM wallet_trust_signals WHERE signal_hash = ?").get(hash)).toMatchObject({ n: 1 });
     });
   });
 
