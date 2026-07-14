@@ -337,11 +337,24 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // The holder's own chokepoint: a tampered/corrupted delivery must not enter the wallet, or it
       // would present a signal the directory never notarized.
       const { env } = deliverable();
-      expect(() => store.deliverWalletSignal(env, "f".repeat(64))).toThrow(/hash_mismatch/i);
+      expect(() => store.deliverWalletSignal(env, "f".repeat(64)))
+        .toThrow(expect.objectContaining({ reason: "hash_mismatch" }));
       expect(store.getWalletSignal("f".repeat(64))).toBeNull();
       // ...and the tampered ENVELOPE (right claimed hash, wrong bytes) is also refused.
       const { hash } = deliverable();
-      expect(() => store.deliverWalletSignal(deliverable({ type: "email" }).env, hash)).toThrow(/hash_mismatch/i);
+      expect(() => store.deliverWalletSignal(deliverable({ type: "email" }).env, hash))
+        .toThrow(expect.objectContaining({ reason: "hash_mismatch" }));
+    });
+
+    it("REFUSES a MALFORMED claimed hash with a DISTINCT reason (not conflated with byte-tamper)", () => {
+      // A malformed hash string (wrong length, or uppercase from a version-skewed directory) is a
+      // different cause than a byte-tamper, and must name itself so the operator looks at the right
+      // subsystem. Both refuse-and-don't-store.
+      const { env } = deliverable();
+      expect(() => store.deliverWalletSignal(env, "not-hex"))
+        .toThrow(expect.objectContaining({ reason: "claimed_hash_malformed" }));
+      expect(() => store.deliverWalletSignal(env, "AABB".repeat(16))) // uppercase
+        .toThrow(expect.objectContaining({ reason: "claimed_hash_malformed" }));
     });
 
     it("re-delivery is idempotent — stored:false the second time, no duplicate", () => {

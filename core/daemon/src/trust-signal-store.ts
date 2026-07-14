@@ -45,6 +45,20 @@ import type { Logger } from "./types.js";
  *  never find it again. */
 export type SignalStatus = "active" | "revoked" | "superseded";
 
+/**
+ * A delivery the holder REFUSED at its own chokepoint. A TYPED error so the delivery consumer (the M8
+ * retirement's `inbound-sessions` re-point) can branch on it: a refused delivery must NEVER be ACKed
+ * — the directory should re-deliver, or the operator investigate. A plain `Error` swallowed by a
+ * best-effort `catch { return }` could accidentally fall through to an ACK; this cannot.
+ */
+export type SignalDeliveryRejection = "claimed_hash_malformed" | "hash_mismatch";
+export class SignalDeliveryRejected extends Error {
+  constructor(readonly reason: SignalDeliveryRejection, detail: string) {
+    super(`signal_delivery_${reason}: ${detail}`);
+    this.name = "SignalDeliveryRejected";
+  }
+}
+
 /** The envelope, as this store takes and returns it. Mirrors `TrustSignalEnvelope` in
  *  protocol-types, plus the two non-hashed local columns. */
 export interface WalletSignalInput {
@@ -251,7 +265,9 @@ export class TrustSignalStore {
    * is therefore a liar, and it must not overwrite the truth. This is also what makes duplicate
    * delivery a no-op and wallet rows safely mergeable across a user's daemons (spec §14.11).
    */
-  putWalletSignal(s: WalletSignalInput): void {
+  /** Returns true iff a NEW row was inserted (false = the content-addressed row already existed, a
+   *  benign duplicate). */
+  putWalletSignal(s: WalletSignalInput): boolean {
     const res = this.#db
       .prepare(
         `INSERT OR IGNORE INTO wallet_trust_signals
@@ -268,6 +284,7 @@ export class TrustSignalStore {
         signalHash: s.signalHash, type: s.type, subjectKind: s.subjectKind, issuerKind: s.issuerKind,
       });
     }
+    return res.changes > 0;
   }
 
   /**
@@ -283,16 +300,22 @@ export class TrustSignalStore {
    * a new row was stored, so the caller can ACK only a genuinely-accepted delivery.
    */
   deliverWalletSignal(envelope: TrustSignalEnvelope, claimedHash: string): { stored: boolean } {
-    const claimedBytes = /^[0-9a-f]{64}$/.test(claimedHash) ? new Uint8Array(Buffer.from(claimedHash, "hex")) : new Uint8Array(0);
-    if (!verifyTrustSignalHash(envelope, claimedBytes)) {
-      // Loud refusal, naming the cause — a delivery that fails the holder's re-hash is never stored.
+    // A malformed claim STRING and a genuine byte-tamper are two different causes — name them apart
+    // (a directory version-skew emitting uppercase hex must not read as universal tamper and send the
+    // operator to the wrong subsystem). Both refuse-and-don't-store; only the message differs.
+    if (!/^[0-9a-f]{64}$/.test(claimedHash)) {
+      this.#logger.warn("signal.delivery.claimed_hash_malformed", { claimedHash, type: envelope.type });
+      throw new SignalDeliveryRejected("claimed_hash_malformed", `claimed hash is not 64-char lowercase hex: ${claimedHash}`);
+    }
+    if (!verifyTrustSignalHash(envelope, new Uint8Array(Buffer.from(claimedHash, "hex")))) {
       this.#logger.warn("signal.delivery.hash_mismatch", {
         claimedHash, type: envelope.type, subjectKind: envelope.subject_kind,
       });
-      throw new Error(`signal_delivery_hash_mismatch: delivered envelope does not hash to the claimed ${claimedHash}`);
+      throw new SignalDeliveryRejected("hash_mismatch", `delivered envelope does not hash to the claimed ${claimedHash}`);
     }
-    const before = this.getWalletSignal(claimedHash) !== null;
-    this.putWalletSignal({
+    // putWalletSignal is idempotent (content-addressed PK) and reports whether it inserted — use that
+    // directly rather than a second SELECT (no read-then-write, no theoretical race).
+    const inserted = this.putWalletSignal({
       signalHash: claimedHash,
       subjectKind: envelope.subject_kind,
       subject: envelope.subject,
@@ -306,7 +329,7 @@ export class TrustSignalStore {
       supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
       status: "active",
     });
-    return { stored: !before };
+    return { stored: inserted };
   }
 
   getWalletSignal(signalHash: string): WalletSignalRow | null {
