@@ -199,3 +199,82 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
     await expect(connect()).rejects.toThrow("directory_auth_rejected");
   });
 });
+
+// ─── DOD-NAT-REACHABILITY-1 (Phase 2): relay endpoints ride signaling_auth_ok ──
+//
+// The reservation must exist BEFORE any session (the standing receiver must be
+// reachable for the first inbound request to arrive at all), so the directory
+// hands its healthy relay pool to the agent at auth time — over the SAME
+// authenticated stream that later carries session_assignment frames. A fresh
+// agent with no session history is reachable from its first agent-online.
+
+describe("createSignalingConnect — relay endpoints from signaling_auth_ok", () => {
+  const RELAY_PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust";
+
+  it("well-formed relay_endpoints are surfaced through onRelayEndpoints", async () => {
+    const nonce = new Uint8Array(32).fill(7);
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce }),
+      encodeFrame({
+        type: "signaling_auth_ok",
+        relay_endpoints: [{ peer_id: RELAY_PEER, multiaddrs: ["/ip4/10.0.0.5/tcp/4001"] }],
+      }),
+    ]);
+    const received: Array<Array<{ peerId: string; addrs: string[] }>> = [];
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: silentLogger,
+      createDirectoryNode: async () => node as never,
+      onRelayEndpoints: (eps) => { received.push(eps); },
+    });
+    await connect();
+    expect(received).toEqual([[{ peerId: RELAY_PEER, addrs: ["/ip4/10.0.0.5/tcp/4001"] }]]);
+  });
+
+  it("malformed relay_endpoints are DROPPED per entry, never thrown — auth must not fail on a bad hint", async () => {
+    const nonce = new Uint8Array(32).fill(8);
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce }),
+      encodeFrame({
+        type: "signaling_auth_ok",
+        relay_endpoints: [
+          { peer_id: 42, multiaddrs: ["/ip4/1.2.3.4/tcp/1"] },          // bad peer_id type
+          { peer_id: RELAY_PEER },                                       // missing multiaddrs
+          { peer_id: RELAY_PEER, multiaddrs: ["/ip4/10.0.0.5/tcp/4001", 7] }, // bad addr entry
+          { peer_id: RELAY_PEER, multiaddrs: ["/ip4/10.0.0.6/tcp/4001"] },    // the one valid entry
+        ],
+      }),
+    ]);
+    const received: Array<Array<{ peerId: string; addrs: string[] }>> = [];
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: silentLogger,
+      createDirectoryNode: async () => node as never,
+      onRelayEndpoints: (eps) => { received.push(eps); },
+    });
+    const result = await connect();
+    expect(result.directoryNodeId).toBe(PEER); // handshake unaffected
+    expect(received).toEqual([[{ peerId: RELAY_PEER, addrs: ["/ip4/10.0.0.6/tcp/4001"] }]]);
+  });
+
+  it("absent relay_endpoints (old directory) → onRelayEndpoints not called, handshake unaffected", async () => {
+    const nonce = new Uint8Array(32).fill(9);
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce }),
+      encodeFrame({ type: "signaling_auth_ok" }),
+    ]);
+    const received: unknown[] = [];
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: silentLogger,
+      createDirectoryNode: async () => node as never,
+      onRelayEndpoints: (eps) => { received.push(eps); },
+    });
+    const result = await connect();
+    expect(result.directoryNodeId).toBe(PEER);
+    expect(received).toEqual([]);
+  });
+});

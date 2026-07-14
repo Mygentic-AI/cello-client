@@ -44,7 +44,8 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
-import { AgentRelayClient, LEAF_KIND_CTRL, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { isValidMultiaddr } from "@cello-protocol/transport";
+import { AgentRelayClient, LEAF_KIND_CTRL, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
@@ -119,6 +120,15 @@ export interface SessionNodeConfig {
    * window. Factories should forward this to createNode({ keepAliveIntervalMs }).
    */
   keepAliveIntervalMs?: number;
+  /**
+   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses
+   * (`<relay-multiaddr>/p2p/<relay-peer-id>/p2p-circuit`) the node should take
+   * reservations on. Each entry makes libp2p reserve a slot with that relay and
+   * advertise the relayed address via getMultiaddrs() — which is what makes a
+   * NAT'd standing receiver dialable at all. A dead relay in this list degrades
+   * (no reservation, WARN) — it never fails node creation.
+   */
+  circuitRelayListenAddrs?: string[];
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -2835,6 +2845,14 @@ export class SessionNodeManager {
     if (addrs.length === 0) {
       return { ok: false, reason: "no_counterparty_addrs", error: "the assignment carried no counterparty session addrs to dial" };
     }
+    // DOD-NAT-REACHABILITY-1: a /p2p-circuit counterparty address is dialed
+    // THROUGH its relay, so the gater must admit that relay peer OUTBOUND. The
+    // relay id is embedded in the address, which arrived inside the FROST-signed
+    // assignment — the same authorization rail as the assigned witness relay.
+    for (const addr of addrs) {
+      const viaRelay = addr.match(/\/p2p\/([^/]+)\/p2p-circuit/);
+      if (viaRelay) entry.gater.setAllowedOutboundPeer(viaRelay[1]!);
+    }
     let lastError = "";
     for (const addr of addrs) {
       try {
@@ -2846,8 +2864,11 @@ export class SessionNodeManager {
         });
         return { ok: true };
       } catch (err: unknown) {
-        // error.message extracted — never [object Object]; try the next addr.
-        lastError = err instanceof Error ? err.message : String(err);
+        // extractErrorMessage handles the transport's structured plain-object
+        // throws (dial() never throws Error instances) — the old
+        // `instanceof Error` idiom logged "[object Object]" on every dial
+        // failure; try the next addr.
+        lastError = extractErrorMessage(err);
       }
     }
     this.#logger.warn("session.transport.connect.failed", {
@@ -4289,6 +4310,126 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-NAT-REACHABILITY-1 (Phase 2): relay endpoints the DIRECTORY handed this
+   * agent at signaling-auth time — the freshest, health-filtered view of the
+   * relay pool, and the only source a FRESH agent (no session history) has.
+   */
+  readonly #directoryRelayEndpoints = new Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>();
+
+  /**
+   * DOD-NAT-REACHABILITY-1 (Phase 2): accept the directory's relay-pool endpoints
+   * for an agent (arrives with signaling_auth_ok, i.e. on every connect AND every
+   * reconnect). If the agent's standing receiver is up but holds NO reservation —
+   * the agent-online ensure raced ahead of auth_ok, or every relay was down at
+   * create time — rebuild it now so the agent becomes dialable without waiting
+   * for a session handoff that (being unreachable) would never come.
+   */
+  setDirectoryRelayEndpoints(agentName: string, endpoints: Array<{ relayPeerId: string; relayAddrs: string[] }>): void {
+    this.#directoryRelayEndpoints.set(agentName, endpoints);
+    if (endpoints.length === 0 || this.#shuttingDown) return;
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return; // not ensured yet — the coming ensure reads the map
+    if (sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) return; // already reserved
+    this.#logger.info("session.standing_receiver.reservation.rebuild", {
+      agentName,
+      relayPeerIds: endpoints.map((e) => e.relayPeerId),
+    });
+    void this.#rebuildStandingReceiver(agentName);
+  }
+
+  /**
+   * Replace an agent's reservation-less standing receiver with one that reserves.
+   *
+   * Deliberately NOT removeStandingReceiverForAgent()+ensureStandingReceiverForAgent():
+   * the public remove CLEARS #agentsWantingReceiver, so a cello_stop_agent landing in
+   * the window while node.stop() is awaited would find no map entry and no creating
+   * marker, leave no tombstone, and the re-ensure would then RESURRECT a receiver for
+   * an agent that asked to go dark — accepting inbound sessions for an offline agent.
+   * Here the want-flag is left intact and re-checked after the stop: a concurrent stop
+   * clears it, and the rebuild correctly no-ops.
+   */
+  async #rebuildStandingReceiver(agentName: string): Promise<void> {
+    try {
+      const sr = this.#standingReceivers.get(agentName);
+      if (sr) {
+        this.#standingReceivers.delete(agentName);
+        try {
+          sr.autoNat.stop();
+          await sr.node.stop();
+        } catch (err: unknown) {
+          this.#logger.warn("session.standing_receiver.teardown.failed", {
+            agentName,
+            error: extractErrorMessage(err),
+          });
+        }
+      }
+      // The agent may have gone offline while we were stopping the old node. Its
+      // want-flag is the authority — never resurrect a receiver it disowned.
+      if (!this.#agentsWantingReceiver.has(agentName) || this.#shuttingDown) return;
+      await this.#ensureStandingReceiver(agentName);
+    } catch (err: unknown) {
+      this.#logger.warn("session.standing_receiver.reservation.rebuild.failed", {
+        agentName,
+        error: extractErrorMessage(err),
+      });
+    }
+  }
+
+  /**
+   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses for an agent's known
+   * relays, so its standing receiver takes reservations and becomes dialable
+   * behind NAT. Sources, merged and deduped by relay peer id: the directory's
+   * auth-time relay pool (freshest — first), then the persisted relay endpoints
+   * of past sessions (getAgentRelayEndpoints — covers a directory that predates
+   * the auth_ok extension).
+   */
+  #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
+    let persisted: Array<{ relayPeerId: string; relayAddrs: string[] }>;
+    try {
+      persisted = this.getAgentRelayEndpoints(agentName);
+    } catch (err: unknown) {
+      // No DB / unknown agent — persisted source unavailable. The directory
+      // source may still serve; reachability degrades only if both are empty.
+      // Logged (not swallowed): a genuine DB failure must be distinguishable
+      // from "fresh agent, no history" in the reachability trail.
+      this.#logger.debug("session.standing_receiver.persisted_relays.unavailable", {
+        agentName,
+        error: extractErrorMessage(err),
+      });
+      persisted = [];
+    }
+    const merged = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
+    for (const ep of [...(this.#directoryRelayEndpoints.get(agentName) ?? []), ...persisted]) {
+      if (!merged.has(ep.relayPeerId)) merged.set(ep.relayPeerId, ep);
+    }
+    const addrs: string[] = [];
+    const relayPeerIds: string[] = [];
+    for (const ep of merged.values()) {
+      const base = ep.relayAddrs[0];
+      if (!base) continue;
+      const candidate = base.includes("/p2p/")
+        ? `${base}/p2p-circuit`
+        : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
+      // These addresses are built from DIRECTORY-supplied endpoints — data from off
+      // this machine. A malformed one throws inside libp2p node construction, which
+      // would take the standing receiver down entirely and leave the agent deaf to
+      // ALL inbound (worse than the defect this fixes). A bad endpoint must cost one
+      // relay, never the receiver.
+      if (!isValidMultiaddr(candidate)) {
+        this.#logger.warn("session.standing_receiver.relay_endpoint.invalid", {
+          agentName,
+          relayPeerId: ep.relayPeerId,
+          addr: candidate,
+        });
+        continue;
+      }
+      addrs.push(candidate);
+      relayPeerIds.push(ep.relayPeerId);
+    }
+    return { addrs, relayPeerIds };
+  }
+
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
   async #tryCreateStandingReceiver(
     agentName: string,
@@ -4301,12 +4442,29 @@ export class SessionNodeManager {
       logger: this.#logger,
     });
 
+    // DOD-NAT-REACHABILITY-1: reserve with the agent's known relays. The relay
+    // peers are allowed OUTBOUND on the gater up front, so reservation refreshes
+    // keep working after the receiver is claimed and setAllowedPeer() narrows
+    // the inbound gate to the session counterparty.
+    const reservations = this.#reservationCircuitAddrs(agentName);
+    for (const relayPeerId of reservations.relayPeerIds) {
+      gater.setAllowedOutboundPeer(relayPeerId);
+    }
+
     let node: CelloNode;
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
+      node = await this.#factory.createNode({
+        sessionId,
+        connectionGater: gater,
+        nodeType: "standing_receiver",
+        ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
+      });
       await node.start();
     } catch (err: unknown) {
-      const error = err instanceof Error ? err.message : String(err);
+      // extractErrorMessage, NOT String(err): the transport throws structured
+      // plain objects ({ reason, message }), and String() destroys both into
+      // "[object Object]" — the loud failure must carry its cause.
+      const error = extractErrorMessage(err);
       this.#logger.error("session.node.create.failed", {
         sessionId,
         agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
@@ -4350,6 +4508,26 @@ export class SessionNodeManager {
       sessionPeerId: node.getPeerId(),
       correlationId,
     });
+
+    // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come
+    // up? circuitAddrs === 0 with reservations requested means every relay
+    // refused/was unreachable — the agent is deaf to NAT'd initiators (public
+    // ones can still connect directly). That must be LOUD, not a quiet shrug.
+    const circuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length;
+    this.#logger.info("session.standing_receiver.reachability", {
+      agentName,
+      circuitAddrs,
+      reservationsRequested: reservations.addrs.length,
+      correlationId,
+    });
+    if (reservations.addrs.length > 0 && circuitAddrs === 0) {
+      this.#logger.warn("session.standing_receiver.reservation.none", {
+        agentName,
+        reservationsRequested: reservations.addrs.length,
+        relayPeerIds: reservations.relayPeerIds,
+        correlationId,
+      });
+    }
     return { outcome: "installed" };
   }
 
@@ -4367,6 +4545,10 @@ export class SessionNodeManager {
   async removeStandingReceiverForAgent(agentName: string): Promise<void> {
     // M8B F14: the agent no longer wants a receiver — disarm the teardown re-arm.
     this.#agentsWantingReceiver.delete(agentName);
+    // The directory hands these out at signaling-auth time, so a re-started agent
+    // gets a fresh set on its next connect — holding the old ones would keep a
+    // retired agent's relay list alive for the daemon's lifetime.
+    this.#directoryRelayEndpoints.delete(agentName);
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) {
       // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no

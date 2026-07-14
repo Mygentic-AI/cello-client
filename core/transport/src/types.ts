@@ -52,18 +52,37 @@ export interface CreateNodeOptions {
    */
   connectionGater?: ConnectionGater;
   /**
-   * CELLO-M7-TRANSPORT-001: the role of this node, which tunes the libp2p service
-   * set:
-   *   - 'session'           — ephemeral per-session dialer; includes dcutr so a
-   *                           relay-fallback connection can be hole-punch upgraded.
-   *   - 'standing_receiver' — pre-warmed inbound receiver; OMITS dcutr (it only
-   *                           needs to know its own dialability, not upgrade
-   *                           existing connections).
-   *   - undefined           — service/default node (directory, relay, client):
-   *                           dcutr included for backward compatibility.
-   * AutoNAT is included for every nodeType.
+   * CELLO-M7-TRANSPORT-001 / DOD-NAT-REACHABILITY-1: the role of this node,
+   * which tunes the libp2p service set:
+   *   - 'session'           — ephemeral per-session dialer.
+   *   - 'standing_receiver' — pre-warmed inbound receiver.
+   *   - undefined           — service node (directory, relay): additionally
+   *                           serves circuit-relay HOP (see relayServer).
+   * AutoNAT and dcutr are included for EVERY nodeType. dcutr on the standing
+   * receiver is load-bearing: the inbound peer of a relayed connection is the
+   * one that initiates the hole-punch upgrade.
    */
   nodeType?: "session" | "standing_receiver";
+  /**
+   * DOD-NAT-REACHABILITY-1: circuit-relay HOP server configuration.
+   * By default HOP is served only by service nodes (nodeType === undefined) —
+   * a client node must not advertise itself as a relay for strangers.
+   * The CELLO relay passes `reservations` to raise the libp2p defaults, which
+   * are sized for a public DHT (15 reservations, 2-minute/128-KiB connection
+   * limits) and would cap CELLO's inbound reachability at toy scale.
+   */
+  relayServer?: {
+    /** Force the HOP service on (true) or off (false) regardless of nodeType. */
+    enabled: boolean;
+    /** Passed through to circuitRelayServer({ reservations }). */
+    reservations?: {
+      maxReservations?: number;
+      applyDefaultLimit?: boolean;
+      reservationTtl?: number;
+      defaultDurationLimit?: number;
+      defaultDataLimit?: bigint;
+    };
+  };
   /**
    * CELLO-M7-SESSION-003 (AC-005): transport keepalive interval in milliseconds.
    * Wires libp2p's connectionMonitor pingInterval so that a counterparty that

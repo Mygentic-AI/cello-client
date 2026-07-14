@@ -125,6 +125,35 @@ export interface SignalingConnectDeps {
    * bound (the auth TBS is unchanged) — the flag rides the encrypted libp2p channel.
    */
   visiting?: boolean;
+  /**
+   * DOD-NAT-REACHABILITY-1 (Phase 2): receives the directory's healthy relay-pool
+   * endpoints when signaling_auth_ok carries `relay_endpoints`. Fires once per
+   * successful connect (so every reconnect refreshes the set). The endpoints ride
+   * the authenticated, directory-verified signaling channel — the same trust rail
+   * as session_assignment frames. Absent field (old directory) → never called.
+   */
+  onRelayEndpoints?: (endpoints: Array<{ peerId: string; addrs: string[] }>) => void;
+}
+
+/**
+ * Parse signaling_auth_ok's optional `relay_endpoints` field. Per-entry strict:
+ * a malformed entry is dropped (auth must never fail on a bad hint), a valid one
+ * survives. Returns [] when the field is absent or not an array.
+ */
+function parseRelayEndpoints(raw: unknown): Array<{ peerId: string; addrs: string[] }> {
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ peerId: string; addrs: string[] }> = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const e = entry as Record<string, unknown>;
+    const peerId = e["peer_id"];
+    const multiaddrs = e["multiaddrs"];
+    if (typeof peerId !== "string" || peerId.length === 0) continue;
+    if (!Array.isArray(multiaddrs) || multiaddrs.length === 0) continue;
+    if (!multiaddrs.every((a): a is string => typeof a === "string" && a.length > 0)) continue;
+    out.push({ peerId, addrs: multiaddrs });
+  }
+  return out;
 }
 
 /**
@@ -146,9 +175,17 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
     }
 
     // Fresh directory-facing node per connect → fresh transport key / Peer ID.
+    // DOD-NAT-REACHABILITY-1: relayServer disabled — this is a long-lived client
+    // node bound on 0.0.0.0; without the explicit opt-out the no-nodeType default
+    // (a service node) would advertise HOP and let LAN peers relay through the
+    // operator's machine.
     const node = deps.createDirectoryNode
       ? await deps.createDirectoryNode(identity.keyProvider)
-      : await createNode({ keyProvider: identity.keyProvider, listenAddresses: ["/ip4/0.0.0.0/tcp/0"] });
+      : await createNode({
+          keyProvider: identity.keyProvider,
+          listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
+          relayServer: { enabled: false },
+        });
 
     let sigStream: Stream;
     try {
@@ -235,6 +272,21 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
         }
         directoryNodeId = nodeId;
         deps.logger.info("directory.auth.challenge.verified", { directoryNodeId });
+      }
+
+      // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool rides
+      // signaling_auth_ok so the standing receiver can reserve BEFORE any
+      // session exists. Surfaced via callback; parse failures drop entries,
+      // never the handshake.
+      if (deps.onRelayEndpoints) {
+        const endpoints = parseRelayEndpoints(ackFrame["relay_endpoints"]);
+        if (endpoints.length > 0) {
+          deps.logger.info("directory.relay_endpoints.received", {
+            directoryNodeId,
+            relayPeerIds: endpoints.map((e) => e.peerId),
+          });
+          deps.onRelayEndpoints(endpoints);
+        }
       }
 
       // ── Step 7: announce our peer info so the directory can broker sessions ──
