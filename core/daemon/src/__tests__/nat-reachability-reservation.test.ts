@@ -449,14 +449,13 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
     }
   }
 
-  it("R11a: an UNREACHABLE relay is dropped by the probe — the receiver comes up, and it is not listed", async () => {
+  it("R11a: an UNREACHABLE relay is rejected — the receiver still comes up", async () => {
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, "sessions-a.db"),
-      standingReceiverRelayProbeTimeoutMs: 400,
-    });
+      });
     await manager.initialize();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
@@ -470,22 +469,16 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       const info = manager.getStandingReceiverInfo("alice");
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
-      // The probe rejected it — either it never answered, or it answered and granted
-      // no reservation. Both are "do not listen on this relay"; both are logged.
-      expect(
-        events.some(
-          (e) =>
-            e.event === "session.standing_receiver.relay.unreachable" ||
-            e.event === "session.standing_receiver.relay.no_reservation",
-        ),
-      ).toBe(true);
+      // The relay was rejected — unreachable, out of slots, or too slow. All three are
+      // "do not listen on this relay", and all three are logged with a named reason.
+      expect(events.some((e) => e.event === "session.standing_receiver.relay.rejected" && e.level === "warn")).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
     }
   }, 20_000);
 
-  it("R11b: a relay whose RESERVATION never completes is rejected by the probe → receiver still comes up, loudly degraded", async () => {
+  it("R11b: a relay whose RESERVATION never completes is abandoned on the deadline → receiver still comes up, loudly degraded", async () => {
     // The relay is dialable, so a dial-only probe would wave it through. The probe
     // attempts the REAL reservation, so it catches the hang here — on a throwaway
     // node — instead of on the standing receiver, where it would leave the agent deaf.
@@ -496,8 +489,7 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       logger,
       dbPath: join(tempDir, "sessions-b.db"),
       standingReceiverReservationTimeoutMs: 400,
-      standingReceiverRelayProbeTimeoutMs: 400,
-    });
+      });
     await manager.initialize();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
@@ -511,7 +503,7 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       const info = manager.getStandingReceiverInfo("alice");
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
-      expect(events.some((e) => e.event === "session.standing_receiver.relay.unreachable")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.relay.rejected" && e.level === "warn")).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
@@ -526,7 +518,6 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, "sessions-c.db"),
-      standingReceiverRelayProbeTimeoutMs: 3_000,
     });
     await manager.initialize();
     try {
@@ -577,7 +568,6 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, dbName),
-      standingReceiverRelayProbeTimeoutMs: 3_000,
       standingReceiverWatchdogIntervalMs: 250,
     });
     return { manager, events };

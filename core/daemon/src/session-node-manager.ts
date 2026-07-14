@@ -48,12 +48,6 @@ import { isValidMultiaddr } from "@cello-protocol/transport";
 import { AgentRelayClient, LEAF_KIND_CTRL, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
-/**
- * DOD-NAT-REACHABILITY-1: how long a relay-reachability probe result stays fresh.
- * Every agent on this daemon is offered the same relay pool, so one probe serves
- * them all; short enough that a relay coming back is picked up on the next re-arm.
- */
-const RELAY_PROBE_CACHE_MS = 60_000;
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
@@ -236,11 +230,6 @@ export class SessionNodeManager {
   #srRetryDelaysMs: number[];
   /** DOD-NAT-REACHABILITY-1: reservation deadline — see #startReceiverNode. */
   #srReservationTimeoutMs: number;
-  /** DOD-NAT-REACHABILITY-1: per-relay dial deadline for the reachability probe. */
-  #srRelayProbeTimeoutMs: number;
-  /** Shared relay-reachability result (all agents are offered the same pool). */
-  #relayReachability: { at: number; reachable: Set<string> } | null = null;
-  #relayProbeInFlight: Promise<Set<string>> | null = null;
   /** DOD-NAT-REACHABILITY-1: watchdog for a SILENTLY lost reservation. */
   #srWatchdogIntervalMs: number;
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
@@ -388,8 +377,6 @@ export class SessionNodeManager {
      * forever and leave the agent with no receiver at all. See #startReceiverNode.
      */
     standingReceiverReservationTimeoutMs?: number;
-    /** DOD-NAT-REACHABILITY-1: per-relay dial deadline for the reachability probe. */
-    standingReceiverRelayProbeTimeoutMs?: number;
     /**
      * DOD-NAT-REACHABILITY-1: how often to check that a standing receiver still HOLDS
      * the reservation it came up with. A dead relay makes the /p2p-circuit address
@@ -411,7 +398,6 @@ export class SessionNodeManager {
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
-    this.#srRelayProbeTimeoutMs = opts.standingReceiverRelayProbeTimeoutMs ?? 5_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
     this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
   }
@@ -4515,8 +4501,6 @@ export class SessionNodeManager {
         relayPeerId: sr.relayPeerId,
         reason: stillConnected ? "circuit_address_vanished" : "relay_connection_gone",
       });
-      // Force a fresh probe: the cached verdict still says the dead relay is fine.
-      this.#relayReachability = null;
       void this.#rebuildStandingReceiver(agentName);
     }
   }
@@ -4536,178 +4520,86 @@ export class SessionNodeManager {
   }
 
   /**
-   * Which of these circuit addresses point at a relay that is actually answering
-   * RIGHT NOW, from this network?
+   * Start the standing receiver's libp2p node, holding a circuit-relay reservation
+   * if one can be had — and WITHOUT one if it cannot.
    *
-   * A circuit listen entry commits libp2p's start() to waiting for that relay, with
-   * no timeout of its own. Handing it a relay that black-holes does not just lose
-   * that one reservation — start() blocks on it, so the healthy relays' reservations
-   * are lost too (live: one unreachable relay left 3 of 4 agents with none). So we
-   * dial each relay first, on a short deadline, and listen only on the winners.
+   * THE INVARIANT, learned live: **standing-receiver creation must NEVER be gated on
+   * a relay.** libp2p's circuit listener awaits a live connection to its relay before
+   * start() resolves, and it does not time out. A relay that does not answer parks
+   * start() forever: no created event, no failure, no retry, no alarm — the agent
+   * simply has no receiver and is deaf to ALL inbound, including the direct path that
+   * worked before reservations existed. Strictly worse than the NAT defect this whole
+   * line exists to fix. So every attempt is raced against a deadline, and failure
+   * ALWAYS falls through to a plain TCP receiver.
    *
-   * The probe is shared: every agent on this daemon is offered the same relay pool,
-   * so one probe node serves them all and the result is cached briefly. That keeps
-   * the probe from becoming the very cost it exists to avoid.
-   */
-  async #reachableCircuitAddrs(circuitAddrs: string[], correlationId: string): Promise<string[]> {
-    if (circuitAddrs.length === 0) return [];
-    // Pick ONE — the first candidate that proved it grants a reservation. See the
-    // note in #startReceiverNode for why more than one is worse than useless here.
-    const pickOne = (reachable: ReadonlySet<string>): string[] => {
-      const winner = circuitAddrs.find((a) => reachable.has(a));
-      return winner === undefined ? [] : [winner];
-    };
-    const now = Date.now();
-    const fresh = this.#relayReachability;
-    if (fresh && now - fresh.at < RELAY_PROBE_CACHE_MS) {
-      return pickOne(fresh.reachable);
-    }
-    if (this.#relayProbeInFlight) {
-      return pickOne(await this.#relayProbeInFlight);
-    }
-
-    this.#relayProbeInFlight = (async (): Promise<Set<string>> => {
-      const reachable = new Set<string>();
-      let probe: CelloNode | undefined;
-      try {
-        // A throwaway dialer: loopback listen, open gater. It never accepts inbound.
-        // Probe each relay INDEPENDENTLY, and probe the thing we actually need: a
-        // RESERVATION, not a dial. A dial only proves the host answers. Live, two of
-        // three production relays answered the dial and then failed the reservation
-        // (their advertised peer id did not match the peer actually at that address,
-        // so Noise rejected the handshake) — a dial-only probe passed them straight
-        // into the listen set, where they cost every agent its reservations.
-        await Promise.all(
-          circuitAddrs.map(async (circuitAddr) => {
-            let one: CelloNode | undefined;
-            try {
-              one = await this.#factory.createNode({
-                sessionId: `relay_probe_${randomUUID()}`,
-                connectionGater: new SessionConnectionGater({ sessionId: "relay_probe", allowedPeerId: null, logger: this.#logger }),
-                nodeType: "standing_receiver",
-                circuitRelayListenAddrs: [circuitAddr],
-              });
-              const node = one;
-              await Promise.race([
-                node.start(),
-                new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error("relay_probe_timeout")), this.#srRelayProbeTimeoutMs),
-                ),
-              ]);
-              // The only proof that counts: the relay actually granted a reservation.
-              if (node.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
-                reachable.add(circuitAddr);
-              } else {
-                this.#logger.info("session.standing_receiver.relay.no_reservation", {
-                  circuitAddr,
-                  reason: "relay_answered_but_granted_no_reservation",
-                  correlationId,
-                });
-              }
-            } catch (err: unknown) {
-              this.#logger.info("session.standing_receiver.relay.unreachable", {
-                circuitAddr,
-                error: extractErrorMessage(err),
-                correlationId,
-              });
-            } finally {
-              if (one) {
-                try { await one.stop(); } catch { /* best-effort */ }
-              }
-            }
-          }),
-        );
-      } catch (err: unknown) {
-        // The probe itself failed. Do NOT fall back to "try them all" — that is the
-        // hang. No proven relay means no circuit listener this round; the receiver
-        // still comes up on TCP and a later rebuild retries.
-        this.#logger.warn("session.standing_receiver.relay_probe.failed", {
-          error: extractErrorMessage(err),
-          correlationId,
-        });
-      } finally {
-        if (probe) {
-          try { await probe.stop(); } catch { /* best-effort */ }
-        }
-      }
-      this.#relayReachability = { at: Date.now(), reachable };
-      this.#relayProbeInFlight = null;
-      return reachable;
-    })();
-
-    return pickOne(await this.#relayProbeInFlight);
-  }
-
-  /**
-   * Start the standing receiver's libp2p node, with reservations if they can be had
-   * QUICKLY, and without them if they cannot.
+   * ONE relay, tried on the REAL node — not a probe.
    *
-   * THE INVARIANT — learned the hard way, live: **standing-receiver creation must
-   * NEVER be gated on relay reachability.** libp2p's circuit listener awaits a live
-   * connection to each relay before start() resolves, and it does not time out. Put
-   * three relays in the initial listen set, have one of them not answer from this
-   * network, and start() hangs FOREVER: no created event, no failure, no retry, no
-   * alarm — the agent simply has no receiver and is deaf to ALL inbound, including
-   * the direct path that worked before reservations existed. That is strictly worse
-   * than the NAT defect this whole line exists to fix.
+   * A relay reservation is a scarce resource: the relay holds it for its full TTL
+   * even after the client disconnects, and it has a finite number of slots. An
+   * earlier design probed each relay on a throwaway node and then reserved AGAIN on
+   * the receiver — burning TWO slots per agent to get one, and leaving the throwaway's
+   * slot pinned for hours. That is how a fleet exhausts a relay. Here the receiver
+   * itself makes the attempt: if the relay grants the reservation, we KEEP that node.
+   * One slot per agent, which is the true cost.
    *
-   * So the reservation attempt is RACED against a deadline. If it wins, we get a
-   * node that is both directly dialable and reachable through the relays. If it does
-   * not, we fall back to a plain TCP receiver — the agent is reachable on the direct
-   * path immediately — and the standing receiver is rebuilt with reservations later,
-   * when the directory next hands us endpoints (setDirectoryRelayEndpoints → the
-   * rebuild-if-deaf path). Degraded, loud, and never deaf.
+   * Candidates are tried in order (directory pool first). The first that actually
+   * grants a reservation wins; the rest are never touched.
    */
   async #startReceiverNode(
     agentName: string,
     sessionId: string,
     gater: SessionConnectionGater,
-    requestedCircuitAddrs: string[],
+    candidateCircuitAddrs: string[],
     correlationId: string,
   ): Promise<CelloNode> {
-    // ONE relay, proven to grant a reservation. Not all of them — measured, against
-    // the real relays:
-    //   * libp2p reserves with concurrency 1 (DEFAULT_RESERVATION_CONCURRENCY), and
-    //     start() awaits EVERY circuit listener, so N relays serialize into
-    //     N × (connect + reserve) ≈ N × 3-4s before the node is usable at all;
-    //   * and it yields exactly ONE relay's addresses anyway.
-    // So asking for three bought no redundancy and cost the agent its reachability:
-    // live, 3 of 4 agents blew the deadline and came up with NO reservation at all.
-    // If the chosen relay later dies, its reservation refresh fails and the
-    // rebuild-if-deaf path re-runs this and picks another.
-    const circuitAddrs = await this.#reachableCircuitAddrs(requestedCircuitAddrs, correlationId);
-    if (circuitAddrs.length > 0) {
-      const withReservations = await this.#factory.createNode({
+    for (const circuitAddr of candidateCircuitAddrs) {
+      const candidate = await this.#factory.createNode({
         sessionId,
         connectionGater: gater,
         nodeType: "standing_receiver",
-        circuitRelayListenAddrs: circuitAddrs,
+        circuitRelayListenAddrs: [circuitAddr],
       });
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = Symbol("reservation_timeout");
+      let outcome: "started" | typeof timedOut | "failed" = "failed";
+      let error = "";
       try {
-        const outcome = await Promise.race([
-          withReservations.start().then(() => "started" as const),
+        outcome = await Promise.race([
+          candidate.start().then(() => "started" as const),
           new Promise<typeof timedOut>((resolve) => {
             timer = setTimeout(() => resolve(timedOut), this.#srReservationTimeoutMs);
           }),
         ]);
-        if (outcome === "started") return withReservations;
+      } catch (err: unknown) {
+        error = extractErrorMessage(err);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
-      // The deadline passed with start() still pending — at least one relay is not
-      // answering. Abandon this node (its start may still be parked on a dial; stop()
-      // is best-effort and must not itself block the fallback) and come up TCP-only.
-      this.#logger.warn("session.standing_receiver.reservation.timeout", {
+
+      // The only proof that counts: the relay actually GRANTED the reservation.
+      // start() resolving is not enough — a relay that is out of reservation slots
+      // completes the handshake and simply grants nothing, leaving a node that looks
+      // started and is reachable by nobody.
+      if (outcome === "started" && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+        return candidate;
+      }
+
+      this.#logger.warn("session.standing_receiver.relay.rejected", {
         agentName,
-        relayCount: circuitAddrs.length,
-        timeoutMs: this.#srReservationTimeoutMs,
-        reason: "reservation_did_not_complete_in_time",
+        circuitAddr,
+        reason:
+          outcome === "started"
+            ? "relay_granted_no_reservation"
+            : outcome === "failed"
+              ? "relay_unreachable"
+              : "reservation_did_not_complete_in_time",
+        ...(error !== "" ? { error } : {}),
         correlationId,
       });
+      // Abandon it. start() may still be parked on a dial, so stop() is best-effort
+      // and must never block the fallback.
       void Promise.resolve()
-        .then(() => withReservations.stop())
+        .then(() => candidate.stop())
         .catch(() => { /* best-effort: the node never finished starting */ });
     }
 
