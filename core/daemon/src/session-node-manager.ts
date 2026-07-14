@@ -29,6 +29,7 @@ import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
+import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
@@ -721,6 +722,13 @@ export class SessionNodeManager {
         PRIMARY KEY (agent_id, key)
       )
     `);
+
+    // M10 / DOD-STORE-CLIENT-1: the two trust-signal tables (wallet + received). Created HERE and
+    // deliberately last: `contact_trust_signals` carries a composite FK to `contacts(agent_id,
+    // pubkey)`, so its parent must exist and must already have been through the agent-id re-key
+    // above. SQLite resolves an FK's parent at DML time, not DDL time — so getting this order wrong
+    // would not fail here, it would fail on the first insert, which is a far worse place to find out.
+    ensureTrustSignalSchema(this.#db, this.#logger);
 
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior

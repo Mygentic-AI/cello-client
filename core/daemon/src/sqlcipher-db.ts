@@ -324,6 +324,31 @@ export function openEncryptedDatabase(
     logger?.warn("persist.db.wal.unavailable", { error: err instanceof Error ? err.message : String(err) });
   }
 
+  // M10-D19: FOREIGN KEY enforcement. SQLite defaults this OFF — and with it off, a declared
+  // `FOREIGN KEY` is DECORATIVE: SQLite happily accepts an orphan row, so a schema that looks like it
+  // enforces a relationship enforces nothing. INV-AGENT-SCOPED depends on this being real (a received
+  // trust signal cannot exist except hung off one agent's contact row — `contact_trust_signals` FKs to
+  // `contacts(agent_id, pubkey)`), and ON DELETE CASCADE only fires when it is on.
+  //
+  // It is per-CONNECTION, not per-database, so it belongs here at open — not in a migration, which
+  // would set it for exactly one connection and leave every later one unguarded.
+  //
+  // Safe to enable on existing databases: the daemon declared ZERO foreign keys before this, so there
+  // is no pre-existing constraint that enforcement could retroactively violate.
+  inner.pragma("foreign_keys = ON");
+  const fkOn = inner.pragma("foreign_keys", { simple: true });
+  if (fkOn !== 1 && fkOn !== true) {
+    // Refuse to run with a silently-unenforced schema. If FKs cannot be turned on, every FK in the
+    // DB is a lie and INV-AGENT-SCOPED is unenforced — that is not a degraded mode we announce and
+    // continue through, it is a broken security property. ABSENT IS NOT FINE.
+    try { inner.close(); } catch { /* ignore */ }
+    throw new DbEncryptionError(
+      "db_open_failed",
+      `PRAGMA foreign_keys did not take effect (reported ${String(fkOn)})`,
+      "This SQLite build will not enforce foreign keys, so per-agent scoping of received trust signals cannot be guaranteed. The daemon will not run with an unenforced schema.",
+    );
+  }
+
   return new SqlcipherDatabase(inner);
 }
 
