@@ -449,14 +449,13 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
     }
   }
 
-  it("a relay whose listener never resolves → the receiver still comes up (TCP-only), loudly degraded", async () => {
+  it("R11a: an UNREACHABLE relay is dropped by the probe — the receiver comes up, and it is not listed", async () => {
     const { logger, events } = makeLogger();
-    const dbPath = join(tempDir, "sessions.db");
     const manager = new SessionNodeManager({
-      factory: new HangingCircuitFactory(),
+      factory: new ProductionSessionNodeFactory(),
       logger,
-      dbPath,
-      standingReceiverReservationTimeoutMs: 300, // don't make the suite wait 8s
+      dbPath: join(tempDir, "sessions-a.db"),
+      standingReceiverRelayProbeTimeoutMs: 400,
     });
     await manager.initialize();
     try {
@@ -467,15 +466,79 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
 
       await manager.ensureStandingReceiverForAgent("alice");
 
-      // THE ASSERTION THAT MATTERS: the agent has a receiver. It is reachable.
+      // THE ASSERTION THAT MATTERS: the agent HAS a receiver. It is reachable.
       const info = manager.getStandingReceiverInfo("alice");
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
-      // Degraded, and it says so — never a silent "healthy".
-      expect(events.some((e) => e.event === "session.standing_receiver.reservation.timeout" && e.level === "warn")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.relay.unreachable")).toBe(true);
       expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
     } finally {
       await manager.gracefulShutdown();
     }
   }, 20_000);
+
+  it("R11b: a relay that ANSWERS but whose reservation never completes → receiver still comes up, loudly degraded", async () => {
+    // The probe cannot catch this one: the relay is dialable, so the circuit listener
+    // is attempted — and libp2p's start() then parks on it forever. The deadline is
+    // the only thing between this and a permanently deaf agent.
+    const relay = await startHopRelay();
+    const { logger, events } = makeLogger();
+    const manager = new SessionNodeManager({
+      factory: new HangingCircuitFactory(),
+      logger,
+      dbPath: join(tempDir, "sessions-b.db"),
+      standingReceiverReservationTimeoutMs: 400,
+      standingReceiverRelayProbeTimeoutMs: 3_000,
+    });
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: relay.peerId, relayAddrs: [relay.addr] }, // dialable → probe passes
+      ]);
+
+      await manager.ensureStandingReceiverForAgent("alice");
+
+      const info = manager.getStandingReceiverInfo("alice");
+      expect(info).not.toBeNull();
+      expect(info!.addrs.length).toBeGreaterThan(0);
+      expect(events.some((e) => e.event === "session.standing_receiver.reservation.timeout" && e.level === "warn")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 25_000);
+
+  it("R11c: a HEALTHY relay still reserves — the probe must not cost the good path", async () => {
+    const relay = await startHopRelay();
+    const { logger } = makeLogger();
+    const manager = new SessionNodeManager({
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath: join(tempDir, "sessions-c.db"),
+      standingReceiverRelayProbeTimeoutMs: 3_000,
+    });
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      // One dead relay AND one healthy one: the dead must not cost the healthy its
+      // reservation (live, exactly this left 3 of 4 agents with none).
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: DEAD_RELAY_PEER_ID, relayAddrs: ["/ip4/127.0.0.1/tcp/59986"] },
+        { relayPeerId: relay.peerId, relayAddrs: [relay.addr] },
+      ]);
+
+      await manager.ensureStandingReceiverForAgent("alice");
+
+      const ok = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      expect(ok).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 25_000);
 });

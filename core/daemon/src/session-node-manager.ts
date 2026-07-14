@@ -47,6 +47,14 @@ import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type Par
 import { isValidMultiaddr } from "@cello-protocol/transport";
 import { AgentRelayClient, LEAF_KIND_CTRL, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
+
+/**
+ * DOD-NAT-REACHABILITY-1: how long a relay-reachability probe result stays fresh.
+ * Every agent on this daemon is offered the same relay pool, so one probe serves
+ * them all; short enough that a relay coming back is picked up on the next re-arm.
+ */
+const RELAY_PROBE_CACHE_MS = 60_000;
+
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
   PassthroughGatewayClient,
@@ -225,6 +233,11 @@ export class SessionNodeManager {
   #srRetryDelaysMs: number[];
   /** DOD-NAT-REACHABILITY-1: reservation deadline — see #startReceiverNode. */
   #srReservationTimeoutMs: number;
+  /** DOD-NAT-REACHABILITY-1: per-relay dial deadline for the reachability probe. */
+  #srRelayProbeTimeoutMs: number;
+  /** Shared relay-reachability result (all agents are offered the same pool). */
+  #relayReachability: { at: number; reachable: Set<string> } | null = null;
+  #relayProbeInFlight: Promise<Set<string>> | null = null;
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -369,6 +382,8 @@ export class SessionNodeManager {
      * forever and leave the agent with no receiver at all. See #startReceiverNode.
      */
     standingReceiverReservationTimeoutMs?: number;
+    /** DOD-NAT-REACHABILITY-1: per-relay dial deadline for the reachability probe. */
+    standingReceiverRelayProbeTimeoutMs?: number;
     /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
      * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
@@ -383,7 +398,8 @@ export class SessionNodeManager {
     }
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
-    this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 8_000;
+    this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
+    this.#srRelayProbeTimeoutMs = opts.standingReceiverRelayProbeTimeoutMs ?? 5_000;
     this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
   }
 
@@ -4441,6 +4457,87 @@ export class SessionNodeManager {
   }
 
   /**
+   * Which of these circuit addresses point at a relay that is actually answering
+   * RIGHT NOW, from this network?
+   *
+   * A circuit listen entry commits libp2p's start() to waiting for that relay, with
+   * no timeout of its own. Handing it a relay that black-holes does not just lose
+   * that one reservation — start() blocks on it, so the healthy relays' reservations
+   * are lost too (live: one unreachable relay left 3 of 4 agents with none). So we
+   * dial each relay first, on a short deadline, and listen only on the winners.
+   *
+   * The probe is shared: every agent on this daemon is offered the same relay pool,
+   * so one probe node serves them all and the result is cached briefly. That keeps
+   * the probe from becoming the very cost it exists to avoid.
+   */
+  async #reachableCircuitAddrs(circuitAddrs: string[], correlationId: string): Promise<string[]> {
+    if (circuitAddrs.length === 0) return [];
+    const now = Date.now();
+    const fresh = this.#relayReachability;
+    if (fresh && now - fresh.at < RELAY_PROBE_CACHE_MS) {
+      return circuitAddrs.filter((a) => fresh.reachable.has(a));
+    }
+    if (this.#relayProbeInFlight) {
+      const reachable = await this.#relayProbeInFlight;
+      return circuitAddrs.filter((a) => reachable.has(a));
+    }
+
+    this.#relayProbeInFlight = (async (): Promise<Set<string>> => {
+      const reachable = new Set<string>();
+      let probe: CelloNode | undefined;
+      try {
+        // A throwaway dialer: loopback listen, open gater. It never accepts inbound.
+        probe = await this.#factory.createNode({
+          sessionId: `relay_probe_${randomUUID()}`,
+          connectionGater: new SessionConnectionGater({ sessionId: "relay_probe", allowedPeerId: null, logger: this.#logger }),
+          nodeType: "session",
+        });
+        await probe.start();
+        const node = probe;
+        await Promise.all(
+          circuitAddrs.map(async (circuitAddr) => {
+            // Dial the RELAY itself — strip the /p2p-circuit suffix (and anything after).
+            const relayAddr = circuitAddr.slice(0, circuitAddr.indexOf("/p2p-circuit"));
+            try {
+              await Promise.race([
+                node.dial(relayAddr),
+                new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error("relay_probe_timeout")), this.#srRelayProbeTimeoutMs),
+                ),
+              ]);
+              reachable.add(circuitAddr);
+            } catch (err: unknown) {
+              this.#logger.info("session.standing_receiver.relay.unreachable", {
+                relayAddr,
+                error: extractErrorMessage(err),
+                correlationId,
+              });
+            }
+          }),
+        );
+      } catch (err: unknown) {
+        // The probe itself failed. Do NOT fall back to "try them all" — that is the
+        // hang. No proven relay means no circuit listener this round; the receiver
+        // still comes up on TCP and a later rebuild retries.
+        this.#logger.warn("session.standing_receiver.relay_probe.failed", {
+          error: extractErrorMessage(err),
+          correlationId,
+        });
+      } finally {
+        if (probe) {
+          try { await probe.stop(); } catch { /* best-effort */ }
+        }
+      }
+      this.#relayReachability = { at: Date.now(), reachable };
+      this.#relayProbeInFlight = null;
+      return reachable;
+    })();
+
+    const reachable = await this.#relayProbeInFlight;
+    return circuitAddrs.filter((a) => reachable.has(a));
+  }
+
+  /**
    * Start the standing receiver's libp2p node, with reservations if they can be had
    * QUICKLY, and without them if they cannot.
    *
@@ -4464,9 +4561,15 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     gater: SessionConnectionGater,
-    circuitAddrs: string[],
+    requestedCircuitAddrs: string[],
     correlationId: string,
   ): Promise<CelloNode> {
+    // Listen ONLY on relays that just answered. libp2p's start() waits for EVERY
+    // circuit listener, so a single black-holed relay drags the whole set past the
+    // deadline and costs the reservations of the healthy ones too — live, that left
+    // 3 of 4 agents with no reservation while one relay was unreachable. Probing is
+    // bounded and shared across agents, so it never becomes the new hang.
+    const circuitAddrs = await this.#reachableCircuitAddrs(requestedCircuitAddrs, correlationId);
     if (circuitAddrs.length > 0) {
       const withReservations = await this.#factory.createNode({
         sessionId,
@@ -4494,7 +4597,7 @@ export class SessionNodeManager {
         agentName,
         relayCount: circuitAddrs.length,
         timeoutMs: this.#srReservationTimeoutMs,
-        reason: "at_least_one_relay_did_not_answer_in_time",
+        reason: "reservation_did_not_complete_in_time",
         correlationId,
       });
       void Promise.resolve()
