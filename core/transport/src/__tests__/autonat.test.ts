@@ -9,8 +9,9 @@
  *   exposes the directory-node prober set, which must be non-empty and not
  *   hardcoded (it is whatever was injected).
  * AC-002 — A session node also includes AutoNAT, AND includes dcutr (the
- *   relay-fallback hole-punch upgrade). A standing receiver OMITS dcutr — it only
- *   needs its own dialability, not connection upgrades.
+ *   relay-fallback hole-punch upgrade). DOD-NAT-REACHABILITY-1: the standing
+ *   receiver includes dcutr too — the inbound peer initiates the upgrade, so the
+ *   original "receiver omits dcutr" spec guaranteed the punch never started.
  * AC-003 — (CELLO_E2E_LIVE) real AutoNAT probe confirms dialable:true with a
  *   non-null publicAddr. Skipped without CELLO_E2E_LIVE (real network required).
  * AC-016 — default createNode (no nodeType) keeps AutoNAT and dcutr — no
@@ -80,9 +81,15 @@ describe("AC-001: standing receiver node has AutoNAT client + prober set", () =>
   });
 });
 
-// ─── AC-002: session node has AutoNAT + dcutr; standing receiver omits dcutr ──
+// ─── AC-002: session node AND standing receiver both have AutoNAT + dcutr ─────
+//
+// DOD-NAT-REACHABILITY-1 SUPERSEDES the original AC-002: the old spec omitted
+// dcutr from standing receivers on the reasoning "a receiver doesn't upgrade
+// connections". That was backwards — @libp2p/dcutr's INBOUND peer initiates the
+// hole-punch upgrade, and the standing receiver is the inbound side of every
+// relayed connection. Omitting it guaranteed the punch could never start.
 
-describe("AC-002: session node has AutoNAT + dcutr; standing receiver omits dcutr", () => {
+describe("AC-002 (superseded by DOD-NAT-REACHABILITY-1): both client node types carry AutoNAT + dcutr", () => {
   let scope = createTestScope();
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
@@ -101,7 +108,7 @@ describe("AC-002: session node has AutoNAT + dcutr; standing receiver omits dcut
     expect(protocols).toContain(DCUTR_PROTOCOL_ID);
   });
 
-  it("standing receiver node advertises AutoNAT but NOT dcutr", async () => {
+  it("standing receiver node advertises AutoNAT AND dcutr — it is the punch initiator", async () => {
     const node = await createNode({
       keyProvider: keyProvider(),
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
@@ -112,7 +119,7 @@ describe("AC-002: session node has AutoNAT + dcutr; standing receiver omits dcut
 
     const protocols = node.getProtocols();
     expect(protocols).toContain(AUTONAT_PROTOCOL_ID);
-    expect(protocols).not.toContain(DCUTR_PROTOCOL_ID);
+    expect(protocols).toContain(DCUTR_PROTOCOL_ID);
   });
 });
 

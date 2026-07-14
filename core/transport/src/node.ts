@@ -192,7 +192,12 @@ class CelloNodeImpl implements CelloNode {
   async handle(protocolId: string, handler: CelloStreamHandler, opts?: { maxInboundStreams?: number }): Promise<void> {
     // libp2p v3 StreamHandler receives (stream, connection); we only need stream
     const streamHandler: StreamHandler = (stream: Stream) => handler(stream);
-    await this.#libp2p.handle(protocolId, streamHandler, opts);
+    // DOD-NAT-REACHABILITY-1: every CELLO protocol must run over a LIMITED relayed
+    // connection — a punch-failed session lives on one, and refusing the stream
+    // there silently converts "NAT'd but online" into "unreachable" (the mailbox
+    // then masks it). There is no CELLO protocol that should refuse a relayed
+    // connection, so this is unconditional rather than a per-handler option.
+    await this.#libp2p.handle(protocolId, streamHandler, { ...opts, runOnLimitedConnection: true });
   }
 
   async newStream(peerIdStr: string, protocolId: string): Promise<Stream> {
@@ -226,7 +231,9 @@ class CelloNodeImpl implements CelloNode {
     }
 
     try {
-      const stream = await openConn.newStream(protocolId);
+      // runOnLimitedConnection: see handle() — the relayed-fallback session must
+      // be able to open CELLO streams in both directions.
+      const stream = await openConn.newStream(protocolId, { runOnLimitedConnection: true });
       return stream;
     } catch (err) {
       if (isStructuredError(err)) throw err;
@@ -353,16 +360,22 @@ function mapStreamError(
  *     receiver) it probes connected directory nodes for dial-back to determine
  *     dialability; on directory nodes it serves the responder role, answering
  *     dial-back requests. Protocol: /libp2p/autonat/1.0.0.
- *   - dcutr() is included for session nodes (and the default/service nodes) so a
- *     relay-fallback connection can be hole-punch upgraded to direct, but is
- *     OMITTED for standing-receiver nodes (nodeType==='standing_receiver') — a
- *     standing receiver only needs to know its own dialability, not upgrade
- *     existing connections.
+ *   - dcutr() is included on EVERY node type (DOD-NAT-REACHABILITY-1). The
+ *     protocol's inbound peer is the one that STARTS the hole-punch upgrade
+ *     (@libp2p/dcutr ignores connections with direction !== 'inbound'), and the
+ *     inbound peer of a relayed connection is precisely the standing receiver.
+ *     The old exclusion ("a receiver doesn't upgrade connections") had it exactly
+ *     backwards and guaranteed the punch could never begin.
+ *   - circuitRelayServer (HOP) is a SERVICE-node capability: included when
+ *     nodeType is undefined (directory, relay) or when opts.relayServer.enabled
+ *     is set. Client nodes (session / standing_receiver) no longer advertise
+ *     themselves as relays for strangers.
  */
 export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
-  // dcutr is for dialers upgrading relay-fallback connections. A standing
-  // receiver is a receiver, not a dialer — omit dcutr there.
-  const includeDcutr = opts.nodeType !== "standing_receiver";
+  // HOP relay: service nodes keep it (deployed-relay compatibility); client node
+  // types must opt in explicitly via relayServer.
+  const includeRelayServer = opts.relayServer?.enabled ?? opts.nodeType === undefined;
+  const reservations = opts.relayServer?.reservations;
   // ADR-0001: generate a fresh keypair for libp2p transport identity.
   // keyProvider is intentionally NOT touched here — see SI-002.
   const transportKey = opts.transportPrivateKey
@@ -395,8 +408,12 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     streamMuxers: [yamux() as any],
     services: {
       identify: identify(),
-      // circuitRelayServer advertises CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID
-      relay: circuitRelayServer(),
+      // circuitRelayServer advertises CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID — service
+      // nodes only (see header). The relay passes `reservations` to raise
+      // maxReservations / drop the default 2-min/128-KiB connection limits.
+      ...(includeRelayServer
+        ? { relay: circuitRelayServer(reservations ? { reservations } : {}) }
+        : {}),
       // AutoNAT (RFC: https://libp2p.io/docs/concepts/nat/autonat/). Client role
       // probes connected directory nodes for dial-back; server role answers
       // probes (directory nodes). Protocol /libp2p/autonat/1.0.0.
@@ -410,7 +427,10 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       // is a build-time-only concern; runtime interop is unaffected.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       autonat: autoNAT() as any,
-      ...(includeDcutr ? { dcutr: dcutr() } : {}),
+      // DOD-NAT-REACHABILITY-1: dcutr on every node — the standing receiver is
+      // the inbound side of a relayed connection, and the inbound side starts
+      // the upgrade. See the header note.
+      dcutr: dcutr(),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
     // Keepalive ping interval, so a peer that vanished without a clean close is
