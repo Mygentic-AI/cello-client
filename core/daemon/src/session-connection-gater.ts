@@ -58,12 +58,16 @@ export class EmptyDirectoryPeerIdProvider implements DirectoryPeerIdProvider {
 export class SessionConnectionGater implements ConnectionGater {
   #allowedPeerId: string | null;
   /**
-   * M7 DOD-SPINE-6: an additional peer the session node may connect to OUTBOUND only —
-   * the relay witness. The session node dials the relay (Structure-2 hash submit); the
-   * relay never dials back. Kept OUTBOUND-only so the INBOUND counterparty-only invariant
-   * (INV-5 — a session node admits exactly one counterparty) is fully preserved.
+   * M7 DOD-SPINE-6 / DOD-NAT-REACHABILITY-1: additional peers the session node may
+   * connect to OUTBOUND only. Originally a single slot for the relay witness
+   * (Structure-2 hash submit); now a SET, because the node also dials independent
+   * relays — its own reservation relays, and the relay embedded in the
+   * counterparty's /p2p-circuit address (which rides the FROST-signed assignment,
+   * so it is authorized by the same rail as the assigned witness). Kept
+   * OUTBOUND-only so the INBOUND counterparty-only invariant (INV-5 — a session
+   * node admits exactly one counterparty) is fully preserved.
    */
-  #allowedOutboundPeerId: string | null = null;
+  readonly #allowedOutboundPeerIds = new Set<string>();
   readonly #sessionId: string;
   readonly #logger: Logger;
 
@@ -83,11 +87,13 @@ export class SessionConnectionGater implements ConnectionGater {
   }
 
   /**
-   * M7 DOD-SPINE-6: permit an OUTBOUND connection to the relay witness (a third peer,
-   * authorized by the FROST-signed assignment). Does NOT widen the inbound allowlist.
+   * M7 DOD-SPINE-6: permit an OUTBOUND connection to a relay peer (the assigned
+   * witness, a reservation relay, or the relay inside the counterparty's circuit
+   * address — all authorized by the signed assignment / directory rail). ADDITIVE:
+   * each call widens the outbound set only. Does NOT widen the inbound allowlist.
    */
   setAllowedOutboundPeer(peerId: string): void {
-    this.#allowedOutboundPeerId = peerId;
+    this.#allowedOutboundPeerIds.add(peerId);
   }
 
   getSessionId(): string {
@@ -113,8 +119,8 @@ export class SessionConnectionGater implements ConnectionGater {
    * Return true to DENY the connection.
    */
   denyOutboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
-    // The relay witness is an OUTBOUND-only allowance (the session node dials it).
-    if (this.#allowedOutboundPeerId !== null && peerId.toString() === this.#allowedOutboundPeerId) {
+    // Relay peers are an OUTBOUND-only allowance (the session node dials them).
+    if (this.#allowedOutboundPeerIds.has(peerId.toString())) {
       return false; // allow
     }
     return this.#denyIfNotAllowed(peerId);

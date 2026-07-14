@@ -37,7 +37,6 @@ import { createNode } from "../node.js";
 import { CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID } from "../protocols.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { CelloNode } from "../types.js";
-import type { Stream } from "@libp2p/interface";
 
 setupV3Tests();
 
@@ -110,11 +109,39 @@ describe("T2: circuitRelayServer (HOP) is a service-node capability, not a clien
   it("relayServer options pass through — a client type with relayServer.enabled advertises HOP", async () => {
     const node = await startNode({
       nodeType: "standing_receiver",
-      relayServer: { enabled: true, maxReservations: 64 },
+      relayServer: { enabled: true },
     });
     scope.addCleanup(async () => { try { await node.stop(); } catch { /* cleanup */ } });
     expect(node.getProtocols()).toContain(CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID);
   });
+
+  it("relayServer.reservations reaches circuitRelayServer — maxReservations: 1 rejects the second reserver", async () => {
+    // Phase 2's deployed relay depends on exactly this passthrough to lift the
+    // libp2p defaults (15 reservations, 2-min/128-KiB limits). Prove the options
+    // object lands: with maxReservations: 1, the first receiver reserves and the
+    // second is refused. Reverting the passthrough (default 15) turns this red.
+    const relay = await startNode({ relayServer: { enabled: true, reservations: { maxReservations: 1 } } });
+    scope.addCleanup(async () => { try { await relay.stop(); } catch { /* cleanup */ } });
+    const relayAddr = relay.listenAddresses().find((a) => a.includes("/p2p/"))!;
+
+    const first = await startNode({
+      nodeType: "standing_receiver",
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0", `${relayAddr}/p2p-circuit`],
+    });
+    scope.addCleanup(async () => { try { await first.stop(); } catch { /* cleanup */ } });
+    await waitFor(() => first.listenAddresses().some((a) => a.includes("/p2p-circuit")), {
+      timeout: 10_000,
+      message: "first receiver never obtained its reservation",
+    });
+
+    const second = await startNode({
+      nodeType: "standing_receiver",
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0", `${relayAddr}/p2p-circuit`],
+    });
+    scope.addCleanup(async () => { try { await second.stop(); } catch { /* cleanup */ } });
+    await new Promise((r) => setTimeout(r, 3_000));
+    expect(second.listenAddresses().some((a) => a.includes("/p2p-circuit"))).toBe(false);
+  }, 25_000);
 });
 
 // ─── T3: reservation → relayed dial → CELLO stream over the LIMITED connection ─
@@ -197,7 +224,7 @@ describe("T3: circuit-relay reservation and a CELLO stream over the limited rela
   }, 20_000);
 });
 
-// ─── T4: a Stream type sanity export used by the daemon changes ───────────────
+// ─── T4: plain nodes are unaffected by the circuit-listen machinery ───────────
 
 describe("T4: circuit listen addresses do not break plain nodes", () => {
   let scope = createTestScope();
@@ -210,7 +237,18 @@ describe("T4: circuit listen addresses do not break plain nodes", () => {
     expect(node.listenAddresses().length).toBeGreaterThan(0);
     expect(node.listenAddresses().every((a) => !a.includes("/p2p-circuit"))).toBe(true);
   });
-});
 
-// keep TS happy about the unused import when the suite is filtered
-void ((): Stream | null => null);
+  it("a dead relay in the listen set does not kill the node — TCP survives, no circuit addr", async () => {
+    const node = await startNode({
+      nodeType: "standing_receiver",
+      listenAddresses: [
+        "/ip4/127.0.0.1/tcp/0",
+        "/ip4/127.0.0.1/tcp/59991/p2p/12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aU76ZgUriHhKust/p2p-circuit",
+      ],
+    });
+    scope.addCleanup(async () => { try { await node.stop(); } catch { /* cleanup */ } });
+    const addrs = node.listenAddresses();
+    expect(addrs.length).toBeGreaterThan(0);
+    expect(addrs.every((a) => !a.includes("/p2p-circuit"))).toBe(true);
+  }, 15_000);
+});

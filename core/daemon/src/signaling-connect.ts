@@ -146,9 +146,17 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
     }
 
     // Fresh directory-facing node per connect → fresh transport key / Peer ID.
+    // DOD-NAT-REACHABILITY-1: relayServer disabled — this is a long-lived client
+    // node bound on 0.0.0.0; without the explicit opt-out the no-nodeType default
+    // (a service node) would advertise HOP and let LAN peers relay through the
+    // operator's machine.
     const node = deps.createDirectoryNode
       ? await deps.createDirectoryNode(identity.keyProvider)
-      : await createNode({ keyProvider: identity.keyProvider, listenAddresses: ["/ip4/0.0.0.0/tcp/0"] });
+      : await createNode({
+          keyProvider: identity.keyProvider,
+          listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
+          relayServer: { enabled: false },
+        });
 
     let sigStream: Stream;
     try {

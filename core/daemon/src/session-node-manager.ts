@@ -119,6 +119,15 @@ export interface SessionNodeConfig {
    * window. Factories should forward this to createNode({ keepAliveIntervalMs }).
    */
   keepAliveIntervalMs?: number;
+  /**
+   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses
+   * (`<relay-multiaddr>/p2p/<relay-peer-id>/p2p-circuit`) the node should take
+   * reservations on. Each entry makes libp2p reserve a slot with that relay and
+   * advertise the relayed address via getMultiaddrs() — which is what makes a
+   * NAT'd standing receiver dialable at all. A dead relay in this list degrades
+   * (no reservation, WARN) — it never fails node creation.
+   */
+  circuitRelayListenAddrs?: string[];
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -2835,6 +2844,14 @@ export class SessionNodeManager {
     if (addrs.length === 0) {
       return { ok: false, reason: "no_counterparty_addrs", error: "the assignment carried no counterparty session addrs to dial" };
     }
+    // DOD-NAT-REACHABILITY-1: a /p2p-circuit counterparty address is dialed
+    // THROUGH its relay, so the gater must admit that relay peer OUTBOUND. The
+    // relay id is embedded in the address, which arrived inside the FROST-signed
+    // assignment — the same authorization rail as the assigned witness relay.
+    for (const addr of addrs) {
+      const viaRelay = addr.match(/\/p2p\/([^/]+)\/p2p-circuit/);
+      if (viaRelay) entry.gater.setAllowedOutboundPeer(viaRelay[1]!);
+    }
     let lastError = "";
     for (const addr of addrs) {
       try {
@@ -4289,6 +4306,33 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses for an agent's known
+   * relays, so its standing receiver takes reservations and becomes dialable
+   * behind NAT. Source: the persisted relay endpoints of past sessions
+   * (getAgentRelayEndpoints). A fresh agent with no session history gets none —
+   * the directory-provided endpoint at agent-online (Phase 2) closes that gap.
+   */
+  #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
+    let endpoints: Array<{ relayPeerId: string; relayAddrs: string[] }>;
+    try {
+      endpoints = this.getAgentRelayEndpoints(agentName);
+    } catch {
+      // No DB / unknown agent — no reservations to take. The receiver still
+      // installs; reachability is degraded, not broken (public agents are fine).
+      return { addrs: [], relayPeerIds: [] };
+    }
+    const addrs: string[] = [];
+    const relayPeerIds: string[] = [];
+    for (const ep of endpoints) {
+      const base = ep.relayAddrs[0];
+      if (!base) continue;
+      addrs.push(base.includes("/p2p/") ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`);
+      relayPeerIds.push(ep.relayPeerId);
+    }
+    return { addrs, relayPeerIds };
+  }
+
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
   async #tryCreateStandingReceiver(
     agentName: string,
@@ -4301,9 +4345,23 @@ export class SessionNodeManager {
       logger: this.#logger,
     });
 
+    // DOD-NAT-REACHABILITY-1: reserve with the agent's known relays. The relay
+    // peers are allowed OUTBOUND on the gater up front, so reservation refreshes
+    // keep working after the receiver is claimed and setAllowedPeer() narrows
+    // the inbound gate to the session counterparty.
+    const reservations = this.#reservationCircuitAddrs(agentName);
+    for (const relayPeerId of reservations.relayPeerIds) {
+      gater.setAllowedOutboundPeer(relayPeerId);
+    }
+
     let node: CelloNode;
     try {
-      node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "standing_receiver" });
+      node = await this.#factory.createNode({
+        sessionId,
+        connectionGater: gater,
+        nodeType: "standing_receiver",
+        ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
+      });
       await node.start();
     } catch (err: unknown) {
       const error = err instanceof Error ? err.message : String(err);
@@ -4350,6 +4408,26 @@ export class SessionNodeManager {
       sessionPeerId: node.getPeerId(),
       correlationId,
     });
+
+    // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come
+    // up? circuitAddrs === 0 with reservations requested means every relay
+    // refused/was unreachable — the agent is deaf to NAT'd initiators (public
+    // ones can still connect directly). That must be LOUD, not a quiet shrug.
+    const circuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length;
+    this.#logger.info("session.standing_receiver.reachability", {
+      agentName,
+      circuitAddrs,
+      reservationsRequested: reservations.addrs.length,
+      correlationId,
+    });
+    if (reservations.addrs.length > 0 && circuitAddrs === 0) {
+      this.#logger.warn("session.standing_receiver.reservation.none", {
+        agentName,
+        reservationsRequested: reservations.addrs.length,
+        relayPeerIds: reservations.relayPeerIds,
+        correlationId,
+      });
+    }
     return { outcome: "installed" };
   }
 

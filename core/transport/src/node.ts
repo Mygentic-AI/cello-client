@@ -10,6 +10,7 @@
  */
 
 import { createLibp2p } from "libp2p";
+import { FaultTolerance } from "@libp2p/interface";
 import { tcp } from "@libp2p/tcp";
 import { webSockets } from "@libp2p/websockets";
 import { noise } from "@chainsafe/libp2p-noise";
@@ -127,11 +128,22 @@ class CelloNodeImpl implements CelloNode {
   // NOT dial-back-confirmed, so they are excluded from dialability — only
   // AutoNAT-confirmed observed addresses count.
   readonly #configuredHosts: ReadonlySet<string>;
+  // DOD-NAT-REACHABILITY-1: whether a non-circuit (TCP/WS) listen address was
+  // configured. When circuit listen entries force NO_FATAL fault tolerance,
+  // start() re-checks that the non-circuit listeners actually materialised —
+  // NO_FATAL must not silently absorb a real EADDRINUSE.
+  readonly #expectsDirectListener: boolean;
 
-  constructor(libp2p: Libp2p, keyProvider: KeyProvider, configuredHosts: ReadonlySet<string>) {
+  constructor(
+    libp2p: Libp2p,
+    keyProvider: KeyProvider,
+    configuredHosts: ReadonlySet<string>,
+    expectsDirectListener: boolean,
+  ) {
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
     this.#configuredHosts = configuredHosts;
+    this.#expectsDirectListener = expectsDirectListener;
     // Recompute dialability whenever libp2p updates its self-reported addresses.
     // AutoNAT verification of an external address triggers a 'self:peer:update'.
     this.#libp2p.addEventListener("self:peer:update", () => {
@@ -164,6 +176,19 @@ class CelloNodeImpl implements CelloNode {
 
   async start(): Promise<void> {
     await this.#libp2p.start();
+    // Restore the invariant NO_FATAL relaxed: if a direct (non-circuit) listen
+    // address was configured, at least one direct listener must exist. A failed
+    // circuit reservation is a tolerated degradation; a failed TCP bind is not.
+    if (
+      this.#expectsDirectListener &&
+      !this.#libp2p.getMultiaddrs().some((ma) => !ma.toString().includes("/p2p-circuit"))
+    ) {
+      await this.#libp2p.stop();
+      throw {
+        reason: "listen_failed",
+        message: "no direct (non-circuit) listener materialised for the configured listen addresses",
+      };
+    }
   }
 
   async stop(): Promise<void> {
@@ -313,6 +338,13 @@ function mapStreamError(
 
   const msg = err instanceof Error ? err.message : String(err);
 
+  // A limited-connection refusal is a POLICY refusal, not a network failure —
+  // do not collapse it into connection_lost. CELLO's own paths always set
+  // runOnLimitedConnection, so seeing this means a protocol/handler missed it.
+  if ((err instanceof Error && err.name === "LimitedConnectionError") || msg.includes("limited connection")) {
+    return { reason: "limited_connection_refused", protocolId, message: msg };
+  }
+
   // Protocol negotiation failure — match specific phrases, not generic "stream"
   if (
     msg.includes("unsupported protocol") ||
@@ -353,7 +385,7 @@ function mapStreamError(
  *   - Transports: TCP + WebSockets
  *   - Security: Noise ONLY (XX pattern, RFC: https://noiseprotocol.org/noise.html)
  *   - Muxer: Yamux
- *   - Services: identify, circuitRelayServer (advertises HOP), AutoNAT, DCuTR
+ *   - Services: identify, circuitRelayServer (service nodes / opt-in), AutoNAT, DCuTR
  *
  * NAT traversal:
  *   - autoNAT() is added to ALL nodes. On client nodes (session / standing
@@ -364,8 +396,6 @@ function mapStreamError(
  *     protocol's inbound peer is the one that STARTS the hole-punch upgrade
  *     (@libp2p/dcutr ignores connections with direction !== 'inbound'), and the
  *     inbound peer of a relayed connection is precisely the standing receiver.
- *     The old exclusion ("a receiver doesn't upgrade connections") had it exactly
- *     backwards and guaranteed the punch could never begin.
  *   - circuitRelayServer (HOP) is a SERVICE-node capability: included when
  *     nodeType is undefined (directory, relay) or when opts.relayServer.enabled
  *     is set. Client nodes (session / standing_receiver) no longer advertise
@@ -382,6 +412,15 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     ? await generateKeyPairFromSeed("Ed25519", opts.transportPrivateKey)
     : await generateKeyPair("Ed25519");
 
+  // DOD-NAT-REACHABILITY-1: a circuit-relay listen entry fails at start() when its
+  // relay is unreachable, and libp2p's default fault tolerance makes ANY listener
+  // failure fatal. One dead relay must never kill the node (sovereign-redundancy:
+  // reservations are taken with several relays precisely so one can die), so relax
+  // to NO_FATAL when circuit addrs are present. CelloNodeImpl.start() restores the
+  // invariant that matters: the non-circuit (TCP) listeners must have materialised,
+  // else start() throws loudly — NO_FATAL must not mask a real EADDRINUSE.
+  const hasCircuitListen = opts.listenAddresses.some((a) => a.includes("/p2p-circuit"));
+
   const libp2p = await createLibp2p({
     start: false,
     privateKey: transportKey,
@@ -389,6 +428,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       listen: opts.listenAddresses,
       ...(opts.announceAddresses?.length ? { announce: opts.announceAddresses } : {}),
     },
+    ...(hasCircuitListen ? { transportManager: { faultTolerance: FaultTolerance.NO_FATAL } } : {}),
     transports: [
       tcp(),
       webSockets(),
@@ -452,5 +492,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   }
 
   // Return node in STOPPED state — caller must call start()
-  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts);
+  const expectsDirectListener =
+    hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
+  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener);
 }
