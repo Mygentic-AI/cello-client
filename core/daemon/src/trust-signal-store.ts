@@ -77,6 +77,19 @@ export interface ReceivedSignalRow extends ReceivedSignalInput {
   receivedAt: number;
 }
 
+/**
+ * ⚠️ TWO TIME UNITS LIVE IN THESE TABLES, AND MIXING THEM SILENTLY PRESENTS EXPIRED SIGNALS.
+ *
+ *   issued_at / expires_at  — epoch **SECONDS**. These are ENVELOPE fields: they are HASHED, so the
+ *                             protocol fixed the unit and we do not get to choose it.
+ *   received_at / verified_at — epoch **MILLISECONDS** (`Date.now()`). Local bookkeeping only, never
+ *                             hashed, and matching the house convention of every other daemon table
+ *                             (`contacts.added_at`, `sessions.updated_at`).
+ *
+ * A factor-of-1000 error between them does not throw. Compared against a 1970 timestamp, every
+ * expiry is still in the future — so the failure mode is an expired signal being cheerfully
+ * presented. Anything that compares against `expires_at` must be in SECONDS; see `listPresentable`.
+ */
 const ENVELOPE_COLUMNS = `
     signal_hash     TEXT NOT NULL,
     subject_kind    TEXT NOT NULL,
@@ -226,8 +239,15 @@ export class TrustSignalStore {
    * Excludes expired and non-active rows. Selective disclosure (all / some / none) is the CALLER's
    * choice on top of this — DOD-PRESENT-1; this returns what is *eligible*, never what to send.
    */
-  listPresentable(opts: { agentId: string; accountId: string; now?: number }): WalletSignalRow[] {
-    const nowSec = Math.floor((opts.now ?? Date.now()) / 1000);
+  listPresentable(opts: { agentId: string; accountId: string; nowSec?: number }): WalletSignalRow[] {
+    // `nowSec` is epoch SECONDS, and it is named for its unit deliberately. The envelope's
+    // `issued_at`/`expires_at` are seconds (they are HASHED, and the protocol fixed the unit);
+    // `Date.now()` is milliseconds. An unnamed `now` here invites a caller to pass one where the
+    // other is meant, and a factor-of-1000 error in an expiry check does not throw — it silently
+    // presents an EXPIRED signal (compared against a 1970 timestamp, every expiry is still in the
+    // future). The first version of this method took `now` and its own test passed seconds into a
+    // parameter that was divided by 1000; it only went green because the fixture's expiry was 1.
+    const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
     const rows = this.#db
       .prepare(
         `SELECT * FROM wallet_trust_signals

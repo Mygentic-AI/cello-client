@@ -161,9 +161,30 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(store.listPresentable({ agentId: alice, accountId: "acct-OTHER" })).toEqual([]);
     });
 
-    it("does not present an EXPIRED signal", () => {
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, expiresAt: 1 }));
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x", now: 1_768_000_000 })).toEqual([]);
+    it("does not present a signal that expired ONE SECOND ago (the unit bug this caught)", () => {
+      // The original test used expires_at = 1 — so small that it was excluded whether the comparison
+      // was in seconds or milliseconds. It passed against a `now` parameter that was silently divided
+      // by 1000, and would have gone on passing while production presented expired signals. An expiry
+      // ONE SECOND in the past is the case that can only pass if the units actually agree.
+      const nowSec = 1_768_000_000;
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, expiresAt: nowSec - 1 }));
+      expect(store.listPresentable({ agentId: alice, accountId: "acct-x", nowSec })).toEqual([]);
+    });
+
+    it("DOES present a signal that expires one second from now", () => {
+      // The other side of the boundary. Together these two pin the comparison to the right unit: a
+      // millisecond/second confusion moves the boundary by a factor of 1000 and breaks one of them.
+      const nowSec = 1_768_000_000;
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alice, expiresAt: nowSec + 1 }));
+      expect(store.listPresentable({ agentId: alice, accountId: "acct-x", nowSec })).toHaveLength(1);
+    });
+
+    it("defaults to the real clock in SECONDS — a signal expired an hour ago is not presented", () => {
+      // Guards the DEFAULT path (no nowSec passed), which is where production actually runs and where
+      // a stray Date.now() in milliseconds would land.
+      const anHourAgo = Math.floor(Date.now() / 1000) - 3600;
+      store.putWalletSignal(envelope({ signalHash: HASH("4"), subjectKind: "agent", subject: alice, expiresAt: anHourAgo }));
+      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
     });
 
     it("does not present a REVOKED or SUPERSEDED signal", () => {
