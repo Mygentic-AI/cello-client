@@ -348,3 +348,71 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
     }
   }, 20_000);
 });
+
+// ─── Review round 3: a hostile/misconfigured directory must not kill the receiver ──
+
+describe("R9+R10: directory-supplied endpoints are untrusted input", () => {
+  let tempDir = "";
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-nat-untrusted-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+  });
+  afterEach(async () => {
+    delete process.env["CELLO_LISTEN_ADDR"];
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function makeManager() {
+    const { logger, events } = makeLogger();
+    const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const manager = new SessionNodeManager({ factory: new ProductionSessionNodeFactory(), logger, dbPath });
+    await manager.initialize();
+    return { manager, events };
+  }
+
+  it("R9: a NON-MULTIADDR relay endpoint (a wss:// URL) is dropped — the receiver still comes up", async () => {
+    // The blocking defect: the directory used to fabricate `[r.endpoint]` (a wss:// URL)
+    // for a relay with no multiaddrs. Fed into libp2p's LISTEN set it throws at node
+    // construction — every create attempt fails and the agent ends up with NO standing
+    // receiver: deaf to ALL inbound, including the direct path that worked before.
+    // A bad endpoint must cost one relay, never the receiver.
+    const { manager, events } = await makeManager();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: DEAD_RELAY_PEER_ID, relayAddrs: ["wss://relay.example.com"] },
+      ]);
+      await manager.ensureStandingReceiverForAgent("alice");
+
+      const info = manager.getStandingReceiverInfo("alice");
+      expect(info).not.toBeNull();                       // the receiver LIVES
+      expect(info!.addrs.length).toBeGreaterThan(0);     // and is dialable directly
+      expect(events.some((e) => e.event === "session.standing_receiver.relay_endpoint.invalid" && e.level === "warn")).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.dead")).toBe(false);
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 20_000);
+
+  it("R10: an agent stopped DURING a rebuild is not resurrected — a stopped agent stays dark", async () => {
+    const relay = await startHopRelay();
+    const { manager } = await makeManager();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      await manager.ensureStandingReceiverForAgent("alice"); // up, no reservation → deaf
+      expect(manager.getStandingReceiverInfo("alice")).not.toBeNull();
+
+      // Endpoints arrive → rebuild starts. The agent goes offline while it is in flight.
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: relay.peerId, relayAddrs: [relay.addr] }]);
+      await manager.removeStandingReceiverForAgent("alice");
+
+      // The rebuild must observe the cleared want-flag and NOT stand a receiver back up
+      // for an agent that asked to go dark (it would accept inbound sessions offline).
+      await wait(1_500);
+      expect(manager.getStandingReceiverInfo("alice")).toBeNull();
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 20_000);
+});

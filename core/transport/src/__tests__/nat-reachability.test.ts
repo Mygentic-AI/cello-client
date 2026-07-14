@@ -239,21 +239,26 @@ describe("T4: circuit listen addresses do not break plain nodes", () => {
     expect(node.listenAddresses().every((a) => !a.includes("/p2p-circuit"))).toBe(true);
   });
 
-  it("buildConfiguredHosts expands a wildcard listen host to EVERY local interface address", () => {
-    // The deterministic pin for review F1: the failure case (dialable:true on a
-    // firewalled public-IP host) needs a public interface IP that CI machines
-    // don't have, so pin the pure expansion directly — every interface address
-    // must land in configuredHosts, which deriveDialability excludes.
+  it("buildConfiguredHosts does NOT expand a wildcard to interface addresses — that would mute a genuinely public host", () => {
+    // A tempting 'fix' under the 0.0.0.0 default is to add every local interface
+    // address to configuredHosts (so a firewalled public IP can't read dialable).
+    // It is wrong: libp2p only surfaces VERIFIED addresses, and a public transport
+    // address stays unverified until AutoNAT confirms it — the firewalled host never
+    // offers one. Expanding here would instead suppress the address of a genuinely
+    // reachable public host AFTER AutoNAT confirmed it, pinning it to dialable:false
+    // forever and forcing it onto a relay it does not need. Keep the set literal.
     const hosts = buildConfiguredHosts(["/ip4/0.0.0.0/tcp/0"]);
-    expect(hosts.has("0.0.0.0")).toBe(true);
-    for (const iface of Object.values(networkInterfaces())) {
-      for (const addr of iface ?? []) {
-        expect(hosts.has(addr.address.toLowerCase())).toBe(true);
-      }
+    expect(hosts).toEqual(new Set(["0.0.0.0"]));
+    const nonLoopbackIfaceAddrs = Object.values(networkInterfaces())
+      .flatMap((i) => i ?? [])
+      .filter((a) => a.family === "IPv4" && !a.internal)
+      .map((a) => a.address);
+    for (const addr of nonLoopbackIfaceAddrs) {
+      expect(hosts.has(addr)).toBe(false);
     }
-    // No wildcard → no interface expansion (loopback-only nodes keep the tight set).
-    const loopbackOnly = buildConfiguredHosts(["/ip4/127.0.0.1/tcp/0"]);
-    expect(loopbackOnly).toEqual(new Set(["127.0.0.1"]));
+    // Announce addrs ARE configured (the EC2/EIP case) and stay excluded.
+    expect(buildConfiguredHosts(["/ip4/0.0.0.0/tcp/4001"], ["/ip4/203.0.113.7/tcp/4001"]))
+      .toEqual(new Set(["0.0.0.0", "203.0.113.7"]));
   });
 
   it("0.0.0.0 listen does NOT make interface addresses count as dialable — configured is not confirmed", async () => {

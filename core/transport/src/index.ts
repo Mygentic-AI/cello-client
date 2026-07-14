@@ -4,7 +4,7 @@
  * Exports the CelloNode factory, interface, protocol constants, and error types.
  */
 
-export { createNode } from "./node.js";
+export { createNode, isValidMultiaddr, buildConfiguredHosts } from "./node.js";
 export type { CelloNode, CreateNodeOptions, CelloStreamHandler } from "./types.js";
 export type {
   CelloTransportError,

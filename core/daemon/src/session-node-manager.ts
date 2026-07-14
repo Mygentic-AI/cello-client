@@ -44,6 +44,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
+import { isValidMultiaddr } from "@cello-protocol/transport";
 import { AgentRelayClient, LEAF_KIND_CTRL, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -4334,14 +4335,45 @@ export class SessionNodeManager {
       agentName,
       relayPeerIds: endpoints.map((e) => e.relayPeerId),
     });
-    void this.removeStandingReceiverForAgent(agentName)
-      .then(() => this.ensureStandingReceiverForAgent(agentName))
-      .catch((err: unknown) => {
-        this.#logger.warn("session.standing_receiver.reservation.rebuild.failed", {
-          agentName,
-          error: err instanceof Error ? err.message : String(err),
-        });
+    void this.#rebuildStandingReceiver(agentName);
+  }
+
+  /**
+   * Replace an agent's reservation-less standing receiver with one that reserves.
+   *
+   * Deliberately NOT removeStandingReceiverForAgent()+ensureStandingReceiverForAgent():
+   * the public remove CLEARS #agentsWantingReceiver, so a cello_stop_agent landing in
+   * the window while node.stop() is awaited would find no map entry and no creating
+   * marker, leave no tombstone, and the re-ensure would then RESURRECT a receiver for
+   * an agent that asked to go dark — accepting inbound sessions for an offline agent.
+   * Here the want-flag is left intact and re-checked after the stop: a concurrent stop
+   * clears it, and the rebuild correctly no-ops.
+   */
+  async #rebuildStandingReceiver(agentName: string): Promise<void> {
+    try {
+      const sr = this.#standingReceivers.get(agentName);
+      if (sr) {
+        this.#standingReceivers.delete(agentName);
+        try {
+          sr.autoNat.stop();
+          await sr.node.stop();
+        } catch (err: unknown) {
+          this.#logger.warn("session.standing_receiver.teardown.failed", {
+            agentName,
+            error: extractErrorMessage(err),
+          });
+        }
+      }
+      // The agent may have gone offline while we were stopping the old node. Its
+      // want-flag is the authority — never resurrect a receiver it disowned.
+      if (!this.#agentsWantingReceiver.has(agentName) || this.#shuttingDown) return;
+      await this.#ensureStandingReceiver(agentName);
+    } catch (err: unknown) {
+      this.#logger.warn("session.standing_receiver.reservation.rebuild.failed", {
+        agentName,
+        error: extractErrorMessage(err),
       });
+    }
   }
 
   /**
@@ -4376,7 +4408,23 @@ export class SessionNodeManager {
     for (const ep of merged.values()) {
       const base = ep.relayAddrs[0];
       if (!base) continue;
-      addrs.push(base.includes("/p2p/") ? `${base}/p2p-circuit` : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`);
+      const candidate = base.includes("/p2p/")
+        ? `${base}/p2p-circuit`
+        : `${base}/p2p/${ep.relayPeerId}/p2p-circuit`;
+      // These addresses are built from DIRECTORY-supplied endpoints — data from off
+      // this machine. A malformed one throws inside libp2p node construction, which
+      // would take the standing receiver down entirely and leave the agent deaf to
+      // ALL inbound (worse than the defect this fixes). A bad endpoint must cost one
+      // relay, never the receiver.
+      if (!isValidMultiaddr(candidate)) {
+        this.#logger.warn("session.standing_receiver.relay_endpoint.invalid", {
+          agentName,
+          relayPeerId: ep.relayPeerId,
+          addr: candidate,
+        });
+        continue;
+      }
+      addrs.push(candidate);
       relayPeerIds.push(ep.relayPeerId);
     }
     return { addrs, relayPeerIds };
@@ -4497,6 +4545,10 @@ export class SessionNodeManager {
   async removeStandingReceiverForAgent(agentName: string): Promise<void> {
     // M8B F14: the agent no longer wants a receiver — disarm the teardown re-arm.
     this.#agentsWantingReceiver.delete(agentName);
+    // The directory hands these out at signaling-auth time, so a re-started agent
+    // gets a fresh set on its next connect — holding the old ones would keep a
+    // retired agent's relay list alive for the daemon's lifetime.
+    this.#directoryRelayEndpoints.delete(agentName);
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) {
       // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no

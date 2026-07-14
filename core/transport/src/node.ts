@@ -9,7 +9,6 @@
  * Use lp.encode(source) / lp.decode(source) with it-pipe for composing pipelines.
  */
 
-import { networkInterfaces } from "node:os";
 import { createLibp2p } from "libp2p";
 import { FaultTolerance } from "@libp2p/interface";
 import { tcp } from "@libp2p/tcp";
@@ -82,31 +81,45 @@ function isPubliclyDialable(addr: string): boolean {
  * The set of hosts a node was CONFIGURED to listen on / announce — excluded from
  * dialability because configuration is not dial-back confirmation.
  *
- * DOD-NAT-REACHABILITY-1 (review F1): a WILDCARD listen host (0.0.0.0 / ::)
- * expands to every local interface address in getMultiaddrs(), so those
- * interface addresses are configured-not-confirmed too. Without this expansion a
- * firewalled public-IP host (VPS class) would read dialable:true with zero
- * AutoNAT dial-back, and its advertised direct address would suppress the
- * working relay circuit address — recreating the unreachable-agent defect.
- * Exported for direct unit-testing (the failure case needs a public interface
- * IP, which CI machines don't have).
+ * DOD-NAT-REACHABILITY-1: do NOT expand a wildcard listen host (0.0.0.0 / ::) to
+ * the machine's interface addresses. It looks like the safe thing to do under the
+ * 0.0.0.0 default, and it is wrong: libp2p's address manager already handles this
+ * exactly right. A PUBLIC transport address starts `verified: false`
+ * (libp2p/dist/src/address-manager/transport-addresses.js — `verified:
+ * !isNetworkAddress(ma)`, with private addresses verified immediately), and
+ * getMultiaddrs() returns ONLY verified addresses. So a firewalled public-IP host
+ * never surfaces its public address at all, and there is nothing to suppress.
+ * Expanding the wildcard here would instead suppress that address in the one case
+ * where it is REAL — a genuinely reachable public host whose address AutoNAT has
+ * confirmed — pinning it to dialable:false forever and forcing it onto a relay it
+ * does not need. Exported for direct unit-testing.
  */
 export function buildConfiguredHosts(listenAddresses: string[], announceAddresses?: string[]): Set<string> {
   const configuredHosts = new Set<string>();
-  let sawWildcard = false;
   for (const a of [...listenAddresses, ...(announceAddresses ?? [])]) {
     const host = extractHost(a);
     if (host !== null) configuredHosts.add(host);
-    if (host === "0.0.0.0" || host === "::") sawWildcard = true;
-  }
-  if (sawWildcard) {
-    for (const iface of Object.values(networkInterfaces())) {
-      for (const addr of iface ?? []) {
-        configuredHosts.add(addr.address.toLowerCase());
-      }
-    }
   }
   return configuredHosts;
+}
+
+/**
+ * Is this string a well-formed multiaddr?
+ *
+ * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses are built from relay
+ * endpoints supplied by the DIRECTORY — data from off this machine. A malformed
+ * entry (a `wss://` URL, a bare peer id, anything not a multiaddr) throws inside
+ * libp2p's node construction, which would take the whole standing receiver down
+ * and leave the agent deaf to ALL inbound. Callers validate before listening, so
+ * a bad endpoint costs one relay, never the receiver.
+ */
+export function isValidMultiaddr(addr: string): boolean {
+  try {
+    multiaddr(addr);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Extract the IPv4/IPv6 host component of a multiaddr string, or null. */
@@ -130,13 +143,12 @@ function extractHost(addr: string): string | null {
  * dynamically (an AutoNAT-confirmed `observed` address — its host is not one we
  * configured) counts toward dialable:true.
  *
- * DOD-NAT-REACHABILITY-1: standing receivers listen on 0.0.0.0 by default, so
- * every LOCAL INTERFACE address appears in getMultiaddrs() as configured-not-
- * confirmed. createNode expands wildcard listen hosts (0.0.0.0 / ::) to the
- * machine's interface addresses when building configuredHosts, so a public IP
- * that is merely ON the interface (a firewalled VPS) never counts as dialable
- * without an AutoNAT dial-back — advertising it would suppress the working
- * relay circuit address and recreate the unreachable-agent defect.
+ * DOD-NAT-REACHABILITY-1: standing receivers now listen on 0.0.0.0 by default,
+ * which does NOT weaken this. libp2p only surfaces VERIFIED addresses through
+ * getMultiaddrs(), and a public transport address stays unverified until AutoNAT
+ * confirms it (see buildConfiguredHosts) — so a firewalled public-IP host never
+ * offers one here at all, and a wildcard bind on a NAT'd machine yields only
+ * private interface addresses, which isPubliclyDialable already rejects.
  */
 function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>): Dialability {
   const publicAddr =
