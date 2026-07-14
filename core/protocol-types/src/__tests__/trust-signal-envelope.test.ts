@@ -33,6 +33,7 @@ import {
   type TrustSignalEnvelope,
 } from "../trust-signal.js";
 import { encodeCbor } from "../cbor.js";
+import { walkCborArray, isCborFloat } from "./cbor-item-walker.js";
 
 /** The reference envelope the hand-derived vector below encodes. */
 function referenceEnvelope(): TrustSignalEnvelope {
@@ -129,28 +130,39 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
   });
 
   describe("integers past 2^32 — the float64 trap (a 100-year expiry reaches it TODAY)", () => {
+    // Slot indices in the fixed-order preimage array (M10-D15/D17).
+    const ISSUED_AT = 8, EXPIRES_AT = 9;
     // An expires_at a century out is 1.768e9 + 3.15e9 = 4.92e9, well past 2^32. This is not a 2106
     // problem; it is the first long-dated signal the portal mints.
     const farFuture = 4_920_000_000;
 
-    it("hashes a far-future expires_at as a CBOR uint64, never a float64", () => {
-      const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), expires_at: farFuture });
-      expect(hex(bytes)).toContain("1b0000000125413e00"); // uint64
-      expect(hex(bytes)).not.toContain("fb");             // no float, anywhere in the preimage
+    // NOTE ON HOW THESE ARE CHECKED. The obvious test — grep the hex for `fb` — is WRONG, and it fired
+    // a false alarm on a real vector the moment the directory ran it: in `... 1a 696ac4fb 5820 ...`
+    // the `fb` is the last byte of a uint32's VALUE, not a header, and the regex matched straight
+    // across the item boundary. A hex search does not know where CBOR items begin. So these walk the
+    // CBOR framing and read actual major types (`cbor-item-walker.ts`).
+
+    it("hashes a far-future expires_at as a CBOR uint64 (major 0), never a float", () => {
+      const items = walkCborArray(encodeTrustSignalEnvelope({ ...referenceEnvelope(), expires_at: farFuture }));
+      expect(items[EXPIRES_AT].major).toBe(0);  // unsigned integer...
+      expect(items[EXPIRES_AT].ai).toBe(27);    // ...as a uint64 (`1b`), not a float64 (`fb`)
+      expect(items.filter(isCborFloat)).toEqual([]);
     });
 
-    it("hashes a far-future issued_at as a CBOR uint64, never a float64", () => {
-      const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: farFuture });
-      expect(hex(bytes)).toContain("1b0000000125413e00");
-      expect(hex(bytes)).not.toContain("fb");
+    it("hashes a far-future issued_at as a CBOR uint64 (major 0), never a float", () => {
+      const items = walkCborArray(encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: farFuture }));
+      expect(items[ISSUED_AT].major).toBe(0);
+      expect(items[ISSUED_AT].ai).toBe(27);
+      expect(items.filter(isCborFloat)).toEqual([]);
     });
 
-    it("NO preimage, for any legal envelope, ever contains a float64 marker", () => {
-      // The property, stated directly. If a float ever enters the preimage the signal is
-      // unreproducible by any other language's CBOR library — so assert its total absence.
+    it("NO preimage, for any legal envelope, ever contains an IEEE float item", () => {
+      // The property, stated directly and checked structurally. A float in the preimage makes the
+      // signal unreproducible by any other language's CBOR library.
       for (const t of [0, 1, 0xffff_ffff, 0xffff_ffff + 1, farFuture, 99_999_999_999]) {
-        const bytes = encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: t, expires_at: t });
-        expect(hex(bytes).match(/fb[0-9a-f]{16}/), `issued_at=${t} encoded a float64`).toBeNull();
+        const items = walkCborArray(encodeTrustSignalEnvelope({ ...referenceEnvelope(), issued_at: t, expires_at: t }));
+        expect(items.filter(isCborFloat), `issued_at=${t} encoded a float`).toEqual([]);
+        expect(items[ISSUED_AT].major, `issued_at=${t} must be a uint`).toBe(0);
       }
     });
 
@@ -224,8 +236,12 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
         ) as unknown as TrustSignalEnvelope;
         const encoded = hex(encodeTrustSignalEnvelope(env));
         expect(encoded).toBe(hex(encodeTrustSignalEnvelope(reversed)));
-        // ...and no envelope, anywhere in the random space, may hash a float.
-        expect(encoded.match(/fb[0-9a-f]{16}/), `float64 in preimage for issued_at=${env.issued_at}`).toBeNull();
+        // ...and no envelope, anywhere in the random space, may hash a float. Checked by CBOR framing,
+        // not by grepping hex — see the note above.
+        expect(
+          walkCborArray(encodeTrustSignalEnvelope(env)).filter(isCborFloat),
+          `float item in preimage for issued_at=${env.issued_at}`,
+        ).toEqual([]);
       }
     });
   });
