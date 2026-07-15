@@ -20,7 +20,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
@@ -766,14 +766,41 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       }
       const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
 
-      const toResponse = (e: InboundSessionEvent) => ({
-        type: "new_session",
-        session_id: e.sessionIdHex,
-        counterparty_pubkey: e.counterpartyPubkeyHex,
-        genesis_prev_root: e.genesisPrevRootHex,
-        // MONIKER-2: validated-at-boundary display hint; null = absent or rejected.
-        offered_moniker: e.offeredMoniker ?? null,
-      });
+      const toResponse = (e: InboundSessionEvent) => {
+        // DOD-CONSUME-1: project verified trust signals for the counterparty.
+        // INV-FRAMING: issuer_kind drives framing (portal-attested vs quoted-untrusted).
+        // INV-TYPE-CARRY: unknown types flow through with generic framing.
+        let trustSignals: Array<Record<string, unknown>> | undefined;
+        try {
+          const agId = sessionNodeManager.resolveAgentId(agentName);
+          const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+          const received = store.listReceived({ agentId: agId, contactPubkey: e.counterpartyPubkeyHex });
+          if (received.length > 0) {
+            trustSignals = received
+              .filter((s) => s.verdict === "active")
+              .map((s) => {
+                let claim: unknown;
+                try { claim = decodeCbor(s.payload); } catch { claim = null; }
+                return {
+                  type: s.type,
+                  issuer: s.issuerKind === "portal" ? "platform-verified" : "peer-claimed",
+                  claim,
+                };
+              });
+            if (trustSignals.length === 0) trustSignals = undefined;
+          }
+        } catch {
+          trustSignals = undefined;
+        }
+        return {
+          type: "new_session",
+          session_id: e.sessionIdHex,
+          counterparty_pubkey: e.counterpartyPubkeyHex,
+          genesis_prev_root: e.genesisPrevRootHex,
+          offered_moniker: e.offeredMoniker ?? null,
+          ...(trustSignals ? { trust_signals: trustSignals } : {}),
+        };
+      };
 
       reapExpiredInboundSessions(agentName); // M8C-TTL-1: don't hand back a stale expired entry
       const queued = inboundSessionQueues.get(agentName);
