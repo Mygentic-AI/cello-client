@@ -109,7 +109,7 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
       issuedAt: decoded.issued_at,
       expiresAt: decoded.expires_at,
       supersedesHash: decoded.supersedes_hash === null ? null : Buffer.from(decoded.supersedes_hash).toString("hex"),
-      verifiedAt: 1_768_000_100,
+      verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });
 
@@ -117,7 +117,7 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].signalHash).toBe(hashHex);
     expect(rows[0].verdict).toBe("active");
-    expect(rows[0].verifiedAt).toBe(1_768_000_100);
+    expect(rows[0].verifiedAt).toBe(1_768_000_100_000);
     expect(rows[0].type).toBe("phone");
   });
 
@@ -189,7 +189,7 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
       issuedAt: decoded.issued_at,
       expiresAt: decoded.expires_at,
       supersedesHash: null,
-      verifiedAt: 1_768_000_200,
+      verifiedAt: 1_768_000_200_000,
       verdict: "active",
     });
 

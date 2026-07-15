@@ -457,7 +457,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
                 issuedAt: envelope.issued_at,
                 expiresAt: envelope.expires_at,
                 supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
-                verifiedAt: Math.floor(Date.now() / 1000),
+                verifiedAt: Date.now(),
                 verdict: "active",
               });
               verified++;

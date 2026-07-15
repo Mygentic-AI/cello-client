@@ -94,7 +94,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issuedAt: 1_768_000_000,
       expiresAt: null,
       supersedesHash: null,
-      verifiedAt: 1_768_000_100,
+      verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });
     return hashHex;
@@ -163,7 +163,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issuedAt: 1_768_000_000,
       expiresAt: null,
       supersedesHash: null,
-      verifiedAt: 1_768_000_100,
+      verifiedAt: 1_768_000_100_000,
       verdict: "revoked",
     });
 
@@ -204,7 +204,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issuedAt: 1_768_000_000,
       expiresAt: null,
       supersedesHash: null,
-      verifiedAt: 1_768_000_100,
+      verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });
 
