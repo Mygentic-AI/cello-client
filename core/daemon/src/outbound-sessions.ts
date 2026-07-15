@@ -24,8 +24,9 @@ import { DbIdentityStore } from "./db-identity-store.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
-import { TrustSignalStore } from "./trust-signal-store.js";
+import { TrustSignalStore, type WalletSignalRow } from "./trust-signal-store.js";
 import { TIER } from "./contacts-tier-migration.js";
+import { encodeTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 
 export interface OutboundSessionDeps {
   logger: Logger;
@@ -183,7 +184,21 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
         const eligible = store.listAllActive();
         if (eligible.length > 0) {
-          trustSignals = eligible.map((s) => ({ hash: s.signalHash, blob: s.payload }));
+          trustSignals = eligible.map((s) => ({
+            hash: s.signalHash,
+            blob: encodeTrustSignalEnvelope({
+              subject_kind: s.subjectKind,
+              subject: s.subject,
+              issuer_kind: s.issuerKind,
+              issuer_pubkey: s.issuerPubkey,
+              type: s.type,
+              schema_version: s.schemaVersion,
+              payload: s.payload,
+              issued_at: s.issuedAt,
+              expires_at: s.expiresAt,
+              supersedes_hash: s.supersedesHash === null ? null : new Uint8Array(Buffer.from(s.supersedesHash, "hex")),
+            }),
+          }));
           logger.info("signal.presentation.attached", {
             agentName, target: targetHex.slice(0, 16), count: trustSignals.length, correlationId,
           });
