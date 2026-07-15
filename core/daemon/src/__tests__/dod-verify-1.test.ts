@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
-import { TrustSignalStore, ensureTrustSignalSchema } from "../trust-signal-store.js";
+import { TrustSignalStore } from "../trust-signal-store.js";
 import {
   encodeTrustSignalEnvelope,
   hashTrustSignalEnvelope,

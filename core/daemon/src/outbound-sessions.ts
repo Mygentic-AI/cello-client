@@ -24,7 +24,7 @@ import { DbIdentityStore } from "./db-identity-store.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
-import { TrustSignalStore, type WalletSignalRow } from "./trust-signal-store.js";
+import { TrustSignalStore } from "./trust-signal-store.js";
 import { TIER } from "./contacts-tier-migration.js";
 import { encodeTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 
