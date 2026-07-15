@@ -216,20 +216,10 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
   });
 });
 
-// The projection function — mirrors the implementation in inbound-sessions.ts toResponse
-import { decodeCbor } from "@cello-protocol/protocol-types";
+// Test the PRODUCTION projection function, not a local mirror.
+import { projectTrustSignals } from "../inbound-sessions.js";
 import type { ReceivedSignalRow } from "../trust-signal-store.js";
 
 function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; issuer: string; claim: unknown }> {
-  return received
-    .filter((s) => s.verdict === "active")
-    .map((s) => {
-      let claim: unknown;
-      try { claim = decodeCbor(s.payload); } catch { claim = null; }
-      return {
-        type: s.type,
-        issuer: s.issuerKind === "portal" ? "platform-verified" : "peer-claimed",
-        claim,
-      };
-    });
+  return projectTrustSignals(received) ?? [];
 }

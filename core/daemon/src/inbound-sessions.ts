@@ -71,6 +71,26 @@ export interface InboundSessionDeps {
   sendTelegramDoorbell: (agentName: string, sessionId: string, kind: "session_request" | "message_waiting" | "state_change", detail: string) => Promise<void>;
 }
 
+/**
+ * DOD-CONSUME-1: project verified trust signals into the LLM-facing JSON shape.
+ * INV-FRAMING: issuer_kind drives framing. INV-TYPE-CARRY: unknown types pass through generically.
+ */
+export function projectTrustSignals(
+  received: ReadonlyArray<{ type: string; issuerKind: string; payload: Uint8Array; verdict: string }>,
+): Array<{ type: string; issuer: string; claim: unknown }> | undefined {
+  const active = received.filter((s) => s.verdict === "active");
+  if (active.length === 0) return undefined;
+  return active.map((s) => {
+    let claim: unknown;
+    try { claim = decodeCbor(s.payload); } catch { claim = null; }
+    return {
+      type: s.type,
+      issuer: s.issuerKind === "portal" ? "platform-verified" : "peer-claimed",
+      claim,
+    };
+  });
+}
+
 export function createInboundSessions(deps: InboundSessionDeps) {
   const {
     logger, sessionNodeManager, agents, getConnState, resolveCurrentAgent,
@@ -767,29 +787,18 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
 
       const toResponse = (e: InboundSessionEvent) => {
-        // DOD-CONSUME-1: project verified trust signals for the counterparty.
-        // INV-FRAMING: issuer_kind drives framing (portal-attested vs quoted-untrusted).
-        // INV-TYPE-CARRY: unknown types flow through with generic framing.
-        let trustSignals: Array<Record<string, unknown>> | undefined;
+        let trustSignals: Array<{ type: string; issuer: string; claim: unknown }> | undefined;
         try {
           const agId = sessionNodeManager.resolveAgentId(agentName);
           const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
           const received = store.listReceived({ agentId: agId, contactPubkey: e.counterpartyPubkeyHex });
-          if (received.length > 0) {
-            trustSignals = received
-              .filter((s) => s.verdict === "active")
-              .map((s) => {
-                let claim: unknown;
-                try { claim = decodeCbor(s.payload); } catch { claim = null; }
-                return {
-                  type: s.type,
-                  issuer: s.issuerKind === "portal" ? "platform-verified" : "peer-claimed",
-                  claim,
-                };
-              });
-            if (trustSignals.length === 0) trustSignals = undefined;
-          }
-        } catch {
+          trustSignals = projectTrustSignals(received);
+        } catch (err: unknown) {
+          logger.warn("signal.projection.failed", {
+            agentName,
+            counterparty: e.counterpartyPubkeyHex.slice(0, 16),
+            reason: err instanceof Error ? err.message : String(err),
+          });
           trustSignals = undefined;
         }
         return {
