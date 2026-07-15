@@ -393,6 +393,16 @@ describe("cli commands", () => {
       expect(result.output).toContain("No daemon running");
     });
 
+    // The "DEV-" sentinel is the local DevTokenValidator's prefix. The CLI must NOT reject it client-side —
+    // rejecting DEV- broke ALL local/spine registration (the CLI wanted CELLO-, the local validator wanted
+    // DEV-, so no token satisfied both). It passes the gate and reaches the daemon (the real authority).
+    it("lets a DEV- sentinel token through the client gate to the daemon (local dev registration)", async () => {
+      const result = await register(tempDir, "alice", "DEV-local-test-token");
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("No daemon running");
+      expect(result.output).not.toContain("start with 'CELLO-'"); // NOT rejected client-side as malformed
+    });
+
     it("returns exit 1 'No daemon running' when no daemon is up (well-formed token)", async () => {
       const result = await register(tempDir, "alice", VALID_TOKEN);
       expect(result.exitCode).toBe(1);

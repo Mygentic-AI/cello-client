@@ -313,12 +313,16 @@ export async function register(
     };
   }
   // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
-  // Checking just the "CELLO-" prefix catches the common typo (pasting the literal words
-  // "CELLO_PREAUTH_TOKEN") without hard-coding the exact length/alphabet — the directory stays the
-  // authority on the full format, so a future format bump can't strand a valid token behind a
-  // client-side "malformed". A wrong-length CELLO- token reaches the daemon and is rejected there
-  // with a structured reason.
-  if (!preAuthToken.startsWith("CELLO-")) {
+  // Checking just the prefix catches the common typo (pasting the literal words "CELLO_PREAUTH_TOKEN")
+  // without hard-coding the exact length/alphabet — the directory stays the authority on the full format,
+  // so a future format bump can't strand a valid token behind a client-side "malformed". The "DEV-"
+  // sentinel is ALSO allowed: it is the dev/local pre-auth prefix that DevTokenValidator accepts
+  // (CELLO_ENV=local), and it is unmistakably intentional, not a paste error. A wrong token of either
+  // prefix reaches the daemon and is rejected there with a structured reason (the local DevTokenValidator
+  // rejects non-DEV-, the prod PgTokenValidator rejects non-CELLO-). Without this, local CLI registration
+  // is impossible — the CLI rejects the very DEV- tokens the local validator requires (it broke the whole
+  // spine suite).
+  if (!preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
     return {
       exitCode: 1,
       output: "That doesn't look like a pre-auth token — real ones start with 'CELLO-' followed by 33 characters. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the token itself?) Get a token from the CELLO Operations Agent on Telegram, then retry.",
