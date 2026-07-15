@@ -29,6 +29,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
+import { ensureIdentitySchema } from "../db-identity-store.js";
 import { withForeignKeysOff } from "../sqlcipher-db.js";
 import { hashTrustSignalEnvelope as hashTrustSignalEnvelopeFn } from "@cello-protocol/protocol-types";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -504,6 +505,35 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // drop travelled WITH the replacement, never before it, and the M8 `agent_id = null` defect is gone.
       const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get();
       expect(row, "M10-D18: the M8 `trust_signals` scaffold must be dropped once its M10 replacement is live").toBeUndefined();
+    });
+
+    it("DROPs a POPULATED M8 trust_signals table without error — the real client-migration case (review F1)", () => {
+      // The fresh-DB assertion above proves a NEW DB has no table, but the load-bearing claim is that an
+      // EXISTING operator DB still holding M8 rows migrates cleanly (client-side, unrecoverable if it
+      // throws or corrupts). Reconstruct that DB — the M8 CREATE + a row — then re-run schema-ensure as a
+      // daemon restart would, and assert the drop fires without throwing and touches nothing else.
+      db.exec(
+        `CREATE TABLE IF NOT EXISTS trust_signals (
+           signal_hash TEXT PRIMARY KEY, agent_id TEXT, signal_kind TEXT NOT NULL,
+           payload BLOB NOT NULL, received_at INTEGER NOT NULL )`,
+      );
+      db.prepare(
+        `INSERT INTO trust_signals (signal_hash, agent_id, signal_kind, payload, received_at) VALUES (?, ?, ?, ?, ?)`,
+      ).run("a".repeat(64), null, "webauthn", Buffer.from([1, 2, 3]), 1_700_000_000_000);
+      expect(
+        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get(),
+        "precondition: the populated M8 table exists",
+      ).toBeDefined();
+      const before = db.prepare("SELECT COUNT(*) AS n FROM agents").get() as { n: number };
+
+      expect(() => ensureIdentitySchema(db)).not.toThrow();
+
+      expect(
+        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get(),
+        "the populated M8 table is dropped on schema-ensure",
+      ).toBeUndefined();
+      // The migration is surgical: it drops ONLY the scaffold, leaving every other table intact.
+      expect(db.prepare("SELECT COUNT(*) AS n FROM agents").get()).toMatchObject({ n: before.n });
     });
   });
 });
