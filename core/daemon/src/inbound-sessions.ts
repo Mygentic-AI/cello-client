@@ -20,9 +20,8 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
-import { hash as cryptoHash } from "@cello-protocol/crypto";
-import { DbIdentityStore } from "./db-identity-store.js";
+import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 
@@ -591,16 +590,28 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       logger.warn("daemon.trust_signal.open_failed", { agentName, signalKind, correlationId });
       return;
     }
-    const recomputed = Buffer.from(cryptoHash(recovered)).toString("hex");
-    if (recomputed !== signalHash) {
-      logger.error("daemon.trust_signal.hash_mismatch", { agentName, signalKind, correlationId });
+    // M10-D18 / M10-D22: the recovered bytes are a canonical CBOR trust-signal envelope (NOT the M8
+    // canonical-JSON record). Decode with the SHARED decoder (INV-CANONICAL — same code the portal/directory
+    // encode with), then hand it to the holder's own chokepoint: `deliverWalletSignal` RE-DERIVES the
+    // DOD-CBOR-1 hash and REFUSES a mismatch. So the raw-sha256 check the M8 path did here is GONE — an
+    // envelope hash is a domain-tagged CBOR hash, not a raw hash of the bytes. Decode-fail OR hash-mismatch
+    // is NOT ACKed: the directory retains the pickup and re-delivers, and the signal is re-mintable.
+    let envelope: TrustSignalEnvelope;
+    try {
+      envelope = decodeTrustSignalEnvelope(recovered);
+    } catch (err) {
+      logger.error("daemon.trust_signal.envelope_undecodable", {
+        agentName, signalKind, correlationId, error: err instanceof Error ? err.message : String(err),
+      });
       return;
     }
     try {
-      const store = new DbIdentityStore(sessionNodeManager.getDb(), logger);
-      store.storeTrustSignal({ signalHash, agentId: null, signalKind, payload: recovered });
+      const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+      store.deliverWalletSignal(envelope, signalHash);
     } catch (err) {
-      logger.error("daemon.trust_signal.store_failed", {
+      // SignalDeliveryRejected (hash_mismatch / claimed_hash_malformed) or a storage fault: NO ACK, so the
+      // directory keeps the pickup for a later retry rather than losing a signal it could not verify here.
+      logger.error("daemon.trust_signal.delivery_rejected", {
         agentName,
         signalKind,
         correlationId,

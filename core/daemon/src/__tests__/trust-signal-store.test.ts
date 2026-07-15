@@ -495,17 +495,15 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       }
     });
 
-    it("the M8 scaffold table is STILL STANDING — this guards against a PREMATURE drop (M10-D18)", () => {
-      // Deliberate, and load-bearing. Dropping it here would leave the M8 delivery arm
-      // (inbound-sessions.ts:601) writing to columns that no longer exist, and the j-trust spine test
-      // red, across four units until MINT-INTERNAL-1 replaced it.
-      //
-      // BE CLEAR ABOUT WHAT THIS DOES AND DOES NOT GUARD. It fails if someone drops the scaffold
-      // EARLY. It does NOT force the drop to ever happen: if MINT-INTERNAL-1 never lands, this stays
-      // green forever and the M8 `agent_id = null` defect survives with it. The forcing function for
-      // the drop is DOD-MINT-INTERNAL-1's own DoD clause and its own test — not this one.
+    it("the M8 scaffold table is GONE — MINT-INTERNAL-1 dropped it together with its replacement (M10-D18)", () => {
+      // THE FORCING FUNCTION. This is DOD-MINT-INTERNAL-1's own test-clause: it was the mirror-image guard
+      // that used to assert the scaffold still STOOD (to catch a PREMATURE drop across the four units
+      // between STORE-CLIENT-1 and here). Now MINT-INTERNAL-1 has landed — the M8 delivery arm is
+      // re-pointed onto TrustSignalStore.deliverWalletSignal (inbound-sessions), the writer + reader are
+      // retired, and `ensureIdentitySchema` drops the table — so it must be ABSENT. Its absence proves the
+      // drop travelled WITH the replacement, never before it, and the M8 `agent_id = null` defect is gone.
       const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_signals'").get();
-      expect(row, "M10-D18: drop `trust_signals` in DOD-MINT-INTERNAL-1, together with its replacement").toBeDefined();
+      expect(row, "M10-D18: the M8 `trust_signals` scaffold must be dropped once its M10 replacement is live").toBeUndefined();
     });
   });
 });

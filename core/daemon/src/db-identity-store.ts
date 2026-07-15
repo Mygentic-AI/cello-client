@@ -165,25 +165,14 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
     }
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
-  db.exec(CREATE_TRUST_SIGNALS_SQL);
+  // M10-D18: DROP the M8 `trust_signals` scaffold. It held canonical-JSON records keyed by a RAW hash;
+  // M10 wallet signals are canonical CBOR envelopes in `wallet_trust_signals` (TrustSignalStore),
+  // re-derived via deliverWalletSignal. The M8 shape can't migrate (different hash + format) and is
+  // re-mintable (D1), so the scaffold is dropped, not converted. IF EXISTS + no FK children → safe and
+  // idempotent on both fresh and existing operator DBs. This is the forcing-function drop that MINT-
+  // INTERNAL-1 owes; a test asserts the table is GONE.
+  db.exec("DROP TABLE IF EXISTS trust_signals");
 }
-
-/**
- * Received trust signals — the daemon's local copy of a signal it pulled from the
- * directory pickup queue, opened (k_local), and HASH-VERIFIED against the directory anchor. Keyed by
- * signal_hash (the verification anchor) → storing the same signal twice is idempotent. The payload is
- * the recovered plaintext JSON — the ONLY plaintext copy of the signal (the server side holds only
- * the hash). In the encrypted SQLCipher DB.
- */
-const CREATE_TRUST_SIGNALS_SQL = `
-  CREATE TABLE IF NOT EXISTS trust_signals (
-    signal_hash   TEXT PRIMARY KEY,
-    agent_id      TEXT,
-    signal_kind   TEXT NOT NULL,
-    payload       BLOB NOT NULL,
-    received_at   INTEGER NOT NULL
-  );
-`;
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
 const toBytes = (v: unknown): Uint8Array =>
@@ -212,26 +201,10 @@ export class DbIdentityStore {
     ensureIdentitySchema(db);
   }
 
-  /**
-   * Store a received + verified trust signal. Idempotent on signal_hash (the same
-   * signal delivered/pulled twice stores once). `payload` is the recovered plaintext JSON.
-   */
-  storeTrustSignal(args: { signalHash: string; agentId: string | null; signalKind: string; payload: Uint8Array }): void {
-    this.#db
-      .prepare(
-        `INSERT OR IGNORE INTO trust_signals (signal_hash, agent_id, signal_kind, payload, received_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(args.signalHash, args.agentId, args.signalKind, toBuf(args.payload), Date.now());
-  }
-
-  /** Read a stored trust signal back by its hash anchor. */
-  getTrustSignal(signalHash: string): { signalKind: string; payload: Uint8Array } | null {
-    const row = this.#db
-      .prepare("SELECT signal_kind, payload FROM trust_signals WHERE signal_hash = ?")
-      .get(signalHash) as { signal_kind: string; payload: unknown } | undefined;
-    return row ? { signalKind: row.signal_kind, payload: toBytes(row.payload) } : null;
-  }
+  // M10-D18: `storeTrustSignal` / `getTrustSignal` (the M8 `trust_signals` writer + reader) are RETIRED.
+  // A received wallet signal is now a canonical CBOR envelope, re-verified and stored in
+  // `wallet_trust_signals` by `TrustSignalStore.deliverWalletSignal` (inbound-sessions). The M8 table is
+  // dropped in `ensureIdentitySchema` above.
 
   /** True if an ACTIVE (non-retired) agent row with this name exists — the create-collision check. */
   hasActiveAgent(agentName: string): boolean {
