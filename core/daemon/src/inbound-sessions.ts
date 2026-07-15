@@ -20,7 +20,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
@@ -415,9 +415,8 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         // (DOD-RENAME-1's rename-baseline update runs earlier, right after the acceptance bound — see
         // the recordOfferedMoniker call there. This map is only the session-scoped display material.)
       }
-      // DOD-PRESENT-1: log received trust signals. Storage/verification is DOD-VERIFY-1's job;
-      // this event makes the receive path observable.
-      if (parsed.trustSignals) {
+      // DOD-VERIFY-1: verify + store received trust signals.
+      if (parsed.trustSignals && parsed.trustSignals.length > 0) {
         logger.info("signal.presentation.received", {
           agentName,
           sessionId: parsed.sessionIdHex,
@@ -425,6 +424,65 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           count: parsed.trustSignals.length,
           correlationId,
         });
+        try {
+          const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+          const agentId = sessionNodeManager.resolveAgentId(agentName);
+          // The FK on contact_trust_signals requires a contact row. Ensure one at UNKNOWN
+          // tier (INSERT OR IGNORE — never overwrites an existing row, never promotes).
+          sessionNodeManager.addContact(agentName, parsed.participantAPubkeyHex, null, "signal_presentation");
+          let verified = 0;
+          let rejected = 0;
+          for (const sig of parsed.trustSignals) {
+            try {
+              const envelope = decodeTrustSignalEnvelope(sig.blob);
+              const hashBytes = new Uint8Array(Buffer.from(sig.hash, "hex"));
+              if (!verifyTrustSignalHash(envelope, hashBytes)) {
+                logger.warn("signal.verify.hash_mismatch", {
+                  agentName, signalHash: sig.hash.slice(0, 16), correlationId,
+                });
+                rejected++;
+                continue;
+              }
+              store.putReceivedSignal({
+                agentId,
+                contactPubkey: parsed.participantAPubkeyHex,
+                signalHash: sig.hash,
+                subjectKind: envelope.subject_kind,
+                subject: envelope.subject,
+                issuerKind: envelope.issuer_kind,
+                issuerPubkey: envelope.issuer_pubkey,
+                type: envelope.type,
+                schemaVersion: envelope.schema_version,
+                payload: envelope.payload,
+                issuedAt: envelope.issued_at,
+                expiresAt: envelope.expires_at,
+                supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
+                verifiedAt: Math.floor(Date.now() / 1000),
+                verdict: "active",
+              });
+              verified++;
+            } catch (err: unknown) {
+              logger.warn("signal.verify.decode_failed", {
+                agentName, signalHash: sig.hash.slice(0, 16),
+                reason: err instanceof Error ? err.message : String(err),
+                correlationId,
+              });
+              rejected++;
+            }
+          }
+          if (verified > 0 || rejected > 0) {
+            logger.info("signal.verify.complete", {
+              agentName, counterparty: parsed.participantAPubkeyHex.slice(0, 16),
+              verified, rejected, correlationId,
+            });
+          }
+        } catch (err: unknown) {
+          logger.warn("signal.verify.store_failed", {
+            agentName,
+            reason: err instanceof Error ? err.message : String(err),
+            correlationId,
+          });
+        }
       }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,
