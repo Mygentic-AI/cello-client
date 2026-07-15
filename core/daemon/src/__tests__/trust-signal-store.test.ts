@@ -224,6 +224,40 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     });
   });
 
+  describe("listAllActive (DOD-PRESENT-1 — holder emit)", () => {
+    it("returns all active, non-expired wallet signals regardless of subject", () => {
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "account", subject: "acct-x", type: "email" }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, type: "phone" }));
+      const all = store.listAllActive();
+      expect(all).toHaveLength(2);
+      expect(all.map((s) => s.signalHash).sort()).toEqual([HASH("1"), HASH("2")].sort());
+    });
+
+    it("excludes expired signals", () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), expiresAt: nowSec - 100 }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), expiresAt: nowSec + 100 }));
+      const all = store.listAllActive();
+      expect(all).toHaveLength(1);
+      expect(all[0].signalHash).toBe(HASH("2"));
+    });
+
+    it("excludes revoked and superseded signals", () => {
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alice }));
+      store.setWalletStatus(HASH("1"), "revoked");
+      store.setWalletStatus(HASH("2"), "superseded");
+      const all = store.listAllActive();
+      expect(all).toHaveLength(1);
+      expect(all[0].signalHash).toBe(HASH("3"));
+    });
+
+    it("returns empty array when wallet is empty", () => {
+      expect(store.listAllActive()).toEqual([]);
+    });
+  });
+
   describe("the received store (INV-AGENT-SCOPED)", () => {
     const PEER = HASH("e");
 

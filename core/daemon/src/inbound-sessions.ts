@@ -201,6 +201,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         offeredMoniker: string | null;
         monikerRejected: boolean;
         monikerRejectReason: "not_string" | "length" | "charset" | null;
+        // DOD-PRESENT-1: trust signals that survived the directory's dumb check.
+        // undefined = absent (older directory or initiator presented nothing).
+        trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
       }
     | null {
     const raw = frame["assignment"];
@@ -223,6 +226,21 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         : [];
     // MONIKER-2 AC2: validate the offered name ONCE, at this wire boundary.
     const monikerResult = extractOfferedMoniker(a);
+    // DOD-PRESENT-1: extract trust signals that survived the directory's dumb check.
+    let trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
+    const rawSignals = a["trust_signals"];
+    if (Array.isArray(rawSignals) && rawSignals.length > 0) {
+      const parsed: Array<{ hash: string; blob: Uint8Array }> = [];
+      for (const entry of rawSignals) {
+        if (entry && typeof entry === "object") {
+          const e = entry as Record<string, unknown>;
+          const hash = typeof e["hash"] === "string" ? e["hash"] : null;
+          const blob = e["blob"] instanceof Uint8Array ? e["blob"] : Buffer.isBuffer(e["blob"]) ? new Uint8Array(e["blob"] as Buffer) : null;
+          if (hash && blob) parsed.push({ hash, blob });
+        }
+      }
+      if (parsed.length > 0) trustSignals = parsed;
+    }
     return {
       sessionIdHex,
       participantAPubkeyHex,
@@ -243,6 +261,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       offeredMoniker: monikerResult.offeredMoniker,
       monikerRejected: monikerResult.rejected,
       monikerRejectReason: monikerResult.reason ?? null,
+      trustSignals,
     };
   }
 
@@ -395,6 +414,17 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         offeredMonikers.set(offerKey(agentName, parsed.sessionIdHex), parsed.offeredMoniker);
         // (DOD-RENAME-1's rename-baseline update runs earlier, right after the acceptance bound — see
         // the recordOfferedMoniker call there. This map is only the session-scoped display material.)
+      }
+      // DOD-PRESENT-1: log received trust signals. Storage/verification is DOD-VERIFY-1's job;
+      // this event makes the receive path observable.
+      if (parsed.trustSignals) {
+        logger.info("signal.presentation.received", {
+          agentName,
+          sessionId: parsed.sessionIdHex,
+          counterparty: parsed.participantAPubkeyHex.slice(0, 16),
+          count: parsed.trustSignals.length,
+          correlationId,
+        });
       }
       enqueueInboundSession(agentName, {
         sessionIdHex: parsed.sessionIdHex,

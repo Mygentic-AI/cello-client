@@ -24,6 +24,8 @@ import { DbIdentityStore } from "./db-identity-store.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
+import { TrustSignalStore } from "./trust-signal-store.js";
+import { TIER } from "./contacts-tier-migration.js";
 
 export interface OutboundSessionDeps {
   logger: Logger;
@@ -172,6 +174,29 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       });
       moniker = undefined;
     }
+    // DOD-PRESENT-1: selective disclosure — present wallet signals to KNOWN+ contacts, nothing to
+    // UNKNOWN/BLOCKED. A failure reading the wallet must never block the session (same rule as moniker).
+    let trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
+    try {
+      const tier = sessionNodeManager.getTier(agentName, targetHex);
+      if (tier >= TIER.KNOWN) {
+        const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+        const eligible = store.listAllActive();
+        if (eligible.length > 0) {
+          trustSignals = eligible.map((s) => ({ hash: s.signalHash, blob: s.payload }));
+          logger.info("signal.presentation.attached", {
+            agentName, target: targetHex.slice(0, 16), count: trustSignals.length, correlationId,
+          });
+        }
+      }
+    } catch (err: unknown) {
+      logger.warn("signal.presentation.read_failed", {
+        agentName,
+        reason: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+      trustSignals = undefined;
+    }
     try {
       const sent = await signaling.sendRaw({
         type: "session_request",
@@ -180,6 +205,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         initiator_session_addrs: sr.addrs,
         wants_session_offer: true,
         ...(moniker !== undefined ? { moniker } : {}),
+        ...(trustSignals !== undefined ? { trust_signals: trustSignals } : {}),
       });
       if (!sent.ok) {
         return { ok: false, reason: sent.reason ?? "directory_unreachable", guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream." };

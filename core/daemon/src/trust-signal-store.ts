@@ -407,6 +407,25 @@ export class TrustSignalStore {
   }
 
   /**
+   * All active, non-expired wallet signals — the full set this daemon may present.
+   *
+   * Unlike `listPresentable` (which filters by subject-kind/subject to disambiguate a multi-agent
+   * daemon), this returns EVERYTHING active. Correct for alpha (one agent per daemon) and safe as a
+   * superset: selective disclosure (the caller) decides what actually goes on the wire.
+   */
+  listAllActive(opts?: { nowSec?: number }): WalletSignalRow[] {
+    const nowSec = opts?.nowSec ?? Math.floor(Date.now() / 1000);
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM wallet_trust_signals
+          WHERE status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)`,
+      )
+      .all(nowSec) as unknown as EnvelopeDbRow[];
+    return rows.map(toWalletRow);
+  }
+
+  /**
    * Store a signal a contact PRESENTED to one of my agents, after it was verified.
    *
    * The FK refuses a row for a contact that does not exist — an unscoped received signal is not
