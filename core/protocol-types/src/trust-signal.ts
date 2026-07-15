@@ -37,7 +37,7 @@
  */
 
 import { hash as sha256 } from "@cello-protocol/crypto";
-import { encodeCbor } from "./cbor.js";
+import { encodeCbor, decodeCbor } from "./cbor.js";
 
 /** Domain separation, bound as element 0 of the preimage array — the house convention
  *  (`AGENT_REVOCATION_DOMAIN`, `PRIMARY_TRANSFER_DOMAIN`). A trust-signal hash can therefore never
@@ -319,4 +319,71 @@ export function verifyTrustSignalHash(envelope: TrustSignalEnvelope, expected: U
   let diff = 0;
   for (let i = 0; i < actual.length; i++) diff |= actual[i] ^ expected[i];
   return diff === 0;
+}
+
+/**
+ * Decode canonical envelope bytes back into the envelope — the inverse of `encodeTrustSignalEnvelope`,
+ * and the ONE decoder every party shares (INV-CANONICAL / M10-D7 — the holder's daemon that RECEIVES a
+ * delivered signal must decode with the SAME code the directory and portal encode with, never a vendored
+ * copy). The preimage is a fixed-order 11-element ARRAY (M10-D15); element 0 is the domain tag.
+ *
+ * REFUSES anything that is not EXACTLY canonical: it re-encodes the decoded envelope with
+ * `encodeTrustSignalEnvelope` and compares the bytes to the input. If they differ — a number that came
+ * back as a float, a byte string mis-read, a non-minimal integer, trailing bytes — it THROWS rather than
+ * return a "best-effort" envelope: a best-effort hash is one two parties can disagree about. Reusing the
+ * encoder (not a hand-rolled re-encode) guarantees the decoder cannot drift from it, AND runs the encoder's
+ * own field validation (epoch-seconds bounds, payload-is-bytes, 32-byte supersedes_hash) — so a
+ * canonical-at-the-byte-level-but-semantically-invalid array (e.g. an out-of-range subject_kind) still
+ * throws here rather than escaping as a bad envelope.
+ *
+ * ⚠️ THROWS on any malformed/non-canonical input (never returns a partial). The holder's chokepoint
+ * (`deliverWalletSignal`) and the recipient's verify both depend on that: a delivery that does not
+ * round-trip is corrupt or tampered and must not be stored. Do NOT wrap in try/catch → default — that is
+ * the silent swallow that turns "unhashable garbage" into "a valid-looking empty signal".
+ */
+export function decodeTrustSignalEnvelope(bytes: Uint8Array): TrustSignalEnvelope {
+  const arr = decodeCbor(bytes);
+  if (!Array.isArray(arr) || arr.length !== 11) {
+    throw new Error(
+      `trust-signal envelope must be an 11-element CBOR array (the fixed preimage), got ` +
+      `${Array.isArray(arr) ? `${arr.length} elements` : typeof arr}`,
+    );
+  }
+  const [domain, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version, payload, issued_at, expires_at, supersedes_hash] =
+    arr as unknown[];
+  if (domain !== TRUST_SIGNAL_DOMAIN) {
+    throw new Error(`trust-signal envelope domain tag is '${String(domain)}', expected '${TRUST_SIGNAL_DOMAIN}' — not a trust-signal envelope`);
+  }
+  // NORMALIZE to a plain, freshly-copied Uint8Array. node's CBOR decoder returns byte strings as a
+  // `Buffer` (a Uint8Array subclass) that can ALIAS a pooled ArrayBuffer — returning it as-is would leak a
+  // view over shared memory and make the decoded type Buffer, not Uint8Array. `new Uint8Array(v)` copies
+  // the bytes into an owned array, so the envelope's byte fields are the same type the encoder expects and
+  // never alias a pool.
+  const asBytes = (v: unknown, field: string): Uint8Array => {
+    if (v instanceof Uint8Array) return new Uint8Array(v);
+    throw new Error(`trust-signal envelope: ${field} must be raw bytes, got ${v === null ? "null" : typeof v}`);
+  };
+  const env: TrustSignalEnvelope = {
+    subject_kind: subject_kind as SignalSubjectKind,
+    subject: subject as string,
+    issuer_kind: issuer_kind as SignalIssuerKind,
+    issuer_pubkey: issuer_pubkey as string,
+    type: type as string,
+    schema_version: Number(schema_version),
+    payload: asBytes(payload, "payload"),
+    issued_at: Number(issued_at),
+    expires_at: expires_at === null || expires_at === undefined ? null : Number(expires_at),
+    supersedes_hash: supersedes_hash === null || supersedes_hash === undefined ? null : asBytes(supersedes_hash, "supersedes_hash"),
+  };
+  // Canonical check: re-encode with the SAME encoder every party runs and compare EXACTLY.
+  const reencoded = encodeTrustSignalEnvelope(env);
+  if (reencoded.length !== bytes.length) {
+    throw new Error("trust-signal envelope bytes are not canonical — re-encoding does not reproduce the input");
+  }
+  for (let i = 0; i < reencoded.length; i++) {
+    if (reencoded[i] !== bytes[i]) {
+      throw new Error("trust-signal envelope bytes are not canonical — re-encoding does not reproduce the input");
+    }
+  }
+  return env;
 }

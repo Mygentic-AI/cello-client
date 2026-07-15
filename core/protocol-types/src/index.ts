@@ -6,6 +6,7 @@ export { encodeCbor, decodeCbor } from "./cbor.js";
 export {
   TRUST_SIGNAL_DOMAIN,
   encodeTrustSignalEnvelope,
+  decodeTrustSignalEnvelope,
   hashTrustSignalEnvelope,
   verifyTrustSignalHash,
 } from "./trust-signal.js";

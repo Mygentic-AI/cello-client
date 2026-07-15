@@ -28,6 +28,7 @@ import { hash as sha256 } from "@cello-protocol/crypto";
 import {
   TRUST_SIGNAL_DOMAIN,
   encodeTrustSignalEnvelope,
+  decodeTrustSignalEnvelope,
   hashTrustSignalEnvelope,
   verifyTrustSignalHash,
   type TrustSignalEnvelope,
@@ -412,6 +413,64 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       // it would silently produce a signal that never expires.
       const bad = { ...referenceEnvelope(), issued_at: 1_768_000_000_000 };
       expect(() => encodeTrustSignalEnvelope(bad)).toThrow(/seconds/i);
+    });
+  });
+
+  // decodeTrustSignalEnvelope — the shared RECEIVING decoder (M10-D7). The holder's daemon and the
+  // recipient re-derive the hash from delivered/presented bytes with THIS, the same code the portal and
+  // directory encode with, never a vendored copy. It must round-trip exactly and refuse anything else.
+  describe("decodeTrustSignalEnvelope — the shared receiving decoder (M10-D7)", () => {
+    it("round-trips the reference envelope (decode ∘ encode is identity)", () => {
+      const env = referenceEnvelope();
+      expect(decodeTrustSignalEnvelope(encodeTrustSignalEnvelope(env))).toEqual(env);
+    });
+
+    it("round-trips an envelope with a far-future expires_at and a 32-byte supersedes_hash", () => {
+      const env: TrustSignalEnvelope = {
+        ...referenceEnvelope(),
+        subject_kind: "account",
+        issuer_kind: "agent",
+        type: "some_type_invented_next_year",     // opaque — the decoder does not gate on it (INV-ZERO-BUMP)
+        schema_version: 2,
+        issued_at: 5_000_000_000,                  // > 2^32 — the uint64 boundary the encoder coerces
+        expires_at: 6_000_000_000,
+        supersedes_hash: new Uint8Array(32).fill(7),
+      };
+      const decoded = decodeTrustSignalEnvelope(encodeTrustSignalEnvelope(env));
+      expect(decoded).toEqual(env);
+      // The re-derived hash matches the original — the decoder produced the SAME canonical bytes.
+      expect(hex(hashTrustSignalEnvelope(decoded))).toBe(hex(hashTrustSignalEnvelope(env)));
+    });
+
+    it("REFUSES bytes whose domain tag is not CELLO-TSIG-v1 (not a trust-signal envelope)", () => {
+      const wrongDomain = encodeCbor([
+        "CELLO-OTHER-v1", "agent", "agent-1", "portal", "aabb", "phone", 1,
+        new Uint8Array([1, 2, 3, 4]), 1_000_000_000, null, null,
+      ]);
+      expect(() => decodeTrustSignalEnvelope(wrongDomain)).toThrow(/domain tag/i);
+    });
+
+    it("REFUSES the wrong arity — a 10- or 12-element array is not the fixed 11-slot preimage", () => {
+      const tooShort = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null]);
+      const tooLong = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null, null, "extra"]);
+      expect(() => decodeTrustSignalEnvelope(tooShort)).toThrow(/11-element/i);
+      expect(() => decodeTrustSignalEnvelope(tooLong)).toThrow(/11-element/i);
+    });
+
+    it("REFUSES a non-array preimage", () => {
+      expect(() => decodeTrustSignalEnvelope(encodeCbor({ not: "an array" }))).toThrow(/11-element/i);
+    });
+
+    it("REFUSES NON-CANONICAL bytes — a >2^32 timestamp float-encoded (not the uint64 the encoder emits)", () => {
+      // A valid epoch-second (~year 2106) but hand-encoded as a plain JS number → CBOR float64 (the trap
+      // pinned above). The canonical form is a uint64; re-encoding the decoded value reproduces the uint64,
+      // whose bytes differ from the float input → the decoder REFUSES rather than notarize a float's hash.
+      const bigTs = 4_294_968_296; // > 2^32
+      const nonCanonical = encodeCbor([
+        TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1,
+        new Uint8Array([1, 2, 3, 4]), bigTs, null, null,
+      ]);
+      expect(() => decodeTrustSignalEnvelope(nonCanonical)).toThrow(/canonical/i);
     });
   });
 });
