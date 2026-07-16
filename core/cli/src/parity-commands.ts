@@ -418,8 +418,15 @@ export function monikerSet(celloDir: string, moniker: string | null, opts: Parit
 // ─── Group B: live conversation (mirrors the MCP params EXACTLY) ───────────────────────────────
 
 /** `cello initiate-session <target-pubkey>` → cello_initiate_session. Prints the session_id. */
-export function initiate(celloDir: string, targetPubkey: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["initiate-session"], { target_pubkey: targetPubkey }, opts);
+export function initiate(
+  celloDir: string,
+  targetPubkey: string,
+  opts: ParityOptions & { include?: string[]; exclude?: string[] },
+): Promise<CliOutput> {
+  const extra: Record<string, unknown> = {};
+  if (opts.include) extra["include_signals"] = opts.include;
+  if (opts.exclude) extra["exclude_signals"] = opts.exclude;
+  return ipcCommand(celloDir, IPC_METHODS["initiate-session"], { target_pubkey: targetPubkey, ...extra }, opts);
 }
 
 /**

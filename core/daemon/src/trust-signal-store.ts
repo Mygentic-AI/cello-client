@@ -76,10 +76,14 @@ export interface WalletSignalInput {
   expiresAt: number | null;
   supersedesHash: string | null;
   status: SignalStatus | string;
+  /** Whether this signal is included in the default presentation bundle. When absent, derived from type suffix. */
+  defaultPresent?: boolean;
 }
 
 export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
+  /** True = included in the default presentation bundle. _id signals default false; everything else true. */
+  defaultPresent: boolean;
 }
 
 /**
@@ -148,6 +152,7 @@ const CREATE_WALLET_SQL = `
   CREATE TABLE IF NOT EXISTS wallet_trust_signals (
     ${ENVELOPE_COLUMNS},
     received_at     INTEGER NOT NULL,
+    default_present INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -175,6 +180,12 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
   // Presentation reads by subject; nothing reads by `type`, and nothing may (INV-ZERO-BUMP — an
   // index predicated on a type VALUE is a per-type construct in the schema).
   db.exec("CREATE INDEX IF NOT EXISTS idx_wallet_signals_subject ON wallet_trust_signals (subject_kind, subject)");
+  // Additive migration: add default_present if the table already exists without it.
+  try {
+    db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN default_present INTEGER NOT NULL DEFAULT 1");
+  } catch {
+    // Column already exists — safe to ignore.
+  }
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
@@ -213,6 +224,7 @@ interface EnvelopeDbRow {
   supersedes_hash: string | null;
   status: string;
   received_at: number;
+  default_present?: number;
 }
 
 /** The received table's row. `verified_at` is `NOT NULL` in the schema, so it is REQUIRED here — an
@@ -237,6 +249,8 @@ function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
     supersedesHash: r.supersedes_hash,
     status: r.status,
     receivedAt: r.received_at,
+    // Rows written before this column existed have null here; treat as true (default-on).
+    defaultPresent: r.default_present !== 0,
   };
 }
 
@@ -268,16 +282,19 @@ export class TrustSignalStore {
   /** Returns true iff a NEW row was inserted (false = the content-addressed row already existed, a
    *  benign duplicate). */
   putWalletSignal(s: WalletSignalInput): boolean {
+    // _id suffix signals default to excluded; everything else defaults to included.
+    const defaultPresent = s.defaultPresent !== undefined ? s.defaultPresent : !s.type.endsWith("_id");
     const res = this.#db
       .prepare(
         `INSERT OR IGNORE INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
-            payload, issued_at, expires_at, supersedes_hash, status, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.signalHash, s.subjectKind, s.subject, s.issuerKind, s.issuerPubkey, s.type, s.schemaVersion,
         toBuf(s.payload), s.issuedAt, s.expiresAt, s.supersedesHash, s.status, Date.now(),
+        defaultPresent ? 1 : 0,
       );
     if (res.changes > 0) {
       this.#logger.info("signal.wallet.stored", {
@@ -437,6 +454,22 @@ export class TrustSignalStore {
   }
 
   /**
+   * Look up a wallet signal by hash prefix (minimum 8 chars). Returns the unique matching signal,
+   * or null if no match, or throws if the prefix is ambiguous (multiple matches).
+   */
+  getWalletSignalByPrefix(prefix: string): WalletSignalRow | null {
+    if (prefix.length < 8) {
+      throw new Error("hash prefix too short — supply at least 8 characters");
+    }
+    const rows = this.#db
+      .prepare("SELECT * FROM wallet_trust_signals WHERE signal_hash LIKE ?")
+      .all(prefix + "%") as unknown as EnvelopeDbRow[];
+    if (rows.length === 0) return null;
+    if (rows.length > 1) throw new Error(`ambiguous hash prefix '${prefix}' matches ${rows.length} signals — supply more characters`);
+    return toWalletRow(rows[0]);
+  }
+
+  /**
    * Hard-delete a wallet signal by hash (GDPR removal). Returns true if a row was deleted.
    *
    * This is a permanent DELETE, not a status transition. Revocation is directory-driven and leaves
@@ -455,13 +488,15 @@ export class TrustSignalStore {
   }
 
   /**
-   * All active, non-expired wallet signals — the full set this daemon may present.
+   * Active, non-expired wallet signals eligible for presentation.
    *
-   * Unlike `listPresentable` (which filters by subject-kind/subject to disambiguate a multi-agent
-   * daemon), this returns EVERYTHING active. Correct for alpha (one agent per daemon) and safe as a
-   * superset: selective disclosure (the caller) decides what actually goes on the wire.
+   * Default behavior: returns only signals where `default_present = 1`.
+   * `include` overrides the default — only the listed types are returned regardless of `default_present`.
+   * `exclude` removes types from the default set.
+   * Both `include` and `exclude` are type strings. Unknown types cause a validation error at the
+   * IPC layer (the caller must pre-validate against listAllWalletSignals before calling this).
    */
-  listAllActive(opts?: { nowSec?: number }): WalletSignalRow[] {
+  listAllActive(opts?: { nowSec?: number; include?: string[]; exclude?: string[] }): WalletSignalRow[] {
     const nowSec = opts?.nowSec ?? Math.floor(Date.now() / 1000);
     const rows = this.#db
       .prepare(
@@ -470,7 +505,25 @@ export class TrustSignalStore {
             AND (expires_at IS NULL OR expires_at > ?)`,
       )
       .all(nowSec) as unknown as EnvelopeDbRow[];
-    return rows.map(toWalletRow);
+    const all = rows.map(toWalletRow);
+    if (opts?.include) {
+      const set = new Set(opts.include);
+      return all.filter((s) => set.has(s.type));
+    }
+    const excluded = new Set(opts?.exclude ?? []);
+    return all.filter((s) => s.defaultPresent && !excluded.has(s.type));
+  }
+
+  /** Set the persistent default-presentation flag for a wallet signal. */
+  setDefaultPresent(signalHash: string, value: boolean): boolean {
+    const res = this.#db
+      .prepare("UPDATE wallet_trust_signals SET default_present = ? WHERE signal_hash = ?")
+      .run(value ? 1 : 0, signalHash);
+    if (Number(res.changes) > 0) {
+      this.#logger.info("signal.wallet.default_present.changed", { signalHash, defaultPresent: value });
+      return true;
+    }
+    return false;
   }
 
   /**

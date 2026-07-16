@@ -147,6 +147,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     sr: { peerId: string; addrs: string[] },
     correlationId: string,
     agentName: string,
+    signalFilter?: { include?: string[]; exclude?: string[] },
   ): Promise<SessionNegotiationResult> {
     let resolveFrame!: (f: Record<string, unknown>) => void;
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
@@ -182,7 +183,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       const tier = sessionNodeManager.getTier(agentName, targetHex);
       if (tier >= TIER.KNOWN) {
         const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-        const eligible = store.listAllActive();
+        const eligible = store.listAllActive({ include: signalFilter?.include, exclude: signalFilter?.exclude });
         if (eligible.length > 0) {
           trustSignals = eligible.map((s) => ({
             hash: s.signalHash,
@@ -350,6 +351,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     targetHex: string,
     sr: { peerId: string; addrs: string[] },
     correlationId: string,
+    signalFilter?: { include?: string[]; exclude?: string[] },
   ): Promise<SessionNegotiationResult> {
     const roster = await resolveConsortiumRoster();
     const target = roster?.find((e) => e.nodeId === owningNodeId) ?? null;
@@ -371,7 +373,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "visiting_connection_unreachable", correlationId });
         return { ok: false, reason: "visiting_connection_unreachable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
       }
-      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName);
+      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName, signalFilter);
       if (result.ok) {
         releaseReason = "handoff-complete";
         // Fix #1: remember the broker for this session so cello_close_session can reconnect to complete the seal.
@@ -414,6 +416,30 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           guidance: "cello_initiate_session requires 'target_pubkey' as the counterparty's 32-byte hex K_local public key.",
         };
       }
+      // include_signals / exclude_signals: validated against the wallet below and passed to
+      // runSessionRequestOverSignaling so the presentation layer applies them.
+      const includeRaw = ctx.params["include_signals"];
+      const excludeRaw = ctx.params["exclude_signals"];
+      const includeTypes = Array.isArray(includeRaw) ? (includeRaw as unknown[]).filter((s): s is string => typeof s === "string") : undefined;
+      const excludeTypes = Array.isArray(excludeRaw) ? (excludeRaw as unknown[]).filter((s): s is string => typeof s === "string") : undefined;
+
+      // Validate include/exclude type strings against what is actually in the wallet.
+      if (includeTypes || excludeTypes) {
+        const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+        const known = new Set(store.listAllWalletSignals().map((s) => s.type));
+        const check = includeTypes ?? excludeTypes ?? [];
+        const unknown = check.filter((t) => !known.has(t));
+        if (unknown.length > 0) {
+          return {
+            ok: false,
+            reason: "unknown_signal_type",
+            guidance: `Signal type(s) not found in wallet: ${unknown.map((t) => `'${t}'`).join(", ")}. See 'cello trust-signals list' for valid types. Use --include type1,type2 or --exclude type1,type2.`,
+          };
+        }
+      }
+      const signalFilter: { include?: string[]; exclude?: string[] } | undefined =
+        includeTypes || excludeTypes ? { include: includeTypes, exclude: excludeTypes } : undefined;
+
       const sr = sessionNodeManager.getStandingReceiverInfo(ctx.agentName);
       if (!sr) {
         return {
@@ -459,7 +485,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
-            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName);
+            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter);
           }
           // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
           // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.
@@ -490,9 +516,9 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             action.kind === "same_node"
               // SAME-NODE: the target is on the node we're already connected to. The existing path runs
               // unchanged — ZERO visiting connections, ZERO new frames beyond the one discovery_lookup.
-              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName)
+              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter)
               // CROSS-NODE: reach into the target's home over a transient visiting connection.
-              : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId);
+              : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId, signalFilter);
 
           // RETRY triggers: (a) the broker reported target_offline (stale replicated presence or a
           // re-home between discovery and the request); (b) a transient visiting-connection failure

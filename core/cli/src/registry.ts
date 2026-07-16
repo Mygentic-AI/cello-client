@@ -364,15 +364,23 @@ export const COMMANDS: readonly CommandSpec[] = [
     group: "Messaging",
     summary: "Open a session with someone (by public key). Prints the session id.",
     help:
-      "Usage: cello initiate-session <target-pubkey> [--agent <name>] [--pretty]  — open a session.\n" +
+      "Usage: cello initiate-session <target-pubkey> [--agent <name>] [--include type1,type2] [--exclude type1,type2] [--pretty]\n" +
       "  <target-pubkey> is the counterparty's hex public key. Prints the session_id you then pass to\n" +
-      "  'cello send' / 'cello receive' / 'cello close-session'. Adds them to your address book.",
+      "  'cello send' / 'cello receive' / 'cello close-session'. Adds them to your address book.\n" +
+      "\n" +
+      "  --include type1,type2  present ONLY these signal types (overrides defaults)\n" +
+      "  --exclude type1,type2  remove these types from the default presentation bundle\n" +
+      "  Both flags fail with an error if a type is not in 'cello trust-signals list'.",
     flags: AGENT_FLAG,
     ipcMethod: IPC_METHODS["initiate-session"],
     jsonOut: true,
     async run(ctx, args) {
       const { agent, pretty, positional } = parityOpts(args);
-      return initiate(ctx.celloDir, positional[0] ?? "", { agent, pretty });
+      const includeIdx = args.indexOf("--include");
+      const excludeIdx = args.indexOf("--exclude");
+      const include = includeIdx >= 0 ? (args[includeIdx + 1] ?? "").split(",").filter(Boolean) : undefined;
+      const exclude = excludeIdx >= 0 ? (args[excludeIdx + 1] ?? "").split(",").filter(Boolean) : undefined;
+      return initiate(ctx.celloDir, positional[0] ?? "", { agent, pretty, include, exclude });
     },
   },
   {
@@ -723,19 +731,25 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "Inspect and manage the trust signals in your local wallet.",
     help:
       "Usage:\n" +
-      "  cello trust-signals list              — show every signal in your wallet (type, hash, status, issued date)\n" +
-      "  cello trust-signals remove <hash>     — permanently delete a signal from your wallet\n" +
+      "  cello trust-signals list              — show every signal (type, hash, status, default, issued)\n" +
+      "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
+      "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
+      "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +
+      "  cello trust-signals revoke <hash>     — tombstone at the directory AND delete locally\n" +
       "\n" +
       "Trust signals are verifiable claims about you (GitHub account age, phone, email, etc.) that your\n" +
       "agent presents to contacts during sessions. They are issued by the CELLO portal, notarized by\n" +
       "the directory, and held in your local encrypted wallet.\n" +
       "\n" +
-      "'remove' is a hard delete — the signal is gone from your device immediately. This is a local\n" +
-      "operation only: it does not revoke the signal at the directory, and a counterparty who already\n" +
-      "received it still has their copy. Use it to exercise your right to remove data from your own\n" +
-      "device (GDPR Article 17), or simply because you no longer want to share that signal.\n" +
+      "The 'def' column in 'list' shows whether a signal is in the default bundle (✓ = yes, – = no).\n" +
+      "Signals with _id suffix (github_id, etc.) start excluded by default. Use enable/disable to change.\n" +
       "\n" +
-      "Example:  cello trust-signals remove b23c24dd…",
+      "'revoke' deletes the signal locally AND sends a tombstone to the directory. This is the correct\n" +
+      "way to retract a signal. The directory will stop delivering it to other agents.\n" +
+      "\n" +
+      "<hash> can be a prefix (min 8 chars). Example:\n" +
+      "  cello trust-signals view b23c24dd\n" +
+      "  cello trust-signals revoke b23c24dd",
     async run(ctx, args) {
       const [sub, ...rest] = args;
       return legacy(await trustSignals(ctx.celloDir, sub ?? "", rest));

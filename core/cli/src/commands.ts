@@ -597,12 +597,14 @@ export async function sessions(
  *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
  *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
 /**
- * `cello trust-signals list` — show all signals in the wallet.
- * `cello trust-signals remove <hash>` — hard-delete a signal (GDPR removal).
+ * `cello trust-signals` — inspect and manage the operator's trust-signal wallet.
  *
- * `list` output is human-readable tabular text (not JSON) — this is an operator inspection command,
- * not a script surface. The hash column is truncated to 12 chars + ellipsis, which is enough to
- * identify a signal for copy-paste into `remove`.
+ * Subcommands:
+ *   list                   — tabular view of all signals (includes default column)
+ *   view <hash-prefix>     — full decoded payload for one signal
+ *   enable <hash-prefix>   — include signal in the default presentation bundle
+ *   disable <hash-prefix>  — exclude signal from the default bundle
+ *   revoke <hash-prefix>   — tombstone at the directory AND hard-delete locally
  */
 export async function trustSignals(
   celloDir: string,
@@ -627,6 +629,7 @@ export async function trustSignals(
           issued_at: number;
           expires_at: number | null;
           supersedes_hash: string | null;
+          default_present: boolean;
         }>;
         reason?: string;
       };
@@ -641,34 +644,129 @@ export async function trustSignals(
         const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
         const hash = s.signal_hash.slice(0, 12) + "…";
         const status = s.status === "active" ? "active" : s.status === "superseded" ? "superseded" : s.status;
-        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${date}`;
+        const def = s.default_present ? "✓" : "–";
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${def.padEnd(4)}  ${date}`;
       });
-      const header = `  ${"type".padEnd(22)}  hash          status        issued`;
-      const divider = "  " + "─".repeat(64);
+      const header = `  ${"type".padEnd(22)}  hash          status        def   issued`;
+      const divider = "  " + "─".repeat(70);
       return { exitCode: 0, output: [header, divider, ...lines].join("\n") };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
-  if (sub === "remove") {
-    const hash = args[0];
-    if (!hash) {
-      return { exitCode: 1, output: "Usage: cello trust-signals remove <signal-hash>" };
+  if (sub === "view") {
+    const prefix = args[0];
+    if (!prefix) {
+      return { exitCode: 1, output: "Usage: cello trust-signals view <hash-prefix>" };
     }
     try {
-      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_remove_signal", { signal_hash: hash }))) as {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_view_signal", { hash_prefix: prefix }))) as {
+        ok: boolean;
+        type?: string;
+        signal_hash?: string;
+        subject_kind?: string;
+        subject?: string;
+        issuer_kind?: string;
+        issuer_pubkey?: string;
+        schema_version?: number;
+        status?: string;
+        default_present?: boolean;
+        issued_at?: number;
+        expires_at?: number | null;
+        supersedes_hash?: string | null;
+        payload?: unknown;
+        reason?: string;
+        guidance?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: result.guidance ?? result.reason ?? "signal not found" };
+      }
+      const lines = [
+        `type:            ${result.type}`,
+        `signal_hash:     ${result.signal_hash}`,
+        `status:          ${result.status}`,
+        `default_present: ${result.default_present ? "yes" : "no"}`,
+        `subject_kind:    ${result.subject_kind}`,
+        `subject:         ${result.subject}`,
+        `issuer_kind:     ${result.issuer_kind}`,
+        `issuer_pubkey:   ${result.issuer_pubkey}`,
+        `schema_version:  ${result.schema_version}`,
+        `issued_at:       ${result.issued_at ? new Date(result.issued_at * 1000).toISOString() : "—"}`,
+        `expires_at:      ${result.expires_at ? new Date(result.expires_at * 1000).toISOString() : "—"}`,
+        `supersedes:      ${result.supersedes_hash ?? "—"}`,
+        `payload:         ${JSON.stringify(result.payload, null, 2)}`,
+      ];
+      return { exitCode: 0, output: lines.join("\n") };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to view signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "enable") {
+    const prefix = args[0];
+    if (!prefix) {
+      return { exitCode: 1, output: "Usage: cello trust-signals enable <hash-prefix>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_enable_signal", { hash_prefix: prefix }))) as {
         ok: boolean;
         signal_hash?: string;
         reason?: string;
         guidance?: string;
       };
       if (!result.ok) {
-        return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+        return { exitCode: 1, output: result.guidance ?? result.reason ?? "failed to enable signal" };
       }
-      return { exitCode: 0, output: `Removed signal ${result.signal_hash}.` };
+      return { exitCode: 0, output: `Signal ${result.signal_hash} enabled (included in default presentation).` };
     } catch (err: unknown) {
-      return { exitCode: 1, output: `Failed to remove signal: ${err instanceof Error ? err.message : String(err)}` };
+      return { exitCode: 1, output: `Failed to enable signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "disable") {
+    const prefix = args[0];
+    if (!prefix) {
+      return { exitCode: 1, output: "Usage: cello trust-signals disable <hash-prefix>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_disable_signal", { hash_prefix: prefix }))) as {
+        ok: boolean;
+        signal_hash?: string;
+        reason?: string;
+        guidance?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: result.guidance ?? result.reason ?? "failed to disable signal" };
+      }
+      return { exitCode: 0, output: `Signal ${result.signal_hash} disabled (excluded from default presentation).` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to disable signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "revoke") {
+    const prefix = args[0];
+    if (!prefix) {
+      return { exitCode: 1, output: "Usage: cello trust-signals revoke <hash-prefix>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_revoke_signal", { hash_prefix: prefix }))) as {
+        ok: boolean;
+        signal_hash?: string;
+        removed_locally?: boolean;
+        directory_results?: Array<{ url: string; ok: boolean; detail?: string }>;
+        reason?: string;
+        guidance?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: result.guidance ?? result.reason ?? "failed to revoke signal" };
+      }
+      const dirOk = result.directory_results?.every((r) => r.ok) ?? false;
+      const dirNote = dirOk ? "directory tombstone set" : "directory unreachable — tombstone may be pending";
+      return { exitCode: 0, output: `Revoked signal ${result.signal_hash}. ${dirNote}.` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to revoke signal: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
@@ -676,8 +774,13 @@ export async function trustSignals(
     exitCode: 1,
     output:
       "Usage:\n" +
-      "  cello trust-signals list              — show all signals in your wallet\n" +
-      "  cello trust-signals remove <hash>     — permanently delete a signal (GDPR removal)",
+      "  cello trust-signals list              — show every signal in your wallet\n" +
+      "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
+      "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
+      "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +
+      "  cello trust-signals revoke <hash>     — tombstone at directory AND delete locally\n" +
+      "\n" +
+      "<hash> can be a prefix (min 8 chars). See 'cello trust-signals list' for hashes.",
   };
 }
 

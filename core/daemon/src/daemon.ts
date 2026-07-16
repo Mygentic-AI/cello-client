@@ -89,6 +89,7 @@ import { TypeRegistry } from "./type-registry.js";
 import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 
 
 export interface DaemonHandle {
@@ -1638,21 +1639,155 @@ async function startDaemonHoldingLock(
       issued_at: r.issuedAt,
       expires_at: r.expiresAt,
       supersedes_hash: r.supersedesHash,
+      default_present: r.defaultPresent,
     }));
     return { ok: true, signals: rows };
   });
 
-  handlers.set("wallet_remove_signal", async (params, _connectionId) => {
-    const hash = typeof params?.signal_hash === "string" ? params.signal_hash : null;
-    if (!hash || !/^[0-9a-f]{64}$/.test(hash)) {
-      return { ok: false, reason: "invalid_hash", guidance: "signal_hash must be 64 lowercase hex characters." };
+  handlers.set("wallet_view_signal", async (params, _connectionId) => {
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!prefix || prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
     }
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-    const removed = store.removeWalletSignal(hash);
-    if (!removed) {
-      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash ${hash}.` };
+    let row;
+    try {
+      row = store.getWalletSignalByPrefix(prefix);
+    } catch (err: unknown) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
     }
-    return { ok: true, signal_hash: hash };
+    if (!row) {
+      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
+    }
+    let payload: unknown;
+    try {
+      payload = decodeCbor(row.payload);
+    } catch {
+      payload = Buffer.from(row.payload).toString("hex");
+    }
+    return {
+      ok: true,
+      type: row.type,
+      signal_hash: row.signalHash,
+      subject_kind: row.subjectKind,
+      subject: row.subject,
+      issuer_kind: row.issuerKind,
+      issuer_pubkey: row.issuerPubkey,
+      schema_version: row.schemaVersion,
+      status: row.status,
+      default_present: row.defaultPresent,
+      issued_at: row.issuedAt,
+      expires_at: row.expiresAt,
+      supersedes_hash: row.supersedesHash,
+      payload,
+    };
+  });
+
+  handlers.set("wallet_enable_signal", async (params, _connectionId) => {
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!prefix || prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    let row;
+    try {
+      row = store.getWalletSignalByPrefix(prefix);
+    } catch (err: unknown) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+    }
+    if (!row) {
+      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
+    }
+    store.setDefaultPresent(row.signalHash, true);
+    return { ok: true, signal_hash: row.signalHash, default_present: true };
+  });
+
+  handlers.set("wallet_disable_signal", async (params, _connectionId) => {
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!prefix || prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    let row;
+    try {
+      row = store.getWalletSignalByPrefix(prefix);
+    } catch (err: unknown) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+    }
+    if (!row) {
+      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
+    }
+    store.setDefaultPresent(row.signalHash, false);
+    return { ok: true, signal_hash: row.signalHash, default_present: false };
+  });
+
+  handlers.set("wallet_revoke_signal", async (params, _connectionId) => {
+    const hashPrefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!hashPrefix || hashPrefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    let row;
+    try {
+      row = store.getWalletSignalByPrefix(hashPrefix);
+    } catch (err: unknown) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+    }
+    if (!row) {
+      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${hashPrefix}'.` };
+    }
+    const signalHash = row.signalHash;
+
+    // Find the first loaded agent to sign the revoke request.
+    const firstAgent = loadedAgents[0];
+    if (!firstAgent) {
+      return { ok: false, reason: "no_agent", guidance: "No agent loaded. Run 'cello login' first." };
+    }
+    const kp = keyProviders.get(firstAgent.name);
+    if (!kp) {
+      return { ok: false, reason: "no_agent_key", guidance: "Agent key not available." };
+    }
+
+    // Build and sign the CBOR revoke request.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const bodyBytes = encodeCbor({ v: 1, op: "revoke", signal_hash: signalHash, issued_at: nowSec });
+    const sigBytes = await kp.sign(bodyBytes);
+    const pubkeyHex = firstAgent.pubkey;
+    const sigHex = Buffer.from(sigBytes).toString("hex");
+    const bodyHex = Buffer.from(bodyBytes).toString("hex");
+
+    // POST to all directory nodes (best-effort — all reachable nodes get the tombstone).
+    const directoryUrl = resolveDirectoryUrl(process.env);
+    const directoryUrls = [directoryUrl];
+    const results: Array<{ url: string; ok: boolean; detail?: string }> = [];
+    for (const url of directoryUrls) {
+      try {
+        const resp = await fetch(`${url}/internal/signal/revoke`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/cbor",
+            "x-cello-signer-pubkey": pubkeyHex,
+            "x-cello-signature": sigHex,
+            "x-body-hex": bodyHex,
+          },
+          body: bodyBytes,
+        });
+        const json = await resp.json() as { ok?: boolean; error?: string; detail?: string };
+        results.push({ url, ok: !!json.ok, detail: json.error ?? json.detail });
+        if (!resp.ok && !json.ok) {
+          logger.warn("signal.wallet.revoke.directory_rejected", { url, signalHash, detail: json.error ?? json.detail });
+        }
+      } catch (err: unknown) {
+        const detail = err instanceof Error ? err.message : String(err);
+        results.push({ url, ok: false, detail });
+        logger.warn("signal.wallet.revoke.directory_unreachable", { url, signalHash, detail });
+      }
+    }
+
+    // Always hard-delete locally regardless of directory result.
+    const removed = store.removeWalletSignal(signalHash);
+    logger.info("signal.wallet.revoked", { signalHash, directoryResults: results.map((r) => ({ url: r.url, ok: r.ok })) });
+    return { ok: true, signal_hash: signalHash, removed_locally: removed, directory_results: results };
   });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
