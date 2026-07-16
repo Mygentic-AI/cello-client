@@ -69,6 +69,7 @@ import { whoLabel } from "./who-label.js";
 import { wireSessionCeremonyHandler, wireSessionOfferHandler, wireSealCeremonyHandler, runAgentRefresh } from "./session-ceremony.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
+import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
@@ -84,6 +85,9 @@ import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
 import { createContentPark } from "./content-park.js";
 import { createInboundSealRequestHandler } from "./inbound-seal-request.js";
 import { registerNotificationHandlers } from "./notification-handlers.js";
+import { TypeRegistry } from "./type-registry.js";
+import { DbRegistryVersionStore } from "./registry-version-store-db.js";
+import { startRegistryPoll } from "./registry-poll.js";
 
 
 export interface DaemonHandle {
@@ -106,6 +110,10 @@ export interface DaemonHandle {
    * adapter (stub default dialable=false in local/test).
    */
   getAutoNatService(): IAutoNatService;
+  /**
+   * DOD-REGISTRY-1: the in-memory type registry — classify signal types.
+   */
+  getTypeRegistry(): TypeRegistry;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -297,6 +305,25 @@ async function startDaemonHoldingLock(
       directoryEndpointResolver,
       logger,
     });
+
+  // DOD-REGISTRY-1: type registry poll — daemon-level, runs even with zero agents.
+  // When registryPubkey is configured, the daemon polls GET /registry, verifies the inner
+  // Ed25519 signature, and updates the in-memory TypeRegistry. A poll failure never blanks
+  // classification (INV-TYPE-CARRY). Absent pubkey = polling disabled, all types unclassified.
+  const typeRegistry = new TypeRegistry();
+  let stopRegistryPoll: (() => void) | undefined;
+  if (config.registryPubkey && config.registryPollScheduler) {
+    const registryVersionStore = new DbRegistryVersionStore(sessionNodeManager.getDb(), logger);
+    stopRegistryPoll = startRegistryPoll({
+      scheduler: config.registryPollScheduler,
+      directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+      typeRegistry,
+      registryVersionStore,
+      registryPubkey: config.registryPubkey,
+      logger,
+      mintCorrelationId: () => randomUUID(),
+    });
+  }
 
   // Load agent identities from the encrypted `agents` table (PERSIST-002 AC-007 — one path).
   // (The encrypted store + lock were established above, before manifest verification.)
@@ -2035,6 +2062,10 @@ async function startDaemonHoldingLock(
     if (manifestPollScheduler) {
       manifestPollScheduler.cancel();
     }
+    stopRegistryPoll?.();
+    if (config.registryPollScheduler) {
+      config.registryPollScheduler.cancel();
+    }
     logger.info("daemon.stopped", { pid: process.pid, reason });
     try {
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
@@ -2073,9 +2104,13 @@ async function startDaemonHoldingLock(
     return autoNatService;
   }
 
+  function getTypeRegistry(): TypeRegistry {
+    return typeRegistry;
+  }
+
   // M8C-TGDOOR-1: cold-capable — start the poller if a token was already configured from a
   // prior run, without waiting for any agent to come online or any client to attach.
   startTelegramPollerIfConfigured();
 
-  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService };
+  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry };
 }

@@ -304,6 +304,16 @@ export interface DaemonConfig {
    * back to a PassthroughGatewayClient (always-allow), so the seam still returns a verdict.
    */
   securityGateway?: SecurityGatewayClient;
+  /**
+   * DOD-REGISTRY-1: Ed25519 pubkey (hex) for verifying the type registry inner signature.
+   * Build-time pinned. When absent, the registry poll is disabled (all types unclassified).
+   */
+  registryPubkey?: string;
+  /**
+   * DOD-REGISTRY-1: poll scheduler for background registry refresh.
+   * When absent (or registryPubkey absent), registry polling is disabled.
+   */
+  registryPollScheduler?: import("@cello-protocol/transport").IManifestPollScheduler;
 }
 
 // --- Session node types ---
