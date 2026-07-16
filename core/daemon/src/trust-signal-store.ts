@@ -463,6 +463,26 @@ export class TrustSignalStore {
     });
   }
 
+  /**
+   * Mark a received signal as superseded. Same monotonic rules as setWalletStatus: revoked wins,
+   * and a superseded signal never goes back to active.
+   */
+  setReceivedStatus(opts: { agentId: string; contactPubkey: string; signalHash: string; status: SignalStatus }): void {
+    const res = this.#db
+      .prepare(
+        `UPDATE contact_trust_signals SET status = ?
+          WHERE agent_id = ? AND contact_pubkey = ? AND signal_hash = ?
+            AND status != 'revoked'
+            AND NOT (status = 'superseded' AND ? = 'active')`,
+      )
+      .run(opts.status, opts.agentId, opts.contactPubkey, opts.signalHash, opts.status);
+    if (res.changes > 0) {
+      this.#logger.info("signal.received.status.changed", {
+        agentId: opts.agentId, signalHash: opts.signalHash, status: opts.status,
+      });
+    }
+  }
+
   /** Evidence only. Never an input to policy — see the header. */
   listReceived(opts: { agentId: string; contactPubkey: string }): ReceivedSignalRow[] {
     const rows = this.#db

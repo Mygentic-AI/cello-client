@@ -463,6 +463,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
                 rejected++;
                 continue;
               }
+              const supersedesHash = envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex");
               store.putReceivedSignal({
                 agentId,
                 contactPubkey: parsed.participantAPubkeyHex,
@@ -476,10 +477,18 @@ export function createInboundSessions(deps: InboundSessionDeps) {
                 payload: envelope.payload,
                 issuedAt: envelope.issued_at,
                 expiresAt: envelope.expires_at,
-                supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
+                supersedesHash,
                 verifiedAt: Date.now(),
                 verdict: "active",
               });
+              if (supersedesHash) {
+                store.setReceivedStatus({
+                  agentId,
+                  contactPubkey: parsed.participantAPubkeyHex,
+                  signalHash: supersedesHash,
+                  status: "superseded",
+                });
+              }
               verified++;
             } catch (err: unknown) {
               logger.warn("signal.verify.decode_failed", {
