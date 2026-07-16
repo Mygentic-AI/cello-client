@@ -88,6 +88,7 @@ import { registerNotificationHandlers } from "./notification-handlers.js";
 import { TypeRegistry } from "./type-registry.js";
 import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
+import { TrustSignalStore } from "./trust-signal-store.js";
 
 
 export interface DaemonHandle {
@@ -1622,6 +1623,36 @@ async function startDaemonHoldingLock(
       signature_hex: r.signatureHex,
     }));
     return { ok: true, receipts };
+  });
+
+  // ─── Trust-signal wallet (operator-facing, no agent scope required) ───
+  handlers.set("wallet_list_signals", async (_params, _connectionId) => {
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const rows = store.listAllWalletSignals().map((r) => ({
+      type: r.type,
+      signal_hash: r.signalHash,
+      subject_kind: r.subjectKind,
+      subject: r.subject,
+      issuer_kind: r.issuerKind,
+      status: r.status,
+      issued_at: r.issuedAt,
+      expires_at: r.expiresAt,
+      supersedes_hash: r.supersedesHash,
+    }));
+    return { ok: true, signals: rows };
+  });
+
+  handlers.set("wallet_remove_signal", async (params, _connectionId) => {
+    const hash = typeof params?.signal_hash === "string" ? params.signal_hash : null;
+    if (!hash || !/^[0-9a-f]{64}$/.test(hash)) {
+      return { ok: false, reason: "invalid_hash", guidance: "signal_hash must be 64 lowercase hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const removed = store.removeWalletSignal(hash);
+    if (!removed) {
+      return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash ${hash}.` };
+    }
+    return { ok: true, signal_hash: hash };
   });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───

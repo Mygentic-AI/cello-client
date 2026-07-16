@@ -50,6 +50,8 @@ describe("F1: usage string lists every command", () => {
         "sessions", "transcript", "sealed-receipt", "relay-receipts",
         // Contacts
         "contacts", "contact",
+        // Trust & endorsements
+        "trust-signals",
         // Other
         "settings", "moniker", "telegram", "bridge",
       ].sort(),

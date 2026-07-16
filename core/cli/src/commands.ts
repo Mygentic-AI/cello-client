@@ -596,6 +596,91 @@ export async function sessions(
 /** M8C-TGDOOR-1: `cello telegram set-token <bot_token> <allowlisted_chat_id>` — persists the
  *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
  *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
+/**
+ * `cello trust-signals list` — show all signals in the wallet.
+ * `cello trust-signals remove <hash>` — hard-delete a signal (GDPR removal).
+ *
+ * `list` output is human-readable tabular text (not JSON) — this is an operator inspection command,
+ * not a script surface. The hash column is truncated to 12 chars + ellipsis, which is enough to
+ * identify a signal for copy-paste into `remove`.
+ */
+export async function trustSignals(
+  celloDir: string,
+  sub: string,
+  args: string[],
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
+  }
+
+  if (sub === "list") {
+    try {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_list_signals"))) as {
+        ok: boolean;
+        signals?: Array<{
+          type: string;
+          signal_hash: string;
+          subject_kind: string;
+          status: string;
+          issued_at: number;
+          expires_at: number | null;
+          supersedes_hash: string | null;
+        }>;
+        reason?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason }, null, 2) };
+      }
+      const signals = result.signals ?? [];
+      if (signals.length === 0) {
+        return { exitCode: 0, output: "No trust signals in wallet." };
+      }
+      const lines = signals.map((s) => {
+        const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
+        const hash = s.signal_hash.slice(0, 12) + "…";
+        const status = s.status === "active" ? "active" : s.status === "superseded" ? "superseded" : s.status;
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${date}`;
+      });
+      const header = `  ${"type".padEnd(22)}  hash          status        issued`;
+      const divider = "  " + "─".repeat(64);
+      return { exitCode: 0, output: [header, divider, ...lines].join("\n") };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "remove") {
+    const hash = args[0];
+    if (!hash) {
+      return { exitCode: 1, output: "Usage: cello trust-signals remove <signal-hash>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_remove_signal", { signal_hash: hash }))) as {
+        ok: boolean;
+        signal_hash?: string;
+        reason?: string;
+        guidance?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason, guidance: result.guidance }, null, 2) };
+      }
+      return { exitCode: 0, output: `Removed signal ${result.signal_hash}.` };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to remove signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  return {
+    exitCode: 1,
+    output:
+      "Usage:\n" +
+      "  cello trust-signals list              — show all signals in your wallet\n" +
+      "  cello trust-signals remove <hash>     — permanently delete a signal (GDPR removal)",
+  };
+}
+
 export async function telegramSetToken(celloDir: string, botToken: string, chatId: string): Promise<CommandResult> {
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);

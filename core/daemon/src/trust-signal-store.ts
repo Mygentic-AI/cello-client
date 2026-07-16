@@ -313,6 +313,7 @@ export class TrustSignalStore {
       });
       throw new SignalDeliveryRejected("hash_mismatch", `delivered envelope does not hash to the claimed ${claimedHash}`);
     }
+    const supersedesHash = envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex");
     // putWalletSignal is idempotent (content-addressed PK) and reports whether it inserted — use that
     // directly rather than a second SELECT (no read-then-write, no theoretical race).
     const inserted = this.putWalletSignal({
@@ -326,9 +327,27 @@ export class TrustSignalStore {
       payload: envelope.payload,
       issuedAt: envelope.issued_at,
       expiresAt: envelope.expires_at,
-      supersedesHash: envelope.supersedes_hash === null ? null : Buffer.from(envelope.supersedes_hash).toString("hex"),
+      supersedesHash,
       status: "active",
     });
+    if (inserted) {
+      // Mark the explicitly superseded hash (from the envelope field) as superseded.
+      if (supersedesHash) {
+        this.setWalletStatus(supersedesHash, "superseded");
+      }
+      // Type-dedup: any OTHER active signal of the same (subject_kind, subject, type) is also
+      // superseded by the new one — this cleans up duplicates delivered without supersedes_hash set
+      // (e.g. the same type re-minted on a fresh portal login with no prior-hash lookup).
+      this.#db
+        .prepare(
+          `UPDATE wallet_trust_signals
+              SET status = 'superseded'
+            WHERE subject_kind = ? AND subject = ? AND type = ?
+              AND signal_hash != ?
+              AND status = 'active'`,
+        )
+        .run(envelope.subject_kind, envelope.subject, envelope.type, claimedHash);
+    }
     return { stored: inserted };
   }
 
@@ -404,6 +423,35 @@ export class TrustSignalStore {
       )
       .all(nowSec, opts.accountId, opts.agentId) as unknown as EnvelopeDbRow[];
     return rows.map(toWalletRow);
+  }
+
+  /**
+   * All wallet signals regardless of status — for operator inspection via `cello trust-signals list`.
+   * Ordered by issued_at DESC so the most recent signal of each type appears first.
+   */
+  listAllWalletSignals(): WalletSignalRow[] {
+    const rows = this.#db
+      .prepare("SELECT * FROM wallet_trust_signals ORDER BY issued_at DESC, received_at DESC")
+      .all() as unknown as EnvelopeDbRow[];
+    return rows.map(toWalletRow);
+  }
+
+  /**
+   * Hard-delete a wallet signal by hash (GDPR removal). Returns true if a row was deleted.
+   *
+   * This is a permanent DELETE, not a status transition. Revocation is directory-driven and leaves
+   * the row for audit; this is the operator exercising their own right to remove a signal from their
+   * own device with no directory involvement.
+   */
+  removeWalletSignal(signalHash: string): boolean {
+    const res = this.#db
+      .prepare("DELETE FROM wallet_trust_signals WHERE signal_hash = ?")
+      .run(signalHash);
+    if (Number(res.changes) > 0) {
+      this.#logger.info("signal.wallet.removed", { signalHash });
+      return true;
+    }
+    return false;
   }
 
   /**

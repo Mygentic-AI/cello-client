@@ -25,6 +25,7 @@ import {
   sessions,
   type SessionFilter,
   telegramSetToken,
+  trustSignals,
   type CommandResult,
 } from "./commands.js";
 import { splitAgentFlag } from "./arg-parse.js";
@@ -94,6 +95,7 @@ export const GROUP_ORDER = [
   "Messaging",
   "Sessions & receipts",
   "Contacts",
+  "Trust & endorsements",
   "Other",
 ] as const;
 
@@ -711,6 +713,32 @@ export const COMMANDS: readonly CommandSpec[] = [
         return contactSetMoniker(ctx.celloDir, pubkey, moniker.length > 0 ? moniker : null, o);
       }
       return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
+    },
+  },
+
+  // ═══ Trust & endorsements ═══════════════════════════════════════════════════════════════════
+  {
+    name: "trust-signals",
+    group: "Trust & endorsements",
+    summary: "Inspect and manage the trust signals in your local wallet.",
+    help:
+      "Usage:\n" +
+      "  cello trust-signals list              — show every signal in your wallet (type, hash, status, issued date)\n" +
+      "  cello trust-signals remove <hash>     — permanently delete a signal from your wallet\n" +
+      "\n" +
+      "Trust signals are verifiable claims about you (GitHub account age, phone, email, etc.) that your\n" +
+      "agent presents to contacts during sessions. They are issued by the CELLO portal, notarized by\n" +
+      "the directory, and held in your local encrypted wallet.\n" +
+      "\n" +
+      "'remove' is a hard delete — the signal is gone from your device immediately. This is a local\n" +
+      "operation only: it does not revoke the signal at the directory, and a counterparty who already\n" +
+      "received it still has their copy. Use it to exercise your right to remove data from your own\n" +
+      "device (GDPR Article 17), or simply because you no longer want to share that signal.\n" +
+      "\n" +
+      "Example:  cello trust-signals remove b23c24dd…",
+    async run(ctx, args) {
+      const [sub, ...rest] = args;
+      return legacy(await trustSignals(ctx.celloDir, sub ?? "", rest));
     },
   },
 
