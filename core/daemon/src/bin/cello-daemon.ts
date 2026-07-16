@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { startDaemon } from "../daemon.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { buildManifestDeps } from "../manifest-deps.js";
+import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 // EXIT_ALREADY_RUNNING is distinct from 1 (generic startup failure) so a caller can tell "lost the
 // race" from "broken" — connectOrStart relies on exactly that distinction, so the constant is shared
 // rather than written down twice.
@@ -22,6 +23,13 @@ import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lo
 import type { Logger } from "../types.js";
 
 const MAX_CONNECTIONS = 16;
+
+// DOD-REGISTRY-1: build-time-pinned registry signer pubkey. The daemon polls GET /registry
+// on the directory and verifies the inner Ed25519 signature against this key. A registry
+// update requires NO release (INV-ZERO-BUMP) — but the daemon must trust THIS key to accept it.
+const REGISTRY_SIGNER_PUBKEY = "d4f9a531205a3aca23dede0ad5f4fb6cd42260c8bbae5f33d2866c39e870d586";
+const REGISTRY_POLL_MIN_MS = 5 * 60_000;  // 5 minutes
+const REGISTRY_POLL_MAX_MS = 15 * 60_000; // 15 minutes
 
 // Composition root: stdout JSON logger
 const logger: Logger = {
@@ -80,6 +88,8 @@ async function main(): Promise<void> {
     logger,
     directoryEndpointResolver,
     ...manifest,
+    registryPubkey: REGISTRY_SIGNER_PUBKEY,
+    registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
 
   const shutdown = async (signal: string): Promise<void> => {
