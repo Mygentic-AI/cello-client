@@ -618,6 +618,7 @@ export async function trustSignals(
   }
 
   if (sub === "list") {
+    const showAll = args.includes("--all");
     try {
       const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_list_signals"))) as {
         ok: boolean;
@@ -636,9 +637,14 @@ export async function trustSignals(
       if (!result.ok) {
         return { exitCode: 1, output: JSON.stringify({ ok: false, reason: result.reason }, null, 2) };
       }
-      const signals = result.signals ?? [];
-      if (signals.length === 0) {
+      const all = result.signals ?? [];
+      const signals = showAll ? all : all.filter((s) => s.status === "active");
+      const supersededCount = all.filter((s) => s.status !== "active").length;
+      if (signals.length === 0 && all.length === 0) {
         return { exitCode: 0, output: "No trust signals in wallet." };
+      }
+      if (signals.length === 0) {
+        return { exitCode: 0, output: `No active trust signals. ${supersededCount} superseded (run with --all to show).` };
       }
       const lines = signals.map((s) => {
         const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
@@ -649,7 +655,10 @@ export async function trustSignals(
       });
       const header = `  ${"type".padEnd(22)}  hash          status        def   issued`;
       const divider = "  " + "─".repeat(70);
-      return { exitCode: 0, output: [header, divider, ...lines].join("\n") };
+      const footer = !showAll && supersededCount > 0
+        ? `\n  (${supersededCount} superseded not shown — run with --all to include)`
+        : "";
+      return { exitCode: 0, output: [header, divider, ...lines].join("\n") + footer };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -774,7 +783,7 @@ export async function trustSignals(
     exitCode: 1,
     output:
       "Usage:\n" +
-      "  cello trust-signals list              — show every signal in your wallet\n" +
+      "  cello trust-signals list [--all]      — show active signals (--all includes superseded)\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
       "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +
