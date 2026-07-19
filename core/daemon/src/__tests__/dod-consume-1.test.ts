@@ -220,6 +220,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
 import { projectTrustSignals } from "../inbound-sessions.js";
 import type { ReceivedSignalRow } from "../trust-signal-store.js";
 
-function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; issuer: string; claim: unknown }> {
-  return projectTrustSignals(received) ?? [];
+function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; issuer: string; signal_hash: string; directory_verified: boolean; claim: unknown }> {
+  const result = projectTrustSignals(received);
+  return result?.trust_signals ?? [];
 }

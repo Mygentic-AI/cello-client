@@ -76,19 +76,25 @@ export interface InboundSessionDeps {
  * INV-FRAMING: issuer_kind drives framing. INV-TYPE-CARRY: unknown types pass through generically.
  */
 export function projectTrustSignals(
-  received: ReadonlyArray<{ type: string; issuerKind: string; payload: Uint8Array; verdict: string }>,
-): Array<{ type: string; issuer: string; claim: unknown }> | undefined {
+  received: ReadonlyArray<{ type: string; issuerKind: string; payload: Uint8Array; verdict: string; signalHash: string }>,
+): { directory_attestation: string; trust_signals: Array<{ type: string; issuer: string; signal_hash: string; directory_verified: boolean; claim: unknown }> } | undefined {
   const active = received.filter((s) => s.verdict === "active");
   if (active.length === 0) return undefined;
-  return active.map((s) => {
+  const signals = active.map((s) => {
     let claim: unknown;
     try { claim = decodeCbor(s.payload); } catch { claim = null; }
     return {
       type: s.type,
       issuer: s.issuerKind === "portal" ? "platform-verified" : "peer-claimed",
+      signal_hash: s.signalHash,
+      directory_verified: true,
       claim,
     };
   });
+  return {
+    directory_attestation: "The following trust signals were each verified by the CELLO directory at the moment of this session. Each signal's hash was checked against the directory's notary ledger and confirmed active. You can independently verify any signal by re-hashing its canonical CBOR envelope and comparing to the signal_hash.",
+    trust_signals: signals,
+  };
 }
 
 export function createInboundSessions(deps: InboundSessionDeps) {
@@ -796,19 +802,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       const timeoutMs = typeof params?.["timeout_ms"] === "number" ? (params["timeout_ms"] as number) : 30_000;
 
       const toResponse = (e: InboundSessionEvent) => {
-        let trustSignals: Array<{ type: string; issuer: string; claim: unknown }> | undefined;
+        let trustSignalProjection: ReturnType<typeof projectTrustSignals>;
         try {
           const agId = sessionNodeManager.resolveAgentId(agentName);
           const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
           const received = store.listReceived({ agentId: agId, contactPubkey: e.counterpartyPubkeyHex });
-          trustSignals = projectTrustSignals(received);
+          trustSignalProjection = projectTrustSignals(received);
         } catch (err: unknown) {
           logger.warn("signal.projection.failed", {
             agentName,
             counterparty: e.counterpartyPubkeyHex.slice(0, 16),
             reason: err instanceof Error ? err.message : String(err),
           });
-          trustSignals = undefined;
+          trustSignalProjection = undefined;
         }
         return {
           type: "new_session",
@@ -816,7 +822,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           counterparty_pubkey: e.counterpartyPubkeyHex,
           genesis_prev_root: e.genesisPrevRootHex,
           offered_moniker: e.offeredMoniker ?? null,
-          ...(trustSignals ? { trust_signals: trustSignals } : {}),
+          ...(trustSignalProjection ?? {}),
         };
       };
 
