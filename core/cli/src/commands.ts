@@ -650,15 +650,16 @@ export async function trustSignals(
         const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
         const hash = s.signal_hash.slice(0, 12) + "…";
         const status = s.status === "active" ? "active" : s.status === "superseded" ? "superseded" : s.status;
-        const def = s.default_present ? "✓" : "–";
-        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${def.padEnd(4)}  ${date}`;
+        const inc = s.default_present ? "✓" : "–";
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${inc.padEnd(4)}  ${date}`;
       });
-      const header = `  ${"type".padEnd(22)}  hash          status        def   issued`;
-      const divider = "  " + "─".repeat(70);
+      const header = `  ${"type".padEnd(22)}  hash          status        include  issued`;
+      const divider = "  " + "─".repeat(72);
+      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'`;
       const footer = !showAll && supersededCount > 0
         ? `\n  (${supersededCount} superseded not shown — run with --all to include)`
         : "";
-      return { exitCode: 0, output: [header, divider, ...lines].join("\n") + footer };
+      return { exitCode: 0, output: [header, divider, ...lines].join("\n") + legend + footer };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
     }
