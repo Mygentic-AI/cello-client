@@ -729,6 +729,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: "trust-signals",
     group: "Trust & endorsements",
     summary: "Inspect and manage the trust signals in your local wallet.",
+    flags: [{ name: "--all" }],
     help:
       "Usage:\n" +
       "  cello trust-signals list              — show every signal (type, hash, status, default, issued)\n" +
