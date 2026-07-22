@@ -282,6 +282,7 @@ export const IPC_METHODS = {
   "close-session": "cello_close_session",
   "await-session": "cello_await_session",
   "name-session": "cello_name_session",
+  dismiss: "cello_dismiss",
   contacts: "cello_contact_list",
   "contact-add": "cello_contact_add",
   "contact-remove": "cello_contact_remove",
@@ -510,6 +511,15 @@ export function nameSession(
   opts: ParityOptions,
 ): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["name-session"], { session_id: sessionId, session_name: sessionName }, opts);
+}
+
+/** `cello dismiss <session-id>` → cello_dismiss. Clears a terminal session from the inbox. */
+export function dismissSession(
+  celloDir: string,
+  sessionId: string,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS.dismiss, { session_id: sessionId }, opts);
 }
 
 /** `cello await-session [--timeout-ms N]` → cello_await_session. Blocks for an inbound doorbell. */

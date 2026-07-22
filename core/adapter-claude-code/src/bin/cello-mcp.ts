@@ -368,6 +368,14 @@ server.tool("cello_name_session", "Name (or rename) one of your sessions so you 
   return jsonText(result);
 });
 
+server.tool("cello_dismiss", "Dismiss a sealed/terminal session from your inbox. Use this after reading the transcript of an answering-machine style session (one that sealed while you were away). Sets a local read_at timestamp — never propagated, never part of the seal or hash chain. After dismissal the session no longer appears in cello_inbox. Only valid for terminal sessions (sealed, abandoned, seal_interrupted_pending, interrupted).", {
+  session_id: z.string().describe("Session ID to dismiss"),
+  agent: z.string().optional().describe("Agent whose session to dismiss (defaults to the current agent)"),
+}, async ({ session_id, agent }) => {
+  const result = await proxy.call("cello_dismiss", agent ? { session_id, agent } : { session_id });
+  return jsonText(result);
+});
+
 server.tool("cello_sessions", "List all sessions for the current agent", {
   agent: z.string().optional().describe("Agent whose sessions to list (defaults to the current agent)"),
 }, async ({ agent }) => {

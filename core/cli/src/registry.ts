@@ -49,6 +49,7 @@ import {
   receive,
   closeSession,
   nameSession,
+  dismissSession,
   awaitSession,
   settingsGet,
   settingsSet,
@@ -472,6 +473,30 @@ export const COMMANDS: readonly CommandSpec[] = [
       // point of taking it positionally rather than as a flag.
       const name = clear ? null : words.join(" ");
       return nameSession(ctx.celloDir, sessionId ?? "", name, { agent, pretty });
+    },
+  },
+  {
+    name: "dismiss",
+    group: "Messaging",
+    summary: "Dismiss a sealed session from your inbox after reading its transcript.",
+    help:
+      "Usage: cello dismiss <session-id> [--agent <name>] [--pretty]\n" +
+      "  Clears a terminal (sealed/abandoned) session from your inbox.\n" +
+      "  Use this after reading the transcript of an answering-machine style session.\n" +
+      "  Sets a local read_at timestamp — never propagated, never part of the seal or hash chain.\n" +
+      "  Only works on terminal sessions; active sessions are handled via cello receive.",
+    flags: [
+      { name: "--agent", consumesValue: true },
+    ],
+    ipcMethod: IPC_METHODS["dismiss"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { agent, pretty, positional } = parityOpts(args);
+      const [sessionId] = positional;
+      if (!sessionId) {
+        return legacy({ exitCode: 1, output: "Usage: cello dismiss <session-id>" });
+      }
+      return dismissSession(ctx.celloDir, sessionId, { agent, pretty });
     },
   },
   {

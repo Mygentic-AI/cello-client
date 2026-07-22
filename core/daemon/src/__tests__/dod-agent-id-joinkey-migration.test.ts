@@ -279,6 +279,22 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
     // fresh==migrated invariant honest against BOTH migrations, not just the re-key.
     migrateSessionTablesToAgentId(migrated, makeLogger().logger);
     migrateContactsAddTierMetadata(migrated, makeLogger().logger);
+    // Replay the inline sessions ALTER migrations that initialize() applies incrementally.
+    // Each is idempotent (duplicate column → swallowed), so adding a new column here keeps
+    // fresh==migrated honest without touching the locked LEGACY_DDL.
+    for (const ddl of [
+      "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
+      "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
+      "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
+      "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
+      "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
+      "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
+      "ALTER TABLE sessions ADD COLUMN session_name TEXT",
+      "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
+    ]) {
+      try { migrated.exec(ddl); } catch { /* duplicate column — already applied */ }
+    }
     new RetryQueue(migrated, makeLogger().logger);
 
     for (const t of SEVEN) {

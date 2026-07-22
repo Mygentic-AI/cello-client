@@ -276,6 +276,38 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     return { ok: true, session_id: sessionId, session_name: check.value };
   });
 
+  // ─── DOD-SEALED-INBOX-1: cello_dismiss — mark a terminal session as read locally ───
+  // Sets read_at on the session row so cello_inbox stops surfacing it in sealed_unread.
+  // Local-only housekeeping — never propagated, never part of the seal or hash chain.
+  handlers.set("cello_dismiss", async (params, connectionId) => {
+    const connState = getConnState(connectionId);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
+
+    const sessionId = params?.session_id as string | undefined;
+    if (!sessionId) {
+      return {
+        ok: false,
+        reason: "missing_params",
+        guidance: "Provide 'session_id' (hex) of the terminal session to dismiss.",
+      };
+    }
+
+    const result = sessionNodeManager.dismissSession(agentName, sessionId);
+    if (!result.ok) {
+      const guidance = result.reason === "session_not_found"
+        ? "No session with this ID belongs to this agent. Check cello_sessions for its sessions and their IDs."
+        : result.reason === "session_not_terminal"
+          ? "Only terminal sessions (sealed, abandoned, seal_interrupted_pending, interrupted) can be dismissed. Active sessions are handled via cello_receive."
+          : undefined;
+      return { ok: false, reason: result.reason, ...(guidance ? { guidance } : {}) };
+    }
+
+    const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
+    logger.info("session.dismissed", { agentName, sessionId, status: record?.status ?? "unknown" });
+    return { ok: true, session_id: sessionId };
+  });
+
   // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same
   // filter/limit semantics, across ALL agents.
   handlers.set("list_sessions", async (params) => {

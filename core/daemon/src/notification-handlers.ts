@@ -73,6 +73,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         expired_at: e.expiredAt,
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
+      const sealed_unread = sessionNodeManager.getSealedUnread(agent);
       const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
       // DOD-RENAME-1 AC3: pending rename notices surface HERE (the INBOX pull), never as a real-time
       // push. The offered name is rendered as an untrusted CLAIM (quoted, with the pubkey) plus the
@@ -94,6 +95,9 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           `"${n.offered_name}" (self-declared — unverified). Adopt it: cello_contact_set_moniker ` +
           `{ pubkey: "${n.pubkey}", moniker: "${n.offered_name}" }, or ignore.`,
       }));
+      if (sealed_unread.length > 0) {
+        return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices, sealed_unread, sealed_unread_guidance: "These sessions are sealed with unread messages. Use cello_transcript to read them. Use cello_dismiss to remove them from your inbox." };
+      }
       return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
     });
 

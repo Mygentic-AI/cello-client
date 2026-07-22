@@ -551,6 +551,12 @@ export class SessionNodeManager {
       // unnamed closed session is a hint it did not close cleanly. Never auto-generate a default —
       // a fabricated name destroys that signal.
       "ALTER TABLE sessions ADD COLUMN session_name TEXT",
+      // DOD-SEALED-INBOX-1: local-only housekeeping flag — epoch-ms timestamp set by cello_dismiss.
+      // Never propagated, never part of the seal ceremony or hash chain. A dismissed terminal
+      // session is excluded from cello_inbox's sealed_unread section. Distinct from the read
+      // watermark: this records "operator acknowledged via dismiss", not "operator received via
+      // cello_receive". NULL = not yet dismissed.
+      "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -937,9 +943,13 @@ export class SessionNodeManager {
            t.direction = 'received'
            AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
 
+  static readonly #TERMINAL_STATUSES = `('sealed','abandoned','seal_interrupted_pending','interrupted')`;
+
   /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
-   *  messages beyond the read watermark. Content-free (counts + ids + last seq, never message text);
-   *  a COUNT/MAX query, no decrypt. Only sessions with unread_count > 0 are returned. */
+   *  messages beyond the read watermark, excluding terminal sessions (sealed, abandoned,
+   *  seal_interrupted_pending) which belong in getSealedUnread instead.
+   *  Sessions with no sessions row are treated as non-terminal (LEFT JOIN).
+   *  Content-free (counts + ids + last seq, never message text); a COUNT/MAX query, no decrypt. */
   getUnreadSummary(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
     if (!this.#db) return [];
     const rows = this.#db
@@ -950,14 +960,62 @@ export class SessionNodeManager {
          FROM transcript t
          LEFT JOIN message_watermarks w
            ON w.agent_id = t.agent_id AND w.session_id = t.session_id
+         LEFT JOIN sessions s
+           ON s.agent_id = t.agent_id AND s.session_id = t.session_id
          WHERE t.agent_id = ?
            AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}
+           AND (s.status IS NULL OR s.status NOT IN ${SessionNodeManager.#TERMINAL_STATUSES})
          GROUP BY t.session_id
          HAVING unread_count > 0
          ORDER BY t.session_id ASC`,
       )
       .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
     return rows;
+  }
+
+  /** DOD-SEALED-INBOX-1: terminal sessions with unread received messages that have not been
+   *  dismissed. These are answering-machine style messages left in a sealed session — the operator
+   *  can read them via cello_transcript but cannot advance the watermark via cello_receive.
+   *  Only returned when read_at IS NULL (not yet dismissed). */
+  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
+    if (!this.#db) return [];
+    const rows = this.#db
+      .prepare(
+        `SELECT t.session_id AS session_id,
+                COUNT(*)      AS unread_count,
+                MAX(t.sequence) AS last_seq
+         FROM transcript t
+         LEFT JOIN message_watermarks w
+           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
+         JOIN sessions s
+           ON s.agent_id = t.agent_id AND s.session_id = t.session_id
+         WHERE t.agent_id = ?
+           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}
+           AND s.status IN ${SessionNodeManager.#TERMINAL_STATUSES}
+           AND s.read_at IS NULL
+         GROUP BY t.session_id
+         HAVING unread_count > 0
+         ORDER BY t.session_id ASC`,
+      )
+      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
+    return rows;
+  }
+
+  /** DOD-SEALED-INBOX-1: mark a terminal session as dismissed — sets read_at to now.
+   *  Only valid for terminal sessions; active/interrupted sessions return session_not_terminal. */
+  dismissSession(agentName: string, sessionId: string): { ok: true } | { ok: false; reason: string } {
+    if (!this.#db) return { ok: false, reason: "db_not_open" };
+    const agentId = this.#requireAgentId(agentName);
+    const row = this.#db
+      .prepare("SELECT status FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(agentId, sessionId) as { status: string } | undefined;
+    if (!row) return { ok: false, reason: "session_not_found" };
+    const terminal = ["sealed", "abandoned", "seal_interrupted_pending", "interrupted"];
+    if (!terminal.includes(row.status)) return { ok: false, reason: "session_not_terminal" };
+    this.#db
+      .prepare("UPDATE sessions SET read_at = ? WHERE agent_id = ? AND session_id = ?")
+      .run(Date.now(), agentId, sessionId);
+    return { ok: true };
   }
 
   /**

@@ -36,6 +36,8 @@ describe("§1 — the help is grouped and logically ordered", () => {
       // close is when you name a session — you have just had the conversation, so that is the moment
       // you know what it was.
       "name-session",
+      // DOD-SEALED-INBOX-1: dismiss sits after name-session — both are post-close housekeeping.
+      "dismiss",
       "send",
       "receive",
       "inbox",

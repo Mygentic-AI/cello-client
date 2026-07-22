@@ -45,7 +45,7 @@ describe("F1: usage string lists every command", () => {
         // Agents
         "agents", "start-agent", "use-agent", "stop-agent", "refresh",
         // Messaging
-        "initiate-session", "await-session", "close-session", "name-session", "send", "receive", "inbox",
+        "initiate-session", "await-session", "close-session", "name-session", "dismiss", "send", "receive", "inbox",
         // Sessions & receipts
         "sessions", "transcript", "sealed-receipt", "relay-receipts",
         // Contacts
