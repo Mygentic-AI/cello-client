@@ -304,7 +304,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     }
 
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
-    logger.info("session.dismissed", { agentName, sessionId, status: record?.status ?? "unknown" });
+    const unreadCount = sessionNodeManager.getUnreadReceivedCount(agentName, sessionId);
+    logger.info("session.dismissed", { agentName, sessionId, status: record?.status ?? "unknown", unreadCount });
     return { ok: true, session_id: sessionId };
   });
 
