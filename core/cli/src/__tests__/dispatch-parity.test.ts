@@ -253,9 +253,22 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.send).not.toHaveBeenCalled();
   });
 
+  it("send: --wrap routes to parity.send with signal:wrap", async () => {
+    await run("send", ["sid1", "goodbye", "--wrap"]);
+    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "goodbye", { agent: undefined, pretty: false, signal: "wrap", estMinutes: undefined });
+  });
+
   it("send: --standby <min> routes to parity.send with signal and estMinutes", async () => {
     await run("send", ["sid1", "hello", "--standby", "5"]);
     expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello", { agent: undefined, pretty: false, signal: "standby", estMinutes: 5 });
+  });
+
+  it("send: --standby with no value returns invalid_est_minutes, not missing_signal", async () => {
+    const result = await runOut("send", ["sid1", "hello", "--standby"]);
+    expect(result.exitCode).toBe(1);
+    const err = JSON.parse(result.stderr);
+    expect(err.reason).toBe("invalid_est_minutes");
+    expect(parity.send).not.toHaveBeenCalled();
   });
 
   it("receive: --since-seq and --timeout-ms reach the daemon as numbers, and neither eats the session id", async () => {

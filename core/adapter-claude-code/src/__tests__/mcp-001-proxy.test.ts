@@ -268,6 +268,24 @@ describe("DAEMON-004: IpcProxy forwards session_id verbatim (real proxy wire sha
     const close = src.slice(src.indexOf('proxy.call("cello_close_session"'));
     expect(close).toMatch(/\.\.\.\(force \? \{ force \} : \{\}\)/);
   });
+
+  it("cello_send signal feature: token appended, missing-signal returns SIGNAL_ERROR", () => {
+    const src = readFileSync(join(import.meta.dirname, "..", "bin", "cello-mcp.ts"), "utf8");
+    // The three token literals must be present in the source — the append path for each value.
+    expect(src).toContain('"[[OVER]]"');
+    expect(src).toContain('"[[WRAP]]"');
+    expect(src).toContain('[[STANDBY EST:');
+    // The content is built by concatenating with the token, not replacing — proves append semantics.
+    expect(src).toContain('contentWithToken');
+    // Missing signal returns the rich error text.
+    expect(src).toContain('reason: "missing_signal"');
+    expect(src).toContain('SIGNAL_ERROR');
+    // Standby with no/bad est_minutes returns a distinct reason.
+    expect(src).toContain('reason: "missing_est_minutes"');
+    // The appended content is what reaches the proxy, not the original.
+    const sendSlice = src.slice(src.indexOf('proxy.call("cello_send"'));
+    expect(sendSlice).toMatch(/content:\s*contentWithToken/);
+  });
 });
 
 // ─── AC-014: Distinct reason codes ───

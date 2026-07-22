@@ -514,13 +514,18 @@ export const COMMANDS: readonly CommandSpec[] = [
       const rest = positional.filter((a) => a !== "--stdin");
 
       // Extract signal flags.
+      // takeValueFlag consumes "--standby" from `rest` regardless of whether a value follows — it
+      // always removes the flag token itself. "No value" means value:undefined, not that the flag
+      // was absent. Track flag presence separately so "--standby" with no value gets the specific
+      // invalid_est_minutes error rather than the generic missing_signal error.
+      const standbyFlagPresent = rest.includes("--standby");
       const standbyResult = takeValueFlag(rest, "--standby");
       const hasOver = standbyResult.rest.includes("--over");
       const hasWrap = standbyResult.rest.includes("--wrap");
       const hasStandby = standbyResult.value !== undefined;
       const positionalOnly = standbyResult.rest.filter((a) => a !== "--over" && a !== "--wrap");
 
-      const signalCount = (hasOver ? 1 : 0) + (hasWrap ? 1 : 0) + (hasStandby ? 1 : 0);
+      const signalCount = (hasOver ? 1 : 0) + (hasWrap ? 1 : 0) + (standbyFlagPresent ? 1 : 0);
       if (signalCount === 0) {
         return {
           stdout: "",
@@ -552,6 +557,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         signal = "wrap";
       } else {
         signal = "standby";
+        if (!hasStandby) {
+          return {
+            stdout: "",
+            stderr: JSON.stringify({ ok: false, reason: "invalid_est_minutes", guidance: "--standby requires a positive number of minutes, e.g. --standby 5" }),
+            exitCode: 1,
+          };
+        }
         estMinutes = Number(standbyResult.value);
         if (!Number.isFinite(estMinutes) || estMinutes <= 0) {
           return {
