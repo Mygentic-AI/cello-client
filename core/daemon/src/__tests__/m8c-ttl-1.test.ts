@@ -10,6 +10,9 @@
  * - T3: a request younger than the TTL stays in pending_session_requests, unaffected.
  * - T4: reaping is lazy (on read), not a background timer — no reap, no side effect, until
  *   something actually reads the queue.
+ * - T5: a non-expired entry whose session has reached a terminal DB status (sealed / abandoned /
+ *   seal_interrupted_pending / interrupted) is silently dropped from pending — NOT moved to
+ *   expired_session_requests.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -126,6 +129,42 @@ describe("M8C-TTL-1: session-request TTL", () => {
     expect(inbox.agents[0].pending_session_requests.find((p) => p.session_id === freshSid)).toBeDefined();
     expect(inbox.agents[0].expired_session_requests).toHaveLength(0);
   });
+
+  it.each(["sealed", "abandoned", "seal_interrupted_pending", "interrupted"] as const)(
+    "T5: a non-expired entry with terminal DB status '%s' is silently dropped (not moved to expired)",
+    async (terminalStatus) => {
+      await makeAgentDir("alice");
+      await start();
+      const client = await connectAs("alice");
+
+      const sessionId = "dd".repeat(16);
+      // Enqueue a fresh (non-expired) inbound session request.
+      await client.send("__test_enqueue_inbound_session", {
+        agentName: "alice",
+        sessionId,
+        counterpartyPubkey: "terminatedpubkey",
+        enqueuedAtOverride: Date.now() - 1000, // 1s old — well within TTL
+      });
+      // Seed a session DB row at the terminal status, as would happen after bilateral close.
+      await client.send("__test_insert_session_row", {
+        agentName: "alice",
+        sessionId,
+        status: terminalStatus,
+        counterpartyPubkey: "terminatedpubkey",
+      });
+
+      const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
+        agents: Array<{
+          pending_session_requests: Array<{ session_id: string }>;
+          expired_session_requests: Array<{ session_id: string }>;
+        }>;
+      };
+      const { pending_session_requests, expired_session_requests } = inbox.agents[0];
+      // Terminal entries are silently dropped — not pending, not in expired list.
+      expect(pending_session_requests.find((p) => p.session_id === sessionId)).toBeUndefined();
+      expect(expired_session_requests.find((e) => e.session_id === sessionId)).toBeUndefined();
+    },
+  );
 
   // Reviewer HIGH finding (aed2d71f, D19): a whitelisted CONTACT-1 contact is exempt from
   // ABUSE-1's acceptance bounds, so they can push unlimited accepted sessions the operator never

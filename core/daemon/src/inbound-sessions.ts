@@ -17,7 +17,7 @@ import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
-import type { AgentInfo, Logger } from "./types.js";
+import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
@@ -182,16 +182,39 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     const live: InboundSessionEvent[] = [];
     let expiredList = expiredSessionRequests.get(agentName);
     for (const e of q) {
-      if (e.enqueuedAt !== undefined && now - e.enqueuedAt > INBOUND_SESSION_TTL_MS) {
-        if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
-        expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
-        if (expiredList.length > EXPIRED_SESSION_REQUESTS_CAP) {
-          expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
+      const tooOld = e.enqueuedAt !== undefined && now - e.enqueuedAt > INBOUND_SESSION_TTL_MS;
+      // Drop entries whose session already reached a terminal state (sealed, abandoned,
+      // seal_interrupted_pending, interrupted) — the inbox reconciler would otherwise show them as
+      // pending indefinitely even after the session is closed.
+      let record: SessionRecord | null = null;
+      try {
+        record = sessionNodeManager.getSessionRecord(agentName, e.sessionIdHex);
+      } catch (err: unknown) {
+        logger.warn("session.inbound.reap.db_lookup_failed", {
+          agentName, sessionId: e.sessionIdHex,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      const terminal = record !== null && (
+        record.status === "sealed" ||
+        record.status === "abandoned" ||
+        record.status === "seal_interrupted_pending" ||
+        record.status === "interrupted"
+      );
+      if (tooOld || terminal) {
+        if (tooOld) {
+          if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
+          expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
+          if (expiredList.length > EXPIRED_SESSION_REQUESTS_CAP) {
+            expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
+          }
+          logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
+        } else {
+          logger.debug("session.request.reaped_terminal", { agentName, sessionId: e.sessionIdHex, status: record?.status });
         }
-        logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
         // MONIKER-2 AC2b (review F1): the offer's display name expires with the offer.
         if (offeredMonikers.delete(offerKey(agentName, e.sessionIdHex))) {
-          logger.debug("moniker.offer.dropped", { agentName, sessionId: e.sessionIdHex, state: "expired" });
+          logger.debug("moniker.offer.dropped", { agentName, sessionId: e.sessionIdHex, state: tooOld ? "expired" : "terminal" });
         }
       } else {
         live.push(e);

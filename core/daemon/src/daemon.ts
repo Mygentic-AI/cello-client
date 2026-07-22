@@ -2026,6 +2026,26 @@ async function startDaemonHoldingLock(
     return { ok: true };
   });
 
+  // TTL-terminal-reap: seed a session row at a given terminal status so tests can assert that
+  // reapExpiredInboundSessions drops the matching inbound queue entry without waiting 24h.
+  handlers.set("__test_insert_session_row", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    const status = params?.status as string | undefined;
+    const counterpartyPubkey = (params?.counterpartyPubkey as string) ?? "testpubkey";
+    if (!agentName || !sessionId || !status) {
+      return { error: "missing_params", guidance: "Provide agentName, sessionId, status." };
+    }
+    const db = sessionNodeManager.getDb();
+    const now = Date.now();
+    const agentRow = db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get(agentName) as { agent_id: string } | undefined;
+    if (!agentRow) return { error: "agent_not_found" };
+    db.prepare(
+      "INSERT OR REPLACE INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(sessionId, agentRow.agent_id, counterpartyPubkey, status, now, now);
+    return { ok: true };
+  });
+
   // M8C-INBOX-1 (reviewer F1): buffer a received message so a test can drive a live cello_receive
   // and assert the watermark advances (the N3 delivery-marks-read coupling), without a session tree.
   handlers.set("__test_buffer_received", async (params, _connectionId) => {
