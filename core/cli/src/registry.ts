@@ -477,18 +477,34 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "send",
     group: "Messaging",
-    summary: "Send a message. Any unread messages must be read first — you'll be told, and blocked until you do.",
+    summary: "Send a message. Requires --over, --standby <min>, or --wrap. Blocked if you have unread messages.",
     help:
-      "Usage: cello send <session-id> <message…> [--stdin] [--agent <name>] [--pretty]\n" +
-      "  The message is the remaining arguments, or the whole of stdin with --stdin (for text with\n" +
-      "  newlines/quotes).\n" +
-      "  If the other side has said something you have not read, the send is REFUSED and tells you how\n" +
-      "  many messages are waiting. Read them ('cello receive <session-id>', or 'cello transcript\n" +
-      "  <session-id>' for the whole conversation) and send again. This is deliberate: you cannot\n" +
-      "  reply to something you never saw. The refusal is printed verbatim and never auto-fixed.",
+      "Usage: cello send <session-id> <message…> --over|--standby <min>|--wrap [--stdin] [--agent <name>] [--pretty]\n\n" +
+      "  Every send REQUIRES exactly one signal flag declaring your next action:\n\n" +
+      "    --over\n" +
+      "        Your turn is complete. You are now entering read mode and waiting for\n" +
+      "        a reply. Use this for most messages.\n\n" +
+      "    --standby <min>\n" +
+      "        Your turn is not yet complete, but your full response will take time.\n" +
+      "        Use this when you want to acknowledge immediately — letting the other\n" +
+      "        party know you received their message and are working on it — before\n" +
+      "        going off to do the work. Replace <min> with your estimate in minutes.\n" +
+      "        The other party does not need to reply. A follow-up message is coming\n" +
+      "        in approximately <min> minutes.\n\n" +
+      "    --wrap\n" +
+      "        This is your final message. You intend to close the session after\n" +
+      "        sending. No reply is expected or needed.\n\n" +
+      "  The message is the remaining positional arguments, or the whole of stdin with --stdin\n" +
+      "  (for text with newlines/quotes).\n\n" +
+      "  If the other side has said something you have not read, the send is REFUSED and tells you\n" +
+      "  how many messages are waiting. Read them ('cello receive <session-id>', or 'cello transcript\n" +
+      "  <session-id>' for the whole conversation) and send again.",
     flags: [
       { name: "--agent", consumesValue: false },
       { name: "--stdin", consumesValue: false },
+      { name: "--over", consumesValue: false },
+      { name: "--standby", consumesValue: true },
+      { name: "--wrap", consumesValue: false },
     ],
     ipcMethod: IPC_METHODS.send,
     jsonOut: true,
@@ -496,9 +512,59 @@ export const COMMANDS: readonly CommandSpec[] = [
       const { agent, pretty, positional } = parityOpts(args);
       const useStdin = positional.includes("--stdin");
       const rest = positional.filter((a) => a !== "--stdin");
-      const sessionId = rest[0] ?? "";
-      const content = useStdin ? await readStdin() : rest.slice(1).join(" ");
-      return send(ctx.celloDir, sessionId, content, { agent, pretty });
+
+      // Extract signal flags.
+      const standbyResult = takeValueFlag(rest, "--standby");
+      const hasOver = standbyResult.rest.includes("--over");
+      const hasWrap = standbyResult.rest.includes("--wrap");
+      const hasStandby = standbyResult.value !== undefined;
+      const positionalOnly = standbyResult.rest.filter((a) => a !== "--over" && a !== "--wrap");
+
+      const signalCount = (hasOver ? 1 : 0) + (hasWrap ? 1 : 0) + (hasStandby ? 1 : 0);
+      if (signalCount === 0) {
+        return {
+          stdout: "",
+          stderr: JSON.stringify({
+            ok: false,
+            reason: "missing_signal",
+            guidance:
+              "Missing signal flag. Every 'cello send' must include --over, --standby <min>, or --wrap.\n\n" +
+              "  --over           Your turn is complete; enter read mode.\n" +
+              "  --standby <min>  Your turn is not yet complete; follow-up coming in <min> minutes.\n" +
+              "  --wrap           Final message; you will close the session after sending.",
+          }),
+          exitCode: 1,
+        };
+      }
+      if (signalCount > 1) {
+        return {
+          stdout: "",
+          stderr: JSON.stringify({ ok: false, reason: "ambiguous_signal", guidance: "Provide exactly one of --over, --standby, or --wrap." }),
+          exitCode: 1,
+        };
+      }
+
+      let signal: "over" | "standby" | "wrap";
+      let estMinutes: number | undefined;
+      if (hasOver) {
+        signal = "over";
+      } else if (hasWrap) {
+        signal = "wrap";
+      } else {
+        signal = "standby";
+        estMinutes = Number(standbyResult.value);
+        if (!Number.isFinite(estMinutes) || estMinutes <= 0) {
+          return {
+            stdout: "",
+            stderr: JSON.stringify({ ok: false, reason: "invalid_est_minutes", guidance: "--standby requires a positive number of minutes, e.g. --standby 5" }),
+            exitCode: 1,
+          };
+        }
+      }
+
+      const sessionId = positionalOnly[0] ?? "";
+      const content = useStdin ? await readStdin() : positionalOnly.slice(1).join(" ");
+      return send(ctx.celloDir, sessionId, content, { agent, pretty, signal, estMinutes });
     },
   },
   {

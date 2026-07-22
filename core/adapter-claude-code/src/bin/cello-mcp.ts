@@ -269,9 +269,35 @@ server.tool("cello_await_session", "Wait for an inbound session request", {
   return jsonText(result);
 });
 
-server.tool("cello_send", "Send a message in an active session", {
+const SIGNAL_ERROR =
+  "Missing signal token. Every cello_send message must end with one of:\n\n" +
+  "  [[OVER]]\n" +
+  "    Your turn is complete. You are now entering read mode and waiting for\n" +
+  "    a reply. Use this for most messages.\n\n" +
+  "  [[STANDBY EST:Xm]]\n" +
+  "    Your turn is not yet complete, but your full response will take time.\n" +
+  "    Use this when you want to acknowledge immediately — letting the other\n" +
+  "    party know you received their message and are working on it — before\n" +
+  "    going off to do the work. Replace X with your estimate in minutes.\n" +
+  "    The other party does not need to reply. A follow-up message is coming\n" +
+  "    in approximately X minutes.\n\n" +
+  "  [[WRAP]]\n" +
+  "    This is your final message. You intend to close the session after\n" +
+  "    sending. No reply is expected or needed.\n\n" +
+  "Append the appropriate token to your message and resend.";
+
+server.tool("cello_send", "Send a message in an active session. REQUIRED: every message must include a signal parameter declaring your next action.", {
   session_id: z.string().describe("Session ID"),
   content: z.string().describe("Message content (UTF-8 text)"),
+  signal: z.enum(["over", "standby", "wrap"]).optional().describe(
+    "REQUIRED. Declares your next action after sending:\n" +
+    "  \"over\"    — your turn is complete; you are entering read mode waiting for a reply.\n" +
+    "  \"standby\" — your turn is not yet complete; you are going to do work and will follow up. Requires est_minutes.\n" +
+    "  \"wrap\"    — this is your final message; close the session after sending.",
+  ),
+  est_minutes: z.number().optional().describe(
+    "Required when signal is \"standby\". Approximate minutes until your follow-up message.",
+  ),
   governance_decisions: z
     .record(z.string(), z.enum(["redact", "allow_once", "allow_always"]))
     .optional()
@@ -281,10 +307,21 @@ server.tool("cello_send", "Send a message in an active session", {
       "\"allow_always\"} to resolve each flagged item. Omitted flags default to redact.",
     ),
   agent: z.string().optional().describe("Agent to send as (defaults to the current agent)"),
-}, async ({ session_id, content, governance_decisions, agent }) => {
+}, async ({ session_id, content, signal, est_minutes, governance_decisions, agent }) => {
+  if (!signal) {
+    return jsonText({ ok: false, reason: "missing_signal", guidance: SIGNAL_ERROR });
+  }
+  if (signal === "standby" && (est_minutes === undefined || !Number.isFinite(est_minutes) || est_minutes <= 0)) {
+    return jsonText({ ok: false, reason: "missing_est_minutes", guidance: "signal \"standby\" requires est_minutes (a positive number of minutes until your follow-up message)." });
+  }
+  const token =
+    signal === "over" ? "[[OVER]]" :
+    signal === "wrap" ? "[[WRAP]]" :
+    `[[STANDBY EST:${est_minutes}m]]`;
+  const contentWithToken = `${content} ${token}`;
   const result = await proxy.call("cello_send", {
     session_id,
-    content,
+    content: contentWithToken,
     ...(governance_decisions !== undefined ? { governance_decisions } : {}),
     ...(agent ? { agent } : {}),
   });

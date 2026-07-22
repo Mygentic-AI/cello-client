@@ -243,8 +243,19 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
   });
 
   it("send: message is the remaining args joined; --agent and --pretty are not part of it", async () => {
-    await run("send", ["sid1", "hello", "there", "--agent", "alice", "--pretty"]);
-    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello there", { agent: "alice", pretty: true });
+    await run("send", ["sid1", "hello", "there", "--over", "--agent", "alice", "--pretty"]);
+    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello there", { agent: "alice", pretty: true, signal: "over", estMinutes: undefined });
+  });
+
+  it("send: missing signal flag returns missing_signal error without calling parity.send", async () => {
+    const result = await runOut("send", ["sid1", "hello"]);
+    expect(result.exitCode).toBe(1);
+    expect(parity.send).not.toHaveBeenCalled();
+  });
+
+  it("send: --standby <min> routes to parity.send with signal and estMinutes", async () => {
+    await run("send", ["sid1", "hello", "--standby", "5"]);
+    expect(parity.send).toHaveBeenCalledWith(CELLO_DIR, "sid1", "hello", { agent: undefined, pretty: false, signal: "standby", estMinutes: 5 });
   });
 
   it("receive: --since-seq and --timeout-ms reach the daemon as numbers, and neither eats the session id", async () => {

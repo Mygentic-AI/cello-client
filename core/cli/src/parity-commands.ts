@@ -441,12 +441,22 @@ export function send(
   celloDir: string,
   sessionId: string,
   content: string,
-  opts: ParityOptions & { governanceDecisions?: Record<string, string> },
+  opts: ParityOptions & {
+    governanceDecisions?: Record<string, string>;
+    signal?: "over" | "standby" | "wrap";
+    estMinutes?: number;
+  },
 ): Promise<CliOutput> {
+  const { signal, estMinutes } = opts;
+  const token =
+    signal === "over" ? " [[OVER]]" :
+    signal === "wrap" ? " [[WRAP]]" :
+    signal === "standby" ? ` [[STANDBY EST:${estMinutes}m]]` :
+    "";
   return ipcCommand(
     celloDir,
     "cello_send",
-    defined({ session_id: sessionId, content, governance_decisions: opts.governanceDecisions }),
+    defined({ session_id: sessionId, content: content + token, governance_decisions: opts.governanceDecisions }),
     opts,
   );
 }
