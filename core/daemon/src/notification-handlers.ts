@@ -96,7 +96,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           `{ pubkey: "${n.pubkey}", moniker: "${n.offered_name}" }, or ignore.`,
       }));
       if (sealed_unread.length > 0) {
-        return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices, sealed_unread, sealed_unread_guidance: "These sessions are sealed with unread messages. Use cello_transcript to read them. Use cello_dismiss to remove them from your inbox." };
+        return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices, sealed_unread, sealed_unread_guidance: "These sessions are sealed with unread messages. Use cello_transcript to read them — reading will automatically clear them from your inbox. Use cello_dismiss to clear without reading." };
       }
       return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
     });
