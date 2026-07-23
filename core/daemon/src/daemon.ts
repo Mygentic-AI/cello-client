@@ -825,10 +825,9 @@ async function startDaemonHoldingLock(
     for (const s of perConnectionState.values()) if (s.currentAgent === agentName) return true;
     return false;
   }
-  const AWAY_TEXT: Record<"request" | "message", string> = {
-    request: "Agent is currently away. Your session request has been received and queued.",
-    message: "Agent is currently away. Your message has been received and will be read when the operator returns.",
-  };
+  // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
+  // the call site so it names the specific away agent.
+  const AWAY_MESSAGE_TEXT = "Agent is currently away. Your message has been received and will be read when the operator returns.";
   // M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — a single shared,
   // deliberately minimal template regardless of kind, distinct from AWAY-1's richer per-type text.
   const STRANGER_TEXT = "Dispatched.";
@@ -840,23 +839,40 @@ async function startDaemonHoldingLock(
   const awayAckSent = new Set<string>();
   async function sendAwayResponse(agentName: string, sessionId: string, kind: "request" | "message"): Promise<void> {
     if (isAttended(agentName)) return;
+    // DOD-AWAY-WRAP-1 AC2: if the triggering message carries [[WRAP]], the caller is done — skip the
+    // away reply entirely and let the seal ceremony proceed. The dedupKey is intentionally NOT added
+    // here: the WRAP path is a silent close, not an away period that should be deduped.
+    if (kind === "message") {
+      const latestHex = sessionNodeManager.peekLatestReceivedContentHex(agentName, sessionId);
+      if (latestHex !== null) {
+        const text = Buffer.from(latestHex, "hex").toString("utf8");
+        if (text.includes("[[WRAP]]")) {
+          logger.info("session.away.response.skipped_wrap", { agentName, sessionId });
+          return;
+        }
+      }
+    }
     const dedupKey = `${agentName}:${sessionId}:${kind}`;
     if (awayAckSent.has(dedupKey)) return;
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
     // Select the ack wording by whether the sender is a known contact — STRANGER_TEXT
-    // ("Dispatched.") for unknown, AWAY_TEXT[kind] for known. The inbound accept path does NOT
+    // ("Dispatched.") for unknown, system default for known. The inbound accept path does NOT
     // auto-add the sender: an unattended stranger STAYS unknown across every inbound interaction.
     // Promotion requires operator engagement — an outbound initiate, a cello_send reply, or an
     // explicit contact add. This is a plain read of current contact state; nothing downstream
     // depends on its ordering.
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
+    // DOD-AWAY-WRAP-1 AC1: request kind uses a leave-a-message greeting that names the away agent.
+    const systemDefault = kind === "request"
+      ? `${agentName} is currently away. Leave a message (send with [[WRAP]] to close) and it will be read when they return.`
+      : AWAY_MESSAGE_TEXT;
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
       // DOD-AWAY-TIER-1: resolve most-specific-first — per-contact away_message → per-tier away
       // (settings) → agent default (settings) → the system default (code, per kind). Total.
       const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
-        ?? (isKnown ? AWAY_TEXT[kind] : STRANGER_TEXT);
+        ?? (isKnown ? systemDefault : STRANGER_TEXT);
       const draftBytes = new TextEncoder().encode(awayText);
       // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
       // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn

@@ -175,7 +175,9 @@ describe("M8C-AWAY-1: away response", () => {
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     expect(messages).toHaveLength(1);
     expect(messages[0].direction).toBe("sent");
-    expect(messages[0].text).toContain("session request has been received and queued");
+    // DOD-AWAY-WRAP-1 AC1: request away greeting names the agent and gives leave-a-message instructions.
+    expect(messages[0].text).toContain("bob is currently away");
+    expect(messages[0].text).toContain("[[WRAP]]");
   });
 
   // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
@@ -344,6 +346,67 @@ describe("M8C-AWAY-1: away response", () => {
 
     const acked = events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message");
     expect(acked.map((e) => e.context.sessionId).sort()).toEqual([SID_1, SID_2].sort());
+  });
+
+  // DOD-AWAY-WRAP-1 AC2/AC3/AC4(b): a [[WRAP]]-signalled inbound message must NOT trigger the away reply.
+  it("DOD-AWAY-WRAP-1: [[WRAP]]-signalled message skips the away reply and logs skipped_wrap", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const wrapContent = new TextEncoder().encode("goodbye [[WRAP]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, wrapContent, msgLeafHash(wrapContent), "c1");
+    await wait(30);
+
+    // No away reply must be sent.
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+    // The skip must be logged (observability AC).
+    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
+    // No sent message in transcript.
+    const { messages } = snm.readTranscript("alice", SID_HEX);
+    expect(messages.filter((m) => m.direction === "sent")).toHaveLength(0);
+  });
+
+  // DOD-AWAY-WRAP-1 AC4(c): a non-[[WRAP]] message still triggers the away reply.
+  it("DOD-AWAY-WRAP-1: a non-[[WRAP]] message still triggers the away reply", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const overContent = new TextEncoder().encode("hello [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, overContent, msgLeafHash(overContent), "c1");
+    await wait(30);
+
+    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
+    const { messages } = snm.readTranscript("alice", SID_HEX);
+    expect(messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+  });
+
+  // DOD-AWAY-WRAP-1 AC1: the request-kind greeting names the agent and gives leave-a-message instructions.
+  it("DOD-AWAY-WRAP-1 AC1: request-kind away greeting names the agent and instructs to use [[WRAP]]", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
+    h.getSessionNodeManager().addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
+
+    injectRef.inject!(assignmentFrame("cd".repeat(32), bobPubkey));
+    await wait(150);
+
+    const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
+    const sent = messages.filter((m) => m.direction === "sent")[0];
+    expect(sent).toBeDefined();
+    expect(sent!.text).toContain("bob is currently away");
+    expect(sent!.text).toContain("[[WRAP]]");
+    expect(sent!.text).toContain("Leave a message");
   });
 
   // Reviewer finding (a9099571, MEDIUM): a transient send failure must not permanently silence the

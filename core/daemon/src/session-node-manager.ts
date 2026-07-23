@@ -3776,6 +3776,16 @@ export class SessionNodeManager {
     return buf.shift() ?? null;
   }
 
+  /** DOD-AWAY-WRAP-1: peek at the hex of the most-recently buffered (last) received message without
+   *  consuming it. Used by sendAwayResponse to detect [[WRAP]]-signalled messages and skip the away
+   *  reply. Returning the last entry (not the first) is intentional — #appendVerifiedContent always
+   *  pushes to the tail, so the tail is the message that just triggered onContentArrived. */
+  peekLatestReceivedContentHex(agentName: string, sessionId: string): string | null {
+    const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
+    if (!buf || buf.length === 0) return null;
+    return buf[buf.length - 1]?.contentHex ?? null;
+  }
+
   /**
    * TEST-ONLY (M8C-INBOX-1 reviewer F1): buffer a received message + persist its transcript row,
    * exactly as the real inbound path (#appendVerifiedContent) does, WITHOUT standing up a session

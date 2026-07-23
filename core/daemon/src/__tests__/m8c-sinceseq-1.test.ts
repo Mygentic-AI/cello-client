@@ -181,7 +181,7 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
       await client.send("cello_use_agent", { name: "alice" });
 
       const s = "e".repeat(64);
-      seedOrphan("alice", s, ["Dispatched.", "Agent is currently away. Your session request has been received and queued."]);
+      seedOrphan("alice", s, ["Dispatched.", "alice is currently away. Leave a message (send with [[WRAP]] to close) and it will be read when they return."]);
 
       // BEFORE the read: the badge shows the two messages (they are real — never hide them).
       const before = (await client.send("cello_check_notifications", { scope: "current" })) as R;
@@ -196,7 +196,7 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
       expect(res["count"]).toBe(2);
       const msgs = res["messages"] as Array<{ sequence: number; content: string; from: string | null }>;
       expect(msgs.map((m) => m.sequence)).toEqual([0, 1]);
-      expect(msgs.map((m) => m.content)).toEqual(["Dispatched.", "Agent is currently away. Your session request has been received and queued."]);
+      expect(msgs.map((m) => m.content)).toEqual(["Dispatched.", "alice is currently away. Leave a message (send with [[WRAP]] to close) and it will be read when they return."]);
       expect(msgs.every((m) => m.from === null)).toBe(true);
 
       // AFTER actual delivery: the badge clears — by the watermark, not by a JOIN that hides rows.

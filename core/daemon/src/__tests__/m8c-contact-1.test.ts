@@ -344,7 +344,9 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: true });
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("session request has been received and queued");
+    // DOD-AWAY-WRAP-1 AC1: request-kind greeting names the agent and gives leave-a-message instructions.
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("bob is currently away");
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("[[WRAP]]");
   });
 
   it("K4/K5 (message-kind): an unknown sender's message on an existing session ALSO gets the minimal text; a known one gets the richer text", async () => {
