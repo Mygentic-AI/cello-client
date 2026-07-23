@@ -853,7 +853,35 @@ async function startDaemonHoldingLock(
       }
     }
     const dedupKey = `${agentName}:${sessionId}:${kind}`;
-    if (awayAckSent.has(dedupKey)) return;
+    if (awayAckSent.has(dedupKey)) {
+      // DOD-INBOX-ONESHOT-1: a second inbound message while the first away ack is still live means
+      // the caller ignored the leave-a-message instruction. Send one [[WRAP]]-bearing rejection and
+      // immediately initiate the seal so the session closes without operator intervention.
+      if (kind === "message") {
+        const record2 = sessionNodeManager.getSessionRecord(agentName, sessionId);
+        if (record2 && record2.status === "active") {
+          const rejectText = "[[WRAP]] This inbox only accepts one message per visit. Closing.";
+          const rejectBytes = new TextEncoder().encode(rejectText);
+          const rejectHash = createHash("sha256").update(new Uint8Array([0x00])).update(rejectBytes).digest();
+          // Best-effort: a send failure still triggers the seal — we are closing regardless.
+          const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
+          if (sendResult.ok) {
+            const rejectHashHex = Buffer.from(rejectHash).toString("hex");
+            const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", rejectHashHex, randomUUID());
+            sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", rejectBytes, randomUUID());
+            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex });
+          } else {
+            logger.warn("session.away.inbox.oneshot.reject_send_failed", { agentName, sessionId, reason: sendResult.reason });
+          }
+          // Initiate seal fire-and-forget — the bilateral wait (DOD-SEAL-BILATERAL-TIMEOUT-1: 660 s)
+          // gives the counterparty time to co-close before the daemon escalates to unilateral.
+          void handleActiveSealFlow(sessionId, record2, randomUUID()).then((result) => {
+            logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId, ok: result.ok, reason: !result.ok ? result.reason : undefined });
+          });
+        }
+      }
+      return;
+    }
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
     // Select the ack wording by whether the sender is a known contact — STRANGER_TEXT

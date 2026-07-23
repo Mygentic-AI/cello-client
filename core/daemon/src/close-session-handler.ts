@@ -316,7 +316,12 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // timeout means the counterparty has not closed yet (our leaf is recorded — the
         // session seals when they call cello_close_session). CELLO_SEAL_BILATERAL_TIMEOUT_MS
         // tunes how long to wait for the counterparty before escalating to a unilateral seal.
-        const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 30_000;
+        // DOD-SEAL-BILATERAL-TIMEOUT-1: default is 660 s (11 min) — deliberately just over
+        // the directory's deliveryGraceSeconds default (600 s / 10 min), so the bilateral
+        // timeout always expires AFTER the grace window. This makes seal_unilateral_too_early
+        // structurally unreachable under normal configuration; override via the env var for
+        // tests or operators who need a shorter window.
+        const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
         let timer!: ReturnType<typeof setTimeout>;
         const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
         const sealedCompletion = await Promise.race([sealedP, timeoutP]);
