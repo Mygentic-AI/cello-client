@@ -853,11 +853,17 @@ async function startDaemonHoldingLock(
       }
     }
     const dedupKey = `${agentName}:${sessionId}:${kind}`;
+    // F3 fix: a dedicated guard prevents re-entry after the rejection fires — without it a
+    // rapid-fire sender could trigger multiple rejection sends and concurrent seal submits while
+    // the session remains active (seal failed). This key is never cleared (no re-attend resets
+    // it — once rejected, the session is closing regardless).
+    const rejectedKey = `${agentName}:${sessionId}:rejected`;
     if (awayAckSent.has(dedupKey)) {
       // DOD-INBOX-ONESHOT-1: a second inbound message while the first away ack is still live means
       // the caller ignored the leave-a-message instruction. Send one [[WRAP]]-bearing rejection and
       // immediately initiate the seal so the session closes without operator intervention.
-      if (kind === "message") {
+      if (kind === "message" && !awayAckSent.has(rejectedKey)) {
+        awayAckSent.add(rejectedKey); // guard BEFORE async work — concurrent arrivals must not re-enter
         const record2 = sessionNodeManager.getSessionRecord(agentName, sessionId);
         if (record2 && record2.status === "active") {
           const rejectText = "[[WRAP]] This inbox only accepts one message per visit. Closing.";
@@ -875,8 +881,13 @@ async function startDaemonHoldingLock(
           }
           // Initiate seal fire-and-forget — the bilateral wait (DOD-SEAL-BILATERAL-TIMEOUT-1: 660 s)
           // gives the counterparty time to co-close before the daemon escalates to unilateral.
+          // F2 fix: log distinct events for success vs failure so the operator's event name is accurate.
           void handleActiveSealFlow(sessionId, record2, randomUUID()).then((result) => {
-            logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId, ok: result.ok, reason: !result.ok ? result.reason : undefined });
+            if (result.ok) {
+              logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId });
+            } else {
+              logger.warn("session.away.inbox.oneshot.seal_initiate_failed", { agentName, sessionId, reason: result.reason });
+            }
           });
         }
       }

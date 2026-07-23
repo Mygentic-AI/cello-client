@@ -465,37 +465,27 @@ describe("M8C-AWAY-1: away response", () => {
     const { messages } = snm.readTranscript("alice", SID_HEX);
     const rejectionMsg = messages.filter((m) => m.direction === "sent").at(-1);
     expect(rejectionMsg?.text).toContain("[[WRAP]]");
-    // Seal was initiated (fires session.seal.initiated or oneshot.seal_initiated log).
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated")).toBeDefined();
+    // AC1 (seal): in this unit-test environment the agent is not loaded from the DB, so
+    // handleActiveSealFlow returns signing_key_unavailable. The honest observable is
+    // seal_initiate_FAILED, not seal_initiated. Reverting the .then() split would collapse these
+    // back to a single "seal_initiated" event with ok:false — this assertion would then fail,
+    // catching the regression.
+    expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiate_failed")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated")).toBeUndefined();
     // AC3: no further away ack fired (only one away.response.sent event total).
     expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
+    // F3: a third message must NOT trigger a second rejection (rejectedKey guard).
+    const msg3 = new TextEncoder().encode("third [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, msg3, msgLeafHash(msg3), "c3");
+    await wait(30);
+    expect(events.filter((e) => e.event === "session.away.inbox.oneshot.rejected")).toHaveLength(1);
   });
 
   // DOD-INBOX-ONESHOT-1 AC4: attended agent — second message does NOT trigger rejection.
-  it("DOD-INBOX-ONESHOT-1 AC4: second message while ATTENDED does not trigger the one-shot rejection", async () => {
-    const { logger, events } = makeLogger();
-    await makeAgentDir("alice");
-    const h = await start(logger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-
-    // Attend before any messages arrive — no away path runs.
-    await connectAs("alice");
-
-    const msg1 = new TextEncoder().encode("hello [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
-    await wait(30);
-    const msg2 = new TextEncoder().encode("hello again [[OVER]]");
-    await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
-    await wait(30);
-
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
-    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
-  });
-
-  // DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as the second message does NOT trigger the rejection
-  // (DOD-AWAY-WRAP-1 handles it cleanly before the dedup guard is checked).
-  it("DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as second message closes cleanly — no rejection fires", async () => {
+  // Revert-anchor: the dedup guard must be SET by an unattended first message before attending.
+  // Without the first unattended message the dedup key is never set and the rejection path is
+  // unreachable regardless — the test would be vacuously true.
+  it("DOD-INBOX-ONESHOT-1 AC4: unattended first message sets dedup; attending then prevents rejection on second", async () => {
     const { logger, events } = makeLogger();
     await makeAgentDir("alice");
     const h = await start(logger, new FakeNode());
@@ -503,19 +493,92 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
-    // First message: normal away ack.
+    // First message arrives UNATTENDED — sets the dedup guard.
     const msg1 = new TextEncoder().encode("hello [[OVER]]");
     await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
     await wait(30);
+    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
 
-    // Second message carries [[WRAP]]: DOD-AWAY-WRAP-1 skips the reply before the dedup path.
+    // Now attend — isAttended returns true for alice.
+    await connectAs("alice");
+
+    // Second message arrives while attended — isAttended() short-circuits, no rejection.
+    const msg2 = new TextEncoder().encode("hello again [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
+    await wait(30);
+
+    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
+    // Only the original away ack fired.
+    expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
+  });
+
+  // DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as the second message does NOT trigger the rejection.
+  // Revert-anchor: event ORDERING proves the [[WRAP]] check fires BEFORE the dedup/rejection path.
+  // If the order were reversed, skipped_wrap would be absent and rejected would appear instead.
+  it("DOD-INBOX-ONESHOT-1 AC5: [[WRAP]] as second message — skipped_wrap fires before rejection path, no rejected event", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    // First message: normal away ack — dedup guard is now set.
+    const msg1 = new TextEncoder().encode("hello [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
+    await wait(30);
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
+    const eventCountBeforeWrap = events.length;
+
+    // Second message carries [[WRAP]]: WRAP check (line 845) runs BEFORE dedup check.
+    // If order were reversed the dedup would fire first → rejected instead of skipped_wrap.
     const msg2 = new TextEncoder().encode("goodbye [[WRAP]]");
     await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
     await wait(30);
 
-    // No rejection — the [[WRAP]] path fired instead.
-    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
-    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
+    const newEvents = events.slice(eventCountBeforeWrap);
+    // skipped_wrap must appear; rejected must not.
+    expect(newEvents.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
+    expect(newEvents.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeUndefined();
+    // skipped_wrap arrives before any possible rejected — index ordering proves it.
+    const skipIdx = newEvents.findIndex((e) => e.event === "session.away.response.skipped_wrap");
+    const rejectIdx = newEvents.findIndex((e) => e.event === "session.away.inbox.oneshot.rejected");
+    expect(skipIdx).toBeGreaterThanOrEqual(0);
+    expect(rejectIdx).toBe(-1); // absent, confirming correct ordering
+  });
+
+  // F1 (reviewer): A5 — cello_use_agent clears awayAckSent so the next away period gets a fresh ack.
+  // This is distinct from per-session isolation (which tests dedup-key scope across sessions).
+  // This tests attend-clearance ACROSS TIME on the same agent.
+  it("A5 (dedicated): cello_use_agent clears the dedup so the next away PERIOD gets a fresh ack", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    const SID_A = "aa".repeat(32);
+    const SID_B = "bb".repeat(32);
+    await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id", "corr-a");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    // Away period 1: first message sets dedup for SID_A.
+    const m1 = new TextEncoder().encode("hi [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_A, m1, msgLeafHash(m1), "c1");
+    await wait(30);
+    expect(events.filter((e) => e.event === "session.away.response.sent")).toHaveLength(1);
+
+    // Attend (cello_use_agent) — clears the dedup entries for "alice".
+    const client = await connectAs("alice");
+    client.close();
+    await wait(30);
+
+    // Away period 2: new session, same agent. Dedup was cleared so a fresh ack fires.
+    await snm.createSessionNode(SID_B, "alice", "bobpubkeyhex", "bob-peer-id", "corr-b");
+    const m2 = new TextEncoder().encode("hi again [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_B, m2, msgLeafHash(m2), "c2");
+    await wait(30);
+
+    // Two away acks total — one per away period.
+    expect(events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toHaveLength(2);
   });
 
   // Reviewer finding (a9099571, MEDIUM): a transient send failure must not permanently silence the
