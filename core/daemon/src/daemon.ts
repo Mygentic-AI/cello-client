@@ -879,16 +879,113 @@ async function startDaemonHoldingLock(
           } else {
             logger.warn("session.away.inbox.oneshot.reject_send_failed", { agentName, sessionId, reason: sendResult.reason });
           }
-          // Initiate seal fire-and-forget — the bilateral wait (DOD-SEAL-BILATERAL-TIMEOUT-1: 660 s)
-          // gives the counterparty time to co-close before the daemon escalates to unilateral.
-          // F2 fix: log distinct events for success vs failure so the operator's event name is accurate.
-          void handleActiveSealFlow(sessionId, record2, randomUUID()).then((result) => {
-            if (result.ok) {
-              logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId });
-            } else {
-              logger.warn("session.away.inbox.oneshot.seal_initiate_failed", { agentName, sessionId, reason: result.reason });
+          // DOD-INBOX-ONESHOT-1 / DOD-SEAL-BILATERAL-TIMEOUT-1: initiate the seal via the
+          // relay-mediated path (submitSealLeaf → bilateral wait → unilateral escalation).
+          // The signaling-only path (handleActiveSealFlow) suffers a leaf_count_mismatch race:
+          // this party's tree includes the just-sent rejection, but the counterparty's tree may
+          // not have ingested it yet when the seal request arrives over the signaling channel.
+          // The relay path avoids this entirely — it posts a SEAL ctrl leaf and waits for the
+          // counterparty to independently co-seal; no bilateral leaf-count comparison needed.
+          void (async () => {
+            const correlationId = randomUUID();
+            const sk = sealKey(agentName, sessionId);
+            if (sealInterruptedInProgress.has(sk)) return;
+            sealInterruptedInProgress.add(sk);
+            try {
+              let resolveSeal!: (c: { rootHex: string; legibility?: unknown }) => void;
+              const sealedP = new Promise<{ rootHex: string; legibility?: unknown }>((r) => { resolveSeal = r; });
+              pendingSealWaiters.set(sk, resolveSeal);
+
+              const submit = await sessionNodeManager.submitSealLeaf(agentName, sessionId, correlationId);
+              if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
+                pendingSealWaiters.delete(sk);
+                if (submit.reason === "relay_unavailable") {
+                  const fallback = await handleActiveSealFlow(sessionId, record2, correlationId);
+                  if (fallback.ok) {
+                    logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId, path: "signaling_fallback" });
+                  } else {
+                    logger.warn("session.away.inbox.oneshot.seal_initiate_failed", { agentName, sessionId, reason: fallback.reason, path: "signaling_fallback" });
+                  }
+                } else {
+                  logger.warn("session.away.inbox.oneshot.seal_initiate_failed", { agentName, sessionId, reason: submit.reason });
+                }
+                return;
+              }
+
+              logger.info("session.away.inbox.oneshot.seal_initiated", { agentName, sessionId, path: "relay" });
+
+              const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
+              let timer!: ReturnType<typeof setTimeout>;
+              const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
+              const sealedCompletion = await Promise.race([sealedP, timeoutP]);
+              clearTimeout(timer);
+              pendingSealWaiters.delete(sk);
+
+              if (sealedCompletion !== null) {
+                logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: sealedCompletion.rootHex });
+                return;
+              }
+
+              // Bilateral timeout — escalate to unilateral seal.
+              const escalation = submit.ok
+                ? { reportedRootHex: submit.reportedRootHex, sequenceNumber: submit.sequenceNumber }
+                : submit.reason === "responder_seal_already_submitted" &&
+                    typeof submit.reportedRootHex === "string" &&
+                    typeof submit.sequenceNumber === "number"
+                  ? { reportedRootHex: submit.reportedRootHex, sequenceNumber: submit.sequenceNumber }
+                  : null;
+              if (!escalation) {
+                logger.warn("session.away.inbox.oneshot.seal_pending", { agentName, sessionId });
+                return;
+              }
+
+              const sealAgentKp = keyProviders.get(agentName);
+              const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
+              const sealCarry = sealAgentPubkeyHex ? sessionNodeManager.getSealCarry(sealAgentPubkeyHex, sessionId) : [];
+              const seal_leaves = sealCarry.map((l) => ({
+                sequence_number: l.sequenceNumber,
+                leaf_kind: l.leafKind,
+                structure2_cbor: l.structure2Cbor,
+                structure1_cbor: l.structure1Cbor,
+                relay_id: l.relayId,
+                relay_timestamp: l.relayTimestamp,
+                relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
+              }));
+
+              let resolveUni!: (r: { ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }) => void;
+              const uniP = new Promise<{ ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }>((r) => { resolveUni = r; });
+              pendingUnilateralWaiters.set(sessionId, resolveUni);
+
+              const sent = await sendOver(agentName, {
+                type: "seal_unilateral",
+                session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
+                reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
+                reported_seq: escalation.sequenceNumber,
+                seal_leaves,
+              });
+              if (!sent.ok) {
+                pendingUnilateralWaiters.delete(sessionId);
+                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: "send_failed" });
+                return;
+              }
+
+              let uniTimer!: ReturnType<typeof setTimeout>;
+              const uniTimeoutP = new Promise<{ ok: false; reason: string }>((r) => {
+                uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), 30_000);
+              });
+              const uniResult = await Promise.race([uniP, uniTimeoutP]);
+              clearTimeout(uniTimer);
+              pendingUnilateralWaiters.delete(sessionId);
+
+              if (uniResult.ok) {
+                logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: uniResult.sealedRootHex, sealType: "unilateral" });
+              } else {
+                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: uniResult.reason });
+              }
+            } finally {
+              sealInterruptedInProgress.delete(sealKey(agentName, sessionId));
             }
-          });
+          })();
         }
       }
       return;
