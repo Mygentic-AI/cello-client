@@ -371,7 +371,8 @@ describe("M8C-AWAY-1: away response", () => {
   });
 
   // DOD-AWAY-WRAP-1 AC4(c): a non-[[WRAP]] message still triggers the away reply.
-  it("DOD-AWAY-WRAP-1: a non-[[WRAP]] message still triggers the away reply", async () => {
+  // The complementary skipped_wrap assertion pins the guard: only [[WRAP]] suppresses; [[OVER]] does not.
+  it("DOD-AWAY-WRAP-1: a non-[[WRAP]] message still triggers the away reply (and skipped_wrap does NOT fire)", async () => {
     const { logger, events } = makeLogger();
     await makeAgentDir("alice");
     const h = await start(logger, new FakeNode());
@@ -384,8 +385,43 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(30);
 
     expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
+    // Revert-test anchor: if the [[WRAP]] guard were absent, skipped_wrap would never fire for any
+    // message — this assertion is vacuously true pre-fix. But if the guard were overly broad (e.g.
+    // matching any message containing "wrap" or "[["), this would catch the regression.
+    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
     const { messages } = snm.readTranscript("alice", SID_HEX);
     expect(messages.filter((m) => m.direction === "sent")).toHaveLength(1);
+  });
+
+  // DOD-AWAY-WRAP-1 AC3: combined transcript shape — greeting at seq 0 (sent), [[WRAP]] message at
+  // seq 1 (received), NOTHING ELSE. Verifies the dedup guard doesn't double-send and the [[WRAP]]
+  // skip leaves no spurious seq 2.
+  it("DOD-AWAY-WRAP-1 AC3: sealed transcript shape — exactly greeting(sent) + [[WRAP]]-msg(received), nothing else", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    snm.addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
+
+    // Step 1: inbound session request → daemon sends away greeting (seq 0, sent).
+    injectRef.inject!(assignmentFrame("cd".repeat(32), bobPubkey));
+    await wait(150);
+
+    // Step 2: caller sends a [[WRAP]] message → daemon skips away reply.
+    const wrapContent = new TextEncoder().encode("leaving my message [[WRAP]]");
+    await snm.ingestReceivedContent("bob", SID_HEX, wrapContent, msgLeafHash(wrapContent), "wrap-corr");
+    await wait(30);
+
+    const { messages } = snm.readTranscript("bob", SID_HEX);
+    expect(messages).toHaveLength(2);
+    expect(messages[0].direction).toBe("sent");      // seq 0: away greeting
+    expect(messages[0].text).toContain("currently away");
+    expect(messages[1].direction).toBe("received");  // seq 1: caller's [[WRAP]] message
+    expect(messages[1].text).toContain("[[WRAP]]");
+    // No seq 2: the away reply was suppressed.
   });
 
   // DOD-AWAY-WRAP-1 AC1: the request-kind greeting names the agent and gives leave-a-message instructions.
