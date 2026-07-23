@@ -3792,6 +3792,15 @@ export class SessionNodeManager {
    * tree — so a test can drive a live cello_receive that advances the read watermark (the N3
    * "delivery marks read" coupling). Only reachable via the CELLO_ENV=test IPC hook.
    */
+  /** CELLO_ENV=test only: patch a relay client and session-id bytes onto an existing active node entry
+   *  so submitSealLeaf succeeds without a real relay handshake (used by the oneshot relay-path test). */
+  patchRelayClientForTest(agentName: string, sessionId: string, relayClient: AgentRelayClient, relaySessionIdBytes: Uint8Array): void {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) throw new Error(`patchRelayClientForTest: no active node for (${agentName}, ${sessionId})`);
+    entry.relayClient = relayClient;
+    entry.relaySessionIdBytes = relaySessionIdBytes;
+  }
+
   pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
     this.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
     const key = this.#k(agentName, sessionId);

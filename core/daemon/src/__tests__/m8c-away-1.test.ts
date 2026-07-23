@@ -31,6 +31,8 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { Encoder, decode } from "cbor-x";
+import * as lp from "it-length-prefixed";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -93,6 +95,78 @@ function makeInjectableSignaling(
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Relay + signaling stubs for DOD-INBOX-ONESHOT-1 relay-path test ─────────
+// Minimal in-process fake relay: auth challenge/ok + hash_submit_ack.
+// Mirrors the version in seal-unilateral-retry.test.ts (no FROST logic needed here).
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
+const FAKE_RELAY_PEER_ID_ONESHOT = "12D3KooWFakeRelayForOneshotTest";
+const FAKE_RELAY_ADDR_ONESHOT = "/ip4/127.0.0.1/tcp/2/p2p/fake-relay-oneshot";
+
+function makeFakeRelayServerOneshot() {
+  let seq = 0;
+  const streams: Array<{ push: (frame: Record<string, unknown>) => void }> = [];
+  function openStream() {
+    const inbound: Uint8Array[] = [];
+    let notify: (() => void) | null = null;
+    let ended = false;
+    const push = (frame: Record<string, unknown>): void => {
+      const encoded = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
+      inbound.push(encoded instanceof Uint8Array ? encoded : (encoded as { subarray(): Uint8Array }).subarray());
+      notify?.();
+    };
+    const stream = {
+      send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
+        const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
+        void (async () => {
+          for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
+            const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
+            const frame = decode(u8) as Record<string, unknown>;
+            if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
+            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
+          }
+        })();
+      },
+      close: async () => { ended = true; notify?.(); },
+      async *[Symbol.asyncIterator]() {
+        while (!ended) {
+          while (inbound.length) yield inbound.shift()!;
+          if (ended) return;
+          await new Promise<void>((r) => { notify = r; });
+          notify = null;
+        }
+      },
+    };
+    push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    streams.push({ push });
+    return stream;
+  }
+  return { openStream, ctrlSubmits: () => [] as unknown[] };
+}
+
+
+// A FakeNode variant whose newStream routes to a fake relay server for the relay peer id.
+// All other newStream calls return a no-op fake stream.
+class FakeRelayAwareNode extends FakeNode {
+  constructor(private readonly fakeRelay: ReturnType<typeof makeFakeRelayServerOneshot>) { super(); }
+  async dial(_addr: unknown): Promise<{ peerId: string }> { return { peerId: FAKE_RELAY_PEER_ID_ONESHOT }; }
+  async newStream(peerId: unknown, _proto: unknown): Promise<Stream> {
+    if (String(peerId) === FAKE_RELAY_PEER_ID_ONESHOT) return this.fakeRelay.openStream() as unknown as Stream;
+    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
+  }
+}
+
+function makeRecordingSignalingOneshot(ref: { inject?: (frame: unknown) => void }): () => Promise<ConnectResult> {
+  let inbound: ((frame: unknown) => void) | null = null;
+  const stream: SignalingStream = {
+    send: async () => {},
+    onMessage: (h: (frame: unknown) => void) => { inbound = h; },
+    close: () => {},
+  };
+  ref.inject = (frame: unknown) => inbound?.(frame);
+  return async () => ({ stream, directoryNodeId: "fake-dir", manifestVersion: 1 });
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe("M8C-AWAY-1: away response", () => {
   let tempDir: string;
@@ -580,6 +654,83 @@ describe("M8C-AWAY-1: away response", () => {
     // Two away acks total — one per away period.
     expect(events.filter((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toHaveLength(2);
   });
+
+  // DOD-INBOX-ONESHOT-1 AC1 — RELAY PATH: second unattended message goes through the relay-mediated
+  // seal path (submitSealLeaf → session_sealed), NOT the signaling-only handleActiveSealFlow.
+  //
+  // Revert test: reverting the IIFE back to `void handleActiveSealFlow(...).then(...)` would invoke
+  // handleActiveSealFlow, which calls submitSealLeaf only in close-session-handler.ts (not reached
+  // here), so no hash_submit_ack arrives and the session_sealed injection has no waiter —
+  // session.away.inbox.oneshot.sealed is never logged. The test would fail with a timeout.
+  it("DOD-INBOX-ONESHOT-1 AC1 (relay path): second unattended message → relay-mediated seal completes", async () => {
+    const priorBilateralMs = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "2000"; // short enough for a unit test
+    try {
+      const { logger, events } = makeLogger();
+      const relay = makeFakeRelayServerOneshot();
+      const sigRef: { inject?: (frame: unknown) => void } = {};
+      await makeAgentDir("alice");
+      // Use FakeNode (not a real libp2p node) so content delivery to counterparty succeeds trivially.
+      // Relay client is patched in below via patchRelayClientForTest — no real handshake needed.
+      const h = await start(logger, new FakeNode(), makeRecordingSignalingOneshot(sigRef));
+      const snm = h.getSessionNodeManager();
+
+      await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+      // Patch a fake relay client onto the active node entry so submitSealLeaf returns ok:true.
+      // The relay's openStream returns an in-process stream that responds to hash_submit.
+      // Wire a relay client onto the session node entry so submitSealLeaf can succeed.
+      // Use the relay-aware FakeNode variant so AgentRelayClient.#connect can open a stream
+      // to the fake relay server without a real libp2p node.
+      const aliceKp = await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+      const relayAwareNode = new FakeRelayAwareNode(relay);
+      const { AgentRelayClient } = await import("../session-relay-client.js");
+      const fakeRelayClient = new AgentRelayClient({
+        relayPeerId: FAKE_RELAY_PEER_ID_ONESHOT,
+        relayAddrs: [FAKE_RELAY_ADDR_ONESHOT],
+        keyProvider: aliceKp,
+        senderPubkey: await aliceKp.getPublicKey(),
+        logger,
+      });
+      await fakeRelayClient.connect(relayAwareNode as Parameters<typeof fakeRelayClient.connect>[0]);
+      await wait(100); // auth handshake
+      snm.patchRelayClientForTest("alice", SID_HEX, fakeRelayClient, SID_BYTES);
+
+      // First message: normal away ack — sets the dedup guard.
+      const msg1 = new TextEncoder().encode("hello [[OVER]]");
+      await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
+      await wait(100);
+      expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
+
+      // Second message: triggers the relay-mediated seal path.
+      const msg2 = new TextEncoder().encode("hello again [[OVER]]");
+      await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
+      await wait(100);
+
+      // Rejection must be logged and carry [[WRAP]].
+      expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeDefined();
+      const { messages } = snm.readTranscript("alice", SID_HEX);
+      expect(messages.filter((m) => m.direction === "sent").at(-1)?.text).toContain("[[WRAP]]");
+
+      // seal_initiated on the relay path must be logged (not seal_initiate_failed).
+      await wait(200);
+      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated" && e.context.path === "relay")).toBeDefined();
+      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiate_failed")).toBeUndefined();
+
+      // Inject session_sealed: the bilateral wait resolves and session.away.inbox.oneshot.sealed fires.
+      sigRef.inject!({
+        type: "session_sealed",
+        session_id: SID_BYTES,
+        sealed_root: new Uint8Array(32).fill(0xab),
+      });
+      await wait(200);
+      expect(events.find((e) => e.event === "session.away.inbox.oneshot.sealed")).toBeDefined();
+    } finally {
+      if (priorBilateralMs === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = priorBilateralMs;
+    }
+  }, 15_000);
 
   // Reviewer finding (a9099571, MEDIUM): a transient send failure must not permanently silence the
   // rest of the away period — the dedup guard must clear so the NEXT arrival retries.
