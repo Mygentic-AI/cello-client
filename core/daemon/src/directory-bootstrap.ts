@@ -31,29 +31,90 @@ export function resolveDirectoryUrl(env: Record<string, string | undefined> = pr
 }
 
 /**
+ * Failure class of a /bootstrap probe. DNS-INCIDENT R3 (2026-07-24): a blanket
+ * `catch { return null }` collapsed every distinct failure into one indistinguishable
+ * `unresolved` warning, so a machine-wide negative-DNS-cache outage (all names
+ * fail getaddrinfo, servers fully healthy) logged identically to a real server
+ * outage. `reason: "dns_error"` on all nodes at once now points at local
+ * resolution, not the directories.
+ * Incident: trustless-cello docs/planning/discussion_logs/2026-07-24_1630_post-wake-directory-dns-resolution-incident.md
+ */
+export type BootstrapFailureReason = "dns_error" | "connect_error" | "timeout" | "http_error" | "bad_response";
+
+export type BootstrapResult =
+  | { ok: true; multiaddr: string }
+  | { ok: false; reason: BootstrapFailureReason; detail?: string };
+
+/** DNS-level getaddrinfo failures vs transport-level connection failures. */
+const DNS_CODES = new Set(["ENOTFOUND", "EAI_AGAIN"]);
+
+/** Walk an error's `cause` chain for the first Node `code` (undici nests the coded error). */
+function findErrorCode(err: unknown): string | null {
+  let cur: unknown = err;
+  for (let depth = 0; depth < 5 && cur instanceof Error; depth++) {
+    const code = (cur as Error & { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    cur = cur.cause;
+  }
+  return null;
+}
+
+function classifyFetchError(err: unknown): { reason: BootstrapFailureReason; detail?: string } {
+  if (err instanceof Error && err.name === "AbortError") return { reason: "timeout", detail: "AbortError" };
+  const code = findErrorCode(err);
+  if (code !== null) {
+    if (DNS_CODES.has(code)) return { reason: "dns_error", detail: code };
+    return { reason: "connect_error", detail: code };
+  }
+  return { reason: "connect_error", detail: err instanceof Error ? err.message : String(err) };
+}
+
+/**
+ * Auto-discover the directory multiaddr via GET /bootstrap, classifying failures
+ * so callers can log a `reason` that distinguishes "this machine cannot resolve
+ * the name" from "the server is down" from "the payload is wrong".
+ */
+export async function fetchBootstrapResult(
+  directoryUrl: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<BootstrapResult> {
+  const bootstrapUrl = `${directoryUrl.replace(/\/$/, "")}/bootstrap`;
+  const ac = new AbortController();
+  const timeout = setTimeout(() => ac.abort(), 5000);
+  try {
+    let resp: Response;
+    try {
+      resp = await fetchFn(bootstrapUrl, { signal: ac.signal });
+    } catch (err: unknown) {
+      return { ok: false, ...classifyFetchError(err) };
+    }
+    if (!resp.ok) return { ok: false, reason: "http_error", detail: String(resp.status) };
+    let json: { multiaddr?: unknown };
+    try {
+      json = (await resp.json()) as { multiaddr?: unknown };
+    } catch (err: unknown) {
+      return { ok: false, reason: "bad_response", detail: err instanceof Error ? err.message : String(err) };
+    }
+    if (typeof json.multiaddr === "string" && json.multiaddr.includes("/p2p/")) {
+      return { ok: true, multiaddr: json.multiaddr };
+    }
+    return { ok: false, reason: "bad_response", detail: "multiaddr missing or lacks /p2p/" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
  * Auto-discover the directory multiaddr via GET /bootstrap on the directory HTTP
  * endpoint. Returns the multiaddr (which embeds the peer ID after "/p2p/"), or null.
+ * Thin compatibility wrapper over fetchBootstrapResult (which carries the failure class).
  */
 export async function fetchBootstrapMultiaddr(
   directoryUrl: string,
   fetchFn: typeof fetch = fetch,
 ): Promise<string | null> {
-  const bootstrapUrl = `${directoryUrl.replace(/\/$/, "")}/bootstrap`;
-  const ac = new AbortController();
-  const timeout = setTimeout(() => ac.abort(), 5000);
-  try {
-    const resp = await fetchFn(bootstrapUrl, { signal: ac.signal });
-    if (!resp.ok) return null;
-    const json = (await resp.json()) as { multiaddr?: unknown };
-    if (typeof json.multiaddr === "string" && json.multiaddr.includes("/p2p/")) {
-      return json.multiaddr;
-    }
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const result = await fetchBootstrapResult(directoryUrl, fetchFn);
+  return result.ok ? result.multiaddr : null;
 }
 
 /**
@@ -137,14 +198,17 @@ export async function manifestNodesToEndpoints(
         });
         return null;
       }
-      const multiaddr = await fetchBootstrapMultiaddr(base, fetchFn);
-      if (!multiaddr) {
+      const probe = await fetchBootstrapResult(base, fetchFn);
+      if (!probe.ok) {
         opts.logger.warn("directory.consortium.node.unresolved", {
           nodeId: node.nodeId,
           endpoint: node.endpoint,
+          reason: probe.reason,
+          detail: probe.detail,
         });
         return null;
       }
+      const multiaddr = probe.multiaddr;
       const peerId = parsePeerIdFromMultiaddr(multiaddr);
       if (!peerId) {
         opts.logger.error("directory.consortium.node.no_peer_id", { nodeId: node.nodeId, multiaddr });
@@ -192,8 +256,9 @@ export function createDirectoryEndpointResolver(
   let lastGood: DirectoryEndpoint | null = null;
 
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
-    const multiaddr = await fetchBootstrapMultiaddr(directoryUrl, fetchFn);
-    if (multiaddr) {
+    const probe = await fetchBootstrapResult(directoryUrl, fetchFn);
+    if (probe.ok) {
+      const multiaddr = probe.multiaddr;
       const peerId = parsePeerIdFromMultiaddr(multiaddr);
       if (peerId) {
         // Log only when the resolved endpoint actually changes (avoids per-connect noise).
@@ -205,7 +270,11 @@ export function createDirectoryEndpointResolver(
       }
       opts.logger.error("directory.bootstrap.no_peer_id", { directoryUrl, multiaddr });
     } else {
-      opts.logger.warn("directory.bootstrap.unavailable", { directoryUrl });
+      opts.logger.warn("directory.bootstrap.unavailable", {
+        directoryUrl,
+        reason: probe.reason,
+        detail: probe.detail,
+      });
     }
     // Fresh resolution failed — reuse the last known-good endpoint if we have one AND stale fallback
     // is enabled. When disabled (the failover-wrapper's primary probe), a fresh failure is reported

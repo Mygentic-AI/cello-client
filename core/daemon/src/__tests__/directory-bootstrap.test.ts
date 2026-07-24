@@ -10,6 +10,7 @@ import {
   PRODUCTION_DIRECTORY_URL,
   resolveDirectoryUrl,
   fetchBootstrapMultiaddr,
+  fetchBootstrapResult,
   parsePeerIdFromMultiaddr,
   createDirectoryEndpointResolver,
   createRosterAwareEndpointResolver,
@@ -100,6 +101,119 @@ describe("fetchBootstrapMultiaddr", () => {
       throw new Error("ECONNREFUSED");
     });
     expect(await fetchBootstrapMultiaddr("http://dir.example", fetchFn as unknown as typeof fetch)).toBeNull();
+  });
+});
+
+// ─── DNS-INCIDENT R3 (2026-07-24): failure-class visibility ──────────────────
+// The blanket `catch { return null }` collapsed DNS failure, connection failure,
+// timeout, and malformed payloads into one indistinguishable `unresolved` log,
+// which is why a machine-wide negative-DNS-cache outage looked identical to a
+// server outage. fetchBootstrapResult classifies; the log events carry `reason`.
+
+/** Mirror of Node/undici's `fetch failed` TypeError with a coded cause. */
+function undiciError(code: string): Error {
+  return Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error(code), { code }),
+  });
+}
+
+describe("fetchBootstrapResult failure classification", () => {
+  it("classifies getaddrinfo ENOTFOUND as dns_error", async () => {
+    const fetchFn = vi.fn(async () => {
+      throw undiciError("ENOTFOUND");
+    });
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "ENOTFOUND" });
+  });
+
+  it("classifies EAI_AGAIN as dns_error", async () => {
+    const fetchFn = vi.fn(async () => {
+      throw undiciError("EAI_AGAIN");
+    });
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "EAI_AGAIN" });
+  });
+
+  it("classifies ECONNREFUSED as connect_error", async () => {
+    const fetchFn = vi.fn(async () => {
+      throw undiciError("ECONNREFUSED");
+    });
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: false, reason: "connect_error", detail: "ECONNREFUSED" });
+  });
+
+  it("classifies an AbortError as timeout", async () => {
+    const fetchFn = vi.fn(async () => {
+      throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+    });
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: false, reason: "timeout", detail: "AbortError" });
+  });
+
+  it("classifies non-2xx as http_error with the status", async () => {
+    const fetchFn = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) }) as unknown as Response);
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: false, reason: "http_error", detail: "503" });
+  });
+
+  it("classifies unparseable JSON as bad_response", async () => {
+    const fetchFn = vi.fn(async () => ({
+      ok: true,
+      json: async () => {
+        throw new SyntaxError("Unexpected token");
+      },
+    }) as unknown as Response);
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toMatchObject({ ok: false, reason: "bad_response" });
+  });
+
+  it("classifies a payload without /p2p/ as bad_response", async () => {
+    const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: "/dns4/host/tcp/80/ws" }));
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toMatchObject({ ok: false, reason: "bad_response" });
+  });
+
+  it("returns ok+multiaddr on success", async () => {
+    const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }));
+    const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
+    expect(r).toEqual({ ok: true, multiaddr: MULTIADDR });
+  });
+});
+
+describe("failure reason threads into log events", () => {
+  it("directory.consortium.node.unresolved carries reason + detail", async () => {
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      ...silentLogger,
+      warn: (event, ctx) => events.push({ event, ctx: (ctx ?? {}) as Record<string, unknown> }),
+    };
+    const fetchFn = vi.fn(async () => {
+      throw undiciError("ENOTFOUND");
+    });
+    const nodes = [{ nodeId: "us-east-1", pubkey: "pk1", endpoint: "http://dir.example" }];
+    const out = await manifestNodesToEndpoints(nodes as never, { logger, fetchFn: fetchFn as unknown as typeof fetch });
+    expect(out).toEqual([]);
+    const unresolved = events.find((e) => e.event === "directory.consortium.node.unresolved");
+    expect(unresolved?.ctx).toMatchObject({ nodeId: "us-east-1", reason: "dns_error", detail: "ENOTFOUND" });
+  });
+
+  it("directory.bootstrap.unavailable carries reason + detail", async () => {
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger: Logger = {
+      ...silentLogger,
+      warn: (event, ctx) => events.push({ event, ctx: (ctx ?? {}) as Record<string, unknown> }),
+    };
+    const fetchFn = vi.fn(async () => {
+      throw undiciError("ECONNREFUSED");
+    });
+    const resolve = createDirectoryEndpointResolver({
+      logger,
+      directoryUrl: "http://dir.example",
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    expect(await resolve()).toBeNull();
+    const unavailable = events.find((e) => e.event === "directory.bootstrap.unavailable");
+    expect(unavailable?.ctx).toMatchObject({ reason: "connect_error", detail: "ECONNREFUSED" });
   });
 });
 
