@@ -827,7 +827,10 @@ async function startDaemonHoldingLock(
   }
   // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
   // the call site so it names the specific away agent.
-  const AWAY_MESSAGE_TEXT = "Agent is currently away. Your message has been received and will be read when the operator returns.";
+  // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
+  // without it a cooperative caller LLM has no reason to stop, sends a follow-up, and eats the
+  // DOD-INBOX-ONESHOT-1 rejection the design itself invited.
+  const AWAY_MESSAGE_TEXT = "Agent is currently away. Your message has been received and will be read when the operator returns. This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
   // M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — a single shared,
   // deliberately minimal template regardless of kind, distinct from AWAY-1's richer per-type text.
   const STRANGER_TEXT = "Dispatched.";
@@ -846,7 +849,11 @@ async function startDaemonHoldingLock(
       const latestHex = sessionNodeManager.peekLatestReceivedContentHex(agentName, sessionId);
       if (latestHex !== null) {
         const text = Buffer.from(latestHex, "hex").toString("utf8");
-        if (text.includes("[[WRAP]]")) {
+        // DOD-WRAP-SUBSTRING-1: match the APPENDED token, not any substring —
+        // DOD-SIGNAL-TOKEN-1 always appends the real token at the END of the body. A substring
+        // match would classify a mere mention of [[WRAP]] (sent signal:"over") as a close
+        // signal, silently skipping both the away reply and the oneshot rejection.
+        if (text.trimEnd().endsWith("[[WRAP]]")) {
           logger.info("session.away.response.skipped_wrap", { agentName, sessionId });
           return;
         }
@@ -866,7 +873,10 @@ async function startDaemonHoldingLock(
         awayAckSent.add(rejectedKey); // guard BEFORE async work — concurrent arrivals must not re-enter
         const record2 = sessionNodeManager.getSessionRecord(agentName, sessionId);
         if (record2 && record2.status === "active") {
-          const rejectText = "[[WRAP]] This inbox only accepts one message per visit. Closing.";
+          // Reviewer F2: token at the END — the daemon's own output must honor the
+          // DOD-SIGNAL-TOKEN-1 append-at-end contract that DOD-WRAP-SUBSTRING-1 detection
+          // is anchored on (a counterparty daemon's end-anchored detector must see this close).
+          const rejectText = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
           const rejectBytes = new TextEncoder().encode(rejectText);
           const rejectHash = createHash("sha256").update(new Uint8Array([0x00])).update(rejectBytes).digest();
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
@@ -1001,7 +1011,7 @@ async function startDaemonHoldingLock(
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
     // DOD-AWAY-WRAP-1 AC1: request kind uses a leave-a-message greeting that names the away agent.
     const systemDefault = kind === "request"
-      ? `${agentName} is currently away. Leave a message (send with [[WRAP]] to close) and it will be read when they return.`
+      ? `${agentName} is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.`
       : AWAY_MESSAGE_TEXT;
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {

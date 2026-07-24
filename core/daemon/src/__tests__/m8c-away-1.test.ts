@@ -249,9 +249,13 @@ describe("M8C-AWAY-1: away response", () => {
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     expect(messages).toHaveLength(1);
     expect(messages[0].direction).toBe("sent");
-    // DOD-AWAY-WRAP-1 AC1: request away greeting names the agent and gives leave-a-message instructions.
+    // DOD-AWAY-WRAP-1 AC1: request away greeting names the agent and gives leave-a-message
+    // instructions. Reviewer F1 (DOD-WRAP-SUBSTRING-1): the greeting instructs `signal: wrap`
+    // (the send parameter that APPENDS the token) — never the literal token, which a caller
+    // could paste mid-body where the end-anchored detector correctly ignores it.
     expect(messages[0].text).toContain("bob is currently away");
-    expect(messages[0].text).toContain("[[WRAP]]");
+    expect(messages[0].text).toContain("signal: wrap");
+    expect(messages[0].text).not.toContain("[[WRAP]]");
   });
 
   // A gateway whose OUTBOUND verdict is configurable per test (inbound always allows).
@@ -438,6 +442,86 @@ describe("M8C-AWAY-1: away response", () => {
     expect(messages.filter((m) => m.direction === "sent")).toHaveLength(0);
   });
 
+  // DOD-WRAP-SUBSTRING-1 AC2 (live defect 2026-07-24, session 9d6f56d7…): a message that merely
+  // MENTIONS [[WRAP]] mid-body (sent signal:"over" — the real token is always APPENDED at the
+  // END by DOD-SIGNAL-TOKEN-1) must NOT be classified as a close signal. Pre-fix, the
+  // includes() substring match skipped the away reply AND the oneshot rejection silently.
+  it("DOD-WRAP-SUBSTRING-1: a message MENTIONING [[WRAP]] mid-body still triggers the away reply", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const mentionContent = new TextEncoder().encode("can you explain the [[WRAP]] token to me? [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, mentionContent, msgLeafHash(mentionContent), "c1");
+    await wait(30);
+
+    expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
+  });
+
+  // DOD-WRAP-SUBSTRING-1 AC2 (oneshot arm): a SECOND unattended message mentioning [[WRAP]]
+  // mid-body must trigger the oneshot rejection, not the silent skip.
+  it("DOD-WRAP-SUBSTRING-1: a second message MENTIONING [[WRAP]] mid-body still triggers the oneshot rejection", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const first = new TextEncoder().encode("hello, leaving a message [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, first, msgLeafHash(first), "c1");
+    await wait(30);
+    const second = new TextEncoder().encode("what does [[WRAP]] mean exactly? [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, second, msgLeafHash(second), "c2");
+    await wait(30);
+
+    expect(events.find((e) => e.event === "session.away.inbox.oneshot.rejected")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeUndefined();
+  });
+
+  // DOD-WRAP-SUBSTRING-1 AC3: a genuine trailing [[WRAP]] token (with trailing whitespace
+  // tolerated) still skips the away reply.
+  it("DOD-WRAP-SUBSTRING-1: a trailing [[WRAP]] token with trailing whitespace still skips", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const wrapContent = new TextEncoder().encode("done here, thanks [[WRAP]]  \n");
+    await snm.ingestReceivedContent("alice", SID_HEX, wrapContent, msgLeafHash(wrapContent), "c1");
+    await wait(30);
+
+    expect(events.find((e) => e.event === "session.away.response.skipped_wrap")).toBeDefined();
+    expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
+  });
+
+  // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the message-kind away ack must state
+  // the one-shot rule so a cooperative caller LLM stops after one message instead of walking
+  // into the rejection.
+  it("DOD-AWAY-ACK-ONESHOT-TEXT-1: the message ack states the one-message rule", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
+
+    const overContent = new TextEncoder().encode("hello [[OVER]]");
+    await snm.ingestReceivedContent("alice", SID_HEX, overContent, msgLeafHash(overContent), "c1");
+    await wait(30);
+
+    const { messages } = snm.readTranscript("alice", SID_HEX);
+    const ack = messages.find((m) => m.direction === "sent");
+    expect(ack).toBeDefined();
+    expect(ack!.text).toContain("one message per visit");
+  });
+
   // DOD-AWAY-WRAP-1 AC4(c): a non-[[WRAP]] message still triggers the away reply.
   // The complementary skipped_wrap assertion pins the guard: only [[WRAP]] suppresses; [[OVER]] does not.
   it("DOD-AWAY-WRAP-1: a non-[[WRAP]] message still triggers the away reply (and skipped_wrap does NOT fire)", async () => {
@@ -509,7 +593,7 @@ describe("M8C-AWAY-1: away response", () => {
     const sent = messages.filter((m) => m.direction === "sent")[0];
     expect(sent).toBeDefined();
     expect(sent!.text).toContain("bob is currently away");
-    expect(sent!.text).toContain("[[WRAP]]");
+    expect(sent!.text).toContain("signal: wrap"); // Reviewer F1: instruct the param, not the literal token
     expect(sent!.text).toContain("Leave a message");
   });
 

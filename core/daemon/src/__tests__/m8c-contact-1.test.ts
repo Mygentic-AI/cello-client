@@ -346,7 +346,9 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
     // DOD-AWAY-WRAP-1 AC1: request-kind greeting names the agent and gives leave-a-message instructions.
     expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("bob is currently away");
-    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("[[WRAP]]");
+    // Reviewer F1 (DOD-WRAP-SUBSTRING-1): the greeting instructs `signal: wrap`, never the
+    // literal token (a pasted mid-body token is invisible to the end-anchored detector).
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toContain("signal: wrap");
   });
 
   it("K4/K5 (message-kind): an unknown sender's message on an existing session ALSO gets the minimal text; a known one gets the richer text", async () => {
