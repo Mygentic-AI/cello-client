@@ -426,12 +426,23 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // was read — safeCursorAdvance refuses to vault past a gap (e.g. an unread sent leaf from
         // another local connection) even though this specific sequence number is now known.
         safeCursorAdvance(connectionId, sessionId, new Set([entry.sequenceNumber]));
+        const contentText = Buffer.from(entry.contentHex, "hex").toString("utf8");
+        const trimmed = contentText.trimEnd();
+        const signalGuidance =
+          trimmed.endsWith("[[WRAP]]")
+            ? "Counterparty wrapped. Call cello_close_session now — do not reply."
+            : trimmed.endsWith("[[OVER]]")
+              ? "Counterparty's turn is done. Counterparty has indicated they are expecting a reply — use cello_send to reply."
+              : /\[\[STANDBY EST:\d+m\]\]$/.test(trimmed)
+                ? "Counterparty is working and will follow up when done — no response expected. To block: call cello_receive with a longer timeout_ms. To check back later: schedule a cron and call cello_receive then."
+                : undefined;
         return {
           ok: true,
-          content: Buffer.from(entry.contentHex, "hex").toString("utf8"),
+          content: contentText,
           sessionId,
           sequence_number: entry.sequenceNumber,
           senderPubkey: entry.senderPubkey,
+          ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
         };
       }
       // 2) F1-b: the session sealed while we were (or before we started) waiting — return the
@@ -466,7 +477,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
           };
         }
-        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting, or read cello_transcript for the full session history." };
+        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history." };
       }
       await new Promise((r) => setTimeout(r, Math.min(20, remaining)));
     }
