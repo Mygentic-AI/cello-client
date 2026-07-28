@@ -37,6 +37,10 @@ export type TestConsortiumNode = {
   region: string;
   provider: "aws" | "gcp" | "azure";
   endpoint: string;
+  /** M12 role split — optional; absent ⇒ validator (canonical body omits absent fields). */
+  role?: "validator" | "replica";
+  /** M12 anti-entropy dial identity — optional. */
+  peerId?: string;
 };
 
 export interface MakeTestManifestOpts {

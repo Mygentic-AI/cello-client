@@ -19,12 +19,25 @@ import type {
   ConsortiumNode,
   OfficerSignature,
   ManifestError,
+  NodeRole,
 } from "../manifest.js";
 import {
   MANIFEST_SIGNATURE_INVALID,
   MANIFEST_VERSION_ROLLBACK,
   MANIFEST_EXPIRED,
+  nodeRole,
+  isValidator,
+  validatorNodes,
 } from "../manifest.js";
+
+const mkNode = (nodeId: string, role?: NodeRole): ConsortiumNode => ({
+  nodeId,
+  pubkey: "a".repeat(64),
+  region: "us-east-1",
+  provider: "aws",
+  endpoint: "https://x.example.com",
+  ...(role ? { role } : {}),
+});
 
 // ─── AC-001: ConsortiumManifest type completeness ────────────────────────────
 
@@ -107,5 +120,52 @@ describe("AC-002: ManifestError type with const exports", () => {
   it("all three error codes are distinct strings", () => {
     const codes = new Set([MANIFEST_SIGNATURE_INVALID, MANIFEST_VERSION_ROLLBACK, MANIFEST_EXPIRED]);
     expect(codes.size).toBe(3);
+  });
+});
+
+// ─── M12 role split: role defaulting + validator filtering ───────────────────
+
+describe("M12 ROLE-MANIFEST-1: node role defaulting", () => {
+  it("a node with no role field is (effectively) a validator — backward compat", () => {
+    const node = mkNode("legacy");
+    expect(node.role).toBeUndefined();
+    expect(nodeRole(node)).toBe("validator");
+    expect(isValidator(node)).toBe(true);
+  });
+
+  it("an explicit validator is a validator; an explicit replica is not", () => {
+    expect(isValidator(mkNode("v", "validator"))).toBe(true);
+    expect(isValidator(mkNode("r", "replica"))).toBe(false);
+    expect(nodeRole(mkNode("r", "replica"))).toBe("replica");
+  });
+
+  it("validatorNodes excludes replicas and keeps role-less (default validator) nodes", () => {
+    const nodes = [mkNode("a"), mkNode("b", "validator"), mkNode("c", "replica")];
+    const vs = validatorNodes(nodes);
+    expect(vs.map((n) => n.nodeId)).toEqual(["a", "b"]);
+  });
+
+  it("an all-legacy (role-less) manifest counts every node as a validator", () => {
+    const nodes = [mkNode("a"), mkNode("b"), mkNode("c")];
+    expect(validatorNodes(nodes)).toHaveLength(3);
+  });
+
+  it("a replica-only node set yields zero validators (caller must reject)", () => {
+    const nodes = [mkNode("r1", "replica"), mkNode("r2", "replica")];
+    expect(validatorNodes(nodes)).toHaveLength(0);
+  });
+
+  it("ConsortiumNode accepts optional role and peerId", () => {
+    const node: ConsortiumNode = {
+      nodeId: "gcp-usc1",
+      pubkey: "b".repeat(64),
+      region: "us-central1",
+      provider: "gcp",
+      endpoint: "https://d.example.com",
+      role: "replica",
+      peerId: "12D3KooWTest",
+    };
+    expect(node.role).toBe("replica");
+    expect(node.peerId).toBe("12D3KooWTest");
   });
 });

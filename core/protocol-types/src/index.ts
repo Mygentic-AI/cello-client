@@ -157,12 +157,16 @@ export type {
   ConsortiumNode,
   OfficerSignature,
   ManifestError,
+  NodeRole,
 } from "./manifest.js";
 
 export {
   MANIFEST_SIGNATURE_INVALID,
   MANIFEST_VERSION_ROLLBACK,
   MANIFEST_EXPIRED,
+  nodeRole,
+  isValidator,
+  validatorNodes,
 } from "./manifest.js";
 
 // M7-SESSION-001: Seal-interrupted protocol types

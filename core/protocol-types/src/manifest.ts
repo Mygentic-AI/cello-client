@@ -9,6 +9,16 @@
  * fetching, caching, and bootstrap).
  */
 
+/**
+ * A node's role in the consortium (M12 role split).
+ *
+ * - `validator` holds FROST shares, participates in DKG, signs seals, and honors the kill
+ *   switch — it is counted in `T = majority(validators)`.
+ * - `replica` holds no shares and never signs; it replicates state for redundancy and reads
+ *   and is NEVER counted in the threshold arithmetic.
+ */
+export type NodeRole = "validator" | "replica";
+
 /** A single directory node in the consortium. */
 export interface ConsortiumNode {
   nodeId: string;
@@ -17,6 +27,39 @@ export interface ConsortiumNode {
   region: string;
   provider: "aws" | "gcp" | "azure";
   endpoint: string;
+  /**
+   * M12 role split. Absent ⇒ `validator` — every manifest written before the split has no
+   * `role` field, and every node in one was a validator, so the default preserves those
+   * manifests byte-for-byte (canonical body omits absent fields) AND semantically.
+   */
+  role?: NodeRole;
+  /**
+   * libp2p PeerId, needed by directory↔directory anti-entropy to dial a peer (M12). Absent in
+   * pre-M12 manifests; PeerIds lived only in unsigned SSM before the split. Optional so those
+   * manifests still verify.
+   */
+  peerId?: string;
+}
+
+/**
+ * The effective role of a node — the single defaulting rule, used everywhere.
+ * A node with no explicit `role` is a validator.
+ */
+export function nodeRole(node: ConsortiumNode): NodeRole {
+  return node.role ?? "validator";
+}
+
+/** True iff the node is (effectively) a validator. */
+export function isValidator(node: ConsortiumNode): boolean {
+  return nodeRole(node) === "validator";
+}
+
+/**
+ * The validator-role nodes of a manifest — the ONLY set that enters threshold arithmetic
+ * (`consortiumNodeCount`, DKG quorum, kill-switch honoring). Replicas are excluded.
+ */
+export function validatorNodes(nodes: readonly ConsortiumNode[]): ConsortiumNode[] {
+  return nodes.filter(isValidator);
 }
 
 /** An officer's Ed25519 signature over the canonical manifest body. */

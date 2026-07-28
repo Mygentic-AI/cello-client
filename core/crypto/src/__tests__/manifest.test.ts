@@ -498,6 +498,50 @@ describe("AC-012: makeTestManifest produces valid manifests", () => {
   });
 });
 
+// ─── M12 ROLE-MANIFEST-1: role-bearing manifests + replica-only rejection ─────
+
+describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
+  it("a pre-M12 (role-less) manifest still verifies unchanged — backward compat", () => {
+    const manifest = makeTestManifest(makeNodes());
+    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(true);
+  });
+
+  it("a mixed validator/replica manifest verifies and the role is inside the signed body", () => {
+    const nodes = makeNodes();
+    nodes[2] = { ...nodes[2], role: "replica", peerId: "12D3KooWReplica" };
+    const manifest = makeTestManifest(nodes);
+    // Signed successfully over the canonical body that now includes role/peerId:
+    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(true);
+    // Tamper: flipping the replica to a validator must break the signature (role is signed).
+    const tampered = {
+      ...manifest,
+      nodes: manifest.nodes.map((n, i) => (i === 2 ? { ...n, role: "validator" } : n)),
+    };
+    const t = verifyManifest(tampered, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(t.ok).toBe(false);
+  });
+
+  it("a replica-only manifest is rejected loudly even with valid signatures", () => {
+    const nodes = makeNodes().map((n) => ({ ...n, role: "replica" as const }));
+    const manifest = makeTestManifest(nodes);
+    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("manifest_signature_invalid");
+      expect(result.detail).toContain("no validator nodes");
+    }
+  });
+
+  it("one validator among replicas is enough to pass the validator-count gate", () => {
+    const nodes = makeNodes().map((n, i) => ({ ...n, role: (i === 0 ? "validator" : "replica") as "validator" | "replica" }));
+    const manifest = makeTestManifest(nodes);
+    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(true);
+  });
+});
+
 // ─── AC-013: Ceremony output verifies; rogue key fails ──────────────────────
 
 describe("AC-013: ceremony verification — rogue key fails", () => {

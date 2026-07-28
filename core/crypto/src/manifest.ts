@@ -136,6 +136,23 @@ export function verifyManifest(
     };
   }
 
+  // M12 ROLE-MANIFEST-1: a manifest with nodes but ZERO validators (every node role="replica")
+  // is rejected loudly. Replicas hold no shares and never sign, so no ceremony could ever
+  // complete — a replica-only consortium is non-functional and is treated as tampered, exactly
+  // like the empty case. Absent `role` ⇒ validator (backward compat), so pre-M12 manifests are
+  // unaffected: they always have ≥1 validator.
+  const validatorCount = manifest.nodes.filter(
+    (n) => (n as { role?: unknown }).role !== "replica",
+  ).length;
+  if (validatorCount === 0) {
+    return {
+      ok: false,
+      reason: "manifest_signature_invalid",
+      detail: "manifest contains no validator nodes (all replicas)",
+      diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+    };
+  }
+
   const body = canonicalManifestBody(manifest);
   const verifiedIndices = new Set<number>();
   const skippedEntries: ManifestVerifySkippedEntry[] = [];
