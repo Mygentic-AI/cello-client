@@ -155,6 +155,17 @@ describe("M12 ROLE-MANIFEST-1: node role defaulting", () => {
     expect(validatorNodes(nodes)).toHaveLength(0);
   });
 
+  it("nodeRole/isValidator treat any non-'replica' string as validator (matches crypto count)", () => {
+    // Untrusted input can carry a bad role despite the type; the verify boundary rejects it, but
+    // the in-memory helpers must never disagree with crypto's `!== "replica"` count. A capital
+    // "Replica" is NOT the exact replica sentinel → validator, identical to the crypto side.
+    const bad = { ...mkNode("x"), role: "Replica" as unknown as NodeRole };
+    expect(nodeRole(bad)).toBe("validator");
+    expect(isValidator(bad)).toBe(true);
+    const realReplica = { ...mkNode("y"), role: "replica" as NodeRole };
+    expect(isValidator(realReplica)).toBe(false);
+  });
+
   it("ConsortiumNode accepts optional role and peerId", () => {
     const node: ConsortiumNode = {
       nodeId: "gcp-usc1",

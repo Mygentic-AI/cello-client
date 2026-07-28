@@ -23,6 +23,7 @@ import type { IManifestProvider } from "@cello-protocol/transport";
 import { manifestNodesToEndpoints } from "./directory-bootstrap.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { RegistrationManager } from "./registration-manager.js";
+import { validatorNodes } from "@cello-protocol/protocol-types";
 
 export interface RegisterHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -124,15 +125,18 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       }
 
       const persistence = getPersistence(name);
-      // DOD-DKG-1: resolve the full consortium roster from the VERIFIED manifest so the DKG fans
-      // across all N directory nodes. Re-resolved here (ceremony time) for fresh failover
+      // DOD-DKG-1 + M12 ROLE-MANIFEST-1: resolve the consortium roster from the VERIFIED
+      // manifest, restricted to VALIDATOR-role nodes — replicas hold no shares and take no part
+      // in a DKG, so including one would either strand registration on a quorum-count mismatch
+      // or deal a share to a share-less node. The directory computes its quorum over validators
+      // too; the two sides must agree on N. Re-resolved here (ceremony time) for fresh failover
       // coordinates. NULL when NO manifest is configured (→ single-node DKG, M6/M7 back-compat);
       // a (possibly EMPTY) array when a manifest IS configured. The null-vs-empty distinction is
       // load-bearing: an empty roster (consortium configured but unreachable) must REFUSE in
       // registration-manager, NOT downgrade to single-node (code-reviewer B1 / fallback-finder).
       const currentManifest = manifestProvider?.getCurrentManifest();
       const consortiumRoster = currentManifest
-        ? await manifestNodesToEndpoints(currentManifest.nodes, { logger })
+        ? await manifestNodesToEndpoints(validatorNodes(currentManifest.nodes), { logger })
         : null;
       const ctx = new DaemonRegistrationContext({
         signaling: agentSignaling,

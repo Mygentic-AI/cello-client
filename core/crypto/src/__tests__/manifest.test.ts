@@ -507,6 +507,41 @@ describe("M12 ROLE-MANIFEST-1: verifyManifest and node roles", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("GOLDEN: a role-less manifest canonicalizes to fixed bytes with NO role key (byte-level compat)", () => {
+    // Pins canonicalManifestBody so any future change to it — which would silently invalidate
+    // every previously-signed manifest — goes red. Proves absent optional fields (role/peerId)
+    // never enter the signed bytes, so pre-M12 manifests are byte-for-byte identical.
+    const manifest = {
+      version: 1,
+      not_before: "2026-01-01T00:00:00Z",
+      expires: "2027-01-01T00:00:00Z",
+      nodes: [
+        { nodeId: "n1", pubkey: "a".repeat(64), region: "us-east-1", provider: "aws", endpoint: "https://a" },
+      ],
+      signatures: [],
+    };
+    const golden =
+      '{"expires":"2027-01-01T00:00:00Z",' +
+      '"nodes":[{"endpoint":"https://a","nodeId":"n1","provider":"aws","pubkey":"' +
+      "a".repeat(64) +
+      '","region":"us-east-1"}],' +
+      '"not_before":"2026-01-01T00:00:00Z","version":1}';
+    expect(new TextDecoder().decode(canonicalManifestBody(manifest))).toBe(golden);
+    expect(golden).not.toContain("role");
+    expect(golden).not.toContain("peerId");
+  });
+
+  it("rejects a node with an unknown role string (closes the domain — F1)", () => {
+    const nodes = makeNodes();
+    (nodes[1] as { role?: string }).role = "Replica"; // capital R — a tooling typo
+    const manifest = makeTestManifest(nodes);
+    const result = verifyManifest(manifest, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.detail).toContain("unknown role");
+    }
+  });
+
   it("a mixed validator/replica manifest verifies and the role is inside the signed body", () => {
     const nodes = makeNodes();
     nodes[2] = { ...nodes[2], role: "replica", peerId: "12D3KooWReplica" };

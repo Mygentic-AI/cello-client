@@ -43,10 +43,14 @@ export interface ConsortiumNode {
 
 /**
  * The effective role of a node — the single defaulting rule, used everywhere.
- * A node with no explicit `role` is a validator.
+ * A node with no explicit `role` is a validator, and — since `role` is untrusted at runtime
+ * despite the type — anything that is not exactly "replica" is a validator. This matches the
+ * crypto verify-boundary count (`!== "replica"`) exactly; a manifest that reached a consumer
+ * has already passed `verifyManifest`, which rejects any role outside {validator, replica}, so
+ * the only values that survive here are the two valid ones.
  */
 export function nodeRole(node: ConsortiumNode): NodeRole {
-  return node.role ?? "validator";
+  return (node.role as unknown) === "replica" ? "replica" : "validator";
 }
 
 /** True iff the node is (effectively) a validator. */

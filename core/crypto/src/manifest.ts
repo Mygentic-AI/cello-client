@@ -136,11 +136,28 @@ export function verifyManifest(
     };
   }
 
-  // M12 ROLE-MANIFEST-1: a manifest with nodes but ZERO validators (every node role="replica")
-  // is rejected loudly. Replicas hold no shares and never sign, so no ceremony could ever
-  // complete — a replica-only consortium is non-functional and is treated as tampered, exactly
-  // like the empty case. Absent `role` ⇒ validator (backward compat), so pre-M12 manifests are
-  // unaffected: they always have ≥1 validator.
+  // M12 ROLE-MANIFEST-1: close the role domain at the verification boundary. `role` is
+  // untrusted input; nothing upstream validates it. Reject any node whose role is PRESENT and
+  // is neither exactly "validator" nor exactly "replica" — otherwise a one-character tooling
+  // error (e.g. "Replica") would be counted as a validator here (`!== "replica"`) while the
+  // directory's `validatorNodes` helper (`role === "validator"`) excludes it, a cross-repo
+  // gate/arithmetic split-brain. On the validated domain the two spellings coincide.
+  for (const n of manifest.nodes) {
+    const role = (n as { role?: unknown }).role;
+    if (role !== undefined && role !== "validator" && role !== "replica") {
+      return {
+        ok: false,
+        reason: "manifest_signature_invalid",
+        detail: `node has unknown role ${JSON.stringify(role)} (expected "validator" or "replica")`,
+        diagnostics: { threshold, validOfficers: [], skippedEntries: [] },
+      };
+    }
+  }
+
+  // A manifest with nodes but ZERO validators (every node role="replica") is rejected loudly.
+  // Replicas hold no shares and never sign, so no ceremony could ever complete — a replica-only
+  // consortium is non-functional and is treated as tampered, exactly like the empty case.
+  // Absent `role` ⇒ validator (backward compat), so pre-M12 manifests always have ≥1 validator.
   const validatorCount = manifest.nodes.filter(
     (n) => (n as { role?: unknown }).role !== "replica",
   ).length;
