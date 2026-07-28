@@ -106,8 +106,14 @@ export interface CreateNodeOptions {
  * The Stream object has `source` (AsyncIterable) and `sink` (async iterable consumer).
  * Use `it-length-prefixed` and `it-pipe` for framed I/O per the it-length-prefixed
  * varint-prefix convention (unsigned varint per https://github.com/multiformats/unsigned-varint).
+ *
+ * `remotePeerId` (M12 anti-entropy): the CONNECTION's authenticated remote PeerId
+ * (`connection.remotePeer`, established by the Noise handshake) — never a wire claim. Handlers
+ * that channel-bind an application-level identity to the transport identity (the AE mutual
+ * handshake) MUST use this instead of any peer-supplied field. Optional second parameter, so
+ * existing single-arg handlers are unaffected.
  */
-export type CelloStreamHandler = (stream: Stream) => void | Promise<void>;
+export type CelloStreamHandler = (stream: Stream, remotePeerId?: string) => void | Promise<void>;
 
 // ─── CelloNode interface ─────────────────────────────────────────────────────
 

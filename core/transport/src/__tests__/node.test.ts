@@ -171,6 +171,27 @@ describe("AC-003: Echo stream with it-length-prefixed framing", () => {
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
 
+  it("handler receives the connection's Noise-authenticated remote PeerId (M12 channel binding)", async () => {
+    const { node: nodeA } = await makeStartedNode();
+    const { node: nodeB } = await makeStartedNode();
+    scope.addCleanup(async () => { try { await nodeA.stop(); } catch {} });
+    scope.addCleanup(async () => { try { await nodeB.stop(); } catch {} });
+
+    let seenRemotePeerId: string | undefined;
+    await nodeB.handle(CELLO_PROTOCOL_ID, async (stream: Stream, remotePeerId?: string) => {
+      seenRemotePeerId = remotePeerId;
+      await stream.close().catch(() => {});
+    });
+
+    await nodeA.dial(nodeB.listenAddresses()[0]!);
+    const stream = await nodeA.newStream(nodeB.getPeerId(), CELLO_PROTOCOL_ID);
+    // Give the handler a tick to fire, then assert: B saw A's TRANSPORT identity — the
+    // connection's remotePeer from the Noise handshake, never a wire claim.
+    await new Promise((r) => setTimeout(r, 200));
+    await stream.close().catch(() => {});
+    expect(seenRemotePeerId).toBe(nodeA.getPeerId());
+  });
+
   it("A writes 32 bytes, B echoes back, A receives same 32 bytes", async () => {
     const { node: nodeA } = await makeStartedNode();
     const { node: nodeB } = await makeStartedNode();

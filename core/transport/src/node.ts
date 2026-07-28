@@ -277,8 +277,11 @@ class CelloNodeImpl implements CelloNode {
   }
 
   async handle(protocolId: string, handler: CelloStreamHandler, opts?: { maxInboundStreams?: number }): Promise<void> {
-    // libp2p v3 StreamHandler receives (stream, connection); we only need stream
-    const streamHandler: StreamHandler = (stream: Stream) => handler(stream);
+    // libp2p v3 StreamHandler receives (stream, connection). The connection's remotePeer is the
+    // Noise-authenticated transport identity — passed through so channel-binding handlers (M12
+    // anti-entropy) can pin against it. Single-arg handlers simply ignore the second parameter.
+    const streamHandler: StreamHandler = (stream: Stream, connection) =>
+      handler(stream, connection?.remotePeer?.toString());
     // DOD-NAT-REACHABILITY-1: every CELLO protocol must run over a LIMITED relayed
     // connection — a punch-failed session lives on one, and refusing the stream
     // there silently converts "NAT'd but online" into "unreachable" (the mailbox
