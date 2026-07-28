@@ -77,3 +77,7 @@ export {
 } from "./consortium-keys.js";
 export type { TestConsortiumNode, MakeTestManifestOpts } from "./manifest-test-fixture.js";
 export { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR } from "./manifest-test-fixture.js";
+
+// M12 DOD-AE-APPEND-1: directory<->directory anti-entropy peer-auth TBS
+export { buildAePeerAuthTbs, verifyAePeerAuth, AE_PEER_AUTH_DOMAIN } from "./ae-peer-auth.js";
+export type { AePeerAuthParams } from "./ae-peer-auth.js";
