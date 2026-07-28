@@ -75,4 +75,28 @@ describe("M12 AE peer-auth TBS", () => {
     expect(verifyAePeerAuth("not-hex", params, new Uint8Array(64))).toBe(false);
     expect(verifyAePeerAuth(pub, params, new Uint8Array(3))).toBe(false);
   });
+
+  it("INJECTIVITY: a newline inside any field is rejected (build throws) — no cross-context reuse", () => {
+    // Without validation, {nodeIdA:'x\ny', nodeIdB:'z'} and {nodeIdA:'x', nodeIdB:'y\nz'} would
+    // produce identical TBS bytes. Rejecting embedded newlines makes the join injective.
+    for (const field of ["nodeIdA", "nodeIdB", "peerIdA", "peerIdB", "timestamp"] as const) {
+      expect(() => buildAePeerAuthTbs({ ...params, [field]: "x\ny" }), field).toThrow(/newline/);
+    }
+  });
+
+  it("A==B is rejected (a single node cannot complete a 'mutual' handshake alone)", () => {
+    expect(() => buildAePeerAuthTbs({ ...params, nodeIdB: params.nodeIdA })).toThrow(/distinct/);
+    expect(() => buildAePeerAuthTbs({ ...params, peerIdB: params.peerIdA })).toThrow(/distinct/);
+  });
+
+  it("a non-hex or wrong-length nonce is rejected", () => {
+    expect(() => buildAePeerAuthTbs({ ...params, nonceAHex: "zz".repeat(32) })).toThrow(/nonce/);
+    expect(() => buildAePeerAuthTbs({ ...params, nonceBHex: "aa" })).toThrow(/nonce/);
+  });
+
+  it("verifyAePeerAuth fails CLOSED on an invalid param set (build would throw) — returns false, no throw", () => {
+    const sig = ed25519.sign(buildAePeerAuthTbs(params), seed);
+    expect(verifyAePeerAuth(pub, { ...params, nodeIdA: "x\ny" }, sig)).toBe(false);
+    expect(verifyAePeerAuth(pub, { ...params, nodeIdB: params.nodeIdA }, sig)).toBe(false);
+  });
 });

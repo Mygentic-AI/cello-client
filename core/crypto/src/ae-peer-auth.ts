@@ -15,12 +15,25 @@
  * domain string would let a signature minted for another purpose verify here.
  *
  * SHARED builder: signer (each directory) and verifier (its peer) both call this, so neither can
- * diverge. Newline-joined UTF-8 text TBS, matching the directory step-5 challenge style.
+ * diverge. Newline-joined UTF-8 text TBS, matching the directory step-5 challenge style. The
+ * builder VALIDATES every field (no embedded newline; nonces are 32-byte hex; A≠B) so the
+ * newline-join is injective by construction — two different param sets can never produce the same
+ * TBS bytes, closing the cross-context signature-reuse footgun. `verifyAePeerAuth` treats an
+ * invalid param set as a failed verification (fail closed), never a throw.
+ *
+ * Channel obligations this primitive CANNOT enforce (the `/cello/anti-entropy/1.0.0` handler MUST):
+ *  - each side mints its own nonce from a CSPRNG;
+ *  - a single-use nonce store rejects any replayed nonce;
+ *  - a bounded timestamp-window check;
+ *  - **peerIdA/peerIdB MUST be taken from the LOCAL Noise-authenticated connection, never from a
+ *    wire claim** — this is the load-bearing channel-binding assumption; without it the binding is
+ *    forgeable.
  *
  * Reference: RFC 8032 (Ed25519).
  */
 
 import { verify as ed25519Verify } from "./ed25519.js";
+import { hexToBytes } from "./hex.js";
 
 /** Dedicated domain — MUST NOT collide with any other TBS domain in the system. */
 export const AE_PEER_AUTH_DOMAIN = "cello-ae-peer-auth-v1";
@@ -47,6 +60,23 @@ export interface AePeerAuthParams {
  * bytes from the same params (roles fixed by who dialed); each signs it with its own node key.
  */
 export function buildAePeerAuthTbs(p: AePeerAuthParams): Uint8Array {
+  // Injectivity: the fields are newline-joined, so a newline INSIDE a field would let two distinct
+  // param sets produce identical TBS bytes (cross-context signature reuse). Reject embedded
+  // newlines and pin the nonce format so the encoding is injective by construction. Build-time
+  // inputs are this node's own → throwing is correct (verifyAePeerAuth catches it → false).
+  const isHex64 = (s: string): boolean => /^[0-9a-fA-F]{64}$/.test(s);
+  for (const f of [p.nodeIdA, p.nodeIdB, p.peerIdA, p.peerIdB, p.timestamp]) {
+    if (f.includes("\n")) throw new Error("ae-peer-auth: field contains a newline");
+  }
+  if (!isHex64(p.nonceAHex) || !isHex64(p.nonceBHex)) {
+    throw new Error("ae-peer-auth: nonce must be 32-byte hex");
+  }
+  // A==B collapses the "mutual" handshake — both sides sign identical bytes verified against the
+  // same key, so ONE signature satisfies both directions (a single node completes it alone,
+  // violating the sovereign invariant). Distinct identities are required.
+  if (p.nodeIdA === p.nodeIdB || p.peerIdA === p.peerIdB) {
+    throw new Error("ae-peer-auth: A and B must be distinct nodes");
+  }
   const tbs = [
     AE_PEER_AUTH_DOMAIN,
     p.nodeIdA,
@@ -71,15 +101,13 @@ export function buildAePeerAuthTbs(p: AePeerAuthParams): Uint8Array {
 export function verifyAePeerAuth(peerPubkeyHex: string, params: AePeerAuthParams, signature: Uint8Array): boolean {
   const pub = hexToBytes(peerPubkeyHex, 32);
   if (pub === null) return false;
-  return ed25519Verify(pub, buildAePeerAuthTbs(params), signature);
-}
-
-/** Decode an exact-length hex string to bytes; null on any malformation (never throws). */
-function hexToBytes(hex: string, expectedBytes: number): Uint8Array | null {
-  if (hex.length !== expectedBytes * 2 || !/^[0-9a-fA-F]+$/.test(hex)) return null;
-  const out = new Uint8Array(expectedBytes);
-  for (let i = 0; i < expectedBytes; i++) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  let tbs: Uint8Array;
+  try {
+    // Fail closed: a malformed/hostile param set (embedded newline, bad nonce, A==B) makes the
+    // builder throw; that is a verification failure, never an exception out of verify.
+    tbs = buildAePeerAuthTbs(params);
+  } catch {
+    return false;
   }
-  return out;
+  return ed25519Verify(pub, tbs, signature);
 }

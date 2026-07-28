@@ -22,6 +22,7 @@
  */
 
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { hexToBytes } from "./hex.js";
 
 /**
  * Structural type for ConsortiumManifest — compatible with
@@ -241,22 +242,6 @@ export function verifyManifest(
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
 /**
- * Decode a hex string to Uint8Array with expected byte length validation.
- * Returns null if the input is not valid hex or doesn't match expectedBytes.
- * Never throws.
+ * hexToBytes is shared from ./hex.js (also used by ae-peer-auth) so validation strictness cannot
+ * diverge between callers — strict regex + exact length, never throws.
  */
-function hexToBytes(hex: string, expectedBytes: number): Uint8Array | null {
-  if (hex.length !== expectedBytes * 2) {
-    return null;
-  }
-  // Strict hex validation before parsing — parseInt("0g", 16) returns 0 (not NaN),
-  // so the NaN check alone does not catch strings with invalid non-leading characters.
-  if (!/^[0-9a-fA-F]+$/.test(hex)) {
-    return null;
-  }
-  const bytes = new Uint8Array(expectedBytes);
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
