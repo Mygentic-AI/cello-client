@@ -46,6 +46,34 @@ const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
 const CC_RE = /\b(?:\d[ -]?){13,19}\b/g;
 const PHONE_RE = /\+?\d[\d\s().-]{7,}\d/g;
 
+/**
+ * A DATE IS NOT A PHONE NUMBER, and agents write dates constantly.
+ *
+ * `PHONE_RE` includes `-` in its character class, so `2026-07-29` matches it — and because the PII
+ * disposition is WARN, the message is NOT SENT until the operator resolves the flag. Reported from
+ * live use within hours of the enforcing flip (2026-07-29): an agent citing a date had its message
+ * refused twice and could not clear it itself, because `allow_once` is gated on
+ * `autonomous_override`, which is off by default and settable only by a human at a terminal.
+ *
+ * The exclusions below are shapes that CANNOT be a phone number, so nothing real is weakened:
+ *   - ISO 8601 dates and datetimes — `2026-07-29`, `2026-07-29T18:33:51`.
+ *   - Digit runs longer than 15, which exceeds the E.164 maximum.
+ *
+ * Deliberately NOT excluded: bare 11-13 digit runs like a commit number or an epoch timestamp.
+ * Those overlap the legitimate phone range (a country-code number is 11 digits), and silently
+ * passing them would weaken the guard to fix an annoyance. They still warn, and that is the correct
+ * trade — but it is why the operator escape hatch has to work.
+ */
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/;
+
+function isPlausiblePhone(value: string): boolean {
+  const digits = value.replace(/\D/g, "");
+  if (digits.length < 7) return false;
+  if (ISO_DATE_RE.test(value.trim())) return false;   // a date, not a number anyone can dial
+  if (/^\d+$/.test(value.trim()) && digits.length > 15) return false; // beyond E.164
+  return true;
+}
+
 function flagIdFor(category: string, value: string): string {
   return createHash("sha256").update(`${category}:${value}`).digest("hex").slice(0, 12);
 }
@@ -108,7 +136,7 @@ export class OutboundPIIScreener {
     collect(IP_RE, "pii:ip", 1, validIp);
     collect(SSN_RE, "pii:ssn", 2, () => true);
     collect(CC_RE, "pii:credit_card", 3, (v) => luhnValid(v.replace(/[^0-9]/g, "")));
-    collect(PHONE_RE, "pii:phone", 4, (v) => v.replace(/\D/g, "").length >= 7);
+    collect(PHONE_RE, "pii:phone", 4, isPlausiblePhone);
 
     // Resolve overlaps: a higher-priority (more specific) match wins its character span.
     candidates.sort((a, b) => a.priority - b.priority || a.start - b.start);
