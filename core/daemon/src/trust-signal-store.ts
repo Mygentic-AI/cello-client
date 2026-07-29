@@ -508,6 +508,20 @@ export class TrustSignalStore {
    * a JS filter, because `include` already routes around `default_present` and a JS branch would
    * route around this the same way.
    *
+   * **`lower(subject)`, because hex has a case and this comparison is byte-exact.** SQLite `TEXT`
+   * uses BINARY collation, so `AABB…` and `aabb…` — the same key — do not match, and the row would
+   * be silently un-presented with no error. The daemon's own `k_local_pubkey` is always lowercase
+   * (`agent-loader.ts` derives it with `.toString("hex")`), so only the STORED side can vary, and it
+   * can: `putWalletSignal` already names "a directory version-skew emitting uppercase hex" as a real
+   * condition. Comparing case-insensitively is the correct equality for hex, not a fallback that
+   * papers over a mismatch.
+   *
+   * Note the residual, because it is NOT closed here: the directory's
+   * `JOIN agent_profiles ap ON ap.k_local_pubkey = sr.subject` is case-sensitive too, so an
+   * uppercase-hex subject that ever got minted would still be invisible THERE. Closing that means
+   * constraining the value where it is produced (the portal's mint) — which spans three components
+   * and is its own decision, not something to smuggle into a presentation-scoping unit.
+   *
    * **ACCOUNT-subject rows are deliberately NOT scoped here, and that half is deferred, not done.**
    * `listPresentable` scopes them on `accountId` — but the daemon holds no `accountId` anywhere in
    * production code, so there is nothing to compare against and inventing one is a separate
@@ -550,7 +564,7 @@ export class TrustSignalStore {
         `SELECT * FROM wallet_trust_signals
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
-            AND (subject_kind <> 'agent' OR subject = ?)`,
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
       )
       .all(nowSec, opts.presentingAgentPubkeyHex) as unknown as EnvelopeDbRow[];
     const all = rows.map(toWalletRow);
@@ -582,7 +596,7 @@ export class TrustSignalStore {
         `SELECT DISTINCT type FROM wallet_trust_signals
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
-            AND (subject_kind <> 'agent' OR subject = ?)`,
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
       )
       .all(now, presentingAgentPubkeyHex) as Array<{ type: string }>;
     return rows.map((r) => r.type);

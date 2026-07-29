@@ -279,6 +279,19 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toHaveLength(1);
     });
 
+    it("matches an UPPERCASE-hex stored subject — hex has a case, SQLite TEXT does not fold it", () => {
+      // A directory version-skew emitting uppercase hex (a condition putWalletSignal already names)
+      // would store `AABB…` for the same key the daemon holds as `aabb…`. Under BINARY collation
+      // that row is invisible — never presented, no error. Case-insensitive comparison is the
+      // correct equality for hex, not a fallback.
+      store.putWalletSignal(envelope({
+        signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey.toUpperCase(), type: "phone",
+      }));
+      expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toHaveLength(1);
+      // ...and it is still SCOPED: Bob does not get Alice's row just because the case differs.
+      expect(store.listAllActive({ presentingAgentPubkeyHex: bobPubkey })).toEqual([]);
+    });
+
     it("REFUSES an absent, empty, or MALFORMED presenting identity — never presents everything (§5a)", () => {
       // ABSENT IS NOT FINE. If the caller cannot say who is presenting, the answer is refuse, not
       // "offer the lot" — the fail-open direction is precisely the defect being fixed, and it would
