@@ -293,6 +293,25 @@ export async function logout(
  *    the agent's key material + registration state + agent→user link.
  *  - Print structured JSON; exit 0 on success, 1 on failure.
  */
+/**
+ * Does this look like a pre-auth capability rather than a mis-paste?
+ *
+ * A capability (M8B-PREAUTH-CAP) is base64url JSON carrying a signed authorization. This decodes
+ * far enough to tell it apart from someone pasting the literal words "CELLO_PREAUTH_TOKEN", and no
+ * further: the directory verifies the signature, the issuer and the window. Anything stricter here
+ * would let a client-side "malformed" strand a capability the consortium would have accepted.
+ */
+function hasCapabilityShape(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+    if (typeof parsed !== "object" || parsed === null) return false;
+    const c = parsed as Record<string, unknown>;
+    return typeof c["sig"] === "string" && typeof c["nonce"] === "string" && typeof c["expires_at"] === "string";
+  } catch {
+    return false;
+  }
+}
+
 export async function register(
   celloDir: string,
   agent: string,
@@ -322,10 +341,21 @@ export async function register(
   // rejects non-DEV-, the prod PgTokenValidator rejects non-CELLO-). Without this, local CLI registration
   // is impossible — the CLI rejects the very DEV- tokens the local validator requires (it broke the whole
   // spine suite).
-  if (!preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
+  // A pre-auth CAPABILITY (M8B-PREAUTH-CAP) is also valid here and has neither prefix: it is
+  // base64url JSON, and preauth-capability.ts specifies it is "carried in the existing round-1
+  // preAuthToken string field and pasted into `cello register`". Gating on the two legacy prefixes
+  // alone rejected the very artifact the capability design says to paste — a capability could be
+  // minted, signed and accepted by every directory, and never got past the client.
+  //
+  // Shape only, and deliberately NOT by importing @cello-protocol/crypto: the CLI does not depend
+  // on it, and adding a package to the operator's install for a paste-error guard is the wrong
+  // trade. The signature, the issuer and the validity window stay the directory's to verify — this
+  // must never become a second authority on whether a capability is valid.
+  const looksLikeCapability = hasCapabilityShape(preAuthToken);
+  if (!looksLikeCapability && !preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
     return {
       exitCode: 1,
-      output: "That doesn't look like a pre-auth token — real ones start with 'CELLO-' followed by 33 characters. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the token itself?) Get a token from the CELLO Operations Agent on Telegram, then retry.",
+      output: "That doesn't look like a pre-auth token or capability — tokens start with 'CELLO-' followed by 33 characters, and a capability is a long base64url blob. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the value itself?) Get one from the CELLO Operations Agent on Telegram, then retry.",
     };
   }
 

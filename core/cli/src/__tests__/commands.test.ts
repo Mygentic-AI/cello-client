@@ -381,7 +381,30 @@ describe("cli commands", () => {
       const result = await register(tempDir, "alice", "CELLO_PREAUTH_TOKEN");
       expect(result.exitCode).toBe(1);
       expect(result.output).toContain("start with 'CELLO-'");
+      // …and the literal words are still caught: they are not decodable as a capability either.
       expect(result.output).not.toContain("No daemon running"); // short-circuited before the daemon
+    });
+
+    // M12: a pre-auth CAPABILITY has neither legacy prefix — it is base64url JSON. Gating on the
+    // prefixes alone rejected the very artifact preauth-capability.ts says to paste here, so a
+    // capability could be minted, signed and accepted by every directory and still never get past
+    // the client. It must reach the daemon, where the signature and validity window are verified.
+    it("lets a pre-auth CAPABILITY through the client gate to the daemon", async () => {
+      const capability = Buffer.from(
+        JSON.stringify({
+          nonce: "0".repeat(32),
+          phone_stub_hash: "a".repeat(64),
+          email_domain: "example.com",
+          issued_at: "2026-07-29T00:00:00.000Z",
+          expires_at: "2030-07-29T00:00:00.000Z",
+          sig: "b".repeat(128),
+        }),
+        "utf8",
+      ).toString("base64url");
+      const result = await register(tempDir, "alice", capability);
+      // Reached the daemon (absent here) rather than being refused as malformed by the CLI.
+      expect(result.output).toContain("No daemon running");
+      expect(result.output).not.toContain("look like a pre-auth token");
     });
 
     // A CELLO- token of the wrong length passes the client-side prefix gate (D13: the client checks
