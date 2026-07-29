@@ -229,10 +229,11 @@ export class OutboundScreener {
           `autonomous_override is OFF.\n` +
           `WHAT YOU CAN DO NOW: re-send with those flag(s) set to "redact" — the value is replaced ` +
           `by a typed placeholder and the message goes.\n` +
-          `IF THE FLAG IS WRONG (a date, an id, your own address), the operator runs ONE of these ` +
-          `in their terminal — you cannot, and should relay it rather than work around it:\n` +
-          `  cello config set pii_whitelist <value>     # this value stops being flagged, permanently\n` +
-          `  cello config set autonomous_override true  # you may then clear your own flags\n` +
+          `IF THE FLAG IS WRONG (a date, an id, your own address), relay these to your operator to ` +
+          `run in their terminal. DO NOT run them yourself and do not work around the guard:\n` +
+          `  cello config list                          # FIRST — 'set' REPLACES the whitelist\n` +
+          `  cello config set pii_whitelist <existing,values,plus,new>\n` +
+          `  cello config set autonomous_override true  # or: let agents clear their own flags\n` +
           `Either prompts them to confirm once. To see exactly what fired: cello policy log`,
         redact: [], allowOnce: [], whitelistAddRequested: [],
       };

@@ -23,6 +23,21 @@ import { GatewayRecordStore, type RecordDisposition } from "../records/record-st
 import { createHash } from "node:crypto";
 import type { ScreenVerdict } from "../types.js";
 
+/**
+ * Fold the WAL into the main database without CLOSING the connection.
+ *
+ * `PRAGMA wal_checkpoint(TRUNCATE)` writes committed frames back into `gateway.db` and empties the
+ * log. Unlike `close()`, it does not unlink `-wal`/`-shm` out from under the daemon's long-lived
+ * handles — which is the whole point (review F1/F2). Best-effort by design: a failed checkpoint
+ * loses nothing, because the records are already committed and the next reader recovers the WAL.
+ */
+function checkpointStore(...stores: Array<{ checkpoint?: () => void } | undefined>): void {
+  for (const s of stores) {
+    try { s?.checkpoint?.(); }
+    catch (err) { process.stderr.write(`cello-gateway: checkpoint failed: ${err instanceof Error ? err.message : String(err)}\n`); }
+  }
+}
+
 async function main(): Promise<void> {
   const socketPath = process.env["CELLO_GATEWAY_SOCKET"];
   if (!socketPath) {
@@ -186,8 +201,17 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     void handle.stop().then(() => {
-      config?.close();
-      records?.close();
+      // DO NOT close() these. Review F1/F2, reproduced against @signalapp/sqlcipher 3.3.5: ANY
+      // connection's close unlinks `-wal`/`-shm` — not just the last one. The daemon holds long-
+      // lived handles on this same file, and `restartSecurityGateway` SIGTERMs this process on
+      // every successful `cello config set`. So closing here left the daemon's handle permanently
+      // stale: `cello policy log` under-reported for the rest of that daemon's life while still
+      // reporting chainValid:true, and the next config write through the stale handle returned ok
+      // and left the store SQLITE_CORRUPT.
+      //
+      // Checkpoint instead: fold the WAL into the main file so nothing is lost, and let process
+      // exit release the descriptors. Exit unlinks nothing that another process is still using.
+      checkpointStore(config, records);
       process.stderr.write(`cello-gateway: stopped (${signal})\n`);
       process.exit(0);
     });

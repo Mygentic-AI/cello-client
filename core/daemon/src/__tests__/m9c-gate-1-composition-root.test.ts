@@ -287,6 +287,58 @@ describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     }
   }, 90_000);
 
+  it("records survive a SIDECAR RESTART — the state the daemon actually lives in (review F1)", async () => {
+    // THE ASSERTION THE FIRST FIX WAS MISSING. Holding the daemon's handle open stopped the
+    // daemon's own reads from unlinking the WAL — but the SIDECAR was still closing its handles on
+    // SIGTERM, and `cello config set` restarts the sidecar on every success. Any close unlinks
+    // `-wal`/`-shm` for every process sharing the file, so the daemon's held handle went stale and
+    // `cello policy log` under-reported for the rest of that daemon's life, while still reporting
+    // chainValid:true. The sidecar now checkpoints instead of closing.
+    booted = await bootDaemon(dir, "security.gateway.spawned");
+    await new Promise((r) => setTimeout(r, 1_500));
+
+    const { LocalSidecarGatewayClient } = await import("@cello-protocol/gateway");
+    const screenOnce = async (n: number): Promise<string> => {
+      const c = new LocalSidecarGatewayClient({ socketPath: join(dir, "gateway.sock") });
+      const v = await c.screenOutbound(
+        new TextEncoder().encode(`msg${n} aws_key=AKIAABCDEFGHIJKLMNOP`),
+        { agentName: "a", sessionId: "s" },
+      );
+      await c.close();
+      return v.disposition;
+    };
+
+    const { connectToDaemon } = await import("../ipc-client.js");
+    const ipc = await connectToDaemon(join(dir, "daemon.sock"));
+    try {
+      await ipc.send("ipc.connect", { clientType: "cli" });
+      const log = async (): Promise<Record<string, unknown>> =>
+        (await ipc.send("cello_policy_log", {})) as Record<string, unknown>;
+
+      expect(await screenOnce(1)).toBe("redact");
+      expect((await log()).total).toBe(1);
+
+      // The real trigger: a config set restarts the sidecar. Tightening, so no confirm needed.
+      const set = (await ipc.send("cello_config_set", { key: "rate_max_per_window", value: 5 })) as
+        Record<string, unknown>;
+      expect(set.ok).toBe(true);
+      await new Promise((r) => setTimeout(r, 2_000));
+
+      expect(await screenOnce(2)).toBe("redact");
+      const after = await log();
+      // 2, not 1. A stale handle reports 1 here — and reports chainValid true while doing it,
+      // which is a truncated audit view asserting its own integrity.
+      expect(after.total).toBe(2);
+      expect(after.chainValid).toBe(true);
+
+      // And the config store is still readable — a write through a stale handle corrupted it (F2).
+      const list = (await ipc.send("cello_config_list", {})) as Record<string, unknown>;
+      expect(list.ok).toBe(true);
+    } finally {
+      await ipc.close();
+    }
+  }, 120_000);
+
   it("SIGTERM takes the sidecar down with the daemon — no orphan holding the store lock", async () => {
     booted = await bootDaemon(dir, "security.gateway.spawned");
     const spawned = booted.lines().find((l) => l.event === "security.gateway.spawned")!;

@@ -27,12 +27,10 @@ describe("M9B — the phone rule does not fire on dates agents actually write", 
     expect(cats('"ts":"2026-07-29T18:33:51"')).not.toContain("pii:phone");
   });
 
-  it("does NOT flag a digit run beyond the E.164 maximum", () => {
-    // 16 digits. E.164 caps a dialable number at 15, so this cannot be a phone number.
-    // (An earlier version of this test used 15 digits — exactly AT the maximum — and correctly
-    // still flagged; the test data was wrong, not the rule.)
-    expect(cats("the run took 1785350111106123 ms")).not.toContain("pii:phone");
-  });
+  // REMOVED: "does NOT flag a digit run beyond the E.164 maximum". That rule is gone (review F4)
+  // — `4155552671000000` is a real number with six zeros stapled on, and the exclusion passed it.
+  // The reported false positive was dates, never long ids, so the rule bought nothing and cost a
+  // covert channel. The replacement assertions are in the F3/F4 block below.
 
   it("STILL flags a 15-digit run — the E.164 maximum is dialable, so it is not excluded", () => {
     expect(cats("id 178535011110612 recorded")).toContain("pii:phone");
@@ -47,5 +45,28 @@ describe("M9B — the phone rule does not fire on dates agents actually write", 
     // Overlaps the legitimate country-code phone range. Passing it silently would weaken the guard
     // to fix an annoyance; it warns, and the operator escape hatch is what makes that acceptable.
     expect(cats("commit 30479063088 succeeded")).toContain("pii:phone");
+  });
+});
+
+describe("M9B — review F3/F4: a date next to a phone number is still a phone number", () => {
+  const screener2 = new OutboundPIIScreener({ whitelist: [] });
+  const c = (t: string): string[] =>
+    screener2.screen(new TextEncoder().encode(t), `s-${Math.random()}`).events.map((e) => e.category);
+
+  it("FLAGS a phone number that follows a date — the start-anchor bypass", () => {
+    // One greedy match starting date-shaped. The first fix discarded the whole thing.
+    expect(c("2026-07-29 415-555-2671")).toContain("pii:phone");
+    expect(c("2026-07-29 (415) 555-2671")).toContain("pii:phone");
+    expect(c("2026-07-29 14155552671")).toContain("pii:phone");
+    expect(c("2026-07-29-4155552671")).toContain("pii:phone");
+  });
+
+  it("FLAGS a phone number padded past 15 digits — the >15 exclusion is gone", () => {
+    expect(c("ref 4155552671000000 end")).toContain("pii:phone");
+    expect(c("ref 0000004155552671 end")).toContain("pii:phone");
+  });
+
+  it("STILL does not flag a bare date", () => {
+    expect(c("tracked in 2026-07-29 planning")).not.toContain("pii:phone");
   });
 });

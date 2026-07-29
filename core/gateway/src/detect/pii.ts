@@ -66,12 +66,28 @@ const PHONE_RE = /\+?\d[\d\s().-]{7,}\d/g;
  */
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/;
 
+/**
+ * A date is not a phone number — but a date FOLLOWED BY one is still a phone number.
+ *
+ * `PHONE_RE`'s character class contains space, `-`, `(`, `)` and `.`, so `2026-07-29 415-555-2671`
+ * is ONE greedy match. The first version of this predicate tested `ISO_DATE_RE` (start-anchored,
+ * no `$`) against the whole match and discarded it — so prefixing eleven characters walked a real
+ * phone number straight past the guard. Review finding F3, and it was a security regression I
+ * introduced while fixing a false positive.
+ *
+ * So: strip a leading ISO date if there is one, then judge WHAT REMAINS. A bare date has nothing
+ * left and is not a phone; a date plus a number still has the number.
+ *
+ * The former ">15 digits cannot be a phone" rule is GONE (F4): `4155552671000000` is a real
+ * number with six zeros stapled on, and it passed. The reported false positive was dates, never
+ * long ids, so the rule bought nothing and cost a covert channel.
+ */
 function isPlausiblePhone(value: string): boolean {
-  const digits = value.replace(/\D/g, "");
-  if (digits.length < 7) return false;
-  if (ISO_DATE_RE.test(value.trim())) return false;   // a date, not a number anyone can dial
-  if (/^\d+$/.test(value.trim()) && digits.length > 15) return false; // beyond E.164
-  return true;
+  const trimmed = value.trim();
+  const remainder = trimmed.replace(ISO_DATE_RE, "");
+  // Nothing but a date -> not a phone. Anything left -> judge the remainder on its own merits.
+  const digits = remainder.replace(/\D/g, "");
+  return digits.length >= 7;
 }
 
 function flagIdFor(category: string, value: string): string {

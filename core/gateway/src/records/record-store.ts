@@ -156,6 +156,14 @@ export class GatewayRecordStore {
     return true;
   }
 
+  /**
+   * Fold the WAL back into the main file WITHOUT closing (review F1/F2). Closing unlinks
+   * `-wal`/`-shm` for every process sharing the file, including the daemon's long-lived handles.
+   */
+  checkpoint(): void {
+    this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+
   close(): void {
     if (this.#closed) return;
     this.#closed = true;

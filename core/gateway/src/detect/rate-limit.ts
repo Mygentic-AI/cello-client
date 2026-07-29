@@ -10,6 +10,7 @@
  * verdict carries a distinct `rate_limited` reason and a retry-after, surfaced to the agent through
  * the outbound seam's never-hang feedback (M9-CORE-001 / M9-FEED-001).
  */
+import { operatorCanRun } from "../screen/affordance.js";
 export interface RateLimitConfig {
   /** Max messages allowed per agent within the window. */
   maxPerWindow: number;
@@ -60,7 +61,9 @@ export class OutboundRateLimiter {
         guidance:
           `Outbound rate limit reached for this agent (${this.#config.maxPerWindow} messages per ` +
           `${Math.round(this.#config.windowMs / 1000)}s). This message was not sent. ` +
-          `Wait about ${Math.ceil(retryAfterMs / 1000)}s and retry; the window slides as older messages age out.`,
+          `WHAT YOU CAN DO NOW: wait about ${Math.ceil(retryAfterMs / 1000)}s and retry — the window ` +
+          `slides as older messages age out, so this clears itself.\n` +
+          operatorCanRun("rate_max_per_window", "<higher number>"),
         retryAfterMs,
       };
     }

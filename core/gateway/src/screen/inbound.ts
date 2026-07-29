@@ -16,6 +16,7 @@
  * un-acked for redelivery. Language and injection run on the SANITIZED text (what the agent would
  * see), so confusable lookalikes normalized to Latin are judged as Latin, not held.
  */
+import { operatorCanRun, noOperatorOverride } from "./affordance.js";
 import { sanitizeInbound } from "../detect/sanitize.js";
 import { scanInjectionPatterns } from "../detect/injection-patterns.js";
 import { screenInboundLanguage, type LanguageOptions } from "../detect/language.js";
@@ -103,7 +104,9 @@ export class InboundScreener {
         }],
         terminal: true,
         reason: "inbound_language_blocked",
-        guidance: lang.reason ?? "This message is in a language outside the gateway allowlist; it was not delivered.",
+        guidance:
+          (lang.reason ?? "This message is in a language outside the allowlist; it was not delivered.") +
+          "\n" + operatorCanRun("language_allow", "<comma-separated languages>"),
       };
     }
 
@@ -123,7 +126,12 @@ export class InboundScreener {
           }],
           terminal: true,
           reason: "inbound_injection_blocked",
-          guidance: "This message was classified as a prompt-injection attempt and was not delivered to the agent.",
+          guidance:
+            "This message was classified as a prompt-injection attempt and was not delivered.\n" +
+            noOperatorOverride(
+              "If you believe it is legitimate, ask the sender to rephrase it without instruction-like " +
+              "framing, or have the operator inspect it directly.",
+            ),
         };
       }
       if (scan.verdict === "flag") {

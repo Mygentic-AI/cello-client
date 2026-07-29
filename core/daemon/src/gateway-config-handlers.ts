@@ -115,6 +115,37 @@ function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok:
   return { ok: true, value: n };
 }
 
+/**
+ * Map a store-layer throw onto a named cause. An exit-point label on a corrupt security store is
+ * the error-substitution defect this project keeps finding (review F7).
+ */
+function storeFault(message: string): { ok: false; reason: string; guidance: string } {
+  if (/SQLITE_CORRUPT|malformed|SQLITE_IOERR/i.test(message)) {
+    return {
+      ok: false,
+      reason: "store_corrupt",
+      guidance:
+        "The security layer's store could not be read — the file is damaged. Screening still runs " +
+        "and still fails closed, but the config history and the audit trail are unreadable. Stop " +
+        `the daemon, move ~/.cello/gateway.db aside, and restart to begin a fresh store. (${message})`,
+    };
+  }
+  if (/SQLITE_BUSY|locked/i.test(message)) {
+    return {
+      ok: false,
+      reason: "store_locked",
+      guidance:
+        "The security layer's store is locked by another process — usually an orphaned gateway " +
+        `from a previous daemon. Stop it and retry. (${message})`,
+    };
+  }
+  return {
+    ok: false,
+    reason: "store_read_failed",
+    guidance: `The security layer's store could not be read. (${message})`,
+  };
+}
+
 export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): void {
   const { handlers, celloDir, logger, getClientType, restartSecurityGateway } = deps;
 
@@ -167,7 +198,11 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       if (/invalid value for config key|unknown config key/i.test(message)) {
         return { ok: false, reason: "invalid_value", guidance: message };
       }
-      throw err;
+      // Review F7: a READ that throws used to escape as `internal_error: an unexpected error
+      // occurred, check daemon logs` — sending the operator to the logs for a corrupted security
+      // store, with no remedy named, while the OPEN path carefully produces store_plaintext_file /
+      // store_locked / store_key_mismatch. The read path deserves the same.
+      return storeFault(message);
     }
     // NO `finally { store.close() }`. The close is the defect: it unlinks the WAL from under the
     // sidecar and every record it writes afterwards is lost.
@@ -248,7 +283,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         ?? "The security layer's record store could not be opened. Check the daemon log.";
       return { ok: false, reason: code, guidance };
     }
-    {
+    try {
       const all = store.all();
       const filtered = since === undefined ? all : all.filter((r) => r.recordedAt >= since);
       const page = filtered.slice(-limit).reverse();
@@ -272,6 +307,8 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         // BEFORE they reason from its contents.
         chainValid: store.verifyChain(),
       };
+    } catch (err: unknown) {
+      return storeFault(err instanceof Error ? err.message : String(err));
     }
   });
 
