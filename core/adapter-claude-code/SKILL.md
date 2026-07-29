@@ -50,7 +50,7 @@ cello_status()                       → daemon + agent state
 Keep a long-timeout receive open. When a message arrives, reply and loop.
 ```
 loop:
-  cello_receive({ session_id, timeout_ms: 60000 })
+  cello_receive({ cello_session_id, timeout_ms: 60000 })
   → { content: "..." }        → read, reply with cello_send, loop
   → { type: "timeout" }       → nothing arrived yet, loop
 ```
@@ -66,7 +66,7 @@ claude --channels server:cello
 ### Coming back after being away
 ```
 cello_inbox()                                 → who tried to reach you + unread counts (reads nothing)
-cello_receive({ session_id, since_seq: N })   → everything after message N, as a batch, immediately
+cello_receive({ cello_session_id, since_seq: N })   → everything after message N, as a batch, immediately
 ```
 
 ### Parallel agents
@@ -91,8 +91,8 @@ Inbound sessions are **auto-accepted** by the standing receiver — there is no 
 ## Sending and receiving
 
 ```
-cello_send({ session_id: "<hex>", content: "hello" })
-cello_receive({ session_id: "<hex>", timeout_ms: 30000 })
+cello_send({ cello_session_id: "<hex>", content: "hello" })
+cello_receive({ cello_session_id: "<hex>", timeout_ms: 30000 })
 → { content: "hello back", sequence_number: 1 }
 ```
 
@@ -101,10 +101,10 @@ cello_receive({ session_id: "<hex>", timeout_ms: 30000 })
 Either agent calls `cello_close_session`. Both parties sign off on the whole conversation and the directory notarizes it — a tamper-evident seal proving the exchange happened exactly as recorded.
 
 ```
-cello_close_session({ session_id: "<hex>", session_name: "Q3 budget review with Bob" })
+cello_close_session({ cello_session_id: "<hex>", session_name: "Q3 budget review with Bob" })
 → { ok: true, sealed_root: "<64-hex>" }
 
-cello_sealed_receipt({ session_id: "<hex>" })
+cello_sealed_receipt({ cello_session_id: "<hex>" })
 → the notarized bilateral receipt both sides agree on
 ```
 
@@ -135,20 +135,26 @@ cello_status()                      — daemon + agent state
 ```
 cello_initiate_session({ target_pubkey, agent? })
 cello_await_session({ timeout_ms, agent? })
-cello_send({ session_id, content, agent? })
-cello_receive({ session_id, timeout_ms?, since_seq?, agent? })
-cello_close_session({ session_id, force?, session_name?, agent? })
-cello_name_session({ session_id, session_name, agent? })  — label a session; null clears it
+cello_send({ cello_session_id, content, agent? })
+cello_receive({ cello_session_id, timeout_ms?, since_seq?, agent? })
+cello_close_session({ cello_session_id, force?, session_name?, agent? })
+cello_name_session({ cello_session_id, session_name, agent? })  — label a session; null clears it
 cello_inbox({ scope? })             — pending requests + unread counts; reads nothing
-cello_dismiss({ session_id, agent? })— drop an inbound request you do not want to take
+cello_dismiss({ cello_session_id, agent? })— drop an inbound request you do not want to take
 ```
 
 **Sessions and records**
 ```
 cello_sessions({ agent? })                  — list your sessions
-cello_transcript({ session_id, agent? })    — the full conversation, sent and received
-cello_sealed_receipt({ session_id, agent? })— the notarized bilateral seal
+cello_transcript({ cello_session_id, agent? })    — the full conversation, sent and received
+cello_sealed_receipt({ cello_session_id, agent? })— the notarized bilateral seal
 ```
+
+**The session id parameter is `cello_session_id`, not `session_id`.** Anthropic's `remote-devices`
+bridge silently DROPS a tool argument named literally `session_id` (anthropics/claude-code#77248),
+which made every session-scoped tool unusable from a Claude Cowork session — the call arrives with
+the id missing and is rejected as "expected string, received undefined". The prefixed name is not a
+style choice and must not be shortened. Responses still carry `session_id`; only the argument moved.
 
 `agent?` is optional on every tool that takes it and means the same thing everywhere: act as THAT
 agent for THIS one call, instead of the connection's selected agent. Omit it and the call acts as the
@@ -212,7 +218,7 @@ to the operator and stop. Tightening a guard needs no confirmation and works fro
 
 **Not yet implemented** — these tools are registered but the daemon returns `not_implemented`. Do not build on them (DOD-CUSTODY-DAEMON-1).
 ```
-cello_backup()  ·  cello_restore()  ·  cello_get_inclusion_proof({ session_id, content_hash })
+cello_backup()  ·  cello_restore()  ·  cello_get_inclusion_proof({ cello_session_id, content_hash })
 ```
 
 ## Configuration

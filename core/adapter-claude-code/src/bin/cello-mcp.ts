@@ -369,6 +369,25 @@ server.tool("cello_policy_log", "What the security layer actually did to your me
 });
 
 // ─── Session tools (proxied through daemon) ─────────────────────────────────
+//
+// ⚠️ THE PARAMETER IS `cello_session_id`, NOT `session_id`. DO NOT "TIDY" IT BACK.
+//
+// Anthropic's `remote-devices` bridge — the path a Claude Cowork session takes to a local MCP
+// server — DROPS the tool argument named literally `session_id`, and only that token. Sibling
+// arguments on the same call arrive intact. anthropics/claude-code#77248, open since 2026-07-13;
+// the suspected cause is a collision with the Streamable-HTTP transport's own `Mcp-Session-Id`.
+// No client setting disables it, so the name is unofficially unusable no matter whose bug it is.
+//
+// Cost of the collision, before the rename: a Cowork client could open a session and then do
+// NOTHING with it — all eight session-scoped tools were dead, every call rejected as
+// "expected string, received undefined" while the operator passed a correct id every time
+// (2026-07-29 discussion log). The failure names the parameter, which reads like a client bug in
+// the caller and sent the first investigation into the daemon. It is neither.
+//
+// This is the MCP SURFACE ONLY. The IPC field stays `session_id` — each handler renames on
+// destructure and the daemon, CLI, database and wire protocol are untouched. Response and
+// notification fields also stay `session_id`: the bridge strips tool-call ARGUMENTS, nothing else,
+// and renaming what we send back would be churn that breaks the channel contract for no gain.
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {
   target_pubkey: z.string().describe("Hex-encoded public key of the target agent"),
@@ -404,7 +423,7 @@ const SIGNAL_ERROR =
   "Append the appropriate token to your message and resend.";
 
 server.tool("cello_send", "Send a message in an active session. REQUIRED: every message must include a signal parameter declaring your next action.", {
-  session_id: z.string().describe("Session ID"),
+  cello_session_id: z.string().describe("Session ID"),
   content: z.string().describe("Message content (UTF-8 text)"),
   signal: z.enum(["over", "standby", "wrap"]).optional().describe(
     "REQUIRED. Declares your next action after sending:\n" +
@@ -424,7 +443,7 @@ server.tool("cello_send", "Send a message in an active session. REQUIRED: every 
       "\"allow_always\"} to resolve each flagged item. Omitted flags default to redact.",
     ),
   agent: z.string().optional().describe("Agent to send as (defaults to the current agent)"),
-}, async ({ session_id, content, signal, est_minutes, governance_decisions, agent }) => {
+}, async ({ cello_session_id: session_id, content, signal, est_minutes, governance_decisions, agent }) => {
   if (!signal) {
     return jsonText({ ok: false, reason: "missing_signal", guidance: SIGNAL_ERROR });
   }
@@ -446,11 +465,11 @@ server.tool("cello_send", "Send a message in an active session. REQUIRED: every 
 });
 
 server.tool("cello_receive", "Receive a message from an active session. With since_seq, instead returns a batch of all messages received after that sequence number (stateless catch-up for away-then-return — no replay race).", {
-  session_id: z.string().describe("Session ID"),
+  cello_session_id: z.string().describe("Session ID"),
   timeout_ms: z.number().optional().describe("Timeout in milliseconds (default: 30000). Ignored when since_seq is set."),
   since_seq: z.number().optional().describe("Catch-up mode: return all messages with sequence > since_seq as a batch, instead of waiting for the next live message."),
   agent: z.string().optional().describe("Agent to receive as (defaults to the current agent)"),
-}, async ({ session_id, timeout_ms, since_seq, agent }) => {
+}, async ({ cello_session_id: session_id, timeout_ms, since_seq, agent }) => {
   const result = await proxy.call("cello_receive", agent
     ? { session_id, timeout_ms, since_seq, agent }
     : { session_id, timeout_ms, since_seq });
@@ -458,11 +477,11 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
 });
 
 server.tool("cello_close_session", "Close a session. Normally triggers the bilateral seal ceremony (both parties get a notarized receipt). Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list. Name the session while you close it: you have just had the conversation, so this is the moment you know what it was.", {
-  session_id: z.string().describe("Session ID to close"),
+  cello_session_id: z.string().describe("Session ID to close"),
   force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
   session_name: z.string().nullable().optional().describe("A short human-readable label for this conversation, e.g. 'Q3 budget review with Bob'. PRIVATE TO YOU: never sent to the counterparty, the relay, or the directory. Optional — leave it out if you cannot describe the session accurately; an unnamed session is a signal it did not close cleanly, so do not invent one."),
   agent: z.string().optional().describe("Agent whose session to close (defaults to the current agent)"),
-}, async ({ session_id, force, session_name, agent }) => {
+}, async ({ cello_session_id: session_id, force, session_name, agent }) => {
   const result = await proxy.call("cello_close_session", {
     session_id,
     ...(force ? { force } : {}),
@@ -475,10 +494,10 @@ server.tool("cello_close_session", "Close a session. Normally triggers the bilat
 });
 
 server.tool("cello_name_session", "Name (or rename) one of your sessions so you can tell it apart from the others. Works on ANY session — active, interrupted, or long sealed — because naming an old conversation for the record is the point. Pass null to clear the name. PRIVATE TO YOU: the name is never sent to the counterparty, the relay, or the directory, and it cannot change anything the protocol does.", {
-  session_id: z.string().describe("Session ID to name"),
+  cello_session_id: z.string().describe("Session ID to name"),
   session_name: z.string().nullable().describe("The label, e.g. 'The deploy postmortem' — or null to clear it"),
   agent: z.string().optional().describe("Agent whose session to name (defaults to the current agent)"),
-}, async ({ session_id, session_name, agent }) => {
+}, async ({ cello_session_id: session_id, session_name, agent }) => {
   const result = await proxy.call("cello_name_session", agent
     ? { session_id, session_name, agent }
     : { session_id, session_name });
@@ -486,9 +505,9 @@ server.tool("cello_name_session", "Name (or rename) one of your sessions so you 
 });
 
 server.tool("cello_dismiss", "Dismiss a sealed/terminal session from your inbox. Use this after reading the transcript of an answering-machine style session (one that sealed while you were away). Sets a local read_at timestamp — never propagated, never part of the seal or hash chain. After dismissal the session no longer appears in cello_inbox. Only valid for terminal sessions (sealed, abandoned, seal_interrupted_pending, interrupted).", {
-  session_id: z.string().describe("Session ID to dismiss"),
+  cello_session_id: z.string().describe("Session ID to dismiss"),
   agent: z.string().optional().describe("Agent whose session to dismiss (defaults to the current agent)"),
-}, async ({ session_id, agent }) => {
+}, async ({ cello_session_id: session_id, agent }) => {
   const result = await proxy.call("cello_dismiss", agent ? { session_id, agent } : { session_id });
   return jsonText(result);
 });
@@ -525,25 +544,25 @@ server.tool("cello_restore", "Restore agent state from backup", {}, async () => 
 });
 
 server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session. NOTE: the response echoes `session_name` — that is YOUR private label for the session, not part of the receipt. If you share this receipt with the counterparty or a third party (comparing sealed_root is the normal reason to), strip it: they have never seen it and it may describe the conversation in terms you did not say to them.", {
-  session_id: z.string().describe("Session ID"),
+  cello_session_id: z.string().describe("Session ID"),
   agent: z.string().optional().describe("Agent whose receipt to read (defaults to the current agent)"),
-}, async ({ session_id, agent }) => {
+}, async ({ cello_session_id: session_id, agent }) => {
   const result = await proxy.call("cello_get_sealed_receipt", agent ? { session_id, agent } : { session_id });
   return jsonText(result);
 });
 
 server.tool("cello_transcript", "Get the durable, readable conversation transcript for a session (sent + received messages, in order) — recoverable after a daemon restart", {
-  session_id: z.string().describe("Session ID"),
+  cello_session_id: z.string().describe("Session ID"),
   agent: z.string().optional().describe("Agent whose transcript to read (defaults to the current agent)"),
-}, async ({ session_id, agent }) => {
+}, async ({ cello_session_id: session_id, agent }) => {
   const result = await proxy.call("cello_get_transcript", agent ? { session_id, agent } : { session_id });
   return jsonText(result);
 });
 
 server.tool("cello_get_inclusion_proof", "Get inclusion proof for a message in a sealed session", {
-  session_id: z.string().describe("Session ID"),
+  cello_session_id: z.string().describe("Session ID"),
   content_hash: z.string().describe("Content hash to prove inclusion of"),
-}, async ({ session_id, content_hash }) => {
+}, async ({ cello_session_id: session_id, content_hash }) => {
   const result = await proxy.call("cello_get_inclusion_proof", { session_id, content_hash });
   return jsonText(result);
 });

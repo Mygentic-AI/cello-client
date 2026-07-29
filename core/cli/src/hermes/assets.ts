@@ -494,7 +494,7 @@ class CelloAdapter(BasePlatformAdapter):
                 " NOT restart anything. Do this now, in order: (1) call the cello_use_agent tool"
                 " with name='"
                 + agent
-                + "'; (2) call the cello_receive tool with session_id='"
+                + "'; (2) call the cello_receive tool with cello_session_id='"
                 + session_id
                 + "' to read the message; (3) reply with the cello_send tool on that same session"
                 " unless the message genuinely needs no answer. cello_receive must precede"

@@ -136,6 +136,12 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     // names a tool that is not on the tool surface.
     expect(SHIPPED_DOCS.length, "no shipped .md found — this audit would be vacuous").toBeGreaterThan(0);
     const known = knownToolNames();
+    // `cello_session_id` is a PARAMETER, not a tool — it carries the prefix only because Anthropic's
+    // remote-devices bridge strips an argument named literally `session_id` (claude-code#77248), so
+    // the bare name is unusable on the MCP surface. It is listed explicitly rather than pattern-
+    // matched away: a prefix-tolerant rule would re-open the exact hole this test was written to
+    // close, where a doc names something that does not exist and nothing notices.
+    known.add("cello_session_id");
     const stale = SHIPPED_DOCS.flatMap((d) =>
       [...new Set(d.text.match(/cello_[a-z_]+/g) ?? [])]
         .filter((t) => !known.has(t))
