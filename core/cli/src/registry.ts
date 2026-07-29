@@ -871,7 +871,9 @@ export const COMMANDS: readonly CommandSpec[] = [
       "Usage:\n" +
       "  cello consent list                    — signals others issued about you, awaiting your decision\n" +
       "  cello consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
-      "  cello consent refuse <hash>           — refuse one: it stays inert and is never presented\n" +
+      "  cello consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
+      "                                          Anything after the hash is a message back to the issuer\n" +
+      "                                          (optional). With no message they are told nothing.\n" +
       "\n" +
       "Anyone can write an endorsement ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
       "until you accept it: nothing pending is presented, counted, or visible to a counterparty. That is\n" +
@@ -890,7 +892,11 @@ export const COMMANDS: readonly CommandSpec[] = [
       const [sub, hash] = positional;
       if (sub === "list") return consentList(ctx.celloDir, o);
       if (sub === "accept" && hash) return consentAccept(ctx.celloDir, hash, o);
-      if (sub === "refuse" && hash) return consentRefuse(ctx.celloDir, hash, o);
+      if (sub === "refuse" && hash) {
+        // Everything after the hash is the message — free text, so it is joined rather than parsed.
+        const msg = positional.slice(2).join(" ");
+        return consentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
+      }
       return { stdout: helpForSpec("consent"), stderr: "", exitCode: 1 };
     },
   },

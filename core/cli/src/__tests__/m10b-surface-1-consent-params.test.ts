@@ -35,9 +35,13 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     const method = `cello_consent_${verb}`;
 
     it(`${method}: the MCP tool sends a parameter the handler reads`, () => {
-      const call = mcp.match(new RegExp(`proxy\\.call\\("${method}", \\{([^}]*)\\}`));
-      expect(call, `${method} is proxied by the MCP shim`).not.toBeNull();
-      const sent = [...call![1].matchAll(/(\w+)/g)].map((m) => m[1]);
+      // The call may be an inline literal OR a conditional (`cond ? {a, b} : {a}`), so read every
+      // object literal between the method name and the end of the call rather than assuming a shape.
+      const at = mcp.indexOf(`proxy.call("${method}"`);
+      expect(at, `${method} is proxied by the MCP shim`).toBeGreaterThan(-1);
+      const region = mcp.slice(at, mcp.indexOf("\n", at));
+      const sent = [...region.matchAll(/\{([^}]*)\}/g)]
+        .flatMap((m) => [...m[1].matchAll(/(\w+)/g)].map((w) => w[1]));
       const read = paramsReadBy(method);
       expect(sent.length).toBeGreaterThan(0);
       for (const name of sent) {
@@ -46,9 +50,18 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     });
 
     it(`${method}: the CLI sends a parameter the handler reads`, () => {
-      const call = cli.match(new RegExp(`IPC_METHODS\\["consent-${verb}"\\], \\{([^}]*)\\}`));
-      expect(call, `consent-${verb} is dispatched by the CLI`).not.toBeNull();
-      const sent = [...call![1].matchAll(/(\w+):/g)].map((m) => m[1]);
+      // Same: the CLI may pass a literal or build a `params` record first (optional fields are
+      // OMITTED rather than sent empty), so read the whole function body.
+      const at = cli.indexOf(`export function consent${verb[0].toUpperCase()}${verb.slice(1)}(`);
+      expect(at, `consent-${verb} is dispatched by the CLI`).toBeGreaterThan(-1);
+      // Start AFTER the signature line — the function's own opening brace is not an object literal,
+      // and reading it as one made `params:` (a type annotation) look like a parameter being sent.
+      const sigEnd = cli.indexOf("\n", at);
+      const body = cli.slice(sigEnd, cli.indexOf("\n}", at));
+      const sent = [
+        ...[...body.matchAll(/\{([^}]*)\}/g)].flatMap((m) => [...m[1].matchAll(/(\w+):/g)].map((w) => w[1])),
+        ...[...body.matchAll(/params\.(\w+) =/g)].map((m) => m[1]),
+      ];
       const read = paramsReadBy(method);
       expect(sent.length).toBeGreaterThan(0);
       for (const name of sent) {

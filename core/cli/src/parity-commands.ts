@@ -547,7 +547,10 @@ export function consentAccept(celloDir: string, hashPrefix: string, opts: Parity
   return ipcCommand(celloDir, IPC_METHODS["consent-accept"], { hash_prefix: hashPrefix }, opts);
 }
 
-/** `cello consent refuse <signal-hash>` → cello_consent_refuse. */
-export function consentRefuse(celloDir: string, hashPrefix: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], { hash_prefix: hashPrefix }, opts);
+/** `cello consent refuse <hash> [message…]` → cello_consent_refuse. An empty message is OMITTED, not
+ *  sent as "": silence is the default and it must be the literal absence of the field (M10B-D4). */
+export function consentRefuse(celloDir: string, hashPrefix: string, message: string | null, opts: ParityOptions): Promise<CliOutput> {
+  const params: Record<string, unknown> = { hash_prefix: hashPrefix };
+  if (message !== null && message.length > 0) params.message = message;
+  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], params, opts);
 }

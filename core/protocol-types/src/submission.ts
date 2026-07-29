@@ -44,8 +44,14 @@ export const SUBMISSION_DOMAIN = "CELLO-SUBMIT-v1";
  * for INV-ZEROBUMP: branching on what a signal *means* is forbidden; branching on what the caller is
  * *asking for* is what a protocol verb is. It rides INSIDE the seal, so the directory still cannot
  * tell a withdrawal from an endorsement.
+ *
+ * `refuse` (M10B-D4) carries the SUBJECT's optional message back to the issuer after she refuses an
+ * endorsement about her. It is a third verb rather than a new structure, and widening this union
+ * changes no field and no order — so every signature already made over a `submit` or `withdraw`
+ * body still verifies. For `refuse` and `withdraw` alike, `subject` is the TARGET SIGNAL HASH: both
+ * act on an existing signal instead of asserting a fact about a party.
  */
-export type SubmissionOp = "submit" | "withdraw";
+export type SubmissionOp = "submit" | "withdraw" | "refuse";
 
 /** The number of elements in the TBS array, INCLUDING the domain tag. Bump only with the wire. */
 const TBS_ARITY = 8;
@@ -163,7 +169,7 @@ export function decodeSubmission(bytes: Uint8Array): SignedSubmission {
     throw new Error(`submission_malformed: wrong domain tag — refusing to read a foreign structure`);
   }
   const op = str(decoded[2], "op");
-  if (op !== "submit" && op !== "withdraw") {
+  if (op !== "submit" && op !== "withdraw" && op !== "refuse") {
     throw new Error(`submission_malformed: unknown op '${op}'`);
   }
   const subjectKind = str(decoded[3], "subject_kind");

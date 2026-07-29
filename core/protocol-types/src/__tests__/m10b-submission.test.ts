@@ -149,3 +149,60 @@ describe("DOD-END-SUBMIT-1 — submission_id (M10B-D20)", () => {
     expect(submissionId(encodeSubmission(BODY(), SIG))).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+/**
+ * M10B-D4 / DOD-END-SURFACE-1 — refusal is a THIRD OP, not a new structure.
+ *
+ * Alice refuses an endorsement Bob issued about her and chooses to tell him why. Her message is
+ * operator-authored free text scanned at intake exactly like Bob's endorsement body — "the same
+ * injection surface pointed the other way" (M10B-D4).
+ *
+ * It rides `op` because `op` is a protocol verb (what the caller is ASKING FOR), which is the axis
+ * INV-ZEROBUMP explicitly permits — as opposed to branching on what a signal MEANS. Crucially this
+ * adds no field and reorders nothing: the TBS arity is unchanged, so every signature already made
+ * over a `submit` or `withdraw` body still verifies. Widening an enum value is not a wire break.
+ */
+describe("M10B-D4 — the `refuse` op", () => {
+  const refusal: SubmissionBody = {
+    v: 1,
+    op: "refuse",
+    subject_kind: "agent",
+    // For a refusal the subject is the TARGET SIGNAL HASH, exactly as it is for a withdrawal: both
+    // verbs act on an existing signal rather than asserting a fact about a party.
+    subject: "b".repeat(64),
+    submitter_pubkey: "a".repeat(64),
+    body: "This says I led the migration; I reviewed it. Happy to be endorsed for the review.",
+    issued_at: 1_800_000_000,
+  };
+
+  it("round-trips through encode → decode with the message intact", () => {
+    const sig = new Uint8Array(64).fill(7);
+    const got = decodeSubmission(encodeSubmission(refusal, sig));
+    expect(got.body).toEqual(refusal);
+    expect(got.body.body).toBe(refusal.body);
+  });
+
+  it("does NOT change the wire arity — a refusal encodes to the same shape as a submission", () => {
+    const sig = new Uint8Array(64).fill(7);
+    const asRefusal = encodeSubmission(refusal, sig);
+    const asSubmit = encodeSubmission({ ...refusal, op: "submit" }, sig);
+    // Same element count: the only difference is one string. If this ever diverges, an existing
+    // signature over a `submit` body has stopped being verifiable and that is a migration.
+    expect((decodeCbor(asRefusal) as unknown[]).length).toBe((decodeCbor(asSubmit) as unknown[]).length);
+  });
+
+  it("is inside the TBS — the message cannot be edited in flight", () => {
+    const tampered = { ...refusal, body: "I fully endorse this, please publish it" };
+    expect(buildSubmissionTbs(tampered)).not.toEqual(buildSubmissionTbs(refusal));
+    // And the op itself is signed, so a refusal cannot be replayed as a submission.
+    expect(buildSubmissionTbs({ ...refusal, op: "submit" })).not.toEqual(buildSubmissionTbs(refusal));
+  });
+
+  it("still REFUSES an op it does not recognise — widening is not opening", () => {
+    const bytes = encodeCbor([
+      SUBMISSION_DOMAIN, 1, "publish", "agent", "b".repeat(64), "a".repeat(64), "x", 1,
+      new Uint8Array(64),
+    ]);
+    expect(() => decodeSubmission(bytes)).toThrow(/unknown op 'publish'/);
+  });
+});

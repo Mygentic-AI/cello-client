@@ -52,6 +52,7 @@ import { createNode, SignalingManager, type ConnectResult, type CelloNode } from
 import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
+import { composeSealedSubmission, sendSealedSubmission } from "./signal-submission.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -272,7 +273,7 @@ async function startDaemonHoldingLock(
   // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
   // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
   // because only we hold the DB handle and the singleton lock a refusal has to release.
-  const { manifestVerified, verifiedManifestVersion } = await verifyStartupManifest({
+  const { manifestVerified, verifiedManifestVersion, verifiedManifest } = await verifyStartupManifest({
     manifestProvider,
     manifestRootKeys,
     manifestThreshold,
@@ -1980,17 +1981,58 @@ async function startDaemonHoldingLock(
     if (!item) {
       return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
     }
+    // ORDER IS LOAD-BEARING: the refusal is recorded FIRST and is never conditional on the message
+    // getting out. A refusal that only takes effect if the network cooperates would leave a signal
+    // Alice believes she rejected sitting in an unrefused state — the exact failure INV-CONSENT
+    // exists to prevent. The message is a courtesy layered on top of a decision already made.
     store.setConsentState(item.signalHash, "refused");
-    // M10B-D4: the refusal MESSAGE back to the issuer is the subject's CHOICE and rides the
-    // submission queue as an `op` — it is not sent here, and it is not sent automatically. Accepting
-    // the message parameter without a carrier would be a promise this verb cannot keep, so the
-    // parameter is deliberately not taken yet; the refusal itself is complete and durable.
-    return {
-      ok: true,
-      signal_hash: item.signalHash,
-      consent_state: "refused",
-      note: "The issuer is not notified. Sending a refusal message requires the submission carrier (DOD-END-SUBMIT-1 wiring).",
-    };
+    const refused = { ok: true as const, signal_hash: item.signalHash, consent_state: "refused" as const };
+
+    // M10B-D4: the message back to the issuer is the subject's CHOICE. Silence is the default, and a
+    // silent refusal tells Bob NOTHING — which is what keeps D-24 intact for anyone who wants it.
+    const message = typeof params?.message === "string" ? params.message.trim() : "";
+    if (message.length === 0) return { ...refused, issuer_notified: false };
+
+    // It rides the submission queue as the `refuse` op: operator-authored free text scanned at
+    // intake exactly like the endorsement body — the same injection surface pointed the other way.
+    // The subject of a refusal is the TARGET SIGNAL HASH, as it is for a withdrawal.
+    const kp = keyProviders.get(sel.name);
+    if (!kp) {
+      logger.warn("signal.refusal.refused", { agentName: sel.name, reason: "key_provider_absent" });
+      return { ...refused, issuer_notified: false, message_error: "key_provider_absent",
+        guidance: `The refusal is recorded. Your message was NOT sent: no signing key is loaded for '${sel.name}'.` };
+    }
+    try {
+      const composed = await composeSealedSubmission({
+        manifest: verifiedManifest, keyProvider: kp, op: "refuse",
+        subjectKind: "agent", subject: item.signalHash, body: message,
+        issuedAt: Math.floor(Date.now() / 1000), logger,
+      });
+      if (!composed.ok) {
+        // ERRORS NAME THEIR CAUSE: composeSealedSubmission's refusals (manifest_unavailable,
+        // intake_key_absent, intake_key_malformed) say WHICH check refused, and that reason
+        // survives here rather than collapsing into a generic send failure.
+        return { ...refused, issuer_notified: false, message_error: composed.reason,
+          guidance: `The refusal is recorded. Your message was NOT sent: ${composed.guidance}` };
+      }
+      const sent = await sendSealedSubmission({
+        signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
+        submissionId: composed.submissionId, intakeKeyId: composed.intakeKeyId,
+        ciphertext: composed.ciphertext, logger,
+      });
+      if (!sent.ok) {
+        return { ...refused, issuer_notified: false, message_error: sent.reason,
+          guidance: `The refusal is recorded. Your message was NOT sent: ${sent.guidance ?? sent.reason}. Retrying is safe — the submission id is derived from the content.` };
+      }
+      logger.info("signal.refusal.sent", { agentName: sel.name, submissionId: composed.submissionId });
+      return { ...refused, issuer_notified: true, submission_id: composed.submissionId };
+    } catch (err: unknown) {
+      // A throw here must not un-refuse anything, and must not read as a clean refusal either.
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn("signal.refusal.refused", { agentName: sel.name, reason });
+      return { ...refused, issuer_notified: false, message_error: reason,
+        guidance: `The refusal is recorded. Your message was NOT sent: ${reason}` };
+    }
   });
 
   handlers.set("wallet_revoke_signal", async (params, _connectionId) => {

@@ -17,6 +17,7 @@
  * Fusing these into one call would either drag the lock in here or leak that timer.
  */
 import type { Logger } from "./types.js";
+import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 import type {
   IManifestProvider,
   IManifestVersionStore,
@@ -53,6 +54,16 @@ export interface ManifestGateResult {
    * and is empty on the back-compat path or when nothing resolved.
    */
   consortiumEndpoints: ConsortiumEndpoint[];
+  /**
+   * The VERIFIED manifest itself, or null on every path that did not verify one.
+   *
+   * Returned because a sealed submission needs the manifest's `intake_key` at request time, long
+   * after startup (M10B / DOD-END-SURFACE-1, the refusal-message carrier). Set ONLY alongside
+   * `manifestVerified = true`, so an unverified manifest can never reach a consumer: a sealing key
+   * read off an unverified manifest is a key an attacker chose, which would seal the operator's
+   * words to the attacker instead of the portal.
+   */
+  verifiedManifest: ConsortiumManifest | null;
 }
 
 /**
@@ -67,9 +78,10 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
   let manifestVerified = false;
   let verifiedManifestVersion = 0;
   let consortiumEndpoints: ConsortiumEndpoint[] = [];
+  let verifiedManifest: ConsortiumManifest | null = null;
 
   if (!manifestProvider || !manifestRootKeys || manifestThreshold === undefined) {
-    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints };
+    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
   }
 
   try {
@@ -84,14 +96,14 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         notBefore: manifest.not_before,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
     }
     if (expiresAt <= now) {
       logger.error("directory.auth.manifest.expired", {
         manifestVersion: manifest.version,
         expiresAt: manifest.expires,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
     }
 
     // Anti-rollback. Equal versions are fine (a restart on an unchanged manifest); only a STRICTLY
@@ -102,12 +114,15 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         lastSeenVersion: lastSeen,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
     }
 
     await manifestVersionStore.persistVersion(manifest.version);
     manifestVerified = true;
     verifiedManifestVersion = manifest.version;
+    // Retained ONLY here — on the one path where the signatures, the window, and the anti-rollback
+    // check have all passed.
+    verifiedManifest = manifest;
     logger.info("directory.auth.manifest.verified", {
       manifestVersion: manifest.version,
       signerCount: manifest.signatures.length,
@@ -142,7 +157,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
     });
   }
 
-  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints };
+  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
 }
 
 export interface ConsortiumRoutingDeps {
