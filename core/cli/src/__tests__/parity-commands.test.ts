@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger } from "@cello-protocol/daemon";
+import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger, PassthroughGatewayClient } from "@cello-protocol/daemon";
 import {
   listAgents,
   startAgent,
@@ -50,6 +50,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
   function makeConfig(): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -471,6 +472,7 @@ describe("current-agent persistence is a plain file", () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-parity-file-"));
     try {
       const handle2 = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
         celloDir: dir,
         socketPath: join(dir, "daemon.sock"),
         lockFilePath: join(dir, "daemon.lock"),

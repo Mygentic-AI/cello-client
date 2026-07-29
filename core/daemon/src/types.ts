@@ -17,8 +17,11 @@ import type {
 import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 
-// Re-export for daemon consumers (the composition root supplies the impl).
+// Re-export for daemon consumers (the composition root supplies the impl). The VALUE re-export is
+// deliberate: `DaemonConfig.securityGateway` is required (INV-9), so every consumer needs a way to
+// satisfy it — including a test that does not screen, which says so by passing the passthrough.
 export type { SecurityGatewayClient };
+export { PassthroughGatewayClient } from "@cello-protocol/gateway";
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {
@@ -317,6 +320,13 @@ export interface DaemonConfig {
    * composition root, which owns the sidecar's lifecycle; absent in tests that assert storage only.
    */
   restartSecurityGateway?: () => Promise<void>;
+  /**
+   * Tear down whatever the composition root started alongside the daemon — today the screening
+   * sidecar. Called at the END of the daemon's own stop(), so it runs on EVERY exit path, not just
+   * the signal handler: `cello logout` goes through the IPC `shutdown` verb, which never reaches
+   * the bin's SIGTERM handler.
+   */
+  onShutdown?: () => Promise<void>;
   /**
    * DOD-REGISTRY-1: Ed25519 pubkey (hex) for verifying the type registry inner signature.
    * Build-time pinned. When absent, the registry poll is disabled (all types unclassified).

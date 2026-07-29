@@ -2771,6 +2771,21 @@ async function startDaemonHoldingLock(
       // Released LAST: while we hold it, no successor daemon can start, which is what lets
       // ipcServer.stop()'s socket re-check above be race-free.
       singletonLock.release();
+      // DOD-M9C-WIRE-1: tear down whatever the composition root started alongside us — today the
+      // screening sidecar. It MUST happen here and not only in the bin's signal handler, because
+      // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
+      // function and never touches the signal path. Getting that wrong has two teeth: the daemon
+      // process would not exit at all (a spawned child's stdio pipes keep the event loop alive,
+      // and this path relies on the loop draining rather than calling process.exit), and a
+      // surviving gateway would hold the store's write lock against the next daemon — the orphan
+      // problem this project already knows by name.
+      if (config.onShutdown) {
+        await config.onShutdown().catch((err: unknown) => {
+          logger.error("daemon.shutdown.hook_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
     }
   }
 

@@ -28,7 +28,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, connectToDaemon, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, connectToDaemon, type DaemonHandle, PassthroughGatewayClient } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { refreshShares, relayReceipts } from "../commands.js";
 
@@ -52,6 +52,7 @@ describe("DOD-AGENT-PARAM-1: the CLI sends the selector the daemon actually read
 
   async function startWithTwoAgents(): Promise<void> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

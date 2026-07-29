@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, type DaemonHandle, PassthroughGatewayClient } from "@cello-protocol/daemon";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
 import { login, logout, status, register, createAgent } from "../commands.js";
@@ -47,6 +47,7 @@ describe("cli commands", () => {
 
   function makeConfig(): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

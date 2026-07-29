@@ -112,6 +112,24 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
   return { client, sidecar };
 }
 
+/**
+ * Stop the screening sidecar. Idempotent, and safe to call when the spawn failed.
+ *
+ * An orphaned gateway holds the encrypted store's write lock against the NEXT daemon, and its
+ * stdio pipes keep this process's event loop alive — so a daemon stopped over IPC would never
+ * actually exit. Both are why this is wired into the daemon's own stop() rather than only into
+ * the signal handler.
+ */
+let securityLayer: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } | undefined;
+async function stopSecurityLayer(): Promise<void> {
+  if (!securityLayer) return;
+  await securityLayer.client.close();
+  if (securityLayer.sidecar) {
+    await securityLayer.sidecar.stop();
+    logger.info("security.gateway.stopped", {});
+  }
+}
+
 async function main(): Promise<void> {
   // M7 Keystone (Part 1): give the daemon its door to the directory. The resolver
   // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
@@ -139,6 +157,7 @@ async function main(): Promise<void> {
   // whose absence made every guard M9 built inert.
   const security: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } =
     await startSecurityLayer();
+  securityLayer = security;
 
   /**
    * Restart the sidecar so a stored config change takes effect (M9C-D17). The gateway reads its
@@ -165,19 +184,16 @@ async function main(): Promise<void> {
     ...manifest,
     securityGateway: security.client,
     restartSecurityGateway,
+    onShutdown: stopSecurityLayer,
     registryPubkey: REGISTRY_SIGNER_PUBKEY,
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
 
   const shutdown = async (signal: string): Promise<void> => {
+    // handle.stop() runs onShutdown (stopSecurityLayer) for us — the teardown lives there so that
+    // `cello logout`, which stops the daemon over IPC and never reaches this handler, tears the
+    // sidecar down too.
     await handle.stop(signal);
-    // The sidecar dies with the daemon that spawned it. An orphaned gateway would hold the store's
-    // write lock against the next daemon (the SQLite-lock discipline this client lives under).
-    await security.client.close();
-    if (security.sidecar) {
-      await security.sidecar.stop();
-      logger.info("security.gateway.stopped", { signal });
-    }
     process.exit(0);
   };
 

@@ -413,6 +413,80 @@ export function settingsSet(celloDir: string, key: string, value: string, opts: 
   return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
 }
 
+// ─── DOD-M9C-SURFACE-1: the security layer's control surface (policy D-4) ──────────────────────
+//
+// NOT agent-scoped: the security layer screens every message on this machine regardless of which
+// agent is selected, so its config is per-INSTALL. Passing agentScoped=false keeps `cello config`
+// working before any agent is selected — the state an operator is in when a misfiring guard has
+// just blocked them and they need to fix it.
+
+/** `cello config list` → every guard with its value AND its governance (version, direction, confirmed). */
+export function gatewayConfigList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_gateway_config_list", {}, opts, false);
+}
+
+/** `cello config get <key>` → one guard, plus whether its version chain still verifies. */
+export function gatewayConfigGet(celloDir: string, key: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_gateway_config_get", { key }, opts, false);
+}
+
+/**
+ * `cello config set <key> <value>` — and THE human confirmation the whole D-4 decision rests on.
+ *
+ * Two phases, and the first one is not a dry run: the daemon attempts the change unconfirmed. If it
+ * TIGHTENS, it is already applied and we print the result. If it LOOSENS, the store refuses it (no
+ * row written) and answers `needs_confirmation` — only then do we prompt, and only then do we
+ * re-send with `confirmed: true`.
+ *
+ * There is deliberately NO `--yes` flag (M9C-D16). A flag that lets a script confirm a loosening is
+ * the environment-variable bypass with a friendlier name, and removing that bypass is the sibling
+ * decision (D-5). If stdin is not a TTY there is no human here, so the answer is no.
+ */
+export function gatewayConfigSet(
+  celloDir: string,
+  key: string,
+  value: string,
+  opts: ParityOptions,
+  prompt: (question: string) => Promise<boolean> = confirmAtTty,
+): Promise<CliOutput> {
+  return withDaemon(celloDir, opts, false, async (client) => {
+    const first = (await client.send("cello_gateway_config_set", { key, value })) as Record<string, unknown>;
+    if (first.reason !== "needs_confirmation") return first;
+
+    const agreed = await prompt(
+      `This makes the security layer LESS protective:\n` +
+        `  ${key} -> ${value}\n` +
+        `  ${String(first.guidance ?? "")}\n` +
+        `Apply it?`,
+    );
+    if (!agreed) {
+      // Not an error — the operator was asked and said no. The guard is unchanged, and the
+      // absence of a stored row is the proof.
+      return { ok: false, reason: "declined", guidance: `'${key}' was NOT changed.` };
+    }
+    return (await client.send("cello_gateway_config_set", { key, value, confirmed: true })) as Record<string, unknown>;
+  });
+}
+
+/**
+ * Ask a yes/no question on the terminal. Refuses when stdin is not a TTY: a pipe, a CI job or an
+ * agent spawning the CLI is not a human, and treating one as a human is exactly the side door
+ * INV-10 exists to close.
+ */
+async function confirmAtTty(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return false;
+  process.stderr.write(`${question} [y/N] `);
+  const answer = await new Promise<string>((resolve) => {
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    process.stdin.once("data", (chunk: string) => {
+      process.stdin.pause();
+      resolve(chunk.trim().toLowerCase());
+    });
+  });
+  return answer === "y" || answer === "yes";
+}
+
 /** `cello moniker set <name>` / `cello moniker clear` → cello_set_moniker. Null clears the override.
  *  This is the agent's OWN outbound name — not `contact set-moniker`, which names a COUNTERPARTY. */
 export function monikerSet(celloDir: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {
