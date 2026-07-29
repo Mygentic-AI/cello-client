@@ -182,8 +182,23 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     try {
       const tier = sessionNodeManager.getTier(agentName, targetHex);
       if (tier >= TIER.KNOWN) {
+        // DOD-END-SCOPE-FIX-1: the wallet is daemon-wide and shared by every agent on the device,
+        // so the presenting agent's own K_local pubkey is what makes an agent-subject signal his to
+        // present. It is the SAME value an agent-subject envelope's `subject` holds — the directory
+        // authenticates the signaling stream with this key and resolves it against
+        // `agent_profiles.k_local_pubkey`, which is the column it joins `subject` on.
+        const agentRec = loadedAgents.find((a) => a.name === agentName);
+        if (!agentRec) {
+          // Not reachable through a loaded agent's own session, and refusing is the only safe
+          // answer: an unresolved presenter cannot be scoped, and presenting unscoped is the defect.
+          throw new Error(`presenting agent '${agentName}' is not loaded — cannot scope the wallet`);
+        }
         const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-        const eligible = store.listAllActive({ include: signalFilter?.include, exclude: signalFilter?.exclude });
+        const eligible = store.listAllActive({
+          presentingAgentPubkeyHex: agentRec.pubkey,
+          include: signalFilter?.include,
+          exclude: signalFilter?.exclude,
+        });
         if (eligible.length > 0) {
           trustSignals = eligible.map((s) => ({
             hash: s.signalHash,

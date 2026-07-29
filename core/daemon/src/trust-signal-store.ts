@@ -414,14 +414,23 @@ export class TrustSignalStore {
   }
 
   /**
-   * The signals `agentId` may present, resolved from the ENVELOPE, not from a stored attribution:
+   * The signals an agent may present, resolved from the ENVELOPE, not from a stored attribution:
    * an `account`-subject row is presentable by every agent under `accountId`; an `agent`-subject row
    * only by its own subject (M10-D5/M10-D14).
+   *
+   * **`agentPubkeyHex` is the K_local pubkey hex, NOT the daemon's device-local `agent_id`.** An
+   * agent-subject envelope's `subject` holds the pubkey — that is the value the directory joins on
+   * (`ap.k_local_pubkey = sr.subject`) — and a UUID compared against it matches nothing at all.
+   *
+   * NOTE (`DOD-END-SCOPE-FIX-1`): this method has no production callers; the live wire path is
+   * `listAllActive`, which now carries the agent-subject half of this scoping. Kept because it is
+   * the only implementation of the ACCOUNT-subject half, which is deferred behind a named
+   * prerequisite — the daemon holds no `accountId` anywhere in production code.
    *
    * Excludes expired and non-active rows. Selective disclosure (all / some / none) is the CALLER's
    * choice on top of this — DOD-PRESENT-1; this returns what is *eligible*, never what to send.
    */
-  listPresentable(opts: { agentId: string; accountId: string; nowSec?: number }): WalletSignalRow[] {
+  listPresentable(opts: { agentPubkeyHex: string; accountId: string; nowSec?: number }): WalletSignalRow[] {
     // `nowSec` is epoch SECONDS, and it is named for its unit deliberately. The envelope's
     // `issued_at`/`expires_at` are seconds (they are HASHED, and the protocol fixed the unit);
     // `Date.now()` is milliseconds. An unnamed `now` here invites a caller to pass one where the
@@ -438,7 +447,7 @@ export class TrustSignalStore {
             AND ( (subject_kind = 'account' AND subject = ?)
                OR (subject_kind = 'agent'   AND subject = ?) )`,
       )
-      .all(nowSec, opts.accountId, opts.agentId) as unknown as EnvelopeDbRow[];
+      .all(nowSec, opts.accountId, opts.agentPubkeyHex) as unknown as EnvelopeDbRow[];
     return rows.map(toWalletRow);
   }
 
@@ -488,7 +497,23 @@ export class TrustSignalStore {
   }
 
   /**
-   * Active, non-expired wallet signals eligible for presentation.
+   * Active, non-expired wallet signals THIS agent is eligible to present — the live wire path
+   * (`outbound-sessions.ts`).
+   *
+   * `presentingAgentPubkeyHex` is the presenting agent's K_local pubkey hex, and it is REQUIRED.
+   * An `agent`-subject row is presentable only by its own subject (M10-D5/M10-D14); the wallet is
+   * daemon-wide and shared by every agent on the device, so without this predicate each agent
+   * offers every co-resident agent's agent-subject signals to its own counterparties —
+   * `INV-AGENT-SCOPED`, which is what `DOD-END-SCOPE-FIX-1` closes. The scoping is in the SQL, not
+   * a JS filter, because `include` already routes around `default_present` and a JS branch would
+   * route around this the same way.
+   *
+   * **ACCOUNT-subject rows are deliberately NOT scoped here, and that half is deferred, not done.**
+   * `listPresentable` scopes them on `accountId` — but the daemon holds no `accountId` anywhere in
+   * production code, so there is nothing to compare against and inventing one is a separate
+   * decision (M10B fourth review F5). Today's behavior for account rows is therefore unchanged:
+   * every agent on the daemon may present them, which is also what M10-D5 says for agents under the
+   * same account. It becomes wrong only when one daemon holds agents of two different accounts.
    *
    * Default behavior: returns only signals where `default_present = 1`.
    * `include` overrides the default — only the listed types are returned regardless of `default_present`.
@@ -496,21 +521,35 @@ export class TrustSignalStore {
    * Both `include` and `exclude` are type strings. Unknown types cause a validation error at the
    * IPC layer (the caller must pre-validate against listAllWalletSignals before calling this).
    */
-  listAllActive(opts?: { nowSec?: number; include?: string[]; exclude?: string[] }): WalletSignalRow[] {
-    const nowSec = opts?.nowSec ?? Math.floor(Date.now() / 1000);
+  listAllActive(opts: {
+    presentingAgentPubkeyHex: string;
+    nowSec?: number;
+    include?: string[];
+    exclude?: string[];
+  }): WalletSignalRow[] {
+    // ABSENT IS NOT FINE (§5a). A caller that cannot say who is presenting gets a refusal, never
+    // the whole wallet: the fail-open direction here IS the defect this method was fixed for, and
+    // it would hand a counterparty another agent's signals with no error and no log.
+    if (!opts.presentingAgentPubkeyHex) {
+      throw new Error(
+        "listAllActive requires the presenting agent's K_local pubkey — refusing to present an unscoped wallet",
+      );
+    }
+    const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
     const rows = this.#db
       .prepare(
         `SELECT * FROM wallet_trust_signals
           WHERE status = 'active'
-            AND (expires_at IS NULL OR expires_at > ?)`,
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR subject = ?)`,
       )
-      .all(nowSec) as unknown as EnvelopeDbRow[];
+      .all(nowSec, opts.presentingAgentPubkeyHex) as unknown as EnvelopeDbRow[];
     const all = rows.map(toWalletRow);
-    if (opts?.include) {
+    if (opts.include) {
       const set = new Set(opts.include);
       return all.filter((s) => set.has(s.type));
     }
-    const excluded = new Set(opts?.exclude ?? []);
+    const excluded = new Set(opts.exclude ?? []);
     return all.filter((s) => s.defaultPresent && !excluded.has(s.type));
   }
 

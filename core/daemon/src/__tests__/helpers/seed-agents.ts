@@ -24,35 +24,66 @@ import type { Logger } from "../../types.js";
 
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
+/** The two identities a seeded agent has, and they are NOT interchangeable — see `seedAgentKeys`. */
+export interface SeededAgent {
+  /** Device-local `randomUUID()`. Keys the session tables. NEVER appears in a hashed envelope. */
+  agentId: string;
+  /** The K_local Ed25519 public key, hex. This is what a trust-signal envelope's `subject` holds. */
+  pubkeyHex: string;
+}
+
 /**
- * Create one `agents` row per name, returning `name → agent_id`. Idempotent per name: an agent that
- * already exists (active) is left alone and its existing id returned.
+ * Create one `agents` row per name, returning `name → {agentId, pubkeyHex}`. Idempotent per name: an
+ * agent that already exists (active) is left alone and its existing identities returned.
  *
  * The stored `k_local_pubkey` is DERIVED from the stored seed, never invented. The daemon's agent
  * loader reads the seed and re-derives the key, so a row whose pubkey column disagrees with its seed
  * is not a shortcut — it is a corrupt identity that would surface as a baffling failure much later.
+ *
+ * **Use `pubkeyHex` — not `agentId` — anywhere a trust-signal envelope's `subject` is being seeded**
+ * (`DOD-END-SCOPE-FIX-1`). The two are different values with different lifetimes, and `agentId` is
+ * device-local: the directory joins an agent-subject signal with
+ * `JOIN agent_profiles ap ON ap.k_local_pubkey = sr.subject`, so a fixture that puts a UUID in
+ * `subject` describes a row production never writes. A scoping predicate written against that
+ * fixture goes green and matches ZERO production rows — silently un-presenting every agent-subject
+ * signal. That trap was live in this file's consumers until 2026-07-29.
  */
-export async function seedAgents(
+export async function seedAgentKeys(
   db: DaemonDatabase,
   names: readonly string[],
   logger: Logger = silentLogger,
-): Promise<Map<string, string>> {
+): Promise<Map<string, SeededAgent>> {
   ensureIdentitySchema(db);
   const store = new DbIdentityStore(db, logger);
-  const ids = new Map<string, string>();
+  const agents = new Map<string, SeededAgent>();
   for (const name of names) {
     const existing = db
-      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
-      .get(name) as { agent_id: string } | undefined;
+      .prepare("SELECT agent_id, k_local_pubkey FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(name) as { agent_id: string; k_local_pubkey: string } | undefined;
     if (existing) {
-      ids.set(name, existing.agent_id);
+      agents.set(name, { agentId: existing.agent_id, pubkeyHex: existing.k_local_pubkey });
       continue;
     }
     // A real seed per agent — two agents must never share identity material — and the pubkey that
     // seed actually produces.
     const seed = new Uint8Array(randomBytes(32));
     const pubkeyHex = Buffer.from(await new InMemoryKeyProvider(seed).getPublicKey()).toString("hex");
-    ids.set(name, store.createAgent(name, seed, pubkeyHex));
+    agents.set(name, { agentId: store.createAgent(name, seed, pubkeyHex), pubkeyHex });
   }
-  return ids;
+  return agents;
+}
+
+/**
+ * `name → agent_id`, for the session-table callers that only ever need the stable id.
+ *
+ * A projection of `seedAgentKeys`, never a second implementation — one seeding path means the two
+ * helpers cannot drift into disagreeing about an agent's identity.
+ */
+export async function seedAgents(
+  db: DaemonDatabase,
+  names: readonly string[],
+  logger: Logger = silentLogger,
+): Promise<Map<string, string>> {
+  const agents = await seedAgentKeys(db, names, logger);
+  return new Map([...agents].map(([name, a]) => [name, a.agentId]));
 }
