@@ -44,6 +44,7 @@ import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.j
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -2360,6 +2361,17 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
     });
   }
+
+  // DOD-M9C-SURFACE-1: the security layer's control surface. Registered here, defined in its own
+  // module — it needs the cello dir, a logger, and the connection's client type, and nothing else
+  // about sessions or ceremonies.
+  registerGatewayConfigHandlers({
+    handlers,
+    celloDir,
+    logger,
+    getClientType: (connectionId) => perConnectionState.get(connectionId)?.clientType,
+    ...(config.restartSecurityGateway ? { restartSecurityGateway: config.restartSecurityGateway } : {}),
+  });
 
   // The session READ surface (session-read-handlers.ts): sealed receipt, transcript, list, name.
   // All four read the PERSISTED store, so they survive a restart and a fresh connection.

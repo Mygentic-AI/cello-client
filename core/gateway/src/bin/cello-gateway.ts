@@ -18,6 +18,7 @@ import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
 import { GatewayConfigStore } from "../config/config-store.js";
+import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
 import { createHash } from "node:crypto";
 import type { ScreenVerdict } from "../types.js";
@@ -63,7 +64,7 @@ async function main(): Promise<void> {
   // OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars are the bootstrap
   // fallback for any key the store has not set. Each setting defaults to its TIGHTEST value (empty
   // whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
-  const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile) : undefined;
+  const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
   const cfg = <T>(key: string, envFallback: T): T => {
     const v = config?.get(key);
     return v !== undefined ? (v as T) : envFallback;
@@ -94,7 +95,7 @@ async function main(): Promise<void> {
   // tamper-evidence, in the same encrypted store as the config (M9C-D9). The verdict's disposition
   // maps to the record: allow → clean (a clean pass IS recorded — an absent record is itself
   // evidence of suppression), redact/block/warn verbatim.
-  const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile) : undefined;
+  const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
   const recordOutcome = (direction: "inbound" | "outbound", v: ScreenVerdict, content: Uint8Array, correlationId?: string): void => {
     if (!records) return;
     const disposition: RecordDisposition = v.disposition === "allow" ? "clean" : v.disposition;

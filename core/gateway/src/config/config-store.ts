@@ -15,7 +15,7 @@
  * Encryption-at-rest (DOD-M9C-STORE-1): the store lives in the gateway's SQLCipher file, opened with
  * the daemon's key via a key FILE path — fail-closed, no plaintext fallback (see store/encrypted-db.ts).
  */
-import { openEncryptedStoreDb, type StoreDb } from "../store/encrypted-db.js";
+import { openEncryptedStoreDb, type StoreDb, type StoreEventSink } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
 /** Whether a config change makes the gateway more restrictive (tighten), less (loosen), or neither. */
@@ -129,8 +129,8 @@ export class GatewayConfigStore {
 
   /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
    *  `keyFilePath` — the daemon's own key file (M9C-D8/D9). Throws GatewayStoreError fail-closed. */
-  constructor(dbPath: string, keyFilePath: string) {
-    this.#db = openEncryptedStoreDb(dbPath, keyFilePath);
+  constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
+    this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
     this.#db.exec(DDL);
   }
 

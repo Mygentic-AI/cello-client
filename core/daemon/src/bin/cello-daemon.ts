@@ -137,7 +137,22 @@ async function main(): Promise<void> {
 
   // D-2: the security and governance layer runs ENFORCING in the shipped daemon. This is the line
   // whose absence made every guard M9 built inert.
-  const security = await startSecurityLayer();
+  const security: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } =
+    await startSecurityLayer();
+
+  /**
+   * Restart the sidecar so a stored config change takes effect (M9C-D17). The gateway reads its
+   * config only at boot, so without this a confirmed loosening is recorded and does nothing.
+   * The socket path is unchanged and `LocalSidecarGatewayClient` reconnects lazily, so the client
+   * needs no involvement. A failure PROPAGATES — the caller reports stored-but-not-applied rather
+   * than telling the operator a guard changed when it did not.
+   */
+  const restartSecurityGateway = async (): Promise<void> => {
+    if (security.sidecar) await security.sidecar.stop();
+    const restarted = await startSecurityLayer();
+    security.sidecar = restarted.sidecar;
+    if (!restarted.sidecar) throw new Error("the screening process did not come back up");
+  };
 
   const handle = await startDaemon({
     celloDir,
@@ -149,6 +164,7 @@ async function main(): Promise<void> {
     directoryEndpointResolver,
     ...manifest,
     securityGateway: security.client,
+    restartSecurityGateway,
     registryPubkey: REGISTRY_SIGNER_PUBKEY,
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });

@@ -133,13 +133,18 @@ class AdaptedDb implements StoreDb {
 }
 
 /**
- * One structured line on stderr. This module has no injected logger — it is loaded by the gateway
- * bin, a composition root whose stdout is reserved for the READY handshake `spawnGatewaySidecar`
- * parses. stderr is drained and surfaced by the spawner, so these lines reach the operator.
+ * Where this module's events go. INJECTED, because the store now has two callers with opposite
+ * needs: the gateway BIN is a composition root with no logger, whose stdout is reserved for the
+ * READY handshake the spawner parses — so its events go to stderr, which the spawner drains and
+ * surfaces. The DAEMON has an injected logger and a hard rule against writing anywhere else
+ * (INV-7), so it passes one in. Defaulting to stderr would have put raw writes in daemon code.
  */
-function emit(fields: Record<string, unknown>): void {
-  process.stderr.write(`${JSON.stringify({ level: "info", ...fields })}\n`);
-}
+export type StoreEventSink = (event: string, context: Record<string, unknown>) => void;
+
+/** The gateway bin's sink: one structured line on stderr, never stdout. */
+export const stderrStoreEventSink: StoreEventSink = (event, context) => {
+  process.stderr.write(`${JSON.stringify({ level: "info", event, ...context })}\n`);
+};
 
 function loadEngine(): SignalModule {
   const require = createRequire(import.meta.url);
@@ -182,7 +187,8 @@ function readStoreKey(keyFilePath: string): Uint8Array {
  * `keyFilePath`. Verifies the key by reading sqlite_master; enables WAL only after verification.
  * Throws GatewayStoreError on every failure path — never returns a plaintext handle.
  */
-export function openEncryptedStoreDb(dbPath: string, keyFilePath: string): StoreDb {
+export function openEncryptedStoreDb(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink): StoreDb {
+  const emit = (event: string, context: Record<string, unknown>): void => onEvent?.(event, context);
   const key = readStoreKey(keyFilePath);
 
   // Distinguish "a plaintext store was left here" from "wrong key" BEFORE trying to decrypt.
@@ -259,14 +265,14 @@ export function openEncryptedStoreDb(dbPath: string, keyFilePath: string): Store
   // holds either way — but never silent.
   try {
     const mode = inner.pragma("journal_mode=WAL", { simple: true });
-    if (mode !== "wal") emit({ event: "gateway.store.wal_unavailable", mode: String(mode) });
+    if (mode !== "wal") emit("gateway.store.wal_unavailable", { mode: String(mode) });
   } catch (err: unknown) {
-    emit({ event: "gateway.store.wal_unavailable", error: err instanceof Error ? err.message : String(err) });
+    emit("gateway.store.wal_unavailable", { error: err instanceof Error ? err.message : String(err) });
   }
 
   // The store is open and encrypted. Structured, on stderr: stdout carries the READY handshake the
   // parent parses, so nothing else may go there. Never the key, and never the key file's contents.
-  emit({ event: "gateway.store.opened", encrypted: true, path: dbPath });
+  emit("gateway.store.opened", { encrypted: true, path: dbPath });
 
   return new AdaptedDb(inner);
 }

@@ -311,6 +311,13 @@ export interface DaemonConfig {
    */
   securityGateway: SecurityGatewayClient;
   /**
+   * Restart the screening sidecar so a stored config change actually applies (M9C-D17). The
+   * gateway reads its config only at boot, so without this a confirmed loosening would be recorded
+   * and have no effect — the operator told `ok`, the running gateway unchanged. Supplied by the
+   * composition root, which owns the sidecar's lifecycle; absent in tests that assert storage only.
+   */
+  restartSecurityGateway?: () => Promise<void>;
+  /**
    * DOD-REGISTRY-1: Ed25519 pubkey (hex) for verifying the type registry inner signature.
    * Build-time pinned. When absent, the registry poll is disabled (all types unclassified).
    */
