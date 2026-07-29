@@ -190,3 +190,153 @@ export async function composeSealedSubmission(
 
   return { ok: true, submissionId: id, intakeKeyId: intakeKey.key_id, ciphertext };
 }
+
+// ─── The send ────────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Why a submission did not reach a directory node. Distinct from the compose-time refusals: those
+ * mean nothing was built, these mean nothing was accepted.
+ */
+export type SubmissionSendFailure =
+  | "directory_unreachable"
+  | "submission_write_timeout"
+  | "submission_unsupported_by_node"
+  | "submission_refused_by_node";
+
+export type SendSubmissionResult =
+  | {
+      ok: true;
+      submissionId: string;
+      /**
+       * Whether the node actually STORED the row, straight from `enqueueSubmission`'s boolean.
+       *
+       * `false` means an id was already present. That is USUALLY this submitter's own retry — which
+       * is what makes retry-across-nodes safe — but it is also the shape of a single-node censorship
+       * attack: `submission_id` is visible in the clear to the receiving node, so a malicious
+       * operator can copy it and pre-insert garbage under the same id at the other nodes, and every
+       * retry then resolves to "already present". Collapsing the two into plain success destroys the
+       * only information that could ever distinguish them.
+       */
+      stored: boolean;
+    }
+  | { ok: false; reason: SubmissionSendFailure; guidance: string };
+
+/** The minimum of `SignalingManager` this needs — narrow, so a test drives it without a transport. */
+export interface SubmissionSignaling {
+  sendRaw(frame: unknown): Promise<{ ok: boolean; reason?: string; guidance?: string }>;
+  registerInboundHandler(handler: (frame: Record<string, unknown>) => void): () => void;
+}
+
+const DEFAULT_ACK_TIMEOUT_MS = 15_000;
+
+/**
+ * Hand a sealed submission to the directory node this agent is connected to, and await its ack.
+ *
+ * ONE node, deliberately. The daemon holds a single signaling stream, and registration already works
+ * this way — it sends `register_request` to the connected node and the DIRECTORY fans out to the
+ * quorum. There is no client-side multi-node write path, and inventing one here would duplicate the
+ * SignalingManager's reconnect. So "failover" for a submission is that existing reconnect, and a
+ * retry afterwards is safe because `submission_id` is content-derived: the same body produces the
+ * same id, so a second node stores it once and the portal mints once (M10B-D20, M10B-D21).
+ */
+export async function sendSealedSubmission(deps: {
+  signaling: SubmissionSignaling;
+  submissionId: string;
+  intakeKeyId: string;
+  ciphertext: Uint8Array;
+  logger: Logger;
+  timeoutMs?: number;
+}): Promise<SendSubmissionResult> {
+  const { signaling, submissionId: id, intakeKeyId, ciphertext, logger } = deps;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+
+  let resolveFrame!: (f: Record<string, unknown>) => void;
+  const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+  const unregister = signaling.registerInboundHandler((frame) => {
+    const t = frame["type"];
+    // A result for a DIFFERENT submission must be ignored: the handler sees every frame on a shared
+    // stream, and accepting someone else's ack would report success for a write that never happened.
+    if (t === "submission_write_result" && frame["submission_id"] === id) resolveFrame(frame);
+    else if (t === "submission_write_error") resolveFrame(frame);
+    // An unknown frame kind makes the node's decoder return null, and it replies `not_authenticated`
+    // (M10B-D25r). That is a VERSION-SKEW symptom wearing an auth label — see the mapping below.
+    else if (t === "not_authenticated") resolveFrame(frame);
+  });
+
+  try {
+    const sent = await signaling.sendRaw({
+      type: "submission_write",
+      submission_id: id,
+      intake_key_id: intakeKeyId,
+      ciphertext,
+    });
+    if (!sent.ok) {
+      logger.warn("signal.submission.refused", { submissionId: id, reason: "directory_unreachable", transport: sent.reason });
+      return {
+        ok: false,
+        reason: "directory_unreachable",
+        guidance:
+          `The submission could not be handed to a directory node (${sent.reason ?? "send failed"}). ` +
+          "It was not lost: re-submitting produces the SAME submission_id, so a retry after the " +
+          "signaling stream reconnects is stored once, not twice.",
+      };
+    }
+
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<Record<string, unknown>>((r) => {
+      timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs);
+    });
+    const frame = await Promise.race([pending, timeout]);
+    clearTimeout(timer);
+
+    if (frame["type"] === "__timeout__") {
+      logger.warn("signal.submission.refused", { submissionId: id, reason: "submission_write_timeout", timeoutMs });
+      return {
+        ok: false,
+        reason: "submission_write_timeout",
+        guidance:
+          `The directory node accepted the frame but did not acknowledge the submission within ${timeoutMs}ms. ` +
+          "Whether it was stored is unknown; re-submitting is safe (same submission_id, stored once).",
+      };
+    }
+
+    if (frame["type"] === "not_authenticated") {
+      // ERROR SUBSTITUTION, caught at the one place that can catch it. Reporting the wire label
+      // verbatim would send an operator to debug keys for a day over a rollout artefact. Directory
+      // nodes are sovereign and deploy independently per region, so an upgraded daemon meeting a
+      // node that has not taken this change is the NORMAL case during a rollout, not an edge.
+      logger.warn("signal.submission.refused", { submissionId: id, reason: "submission_unsupported_by_node" });
+      return {
+        ok: false,
+        reason: "submission_unsupported_by_node",
+        guidance:
+          "The directory node rejected the frame as unrecognised — it has not deployed submission " +
+          "support yet (nodes deploy independently per region, so this is a version-skew symptom, " +
+          "NOT an authentication problem). Retry once this region's node is updated, or connect to " +
+          "another node.",
+      };
+    }
+
+    if (frame["type"] === "submission_write_error") {
+      const reason = typeof frame["reason"] === "string" ? frame["reason"] : "unspecified";
+      logger.warn("signal.submission.refused", { submissionId: id, reason: "submission_refused_by_node", nodeReason: reason });
+      return {
+        ok: false,
+        reason: "submission_refused_by_node",
+        // The upstream reason SURVIVES into the payload rather than being flattened into this
+        // function's own exit label (§5b).
+        guidance: `The directory node refused the submission: ${reason}.`,
+      };
+    }
+
+    const stored = frame["stored"] === true;
+    logger.info(stored ? "signal.submission.queued" : "signal.submission.duplicate", {
+      submissionId: id,
+      intakeKeyId,
+      stored,
+    });
+    return { ok: true, submissionId: id, stored };
+  } finally {
+    unregister();
+  }
+}
