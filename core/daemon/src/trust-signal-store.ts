@@ -263,6 +263,25 @@ interface ReceivedDbRow extends EnvelopeDbRow {
   verified_at: number;
 }
 
+/**
+ * Refuse anything that is not a 32-byte K_local pubkey as lowercase hex.
+ *
+ * SHARED, because it was written once for `listAllActive` and then DROPPED by three methods that
+ * copied its SQL predicate without it (review F3). The predicate alone fails closed, but silently:
+ * a device-local `agent_id` UUID — the natural thing to have in hand in an IPC handler — matches
+ * zero rows, which is indistinguishable from "this operator has nothing pending". For the consent
+ * queue that silence IS the bug the queue exists to prevent, and `markConsentNotified` would still
+ * match account rows and log success, so the surface would look like it was working.
+ */
+function requireAgentPubkeyHex(value: string | undefined, caller: string): void {
+  if (!/^[0-9a-f]{64}$/.test(value ?? "")) {
+    throw new Error(
+      `${caller} requires the agent's 32-byte K_local pubkey as lowercase hex — ` +
+        `refusing rather than returning an empty result that reads as "nothing to show"`,
+    );
+  }
+}
+
 function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
   return {
     signalHash: r.signal_hash,
@@ -652,12 +671,7 @@ export class TrustSignalStore {
     // `DOD-END-SCOPE-FIX-1` exists to close, so it is closed by construction here rather than by
     // remembering to pass the right thing. 32-byte Ed25519 key, lowercase hex, as `agent-loader.ts`
     // produces it.
-    if (!/^[0-9a-f]{64}$/.test(opts.presentingAgentPubkeyHex ?? "")) {
-      throw new Error(
-        "listAllActive requires the presenting agent's 32-byte K_local pubkey as lowercase hex — " +
-          "refusing to present an unscoped wallet",
-      );
-    }
+    requireAgentPubkeyHex(opts.presentingAgentPubkeyHex, "listAllActive");
     const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
     const rows = this.#db
       .prepare(
@@ -752,18 +766,34 @@ export class TrustSignalStore {
    *
    * Keyed by CONSENT STATE, never by type — that is what makes a whole new queue legal under
    * INV-ZEROBUMP, and it is why a future client-sourced type appears here with no code change.
-   * SCOPED to the presenting agent on the same axis as presentation (DOD-END-SCOPE-FIX-1): a queue
-   * showing every agent's pending items would let one agent decide on another's behalf.
+   *
+   * SCOPING, STATED HONESTLY. Agent-subject items are scoped to their subject, on the same axis as
+   * presentation (DOD-END-SCOPE-FIX-1). ACCOUNT-subject items are visible to every agent on the
+   * daemon — the same deferred residual `listAllActive` carries, because the daemon holds no
+   * `accountId` anywhere in production code and per M10-D5 account signals serve every agent under
+   * the account.
+   *
+   * ⚠️ BUT THE RESIDUAL CHANGES CHARACTER HERE, and that is worth naming rather than inheriting
+   * silently: in `listAllActive` the consequence is SHOWING the wrong signal; here it is DECIDING.
+   * Any agent on the daemon can accept an account-subject endorsement on another's behalf, and
+   * acceptance runs a destructive supersession. Nobody has ruled on whether account-subject consent
+   * should be per-agent or per-account — M10B-D9 says acceptance is recorded once per account-subject
+   * SIGNAL, which points at "any agent may decide", but it was written about the operator surface,
+   * not about authority. Recorded as an open question on `DOD-END-SURFACE-1` rather than settled by
+   * whichever predicate got copied first.
    */
   listPendingConsent(agentPubkeyHex: string): WalletSignalRow[] {
+    requireAgentPubkeyHex(agentPubkeyHex, "listPendingConsent");
     const rows = this.#db
       .prepare(
         `SELECT * FROM wallet_trust_signals
           WHERE consent_state = 'pending'
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
             AND (subject_kind <> 'agent' OR lower(subject) = ?)
           ORDER BY received_at ASC`,
       )
-      .all(agentPubkeyHex) as unknown as EnvelopeDbRow[];
+      .all(Math.floor(Date.now() / 1000), agentPubkeyHex) as unknown as EnvelopeDbRow[];
     return rows.map(toWalletRow);
   }
 
@@ -775,19 +805,23 @@ export class TrustSignalStore {
    * because the silence is per-item and not a permanent "already notified" flag on the agent.
    */
   countUnnotifiedConsent(agentPubkeyHex: string): number {
+    requireAgentPubkeyHex(agentPubkeyHex, "countUnnotifiedConsent");
     const row = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM wallet_trust_signals
           WHERE consent_state = 'pending'
             AND consent_notified_at IS NULL
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
             AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
       )
-      .get(agentPubkeyHex) as { n: number };
+      .get(Math.floor(Date.now() / 1000), agentPubkeyHex) as { n: number };
     return Number(row.n);
   }
 
   /** Record that the operator has been told about this agent's currently-pending decisions. */
   markConsentNotified(agentPubkeyHex: string): number {
+    requireAgentPubkeyHex(agentPubkeyHex, "markConsentNotified");
     const res = this.#db
       .prepare(
         `UPDATE wallet_trust_signals

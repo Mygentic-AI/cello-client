@@ -56,7 +56,14 @@ export function migrateWalletAddConsentState(db: DaemonDatabase, logger: Logger)
 
   // BIRTH GATE. Idempotent, and deliberately NOT "backfill wherever the value is NULL": a NULL that
   // appears later is not a legacy row, and promoting it would be the clobber this file prevents.
-  if (columns.has("consent_state")) return;
+  //
+  // IT GATES ON BOTH COLUMNS, and gating on only `consent_state` was a real bug that shipped: every
+  // database that ran the previous release already had `consent_state`, so this returned here and
+  // `consent_notified_at` was NEVER ADDED on upgrade. Fresh installs got it, upgrades did not —
+  // exactly the fresh-vs-migrated divergence the suite has a test for, on a column that test did not
+  // cover. It stayed green because the partial-migration test asserted only NEGATIVES, which are
+  // satisfied by returning before any of the code under test runs.
+  if (columns.has("consent_state") && columns.has("consent_notified_at")) return;
 
   // BEGIN IMMEDIATE, not DEFERRED: a deferred transaction takes no write lock, so two daemons on one
   // DB — a named real condition in this project — can both pass the gate above and the loser dies at

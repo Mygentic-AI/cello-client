@@ -351,6 +351,15 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
 
     expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
 
+    // THE PAIRED POSITIVE, and it is the assertion that was missing. The two negatives below are
+    // satisfied by the migration returning early and doing NOTHING — which is exactly what it did:
+    // the outer gate keyed on `consent_state` alone, so every UPGRADED database (the real production
+    // shape) skipped the new column entirely while fresh installs got it. The test passed
+    // byte-identically on the parent commit. A negative is only as good as the positive beside it.
+    const cols = (db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string }>)
+      .map((c) => c.name);
+    expect(cols, "the column the migration exists to add").toContain("consent_notified_at");
+
     expect(store.getWalletSignal(HASH("e"))!.consentState).toBe("refused");  // NOT re-backfilled
   });
 });

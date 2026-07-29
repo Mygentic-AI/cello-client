@@ -168,4 +168,43 @@ describe("DOD-END-PENDING-1 — the pending-consent queue", () => {
       expect(store.listPendingConsent(alice).map((i) => i.type)).toEqual(["some_future_type"]);
     });
   });
+
+  describe("review findings — the guards the queue inherited without", () => {
+    it("REFUSES a non-pubkey agent key instead of returning an empty queue (F3, §5a)", () => {
+      // The silent fallback: a device-local agent_id UUID — the natural thing to have in an IPC
+      // handler — matches zero rows, which reads as "nothing pending". For this queue that silence
+      // IS the failure it exists to prevent, and markConsentNotified would still match account rows
+      // and log success, so the surface would look like it was working.
+      store.putWalletSignal(envelope({ signalHash: HASH("f") }));
+      for (const bad of ["not-a-key", alice.toUpperCase(), "", "550e8400-e29b-41d4-a716-446655440000"]) {
+        expect(() => store.listPendingConsent(bad), bad).toThrow(/lowercase hex/i);
+        expect(() => store.countUnnotifiedConsent(bad), bad).toThrow(/lowercase hex/i);
+        expect(() => store.markConsentNotified(bad), bad).toThrow(/lowercase hex/i);
+      }
+      expect(store.listPendingConsent(alice)).toHaveLength(1);   // the paired positive
+    });
+
+    it("matches an UPPERCASE-hex stored subject — the lower() is real, not decoration", () => {
+      // The previous scoping test could not see this: seedAgentKeys produces lowercase on both
+      // sides, so dropping `lower(` from the predicate passed anyway.
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), subject: alice.toUpperCase() }));
+      expect(store.listPendingConsent(alice).map((i) => i.signalHash)).toEqual([HASH("1")]);
+    });
+
+    it("does NOT list or nag about a SUPERSEDED pending item (F6)", () => {
+      // Reachable via M10B-D4's correction loop: Bob sends E1, then a corrected E2; accepting E2
+      // supersedes E1, whose consent_state stays 'pending'. Without this it sits in the queue
+      // forever asking the operator to decide on something that can never be presented.
+      store.putWalletSignal(envelope({ signalHash: HASH("2") }));
+      store.setWalletStatus(HASH("2"), "superseded");
+      expect(store.listPendingConsent(alice)).toEqual([]);
+      expect(store.countUnnotifiedConsent(alice)).toBe(0);
+    });
+
+    it("does NOT list an EXPIRED pending item", () => {
+      const past = Math.floor(Date.now() / 1000) - 3600;
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), expiresAt: past }));
+      expect(store.listPendingConsent(alice)).toEqual([]);
+    });
+  });
 });

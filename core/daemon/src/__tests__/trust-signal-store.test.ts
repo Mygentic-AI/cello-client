@@ -298,10 +298,10 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // return silently with a full wallet. Malformed gets the same answer for the same reason: it
       // fails CLOSED either way, but only a refusal is diagnosable.
       store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
-      expect(() => store.listAllActive({ presentingAgentPubkeyHex: "" })).toThrow(/presenting agent/i);
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: "" })).toThrow(/lowercase hex/i);
       expect(() =>
         store.listAllActive({ presentingAgentPubkeyHex: undefined as unknown as string }),
-      ).toThrow(/presenting agent/i);
+      ).toThrow(/lowercase hex/i);
       // Right length, wrong case — the shape check has to be exact or a mixed-case key silently
       // matches nothing.
       expect(() => store.listAllActive({ presentingAgentPubkeyHex: alicePubkey.toUpperCase() })).toThrow(/lowercase hex/i);
