@@ -527,12 +527,21 @@ export class TrustSignalStore {
     include?: string[];
     exclude?: string[];
   }): WalletSignalRow[] {
-    // ABSENT IS NOT FINE (§5a). A caller that cannot say who is presenting gets a refusal, never
-    // the whole wallet: the fail-open direction here IS the defect this method was fixed for, and
-    // it would hand a counterparty another agent's signals with no error and no log.
-    if (!opts.presentingAgentPubkeyHex) {
+    // ABSENT IS NOT FINE (§5a), AND SO IS MALFORMED. A caller that cannot say who is presenting gets
+    // a refusal, never the whole wallet: the fail-open direction here IS the defect this method was
+    // fixed for, and it would hand a counterparty another agent's signals with no error and no log.
+    //
+    // The SHAPE check is the half that is easy to omit and expensive to omit. An empty string is
+    // caught by any guard; a device-local `agent_id` UUID, an agent NAME, or uppercase hex all sail
+    // through a truthiness check and then match zero rows — which is indistinguishable, to every
+    // caller, from "this operator holds no signals". That silence is precisely the trap
+    // `DOD-END-SCOPE-FIX-1` exists to close, so it is closed by construction here rather than by
+    // remembering to pass the right thing. 32-byte Ed25519 key, lowercase hex, as `agent-loader.ts`
+    // produces it.
+    if (!/^[0-9a-f]{64}$/.test(opts.presentingAgentPubkeyHex ?? "")) {
       throw new Error(
-        "listAllActive requires the presenting agent's K_local pubkey — refusing to present an unscoped wallet",
+        "listAllActive requires the presenting agent's 32-byte K_local pubkey as lowercase hex — " +
+          "refusing to present an unscoped wallet",
       );
     }
     const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
@@ -551,6 +560,32 @@ export class TrustSignalStore {
     }
     const excluded = new Set(opts.exclude ?? []);
     return all.filter((s) => s.defaultPresent && !excluded.has(s.type));
+  }
+
+  /**
+   * The distinct signal TYPES this agent could present — active, unexpired, and scoped to the
+   * presenting agent exactly as `listAllActive` scopes rows.
+   *
+   * Deliberately ignores `default_present`, because this answers "may this type be named in a
+   * filter", and `include` exists precisely to override the default. Validating a filter against
+   * `listAllActive`'s output would reject a type the operator holds but has defaulted off — the
+   * filter rejecting the thing it was built to select.
+   *
+   * The scoping is the point: the wallet is daemon-wide, so validating a filter against the whole
+   * wallet accepts a type only a CO-RESIDENT agent holds, and the session then presents nothing with
+   * no error (review MEDIUM-4).
+   */
+  listPresentableTypes(presentingAgentPubkeyHex: string, nowSec?: number): string[] {
+    const now = nowSec ?? Math.floor(Date.now() / 1000);
+    const rows = this.#db
+      .prepare(
+        `SELECT DISTINCT type FROM wallet_trust_signals
+          WHERE status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR subject = ?)`,
+      )
+      .all(now, presentingAgentPubkeyHex) as Array<{ type: string }>;
+    return rows.map((r) => r.type);
   }
 
   /** Set the persistent default-presentation flag for a wallet signal. */

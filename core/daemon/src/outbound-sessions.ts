@@ -218,6 +218,22 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           logger.info("signal.presentation.attached", {
             agentName, target: targetHex.slice(0, 16), count: trustSignals.length, correlationId,
           });
+        } else {
+          // A ZERO-ROW PRESENTATION IS THE FAILURE THIS UNIT EXISTS TO PREVENT, so it must not be
+          // the one outcome that emits nothing. Without this line "the operator holds no signals"
+          // and "the operator's signals no longer match their key" are the same observation: silence
+          // plus a session that formed normally. The second is reachable — a key rotation, a
+          // re-registration, a signal minted against a stale `k_local_pubkey` — and it is exactly
+          // the shape the DoD describes as "goes green while matching ZERO rows in production".
+          // `heldTotal` is what makes them distinguishable: 0 means nothing to present, >0 means the
+          // wallet has rows that this agent's scoping excluded.
+          logger.info("signal.presentation.none_eligible", {
+            agentName,
+            target: targetHex.slice(0, 16),
+            heldTotal: store.listAllWalletSignals().length,
+            filter: signalFilter ?? null,
+            correlationId,
+          });
         }
       }
     } catch (err: unknown) {
@@ -438,10 +454,26 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       const includeTypes = Array.isArray(includeRaw) ? (includeRaw as unknown[]).filter((s): s is string => typeof s === "string") : undefined;
       const excludeTypes = Array.isArray(excludeRaw) ? (excludeRaw as unknown[]).filter((s): s is string => typeof s === "string") : undefined;
 
-      // Validate include/exclude type strings against what is actually in the wallet.
+      // Validate include/exclude type strings against what THIS agent can actually present.
+      //
+      // Not against the whole wallet: the wallet is daemon-wide, so `listAllWalletSignals()` spans
+      // every agent on the device. Validating against it means Alice's `--include track_record`
+      // passes because BOB holds one, and she then presents nothing with no error and no guidance —
+      // the daemon telling her the type is fine and then silently omitting it. Before presentation
+      // was scoped that filter would have presented Bob's signal; scoping turned a leak into a lie,
+      // and this turns the lie back into the `unknown_signal_type` message that already exists.
+      // (It also stops the validator being a cross-agent enumeration oracle.)
       if (includeTypes || excludeTypes) {
         const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-        const known = new Set(store.listAllWalletSignals().map((s) => s.type));
+        const presenter = loadedAgents.find((a) => a.name === ctx.agentName);
+        if (!presenter) {
+          return {
+            ok: false,
+            reason: "agent_not_found",
+            guidance: `Agent '${ctx.agentName}' is not loaded on this daemon.`,
+          };
+        }
+        const known = new Set(store.listPresentableTypes(presenter.pubkey));
         const check = includeTypes ?? excludeTypes ?? [];
         const unknown = check.filter((t) => !known.has(t));
         if (unknown.length > 0) {

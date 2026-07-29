@@ -265,25 +265,36 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(forBob.map((s) => s.signalHash)).toEqual([HASH("3")]);
     });
 
-    it("scopes on the K_local PUBKEY, not the daemon's agent_id — the UUID matches nothing", () => {
+    it("scopes on the K_local PUBKEY, not the daemon's agent_id — the UUID is REFUSED", () => {
       // The trap this unit exists to close (fourth review HIGH-4): a predicate written against the
       // old fixture convention compares `subject` to a device-local UUID. It goes green on a fixture
       // seeded the same wrong way and matches ZERO production rows — silently un-presenting every
-      // agent-subject signal. Passing the UUID here must therefore return NOTHING, not everything.
+      // agent-subject signal.
+      //
+      // Returning [] for the UUID would pin that silence. Refusing kills the trap by construction:
+      // a caller holding the wrong identity is a BUG, not an operator with an empty wallet, and the
+      // two must not be indistinguishable (review MEDIUM-3).
       store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, type: "phone" }));
-      expect(store.listAllActive({ presentingAgentPubkeyHex: alice })).toEqual([]);
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: alice })).toThrow(/lowercase hex/i);
       expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toHaveLength(1);
     });
 
-    it("REFUSES when the presenting identity is absent or empty — never presents everything (§5a)", () => {
+    it("REFUSES an absent, empty, or MALFORMED presenting identity — never presents everything (§5a)", () => {
       // ABSENT IS NOT FINE. If the caller cannot say who is presenting, the answer is refuse, not
       // "offer the lot" — the fail-open direction is precisely the defect being fixed, and it would
-      // return silently with a full wallet.
+      // return silently with a full wallet. Malformed gets the same answer for the same reason: it
+      // fails CLOSED either way, but only a refusal is diagnosable.
       store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
       expect(() => store.listAllActive({ presentingAgentPubkeyHex: "" })).toThrow(/presenting agent/i);
       expect(() =>
         store.listAllActive({ presentingAgentPubkeyHex: undefined as unknown as string }),
       ).toThrow(/presenting agent/i);
+      // Right length, wrong case — the shape check has to be exact or a mixed-case key silently
+      // matches nothing.
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: alicePubkey.toUpperCase() })).toThrow(/lowercase hex/i);
+      // An agent NAME: the other value in scope at the call site, and the easiest one to pass by
+      // mistake.
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: "alice" })).toThrow(/lowercase hex/i);
     });
 
     it("excludes expired signals", () => {
