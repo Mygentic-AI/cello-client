@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 import { buildChannelParams } from "../channel-params.js";
+import { summarizeInboundFrame } from "../frame-trace.js";
 
 // --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
@@ -548,7 +549,31 @@ server.tool("cello_get_inclusion_proof", "Get inclusion proof for a message in a
 });
 
 // ─── Connect stdio transport ─────────────────────────────────────────────────
-await server.connect(new StdioServerTransport());
+const transport = new StdioServerTransport();
+await server.connect(transport);
+
+// ─── CELLO_MCP_TRACE: what the CLIENT actually sent ──────────────────────────
+// Wraps the transport's message hook, which is the LAST point where an inbound frame still exists
+// unaltered — the SDK validates `arguments` against the tool's zod shape before any handler of ours
+// runs, so a dropped parameter reaches us only as "expected string, received undefined" with no
+// record of what arrived. That gap is why a Cowork/`remote-devices` bridge failure could not be
+// diagnosed from this side at all (2026-07-29 discussion log). Off by default; message content is
+// never recorded verbatim — see frame-trace.ts.
+if (process.env.CELLO_MCP_TRACE === "1") {
+  const inner = transport.onmessage?.bind(transport);
+  transport.onmessage = (msg) => {
+    // The trace must never be able to break the call it is observing: a throw here would take down
+    // a tool call that would otherwise have worked, turning a diagnostic into an outage.
+    try {
+      const { event, ...context } = summarizeInboundFrame(msg);
+      logEvent(event, context);
+    } catch (err: unknown) {
+      logEvent("mcp.frame.trace.failed", { error: err instanceof Error ? err.message : String(err) });
+    }
+    inner?.(msg);
+  };
+  logEvent("mcp.frame.trace.enabled", {});
+}
 
 // ─── Channel stage 1 (CELLO-M8C-WAKE-001): forward daemon notifications ──────────
 // The daemon's NotificationDispatcher pushes content-free doorbell frames over IPC
