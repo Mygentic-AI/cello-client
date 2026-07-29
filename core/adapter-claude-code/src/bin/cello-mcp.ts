@@ -204,6 +204,14 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
 // These existed on the CLI only, which is the DOD-SETTINGS-SURFACE-1 mistake: an agent driving CELLO
 // through MCP could hold signals it could neither read nor control.
 
+server.tool("cello_trust_signals_issue", "Issue a trust signal ABOUT a counterparty — your own words vouching for something you have seen them do. It is submitted to the CELLO portal (sealed; the directory cannot read it), scanned, and minted; the SUBJECT must then accept it before anyone else can see it, so nothing here is final until they decide. You cannot issue one about yourself.", {
+  subject_pubkey: z.string().describe("The counterparty's public key, 64 hex characters — see cello_contacts"),
+  body: z.string().describe("What you are vouching for, in your own words. Scanned at intake; it reaches readers quoted and attributed to you, never restated in CELLO's voice."),
+}, async ({ subject_pubkey, body }) => {
+  const result = await proxy.call("cello_trust_signals_issue", { subject_pubkey, body });
+  return jsonText(result);
+});
+
 server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
   const result = await proxy.call("wallet_list_signals", {});
   return jsonText(result);

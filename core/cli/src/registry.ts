@@ -838,6 +838,8 @@ export const COMMANDS: readonly CommandSpec[] = [
     flags: [{ name: "--all" }],
     help:
       "Usage:\n" +
+      "  cello trust-signals issue <pubkey> <text…>\n" +
+      "                                        — vouch for a counterparty in your own words\n" +
       "  cello trust-signals list              — show every signal (type, hash, status, default, issued)\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +

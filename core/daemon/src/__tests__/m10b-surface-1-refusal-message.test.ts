@@ -23,13 +23,13 @@ describe("M10B-D4 — refusing with a message", () => {
 
   it("records the refusal BEFORE anything that can fail — a refusal never depends on the network", () => {
     // The ordering IS the invariant: if the send were attempted first and threw, Alice would have
-    // refused a signal that is still pending. Assert the positions, not the prose.
+    // refused a signal that is still pending. Assert the positions, not the prose. The send now
+    // lives in `submitForAgent` (shared with the issue verb), so the ordering to assert is
+    // "recorded, THEN handed to the submission path".
     const setRefused = handler.indexOf('setConsentState(item.signalHash, "refused")');
-    const compose = handler.indexOf("composeSealedSubmission");
-    const send = handler.indexOf("sendSealedSubmission");
+    const submit = handler.indexOf("submitForAgent(");
     expect(setRefused).toBeGreaterThan(-1);
-    expect(compose).toBeGreaterThan(setRefused);
-    expect(send).toBeGreaterThan(setRefused);
+    expect(submit).toBeGreaterThan(setRefused);
   });
 
   it("returns the refusal on EVERY failure path — a failed message is not a failed refusal", () => {
@@ -37,7 +37,7 @@ describe("M10B-D4 — refusing with a message", () => {
     // survive. A path that returned `ok: false` would tell Alice her refusal did not happen when it
     // did — and she would try again on a signal that is already refused.
     const returns = [...handler.matchAll(/return \{ \.\.\.refused[^}]*\}/g)].map((m) => m[0]);
-    expect(returns.length).toBeGreaterThanOrEqual(4); // no-message, no-key, compose-refused, send-failed, throw
+    expect(returns.length).toBeGreaterThanOrEqual(3); // no-message, account-subject, submit-failed, success
     for (const r of returns) expect(r).not.toMatch(/ok:\s*false/);
   });
 
@@ -45,8 +45,10 @@ describe("M10B-D4 — refusing with a message", () => {
     // §5a ERRORS NAME THEIR CAUSE: composeSealedSubmission's reason survives into the response
     // instead of collapsing to something like "send_failed", which would send an operator hunting
     // the network when the real cause is a manifest with no intake key.
-    expect(handler).toMatch(/message_error: composed\.reason/);
-    expect(handler).toMatch(/message_error: sent\.reason/);
+    // The cause now arrives via the shared path's `reason`, which forwards composeSealedSubmission's
+    // and sendSealedSubmission's verbatim — asserted on the helper below.
+    expect(handler).toMatch(/message_error: res\.reason/);
+    expect(handler).toMatch(/guidance: res\.guidance/);
   });
 
   it("treats an omitted, empty, or whitespace-only message as SILENCE", () => {
@@ -71,7 +73,7 @@ describe("M10B-D4 — refusing with a message", () => {
     expect(handler).toMatch(/message_queued: true/);
     // And `stored` survives: it is the one signal separating a benign duplicate from single-node
     // censorship, and collapsing it into plain success destroys that distinction permanently.
-    expect(handler).toMatch(/stored: sent\.stored/);
+    expect(handler).toMatch(/stored: res\.stored/);
   });
 
   it("the message is inside the signed TBS — the issuer cannot be shown different words", () => {
@@ -84,5 +86,48 @@ describe("M10B-D4 — refusing with a message", () => {
     expect(buildSubmissionTbs(tampered)).not.toEqual(buildSubmissionTbs(body));
     // And it survives the round trip byte-for-byte, so what Alice typed is what Bob reads.
     expect(decodeSubmission(encodeSubmission(body, new Uint8Array(64))).body.body).toBe(body.body);
+  });
+});
+
+/**
+ * The compose/seal/send path is now SHARED by `refuse` and `issue`. It is where every guard that
+ * must hold for any submission lives, so it is asserted once, here — rather than re-asserted per
+ * verb, which is how two paths that must agree stop agreeing.
+ */
+describe("submitForAgent — the guards every submission passes through", () => {
+  const daemon = readFileSync(resolve(here, "../daemon.ts"), "utf8");
+  const helper = (() => {
+    const start = daemon.indexOf("async function submitForAgent(");
+    expect(start, "submitForAgent exists").toBeGreaterThan(-1);
+    return daemon.slice(start, daemon.indexOf("\n  handlers.set(", start));
+  })();
+
+  it("refuses to bring a STOPPED agent online as a side effect", () => {
+    // getAgentSignaling CONSTRUCTS a manager when none exists — it dials and authenticates
+    // immediately. The online check must come BEFORE it, or sending a message silently puts an
+    // unstarted agent on the directory with no standing receiver behind it.
+    const gate = helper.indexOf("onlineAgents.has(sel.name)");
+    const signaling = helper.indexOf("getAgentSignaling(");
+    expect(gate).toBeGreaterThan(-1);
+    expect(signaling).toBeGreaterThan(gate);
+  });
+
+  it("caps the body before anything encodes, signs, or transmits it", () => {
+    const cap = helper.indexOf("MAX_SUBMISSION_BODY_CHARS");
+    expect(cap).toBeGreaterThan(-1);
+    expect(helper.indexOf("composeSealedSubmission")).toBeGreaterThan(cap);
+  });
+
+  it("forwards the CAUSE from both compose and send, never a generic label", () => {
+    expect(helper).toMatch(/reason: composed\.reason/);
+    expect(helper).toMatch(/reason: sent\.reason/);
+    expect(helper).toMatch(/stored: sent\.stored/);
+  });
+
+  it("takes the signing key from the SELECTED agent, with no way to name another", () => {
+    // INV-ATTRIBUTION by construction: the provider is looked up from sel.name, and there is no
+    // parameter through which a caller could pass a different identity.
+    expect(helper).toMatch(/keyProviders\.get\(sel\.name\)/);
+    expect(helper).not.toMatch(/opts\.(keyProvider|submitterPubkey)/);
   });
 });

@@ -711,6 +711,26 @@ export async function trustSignals(
     }
   }
 
+  if (sub === "issue") {
+    const [subject, ...rest] = args;
+    const body = rest.join(" ");
+    if (!subject || body.length === 0) {
+      return { exitCode: 1, output: "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>" };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_trust_signals_issue", { subject_pubkey: subject, body }))) as {
+        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      }
+      return { exitCode: 0, output: result.guidance ?? "Submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   if (sub === "view") {
     const prefix = args[0];
     if (!prefix) {
