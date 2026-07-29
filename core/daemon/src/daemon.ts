@@ -43,7 +43,8 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -252,16 +253,26 @@ async function startDaemonHoldingLock(
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
 
   // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
-  // cello_send and the inbound screen inside SessionNodeManager. Absent config falls back to a
-  // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
-  // still returning a verdict (SI-001).
-  const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
-  // M9-CORE-001 observability: announce the gateway mode at startup. The sidecar socket connects
-  // lazily on the first screen, so this records which adapter is wired (sidecar vs the always-allow
-  // passthrough default), not a live socket handshake.
-  logger.info("security.gateway.connected", {
-    mode: config.securityGateway ? "sidecar" : "passthrough",
-  });
+  // cello_send and the inbound screen inside SessionNodeManager. REQUIRED (INV-9): there is no
+  // fallback, because the fallback WAS the bug — an always-allow default that nothing in the
+  // product ever overrode.
+  // The type says required, but tests are excluded from typecheck and JS callers exist, so the
+  // absence has to be LOUD here rather than a TypeError three lines later that names the wrong
+  // subsystem. A test that genuinely does not screen says so by passing the passthrough client.
+  if (!config.securityGateway) {
+    throw new Error(
+      "startDaemon: securityGateway is required (INV-9). The daemon no longer defaults to " +
+        "always-allow screening, because that default shipped a security layer that never ran. " +
+        "Pass a LocalSidecarGatewayClient in production, or new PassthroughGatewayClient() if " +
+        "this caller deliberately does not screen.",
+    );
+  }
+  const securityGateway: SecurityGatewayClient = config.securityGateway;
+  // Observability: announce the mode the CLIENT declares (M9C-D11), never a ternary over the
+  // config. The sidecar socket connects lazily on the first screen, so this reports which adapter
+  // is wired, not a live socket handshake — but it reports it from the object that will do the
+  // screening, so a wiring mistake shows up here instead of hiding behind a correct-looking line.
+  logger.info("security.gateway.connected", { mode: securityGateway.mode });
 
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
@@ -2432,6 +2443,17 @@ async function startDaemonHoldingLock(
     });
   }
 
+  // DOD-M9C-SURFACE-1: the security layer's control surface. Registered here, defined in its own
+  // module — it needs the cello dir, a logger, and the connection's client type, and nothing else
+  // about sessions or ceremonies.
+  registerGatewayConfigHandlers({
+    handlers,
+    celloDir,
+    logger,
+    getClientType: (connectionId) => perConnectionState.get(connectionId)?.clientType,
+    ...(config.restartSecurityGateway ? { restartSecurityGateway: config.restartSecurityGateway } : {}),
+  });
+
   // The session READ surface (session-read-handlers.ts): sealed receipt, transcript, list, name.
   // All four read the PERSISTED store, so they survive a restart and a fresh connection.
   registerSessionReadHandlers({
@@ -2817,6 +2839,26 @@ async function startDaemonHoldingLock(
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();
     } finally {
+      // DOD-M9C-WIRE-1: tear down whatever the composition root started alongside us — today the
+      // screening sidecar. Two reasons it is HERE and not only in the bin's signal handler:
+      // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
+      // function and never touches the signal path; and a spawned child's stdio pipes keep this
+      // process's event loop alive, so a daemon stopped that way would never actually exit.
+      //
+      // FIRST in the finally, BEFORE the singleton lock is released (review F4). The comment below
+      // states the property the lock provides — "while we hold it, no successor daemon can start"
+      // — and the sidecar teardown needs exactly that property: the `shutdown` verb acknowledges
+      // immediately without awaiting this drain, so `cello logout && cello login` can race a new
+      // daemon into existence. Releasing the lock first would let its gateway spawn while ours
+      // still holds gateway.db's write lock, which the 3s busy_timeout usually hides — making the
+      // failure intermittent rather than absent.
+      if (config.onShutdown) {
+        await config.onShutdown().catch((err: unknown) => {
+          logger.error("daemon.shutdown.hook_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
       // held. In the real binary the process exits and the kernel reclaims it — but an in-process
       // caller (vitest, an embedder) whose shutdown throws would otherwise find every subsequent

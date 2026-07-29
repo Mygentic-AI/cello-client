@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
@@ -28,7 +29,7 @@ describe("per-counterparty signal preferences", () => {
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "cello-prefs-"));
-    mgr = new SessionNodeManager({ factory: stubFactory, logger: silent, dbPath: join(dir, "sessions.db") });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stubFactory, logger: silent, dbPath: join(dir, "sessions.db") });
     await mgr.initialize();
     // Real agent rows: `agent_id` is what the preference table keys on, and #requireAgentId throws
     // for an unknown name — so a test that skipped this would be testing nothing.

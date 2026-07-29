@@ -414,6 +414,135 @@ export function settingsSet(celloDir: string, key: string, value: string, opts: 
   return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
 }
 
+// ─── DOD-M9C-SURFACE-1: the security layer's control surface (policy D-4) ──────────────────────
+//
+// NOT agent-scoped: the security layer screens every message on this machine regardless of which
+// agent is selected, so its config is per-INSTALL. Passing agentScoped=false keeps `cello config`
+// working before any agent is selected — the state an operator is in when a misfiring guard has
+// just blocked them and they need to fix it.
+
+/** `cello config list` → every guard with its value AND its governance (version, direction, confirmed). */
+export function gatewayConfigList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_config_list", {}, opts, false);
+}
+
+/** `cello config get <key>` → one guard, plus whether its version chain still verifies. */
+export function gatewayConfigGet(celloDir: string, key: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, "cello_config_get", { key }, opts, false);
+}
+
+/**
+ * `cello config set <key> <value>` — and THE human confirmation the whole D-4 decision rests on.
+ *
+ * Two phases, and the first one is not a dry run: the daemon attempts the change unconfirmed. If it
+ * TIGHTENS, it is already applied and we print the result. If it LOOSENS, the store refuses it (no
+ * row written) and answers `needs_confirmation` — only then do we prompt, and only then do we
+ * re-send with `confirmed: true`.
+ *
+ * There is deliberately NO `--yes` flag (M9C-D16). A flag that lets a script confirm a loosening is
+ * the environment-variable bypass with a friendlier name, and removing that bypass is the sibling
+ * decision (D-5). If stdin is not a TTY there is no human here, so the answer is no.
+ */
+export function gatewayConfigSet(
+  celloDir: string,
+  key: string,
+  value: string,
+  opts: ParityOptions,
+  prompt: (question: string) => Promise<ConfirmAnswer> = confirmAtTty,
+): Promise<CliOutput> {
+  return withDaemon(celloDir, opts, false, async (client) => {
+    const first = (await client.send("cello_config_set", { key, value })) as Record<string, unknown>;
+    if (first.reason !== "needs_confirmation") return first;
+
+    // Render what is ACTUALLY changing. `set` REPLACES a list, so showing only the new value would
+    // hide four dropped entries in a five-entry whitelist (review F7). `from: null` means the key
+    // has never been configured and the built-in tightest default applies.
+    const from = "from" in first ? first.from : undefined;
+    const fromText = from === null || from === undefined
+      ? "(never configured — the built-in default applies)"
+      : JSON.stringify(from);
+    const answer = await prompt(
+      `This makes the security layer LESS protective:\n` +
+        `  ${key}\n` +
+        `    from: ${fromText}\n` +
+        `    to:   ${value}\n` +
+        `  ${String(first.guidance ?? "")}\n` +
+        `Apply it?`,
+    );
+
+    if (answer === "no_tty") {
+      // NOT the same as "the operator said no" (review F3). A CI job or an agent was never shown a
+      // prompt, and telling it the human declined is a lie about what happened — and leaves it no
+      // way forward. Name the cause and hand over the command.
+      return {
+        ok: false,
+        reason: "not_a_tty",
+        guidance:
+          `Weakening '${key}' needs a human at a terminal, and this session has no interactive ` +
+          `input. Run it yourself in a terminal: cello config set ${key} ${value}`,
+      };
+    }
+    if (answer === "no") {
+      // The operator was asked and said no. Not an error — and the absence of a stored row is the
+      // proof that nothing changed.
+      return { ok: false, reason: "declined", guidance: `'${key}' was NOT changed.` };
+    }
+    return (await client.send("cello_config_set", { key, value, confirmed: true })) as Record<string, unknown>;
+  });
+}
+
+/** What a confirmation attempt actually resolved to. `no_tty` is NOT `no` — see F3 above. */
+export type ConfirmAnswer = "yes" | "no" | "no_tty";
+
+/**
+ * Ask a yes/no question on the terminal. Returns `no_tty` — distinct from `no` — when stdin is not
+ * a TTY: a pipe, a CI job or an agent spawning the CLI is not a human, and treating one as a human
+ * who declined is the side door INV-10 exists to close, told as a misleading story.
+ */
+async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
+  if (!process.stdin.isTTY) return "no_tty";
+  process.stderr.write(`${question} [y/N] `);
+  const answer = await new Promise<string>((resolve) => {
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    const done = (value: string): void => {
+      process.stdin.pause();
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onEnd);
+      resolve(value);
+    };
+    // `end`/`error` as well as `data`: a terminal where the operator hits Ctrl-D closes stdin
+    // without ever emitting data, and a promise that never settles is a hang — INV-6 says a
+    // deadline always produces an answer, and "no" is the safe one.
+    const onData = (chunk: string): void => done(chunk.trim().toLowerCase());
+    const onEnd = (): void => done("");
+    process.stdin.once("data", onData);
+    process.stdin.once("end", onEnd);
+    process.stdin.once("error", onEnd);
+  });
+  return answer === "y" || answer === "yes" ? "yes" : "no";
+}
+
+/**
+ * `cello policy log` → cello_policy_log (DOD-M9C-AUDIT-1, policy D-11).
+ *
+ * Ships with the enforcement flip by decision: it is the answer to "did this new error come from
+ * the security layer or from my own change?" — a lookup instead of a guess.
+ */
+export function policyLog(
+  celloDir: string,
+  opts: ParityOptions & { limit?: number; sinceMs?: number },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    "cello_policy_log",
+    defined({ limit: opts.limit, since_ms: opts.sinceMs }),
+    opts,
+    false,
+  );
+}
+
 /** `cello moniker set <name>` / `cello moniker clear` → cello_set_moniker. Null clears the override.
  *  This is the agent's OWN outbound name — not `contact set-moniker`, which names a COUNTERPARTY. */
 export function monikerSet(celloDir: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {

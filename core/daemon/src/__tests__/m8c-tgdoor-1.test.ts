@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { DaemonConfig } from "../types.js";
@@ -112,6 +113,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
 
   async function start(withBot: boolean, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger: { debug() {}, info() {}, warn() {}, error() {} },
       sessionNodeFactory: new FixedFactory(new FakeNode()),

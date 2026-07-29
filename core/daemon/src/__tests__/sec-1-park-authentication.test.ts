@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { encode as cborEncode } from "cbor-x";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
@@ -77,7 +78,7 @@ class ControlledFactory implements ISessionNodeFactory {
 }
 
 async function makeManager(logger: Logger, dbPath: string): Promise<SessionNodeManager> {
-  const mgr = new SessionNodeManager({ factory: new ControlledFactory(new FakeNode() as unknown as CelloNode), logger, dbPath });
+  const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ControlledFactory(new FakeNode() as unknown as CelloNode), logger, dbPath });
   await mgr.initialize();
   return mgr;
 }

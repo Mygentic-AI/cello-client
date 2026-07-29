@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes, createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -59,6 +60,7 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

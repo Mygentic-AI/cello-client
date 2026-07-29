@@ -57,6 +57,10 @@ import {
   awaitSession,
   settingsGet,
   settingsSet,
+  gatewayConfigList,
+  gatewayConfigGet,
+  gatewayConfigSet,
+  policyLog,
   monikerSet,
 } from "./parity-commands.js";
 
@@ -918,6 +922,61 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
 
   // ═══ Other ══════════════════════════════════════════════════════════════════════════════════
+  {
+    name: "policy",
+    group: "Other",
+    summary: "Show what the security layer did to your messages — newest first.",
+    help:
+      "Usage: cello policy log [--limit <n>] [--since <ms-epoch>]\n" +
+      "  Every screened message and what happened to it: clean, redacted, blocked or warned, with\n" +
+      "  the rule that fired and the correlation id (DOD-M9C-AUDIT-1). This is how you tell whether\n" +
+      "  a new failure came from the security layer or from something else — it is a lookup, not a\n" +
+      "  guess. Default 50 entries, max 500. `chainValid: false` means the log itself was tampered\n" +
+      "  with; do not reason from its contents until that is explained.\n" +
+      "  Example:  cello policy log --limit 20",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      if (positional[0] !== "log") return { stdout: helpForSpec("policy"), stderr: "", exitCode: 1 };
+      const { value: limitRaw } = takeValueFlag(positional, "--limit");
+      const { value: sinceRaw } = takeValueFlag(positional, "--since");
+      const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
+      const sinceMs = sinceRaw !== undefined ? Number(sinceRaw) : undefined;
+      return policyLog(ctx.celloDir, {
+        pretty,
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+        ...(sinceMs !== undefined && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+      });
+    },
+  },
+  {
+    name: "config",
+    group: "Other",
+    summary: "Read or change the security layer's guards (screening, redaction, rate limits).",
+    help:
+      "Usage: cello config list | cello config get <key> | cello config set <key> <value>\n" +
+      "  The security and governance layer's own settings (DOD-M9C-SURFACE-1). Per-INSTALL, not per-agent.\n" +
+      "  Keys: autonomous_override (true|false), pii_whitelist (comma-separated, empty string clears),\n" +
+      "        language_allow (comma-separated), rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +
+      "  TIGHTENING a guard applies immediately. LOOSENING one asks you to confirm at the terminal —\n" +
+      "  there is no --yes flag, because a flag a script can pass is not a human. Every change is\n" +
+      "  versioned and hash-chained; 'list' shows the version, the direction, and whether a human\n" +
+      "  confirmed it. Example:  cello config set pii_whitelist me@example.com",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      const opts = { pretty };
+      const [sub, key, ...rest] = positional;
+      if (sub === "list") return gatewayConfigList(ctx.celloDir, opts);
+      if (sub === "get" && key) return gatewayConfigGet(ctx.celloDir, key, opts);
+      // The value is the REST of the line joined, so a comma-separated list survives a shell that
+      // split it on spaces (`pii_whitelist a@x.example, b@x.example`).
+      if (sub === "set" && key && rest.length > 0) {
+        return gatewayConfigSet(ctx.celloDir, key, rest.join(" "), opts);
+      }
+      return { stdout: helpForSpec("config"), stderr: "", exitCode: 1 };
+    },
+  },
   {
     name: "settings",
     group: "Other",

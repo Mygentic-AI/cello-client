@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger } from "../types.js";
@@ -96,6 +97,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
 
     const injectB: { inject?: (frame: unknown) => void } = {};
     const B = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: dirB,
       socketPath: join(dirB, "daemon.sock"),
       lockFilePath: join(dirB, "daemon.lock"),
@@ -129,6 +131,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
       },
     };
     const A = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: dirA,
       socketPath: join(dirA, "daemon.sock"),
       lockFilePath: join(dirA, "daemon.lock"),

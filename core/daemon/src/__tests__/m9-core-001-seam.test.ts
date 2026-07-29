@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, GatewayRecordStore, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -115,7 +116,8 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   }
 
   /** Spawn a gateway sidecar; return its handle + request-log path. `env` seeds gateway config
-   *  (e.g. CELLO_GATEWAY_PII_WHITELIST, CELLO_GATEWAY_AUTONOMOUS_OVERRIDE) — INV-4 config. */
+   *  (CELLO_GATEWAY_STORE_DB / _STORE_KEY_FILE — plumbing only; every POLICY value comes from the
+ *  store, since DOD-M9C-ENV-1 removed the env fallbacks). */
   async function spawnGateway(tag: string, env?: Record<string, string>): Promise<{ gw: SpawnedGateway; sock: string; log: string }> {
     const sock = join(tempDir, `${tag}.sock`);
     const log = join(tempDir, `${tag}.log`);
@@ -134,6 +136,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   }): Promise<{ h: Awaited<ReturnType<typeof startDaemon>>; events: LogEvent[] }> {
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: opts.celloDir,
       socketPath: join(opts.celloDir, "daemon.sock"),
       lockFilePath: join(opts.celloDir, "daemon.lock"),
@@ -254,9 +257,14 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const b = await spawnGateway("gb");
     const { clientA, clientB, aEvents, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
 
-    // H1 observability: each daemon announced its gateway mode at startup.
-    expect(aEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
-    expect(bEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
+    // H1 observability: each daemon announced its gateway mode at startup. The value is
+    // "enforcing", not "sidecar" (M9C-D11): the old word named the TRANSPORT SHAPE, which tells an
+    // operator nothing about whether their agent is screened — and "sidecar" would still have been
+    // announced by a daemon whose sidecar never screened anything. The mode now names what the
+    // client DOES with content, and it comes from the client object rather than a caller-side
+    // ternary over the config.
+    expect(aEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "enforcing")).toBeDefined();
+    expect(bEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "enforcing")).toBeDefined();
 
     const text = "hello over the gateway-screened stack";
     const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: text }) as Record<string, unknown>;
@@ -442,9 +450,17 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("OUT-002 whitelist: a WHITELISTED own-email passes SILENTLY (no warn) and is delivered intact", async () => {
-      // A's gateway is seeded with the operator's own email (INV-4 config via env). Sharing it must be
-      // frictionless — passes silently, no governance round-trip — the done-condition's silent-pass.
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_PII_WHITELIST: "owner@self.example" });
+      // A's gateway is seeded through its STORE — the only way in since DOD-M9C-ENV-1 removed the
+      // env fallbacks (policy D-5). Whitelisting is a LOOSENING, so it is written confirmed: the
+      // test stands in for the human at the CLI prompt. Sharing your own email must be frictionless
+      // — passes silently, no governance round-trip — the done-condition's silent-pass.
+      const wlDb = join(tempDir, "gw-wl.db");
+      const wlKey = join(tempDir, "gw-wl.key");
+      writeFileSync(wlKey, randomBytes(32), { mode: 0o600 });
+      const wlStore = new GatewayConfigStore(wlDb, wlKey);
+      expect(wlStore.set("pii_whitelist", ["owner@self.example"], { confirmed: true }).ok).toBe(true);
+      wlStore.close();
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: wlDb, CELLO_GATEWAY_STORE_KEY_FILE: wlKey });
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "contact me at owner@self.example anytime" }) as Record<string, unknown>;
@@ -553,9 +569,18 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("OUT-004 rate limit: over-rate sends are throttled with a distinct rate_limited reason + guidance", async () => {
-      // A's gateway is seeded with a 2-per-window cap (INV-4 config via env). The first two clean sends
-      // go out; the third is throttled — a distinct top-level reason (not the generic block), with guidance.
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_RATE_MAX_PER_WINDOW: "2", CELLO_GATEWAY_RATE_WINDOW_MS: "60000" });
+      // A's gateway is seeded with a 2-per-window cap through its STORE — the env fallbacks are gone
+      // (DOD-M9C-ENV-1). Setting a cap TIGHTENS (no cap is the loosest state), so it needs no
+      // confirmation. The first two clean sends go out; the third is throttled — a distinct
+      // top-level reason (not the generic block), with guidance.
+      const rlDb = join(tempDir, "gw-rl.db");
+      const rlKey = join(tempDir, "gw-rl.key");
+      writeFileSync(rlKey, randomBytes(32), { mode: 0o600 });
+      const rlStore = new GatewayConfigStore(rlDb, rlKey);
+      expect(rlStore.set("rate_max_per_window", 2).ok).toBe(true);
+      expect(rlStore.set("rate_window_ms", 60000).ok).toBe(true);
+      rlStore.close();
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: rlDb, CELLO_GATEWAY_STORE_KEY_FILE: rlKey });
       const b = await spawnGateway("gb");
       const { clientA } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const s1 = await clientA.send("cello_send", { session_id: SID_HEX, content: "message one" }) as Record<string, unknown>;

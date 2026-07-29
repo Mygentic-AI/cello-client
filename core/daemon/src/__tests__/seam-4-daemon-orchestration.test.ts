@@ -36,6 +36,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -119,6 +120,7 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
   }): Promise<{ h: Awaited<ReturnType<typeof startDaemon>>; events: LogEvent[] }> {
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: opts.celloDir,
       socketPath: join(opts.celloDir, "daemon.sock"),
       lockFilePath: join(opts.celloDir, "daemon.lock"),

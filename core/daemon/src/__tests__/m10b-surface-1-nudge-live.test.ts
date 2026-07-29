@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle, type DaemonConfig } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger } from "../types.js";
@@ -38,6 +39,7 @@ describe("DOD-END-SURFACE-1 — the pending-consent nudge, over a live daemon", 
   async function boot(): Promise<void> {
     tempDir = await mkdtemp(join(tmpdir(), "cello-nudge-"));
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -152,6 +154,7 @@ describe("DOD-END-SURFACE-1 — cello_trust_signals_issue, over a live daemon", 
   async function client(): Promise<IpcClient> {
     tempDir = await mkdtemp(join(tmpdir(), "cello-issue-"));
     handle = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

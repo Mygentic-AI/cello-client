@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER, normalizeTier, isKnownTierValue } from "../contacts-tier-migration.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -83,7 +84,7 @@ describe("DOD-TIER-1 — getTier FAILS CLOSED on an unreachable ACL", () => {
   it("throws (never returns UNKNOWN) when the DB is not initialized — a security read must not admit on failure", () => {
     // getTier gates inbound bounds in Step 2. If it degraded to UNKNOWN when it cannot read the ACL,
     // a BLOCKED sender would read as UNKNOWN and be admitted. So a missing DB throws, like addContact.
-    const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
     // NOT initialized — #db is undefined.
     expect(() => mgr.getTier("ada", "anypubkey")).toThrow(/not initialized/);
   });
@@ -101,7 +102,7 @@ describe("DOD-TIER-1 — SessionNodeManager.getTier + addContact stamping", () =
     const seed = openTestDb(dbPath);
     ada = (await seedAgents(seed, ["ada"])).get("ada")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
   });
   afterEach(async () => {

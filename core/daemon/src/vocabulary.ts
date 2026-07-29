@@ -85,6 +85,15 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },
   { mcp: "cello_settings_set", cli: "cello settings set" },
+  // DOD-M9C-SURFACE-1. `set` appears on both surfaces but they are NOT equivalent, by decision
+  // (M9C-D3/D15): the CLI can confirm a loosening, MCP cannot and is refused with the command to
+  // run. Listed as a pair because the verb and its reads are genuinely parallel; the asymmetry is
+  // in what the daemon will accept, not in which names exist.
+  { mcp: "cello_config_list", cli: "cello config list" },
+  { mcp: "cello_config_get", cli: "cello config get" },
+  { mcp: "cello_config_set", cli: "cello config set" },
+  // DOD-M9C-AUDIT-1 — read-only on both surfaces.
+  { mcp: "cello_policy_log", cli: "cello policy log" },
 ];
 
 /**

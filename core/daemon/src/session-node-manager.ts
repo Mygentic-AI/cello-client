@@ -52,7 +52,6 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
-  PassthroughGatewayClient,
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
   type SecurityGatewayClient,
@@ -386,9 +385,10 @@ export class SessionNodeManager {
     standingReceiverWatchdogIntervalMs?: number;
     /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
-     * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
+     * REQUIRED — there is no always-allow default (INV-9). A caller that does not screen must
+     * say so by passing PassthroughGatewayClient from `@cello-protocol/gateway/testing`.
      */
-    securityGateway?: SecurityGatewayClient;
+    securityGateway: SecurityGatewayClient;
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
@@ -400,7 +400,21 @@ export class SessionNodeManager {
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
-    this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
+    // REQUIRED, no fallback (INV-9, audit finding). This line used to read
+    // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
+    // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
+    // was hardened to throw while this constructor was not, so the inbound screen had a silent
+    // always-allow path that nothing in the product reached TODAY and any future refactor could.
+    // "Currently unreachable" is a property of today's call sites, not of the code.
+    if (!opts.securityGateway) {
+      throw new Error(
+        "SessionNodeManager: securityGateway is required (INV-9). The inbound screen has no " +
+          "always-allow fallback, because that fallback is how the entire security layer shipped " +
+          "inert. Pass a real client, or new PassthroughGatewayClient() from a test that " +
+          "deliberately does not screen.",
+      );
+    }
+    this.#securityGateway = opts.securityGateway;
   }
 
   /**

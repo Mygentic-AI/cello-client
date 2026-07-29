@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -46,6 +47,7 @@ describe("cello_register single-flight guard", () => {
     let releaseResolver!: () => void;
     const resolverGate = new Promise<void>((r) => { releaseResolver = r; });
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -85,6 +87,7 @@ describe("cello_register single-flight guard", () => {
     await mkdir(join(agentsDir, "alice"), { recursive: true });
     await FileKeyProvider.load(join(agentsDir, "alice", "key"));
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore } from "../trust-signal-store.js";
 import { encodeCbor, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
@@ -53,7 +54,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     const ids = await seedAgents(seed, ["alice"]);
     aliceId = ids.get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);

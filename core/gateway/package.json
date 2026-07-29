@@ -16,6 +16,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./testing": {
+      "import": "./dist/testing.js",
+      "types": "./dist/testing.d.ts"
+    },
     "./detect": {
       "import": "./dist/detect/index.js",
       "types": "./dist/detect/index.d.ts"
@@ -34,10 +38,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@signalapp/sqlcipher": "^3.3.5",
     "re2-wasm": "^1.0.2"
   },
   "optionalDependencies": {
+    "@signalapp/sqlcipher": "^3.3.5",
     "re2": "^1.25.0"
   },
   "devDependencies": {

@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle, type DaemonConfig } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger } from "../types.js";
@@ -39,6 +40,7 @@ afterEach(async () => {
 
 function makeConfig(): DaemonConfig {
   return {
+      securityGateway: new PassthroughGatewayClient(),
     celloDir: tempDir,
     socketPath: join(tempDir, "daemon.sock"),
     lockFilePath: join(tempDir, "daemon.lock"),

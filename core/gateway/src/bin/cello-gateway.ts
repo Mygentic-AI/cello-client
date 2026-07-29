@@ -18,6 +18,7 @@ import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns } from "../detect/injection-patterns.js";
 import { compileSecretRules } from "../detect/secrets.js";
 import { GatewayConfigStore } from "../config/config-store.js";
+import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
 import { createHash } from "node:crypto";
 import type { ScreenVerdict } from "../types.js";
@@ -44,8 +45,13 @@ async function main(): Promise<void> {
   // security records, keyed by the daemon's key file — the daemon's spawn plumbing passes the two
   // paths (M9C-D8: a key FILE path, never key bytes). Both stores fail closed: a missing or wrong
   // key throws GatewayStoreError, which exits the process rather than screening unconfigured.
-  const storeDbPath = process.env["CELLO_GATEWAY_STORE_DB"];
-  const storeKeyFile = process.env["CELLO_GATEWAY_STORE_KEY_FILE"];
+  // `|| undefined` so the guard below and the two call sites read the SAME value. Testing
+  // `=== undefined` here while the call sites test truthiness let CELLO_GATEWAY_STORE_DB="" pass
+  // the guard and then silently produce NO stores — screening every message with no audit trail
+  // and no config governance, while printing READY as if healthy. An empty string is exactly what
+  // a path computation that returned nothing interpolates to.
+  const storeDbPath = process.env["CELLO_GATEWAY_STORE_DB"] || undefined;
+  const storeKeyFile = process.env["CELLO_GATEWAY_STORE_KEY_FILE"] || undefined;
   if ((storeDbPath === undefined) !== (storeKeyFile === undefined)) {
     // Half-configured storage is a plumbing bug, not a degraded mode to run through: it would
     // silently drop either the operator's config or the whole audit trail.
@@ -54,30 +60,35 @@ async function main(): Promise<void> {
     return;
   }
 
-  // M9-CFG-001 (INV-4): the gateway owns its config. When the store is configured it is the SOURCE
-  // OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars are the bootstrap
-  // fallback for any key the store has not set. Each setting defaults to its TIGHTEST value (empty
-  // whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
-  const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile) : undefined;
-  const cfg = <T>(key: string, envFallback: T): T => {
+  // M9-CFG-001 (INV-4) + DOD-M9C-ENV-1 (policy D-5): the gateway owns its config, and the STORE IS
+  // THE ONLY SOURCE. There is deliberately no environment fallback for any policy value.
+  //
+  // There used to be four: CELLO_GATEWAY_AUTONOMOUS_OVERRIDE, _PII_WHITELIST,
+  // _RATE_MAX_PER_WINDOW and _RATE_WINDOW_MS sat UNDER the store as defaults. Each one could loosen
+  // a guard with no confirmation, no versioned row, and no hash-chained fingerprint — the entire
+  // tighten-free / loosen-confirmed mechanism bypassed by anyone who could set a variable. A gate
+  // with a published bypass is not a gate. They are gone; `cello config set` is the way in, and it
+  // asks a human before it weakens anything.
+  //
+  // Each key still falls back to its TIGHTEST value when the store has not set it (empty whitelist,
+  // override off, no rate cap), so an absent or empty config never silently loosens.
+  const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
+  const cfg = <T>(key: string, tightestDefault: T): T => {
     const v = config?.get(key);
-    return v !== undefined ? (v as T) : envFallback;
+    return v !== undefined ? (v as T) : tightestDefault;
   };
 
-  const piiWhitelist = cfg<string[]>(
-    "pii_whitelist",
-    (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-  );
+  const piiWhitelist = cfg<string[]>("pii_whitelist", []);
   // autonomous_override defaults OFF — the agent's only autonomous lever over a PII warn is `redact`;
   // allowing a value out is a human action (loosening the store requires confirmation).
-  const autonomousOverride = cfg<boolean>("autonomous_override", process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1");
+  const autonomousOverride = cfg<boolean>("autonomous_override", false);
   // OUT-004 per-agent outbound rate cap. A positive cap enables it. NOTE: "no cap" is the LOOSEST state,
   // not the tightest — so rate-limiting is OFF by default (the operator opts in to a cap). If a cap IS
   // set but the window is missing/invalid, do NOT silently disable the cap (code-review M1) — fall back
   // to a sane default window so a configured limit is never lost.
   const DEFAULT_RATE_WINDOW_MS = 60_000;
-  const rateMax = Number(cfg<number>("rate_max_per_window", Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"])));
-  const rawWindow = Number(cfg<number>("rate_window_ms", Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"])));
+  const rateMax = Number(cfg<number>("rate_max_per_window", 0));
+  const rawWindow = Number(cfg<number>("rate_window_ms", DEFAULT_RATE_WINDOW_MS));
   const rateWindowMs = Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : DEFAULT_RATE_WINDOW_MS;
   const rateLimit = Number.isFinite(rateMax) && rateMax > 0
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
@@ -89,7 +100,7 @@ async function main(): Promise<void> {
   // tamper-evidence, in the same encrypted store as the config (M9C-D9). The verdict's disposition
   // maps to the record: allow → clean (a clean pass IS recorded — an absent record is itself
   // evidence of suppression), redact/block/warn verbatim.
-  const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile) : undefined;
+  const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
   const recordOutcome = (direction: "inbound" | "outbound", v: ScreenVerdict, content: Uint8Array, correlationId?: string): void => {
     if (!records) return;
     const disposition: RecordDisposition = v.disposition === "allow" ? "clean" : v.disposition;
@@ -183,9 +194,25 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // PARENT DEATH SWITCH (review F5). The daemon spawns this process with a piped stdin and never
+  // writes to it; when the daemon dies — including the ways that skip its shutdown path entirely,
+  // SIGKILL and crashes — the kernel closes the pipe and this fires. Without it the gateway
+  // outlives its daemon holding the store's write lock, and the next daemon comes up permanently
+  // fail-closed against a lock nobody can explain.
+  process.stdin.on("end", () => shutdown("parent_exited"));
+  process.stdin.on("close", () => shutdown("parent_exited"));
+  process.stdin.resume();
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`cello-gateway: fatal ${err instanceof Error ? err.message : String(err)}\n`);
+  // Print the CODE and the GUIDANCE, not just the message. The guidance is the only part that
+  // tells the operator what to do, and dropping it was how "your key file is missing" reached
+  // them as "sidecar exited before ready (code 1)".
+  const code = (err as { code?: string } | null)?.code;
+  const guidance = (err as { guidance?: string } | null)?.guidance;
+  const message = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`cello-gateway: fatal${code ? ` [${code}]` : ""} ${message}\n`);
+  if (guidance) process.stderr.write(`cello-gateway: ${guidance}\n`);
   process.exit(1);
 });

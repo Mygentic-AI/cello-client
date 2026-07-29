@@ -64,9 +64,13 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
   const reachable = transitiveLocalImports(join(SRC, "detect/index.ts"));
 
   it("NEVER reaches node:sqlite — VERBOTEN, and the reason the subpath exists at all", () => {
-    // The package barrel re-exports GatewayConfigStore/GatewayRecordStore, which both statically
-    // import node:sqlite. Importing the barrel from a Next.js Fargate app pulls it in.
+    // A denylist against regression. Note what it can and cannot see as of DOD-M9C-STORE-1
+    // (2026-07-29): the stores no longer import node:sqlite at all — they load SQLCipher, a NATIVE
+    // prebuilt, through createRequire inside a function, which this static scan cannot detect. So
+    // the live guard against the barrel's weight is the structural filename assertion below
+    // ("NEVER reaches the gateway server, its stores, or the sidecar spawner"), not this line.
     expect([...bareSpecifiers(reachable)]).not.toContain("node:sqlite");
+    expect([...bareSpecifiers(reachable)]).not.toContain("@signalapp/sqlcipher");
   });
 
   it("NEVER reaches the DeBERTa Layer-2 scanner — it degrades OPEN and intake must fail CLOSED", () => {

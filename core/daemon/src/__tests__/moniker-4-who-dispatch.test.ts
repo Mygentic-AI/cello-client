@@ -14,6 +14,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { NotificationDispatcher } from "../notification-dispatcher.js";
@@ -131,6 +132,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
     const bobPubkey = Buffer.from(await kp.getPublicKey()).toString("hex");
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

@@ -5,6 +5,7 @@
  * (`SecurityGatewayClient` + verdict types) and a client implementation; all detection lives
  * here. M9-CORE-001 ships the seam with a pass-through; later stories add the pipeline.
  */
+export type { GatewayMode } from "./types.js";
 export type {
   ScreenDirection,
   ScreenDisposition,
@@ -36,12 +37,14 @@ export type { InstallResult, InstallOptions } from "./detect/model-installer.js"
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
 export { GatewayConfigStore } from "./config/config-store.js";
 export type { ConfigDirection, SetResult, ConfigVersionRow } from "./config/config-store.js";
-export { GatewayStoreError } from "./store/encrypted-db.js";
-export type { GatewayStoreErrorCode } from "./store/encrypted-db.js";
+export { GatewayStoreError, stderrStoreEventSink, openEncryptedStoreDb } from "./store/encrypted-db.js";
+export type { GatewayStoreErrorCode, StoreEventSink } from "./store/encrypted-db.js";
 export { GatewayRecordStore } from "./records/record-store.js";
 export type { RecordDisposition, RecordDirection, RecordInput, SecurityRecord } from "./records/record-store.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
-export { PassthroughGatewayClient } from "./passthrough.js";
+// PassthroughGatewayClient is NOT exported here — it lives at `@cello-protocol/gateway/testing`
+// (DOD-M9C-WIRE-1). An always-allow client on the production barrel is how the security layer
+// shipped inert; reaching for it should be a deliberate act, visible in a diff.
 
 // Wire protocol (shared by the local sidecar; Phase 2's mTLS gateway reuses these shapes).
 export {
