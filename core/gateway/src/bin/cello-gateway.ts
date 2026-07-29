@@ -60,30 +60,35 @@ async function main(): Promise<void> {
     return;
   }
 
-  // M9-CFG-001 (INV-4): the gateway owns its config. When the store is configured it is the SOURCE
-  // OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars are the bootstrap
-  // fallback for any key the store has not set. Each setting defaults to its TIGHTEST value (empty
-  // whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
+  // M9-CFG-001 (INV-4) + DOD-M9C-ENV-1 (policy D-5): the gateway owns its config, and the STORE IS
+  // THE ONLY SOURCE. There is deliberately no environment fallback for any policy value.
+  //
+  // There used to be four: CELLO_GATEWAY_AUTONOMOUS_OVERRIDE, _PII_WHITELIST,
+  // _RATE_MAX_PER_WINDOW and _RATE_WINDOW_MS sat UNDER the store as defaults. Each one could loosen
+  // a guard with no confirmation, no versioned row, and no hash-chained fingerprint — the entire
+  // tighten-free / loosen-confirmed mechanism bypassed by anyone who could set a variable. A gate
+  // with a published bypass is not a gate. They are gone; `cello config set` is the way in, and it
+  // asks a human before it weakens anything.
+  //
+  // Each key still falls back to its TIGHTEST value when the store has not set it (empty whitelist,
+  // override off, no rate cap), so an absent or empty config never silently loosens.
   const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;
-  const cfg = <T>(key: string, envFallback: T): T => {
+  const cfg = <T>(key: string, tightestDefault: T): T => {
     const v = config?.get(key);
-    return v !== undefined ? (v as T) : envFallback;
+    return v !== undefined ? (v as T) : tightestDefault;
   };
 
-  const piiWhitelist = cfg<string[]>(
-    "pii_whitelist",
-    (process.env["CELLO_GATEWAY_PII_WHITELIST"] ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-  );
+  const piiWhitelist = cfg<string[]>("pii_whitelist", []);
   // autonomous_override defaults OFF — the agent's only autonomous lever over a PII warn is `redact`;
   // allowing a value out is a human action (loosening the store requires confirmation).
-  const autonomousOverride = cfg<boolean>("autonomous_override", process.env["CELLO_GATEWAY_AUTONOMOUS_OVERRIDE"] === "1");
+  const autonomousOverride = cfg<boolean>("autonomous_override", false);
   // OUT-004 per-agent outbound rate cap. A positive cap enables it. NOTE: "no cap" is the LOOSEST state,
   // not the tightest — so rate-limiting is OFF by default (the operator opts in to a cap). If a cap IS
   // set but the window is missing/invalid, do NOT silently disable the cap (code-review M1) — fall back
   // to a sane default window so a configured limit is never lost.
   const DEFAULT_RATE_WINDOW_MS = 60_000;
-  const rateMax = Number(cfg<number>("rate_max_per_window", Number(process.env["CELLO_GATEWAY_RATE_MAX_PER_WINDOW"])));
-  const rawWindow = Number(cfg<number>("rate_window_ms", Number(process.env["CELLO_GATEWAY_RATE_WINDOW_MS"])));
+  const rateMax = Number(cfg<number>("rate_max_per_window", 0));
+  const rawWindow = Number(cfg<number>("rate_window_ms", DEFAULT_RATE_WINDOW_MS));
   const rateWindowMs = Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : DEFAULT_RATE_WINDOW_MS;
   const rateLimit = Number.isFinite(rateMax) && rateMax > 0
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
