@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -82,6 +83,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
   async function start(node: CelloNode): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger: noopLogger, sessionNodeFactory: new FixedFactory(node),
     };

@@ -24,6 +24,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -73,6 +74,7 @@ describe("M8C-WAKE-1: real daemon → real shim → notifications/claude/channel
   it("forwards session_state_changed (created + sealed) as content-free claude/channel events", async () => {
     // ─── real daemon ───
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

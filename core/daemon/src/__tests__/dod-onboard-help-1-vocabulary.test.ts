@@ -13,6 +13,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -286,6 +287,7 @@ describe("DOD-ONBOARD-HELP-1 §5 — a live daemon renders guidance per connecti
   it("tells a CLI caller `cello use-agent` and an MCP caller `cello_use_agent` — same handler, same session", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-vocab-"));
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -343,6 +345,7 @@ describe("DOD-ONBOARD-HELP-1 (review F7) — a contact pubkey must be a pubkey",
   it("refuses a non-hex pubkey on every contact handler, and changes nothing", async () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-pubkey-"));
     handle = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

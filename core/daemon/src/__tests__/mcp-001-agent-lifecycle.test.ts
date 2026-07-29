@@ -21,6 +21,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -58,6 +59,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

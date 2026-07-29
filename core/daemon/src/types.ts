@@ -300,10 +300,16 @@ export interface DaemonConfig {
    * The security gateway client. Every outbound message is screened in cello_send before
    * sessionNodeManager.sendContent; every inbound message is screened in the inbound funnel
    * before it enters the receive buffer. The daemon holds ONLY this narrow interface — all
-   * detection lives in the separate gateway program. When absent, the composition root falls
-   * back to a PassthroughGatewayClient (always-allow), so the seam still returns a verdict.
+   * detection lives in the separate gateway program.
+   *
+   * REQUIRED (INV-9, M9C-D10). It was optional, defaulting to `PassthroughGatewayClient`, and
+   * because no production caller ever set it, every shipped daemon screened NOTHING while
+   * announcing that the gateway was connected. An optional field with a permissive default made
+   * the invariant hold by CONVENTION while the comment claimed it held by construction. Now the
+   * compiler asks. A caller that genuinely wants no screening — a test — passes
+   * `new PassthroughGatewayClient()` and thereby says so out loud.
    */
-  securityGateway?: SecurityGatewayClient;
+  securityGateway: SecurityGatewayClient;
   /**
    * DOD-REGISTRY-1: Ed25519 pubkey (hex) for verifying the type registry inner signature.
    * Build-time pinned. When absent, the registry poll is disabled (all types unclassified).

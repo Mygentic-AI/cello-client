@@ -22,6 +22,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { resolveCelloEnv, createTransportSelector } from "../transport-composition.js";
@@ -66,6 +67,8 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

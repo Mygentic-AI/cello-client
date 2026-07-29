@@ -34,10 +34,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@signalapp/sqlcipher": "^3.3.5",
     "re2-wasm": "^1.0.2"
   },
   "optionalDependencies": {
+    "@signalapp/sqlcipher": "^3.3.5",
     "re2": "^1.25.0"
   },
   "devDependencies": {

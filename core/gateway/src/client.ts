@@ -19,7 +19,7 @@ import {
   type WireScreenRequest,
   type WireScreenResponse,
 } from "./protocol.js";
-import { failClosedVerdict, GOVERNANCE_TIMEOUT, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
+import { failClosedVerdict, GOVERNANCE_TIMEOUT, type GatewayMode, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
 import type { GatewayLogger } from "./server.js";
 
 const NOOP_LOGGER: GatewayLogger = { info() {}, warn() {}, error() {} };
@@ -40,6 +40,12 @@ export interface LocalSidecarGatewayClientOptions {
 }
 
 export class LocalSidecarGatewayClient implements SecurityGatewayClient {
+  /**
+   * `enforcing` — and it stays `enforcing` even when the socket is down, because a client whose
+   * gateway is unreachable does not start allowing content: it fails closed (`gateway_unavailable`).
+   * The mode describes what this client DOES with content, not whether the socket happens to be up.
+   */
+  readonly mode: GatewayMode = "enforcing";
   readonly #socketPath: string;
   readonly #deadlineMs: number;
   readonly #logger: GatewayLogger;

@@ -43,7 +43,7 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -252,16 +252,26 @@ async function startDaemonHoldingLock(
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
 
   // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
-  // cello_send and the inbound screen inside SessionNodeManager. Absent config falls back to a
-  // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
-  // still returning a verdict (SI-001).
-  const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
-  // M9-CORE-001 observability: announce the gateway mode at startup. The sidecar socket connects
-  // lazily on the first screen, so this records which adapter is wired (sidecar vs the always-allow
-  // passthrough default), not a live socket handshake.
-  logger.info("security.gateway.connected", {
-    mode: config.securityGateway ? "sidecar" : "passthrough",
-  });
+  // cello_send and the inbound screen inside SessionNodeManager. REQUIRED (INV-9): there is no
+  // fallback, because the fallback WAS the bug — an always-allow default that nothing in the
+  // product ever overrode.
+  // The type says required, but tests are excluded from typecheck and JS callers exist, so the
+  // absence has to be LOUD here rather than a TypeError three lines later that names the wrong
+  // subsystem. A test that genuinely does not screen says so by passing the passthrough client.
+  if (!config.securityGateway) {
+    throw new Error(
+      "startDaemon: securityGateway is required (INV-9). The daemon no longer defaults to " +
+        "always-allow screening, because that default shipped a security layer that never ran. " +
+        "Pass a LocalSidecarGatewayClient in production, or new PassthroughGatewayClient() if " +
+        "this caller deliberately does not screen.",
+    );
+  }
+  const securityGateway: SecurityGatewayClient = config.securityGateway;
+  // Observability: announce the mode the CLIENT declares (M9C-D11), never a ternary over the
+  // config. The sidecar socket connects lazily on the first screen, so this reports which adapter
+  // is wired, not a live socket handshake — but it reports it from the object that will do the
+  // screening, so a wiring mistake shows up here instead of hiding behind a correct-looking line.
+  logger.info("security.gateway.connected", { mode: securityGateway.mode });
 
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),

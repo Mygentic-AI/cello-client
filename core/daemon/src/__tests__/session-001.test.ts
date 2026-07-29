@@ -51,6 +51,7 @@ import * as lp from "it-length-prefixed";
 import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse, SessionRecord } from "../types.js";
@@ -493,6 +494,7 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
   it("AC-007: interrupted_sessions always present (empty when none)", async () => {
     const l = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -548,6 +550,7 @@ describe("SESSION-001: daemon status interrupted_sessions field", () => {
     db.close();
 
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -609,6 +612,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
   async function startTestDaemon(): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const { logger } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -769,6 +773,7 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
 
     const { logger } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -907,6 +912,7 @@ describe("SESSION-001: SI-002 tampered leaf signature rejected", () => {
 
     const { logger: testLogger, events: logEvents } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -1004,6 +1010,7 @@ describe("SESSION-001: AC-016 composition root wiring", () => {
   it("AC-016: composition root wires session_interrupted frame handler", async () => {
     const { logger, events: logEvents } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -1368,6 +1375,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const { logger } = makeLogger();
     const h = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
     });
@@ -1445,6 +1453,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const { logger } = makeLogger();
     const h = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
     });
@@ -1496,6 +1505,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const { logger } = makeLogger();
     const h = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
     });
@@ -1568,6 +1578,7 @@ describe("SESSION-001 H-1: bilateral seal-interrupted commitment", () => {
 
     const { logger } = makeLogger();
     const h = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, signalingConnect,
     });

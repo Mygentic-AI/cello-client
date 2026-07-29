@@ -57,6 +57,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager } from "../session-node-manager.js";
 import {
   SessionConnectionGater,
@@ -1306,6 +1307,7 @@ describe("SessionNodeManager — integration tests", () => {
     const { logger, events } = makeLogger();
 
     const handle = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon-ac011.sock"),
       lockFilePath: join(tempDir, "daemon-ac011.lock"),

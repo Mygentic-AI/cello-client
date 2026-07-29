@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { readLock } from "../lock-file.js";
@@ -52,6 +53,8 @@ describe("daemon", () => {
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

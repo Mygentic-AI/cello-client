@@ -45,6 +45,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -212,6 +213,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     signalingConnect?: () => Promise<ConnectResult>;
   }): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

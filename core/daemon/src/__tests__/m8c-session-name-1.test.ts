@@ -19,6 +19,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -59,6 +60,7 @@ describe("DOD-SESSION-NAME-1: naming a session", () => {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
     await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

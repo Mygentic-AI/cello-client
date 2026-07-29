@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -107,6 +108,7 @@ describe("M8B F13: initiate_session validates the counterparty endpoint before r
       },
     };
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: dirA,
       socketPath: join(dirA, "daemon.sock"),
       lockFilePath: join(dirA, "daemon.lock"),

@@ -60,7 +60,7 @@ importers:
         version: link:../daemon
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -98,7 +98,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -139,9 +139,6 @@ importers:
 
   core/gateway:
     dependencies:
-      '@signalapp/sqlcipher':
-        specifier: ^3.3.5
-        version: 3.3.5
       re2-wasm:
         specifier: ^1.0.2
         version: 1.0.2
@@ -153,6 +150,9 @@ importers:
         specifier: ^4.22.4
         version: 4.22.4
     optionalDependencies:
+      '@signalapp/sqlcipher':
+        specifier: ^3.3.5
+        version: 3.3.5
       re2:
         specifier: ^1.25.0
         version: 1.25.0
@@ -171,7 +171,7 @@ importers:
         version: link:../test-fixtures
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -184,7 +184,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -251,7 +251,7 @@ importers:
     devDependencies:
       '@claude-flow/testing':
         specifier: 3.0.0-alpha.6
-        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
+        version: 3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))
       '@types/node':
         specifier: ^25.6.2
         version: 25.9.1
@@ -3561,7 +3561,7 @@ snapshots:
 
   '@claude-flow/swarm@3.0.0-alpha.8': {}
 
-  '@claude-flow/testing@3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))':
+  '@claude-flow/testing@3.0.0-alpha.6(@claude-flow/memory@3.0.0-alpha.18(@types/node@25.9.1))(@claude-flow/shared@3.0.0-alpha.8)(@claude-flow/swarm@3.0.0-alpha.8)(vitest@3.2.4(@types/node@25.9.1)(tsx@4.22.4))':
     dependencies:
       '@claude-flow/memory': 3.0.0-alpha.18(@types/node@25.9.1)(zod@4.4.3)
       '@claude-flow/shared': 3.0.0-alpha.8

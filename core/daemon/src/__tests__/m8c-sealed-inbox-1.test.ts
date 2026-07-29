@@ -14,6 +14,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { DaemonConfig } from "../types.js";
@@ -44,6 +45,7 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
 
   async function start(): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger: { debug() {}, info() {}, warn() {}, error() {} },
     };

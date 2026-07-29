@@ -6,11 +6,15 @@
  * consumes THIS entry point and never the package barrel.
  *
  * WHY A SEPARATE ENTRY POINT AT ALL. `src/index.ts` re-exports `GatewayConfigStore` and
- * `GatewayRecordStore`, and both statically `import { DatabaseSync } from "node:sqlite"` — VERBOTEN
- * in this project — alongside the gateway HTTP server and the sidecar spawner. A barrel import from
- * the portal would evaluate all of that inside a Next.js Fargate app. The package `exports` map
- * previously offered only `"."`, so there was no deep-import escape; this is that escape, made
- * deliberate and narrow.
+ * `GatewayRecordStore`, which reach `@signalapp/sqlcipher` — a NATIVE prebuilt binary — alongside
+ * the gateway HTTP server and the sidecar spawner. A barrel import from the portal would evaluate
+ * all of that inside a Next.js Fargate app. The package `exports` map previously offered only
+ * `"."`, so there was no deep-import escape; this is that escape, made deliberate and narrow.
+ *
+ * Note the danger changed shape but not size on 2026-07-29 (`DOD-M9C-STORE-1`): the stores used to
+ * import `node:sqlite` statically, and now load SQLCipher through `createRequire` inside a
+ * function — so a scanner looking for a static import would no longer SEE it. The structural
+ * assertions that name the store files by name are what still guard this boundary.
  *
  * WHAT IS DELIBERATELY ABSENT, and it is the more important half:
  *

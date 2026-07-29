@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
-import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, GatewayRecordStore, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext } from "@cello-protocol/gateway";
+import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, GatewayRecordStore, type SpawnedGateway, type SecurityGatewayClient, type ScreenVerdict, type ScreenContext, PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -134,6 +134,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
   }): Promise<{ h: Awaited<ReturnType<typeof startDaemon>>; events: LogEvent[] }> {
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: opts.celloDir,
       socketPath: join(opts.celloDir, "daemon.sock"),
       lockFilePath: join(opts.celloDir, "daemon.lock"),
@@ -254,9 +255,14 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const b = await spawnGateway("gb");
     const { clientA, clientB, aEvents, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
 
-    // H1 observability: each daemon announced its gateway mode at startup.
-    expect(aEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
-    expect(bEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "sidecar")).toBeDefined();
+    // H1 observability: each daemon announced its gateway mode at startup. The value is
+    // "enforcing", not "sidecar" (M9C-D11): the old word named the TRANSPORT SHAPE, which tells an
+    // operator nothing about whether their agent is screened — and "sidecar" would still have been
+    // announced by a daemon whose sidecar never screened anything. The mode now names what the
+    // client DOES with content, and it comes from the client object rather than a caller-side
+    // ternary over the config.
+    expect(aEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "enforcing")).toBeDefined();
+    expect(bEvents.find((e) => e.event === "security.gateway.connected" && e.context["mode"] === "enforcing")).toBeDefined();
 
     const text = "hello over the gateway-screened stack";
     const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: text }) as Record<string, unknown>;

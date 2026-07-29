@@ -36,6 +36,7 @@ import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -194,6 +195,7 @@ describe("cello_list_sessions: MCP handler", () => {
   function makeConfig(): DaemonConfig {
     const { logger } = makeLogger();
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

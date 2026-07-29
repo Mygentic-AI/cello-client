@@ -17,6 +17,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -49,6 +50,7 @@ describe("M8C-MSGWAKE-1: cello_message doorbell on inbound content", () => {
       await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
     }
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger,
     };

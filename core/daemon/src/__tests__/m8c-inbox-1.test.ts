@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
@@ -49,6 +50,7 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
       await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
     }
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger,
     };

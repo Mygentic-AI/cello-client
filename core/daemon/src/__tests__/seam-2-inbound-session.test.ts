@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -124,6 +125,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     signalingConnect: () => Promise<ConnectResult>;
   }): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

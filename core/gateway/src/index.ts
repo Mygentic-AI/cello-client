@@ -5,6 +5,7 @@
  * (`SecurityGatewayClient` + verdict types) and a client implementation; all detection lives
  * here. M9-CORE-001 ships the seam with a pass-through; later stories add the pipeline.
  */
+export type { GatewayMode } from "./types.js";
 export type {
   ScreenDirection,
   ScreenDisposition,

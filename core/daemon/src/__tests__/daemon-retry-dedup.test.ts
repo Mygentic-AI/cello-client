@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { randomBytes } from "node:crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse } from "../types.js";
@@ -57,6 +58,8 @@ describe("daemon retry-queue and nonce-dedup integration", () => {
 
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

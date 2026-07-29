@@ -12,7 +12,10 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { LocalSidecarGatewayClient, spawnGatewaySidecar, type SpawnedGateway } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
+import { resolveDbKey, dbKeyPathFor } from "../sqlcipher-db.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { buildManifestDeps } from "../manifest-deps.js";
 import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
@@ -56,6 +59,59 @@ const socketPath = join(celloDir, "daemon.sock");
 const lockFilePath = join(celloDir, "daemon.lock");
 const version = process.env.CELLO_VERSION || "0.0.1";
 
+/**
+ * Bring up the security and governance layer (DOD-M9C-WIRE-1, policy D-2).
+ *
+ * THE DEFECT THIS EXISTS TO CLOSE: this function did not exist. `startDaemon` was called without a
+ * gateway, fell back to an always-allow stub, and every shipped daemon screened nothing while
+ * logging `security.gateway.connected`. The layer was fully built, unit-green and gate-green the
+ * whole time — the gate injected the client the product never did.
+ *
+ * Fail-closed, never passthrough (M9C-D12): if the sidecar cannot be spawned, the client is STILL
+ * the enforcing one. It fails closed on every call (`gateway_unavailable`, INV-6), the failure is
+ * announced, and the daemon stays up so the operator can run `cello config` / `cello policy log`
+ * against it and find out why. A dead agent with a cryptic startup error diagnoses nothing, and a
+ * silent downgrade to passthrough is the original bug wearing a hat.
+ */
+async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined }> {
+  const socketPath = join(celloDir, "gateway.sock");
+  const client = new LocalSidecarGatewayClient({ socketPath, logger });
+
+  // The sidecar opens the encrypted store at startup, but the key file is only created when the
+  // daemon first opens its own database — which happens AFTER this. So resolve it here (M9C-D13):
+  // the same idempotent call the daemon makes, which on a fresh install is the one that generates
+  // the key. The bytes are deliberately unused; only the side effect matters, and the key never
+  // travels to the child — the child gets the PATH (M9C-D8).
+  const keyFilePath = dbKeyPathFor(join(celloDir, "sessions.db"));
+  let sidecar: SpawnedGateway | undefined;
+  try {
+    mkdirSync(celloDir, { recursive: true, mode: 0o700 });
+    resolveDbKey(join(celloDir, "sessions.db"), keyFilePath);
+    sidecar = await spawnGatewaySidecar({
+      socketPath,
+      env: {
+        CELLO_GATEWAY_STORE_DB: join(celloDir, "gateway.db"),
+        CELLO_GATEWAY_STORE_KEY_FILE: keyFilePath,
+      },
+    });
+    logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath });
+    sidecar.process.once("exit", (code, signal) => {
+      // No auto-restart (M9C-D14). Every subsequent screen fails closed with a real cause; this
+      // line is how the operator learns the screening process died rather than inferring it from
+      // a wall of blocked sends.
+      logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none" });
+    });
+  } catch (err: unknown) {
+    logger.error("security.gateway.spawn_failed", {
+      error: err instanceof Error ? err.message : String(err),
+      guidance:
+        "The security layer could not start, so nothing can be sent or received: every message " +
+        "fails closed. Check the daemon log for the cause above, then restart the daemon.",
+    });
+  }
+  return { client, sidecar };
+}
+
 async function main(): Promise<void> {
   // M7 Keystone (Part 1): give the daemon its door to the directory. The resolver
   // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
@@ -79,6 +135,10 @@ async function main(): Promise<void> {
   // node pubkeys in it. Both dialers (keystone + per-agent) receive the verifier via startDaemon.
   const manifest = buildManifestDeps(logger);
 
+  // D-2: the security and governance layer runs ENFORCING in the shipped daemon. This is the line
+  // whose absence made every guard M9 built inert.
+  const security = await startSecurityLayer();
+
   const handle = await startDaemon({
     celloDir,
     socketPath,
@@ -88,12 +148,20 @@ async function main(): Promise<void> {
     logger,
     directoryEndpointResolver,
     ...manifest,
+    securityGateway: security.client,
     registryPubkey: REGISTRY_SIGNER_PUBKEY,
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
 
   const shutdown = async (signal: string): Promise<void> => {
     await handle.stop(signal);
+    // The sidecar dies with the daemon that spawned it. An orphaned gateway would hold the store's
+    // write lock against the next daemon (the SQLite-lock discipline this client lives under).
+    await security.client.close();
+    if (security.sidecar) {
+      await security.sidecar.stop();
+      logger.info("security.gateway.stopped", { signal });
+    }
     process.exit(0);
   };
 

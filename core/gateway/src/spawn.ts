@@ -54,13 +54,29 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
 
   const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
 
+  // DRAIN the child's stderr and keep the tail. Two reasons, and the first one is the whole point:
+  // every refusal the gateway can produce — a missing key file, a locked store, a leftover
+  // plaintext store, each with its own code and its own guidance — is written HERE. Without a
+  // listener it went into a pipe nobody read, and the only thing the caller ever saw was
+  // "gateway sidecar exited before ready (code 1)" — a message naming where the failure surfaced
+  // and nothing about what went wrong. Second: an unread pipe fills, and the gateway writes a
+  // stderr line per screen error, so a long-running gateway would eventually block on it.
+  let stderrTail = "";
+  const MAX_STDERR_TAIL = 8_192;
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-MAX_STDERR_TAIL);
+  });
+  /** The child's own words, appended to a failure so the CAUSE travels with the symptom. */
+  const withChildStderr = (message: string): string =>
+    stderrTail.trim() ? `${message}\n--- gateway stderr ---\n${stderrTail.trim()}` : message;
+
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      reject(new Error(`gateway sidecar did not become ready within ${readyTimeoutMs}ms`));
+      reject(new Error(withChildStderr(`gateway sidecar did not become ready within ${readyTimeoutMs}ms`)));
     }, readyTimeoutMs);
 
     const onStdout = (chunk: Buffer) => {
@@ -77,7 +93,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(new Error(`gateway sidecar exited before ready (code ${code})`));
+      reject(new Error(withChildStderr(`gateway sidecar exited before ready (code ${code})`)));
     });
   });
 

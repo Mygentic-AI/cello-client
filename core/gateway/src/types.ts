@@ -110,7 +110,18 @@ export interface ScreenVerdict {
  * deadline. A timeout or unreachable gateway resolves to a fail-closed `block`
  * (`gateway_unavailable`), never a rejected/never-settling promise (INV-6 / SI-001).
  */
+/** What a client actually does to content. `enforcing` screens; `passthrough` allows everything. */
+export type GatewayMode = "enforcing" | "passthrough";
+
 export interface SecurityGatewayClient {
+  /**
+   * Declared by the implementation, never computed by the caller (M9C-D11). The daemon announces
+   * this at boot, and it is the field an operator greps to know whether their agent is screened —
+   * so it must come from the object that will actually do (or not do) the screening. The defect
+   * this closes: the daemon used to announce `config.securityGateway ? "sidecar" : "passthrough"`,
+   * so the boot line described the caller's intent rather than the object's behavior.
+   */
+  readonly mode: GatewayMode;
   screenOutbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict>;
   screenInbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict>;
 }

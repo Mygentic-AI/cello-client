@@ -44,8 +44,13 @@ async function main(): Promise<void> {
   // security records, keyed by the daemon's key file — the daemon's spawn plumbing passes the two
   // paths (M9C-D8: a key FILE path, never key bytes). Both stores fail closed: a missing or wrong
   // key throws GatewayStoreError, which exits the process rather than screening unconfigured.
-  const storeDbPath = process.env["CELLO_GATEWAY_STORE_DB"];
-  const storeKeyFile = process.env["CELLO_GATEWAY_STORE_KEY_FILE"];
+  // `|| undefined` so the guard below and the two call sites read the SAME value. Testing
+  // `=== undefined` here while the call sites test truthiness let CELLO_GATEWAY_STORE_DB="" pass
+  // the guard and then silently produce NO stores — screening every message with no audit trail
+  // and no config governance, while printing READY as if healthy. An empty string is exactly what
+  // a path computation that returned nothing interpolates to.
+  const storeDbPath = process.env["CELLO_GATEWAY_STORE_DB"] || undefined;
+  const storeKeyFile = process.env["CELLO_GATEWAY_STORE_KEY_FILE"] || undefined;
   if ((storeDbPath === undefined) !== (storeKeyFile === undefined)) {
     // Half-configured storage is a plumbing bug, not a degraded mode to run through: it would
     // silently drop either the operator's config or the whole audit trail.
@@ -186,6 +191,13 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`cello-gateway: fatal ${err instanceof Error ? err.message : String(err)}\n`);
+  // Print the CODE and the GUIDANCE, not just the message. The guidance is the only part that
+  // tells the operator what to do, and dropping it was how "your key file is missing" reached
+  // them as "sidecar exited before ready (code 1)".
+  const code = (err as { code?: string } | null)?.code;
+  const guidance = (err as { guidance?: string } | null)?.guidance;
+  const message = err instanceof Error ? err.message : String(err);
+  process.stderr.write(`cello-gateway: fatal${code ? ` [${code}]` : ""} ${message}\n`);
+  if (guidance) process.stderr.write(`cello-gateway: ${guidance}\n`);
   process.exit(1);
 });
