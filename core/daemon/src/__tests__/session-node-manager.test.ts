@@ -173,7 +173,7 @@ async function makeManager(opts: {
   const dir = opts.tempDirOverride ?? tempDir;
   const dbPath = join(dir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
   const factory = opts.factory ?? new RealNodeFactory();
-  const manager = new SessionNodeManager({ factory, logger, dbPath });
+  const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory, logger, dbPath });
   return { manager, logger, events, dbPath };
 }
 
@@ -304,7 +304,7 @@ describe("SessionNodeManager — unit tests", () => {
     const stub = new StubNodeFactory();
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "test.db");
-    const manager = new SessionNodeManager({ factory: stub, logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stub, logger, dbPath });
     // Note: initialize() not called, so standing receiver is not ready
 
     const result = await manager.acceptSession(
@@ -353,13 +353,13 @@ describe("SessionNodeManager — unit tests", () => {
     // Use a stub for initialize() so the standing receiver succeeds,
     // then replace factory for subsequent calls via a wrapping approach
     const stub = new StubNodeFactory();
-    const manager = new SessionNodeManager({ factory: stub, logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stub, logger, dbPath });
     await manager.initialize();
 
     // Now create via a new manager using the failing factory
     const { logger: l2, events: ev2 } = makeLogger();
     const dbPath2 = join(tempDir, "ac013-fail2.db");
-    const manager2 = new SessionNodeManager({ factory: failing, logger: l2, dbPath: dbPath2 });
+    const manager2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: failing, logger: l2, dbPath: dbPath2 });
     // initialize() will fail to create the standing receiver — that's expected
     await manager2.initialize().catch(() => {}); // standing receiver creation fails silently
 
@@ -384,7 +384,7 @@ describe("SessionNodeManager — unit tests", () => {
     const failing = new FailingNodeFactory("standing receiver fail");
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "ac013-sr.db");
-    const manager = new SessionNodeManager({ factory: failing, logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: failing, logger, dbPath });
     await manager.initialize(); // initialize fails to create standing receiver — that's expected
 
     const result = await manager.acceptSession("ac013-sr-session", "agent", "pk", "initiator-peer", "corr");
@@ -456,7 +456,7 @@ describe("SessionNodeManager — unit tests", () => {
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "test-ac015.db");
 
-    const manager = new SessionNodeManager({ factory: stub, logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stub, logger, dbPath });
     await manager.initialize();
 
     // Intercept the standing receiver's gater by reading it via getStandingReceiverReady
@@ -491,7 +491,7 @@ describe("SessionNodeManager — unit tests", () => {
 
     const dbPath2 = join(tempDir, "test-ac015b.db");
     const { logger: logger2 } = makeLogger();
-    const manager2 = new SessionNodeManager({ factory: captureFactory, logger: logger2, dbPath: dbPath2 });
+    const manager2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: captureFactory, logger: logger2, dbPath: dbPath2 });
     await manager2.initialize();
     // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
     await seedAgents(manager2.getDb(), ["test-agent"]);
@@ -1270,7 +1270,7 @@ describe("SessionNodeManager — integration tests", () => {
 
     // Fresh daemon restart — should detect and fix orphans
     const { logger, events } = makeLogger();
-    const manager = new SessionNodeManager({ factory: stub, logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stub, logger, dbPath });
     await manager.initialize();
 
     // Verify session.interrupted.detected was logged for both orphans

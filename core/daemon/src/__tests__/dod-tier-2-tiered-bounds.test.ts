@@ -19,6 +19,7 @@ import { createHash } from "node:crypto";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER, DEFAULT_TIER_BOUNDS, tierBoundsFor } from "../contacts-tier-migration.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import {
   SessionNodeManager,
   ABUSE_MAX_SESSION_RECEIVED_BYTES,
@@ -110,7 +111,7 @@ describe("DOD-TIER-2/3 — tier-graduated acceptance bound", () => {
     const seed = openTestDb(dbPath);
     alice = (await seedAgents(seed, ["alice"])).get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
   });
@@ -203,7 +204,7 @@ describe("DOD-TIER-2 — per-tier byte cap on received content (AC2)", () => {
     const seed = openTestDb(dbPath);
     alice = (await seedAgents(seed, ["alice"])).get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
   });

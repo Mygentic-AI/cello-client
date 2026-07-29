@@ -111,6 +111,7 @@ async function makeSessionNodeManager(
   dbPath: string,
 ): Promise<SessionNodeManager> {
   const mgr = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
     factory: new StubNodeFactory(),
     logger,
     dbPath,
@@ -382,6 +383,7 @@ describe("SESSION-001: SQLite schema extension", () => {
     // Now initialize SessionNodeManager — it should run the idempotent ALTER TABLE
     const { logger } = makeLogger();
     const mgr = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory: new StubNodeFactory(),
       logger,
       dbPath,
@@ -412,11 +414,11 @@ describe("SESSION-001: SQLite schema extension", () => {
     const { logger } = makeLogger();
 
     // First init — creates columns
-    const mgr1 = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
+    const mgr1 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger, dbPath });
     await mgr1.initialize();
 
     // Second init — should not throw
-    const mgr2 = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
+    const mgr2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger, dbPath });
     await expect(mgr2.initialize()).resolves.not.toThrow();
   });
 });

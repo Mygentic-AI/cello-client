@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { isValidSettingKey, boundSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY, settableTierName } from "../agent-settings-keys.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -65,7 +66,7 @@ describe("DOD-SETTINGS-1 — the per-agent store", () => {
     const seed = openTestDb(dbPath);
     await seedAgents(seed, ["alice", "bob"]);
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
   });
   afterEach(async () => {
@@ -102,7 +103,7 @@ describe("DOD-SETTINGS-1 — the per-agent store", () => {
   });
 
   it("T2: setSetting fails closed on an uninitialized DB (a silent no-op write would be a lie)", () => {
-    const bare = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
+    const bare = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
     expect(() => bare.setSetting("alice", AWAY_DEFAULT_KEY, "hi")).toThrow(/not initialized/);
   });
 

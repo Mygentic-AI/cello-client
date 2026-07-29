@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory } from "../session-node-manager.js";
 import { upgradeAbsentToRecovered, hasAbsentParticipant } from "../seal-receipt-upgrade.js";
 import { seedAgents } from "./helpers/seed-agents.js";
@@ -31,7 +32,7 @@ describe("FINDING-6: recordSealCertificateEnsuringRow (durable absent-party rece
   afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
 
   async function newManager(): Promise<{ mgr: SessionNodeManager; bob: string }> {
-    const mgr = new SessionNodeManager({ factory: stubFactory, logger: silentLogger, dbPath: join(tempDir, `f6-${Math.random().toString(36).slice(2)}.db`) });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: stubFactory, logger: silentLogger, dbPath: join(tempDir, `f6-${Math.random().toString(36).slice(2)}.db`) });
     await mgr.initialize();
     // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
     const ids = await seedAgents(mgr.getDb(), ["bob"]);

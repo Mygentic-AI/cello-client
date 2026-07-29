@@ -16,6 +16,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER } from "../contacts-tier-migration.js";
 import { awayTierSettingKey, AWAY_DEFAULT_KEY } from "../agent-settings-keys.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -49,7 +50,7 @@ describe("DOD-AWAY-TIER-1 — away message resolution (most-specific-first)", ()
     const seed = openTestDb(dbPath);
     await seedAgents(seed, ["alice"]);
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     mgr.addContact("alice", pk, undefined, "accepted", TIER.KNOWN);

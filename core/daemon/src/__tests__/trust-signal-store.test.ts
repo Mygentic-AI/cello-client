@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgentKeys } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
@@ -106,7 +107,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     alicePubkey = agents.get("alice")!.pubkeyHex;
     bobPubkey = agents.get("bob")!.pubkeyHex;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);
@@ -535,7 +536,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       const dir2 = await mkdtemp(join(tmpdir(), "dod-store-client-1-fresh-"));
       try {
         const p2 = join(dir2, "sessions.db");
-        const mgr2 = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: p2 });
+        const mgr2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: p2 });
         await mgr2.initialize();
         const fresh = mgr2.getDb();
         ensureTrustSignalSchema(fresh, silent); // applied again, exactly as an upgrade would

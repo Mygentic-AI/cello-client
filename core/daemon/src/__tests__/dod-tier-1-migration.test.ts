@@ -33,6 +33,7 @@ import {
   TIER,
   migrateContactsAddTierMetadata,
 } from "../contacts-tier-migration.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -182,12 +183,12 @@ describe("DOD-TIER-1 — contacts tier metadata migration (real SQLCipher)", () 
     seed.prepare("INSERT INTO contacts (agent_id, pubkey, added_at) VALUES (?, ?, ?)")
       .run(ids.get("ada"), "somebodypubkey", 111);
     seed.close();
-    const migratedMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: oldPath });
+    const migratedMgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: oldPath });
     await migratedMgr.initialize();
 
     // FRESH: a brand-new manager, no pre-existing contacts.
     const freshPath = join(tempDir, "fresh.db");
-    const freshMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: freshPath });
+    const freshMgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: freshPath });
     await freshMgr.initialize();
 
     const norm = (db: DaemonDatabase) =>

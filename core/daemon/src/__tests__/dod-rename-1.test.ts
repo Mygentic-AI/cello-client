@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER } from "../contacts-tier-migration.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -47,7 +48,7 @@ describe("DOD-RENAME-1 — Option C rename detection", () => {
     const seed = openTestDb(dbPath);
     alice = (await seedAgents(seed, ["alice"])).get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     void alice;
     mgr.addContact("alice", pk, undefined, "accepted", TIER.KNOWN);

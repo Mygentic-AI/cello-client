@@ -27,6 +27,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -108,6 +109,7 @@ describe("M8B F14: standing receiver re-arm", () => {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory,
       logger,
       dbPath,

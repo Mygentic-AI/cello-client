@@ -6,12 +6,29 @@
  * portal page. A `confirmed` flag that only tests set is a gate nobody can pass and nobody can
  * open. These three verbs are the surface, and the confirmation is a human at a terminal.
  *
- * INV-10 — the loosen gate has no side door. Every loosening flows through the versioned store,
- * and `confirmed` is honored ONLY from a `cli` connection (M9C-D15). An MCP caller — which is what
- * an LLM agent is — gets a refusal naming the command a human must run. Stated plainly: this is
- * not a cryptographic boundary, because it does not need to be. The threat is an agent talking
- * itself into weakening its own guards; the agent reaches the daemon through the MCP server, which
- * declares `mcp`. Anyone who can spawn a process claiming to be the CLI can simply run the CLI.
+ * INV-10 — WHAT THIS GATE ACTUALLY GUARANTEES, stated honestly (audit finding, 2026-07-29).
+ *
+ * Every loosening flows through the versioned store, and `confirmed` is honored only from a
+ * connection whose declared `clientType` is exactly `cli` — an MCP caller, or one that never
+ * handshook at all, is refused with the command a human must run.
+ *
+ * **That is not an authentication boundary, and it must not be described as one.** `clientType` is
+ * SELF-DECLARED: the daemon records whatever string arrives in `ipc.connect`. Any process running
+ * as the operator can open `~/.cello/daemon.sock` (mode 0600), announce `clientType: "cli"`, and
+ * pass `confirmed: true`. That includes an agent with a shell tool. The TTY check that represents
+ * the human lives in the CLI process (`confirmAtTty`), and the daemon has no way to verify it —
+ * a same-uid process is indistinguishable from the operator by any local mechanism, so no amount
+ * of daemon-side checking closes this.
+ *
+ * What it therefore DOES do, which is worth having: it removes every path an agent reaches by
+ * ORDINARY means — the MCP tools it is given, and the CLI it can invoke (which refuses on a
+ * non-TTY stdin). An agent must go out of its way, speaking raw IPC and misrepresenting itself,
+ * and that is a different and much louder act than calling a tool it was handed.
+ *
+ * The real boundary is the one D-4 already names as the destination: the portal passkey. A
+ * confirmation the operator performs on a surface the local machine cannot forge is the only thing
+ * that makes "and nothing else produces this flag" true. Until then, this is a friction gate with
+ * a versioned, hash-chained audit trail — not a lock.
  *
  * The store is opened per call rather than held open: config commands are rare, the file is shared
  * with the gateway process, and a long-lived second write handle buys nothing but lock contention.

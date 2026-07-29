@@ -27,6 +27,7 @@ import { DatabaseSync } from "node:sqlite";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
 import { migrateContactsAddTierMetadata } from "../contacts-tier-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { RetryQueue } from "../retry-queue.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
@@ -256,12 +257,12 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
    * column to `session-node-manager` and forgets `agent-id-migration`, this goes red.
    */
   it("column sets and primary keys are identical for all seven tables", async () => {
-    const freshMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "fresh.db") });
+    const freshMgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "fresh.db") });
     await freshMgr.initialize();
     const fresh = freshMgr.getDb();
     new RetryQueue(fresh, makeLogger().logger); // creates retry_queue in the re-keyed shape
 
-    const migratedMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "old.db") });
+    const migratedMgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "old.db") });
     await migratedMgr.initialize();
     const migrated = migratedMgr.getDb();
     // Tear the six back down to their legacy shape, plus a legacy retry_queue, then re-run init's
@@ -310,7 +311,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
   });
 
   it("the re-keyed retry_queue carries the agent-scoped unique index, and it is the CORRECT tuple", async () => {
-    const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "rq.db") });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "rq.db") });
     await mgr.initialize();
     const db = mgr.getDb();
     new RetryQueue(db, makeLogger().logger);

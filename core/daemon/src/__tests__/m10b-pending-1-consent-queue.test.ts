@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgentKeys } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, type WalletSignalInput } from "../trust-signal-store.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -71,7 +72,7 @@ describe("DOD-END-PENDING-1 — the pending-consent queue", () => {
     alice = agents.get("alice")!.pubkeyHex;
     bob = agents.get("bob")!.pubkeyHex;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);
