@@ -51,7 +51,7 @@ import * as lp from "it-length-prefixed";
 import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse, SessionRecord } from "../types.js";

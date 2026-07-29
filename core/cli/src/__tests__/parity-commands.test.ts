@@ -20,7 +20,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger, PassthroughGatewayClient } from "@cello-protocol/daemon";
+import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger } from "@cello-protocol/daemon";
+import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import {
   listAgents,
   startAgent,

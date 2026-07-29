@@ -33,7 +33,7 @@ import {
   TIER,
   migrateContactsAddTierMetadata,
 } from "../contacts-tier-migration.js";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";

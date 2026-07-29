@@ -19,7 +19,8 @@ export type {
   IManifestPollScheduler,
   IDirectoryChallengeVerifier,
 } from "./types.js";
-export { ErrorCodes, PassthroughGatewayClient } from "./types.js";
+// PassthroughGatewayClient is at `@cello-protocol/daemon/testing`, not here (DOD-M9C-WIRE-1).
+export { ErrorCodes } from "./types.js";
 
 export { startDaemon, type DaemonHandle } from "./daemon.js";
 export { readLock, acquireLock, removeLock, removeLockIfOwned, isProcessAlive } from "./lock-file.js";

@@ -27,7 +27,7 @@ import { DatabaseSync } from "node:sqlite";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
 import { migrateContactsAddTierMetadata } from "../contacts-tier-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { RetryQueue } from "../retry-queue.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";

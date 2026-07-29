@@ -14,7 +14,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, connectToDaemon, acquireLock, type DaemonHandle, type DaemonConfig, type Logger, type IpcClient, PassthroughGatewayClient } from "@cello-protocol/daemon";
+import { startDaemon, connectToDaemon, acquireLock, type DaemonHandle, type DaemonConfig, type Logger, type IpcClient } from "@cello-protocol/daemon";
+import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import { autoStartAllAgents, formatLoginSummary, login } from "../commands.js";
 
 describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {

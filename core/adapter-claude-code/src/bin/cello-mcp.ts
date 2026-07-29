@@ -158,7 +158,9 @@ server.tool("cello_agents", "List all agents with state from this connection's p
 // ─── Contact whitelist tools (CC-9) ─────────────────────────────────────────
 // The per-agent whitelist is load-bearing: a known contact is fast-tracked and exempt from the
 // unknown-sender gate + the ABUSE-1 acceptance caps. Those caps ARE enforced. CONTENT screening
-// (prompt-injection defense) is NOT: the daemon runs PassthroughGatewayClient, so no tool
+// (prompt-injection defense) IS live as of DOD-M9C-WIRE-1 — the daemon spawns the screening
+// sidecar and runs enforcing; this comment previously said the opposite, which was true when the
+// layer was inert and shipped in the tarball claiming so
 // description here may tell the operator's agent that message text is screened.
 
 server.tool("cello_contacts", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from the unknown-sender gate and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {

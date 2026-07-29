@@ -16,7 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory } from "../session-node-manager.js";
 import { upgradeAbsentToRecovered, hasAbsentParticipant } from "../seal-receipt-upgrade.js";
 import { seedAgents } from "./helpers/seed-agents.js";

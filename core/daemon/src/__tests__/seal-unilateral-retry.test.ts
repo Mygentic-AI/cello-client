@@ -35,7 +35,7 @@ import * as lp from "it-length-prefixed";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { DbRegistrationPersistence } from "../db-identity-store.js";

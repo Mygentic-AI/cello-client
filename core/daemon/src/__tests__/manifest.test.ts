@@ -28,7 +28,7 @@ import {
   InMemoryManifestVersionStore,
   ImmediatePollScheduler,
 } from "@cello-protocol/transport";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { FileManifestProvider } from "../manifest-loader.js";
 import type { Logger, DaemonConfig } from "../types.js";

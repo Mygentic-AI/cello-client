@@ -16,7 +16,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER, DEFAULT_TIER_BOUNDS } from "../contacts-tier-migration.js";
 import { boundSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY, validateSettingValue } from "../agent-settings-keys.js";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";

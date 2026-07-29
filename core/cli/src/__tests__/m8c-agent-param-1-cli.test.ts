@@ -28,7 +28,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, connectToDaemon, type DaemonHandle, PassthroughGatewayClient } from "@cello-protocol/daemon";
+import { startDaemon, connectToDaemon, type DaemonHandle } from "@cello-protocol/daemon";
+import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { refreshShares, relayReceipts } from "../commands.js";
 

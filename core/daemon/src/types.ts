@@ -17,11 +17,10 @@ import type {
 import type { TransportDialer, SessionNegotiator } from "./transport-selector.js";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 
-// Re-export for daemon consumers (the composition root supplies the impl). The VALUE re-export is
-// deliberate: `DaemonConfig.securityGateway` is required (INV-9), so every consumer needs a way to
-// satisfy it — including a test that does not screen, which says so by passing the passthrough.
+// Re-export the TYPE for daemon consumers (the composition root supplies the impl). The always-allow
+// implementation is NOT re-exported here — it lives at `@cello-protocol/daemon/testing`, so a
+// production file cannot reach it by ordinary import (DOD-M9C-WIRE-1, INV-9).
 export type { SecurityGatewayClient };
-export { PassthroughGatewayClient } from "@cello-protocol/gateway";
 
 // Re-export manifest interfaces for consumers of the daemon package
 export type {

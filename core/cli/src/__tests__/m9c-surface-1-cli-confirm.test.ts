@@ -11,7 +11,8 @@ import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { startDaemon, PassthroughGatewayClient, type DaemonHandle, type Logger } from "@cello-protocol/daemon";
+import { startDaemon, type DaemonHandle, type Logger } from "@cello-protocol/daemon";
+import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import { gatewayConfigSet, gatewayConfigGet } from "../parity-commands.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };

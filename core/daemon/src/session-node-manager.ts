@@ -385,7 +385,8 @@ export class SessionNodeManager {
     standingReceiverWatchdogIntervalMs?: number;
     /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
-     * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
+     * REQUIRED — there is no always-allow default (INV-9). A caller that does not screen must
+     * say so by passing PassthroughGatewayClient from `@cello-protocol/gateway/testing`.
      */
     securityGateway: SecurityGatewayClient;
   }) {
