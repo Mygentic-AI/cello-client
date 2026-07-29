@@ -52,6 +52,19 @@ export interface CreateNodeOptions {
    */
   connectionGater?: ConnectionGater;
   /**
+   * AutoNAT dial-back RESPONDER (answering other peers' "can you dial me?" requests).
+   * Defaults to service-node behaviour (`nodeType === undefined`), like `relayServer`.
+   *
+   * Set `{ enabled: false }` on any CLIENT node, INCLUDING ones that leave `nodeType` unset --
+   * the directory-signaling node does exactly that, so the default alone would leave the responder
+   * on. @libp2p/autonat's responder answers by calling openConnection(peer), which RETURNS AN
+   * ALREADY-OPEN CONNECTION, and then closes it in a `finally`; on a client that is the connection
+   * carrying directory signaling, so it dies with yamux GoAway. The PROBER half is unaffected --
+   * it opens outbound streams and needs no inbound handler -- so getDialability()
+   * (DOD-NAT-REACHABILITY-1) still works.
+   */
+  autonatResponder?: { enabled: boolean };
+  /**
    * CELLO-M7-TRANSPORT-001 / DOD-NAT-REACHABILITY-1: the role of this node,
    * which tunes the libp2p service set:
    *   - 'session'           — ephemeral per-session dialer.

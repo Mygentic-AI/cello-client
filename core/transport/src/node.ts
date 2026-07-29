@@ -18,6 +18,9 @@ import { yamux } from "@chainsafe/libp2p-yamux";
 import { circuitRelayServer, circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { dcutr } from "@libp2p/dcutr";
 import { autoNAT } from "@libp2p/autonat";
+
+/** AutoNAT dial-back protocol. Default prefix "libp2p"; see @libp2p/autonat protocolPrefix. */
+const AUTONAT_PROTOCOL = "/libp2p/autonat/1.0.0";
 import { identify } from "@libp2p/identify";
 import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
 import { multiaddr } from "@multiformats/multiaddr";
@@ -183,6 +186,7 @@ class CelloNodeImpl implements CelloNode {
   // Whether ANY circuit listen entry was configured (drives the circuit-only
   // zero-listener refusal in start()).
   readonly #hasCircuitListen: boolean;
+  readonly #dropAutonatResponder: boolean;
 
   constructor(
     libp2p: Libp2p,
@@ -190,12 +194,14 @@ class CelloNodeImpl implements CelloNode {
     configuredHosts: ReadonlySet<string>,
     expectsDirectListener: boolean,
     hasCircuitListen: boolean,
+    dropAutonatResponder: boolean = false,
   ) {
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
     this.#configuredHosts = configuredHosts;
     this.#expectsDirectListener = expectsDirectListener;
     this.#hasCircuitListen = hasCircuitListen;
+    this.#dropAutonatResponder = dropAutonatResponder;
     // Recompute dialability whenever libp2p updates its self-reported addresses.
     // AutoNAT verification of an external address triggers a 'self:peer:update'.
     this.#libp2p.addEventListener("self:peer:update", () => {
@@ -228,6 +234,25 @@ class CelloNodeImpl implements CelloNode {
 
   async start(): Promise<void> {
     await this.#libp2p.start();
+    // Drop the AutoNAT RESPONDER on client nodes, keeping the prober half.
+    //
+    // @libp2p/autonat's responder answers a dial-back request by calling openConnection(peer) --
+    // which RETURNS AN ALREADY-OPEN CONNECTION -- and then closes it in a `finally`. On a client
+    // that connection is the one carrying directory signaling, so the close sends yamux GoAway and
+    // kills every stream on it. Observed as registration failing with `signaling_lost` ~2ms after
+    // `directory.signaling.connected`, against a directory that had done nothing wrong.
+    //
+    // Only the responder is removed. The prober half opens OUTBOUND streams and needs no inbound
+    // handler, so getDialability() (DOD-NAT-REACHABILITY-1, which wraps the libp2p observable) is
+    // unaffected. A client has no reason to serve dial-back anyway -- it is not infrastructure;
+    // directories and relays keep the responder for exactly that purpose.
+    if (this.#dropAutonatResponder) {
+      try {
+        await this.#libp2p.unhandle(AUTONAT_PROTOCOL);
+      } catch {
+        // Never registered (autonat absent or renamed upstream) -- nothing to remove.
+      }
+    }
     // Restore the invariant NO_FATAL relaxed: if a direct (non-circuit) listen
     // address was configured, at least one direct listener must exist. A failed
     // circuit reservation is a tolerated degradation; a failed TCP bind is not.
@@ -470,6 +495,9 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // HOP relay: service nodes keep it (deployed-relay compatibility); client node
   // types must opt in explicitly via relayServer.
   const includeRelayServer = opts.relayServer?.enabled ?? opts.nodeType === undefined;
+  // Same default shape as relayServer: service nodes respond, clients do not. Clients that leave
+  // nodeType unset (the directory-signaling node) must opt out EXPLICITLY.
+  const includeAutonatResponder = opts.autonatResponder?.enabled ?? opts.nodeType === undefined;
   const reservations = opts.relayServer?.reservations;
   // ADR-0001: generate a fresh keypair for libp2p transport identity.
   // keyProvider is intentionally NOT touched here — see SI-002.
@@ -555,5 +583,5 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // Return node in STOPPED state — caller must call start()
   const expectsDirectListener =
     hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
-  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen);
+  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder);
 }

@@ -185,6 +185,10 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
           keyProvider: identity.keyProvider,
           listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
           relayServer: { enabled: false },
+          // Same reason as relayServer above: this is a CLIENT node that leaves nodeType unset, so
+          // the service-node default would leave the AutoNAT responder on -- and answering one
+          // dial-back tears down this very connection, killing signaling mid-registration.
+          autonatResponder: { enabled: false },
         });
 
     let sigStream: Stream;
