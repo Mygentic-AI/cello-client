@@ -225,3 +225,62 @@ function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; is
   const result = projectTrustSignals(received);
   return result?.trust_signals ?? [];
 }
+
+/**
+ * M10B / `M10B-D13` — the framing SPLITS on issuer_kind, and the wrapper matters as much as the
+ * payload.
+ *
+ * The projection previously wrapped every signal in one sentence — "each verified by the CELLO
+ * directory… confirmed active" — with `directory_verified: true`, regardless of author. For a
+ * portal-issued fact that is accurate. For an agent-issued endorsement it launders authority: the
+ * directory checked that the HASH is notarized, and nothing about whether the claim is true.
+ *
+ * D13 states the trap precisely: the payload split alone does NOT satisfy INV-UNTRUSTED. A live
+ * journey asserting only on fields nested inside `claim` would pass while a stranger's sentence
+ * reached the model under CELLO's authority.
+ */
+describe("M10B-D13 — peer-claimed content is framed as peer-claimed", () => {
+  const sig = (issuerKind: string, payload: Record<string, unknown>) => ({
+    type: "endorsement",
+    issuerKind,
+    payload: encodeCbor(payload),
+    verdict: "active",
+    signalHash: "ab".repeat(32),
+  });
+
+  it("does NOT tell a model that peer-claimed content was verified by CELLO", () => {
+    const out = projectTrustSignals([sig("agent", { claim: "x", statement: "Alice is great" })])!;
+    // The attestation must not claim the directory verified the SIGNAL — only its provenance.
+    expect(out.directory_attestation).not.toMatch(/each verified by the CELLO directory/i);
+    expect(out.directory_attestation).toMatch(/provenance|not of truth/i);
+    // And it must warn about the peer-claimed one specifically.
+    expect(out.directory_attestation).toMatch(/peer-claimed/i);
+  });
+
+  it("marks a peer-claimed signal and tells the model how to treat it", () => {
+    const [s] = projectTrustSignals([sig("agent", { statement: "Alice is great" })])!.trust_signals;
+    expect(s.issuer).toBe("peer-claimed");
+    expect(s.content_is_peer_claimed).toBe(true);
+    expect(String(s.framing)).toMatch(/did NOT verify|does not vouch/i);
+    expect(String(s.framing)).toMatch(/quote and attribute|never restate/i);
+  });
+
+  it("leaves PORTAL-issued facts framed as platform-verified — not 'warn about everything'", () => {
+    // The counterpart. Without it, satisfying the above by flagging every signal would pass, and a
+    // caveat that fires on the normal case teaches a model to ignore it.
+    const [s] = projectTrustSignals([sig("portal", { claim: "verified phone" })])!.trust_signals;
+    expect(s.issuer).toBe("platform-verified");
+    expect(s.content_is_peer_claimed).toBe(false);
+    expect(s.framing, "a portal fact needs no untrusted-content warning").toBeUndefined();
+    // And with no peer-claimed signal present, the attestation carries no peer-claimed caveat.
+    const out = projectTrustSignals([sig("portal", { claim: "verified phone" })])!;
+    expect(out.directory_attestation).not.toMatch(/peer-claimed/i);
+  });
+
+  it("still reports the hash as notarized for both — that check IS real", () => {
+    // `directory_verified` is hash-level and true either way; what differs is what it means about
+    // the CONTENT. Collapsing the two would be the opposite error.
+    expect(projectTrustSignals([sig("agent", {})])!.trust_signals[0].directory_verified).toBe(true);
+    expect(projectTrustSignals([sig("portal", {})])!.trust_signals[0].directory_verified).toBe(true);
+  });
+});
