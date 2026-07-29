@@ -16,7 +16,7 @@
  *     and also the shape of a single-node censorship attack (Entry 20), so it must never be
  *     collapsed into plain success.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { sendSealedSubmission } from "../signal-submission.js";
 import type { Logger } from "../types.js";
 
@@ -38,6 +38,10 @@ const SUBMISSION = {
 function signalingThatReplies(reply: Record<string, unknown> | null, sendResult = { ok: true as const }) {
   const handlers: Array<(f: Record<string, unknown>) => void> = [];
   return {
+    // EXPOSED so the unregister test can observe the leak it is named for. Previously it asserted
+    // only that registerInboundHandler RETURNED a function — true of any stub — and passed with
+    // `finally { unregister() }` deleted.
+    handlers,
     sent: [] as unknown[],
     async sendRaw(frame: unknown) {
       this.sent.push(frame);
@@ -95,7 +99,7 @@ describe("DOD-END-SUBMIT-1 — the submission_write frame", () => {
 });
 
 describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or misleading", () => {
-  it("maps a version-skew `not_authenticated` to a SKEW cause, not an auth failure", async () => {
+  it("names the AMBIGUITY on a version-skew `not_authenticated` — never asserts one cause", async () => {
     // The trap (M10B-D25r F2): decodeInboundSignalingFrame returns null for an unknown frame kind and
     // the node replies not_authenticated. Reporting that verbatim is ERROR SUBSTITUTION — the label
     // names the exit point and sends the operator to the wrong subsystem. Directory nodes deploy
@@ -106,13 +110,15 @@ describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or m
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
     expect(res.reason).toBe("submission_unsupported_by_node");
-    expect(res.guidance).toMatch(/has not deployed|version|skew/i);
-    // And it must NOT be reported as an authentication problem.
-    expect(res.guidance).not.toMatch(/check your key|re-register/i);
+    expect(res.guidance).toMatch(/has not deployed|version/i);
+    // It must NAME the other two producers rather than ruling them out. An earlier version asserted
+    // "NOT an authentication problem", which is false when the frame really did arrive pre-auth.
+    expect(res.guidance).toMatch(/authentication/i);
+    expect(res.guidance).toMatch(/malformed/i);
   });
 
   it("reports the node's own refusal reason when it names one", async () => {
-    const s = signalingThatReplies({ type: "submission_write_error", reason: "queue_full" });
+    const s = signalingThatReplies({ type: "submission_write_error", submission_id: SUBMISSION.submissionId, reason: "queue_full" });
     const res = await send(s);
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
@@ -125,8 +131,11 @@ describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or m
     const res = await send(s);
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("unreachable");
-    expect(res.reason).toBe("directory_unreachable");
+    // F7: the reason CODE is the transport's own cause, not the exit-point label.
+    expect(res.reason).toBe("signaling_reconnecting");
     expect(res.guidance).toMatch(/signaling_reconnecting/);
+    // F1: it must NOT claim a retry that no code performs.
+    expect(res.guidance).toMatch(/NOT handed|nothing has retried/i);
   });
 
   it("TIMES OUT rather than hanging when the node never answers", async () => {
@@ -139,14 +148,28 @@ describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or m
     expect(res.reason).toBe("submission_write_timeout");
   });
 
-  it("UNREGISTERS its inbound handler on every path — no leak per submission", async () => {
-    // A handler left registered per submission accumulates on a long-lived stream.
-    const s = signalingThatReplies(null);
-    const spy = vi.spyOn(s, "registerInboundHandler");
-    await send(s, 60);
-    const unregister = spy.mock.results[0]?.value as () => void;
-    expect(typeof unregister).toBe("function");
-    // Registering again and firing must not re-enter the completed send.
-    await expect(send(s, 60)).resolves.toMatchObject({ ok: false });
+  it("UNREGISTERS its inbound handler on EVERY terminal path — observed, not assumed", async () => {
+    // The previous version of this test read the return value of registerInboundHandler and asserted
+    // it was a function. That is true of any stub, and the test passed with `finally { unregister() }`
+    // deleted — a hollow test named for a leak it could not see. This one counts the handlers.
+    const ok = signalingThatReplies({ type: "submission_write_result", submission_id: SUBMISSION.submissionId, stored: true });
+    await send(ok);
+    expect(ok.handlers.length, "success path").toBe(0);
+
+    const dup = signalingThatReplies({ type: "submission_write_result", submission_id: SUBMISSION.submissionId, stored: false });
+    await send(dup);
+    expect(dup.handlers.length, "duplicate path").toBe(0);
+
+    const err = signalingThatReplies({ type: "submission_write_error", submission_id: SUBMISSION.submissionId, reason: "queue_full" });
+    await send(err);
+    expect(err.handlers.length, "node-error path").toBe(0);
+
+    const timedOut = signalingThatReplies(null);
+    await send(timedOut, 60);
+    expect(timedOut.handlers.length, "timeout path").toBe(0);
+
+    const unsent = signalingThatReplies(null, { ok: false as unknown as true, reason: "signaling_lost" } as never);
+    await send(unsent);
+    expect(unsent.handlers.length, "send-failure path").toBe(0);
   });
 });

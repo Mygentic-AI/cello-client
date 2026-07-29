@@ -133,6 +133,14 @@ describe("DOD-END-SUBMIT-1 — the sealed submission", () => {
     expect(body.submitter_pubkey).toBe(expected);
   });
 
+  // NOTE, stated rather than papered over: the two attribution tests below CANNOT see the invariant
+  // they are named for. They check that the pubkey equals the signer's — and an implementation of
+  // the form `submitter_pubkey: opts.submitterPubkey ?? signerPubkey` passes both, because no test
+  // supplies an override. The invariant is the ABSENCE of a parameter, which is a property of the
+  // type; it is pinned by the compile-time guard in `signal-submission.ts`, NOT here. A
+  // `@ts-expect-error` in this file would assert nothing at all: `core/daemon/tsconfig.json`
+  // excludes `src/__tests__`, so nothing typechecks it.
+
   it("INV-ATTRIBUTION: the signature VERIFIES against that pubkey, over the canonical TBS", async () => {
     // Ed25519 has no key recovery, so the pubkey in the body is worthless until this check passes.
     // This is the check that turns a claimed identity into an authenticated one.

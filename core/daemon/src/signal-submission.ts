@@ -90,6 +90,30 @@ export interface ComposeSubmissionOptions {
 }
 
 /**
+ * COMPILE-TIME GUARD for INV-ATTRIBUTION, and it lives HERE rather than in a test on purpose.
+ *
+ * The invariant is enforced by the ABSENCE of a parameter: `submitter_pubkey` is read from the
+ * signing key provider, so a caller cannot name someone else because there is nowhere to put the
+ * lie. No runtime test can observe that — an implementation of the form
+ * `submitter_pubkey: opts.submitterPubkey ?? signerPubkey` passes every attribution test in the
+ * suite, because no test supplies an override. It is a property of the TYPE, so it is pinned at
+ * compile time or not at all.
+ *
+ * And it cannot be pinned from a test file: `core/daemon/tsconfig.json` EXCLUDES `src/__tests__`, so
+ * a `@ts-expect-error` there is never evaluated and asserts nothing — a hollow test wearing
+ * compile-time clothing. This file is in `include`, so this one really does fail the build.
+ *
+ * Add a submitter-identity field to `ComposeSubmissionOptions` and the assignment below stops
+ * compiling.
+ */
+type NoSubmitterIdentityOverride =
+  Extract<keyof ComposeSubmissionOptions, "submitterPubkey" | "submitter_pubkey" | "submitterKey" | "issuerPubkey"> extends never
+    ? true
+    : "INV-ATTRIBUTION: ComposeSubmissionOptions must never accept a caller-supplied submitter identity";
+const INV_ATTRIBUTION_NO_OVERRIDE: NoSubmitterIdentityOverride = true;
+void INV_ATTRIBUTION_NO_OVERRIDE;
+
+/**
  * Compose → sign → seal. Returns the exact three values a queue row needs, or a named refusal.
  *
  * Note what this function does NOT do: it does not send, and it does not scan. Sending is the
@@ -250,17 +274,27 @@ export async function sendSealedSubmission(deps: {
   const { signaling, submissionId: id, intakeKeyId, ciphertext, logger } = deps;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
 
+  // Advisory only — see the handler. Never resolves the send; it sharpens the TIMEOUT's diagnosis.
+  let sawNotAuthenticated = false;
   let resolveFrame!: (f: Record<string, unknown>) => void;
   const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
   const unregister = signaling.registerInboundHandler((frame) => {
     const t = frame["type"];
     // A result for a DIFFERENT submission must be ignored: the handler sees every frame on a shared
     // stream, and accepting someone else's ack would report success for a write that never happened.
+    // EVERY resolve path is id-gated. The handler sees every frame on a SHARED stream, so an
+    // ungated one resolves this submission with someone else's outcome — and two concurrent
+    // submissions is not an exotic case, it is the second endorsement.
     if (t === "submission_write_result" && frame["submission_id"] === id) resolveFrame(frame);
-    else if (t === "submission_write_error") resolveFrame(frame);
-    // An unknown frame kind makes the node's decoder return null, and it replies `not_authenticated`
-    // (M10B-D25r). That is a VERSION-SKEW symptom wearing an auth label — see the mapping below.
-    else if (t === "not_authenticated") resolveFrame(frame);
+    else if (t === "submission_write_error" && frame["submission_id"] === id) resolveFrame(frame);
+    // `not_authenticated` is DELIBERATELY NOT a resolve path. An older node replies it when its
+    // decoder returns null (M10B-D25r), so it is the version-skew symptom — but it is also what the
+    // node sends for a frame that arrives before auth completes, and for ANY other component's
+    // undecodable frame on this same stream. Resolving on it would let an unrelated
+    // `manifest_poll_request` to an older node report THIS submission as unsupported, while the real
+    // result arrives afterwards and is dropped on the floor. It is recorded as advisory context and
+    // the timeout decides.
+    else if (t === "not_authenticated") sawNotAuthenticated = true;
   });
 
   try {
@@ -271,14 +305,22 @@ export async function sendSealedSubmission(deps: {
       ciphertext,
     });
     if (!sent.ok) {
-      logger.warn("signal.submission.refused", { submissionId: id, reason: "directory_unreachable", transport: sent.reason });
+      // The reason CODE carries the transport's own cause when it has one. `directory_unreachable`
+      // is an exit-point label — a machine consumer branching on it cannot tell "reconnecting" from
+      // "lost", and those want different operator actions.
+      const cause = sent.reason ?? "directory_unreachable";
+      logger.warn("signal.submission.refused", { submissionId: id, reason: cause });
       return {
         ok: false,
-        reason: "directory_unreachable",
+        reason: cause as SubmissionSendFailure,
+        // STATED AS IT IS: this submission was NOT delivered and NOTHING here retries it. An earlier
+        // draft said "it was not lost", which asserted a retry no code performs — the caller would
+        // have to re-invoke, and until DOD-END-SURFACE-1 there is no caller at all. What IS true is
+        // that re-submitting is SAFE, which is a different claim.
         guidance:
-          `The submission could not be handed to a directory node (${sent.reason ?? "send failed"}). ` +
-          "It was not lost: re-submitting produces the SAME submission_id, so a retry after the " +
-          "signaling stream reconnects is stored once, not twice.",
+          `The submission was NOT handed to a directory node (${cause}) and nothing has retried it. ` +
+          "Re-submitting is safe: it produces the SAME submission_id, so the retry is stored once, " +
+          "not twice.",
       };
     }
 
@@ -290,30 +332,26 @@ export async function sendSealedSubmission(deps: {
     clearTimeout(timer);
 
     if (frame["type"] === "__timeout__") {
-      logger.warn("signal.submission.refused", { submissionId: id, reason: "submission_write_timeout", timeoutMs });
+      // F2: NAME THE AMBIGUITY RATHER THAN RESOLVING IT. `not_authenticated` has THREE producers on
+      // the directory side — an undecodable frame from a node that has not deployed this frame kind
+      // (the version-skew case), an undecodable frame from a node that HAS (i.e. our own bug: a
+      // malformed id or an empty ciphertext), and a frame that genuinely arrived before auth
+      // completed. An earlier draft asserted the first with certainty and told the operator it was
+      // "NOT an authentication problem" — which, in the third case, sends them away from the actual
+      // cause and towards a deploy that will never fix it.
+      const reason = sawNotAuthenticated ? "submission_unsupported_by_node" : "submission_write_timeout";
+      logger.warn("signal.submission.refused", { submissionId: id, reason, timeoutMs, sawNotAuthenticated });
       return {
         ok: false,
-        reason: "submission_write_timeout",
-        guidance:
-          `The directory node accepted the frame but did not acknowledge the submission within ${timeoutMs}ms. ` +
-          "Whether it was stored is unknown; re-submitting is safe (same submission_id, stored once).",
-      };
-    }
-
-    if (frame["type"] === "not_authenticated") {
-      // ERROR SUBSTITUTION, caught at the one place that can catch it. Reporting the wire label
-      // verbatim would send an operator to debug keys for a day over a rollout artefact. Directory
-      // nodes are sovereign and deploy independently per region, so an upgraded daemon meeting a
-      // node that has not taken this change is the NORMAL case during a rollout, not an edge.
-      logger.warn("signal.submission.refused", { submissionId: id, reason: "submission_unsupported_by_node" });
-      return {
-        ok: false,
-        reason: "submission_unsupported_by_node",
-        guidance:
-          "The directory node rejected the frame as unrecognised — it has not deployed submission " +
-          "support yet (nodes deploy independently per region, so this is a version-skew symptom, " +
-          "NOT an authentication problem). Retry once this region's node is updated, or connect to " +
-          "another node.",
+        reason,
+        guidance: sawNotAuthenticated
+          ? "The directory node did not recognise the frame and never acknowledged the submission. " +
+            "MOST LIKELY it has not deployed submission support yet — nodes deploy independently per " +
+            "region, so check this node's version first. Two other conditions produce the same reply: " +
+            "a malformed submission from this client, and a frame rejected because authentication had " +
+            "not completed (if the signaling stream also dropped, look there). Re-submitting is safe."
+          : `The directory node accepted the frame but did not acknowledge the submission within ${timeoutMs}ms. ` +
+            "Whether it was stored is unknown; re-submitting is safe (same submission_id, stored once).",
       };
     }
 
