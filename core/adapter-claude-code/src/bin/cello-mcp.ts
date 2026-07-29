@@ -212,16 +212,16 @@ server.tool("cello_consent_list", "List trust signals (e.g. endorsements) that o
 });
 
 server.tool("cello_consent_accept", "Accept a trust signal issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
-  signal_hash: z.string().describe("Hex signal hash of the pending item, as shown by cello_consent_list"),
-}, async ({ signal_hash }) => {
-  const result = await proxy.call("cello_consent_accept", { signal_hash });
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_consent_list"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("cello_consent_accept", { hash_prefix });
   return jsonText(result);
 });
 
 server.tool("cello_consent_refuse", "Refuse a trust signal issued about the currently selected agent. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused signal is inert everywhere it is checked.", {
-  signal_hash: z.string().describe("Hex signal hash of the pending item, as shown by cello_consent_list"),
-}, async ({ signal_hash }) => {
-  const result = await proxy.call("cello_consent_refuse", { signal_hash });
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_consent_list"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("cello_consent_refuse", { hash_prefix });
   return jsonText(result);
 });
 

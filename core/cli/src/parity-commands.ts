@@ -543,11 +543,11 @@ export function consentList(celloDir: string, opts: ParityOptions): Promise<CliO
 }
 
 /** `cello consent accept <signal-hash>` → cello_consent_accept. */
-export function consentAccept(celloDir: string, signalHash: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["consent-accept"], { signal_hash: signalHash }, opts);
+export function consentAccept(celloDir: string, hashPrefix: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["consent-accept"], { hash_prefix: hashPrefix }, opts);
 }
 
 /** `cello consent refuse <signal-hash>` → cello_consent_refuse. */
-export function consentRefuse(celloDir: string, signalHash: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], { signal_hash: signalHash }, opts);
+export function consentRefuse(celloDir: string, hashPrefix: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], { hash_prefix: hashPrefix }, opts);
 }
