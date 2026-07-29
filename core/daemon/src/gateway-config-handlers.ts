@@ -17,7 +17,7 @@
  * with the gateway process, and a long-lived second write handle buys nothing but lock contention.
  */
 import { join } from "node:path";
-import { GatewayConfigStore, type ConfigDirection } from "@cello-protocol/gateway";
+import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import { dbKeyPathFor } from "./sqlcipher-db.js";
@@ -151,6 +151,66 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         chainValid: store.verifyChain(key),
       };
     });
+  });
+
+  // DOD-M9C-AUDIT-1 (policy D-11) — "what did my policy do?"
+  //
+  // This ships WITH the enforcement flip, by decision, and not later: it is the concrete answer to
+  // the question D-2 raised — *"I have ongoing development everywhere, and if a new error appears
+  // I won't know whether it came from the flip or from my own work."* Attribution should be a
+  // lookup, not a guess, so every screened message is already recorded with its disposition and
+  // the rule that fired. This reads that record. Deliberately a list, not a dashboard.
+  //
+  // Newest first, because the question is almost always "what just happened".
+  handlers.set("cello_policy_log", async (params) => {
+    const rawLimit = params?.limit;
+    const limit = typeof rawLimit === "number" && Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(Math.floor(rawLimit), 500)
+      : 50;
+    const since = typeof params?.since_ms === "number" && Number.isFinite(params.since_ms)
+      ? params.since_ms
+      : undefined;
+
+    let store: GatewayRecordStore;
+    try {
+      store = new GatewayRecordStore(
+        join(celloDir, "gateway.db"),
+        dbKeyPathFor(join(celloDir, "sessions.db")),
+        (event, context) => logger.info(event, context),
+      );
+    } catch (err: unknown) {
+      const code = (err as { code?: string } | null)?.code ?? "record_store_unavailable";
+      const guidance = (err as { guidance?: string } | null)?.guidance
+        ?? "The security layer's record store could not be opened. Check the daemon log.";
+      return { ok: false, reason: code, guidance };
+    }
+    try {
+      const all = store.all();
+      const filtered = since === undefined ? all : all.filter((r) => r.recordedAt >= since);
+      const page = filtered.slice(-limit).reverse();
+      return {
+        ok: true,
+        // `source` is here from day one so the reachability half (refusals, tier gates, away
+        // responses — policy audit §15 items 5-8) can join this list later without changing its
+        // shape. A consumer that learns to read one source reads both.
+        entries: page.map((r) => ({
+          source: "security" as const,
+          at: r.recordedAt,
+          direction: r.direction,
+          disposition: r.disposition,
+          reason: r.reason ?? null,
+          correlationId: r.correlationId ?? null,
+          contentHash: r.contentHash,
+        })),
+        total: filtered.length,
+        returned: page.length,
+        // A broken chain means the log itself was tampered with, which the operator must be told
+        // BEFORE they reason from its contents.
+        chainValid: store.verifyChain(),
+      };
+    } finally {
+      store.close();
+    }
   });
 
   handlers.set("cello_config_set", async (params, connectionId) => {

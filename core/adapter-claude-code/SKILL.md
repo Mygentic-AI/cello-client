@@ -197,6 +197,7 @@ cello_settings_set({ key, value })
 cello_config_list()          — every guard: value, version, and whether a human confirmed it
 cello_config_get({ key })    — one guard, plus whether its history still verifies
 cello_config_set({ key, value })
+cello_policy_log({ limit?, since_ms? })  — what the layer DID: clean/redacted/blocked/warned
 ```
 A change that makes the layer LESS protective — turning on `autonomous_override`, adding to the PII
 whitelist, allowing another language, raising the rate cap or shortening its window — is **refused

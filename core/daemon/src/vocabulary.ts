@@ -91,6 +91,8 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_config_list", cli: "cello config list" },
   { mcp: "cello_config_get", cli: "cello config get" },
   { mcp: "cello_config_set", cli: "cello config set" },
+  // DOD-M9C-AUDIT-1 — read-only on both surfaces.
+  { mcp: "cello_policy_log", cli: "cello policy log" },
 ];
 
 /**

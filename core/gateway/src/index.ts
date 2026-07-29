@@ -37,7 +37,7 @@ export type { InstallResult, InstallOptions } from "./detect/model-installer.js"
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
 export { GatewayConfigStore } from "./config/config-store.js";
 export type { ConfigDirection, SetResult, ConfigVersionRow } from "./config/config-store.js";
-export { GatewayStoreError, stderrStoreEventSink } from "./store/encrypted-db.js";
+export { GatewayStoreError, stderrStoreEventSink, openEncryptedStoreDb } from "./store/encrypted-db.js";
 export type { GatewayStoreErrorCode, StoreEventSink } from "./store/encrypted-db.js";
 export { GatewayRecordStore } from "./records/record-store.js";
 export type { RecordDisposition, RecordDirection, RecordInput, SecurityRecord } from "./records/record-store.js";

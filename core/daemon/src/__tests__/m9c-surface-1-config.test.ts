@@ -10,7 +10,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { GatewayConfigStore } from "@cello-protocol/gateway";
+import { GatewayConfigStore, GatewayRecordStore } from "@cello-protocol/gateway";
 import { registerGatewayConfigHandlers } from "../gateway-config-handlers.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
@@ -140,6 +140,66 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(res.ok).toBe(true);
     expect(res.value).toBe(120000);
     expect(res.chainValid).toBe(true);
+  });
+
+  // ─── DOD-M9C-AUDIT-1: what did my policy do? ───────────────────────────────────────────────
+
+  it("the policy log reports what the layer did, newest first, with the rule that fired", async () => {
+    const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
+    records.record({ direction: "outbound", disposition: "clean", contentHash: "aa".repeat(32) });
+    records.record({
+      direction: "outbound", disposition: "redact", contentHash: "bb".repeat(32),
+      reason: "secret:aws-access-key", correlationId: "corr-1",
+    });
+    records.close();
+
+    const res = await call("cello_policy_log", {});
+    expect(res.ok).toBe(true);
+    const entries = res.entries as Array<Record<string, unknown>>;
+    expect(entries).toHaveLength(2);
+    // Newest first — the question is nearly always "what just happened".
+    expect(entries[0]!.disposition).toBe("redact");
+    expect(entries[0]!.reason).toBe("secret:aws-access-key");
+    expect(entries[0]!.correlationId).toBe("corr-1");
+    // A clean pass is recorded too: an ABSENT record for a delivered message is itself evidence.
+    expect(entries[1]!.disposition).toBe("clean");
+    // The shape carries `source` from day one so reachability entries can join later.
+    expect(entries[0]!.source).toBe("security");
+    expect(res.chainValid).toBe(true);
+  });
+
+  it("the policy log reports chainValid:false when the record log was TAMPERED with", async () => {
+    const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
+    records.record({ direction: "outbound", disposition: "block", contentHash: "cc".repeat(32), reason: "injection" });
+    records.close();
+
+    // Rewrite the stored disposition — the exact edit someone covering their tracks would make.
+    // Opened WITH the key, because after STORE-1 that is the only door into the file at all; the
+    // chain never claimed to stop a key-holder, only to make the edit detectable.
+    const { openEncryptedStoreDb } = await import("@cello-protocol/gateway");
+    const db = openEncryptedStoreDb(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
+    db.prepare("UPDATE security_records SET disposition = 'clean' WHERE seq = 1").run();
+    db.close();
+
+    const res = await call("cello_policy_log", {});
+    expect(res.ok).toBe(true);
+    // The operator must be told the log itself is untrustworthy BEFORE reasoning from it.
+    expect(res.chainValid).toBe(false);
+  });
+
+  it("limit is bounded and the log survives having no records at all", async () => {
+    const empty = await call("cello_policy_log", {});
+    expect(empty.ok).toBe(true);
+    expect(empty.entries).toEqual([]);
+
+    const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
+    for (let i = 0; i < 5; i++) {
+      records.record({ direction: "inbound", disposition: "clean", contentHash: String(i).repeat(64).slice(0, 64) });
+    }
+    records.close();
+    const limited = await call("cello_policy_log", { limit: 2 });
+    expect((limited.entries as unknown[]).length).toBe(2);
+    expect(limited.total).toBe(5);
   });
 
   it("a comma-separated list is parsed, and an EMPTY string clears rather than storing an empty member", async () => {

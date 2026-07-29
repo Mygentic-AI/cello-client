@@ -59,6 +59,7 @@ import {
   gatewayConfigList,
   gatewayConfigGet,
   gatewayConfigSet,
+  policyLog,
   monikerSet,
 } from "./parity-commands.js";
 
@@ -907,6 +908,33 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
 
   // ═══ Other ══════════════════════════════════════════════════════════════════════════════════
+  {
+    name: "policy",
+    group: "Other",
+    summary: "Show what the security layer did to your messages — newest first.",
+    help:
+      "Usage: cello policy log [--limit <n>] [--since <ms-epoch>]\n" +
+      "  Every screened message and what happened to it: clean, redacted, blocked or warned, with\n" +
+      "  the rule that fired and the correlation id (DOD-M9C-AUDIT-1). This is how you tell whether\n" +
+      "  a new failure came from the security layer or from something else — it is a lookup, not a\n" +
+      "  guess. Default 50 entries, max 500. `chainValid: false` means the log itself was tampered\n" +
+      "  with; do not reason from its contents until that is explained.\n" +
+      "  Example:  cello policy log --limit 20",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      if (positional[0] !== "log") return { stdout: helpForSpec("policy"), stderr: "", exitCode: 1 };
+      const { value: limitRaw } = takeValueFlag(positional, "--limit");
+      const { value: sinceRaw } = takeValueFlag(positional, "--since");
+      const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
+      const sinceMs = sinceRaw !== undefined ? Number(sinceRaw) : undefined;
+      return policyLog(ctx.celloDir, {
+        pretty,
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+        ...(sinceMs !== undefined && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+      });
+    },
+  },
   {
     name: "config",
     group: "Other",

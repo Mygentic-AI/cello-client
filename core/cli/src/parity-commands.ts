@@ -487,6 +487,25 @@ async function confirmAtTty(question: string): Promise<boolean> {
   return answer === "y" || answer === "yes";
 }
 
+/**
+ * `cello policy log` → cello_policy_log (DOD-M9C-AUDIT-1, policy D-11).
+ *
+ * Ships with the enforcement flip by decision: it is the answer to "did this new error come from
+ * the security layer or from my own change?" — a lookup instead of a guess.
+ */
+export function policyLog(
+  celloDir: string,
+  opts: ParityOptions & { limit?: number; sinceMs?: number },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    "cello_policy_log",
+    defined({ limit: opts.limit, since_ms: opts.sinceMs }),
+    opts,
+    false,
+  );
+}
+
 /** `cello moniker set <name>` / `cello moniker clear` → cello_set_moniker. Null clears the override.
  *  This is the agent's OWN outbound name — not `contact set-moniker`, which names a COUNTERPARTY. */
 export function monikerSet(celloDir: string, moniker: string | null, opts: ParityOptions): Promise<CliOutput> {

@@ -53,7 +53,7 @@ describe("F1: usage string lists every command", () => {
         // Trust & endorsements
         "trust-signals", "consent",
         // Other
-        "settings", "moniker", "telegram", "bridge", "config",
+        "settings", "moniker", "telegram", "bridge", "config", "policy",
       ].sort(),
     );
   });

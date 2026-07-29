@@ -346,6 +346,16 @@ server.tool("cello_config_set", "Change a security-layer guard. You can only mak
   return jsonText(await proxy.call("cello_config_set", { key, value }));
 });
 
+server.tool("cello_policy_log", "What the security layer actually did to your messages, newest first: clean / redacted / blocked / warned, with the rule that fired and the correlation id. Use this when a message did not arrive or arrived altered, BEFORE guessing at a cause — it is the difference between knowing and speculating. `chainValid: false` means the log itself was tampered with; say so rather than reasoning from its contents. Read-only.", {
+  limit: z.number().optional().describe("How many entries (default 50, max 500)"),
+  since_ms: z.number().optional().describe("Only entries at or after this epoch-millisecond timestamp"),
+}, async ({ limit, since_ms }) => {
+  const params: Record<string, unknown> = {};
+  if (limit !== undefined) params.limit = limit;
+  if (since_ms !== undefined) params.since_ms = since_ms;
+  return jsonText(await proxy.call("cello_policy_log", params));
+});
+
 // ─── Session tools (proxied through daemon) ─────────────────────────────────
 
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {
