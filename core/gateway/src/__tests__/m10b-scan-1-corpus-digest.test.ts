@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
+import { createHash } from "node:crypto";
 import { initLinearRegex } from "../detect/linear-regex.js";
 import { compileInjectionPatterns, compileSecretRules, detectorCorpusDigest, injectionPatternIds, secretRuleIds } from "../detect/index.js";
 
@@ -38,7 +39,6 @@ describe("detectorCorpusDigest", () => {
       // Recompute the digest the way the implementation does, from the two active id sets, and prove
       // that perturbing either input changes the result. Without this, a digest that silently
       // ignored the secret rules would pass every other test here.
-      const { createHash } = require("node:crypto") as typeof import("node:crypto");
       const digestOf = (injection: string[], secrets: string[]): string =>
         createHash("sha256").update(JSON.stringify({ injection: [...injection].sort(), secrets: [...secrets].sort() }), "utf8").digest("hex");
       const patterns = injectionPatternIds()!;
@@ -52,7 +52,6 @@ describe("detectorCorpusDigest", () => {
       // Order is not a property anyone should depend on — reordering the source array changes
       // nothing about which text is caught. A digest that moved would force a spurious
       // scanner_version change and read as a rule change to anyone auditing it.
-      const { createHash } = require("node:crypto") as typeof import("node:crypto");
       const digestOf = (injection: string[], secrets: string[]): string =>
         createHash("sha256").update(JSON.stringify({ injection: [...injection].sort(), secrets: [...secrets].sort() }), "utf8").digest("hex");
       const patterns = injectionPatternIds()!;
