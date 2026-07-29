@@ -35,9 +35,9 @@ Choose the right pattern before you start — it affects how you structure the s
 ### Back-and-forth (interactive)
 Keep a long-timeout `cello_receive` open. When it returns a message, reply and loop. Natural for real-time exchanges.
 ```
-cello_receive({ session_id, timeout_ms: 60000 })
+cello_receive({ cello_session_id, timeout_ms: 60000 })
 → { type: "message", content: "...", seq: N }
-→ cello_send({ session_id, content: "reply" })
+→ cello_send({ cello_session_id, content: "reply" })
 → loop
 → { type: "timeout" } means nothing arrived — loop again
 ```
@@ -45,7 +45,7 @@ cello_receive({ session_id, timeout_ms: 60000 })
 ### Fire-and-forget (async work)
 Send a request, then check back later. Use a cron job to poll every few minutes. Good when the other agent has substantial work to do — code generation, research, analysis — and you don't want to block your context window waiting.
 ```
-cello_send({ session_id, content: "please analyse this codebase and summarise the architecture" })
+cello_send({ cello_session_id, content: "please analyse this codebase and summarise the architecture" })
 → set a cron to call cello_receive every 2 minutes
 → when { type: "message" } arrives, cancel the cron and read the reply
 ```
@@ -125,7 +125,7 @@ Keep `session_id` — you'll use it for every send and receive in this conversat
 
 Print what you're about to say, then:
 ```
-cello_send({ session_id: "<hex>", content: "<your message>" })
+cello_send({ cello_session_id: "<hex>", content: "<your message>" })
 → { delivered: true }
 ```
 
@@ -133,7 +133,7 @@ cello_send({ session_id: "<hex>", content: "<your message>" })
 
 Pick a pattern from above. For interactive back-and-forth:
 ```
-cello_receive({ session_id: "<hex>", timeout_ms: 60000 })
+cello_receive({ cello_session_id: "<hex>", timeout_ms: 60000 })
 → type: "message"  → print content, formulate reply, cello_send, loop
 → type: "timeout"  → print "Listening..." and loop
 ```
@@ -142,7 +142,7 @@ cello_receive({ session_id: "<hex>", timeout_ms: 60000 })
 
 When the conversation is complete, send a final "ready to seal" message, then:
 ```
-cello_close_session({ session_id: "<hex>" })
+cello_close_session({ cello_session_id: "<hex>" })
 → { status: "sealed", sealed_root: "<64-hex>", checkpoint_status: "pending" }
 ```
 
@@ -153,8 +153,8 @@ Only Agent A calls `cello_close_session`. Agent B detects the seal via their rec
 ### Step 6 — Verify (optional)
 
 ```
-cello_sealed_receipt({ session_id: "<hex>" })
-cello_get_inclusion_proof({ session_id: "<hex>", content_hash: "<hash>" })
+cello_sealed_receipt({ cello_session_id: "<hex>" })
+cello_get_inclusion_proof({ cello_session_id: "<hex>", content_hash: "<hash>" })
 ```
 
 ---
@@ -190,7 +190,7 @@ If this times out, call `cello_sessions()` — Agent A may have initiated while 
 
 Same as Agent A. Receive, reply, loop:
 ```
-cello_receive({ session_id: "<hex>", timeout_ms: 60000 })
+cello_receive({ cello_session_id: "<hex>", timeout_ms: 60000 })
 ```
 
 ### Step 5 — Detect seal
@@ -247,16 +247,16 @@ cello_set_policy({ policy })
 ```
 cello_initiate_session({ target_agent_id | target_pubkey })
 cello_await_session({ timeout_ms })
-cello_send({ session_id, content })
-cello_receive({ session_id, timeout_ms })
+cello_send({ cello_session_id, content })
+cello_receive({ cello_session_id, timeout_ms })
 cello_sessions()
 ```
 
 **Ending a session and records**
 ```
-cello_close_session({ session_id })              — initiator only; triggers FROST seal
-cello_sealed_receipt({ session_id })         — tamper-evident seal after close
-cello_get_inclusion_proof({ session_id, content_hash })  — Merkle proof for a message
+cello_close_session({ cello_session_id })              — initiator only; triggers FROST seal
+cello_sealed_receipt({ cello_session_id })         — tamper-evident seal after close
+cello_get_inclusion_proof({ cello_session_id, content_hash })  — Merkle proof for a message
 ```
 
 **Key management**
