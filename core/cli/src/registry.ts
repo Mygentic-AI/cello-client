@@ -105,6 +105,10 @@ export const GROUP_ORDER = [
   "Sessions & receipts",
   "Contacts",
   "Trust & endorsements",
+  // The security and governance layer's own surfaces. Its own group because burying them under
+  // "Other" is how an operator fails to find the one command that unblocks a misfiring guard —
+  // and how an agent that hits that guard has nothing concrete to relay.
+  "Security",
   "Other",
 ] as const;
 
@@ -924,12 +928,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   // ═══ Other ══════════════════════════════════════════════════════════════════════════════════
   {
     name: "policy",
-    group: "Other",
+    group: "Security",
     summary: "Show what the security layer did to your messages — newest first.",
     help:
       "Usage: cello policy log [--limit <n>] [--since <ms-epoch>]\n" +
       "  Every screened message and what happened to it: clean, redacted, blocked or warned, with\n" +
-      "  the rule that fired and the correlation id (DOD-M9C-AUDIT-1). This is how you tell whether\n" +
+      "  the rule that fired and the correlation id. This is how you tell whether\n" +
       "  a new failure came from the security layer or from something else — it is a lookup, not a\n" +
       "  guess. Default 50 entries, max 500. `chainValid: false` means the log itself was tampered\n" +
       "  with; do not reason from its contents until that is explained.\n" +
@@ -951,11 +955,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: "config",
-    group: "Other",
+    group: "Security",
     summary: "Read or change the security layer's guards (screening, redaction, rate limits).",
     help:
       "Usage: cello config list | cello config get <key> | cello config set <key> <value>\n" +
-      "  The security and governance layer's own settings (DOD-M9C-SURFACE-1). Per-INSTALL, not per-agent.\n" +
+      "  The security layer's own guards. Per-INSTALL, not per-agent — they apply to every agent here.\n" +
       "  Keys: autonomous_override (true|false), pii_whitelist (comma-separated, empty string clears),\n" +
       "        language_allow (comma-separated), rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +
       "  TIGHTENING a guard applies immediately. LOOSENING one asks you to confirm at the terminal —\n" +

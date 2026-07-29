@@ -219,11 +219,21 @@ export class OutboundScreener {
       return {
         reWarn: true,
         warnEvents: rejected.map(warnEvent),
+        // TELL THE AGENT WHAT IT CAN DO. The recurring failure this closes: an agent hits a guard,
+        // is told what happened, and is never told what is available — so it retries the same thing,
+        // or gives up, or invents a workaround. It cannot run the loosening commands itself (that is
+        // the point of the gate), but it CAN relay them, and relaying an exact command is the
+        // difference between a stuck operator and a two-second fix.
         guidance:
-          `NOT SENT. ${rejected.length} item(s) cannot be allowed autonomously because the gateway's ` +
-          `autonomous_override is OFF. Re-send with those flag(s) set to "redact" (a typed placeholder), ` +
-          `or have the operator whitelist the value(s) — only the operator can authorize sending personal ` +
-          `data the gateway flagged.`,
+          `NOT SENT. ${rejected.length} item(s) cannot be allowed autonomously because ` +
+          `autonomous_override is OFF.\n` +
+          `WHAT YOU CAN DO NOW: re-send with those flag(s) set to "redact" — the value is replaced ` +
+          `by a typed placeholder and the message goes.\n` +
+          `IF THE FLAG IS WRONG (a date, an id, your own address), the operator runs ONE of these ` +
+          `in their terminal — you cannot, and should relay it rather than work around it:\n` +
+          `  cello config set pii_whitelist <value>     # this value stops being flagged, permanently\n` +
+          `  cello config set autonomous_override true  # you may then clear your own flags\n` +
+          `Either prompts them to confirm once. To see exactly what fired: cello policy log`,
         redact: [], allowOnce: [], whitelistAddRequested: [],
       };
     }
