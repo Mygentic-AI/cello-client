@@ -53,12 +53,17 @@ function keyProvider() {
 
 // ─── AC-001: standing receiver includes AutoNAT client ───────────────────────
 
+// M12: a CLIENT node no longer advertises the AutoNAT protocol. The responder half answers a
+// dial-back by calling openConnection(peer) -- which RETURNS AN ALREADY-OPEN CONNECTION -- and then
+// closes it, tearing down whatever else that connection carried (directory signaling, mid-DKG).
+// The PROBER half is untouched: it opens OUTBOUND streams and advertises nothing, so dialability
+// still works. `getProtocols()` reflects the inbound HANDLER, i.e. exactly the half that is gone.
 describe("AC-001: standing receiver node has AutoNAT client + prober set", () => {
   let scope = createTestScope();
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
 
-  it("started standing-receiver node advertises the AutoNAT protocol", async () => {
+  it("started standing-receiver node does NOT advertise the AutoNAT responder", async () => {
     const node = await createNode({
       keyProvider: keyProvider(),
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
@@ -67,7 +72,7 @@ describe("AC-001: standing receiver node has AutoNAT client + prober set", () =>
     await node.start();
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
 
-    expect(node.getProtocols()).toContain(AUTONAT_PROTOCOL_ID);
+    expect(node.getProtocols()).not.toContain(AUTONAT_PROTOCOL_ID);
   });
 
   it("the injected IAutoNatService prober set is the directory multiaddrs (non-empty, not hardcoded)", () => {
@@ -94,7 +99,7 @@ describe("AC-002 (superseded by DOD-NAT-REACHABILITY-1): both client node types 
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
 
-  it("session node advertises both AutoNAT and dcutr", async () => {
+  it("session node keeps dcutr and drops the AutoNAT responder", async () => {
     const node = await createNode({
       keyProvider: keyProvider(),
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
@@ -104,11 +109,12 @@ describe("AC-002 (superseded by DOD-NAT-REACHABILITY-1): both client node types 
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
 
     const protocols = node.getProtocols();
-    expect(protocols).toContain(AUTONAT_PROTOCOL_ID);
+    expect(protocols).not.toContain(AUTONAT_PROTOCOL_ID);
+    // dcutr MUST survive -- it is a separate service and the hole-punch depends on it.
     expect(protocols).toContain(DCUTR_PROTOCOL_ID);
   });
 
-  it("standing receiver node advertises AutoNAT AND dcutr — it is the punch initiator", async () => {
+  it("standing receiver keeps dcutr — it is the punch initiator — and drops the responder", async () => {
     const node = await createNode({
       keyProvider: keyProvider(),
       listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
@@ -118,8 +124,47 @@ describe("AC-002 (superseded by DOD-NAT-REACHABILITY-1): both client node types 
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
 
     const protocols = node.getProtocols();
-    expect(protocols).toContain(AUTONAT_PROTOCOL_ID);
+    expect(protocols).not.toContain(AUTONAT_PROTOCOL_ID);
     expect(protocols).toContain(DCUTR_PROTOCOL_ID);
+  });
+});
+
+// ─── M12: the autonatResponder opt-out, in BOTH directions ───────────────────
+//
+// nodeType is NOT a sufficient discriminator and this is the regression guard for that. The
+// directory-SIGNALING node is a long-lived client that deliberately leaves nodeType UNSET, so a
+// nodeType-only rule left the responder enabled on exactly the connection it destroys. The first
+// attempt at this fix built, linted, and still failed for that reason.
+describe("M12: autonatResponder opt-out overrides the nodeType default", () => {
+  let scope = createTestScope();
+  beforeEach(() => { scope = createTestScope(); });
+  afterEach(() => scope.run(async () => {}));
+
+  it("a node with NO nodeType drops the responder when explicitly opted out", async () => {
+    const node = await createNode({
+      keyProvider: keyProvider(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      autonatResponder: { enabled: false },
+    });
+    await node.start();
+    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
+
+    expect(node.getProtocols()).not.toContain(AUTONAT_PROTOCOL_ID);
+  });
+
+  it("a client node KEEPS the responder when explicitly opted in", async () => {
+    const node = await createNode({
+      keyProvider: keyProvider(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      autonatResponder: { enabled: true },
+    });
+    await node.start();
+    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
+
+    // Proves the removal is driven by the OPTION, not by an unconditional unhandle() that would
+    // strip the responder from directories and relays too.
+    expect(node.getProtocols()).toContain(AUTONAT_PROTOCOL_ID);
   });
 });
 
