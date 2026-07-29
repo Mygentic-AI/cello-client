@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/gateway",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": false,
   "type": "module",
   "engines": {
@@ -15,6 +15,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./detect": {
+      "import": "./dist/detect/index.js",
+      "types": "./dist/detect/index.d.ts"
     },
     "./package.json": "./package.json"
   },

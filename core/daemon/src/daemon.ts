@@ -88,6 +88,7 @@ import { registerNotificationHandlers } from "./notification-handlers.js";
 import { TypeRegistry } from "./type-registry.js";
 import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
+import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 
@@ -1802,6 +1803,12 @@ async function startDaemonHoldingLock(
       expires_at: r.expiresAt,
       supersedes_hash: r.supersedesHash,
       default_present: r.defaultPresent,
+      // M10B / DOD-END-ACCEPT-1 review F4. Without this the operator cannot distinguish a signal
+      // that will be presented from one awaiting their decision — or one they already refused —
+      // because `default_present: true` looks identical in all three cases. `default_present`
+      // answers "include it by default"; this answers the prior question, "may it be presented at
+      // all".
+      consent_state: r.consentState,
     }));
     return { ok: true, signals: rows };
   });
@@ -1838,6 +1845,7 @@ async function startDaemonHoldingLock(
       schema_version: row.schemaVersion,
       status: row.status,
       default_present: row.defaultPresent,
+      consent_state: row.consentState,  // review F4 — see wallet_list_signals
       issued_at: row.issuedAt,
       expires_at: row.expiresAt,
       supersedes_hash: row.supersedesHash,
@@ -1859,6 +1867,19 @@ async function startDaemonHoldingLock(
     }
     if (!row) {
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
+    }
+    // M10B / DOD-END-ACCEPT-1 review F4. Enabling a signal the subject has not accepted returned
+    // `{ok: true, default_present: true}` — the daemon affirming it will now be presented, when it
+    // never will. `default_present` selects from what is ELIGIBLE, and an unconsented signal is not
+    // eligible; saying yes here is a hollow success on the one verb that does respond.
+    if (row.consentState !== CONSENT_ACCEPTED) {
+      return {
+        ok: false,
+        reason: "consent_pending",
+        guidance:
+          `This signal is '${row.consentState ?? "unset"}', not accepted, so it cannot be presented ` +
+          "regardless of the default-present flag. Accept it first; enabling it changes nothing until then.",
+      };
     }
     store.setDefaultPresent(row.signalHash, true);
     return { ok: true, signal_hash: row.signalHash, default_present: true };

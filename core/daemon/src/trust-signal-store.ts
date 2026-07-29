@@ -38,6 +38,7 @@
 
 import { verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
+import { migrateWalletAddConsentState, CONSENT_ACCEPTED, type ConsentState } from "./consent-migration.js";
 import type { Logger } from "./types.js";
 
 /** Status lives OUTSIDE the hash — it is mutable after minting, which is exactly why it is not in
@@ -82,6 +83,14 @@ export interface WalletSignalInput {
 
 export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
+  /** M10B-D14r2 — may this be presented at all. Distinct from `defaultPresent`, which answers the
+   *  different question of whether to include it BY DEFAULT once it may be presented.
+   *
+   *  NULLABLE, because the COLUMN is (SQLite cannot ADD COLUMN NOT NULL without a default). Declaring
+   *  it non-null would be a type that lies to every future consumer — and the consumer who then
+   *  writes `!== "refused"` ships a NULL straight through as presentable. The predicate tests for
+   *  exactly `accepted`, so NULL fails closed; the type must say so too. */
+  consentState: ConsentState | null;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
   defaultPresent: boolean;
 }
@@ -153,6 +162,21 @@ const CREATE_WALLET_SQL = `
     ${ENVELOPE_COLUMNS},
     received_at     INTEGER NOT NULL,
     default_present INTEGER NOT NULL DEFAULT 1,
+    -- M10B-D14r2 — NULLABLE, and that is forced rather than chosen: SQLite cannot ADD COLUMN with
+    -- NOT NULL and no DEFAULT, so a MIGRATED database can only ever have a nullable column. Making
+    -- the fresh DDL stricter would give fresh installs a different schema from migrated ones, and
+    -- the divergence would surface only on fresh installs — i.e. on every new operator, which is the
+    -- worst possible audience for it. The repo's "fresh == migrated" convention wins.
+    --
+    -- Nullability costs nothing here because presentability is enforced by the PREDICATE, which tests
+    -- for exactly 'accepted' rather than for the absence of a bad value. NULL, '', 'ACCEPTED' and any
+    -- future state all fail closed by construction (§5a), so the column constraint was never what was
+    -- protecting the invariant.
+    consent_state   TEXT,
+    -- DOD-END-PENDING-1 — when the operator was TOLD about this pending decision. NULL = not yet
+    -- told. Separate from consent_state because the item and the notification have different
+    -- lifetimes: the decision persists until made, the nag stops once seen.
+    consent_notified_at INTEGER,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -186,6 +210,11 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
   } catch {
     // Column already exists — safe to ignore.
   }
+  // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent
+  // ALTER whose only expected failure is "already exists"; it is NOT safe for a migration with a
+  // one-time backfill, where a swallowed failure leaves the daemon running against a schema it
+  // believes gates consent and does not. This one is birth-gated and rethrows.
+  migrateWalletAddConsentState(db, _logger);
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
@@ -234,9 +263,29 @@ interface ReceivedDbRow extends EnvelopeDbRow {
   verified_at: number;
 }
 
+/**
+ * Refuse anything that is not a 32-byte K_local pubkey as lowercase hex.
+ *
+ * SHARED, because it was written once for `listAllActive` and then DROPPED by three methods that
+ * copied its SQL predicate without it (review F3). The predicate alone fails closed, but silently:
+ * a device-local `agent_id` UUID — the natural thing to have in hand in an IPC handler — matches
+ * zero rows, which is indistinguishable from "this operator has nothing pending". For the consent
+ * queue that silence IS the bug the queue exists to prevent, and `markConsentNotified` would still
+ * match account rows and log success, so the surface would look like it was working.
+ */
+function requireAgentPubkeyHex(value: string | undefined, caller: string): void {
+  if (!/^[0-9a-f]{64}$/.test(value ?? "")) {
+    throw new Error(
+      `${caller} requires the agent's 32-byte K_local pubkey as lowercase hex — ` +
+        `refusing rather than returning an empty result that reads as "nothing to show"`,
+    );
+  }
+}
+
 function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
   return {
     signalHash: r.signal_hash,
+    consentState: (r as unknown as { consent_state: string }).consent_state as ConsentState,
     subjectKind: r.subject_kind as "account" | "agent",
     subject: r.subject,
     issuerKind: r.issuer_kind as "portal" | "agent",
@@ -288,18 +337,32 @@ export class TrustSignalStore {
       .prepare(
         `INSERT OR IGNORE INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
-            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present,
+            consent_state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.signalHash, s.subjectKind, s.subject, s.issuerKind, s.issuerPubkey, s.type, s.schemaVersion,
         toBuf(s.payload), s.issuedAt, s.expiresAt, s.supersedesHash, s.status, Date.now(),
         defaultPresent ? 1 : 0,
+        // M10B-D14r2 / INV-CONSENT. Keys on ISSUER_KIND, never on the type string, so every future
+        // client-sourced type inherits consent for free (M10B-D1). An `agent`-issued signal was
+        // authored by somebody else ABOUT the operator and is unpresentable until they say so; a
+        // `portal`-issued one was minted for them, at their own action, and has no third party to
+        // wait for. Written at the one insert path, and the SQL predicate fails closed regardless.
+        s.issuerKind === "agent" ? "pending" : CONSENT_ACCEPTED,
       );
     if (res.changes > 0) {
       this.#logger.info("signal.wallet.stored", {
         signalHash: s.signalHash, type: s.type, subjectKind: s.subjectKind, issuerKind: s.issuerKind,
       });
+      if (s.issuerKind === "agent") {
+        // DOD-END-PENDING-1 named event. Emitted where the decision is CREATED, so the log shows a
+        // decision being owed even if the operator never selects the agent again.
+        this.#logger.info("signal.consent.pending", {
+          signalHash: s.signalHash, subject: s.subject.slice(0, 16), issuerPubkey: s.issuerPubkey.slice(0, 16),
+        });
+      }
     }
     return res.changes > 0;
   }
@@ -348,24 +411,79 @@ export class TrustSignalStore {
       status: "active",
     });
     if (inserted) {
-      // Mark the explicitly superseded hash (from the envelope field) as superseded.
-      if (supersedesHash) {
-        this.setWalletStatus(supersedesHash, "superseded");
+      // ⚠️ SUPERSESSION IS A DESTRUCTIVE WRITE BY A THIRD PARTY, so it is gated twice.
+      //
+      // GATE 1 — CONSENT (M10B / DOD-END-ACCEPT-1 review F1). An `issuer_kind: agent` delivery lands
+      // `pending` and is unpresentable, which stops a rogue endorsement being DISPLAYED. It does not
+      // stop it ERASING: without this gate the rogue's insert superseded the subject's own ACCEPTED
+      // endorsement of the same type, and Alice presented NOTHING. Consent that blocks display but
+      // not deletion closes half the threat Andre named. An unconsented signal supersedes nothing;
+      // `setConsentState` re-runs these effects if and when the subject accepts it.
+      //
+      // GATE 2 — AUTHORITY (review F2, pre-existing since M10). `supersedes_hash` was honoured
+      // without asking whether the new issuer is entitled to supersede the target, so any third
+      // party who could get one signal delivered could knock out ANY row in the wallet — including
+      // phone and email — just by naming its hash. Supersession now requires the SAME ISSUER: for an
+      // agent the key IS the identity, and for the portal it is the one logical issuer. This mirrors
+      // what the directory does in V54, where an unauthorised write must not change what a third
+      // party can present.
+      const consented = this.getWalletSignal(claimedHash)?.consentState === CONSENT_ACCEPTED;
+      if (consented) {
+        this.#applySupersession(envelope, claimedHash, supersedesHash);
+      } else {
+        this.#logger.info("signal.supersede.deferred", {
+          signalHash: claimedHash,
+          issuerKind: envelope.issuer_kind,
+          reason: "not consented — supersession is re-evaluated on acceptance",
+        });
       }
-      // Type-dedup: any OTHER active signal of the same (subject_kind, subject, type) is also
-      // superseded by the new one — this cleans up duplicates delivered without supersedes_hash set
-      // (e.g. the same type re-minted on a fresh portal login with no prior-hash lookup).
-      this.#db
-        .prepare(
-          `UPDATE wallet_trust_signals
-              SET status = 'superseded'
-            WHERE subject_kind = ? AND subject = ? AND type = ?
-              AND signal_hash != ?
-              AND status = 'active'`,
-        )
-        .run(envelope.subject_kind, envelope.subject, envelope.type, claimedHash);
     }
     return { stored: inserted };
+  }
+
+  /**
+   * Apply a newly-consented signal's supersession effects, with the ISSUER-AUTHORITY check.
+   *
+   * Extracted so acceptance can re-run it: a signal that arrived `pending` supersedes nothing until
+   * the subject accepts it, and at that moment the same rules must apply as if it had arrived
+   * accepted. One implementation, so the two entry points cannot drift.
+   */
+  #applySupersession(
+    envelope: { subject_kind: string; subject: string; type: string; issuer_kind: string; issuer_pubkey: string },
+    claimedHash: string,
+    supersedesHash: string | null,
+  ): void {
+    if (supersedesHash) {
+      const target = this.getWalletSignal(supersedesHash);
+      // SAME ISSUER, or refuse. A missing target is NOT an invitation to proceed (§5a): if we cannot
+      // see what is being superseded we cannot judge the authority, so we do not act.
+      const authorized = target !== null && target.issuerPubkey === envelope.issuer_pubkey;
+      if (authorized) {
+        this.setWalletStatus(supersedesHash, "superseded");
+      } else {
+        this.#logger.warn("signal.supersede.refused", {
+          signalHash: claimedHash,
+          supersedesHash,
+          reason: target === null ? "target_not_held" : "issuer_mismatch",
+          newIssuer: envelope.issuer_pubkey.slice(0, 16),
+          targetIssuer: target === null ? null : target.issuerPubkey.slice(0, 16),
+        });
+      }
+    }
+    // Type-dedup: another active signal of the same (subject_kind, subject, type) is superseded by
+    // the new one — duplicates delivered without supersedes_hash (e.g. a type re-minted on a fresh
+    // portal login with no prior-hash lookup). SCOPED TO THE SAME ISSUER for the same reason: a
+    // stranger's endorsement is not a newer version of yours just because it shares a type string.
+    this.#db
+      .prepare(
+        `UPDATE wallet_trust_signals
+            SET status = 'superseded'
+          WHERE subject_kind = ? AND subject = ? AND type = ?
+            AND signal_hash != ?
+            AND issuer_pubkey = ?
+            AND status = 'active'`,
+      )
+      .run(envelope.subject_kind, envelope.subject, envelope.type, claimedHash, envelope.issuer_pubkey);
   }
 
   getWalletSignal(signalHash: string): WalletSignalRow | null {
@@ -414,14 +532,23 @@ export class TrustSignalStore {
   }
 
   /**
-   * The signals `agentId` may present, resolved from the ENVELOPE, not from a stored attribution:
+   * The signals an agent may present, resolved from the ENVELOPE, not from a stored attribution:
    * an `account`-subject row is presentable by every agent under `accountId`; an `agent`-subject row
    * only by its own subject (M10-D5/M10-D14).
+   *
+   * **`agentPubkeyHex` is the K_local pubkey hex, NOT the daemon's device-local `agent_id`.** An
+   * agent-subject envelope's `subject` holds the pubkey — that is the value the directory joins on
+   * (`ap.k_local_pubkey = sr.subject`) — and a UUID compared against it matches nothing at all.
+   *
+   * NOTE (`DOD-END-SCOPE-FIX-1`): this method has no production callers; the live wire path is
+   * `listAllActive`, which now carries the agent-subject half of this scoping. Kept because it is
+   * the only implementation of the ACCOUNT-subject half, which is deferred behind a named
+   * prerequisite — the daemon holds no `accountId` anywhere in production code.
    *
    * Excludes expired and non-active rows. Selective disclosure (all / some / none) is the CALLER's
    * choice on top of this — DOD-PRESENT-1; this returns what is *eligible*, never what to send.
    */
-  listPresentable(opts: { agentId: string; accountId: string; nowSec?: number }): WalletSignalRow[] {
+  listPresentable(opts: { agentPubkeyHex: string; accountId: string; nowSec?: number }): WalletSignalRow[] {
     // `nowSec` is epoch SECONDS, and it is named for its unit deliberately. The envelope's
     // `issued_at`/`expires_at` are seconds (they are HASHED, and the protocol fixed the unit);
     // `Date.now()` is milliseconds. An unnamed `now` here invites a caller to pass one where the
@@ -436,9 +563,10 @@ export class TrustSignalStore {
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
             AND ( (subject_kind = 'account' AND subject = ?)
-               OR (subject_kind = 'agent'   AND subject = ?) )`,
+               OR (subject_kind = 'agent'   AND subject = ?) )
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
       )
-      .all(nowSec, opts.accountId, opts.agentId) as unknown as EnvelopeDbRow[];
+      .all(nowSec, opts.accountId, opts.agentPubkeyHex) as unknown as EnvelopeDbRow[];
     return rows.map(toWalletRow);
   }
 
@@ -488,7 +616,37 @@ export class TrustSignalStore {
   }
 
   /**
-   * Active, non-expired wallet signals eligible for presentation.
+   * Active, non-expired wallet signals THIS agent is eligible to present — the live wire path
+   * (`outbound-sessions.ts`).
+   *
+   * `presentingAgentPubkeyHex` is the presenting agent's K_local pubkey hex, and it is REQUIRED.
+   * An `agent`-subject row is presentable only by its own subject (M10-D5/M10-D14); the wallet is
+   * daemon-wide and shared by every agent on the device, so without this predicate each agent
+   * offers every co-resident agent's agent-subject signals to its own counterparties —
+   * `INV-AGENT-SCOPED`, which is what `DOD-END-SCOPE-FIX-1` closes. The scoping is in the SQL, not
+   * a JS filter, because `include` already routes around `default_present` and a JS branch would
+   * route around this the same way.
+   *
+   * **`lower(subject)`, because hex has a case and this comparison is byte-exact.** SQLite `TEXT`
+   * uses BINARY collation, so `AABB…` and `aabb…` — the same key — do not match, and the row would
+   * be silently un-presented with no error. The daemon's own `k_local_pubkey` is always lowercase
+   * (`agent-loader.ts` derives it with `.toString("hex")`), so only the STORED side can vary, and it
+   * can: `putWalletSignal` already names "a directory version-skew emitting uppercase hex" as a real
+   * condition. Comparing case-insensitively is the correct equality for hex, not a fallback that
+   * papers over a mismatch.
+   *
+   * Note the residual, because it is NOT closed here: the directory's
+   * `JOIN agent_profiles ap ON ap.k_local_pubkey = sr.subject` is case-sensitive too, so an
+   * uppercase-hex subject that ever got minted would still be invisible THERE. Closing that means
+   * constraining the value where it is produced (the portal's mint) — which spans three components
+   * and is its own decision, not something to smuggle into a presentation-scoping unit.
+   *
+   * **ACCOUNT-subject rows are deliberately NOT scoped here, and that half is deferred, not done.**
+   * `listPresentable` scopes them on `accountId` — but the daemon holds no `accountId` anywhere in
+   * production code, so there is nothing to compare against and inventing one is a separate
+   * decision (M10B fourth review F5). Today's behavior for account rows is therefore unchanged:
+   * every agent on the daemon may present them, which is also what M10-D5 says for agents under the
+   * same account. It becomes wrong only when one daemon holds agents of two different accounts.
    *
    * Default behavior: returns only signals where `default_present = 1`.
    * `include` overrides the default — only the listed types are returned regardless of `default_present`.
@@ -496,22 +654,186 @@ export class TrustSignalStore {
    * Both `include` and `exclude` are type strings. Unknown types cause a validation error at the
    * IPC layer (the caller must pre-validate against listAllWalletSignals before calling this).
    */
-  listAllActive(opts?: { nowSec?: number; include?: string[]; exclude?: string[] }): WalletSignalRow[] {
-    const nowSec = opts?.nowSec ?? Math.floor(Date.now() / 1000);
+  listAllActive(opts: {
+    presentingAgentPubkeyHex: string;
+    nowSec?: number;
+    include?: string[];
+    exclude?: string[];
+  }): WalletSignalRow[] {
+    // ABSENT IS NOT FINE (§5a), AND SO IS MALFORMED. A caller that cannot say who is presenting gets
+    // a refusal, never the whole wallet: the fail-open direction here IS the defect this method was
+    // fixed for, and it would hand a counterparty another agent's signals with no error and no log.
+    //
+    // The SHAPE check is the half that is easy to omit and expensive to omit. An empty string is
+    // caught by any guard; a device-local `agent_id` UUID, an agent NAME, or uppercase hex all sail
+    // through a truthiness check and then match zero rows — which is indistinguishable, to every
+    // caller, from "this operator holds no signals". That silence is precisely the trap
+    // `DOD-END-SCOPE-FIX-1` exists to close, so it is closed by construction here rather than by
+    // remembering to pass the right thing. 32-byte Ed25519 key, lowercase hex, as `agent-loader.ts`
+    // produces it.
+    requireAgentPubkeyHex(opts.presentingAgentPubkeyHex, "listAllActive");
+    const nowSec = opts.nowSec ?? Math.floor(Date.now() / 1000);
     const rows = this.#db
       .prepare(
         `SELECT * FROM wallet_trust_signals
           WHERE status = 'active'
-            AND (expires_at IS NULL OR expires_at > ?)`,
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
       )
-      .all(nowSec) as unknown as EnvelopeDbRow[];
+      .all(nowSec, opts.presentingAgentPubkeyHex) as unknown as EnvelopeDbRow[];
     const all = rows.map(toWalletRow);
-    if (opts?.include) {
+    if (opts.include) {
       const set = new Set(opts.include);
       return all.filter((s) => set.has(s.type));
     }
-    const excluded = new Set(opts?.exclude ?? []);
+    const excluded = new Set(opts.exclude ?? []);
     return all.filter((s) => s.defaultPresent && !excluded.has(s.type));
+  }
+
+  /**
+   * The distinct signal TYPES this agent could present — active, unexpired, and scoped to the
+   * presenting agent exactly as `listAllActive` scopes rows.
+   *
+   * Deliberately ignores `default_present`, because this answers "may this type be named in a
+   * filter", and `include` exists precisely to override the default. Validating a filter against
+   * `listAllActive`'s output would reject a type the operator holds but has defaulted off — the
+   * filter rejecting the thing it was built to select.
+   *
+   * The scoping is the point: the wallet is daemon-wide, so validating a filter against the whole
+   * wallet accepts a type only a CO-RESIDENT agent holds, and the session then presents nothing with
+   * no error (review MEDIUM-4).
+   */
+  listPresentableTypes(presentingAgentPubkeyHex: string, nowSec?: number): string[] {
+    const now = nowSec ?? Math.floor(Date.now() / 1000);
+    const rows = this.#db
+      .prepare(
+        `SELECT DISTINCT type FROM wallet_trust_signals
+          WHERE status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
+      )
+      .all(now, presentingAgentPubkeyHex) as Array<{ type: string }>;
+    return rows.map((r) => r.type);
+  }
+
+  /**
+   * Record the subject's consent decision (D-23). The ONLY writer of this column after insert.
+   *
+   * `refused` is terminal in spirit but not enforced as one-way here: `M10B-D4` allows Bob to issue a
+   * CORRECTED endorsement after a refusal, and that is a NEW signal with its own hash — it does not
+   * reuse this row. What must never happen is a refusal being silently undone, which is why the
+   * migration is birth-gated rather than NULL-driven.
+   */
+  setConsentState(signalHash: string, state: ConsentState): boolean {
+    const res = this.#db
+      .prepare("UPDATE wallet_trust_signals SET consent_state = ? WHERE signal_hash = ?")
+      .run(state, signalHash);
+    if (Number(res.changes) === 0) return false;
+    this.#logger.info("signal.consent.changed", { signalHash, consentState: state });
+
+    // ACCEPTANCE IS WHEN SUPERSESSION BECOMES LEGITIMATE (review F1). Delivery deliberately defers
+    // it — an unconsented signal must not erase a consented one — so the effects are applied here
+    // instead, through the SAME authority-checked path, at the moment the subject says yes. Without
+    // this an accepted re-issue would sit alongside the endorsement it replaces rather than
+    // superseding it, and the operator would present both.
+    if (state === CONSENT_ACCEPTED) {
+      const row = this.getWalletSignal(signalHash);
+      if (row) {
+        this.#applySupersession(
+          {
+            subject_kind: row.subjectKind,
+            subject: row.subject,
+            type: row.type,
+            issuer_kind: row.issuerKind,
+            issuer_pubkey: row.issuerPubkey,
+          },
+          signalHash,
+          row.supersedesHash,
+        );
+      }
+    }
+    return true;
+  }
+
+  /**
+   * DOD-END-PENDING-1 — the decisions this agent still owes (`M10B-D5`).
+   *
+   * Its OWN surface, deliberately not the transcript inbox: an inbox item is cleared by reading or
+   * dismissing a transcript, and an endorsement awaiting consent has no transcript, so it would be an
+   * item the operator could never clear the normal way.
+   *
+   * Keyed by CONSENT STATE, never by type — that is what makes a whole new queue legal under
+   * INV-ZEROBUMP, and it is why a future client-sourced type appears here with no code change.
+   *
+   * SCOPING, STATED HONESTLY. Agent-subject items are scoped to their subject, on the same axis as
+   * presentation (DOD-END-SCOPE-FIX-1). ACCOUNT-subject items are visible to every agent on the
+   * daemon — the same deferred residual `listAllActive` carries, because the daemon holds no
+   * `accountId` anywhere in production code and per M10-D5 account signals serve every agent under
+   * the account.
+   *
+   * ⚠️ BUT THE RESIDUAL CHANGES CHARACTER HERE, and that is worth naming rather than inheriting
+   * silently: in `listAllActive` the consequence is SHOWING the wrong signal; here it is DECIDING.
+   * Any agent on the daemon can accept an account-subject endorsement on another's behalf, and
+   * acceptance runs a destructive supersession. Nobody has ruled on whether account-subject consent
+   * should be per-agent or per-account — M10B-D9 says acceptance is recorded once per account-subject
+   * SIGNAL, which points at "any agent may decide", but it was written about the operator surface,
+   * not about authority. Recorded as an open question on `DOD-END-SURFACE-1` rather than settled by
+   * whichever predicate got copied first.
+   */
+  listPendingConsent(agentPubkeyHex: string): WalletSignalRow[] {
+    requireAgentPubkeyHex(agentPubkeyHex, "listPendingConsent");
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM wallet_trust_signals
+          WHERE consent_state = 'pending'
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+          ORDER BY received_at ASC`,
+      )
+      .all(Math.floor(Date.now() / 1000), agentPubkeyHex) as unknown as EnvelopeDbRow[];
+    return rows.map(toWalletRow);
+  }
+
+  /**
+   * How many pending decisions this agent has NOT yet been told about.
+   *
+   * Asked on every agent selection, so it must go quiet once the operator has been told — while the
+   * ITEM stays in `listPendingConsent` until they actually decide. A new arrival raises it again,
+   * because the silence is per-item and not a permanent "already notified" flag on the agent.
+   */
+  countUnnotifiedConsent(agentPubkeyHex: string): number {
+    requireAgentPubkeyHex(agentPubkeyHex, "countUnnotifiedConsent");
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM wallet_trust_signals
+          WHERE consent_state = 'pending'
+            AND consent_notified_at IS NULL
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+      )
+      .get(Math.floor(Date.now() / 1000), agentPubkeyHex) as { n: number };
+    return Number(row.n);
+  }
+
+  /** Record that the operator has been told about this agent's currently-pending decisions. */
+  markConsentNotified(agentPubkeyHex: string): number {
+    requireAgentPubkeyHex(agentPubkeyHex, "markConsentNotified");
+    const res = this.#db
+      .prepare(
+        `UPDATE wallet_trust_signals
+            SET consent_notified_at = ?
+          WHERE consent_state = 'pending'
+            AND consent_notified_at IS NULL
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+      )
+      .run(Date.now(), agentPubkeyHex);
+    const n = Number(res.changes);
+    if (n > 0) this.#logger.info("signal.consent.notified", { agentPubkey: agentPubkeyHex.slice(0, 16), count: n });
+    return n;
   }
 
   /** Set the persistent default-presentation flag for a wallet signal. */

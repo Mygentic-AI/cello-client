@@ -26,7 +26,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
-import { seedAgents } from "./helpers/seed-agents.js";
+import { seedAgentKeys } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
@@ -78,16 +78,33 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
   let mgr: SessionNodeManager;
   let db: DaemonDatabase;
   let store: TrustSignalStore;
+  /**
+   * BOTH identities, deliberately, because they are not interchangeable and this file needs each
+   * (`DOD-END-SCOPE-FIX-1`, fourth-review HIGH-4):
+   *
+   *   `alice`/`bob`             — the device-local `agent_id` UUID. Keys the SESSION tables, so it
+   *                               is what `contact_trust_signals.agent_id` and its FK take.
+   *   `alicePubkey`/`bobPubkey` — the K_local pubkey hex. This is what an agent-subject ENVELOPE's
+   *                               `subject` holds in production; the directory joins it with
+   *                               `JOIN agent_profiles ap ON ap.k_local_pubkey = sr.subject`.
+   *
+   * Until 2026-07-29 this file seeded `subject` with the UUID, so every presentation-scoping
+   * assertion was written against a row shape production never produces.
+   */
   let alice: string;
   let bob: string;
+  let alicePubkey: string;
+  let bobPubkey: string;
 
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "dod-store-client-1-"));
     const dbPath = join(tempDir, "sessions.db");
     const seed = openTestDb(dbPath);
-    const ids = await seedAgents(seed, ["alice", "bob"]);
-    alice = ids.get("alice")!;
-    bob = ids.get("bob")!;
+    const agents = await seedAgentKeys(seed, ["alice", "bob"]);
+    alice = agents.get("alice")!.agentId;
+    bob = agents.get("bob")!.agentId;
+    alicePubkey = agents.get("alice")!.pubkeyHex;
+    bobPubkey = agents.get("bob")!.pubkeyHex;
     seed.close();
     mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
@@ -102,7 +119,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
 
   describe("the wallet (M10-D14: no agent association)", () => {
     it("stores and reads back a whole envelope, payload byte-for-byte", () => {
-      store.putWalletSignal(envelope({ subject: alice }));
+      store.putWalletSignal(envelope({ subject: alicePubkey }));
       const got = store.getWalletSignal(HASH("a"));
       expect(got).not.toBeNull();
       expect(got!.type).toBe("phone");
@@ -147,11 +164,11 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
 
     it("an account-subject row is presentable by EVERY agent under that account (M10-D5)", () => {
       store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "account", subject: "acct-x", type: "email" }));
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, type: "phone" }));
-      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: bob, type: "phone" }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, type: "phone" }));
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: bobPubkey, type: "phone" }));
 
-      const forAlice = store.listPresentable({ agentId: alice, accountId: "acct-x" }).map((s) => s.signalHash).sort();
-      const forBob = store.listPresentable({ agentId: bob, accountId: "acct-x" }).map((s) => s.signalHash).sort();
+      const forAlice = store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" }).map((s) => s.signalHash).sort();
+      const forBob = store.listPresentable({ agentPubkeyHex: bobPubkey, accountId: "acct-x" }).map((s) => s.signalHash).sort();
 
       expect(forAlice).toEqual([HASH("1"), HASH("2")].sort()); // the account row + her own
       expect(forBob).toEqual([HASH("1"), HASH("3")].sort());   // the account row + his own
@@ -161,7 +178,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
 
     it("an agent under a DIFFERENT account cannot present the account signal", () => {
       store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "account", subject: "acct-x" }));
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-OTHER" })).toEqual([]);
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-OTHER" })).toEqual([]);
     });
 
     it("does not present a signal that expired ONE SECOND ago (the unit bug this caught)", () => {
@@ -170,34 +187,34 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // by 1000, and would have gone on passing while production presented expired signals. An expiry
       // ONE SECOND in the past is the case that can only pass if the units actually agree.
       const nowSec = 1_768_000_000;
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, expiresAt: nowSec - 1 }));
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x", nowSec })).toEqual([]);
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, expiresAt: nowSec - 1 }));
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x", nowSec })).toEqual([]);
     });
 
     it("DOES present a signal that expires one second from now", () => {
       // The other side of the boundary. Together these two pin the comparison to the right unit: a
       // millisecond/second confusion moves the boundary by a factor of 1000 and breaks one of them.
       const nowSec = 1_768_000_000;
-      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alice, expiresAt: nowSec + 1 }));
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x", nowSec })).toHaveLength(1);
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alicePubkey, expiresAt: nowSec + 1 }));
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x", nowSec })).toHaveLength(1);
     });
 
     it("defaults to the real clock in SECONDS — a signal expired an hour ago is not presented", () => {
       // Guards the DEFAULT path (no nowSec passed), which is where production actually runs and where
       // a stray Date.now() in milliseconds would land.
       const anHourAgo = Math.floor(Date.now() / 1000) - 3600;
-      store.putWalletSignal(envelope({ signalHash: HASH("4"), subjectKind: "agent", subject: alice, expiresAt: anHourAgo }));
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+      store.putWalletSignal(envelope({ signalHash: HASH("4"), subjectKind: "agent", subject: alicePubkey, expiresAt: anHourAgo }));
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
 
     it("does not present a REVOKED or SUPERSEDED signal", () => {
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
       store.setWalletStatus(HASH("2"), "superseded");
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
 
-      store.putWalletSignal(envelope({ signalHash: HASH("5"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("5"), subjectKind: "agent", subject: alicePubkey }));
       store.setWalletStatus(HASH("5"), "revoked");
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
 
     it("REVOCATION IS TERMINAL — a revoked signal can never be resurrected to active (F5)", () => {
@@ -205,17 +222,17 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       // reporting `active` for a hash we already revoked would flip it back — and listPresentable
       // would start offering a revoked signal to counterparties again. The directory is the authority
       // on revocation, but a LATE answer from it is not a NEW answer.
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
       store.setWalletStatus(HASH("2"), "revoked");
 
       store.setWalletStatus(HASH("2"), "active"); // the stale/replayed read
 
       expect(store.getWalletSignal(HASH("2"))!.status).toBe("revoked");
-      expect(store.listPresentable({ agentId: alice, accountId: "acct-x" })).toEqual([]);
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
 
     it("a SUPERSEDED signal may still be revoked, but never returned to active", () => {
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
       store.setWalletStatus(HASH("2"), "superseded");
       store.setWalletStatus(HASH("2"), "active");
       expect(store.getWalletSignal(HASH("2"))!.status).toBe("superseded"); // not resurrected
@@ -225,36 +242,96 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
   });
 
   describe("listAllActive (DOD-PRESENT-1 — holder emit)", () => {
-    it("returns all active, non-expired wallet signals regardless of subject", () => {
+    it("offers an account-subject row and the presenting agent's OWN agent-subject row", () => {
       store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "account", subject: "acct-x", type: "email" }));
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice, type: "phone" }));
-      const all = store.listAllActive();
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, type: "phone" }));
+      const all = store.listAllActive({ presentingAgentPubkeyHex: alicePubkey });
       expect(all).toHaveLength(2);
       expect(all.map((s) => s.signalHash).sort()).toEqual([HASH("1"), HASH("2")].sort());
     });
 
+    // ─── DOD-END-SCOPE-FIX-1 — INV-AGENT-SCOPED on the LIVE path ────────────────────────────────
+    // `listPresentable` implements this scoping and has ZERO production callers. The wire path is
+    // `listAllActive` (`outbound-sessions.ts:186`), which took no presenting identity at all — so
+    // every agent on a daemon offered every other agent's agent-subject signals to its own
+    // counterparties. An M10 defect, live, surfaced by M10B and fixed here.
+    it("does NOT offer ANOTHER agent's agent-subject signal — INV-AGENT-SCOPED, live path", () => {
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, type: "phone" }));
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: bobPubkey, type: "phone" }));
+
+      const forBob = store.listAllActive({ presentingAgentPubkeyHex: bobPubkey });
+
+      // Bob presents his own signal and NOT Alice's. Revert the SQL predicate and this returns both.
+      expect(forBob.map((s) => s.signalHash)).toEqual([HASH("3")]);
+    });
+
+    it("scopes on the K_local PUBKEY, not the daemon's agent_id — the UUID is REFUSED", () => {
+      // The trap this unit exists to close (fourth review HIGH-4): a predicate written against the
+      // old fixture convention compares `subject` to a device-local UUID. It goes green on a fixture
+      // seeded the same wrong way and matches ZERO production rows — silently un-presenting every
+      // agent-subject signal.
+      //
+      // Returning [] for the UUID would pin that silence. Refusing kills the trap by construction:
+      // a caller holding the wrong identity is a BUG, not an operator with an empty wallet, and the
+      // two must not be indistinguishable (review MEDIUM-3).
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey, type: "phone" }));
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: alice })).toThrow(/lowercase hex/i);
+      expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toHaveLength(1);
+    });
+
+    it("matches an UPPERCASE-hex stored subject — hex has a case, SQLite TEXT does not fold it", () => {
+      // A directory version-skew emitting uppercase hex (a condition putWalletSignal already names)
+      // would store `AABB…` for the same key the daemon holds as `aabb…`. Under BINARY collation
+      // that row is invisible — never presented, no error. Case-insensitive comparison is the
+      // correct equality for hex, not a fallback.
+      store.putWalletSignal(envelope({
+        signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey.toUpperCase(), type: "phone",
+      }));
+      expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toHaveLength(1);
+      // ...and it is still SCOPED: Bob does not get Alice's row just because the case differs.
+      expect(store.listAllActive({ presentingAgentPubkeyHex: bobPubkey })).toEqual([]);
+    });
+
+    it("REFUSES an absent, empty, or MALFORMED presenting identity — never presents everything (§5a)", () => {
+      // ABSENT IS NOT FINE. If the caller cannot say who is presenting, the answer is refuse, not
+      // "offer the lot" — the fail-open direction is precisely the defect being fixed, and it would
+      // return silently with a full wallet. Malformed gets the same answer for the same reason: it
+      // fails CLOSED either way, but only a refusal is diagnosable.
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: "" })).toThrow(/lowercase hex/i);
+      expect(() =>
+        store.listAllActive({ presentingAgentPubkeyHex: undefined as unknown as string }),
+      ).toThrow(/lowercase hex/i);
+      // Right length, wrong case — the shape check has to be exact or a mixed-case key silently
+      // matches nothing.
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: alicePubkey.toUpperCase() })).toThrow(/lowercase hex/i);
+      // An agent NAME: the other value in scope at the call site, and the easiest one to pass by
+      // mistake.
+      expect(() => store.listAllActive({ presentingAgentPubkeyHex: "alice" })).toThrow(/lowercase hex/i);
+    });
+
     it("excludes expired signals", () => {
       const nowSec = Math.floor(Date.now() / 1000);
-      store.putWalletSignal(envelope({ signalHash: HASH("1"), expiresAt: nowSec - 100 }));
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), expiresAt: nowSec + 100 }));
-      const all = store.listAllActive();
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), subject: alicePubkey, expiresAt: nowSec - 100 }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subject: alicePubkey, expiresAt: nowSec + 100 }));
+      const all = store.listAllActive({ presentingAgentPubkeyHex: alicePubkey });
       expect(all).toHaveLength(1);
       expect(all[0].signalHash).toBe(HASH("2"));
     });
 
     it("excludes revoked and superseded signals", () => {
-      store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "agent", subject: alice }));
-      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alice }));
-      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alice }));
+      store.putWalletSignal(envelope({ signalHash: HASH("1"), subjectKind: "agent", subject: alicePubkey }));
+      store.putWalletSignal(envelope({ signalHash: HASH("2"), subjectKind: "agent", subject: alicePubkey }));
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subjectKind: "agent", subject: alicePubkey }));
       store.setWalletStatus(HASH("1"), "revoked");
       store.setWalletStatus(HASH("2"), "superseded");
-      const all = store.listAllActive();
+      const all = store.listAllActive({ presentingAgentPubkeyHex: alicePubkey });
       expect(all).toHaveLength(1);
       expect(all[0].signalHash).toBe(HASH("3"));
     });
 
     it("returns empty array when wallet is empty", () => {
-      expect(store.listAllActive()).toEqual([]);
+      expect(store.listAllActive({ presentingAgentPubkeyHex: alicePubkey })).toEqual([]);
     });
   });
 
