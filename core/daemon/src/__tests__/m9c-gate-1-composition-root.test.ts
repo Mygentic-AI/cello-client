@@ -247,6 +247,46 @@ describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => 
     }
   }, 90_000);
 
+  it("records SURVIVE being read — the operator surface must not destroy the audit trail", async () => {
+    // THE REGRESSION THIS EXISTS FOR. Screening worked on Andre's daemon while security_records
+    // stayed empty. Cause: the daemon opened the store per call and CLOSED it, and that close
+    // unlinks `-wal`/`-shm` out from under the live sidecar — every record the sidecar wrote
+    // afterwards landed in an orphaned file that no reader would ever see. So `cello policy log`,
+    // the surface whose whole job is showing what the layer did, silently destroyed the record of
+    // what it did next.
+    //
+    // The sequence is the assertion: screen, READ THROUGH THE OPERATOR SURFACE, screen again, read
+    // again. The second read must see BOTH. Reverting to open-per-call makes this see 1.
+    booted = await bootDaemon(dir, "security.gateway.spawned");
+    await new Promise((r) => setTimeout(r, 1_500));
+
+    const { LocalSidecarGatewayClient } = await import("@cello-protocol/gateway");
+    const screenOnce = async (n: number): Promise<string> => {
+      const c = new LocalSidecarGatewayClient({ socketPath: join(dir, "gateway.sock") });
+      const v = await c.screenOutbound(
+        new TextEncoder().encode(`msg${n} aws_key=AKIAABCDEFGHIJKLMNOP`),
+        { agentName: "a", sessionId: "s" },
+      );
+      await c.close();
+      return v.disposition;
+    };
+
+    const { connectToDaemon } = await import("../ipc-client.js");
+    const ipc = await connectToDaemon(join(dir, "daemon.sock"));
+    try {
+      await ipc.send("ipc.connect", { clientType: "cli" });
+      const total = async (): Promise<number> =>
+        ((await ipc.send("cello_policy_log", {})) as Record<string, unknown>).total as number;
+
+      expect(await screenOnce(1)).toBe("redact");
+      expect(await total()).toBe(1);          // the read that used to unlink the WAL
+      expect(await screenOnce(2)).toBe("redact");
+      expect(await total()).toBe(2);          // 1 here means the write was orphaned
+    } finally {
+      await ipc.close();
+    }
+  }, 90_000);
+
   it("SIGTERM takes the sidecar down with the daemon — no orphan holding the store lock", async () => {
     booted = await bootDaemon(dir, "security.gateway.spawned");
     const spawned = booted.lines().find((l) => l.event === "security.gateway.spawned")!;

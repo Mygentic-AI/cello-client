@@ -30,8 +30,21 @@
  * that makes "and nothing else produces this flag" true. Until then, this is a friction gate with
  * a versioned, hash-chained audit trail — not a lock.
  *
- * The store is opened per call rather than held open: config commands are rare, the file is shared
- * with the gateway process, and a long-lived second write handle buys nothing but lock contention.
+ * STORE HANDLES ARE HELD OPEN FOR THE PROCESS LIFETIME. They were originally opened per call, on
+ * the reasoning that config commands are rare and a second long-lived handle buys only lock
+ * contention. That was wrong, and it cost the entire audit trail — proven against the shipped
+ * daemon on 2026-07-29:
+ *
+ *   1. sidecar screens a message  -> record written, visible, `-wal` present
+ *   2. a reader opens and CLOSES  -> SQLite unlinks `-wal`/`-shm` out from under the live sidecar
+ *   3. sidecar screens again      -> the write lands in the now-orphaned WAL
+ *   4. a fresh reader sees        -> only the FIRST record. Everything after step 2 is lost.
+ *
+ * So `cello policy log` and `cello config list` — the surfaces that exist to show what the layer
+ * did — were silently destroying the record of what it did next. Holding the handle open means no
+ * connection ever performs the last-connection close while the sidecar is alive, which is the
+ * event that removes the WAL. The handles are deliberately not closed per call; process exit
+ * releases them, and the sidecar is torn down before the daemon exits (INV-9 shutdown ordering).
  */
 import { join } from "node:path";
 import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@cello-protocol/gateway";
@@ -105,14 +118,33 @@ function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok:
 export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): void {
   const { handlers, celloDir, logger, getClientType, restartSecurityGateway } = deps;
 
-  const openStore = (): GatewayConfigStore =>
-    new GatewayConfigStore(
-      join(celloDir, "gateway.db"),
-      dbKeyPathFor(join(celloDir, "sessions.db")),
-      // INV-7: the daemon logs through its injected logger and nowhere else. Without this sink the
-      // store would write raw lines to the daemon's stderr.
-      (event, context) => logger.info(event, context),
-    );
+  // ONE handle, opened lazily, never closed per call — see the header. Closing is what unlinks the
+  // WAL and orphans every subsequent sidecar write.
+  let configStore: GatewayConfigStore | undefined;
+  const openStore = (): GatewayConfigStore => {
+    if (!configStore) {
+      configStore = new GatewayConfigStore(
+        join(celloDir, "gateway.db"),
+        dbKeyPathFor(join(celloDir, "sessions.db")),
+        // INV-7: the daemon logs through its injected logger and nowhere else. Without this sink the
+        // store would write raw lines to the daemon's stderr.
+        (event, context) => logger.info(event, context),
+      );
+    }
+    return configStore;
+  };
+
+  let recordStore: GatewayRecordStore | undefined;
+  const openRecordStore = (): GatewayRecordStore => {
+    if (!recordStore) {
+      recordStore = new GatewayRecordStore(
+        join(celloDir, "gateway.db"),
+        dbKeyPathFor(join(celloDir, "sessions.db")),
+        (event, context) => logger.info(event, context),
+      );
+    }
+    return recordStore;
+  };
 
   /** Every store open can fail closed (missing key, locked file). Report the CAUSE, not a label. */
   const withStore = <T>(fn: (store: GatewayConfigStore) => T): T | { ok: false; reason: string; guidance: string } => {
@@ -136,9 +168,9 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         return { ok: false, reason: "invalid_value", guidance: message };
       }
       throw err;
-    } finally {
-      store.close();
     }
+    // NO `finally { store.close() }`. The close is the defect: it unlinks the WAL from under the
+    // sidecar and every record it writes afterwards is lost.
   };
 
   // Read the whole surface. Shows the GOVERNANCE, not just the value (M9C-D18): after an incident
@@ -209,18 +241,14 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
 
     let store: GatewayRecordStore;
     try {
-      store = new GatewayRecordStore(
-        join(celloDir, "gateway.db"),
-        dbKeyPathFor(join(celloDir, "sessions.db")),
-        (event, context) => logger.info(event, context),
-      );
+      store = openRecordStore();
     } catch (err: unknown) {
       const code = (err as { code?: string } | null)?.code ?? "record_store_unavailable";
       const guidance = (err as { guidance?: string } | null)?.guidance
         ?? "The security layer's record store could not be opened. Check the daemon log.";
       return { ok: false, reason: code, guidance };
     }
-    try {
+    {
       const all = store.all();
       const filtered = since === undefined ? all : all.filter((r) => r.recordedAt >= since);
       const page = filtered.slice(-limit).reverse();
@@ -244,8 +272,6 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         // BEFORE they reason from its contents.
         chainValid: store.verifyChain(),
       };
-    } finally {
-      store.close();
     }
   });
 

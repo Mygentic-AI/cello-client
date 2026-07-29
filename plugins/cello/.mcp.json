@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cello": {
+      "command": "npx",
+      "args": ["--yes", "@cello-protocol/connect@0.0.97"]
+    }
+  }
+}
