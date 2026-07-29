@@ -38,6 +38,7 @@
 
 import { verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
+import { migrateWalletAddConsentState, CONSENT_ACCEPTED, type ConsentState } from "./consent-migration.js";
 import type { Logger } from "./types.js";
 
 /** Status lives OUTSIDE the hash — it is mutable after minting, which is exactly why it is not in
@@ -82,6 +83,9 @@ export interface WalletSignalInput {
 
 export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
+  /** M10B-D14r2 — may this be presented at all. Distinct from `defaultPresent`, which answers the
+   *  different question of whether to include it BY DEFAULT once it may be presented. */
+  consentState: ConsentState;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
   defaultPresent: boolean;
 }
@@ -153,6 +157,17 @@ const CREATE_WALLET_SQL = `
     ${ENVELOPE_COLUMNS},
     received_at     INTEGER NOT NULL,
     default_present INTEGER NOT NULL DEFAULT 1,
+    -- M10B-D14r2 — NULLABLE, and that is forced rather than chosen: SQLite cannot ADD COLUMN with
+    -- NOT NULL and no DEFAULT, so a MIGRATED database can only ever have a nullable column. Making
+    -- the fresh DDL stricter would give fresh installs a different schema from migrated ones, and
+    -- the divergence would surface only on fresh installs — i.e. on every new operator, which is the
+    -- worst possible audience for it. The repo's "fresh == migrated" convention wins.
+    --
+    -- Nullability costs nothing here because presentability is enforced by the PREDICATE, which tests
+    -- for exactly 'accepted' rather than for the absence of a bad value. NULL, '', 'ACCEPTED' and any
+    -- future state all fail closed by construction (§5a), so the column constraint was never what was
+    -- protecting the invariant.
+    consent_state   TEXT,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -186,6 +201,11 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
   } catch {
     // Column already exists — safe to ignore.
   }
+  // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent
+  // ALTER whose only expected failure is "already exists"; it is NOT safe for a migration with a
+  // one-time backfill, where a swallowed failure leaves the daemon running against a schema it
+  // believes gates consent and does not. This one is birth-gated and rethrows.
+  migrateWalletAddConsentState(db, _logger);
 }
 
 const toBuf = (b: Uint8Array): Buffer => Buffer.from(b);
@@ -237,6 +257,7 @@ interface ReceivedDbRow extends EnvelopeDbRow {
 function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
   return {
     signalHash: r.signal_hash,
+    consentState: (r as unknown as { consent_state: string }).consent_state as ConsentState,
     subjectKind: r.subject_kind as "account" | "agent",
     subject: r.subject,
     issuerKind: r.issuer_kind as "portal" | "agent",
@@ -288,13 +309,20 @@ export class TrustSignalStore {
       .prepare(
         `INSERT OR IGNORE INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
-            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present,
+            consent_state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.signalHash, s.subjectKind, s.subject, s.issuerKind, s.issuerPubkey, s.type, s.schemaVersion,
         toBuf(s.payload), s.issuedAt, s.expiresAt, s.supersedesHash, s.status, Date.now(),
         defaultPresent ? 1 : 0,
+        // M10B-D14r2 / INV-CONSENT. Keys on ISSUER_KIND, never on the type string, so every future
+        // client-sourced type inherits consent for free (M10B-D1). An `agent`-issued signal was
+        // authored by somebody else ABOUT the operator and is unpresentable until they say so; a
+        // `portal`-issued one was minted for them, at their own action, and has no third party to
+        // wait for. Written at the one insert path, and the SQL predicate fails closed regardless.
+        s.issuerKind === "agent" ? "pending" : CONSENT_ACCEPTED,
       );
     if (res.changes > 0) {
       this.#logger.info("signal.wallet.stored", {
@@ -564,7 +592,8 @@ export class TrustSignalStore {
         `SELECT * FROM wallet_trust_signals
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
-            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
       )
       .all(nowSec, opts.presentingAgentPubkeyHex) as unknown as EnvelopeDbRow[];
     const all = rows.map(toWalletRow);
@@ -600,6 +629,25 @@ export class TrustSignalStore {
       )
       .all(now, presentingAgentPubkeyHex) as Array<{ type: string }>;
     return rows.map((r) => r.type);
+  }
+
+  /**
+   * Record the subject's consent decision (D-23). The ONLY writer of this column after insert.
+   *
+   * `refused` is terminal in spirit but not enforced as one-way here: `M10B-D4` allows Bob to issue a
+   * CORRECTED endorsement after a refusal, and that is a NEW signal with its own hash — it does not
+   * reuse this row. What must never happen is a refusal being silently undone, which is why the
+   * migration is birth-gated rather than NULL-driven.
+   */
+  setConsentState(signalHash: string, state: ConsentState): boolean {
+    const res = this.#db
+      .prepare("UPDATE wallet_trust_signals SET consent_state = ? WHERE signal_hash = ?")
+      .run(state, signalHash);
+    if (Number(res.changes) > 0) {
+      this.#logger.info("signal.consent.changed", { signalHash, consentState: state });
+      return true;
+    }
+    return false;
   }
 
   /** Set the persistent default-presentation flag for a wallet signal. */
