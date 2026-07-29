@@ -68,9 +68,30 @@ export function migrateWalletAddConsentState(db: DaemonDatabase, logger: Logger)
     const underLock = new Set(
       (db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string }>).map((c) => c.name),
     );
-    if (underLock.has("consent_state")) { db.exec("COMMIT"); return; }
+    // EACH COLUMN IS GATED INDEPENDENTLY. An earlier version added both under one gate keyed on
+    // `consent_state`, so a database holding one but not the other hit `duplicate column name`, the
+    // migration rethrew, and the daemon refused to start — a self-inflicted boot failure on a
+    // recoverable state. Caught by the legacy-backfill test, which constructs exactly that shape.
+    const needsConsent = !underLock.has("consent_state");
+    const needsNotified = !underLock.has("consent_notified_at");
+    if (!needsConsent && !needsNotified) { db.exec("COMMIT"); return; }
+
     // No DEFAULT — see the header. The rows are given their value by the explicit backfill below.
-    db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN consent_state TEXT");
+    if (needsConsent) db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN consent_state TEXT");
+    // DOD-END-PENDING-1 / M10B-D5 — the NOTIFICATION's lifetime, which is NOT the item's. The item
+    // persists until accepted or refused; the notification is raised once and stops once seen. One
+    // flag cannot carry both: a single seen-bit would either dismiss the pending decision (losing it)
+    // or re-fire on every agent selection (nagging). Two facts, two columns.
+    if (needsNotified) db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN consent_notified_at INTEGER");
+
+    if (!needsConsent) {
+      // The backfill belongs to consent_state's BIRTH. If only the notification column was missing,
+      // the rows already carry their consent and must not be re-judged — that is the clobber this
+      // file exists to prevent, and it would arrive by the back door of a partially-migrated schema.
+      db.exec("COMMIT");
+      logger.info("signal.consent.migrated", { backfilled: 0, added: "consent_notified_at" });
+      return;
+    }
     // THE DIRECTION IS ENFORCED, NOT ARGUED (review F5). The header's reasoning — "everything
     // predating this column is portal-issued" — is true TODAY only by release timing: the daemon has
     // accepted `issuer_kind: agent` since M10, and a dev or staging wallet that picked one up during

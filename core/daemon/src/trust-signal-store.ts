@@ -173,6 +173,10 @@ const CREATE_WALLET_SQL = `
     -- future state all fail closed by construction (§5a), so the column constraint was never what was
     -- protecting the invariant.
     consent_state   TEXT,
+    -- DOD-END-PENDING-1 — when the operator was TOLD about this pending decision. NULL = not yet
+    -- told. Separate from consent_state because the item and the notification have different
+    -- lifetimes: the decision persists until made, the nag stops once seen.
+    consent_notified_at INTEGER,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -333,6 +337,13 @@ export class TrustSignalStore {
       this.#logger.info("signal.wallet.stored", {
         signalHash: s.signalHash, type: s.type, subjectKind: s.subjectKind, issuerKind: s.issuerKind,
       });
+      if (s.issuerKind === "agent") {
+        // DOD-END-PENDING-1 named event. Emitted where the decision is CREATED, so the log shows a
+        // decision being owed even if the operator never selects the agent again.
+        this.#logger.info("signal.consent.pending", {
+          signalHash: s.signalHash, subject: s.subject.slice(0, 16), issuerPubkey: s.issuerPubkey.slice(0, 16),
+        });
+      }
     }
     return res.changes > 0;
   }
@@ -730,6 +741,65 @@ export class TrustSignalStore {
       }
     }
     return true;
+  }
+
+  /**
+   * DOD-END-PENDING-1 — the decisions this agent still owes (`M10B-D5`).
+   *
+   * Its OWN surface, deliberately not the transcript inbox: an inbox item is cleared by reading or
+   * dismissing a transcript, and an endorsement awaiting consent has no transcript, so it would be an
+   * item the operator could never clear the normal way.
+   *
+   * Keyed by CONSENT STATE, never by type — that is what makes a whole new queue legal under
+   * INV-ZEROBUMP, and it is why a future client-sourced type appears here with no code change.
+   * SCOPED to the presenting agent on the same axis as presentation (DOD-END-SCOPE-FIX-1): a queue
+   * showing every agent's pending items would let one agent decide on another's behalf.
+   */
+  listPendingConsent(agentPubkeyHex: string): WalletSignalRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM wallet_trust_signals
+          WHERE consent_state = 'pending'
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+          ORDER BY received_at ASC`,
+      )
+      .all(agentPubkeyHex) as unknown as EnvelopeDbRow[];
+    return rows.map(toWalletRow);
+  }
+
+  /**
+   * How many pending decisions this agent has NOT yet been told about.
+   *
+   * Asked on every agent selection, so it must go quiet once the operator has been told — while the
+   * ITEM stays in `listPendingConsent` until they actually decide. A new arrival raises it again,
+   * because the silence is per-item and not a permanent "already notified" flag on the agent.
+   */
+  countUnnotifiedConsent(agentPubkeyHex: string): number {
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM wallet_trust_signals
+          WHERE consent_state = 'pending'
+            AND consent_notified_at IS NULL
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+      )
+      .get(agentPubkeyHex) as { n: number };
+    return Number(row.n);
+  }
+
+  /** Record that the operator has been told about this agent's currently-pending decisions. */
+  markConsentNotified(agentPubkeyHex: string): number {
+    const res = this.#db
+      .prepare(
+        `UPDATE wallet_trust_signals
+            SET consent_notified_at = ?
+          WHERE consent_state = 'pending'
+            AND consent_notified_at IS NULL
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+      )
+      .run(Date.now(), agentPubkeyHex);
+    const n = Number(res.changes);
+    if (n > 0) this.#logger.info("signal.consent.notified", { agentPubkey: agentPubkeyHex.slice(0, 16), count: n });
+    return n;
   }
 
   /** Set the persistent default-presentation flag for a wallet signal. */

@@ -113,7 +113,9 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
       // Simulates the real migration case: a wallet that predates the column entirely. Defaulting
       // those rows to 'pending' would silently make every phone/email signal already in every wallet
       // unpresentable — a data-loss-shaped bug that raises no error.
+      // A genuine legacy shape: neither consent column present.
       db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_state");
+      db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_notified_at");
       db.prepare(
         `INSERT INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
@@ -335,5 +337,20 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
       store.setConsentState(HASH("4"), "refused");
       expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
+  });
+
+  it("a PARTIALLY migrated database (one column, not the other) migrates instead of crashing", () => {
+    // Self-inflicted boot failure, caught by the suite: both columns were added under ONE birth gate
+    // keyed on consent_state, so a DB holding consent_state but missing consent_notified_at hit
+    // `duplicate column name`, the migration rethrew, and the daemon refused to start. Each column is
+    // gated independently now — and the backfill stays tied to consent_state's birth, so rows that
+    // already carry a decision are not re-judged.
+    store.putWalletSignal(envelope({ signalHash: HASH("e"), subject: alicePubkey, issuerKind: "agent" }));
+    store.setConsentState(HASH("e"), "refused");
+    db.exec("ALTER TABLE wallet_trust_signals DROP COLUMN consent_notified_at");
+
+    expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
+
+    expect(store.getWalletSignal(HASH("e"))!.consentState).toBe("refused");  // NOT re-backfilled
   });
 });
