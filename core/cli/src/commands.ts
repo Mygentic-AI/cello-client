@@ -661,6 +661,7 @@ export async function trustSignals(
           expires_at: number | null;
           supersedes_hash: string | null;
           default_present: boolean;
+          consent_state: string | null;
         }>;
         reason?: string;
       };
@@ -676,16 +677,31 @@ export async function trustSignals(
       if (signals.length === 0) {
         return { exitCode: 0, output: `No active trust signals. ${supersededCount} superseded (run with --all to show).` };
       }
+      // M10B / DOD-END-SURFACE-1. `status` is the DIRECTORY's answer (is the notarization live);
+      // consent is the SUBJECT's answer (may it be shown at all). A signal needs both, and only
+      // `accepted` is presentable — so anything else must never render as included, or the
+      // operator's own list contradicts what presentation actually does.
+      const presentable = (s: { consent_state: string | null }) => s.consent_state === "accepted";
+      const anyAwaiting = signals.some((s) => !presentable(s));
       const lines = signals.map((s) => {
         const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
         const hash = s.signal_hash.slice(0, 12) + "…";
         const status = s.status === "active" ? "active" : s.status === "superseded" ? "superseded" : s.status;
-        const inc = s.default_present ? "✓" : "–";
-        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${inc.padEnd(4)}  ${date}`;
+        // ABSENT IS NOT FINE (§5a): an unset or unrecognised consent state reads as "awaiting", never
+        // as presentable. The attacker never has to defeat this check — they omit what triggers it.
+        const consent = s.consent_state === "accepted" ? "—"
+          : s.consent_state === "pending" ? "PENDING"
+          : s.consent_state === "refused" ? "refused"
+          : "awaiting";
+        const inc = presentable(s) ? (s.default_present ? "✓" : "–") : "✗";
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${consent.padEnd(9)}  ${inc.padEnd(4)}  ${date}`;
       });
-      const header = `  ${"type".padEnd(22)}  hash          status        include  issued`;
-      const divider = "  " + "─".repeat(72);
-      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'`;
+      const header = `  ${"type".padEnd(22)}  hash          status        consent    include  issued`;
+      const divider = "  " + "─".repeat(84);
+      const consentLegend = anyAwaiting
+        ? `\n  consent: PENDING = someone issued this ABOUT you and it awaits your decision — it is NOT\n           shown to anyone until you accept.  Run 'cello consent list' to read and decide.\n           refused = you refused it; it stays inert.  ✗ = not presentable, whatever 'include' says.`
+        : "";
+      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'${consentLegend}`;
       const footer = !showAll && supersededCount > 0
         ? `\n  (${supersededCount} superseded not shown — run with --all to include)`
         : "";
