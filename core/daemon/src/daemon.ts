@@ -1904,6 +1904,95 @@ async function startDaemonHoldingLock(
     return { ok: true, signal_hash: row.signalHash, default_present: false };
   });
 
+  // ── M10B / DOD-END-SURFACE-1 — the consent verbs (D-23, M10B-D5) ───────────────────────────────
+  //
+  // SCOPED TO THE SELECTED AGENT, not to "the first loaded agent" the way wallet_revoke_signal is.
+  // Consent is a decision the SUBJECT makes about an object a third party wrote concerning them, so
+  // answering it on the wrong agent's behalf is not a cosmetic error — it is one agent deciding for
+  // another. The presenting-agent pubkey is also what the store's queries scope on, and passing the
+  // device-local agent_id instead now REFUSES rather than silently returning an empty queue.
+  const resolveSelectedAgent = (connectionId: string):
+    | { ok: true; name: string; pubkey: string }
+    | { ok: false; reason: string; guidance: string } => {
+    const name = perConnectionState.get(connectionId)?.currentAgent ?? null;
+    if (!name) {
+      return {
+        ok: false,
+        reason: "no_current_agent",
+        guidance: "Select an agent first (cello_use_agent) — a consent decision belongs to the agent it is about.",
+      };
+    }
+    const rec = loadedAgents.find((a) => a.name === name);
+    if (!rec) {
+      return { ok: false, reason: "agent_not_loaded", guidance: `Agent '${name}' is selected but not loaded on this daemon.` };
+    }
+    return { ok: true, name, pubkey: rec.pubkey };
+  };
+
+  handlers.set("consent_list_pending", async (_params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const items = store.listPendingConsent(sel.pubkey).map((r) => ({
+      signal_hash: r.signalHash,
+      type: r.type,
+      issuer_pubkey: r.issuerPubkey,
+      issued_at: r.issuedAt,
+      // The payload is the ENDORSER'S OWN WORDS and is returned raw, unparsed, for the operator to
+      // read before deciding. It is not interpreted here and it is never presented to anyone until
+      // they accept — that is the entire point of the decision they are being asked to make.
+      payload_bytes: r.payload.length,
+    }));
+    // Seeing the list IS being told. Marking here rather than in cello_use_agent means the operator
+    // is never marked notified about something they were not actually shown.
+    store.markConsentNotified(sel.pubkey);
+    return { ok: true, agent: sel.name, pending: items };
+  });
+
+  handlers.set("consent_accept", async (params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!prefix || prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const item = store.listPendingConsent(sel.pubkey).find((r) => r.signalHash.startsWith(prefix));
+    if (!item) {
+      // Deliberately does NOT fall back to a wallet-wide lookup: a hash this agent has no pending
+      // decision on is not this agent's to accept, and finding it anyway would be the cross-agent
+      // decision this scoping exists to prevent.
+      return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
+    }
+    store.setConsentState(item.signalHash, "accepted");
+    return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
+  });
+
+  handlers.set("consent_refuse", async (params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
+    if (!prefix || prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
+    }
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const item = store.listPendingConsent(sel.pubkey).find((r) => r.signalHash.startsWith(prefix));
+    if (!item) {
+      return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
+    }
+    store.setConsentState(item.signalHash, "refused");
+    // M10B-D4: the refusal MESSAGE back to the issuer is the subject's CHOICE and rides the
+    // submission queue as an `op` — it is not sent here, and it is not sent automatically. Accepting
+    // the message parameter without a carrier would be a promise this verb cannot keep, so the
+    // parameter is deliberately not taken yet; the refusal itself is complete and durable.
+    return {
+      ok: true,
+      signal_hash: item.signalHash,
+      consent_state: "refused",
+      note: "The issuer is not notified. Sending a refusal message requires the submission carrier (DOD-END-SUBMIT-1 wiring).",
+    };
+  });
+
   handlers.set("wallet_revoke_signal", async (params, _connectionId) => {
     const hashPrefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
     if (!hashPrefix || hashPrefix.length < 8) {
