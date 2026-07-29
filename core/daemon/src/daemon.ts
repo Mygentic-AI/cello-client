@@ -2758,6 +2758,26 @@ async function startDaemonHoldingLock(
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();
     } finally {
+      // DOD-M9C-WIRE-1: tear down whatever the composition root started alongside us — today the
+      // screening sidecar. Two reasons it is HERE and not only in the bin's signal handler:
+      // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
+      // function and never touches the signal path; and a spawned child's stdio pipes keep this
+      // process's event loop alive, so a daemon stopped that way would never actually exit.
+      //
+      // FIRST in the finally, BEFORE the singleton lock is released (review F4). The comment below
+      // states the property the lock provides — "while we hold it, no successor daemon can start"
+      // — and the sidecar teardown needs exactly that property: the `shutdown` verb acknowledges
+      // immediately without awaiting this drain, so `cello logout && cello login` can race a new
+      // daemon into existence. Releasing the lock first would let its gateway spawn while ours
+      // still holds gateway.db's write lock, which the 3s busy_timeout usually hides — making the
+      // failure intermittent rather than absent.
+      if (config.onShutdown) {
+        await config.onShutdown().catch((err: unknown) => {
+          logger.error("daemon.shutdown.hook_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
       // held. In the real binary the process exits and the kernel reclaims it — but an in-process
       // caller (vitest, an embedder) whose shutdown throws would otherwise find every subsequent
@@ -2771,21 +2791,6 @@ async function startDaemonHoldingLock(
       // Released LAST: while we hold it, no successor daemon can start, which is what lets
       // ipcServer.stop()'s socket re-check above be race-free.
       singletonLock.release();
-      // DOD-M9C-WIRE-1: tear down whatever the composition root started alongside us — today the
-      // screening sidecar. It MUST happen here and not only in the bin's signal handler, because
-      // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
-      // function and never touches the signal path. Getting that wrong has two teeth: the daemon
-      // process would not exit at all (a spawned child's stdio pipes keep the event loop alive,
-      // and this path relies on the loop draining rather than calling process.exit), and a
-      // surviving gateway would hold the store's write lock against the next daemon — the orphan
-      // problem this project already knows by name.
-      if (config.onShutdown) {
-        await config.onShutdown().catch((err: unknown) => {
-          logger.error("daemon.shutdown.hook_failed", {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
-      }
     }
   }
 

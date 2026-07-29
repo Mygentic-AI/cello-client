@@ -102,12 +102,18 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
       logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none" });
     });
   } catch (err: unknown) {
-    logger.error("security.gateway.spawn_failed", {
-      error: err instanceof Error ? err.message : String(err),
-      guidance:
-        "The security layer could not start, so nothing can be sent or received: every message " +
-        "fails closed. Check the daemon log for the cause above, then restart the daemon.",
-    });
+    const message = err instanceof Error ? err.message : String(err);
+    // The gateway's own errors carry a code and actionable guidance; the spawner appends the
+    // child's stderr tail. Keep BOTH, and hand them to the client so every later refusal names
+    // this cause instead of the generic "could not be reached, retry" (review F2) — which points
+    // at the transport when the fault was a key file, a lock, or a stale plaintext store, and
+    // suggests a retry that can never succeed.
+    const code = (err as { code?: string } | null)?.code ?? "sidecar_spawn_failed";
+    const guidance = (err as { guidance?: string } | null)?.guidance
+      ?? "The security layer could not start, so nothing can be sent or received: every message " +
+         "fails closed. Fix the cause below and restart the daemon.";
+    logger.error("security.gateway.spawn_failed", { reason: code, error: message, guidance });
+    client.setUnavailableCause(code, `${guidance} (cause: ${message})`);
   }
   return { client, sidecar };
 }

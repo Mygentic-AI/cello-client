@@ -48,7 +48,6 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
   function makeConfig(): DaemonConfig {
     return {
       securityGateway: new PassthroughGatewayClient(),
-      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

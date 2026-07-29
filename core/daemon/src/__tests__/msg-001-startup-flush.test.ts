@@ -61,7 +61,6 @@ describe("CELLO-M7-MSG-001 daemon startup flush of un-acked content", () => {
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
       securityGateway: new PassthroughGatewayClient(),
-      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

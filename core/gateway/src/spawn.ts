@@ -43,7 +43,13 @@ function defaultEntryPath(): string {
 export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<SpawnedGateway> {
   const entry = opts.entryPath ?? defaultEntryPath();
   const child = spawn(process.execPath, [entry], {
-    stdio: ["ignore", "pipe", "pipe"],
+    // stdin is a PIPE, not "ignore", and it is the child's death switch (review F5). A daemon that
+    // dies without running its shutdown path — SIGKILL, a crash, the OOM killer — leaves the
+    // gateway alive holding the encrypted store's write lock. The NEXT daemon's gateway then hits
+    // `store_locked`, exits before ready, and with no auto-restart (M9C-D14) that daemon spends its
+    // whole life fail-closed on one boot log line. When the parent dies the kernel closes this
+    // pipe, and the child exits on the `end` event.
+    stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...process.env,
       ...opts.env,
@@ -61,6 +67,10 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
   // "gateway sidecar exited before ready (code 1)" — a message naming where the failure surfaced
   // and nothing about what went wrong. Second: an unread pipe fills, and the gateway writes a
   // stderr line per screen error, so a long-running gateway would eventually block on it.
+  // A ChildProcess with no `error` listener turns a spawn-level failure (EMFILE, ENOMEM, EACCES)
+  // into an UNCAUGHT exception on a later tick — outside the caller's try — which would kill the
+  // daemon at boot rather than letting it degrade to the announced fail-closed mode (review F11).
+  // The promise below rejects on `exit`; this makes sure `error` cannot escape in the meantime.
   let stderrTail = "";
   const MAX_STDERR_TAIL = 8_192;
   child.stderr?.on("data", (chunk: Buffer) => {
@@ -89,12 +99,16 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
       }
     };
     child.stdout?.on("data", onStdout);
-    child.once("exit", (code) => {
+    const fail = (message: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(new Error(withChildStderr(`gateway sidecar exited before ready (code ${code})`)));
-    });
+      reject(new Error(withChildStderr(message)));
+    };
+    child.once("exit", (code) => fail(`gateway sidecar exited before ready (code ${code})`));
+    // The spawn itself failing is a different cause from the child exiting, and the operator needs
+    // to be able to tell them apart.
+    child.once("error", (err: Error) => fail(`gateway sidecar could not be spawned: ${err.message}`));
   });
 
   return {

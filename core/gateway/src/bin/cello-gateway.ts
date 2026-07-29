@@ -194,6 +194,15 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+
+  // PARENT DEATH SWITCH (review F5). The daemon spawns this process with a piped stdin and never
+  // writes to it; when the daemon dies — including the ways that skip its shutdown path entirely,
+  // SIGKILL and crashes — the kernel closes the pipe and this fires. Without it the gateway
+  // outlives its daemon holding the store's write lock, and the next daemon comes up permanently
+  // fail-closed against a lock nobody can explain.
+  process.stdin.on("end", () => shutdown("parent_exited"));
+  process.stdin.on("close", () => shutdown("parent_exited"));
+  process.stdin.resume();
 }
 
 main().catch((err: unknown) => {

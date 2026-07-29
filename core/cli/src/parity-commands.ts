@@ -447,44 +447,80 @@ export function gatewayConfigSet(
   key: string,
   value: string,
   opts: ParityOptions,
-  prompt: (question: string) => Promise<boolean> = confirmAtTty,
+  prompt: (question: string) => Promise<ConfirmAnswer> = confirmAtTty,
 ): Promise<CliOutput> {
   return withDaemon(celloDir, opts, false, async (client) => {
     const first = (await client.send("cello_config_set", { key, value })) as Record<string, unknown>;
     if (first.reason !== "needs_confirmation") return first;
 
-    const agreed = await prompt(
+    // Render what is ACTUALLY changing. `set` REPLACES a list, so showing only the new value would
+    // hide four dropped entries in a five-entry whitelist (review F7). `from: null` means the key
+    // has never been configured and the built-in tightest default applies.
+    const from = "from" in first ? first.from : undefined;
+    const fromText = from === null || from === undefined
+      ? "(never configured — the built-in default applies)"
+      : JSON.stringify(from);
+    const answer = await prompt(
       `This makes the security layer LESS protective:\n` +
-        `  ${key} -> ${value}\n` +
+        `  ${key}\n` +
+        `    from: ${fromText}\n` +
+        `    to:   ${value}\n` +
         `  ${String(first.guidance ?? "")}\n` +
         `Apply it?`,
     );
-    if (!agreed) {
-      // Not an error — the operator was asked and said no. The guard is unchanged, and the
-      // absence of a stored row is the proof.
+
+    if (answer === "no_tty") {
+      // NOT the same as "the operator said no" (review F3). A CI job or an agent was never shown a
+      // prompt, and telling it the human declined is a lie about what happened — and leaves it no
+      // way forward. Name the cause and hand over the command.
+      return {
+        ok: false,
+        reason: "not_a_tty",
+        guidance:
+          `Weakening '${key}' needs a human at a terminal, and this session has no interactive ` +
+          `input. Run it yourself in a terminal: cello config set ${key} ${value}`,
+      };
+    }
+    if (answer === "no") {
+      // The operator was asked and said no. Not an error — and the absence of a stored row is the
+      // proof that nothing changed.
       return { ok: false, reason: "declined", guidance: `'${key}' was NOT changed.` };
     }
     return (await client.send("cello_config_set", { key, value, confirmed: true })) as Record<string, unknown>;
   });
 }
 
+/** What a confirmation attempt actually resolved to. `no_tty` is NOT `no` — see F3 above. */
+export type ConfirmAnswer = "yes" | "no" | "no_tty";
+
 /**
- * Ask a yes/no question on the terminal. Refuses when stdin is not a TTY: a pipe, a CI job or an
- * agent spawning the CLI is not a human, and treating one as a human is exactly the side door
- * INV-10 exists to close.
+ * Ask a yes/no question on the terminal. Returns `no_tty` — distinct from `no` — when stdin is not
+ * a TTY: a pipe, a CI job or an agent spawning the CLI is not a human, and treating one as a human
+ * who declined is the side door INV-10 exists to close, told as a misleading story.
  */
-async function confirmAtTty(question: string): Promise<boolean> {
-  if (!process.stdin.isTTY) return false;
+async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
+  if (!process.stdin.isTTY) return "no_tty";
   process.stderr.write(`${question} [y/N] `);
   const answer = await new Promise<string>((resolve) => {
     process.stdin.resume();
     process.stdin.setEncoding("utf8");
-    process.stdin.once("data", (chunk: string) => {
+    const done = (value: string): void => {
       process.stdin.pause();
-      resolve(chunk.trim().toLowerCase());
-    });
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onEnd);
+      resolve(value);
+    };
+    // `end`/`error` as well as `data`: a terminal where the operator hits Ctrl-D closes stdin
+    // without ever emitting data, and a promise that never settles is a hang — INV-6 says a
+    // deadline always produces an answer, and "no" is the safe one.
+    const onData = (chunk: string): void => done(chunk.trim().toLowerCase());
+    const onEnd = (): void => done("");
+    process.stdin.once("data", onData);
+    process.stdin.once("end", onEnd);
+    process.stdin.once("error", onEnd);
   });
-  return answer === "y" || answer === "yes";
+  return answer === "y" || answer === "yes" ? "yes" : "no";
 }
 
 /**

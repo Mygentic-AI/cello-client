@@ -72,6 +72,16 @@ function coerce(key: string, raw: unknown): { ok: true; value: unknown } | { ok:
   }
   const n = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw) : NaN;
   if (!Number.isFinite(n)) return { ok: false, reason: `${key} is a number.` };
+  // Mirror the store's own range rules HERE (review F6). Without this, `rate_window_ms 0` reached
+  // the store's validator, which THROWS — and an uncaught throw becomes `internal_error: an
+  // unexpected error occurred, check daemon logs`. The operator asked for something out of range
+  // and was told the daemon broke.
+  if (key === "rate_max_per_window" && n < 0) {
+    return { ok: false, reason: "rate_max_per_window cannot be negative (0 means no cap)." };
+  }
+  if (key === "rate_window_ms" && n <= 0) {
+    return { ok: false, reason: "rate_window_ms must be greater than 0 milliseconds." };
+  }
   return { ok: true, value: n };
 }
 
@@ -100,6 +110,15 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     }
     try {
       return fn(store);
+    } catch (err: unknown) {
+      // The store validates too, and it THROWS. A validation fault is the caller's input being
+      // wrong, not the daemon being broken — surfacing it as `internal_error` sends the operator
+      // to the logs for a problem they can fix in the command they just typed.
+      const message = err instanceof Error ? err.message : String(err);
+      if (/invalid value for config key|unknown config key/i.test(message)) {
+        return { ok: false, reason: "invalid_value", guidance: message };
+      }
+      throw err;
     } finally {
       store.close();
     }
@@ -224,7 +243,19 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     const parsed = coerce(key, params.value);
     if (!parsed.ok) return { ok: false, reason: "invalid_value", guidance: parsed.reason };
 
-    const surface = getClientType(connectionId) === "mcp" ? "mcp" : "cli";
+    // F1 (review, BLOCKING): the permissive side must not be the DEFAULT. `getClientType` returns
+    // undefined for a connection that never sent `ipc.connect`, and the daemon itself defaults a
+    // handshake with no clientType to "cli" — so `!== "mcp"` meant a raw socket write could carry
+    // `confirmed: true` and land a human-confirmed loosening with no human anywhere near it. Ten
+    // lines of node against ~/.cello/daemon.sock was the whole attack.
+    //
+    // And the justification for the original shape was FALSE in the direction that mattered: an
+    // agent running `cello config set …` from a Bash tool gets a NON-TTY stdin and is refused, so
+    // the raw socket was not "the same as just running the CLI" — it was the only route that worked
+    // for a non-human. Now only an EXPLICIT `cli` handshake may confirm; everything else is an
+    // untrusted surface.
+    const clientType = getClientType(connectionId);
+    const surface = clientType === "cli" ? "cli" : clientType === "mcp" ? "mcp" : "unknown";
     const confirmed = params.confirmed === true;
 
     return withStore((store) => {
@@ -238,8 +269,8 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         return applied(key, attempt.direction, attempt.version, false);
       }
 
-      // It is a loosening. Two ways to be refused, and they are different failures.
-      if (surface === "mcp") {
+      // It is a loosening. Three ways to be refused, and they are different failures.
+      if (surface !== "cli") {
         logger.warn("gateway.config.loosen_refused", { key, surface, reason: "loosen_requires_cli" });
         return {
           ok: false,
@@ -252,11 +283,18 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       }
       if (!confirmed) {
         logger.warn("gateway.config.loosen_refused", { key, surface, reason: "needs_confirmation" });
+        const history = store.history(key);
+        const latest = history[history.length - 1];
         return {
           ok: false,
           reason: "needs_confirmation",
           direction: "loosen" as ConfigDirection,
-          guidance: `This weakens ${KEY_HELP[key]}. Re-run and confirm at the prompt to apply it.`,
+          // The CURRENT value travels with the refusal (review F7). `set` REPLACES a list, so
+          // `cello config set pii_whitelist new@x.example` against a five-entry whitelist drops
+          // four of them — and a prompt that shows only the new value hides that entirely.
+          // `null` means never configured, i.e. the built-in tightest default applies.
+          from: latest ? latest.value : null,
+          guidance: `This makes ${KEY_HELP[key]} LESS restrictive.`,
         };
       }
 

@@ -55,10 +55,30 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
   #nextId = 1;
   #closed = false;
 
+  /**
+   * Why the gateway is unreachable, when the composition root already knows (review F2).
+   *
+   * Without this, a sidecar that never started surfaced as `gateway_unavailable` on every message
+   * — an exit-point label that says "the transport failed, check the gateway is running and
+   * retry". But the gateway is not running and never will be, retrying can never work, and the
+   * actual cause (a missing key file, a store locked by an orphan, a leftover plaintext store, a
+   * missing binary) was logged once at boot and then thrown away. The spawner already captures
+   * the child's coded, guided stderr; this is where it survives to the operator.
+   */
+  #unavailable: { reason: string; guidance: string } | undefined;
+
   constructor(opts: LocalSidecarGatewayClientOptions) {
     this.#socketPath = opts.socketPath;
     this.#deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
     this.#logger = opts.logger ?? NOOP_LOGGER;
+  }
+
+  /**
+   * Record why the sidecar could not be started, so every later refusal names THAT rather than the
+   * generic unreachable label. Called by the composition root when the spawn fails.
+   */
+  setUnavailableCause(reason: string, guidance: string): void {
+    this.#unavailable = { reason, guidance };
   }
 
   screenOutbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict> {
@@ -94,6 +114,12 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
         direction,
         error: err instanceof Error ? err.message : String(err),
       });
+      // The known cause wins over the generic one (F2): "your daemon key file is missing" sends
+      // the operator to the right place; "the gateway could not be reached, retry" does not.
+      if (this.#unavailable) {
+        const verdict = failClosedVerdict(direction, this.#unavailable.reason);
+        return { ...verdict, guidance: this.#unavailable.guidance };
+      }
       return failClosedVerdict(direction);
     }
 

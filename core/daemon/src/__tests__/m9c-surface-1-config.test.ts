@@ -64,6 +64,51 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(restarts).toBe(0);
   });
 
+  it("F1: a connection that NEVER declared a client type cannot confirm a loosening", async () => {
+    // The hole this closes: `getClientType` returns undefined for a raw socket that skipped
+    // `ipc.connect`, and the daemon ALSO defaults a handshake with no clientType to "cli". With
+    // `!== "mcp"` meaning "cli", ten lines of node against ~/.cello/daemon.sock could land a
+    // confirmed loosening with no human anywhere near it — and verifyChain would attest it as
+    // human-confirmed forever. The permissive side must never be the default.
+    const res = await call(
+      "cello_config_set",
+      { key: "autonomous_override", value: true, confirmed: true },
+      "unknown-conn", // not in clientTypes → getClientType returns undefined
+    );
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("loosen_requires_cli");
+
+    const store = openStore();
+    expect(store.history("autonomous_override")).toEqual([]);
+    store.close();
+  });
+
+  it("F1: an MCP caller passing confirmed:true directly is still refused — the flag is not a key", async () => {
+    const res = await call(
+      "cello_config_set",
+      { key: "autonomous_override", value: true, confirmed: true },
+      "mcp-conn",
+    );
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("loosen_requires_cli");
+    const store = openStore();
+    expect(store.history("autonomous_override")).toEqual([]);
+    store.close();
+  });
+
+  it("F6: an out-of-range value is invalid_value, never internal_error", async () => {
+    const res = await call("cello_config_set", { key: "rate_window_ms", value: 0 });
+    expect(res.reason).toBe("invalid_value");
+    expect(String(res.guidance)).toContain("greater than 0");
+  });
+
+  it("F7: the needs_confirmation refusal carries the CURRENT value, so a replacement cannot hide a drop", async () => {
+    await call("cello_config_set", { key: "pii_whitelist", value: "a@x.example,b@x.example", confirmed: true });
+    const res = await call("cello_config_set", { key: "pii_whitelist", value: "c@x.example" });
+    expect(res.reason).toBe("needs_confirmation");
+    expect(res.from).toEqual(["a@x.example", "b@x.example"]);
+  });
+
   it("a CLI caller without confirmation is refused with needs_confirmation — and still writes no row", async () => {
     const res = await call("cello_config_set", { key: "autonomous_override", value: true });
     expect(res.ok).toBe(false);

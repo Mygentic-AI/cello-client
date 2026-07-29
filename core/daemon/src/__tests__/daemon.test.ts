@@ -54,7 +54,6 @@ describe("daemon", () => {
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
       securityGateway: new PassthroughGatewayClient(),
-      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

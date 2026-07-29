@@ -68,7 +68,6 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
   function makeConfig(overrides?: Partial<DaemonConfig>): DaemonConfig {
     return {
       securityGateway: new PassthroughGatewayClient(),
-      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

@@ -960,11 +960,6 @@ export const COMMANDS: readonly CommandSpec[] = [
       if (sub === "set" && key && rest.length > 0) {
         return gatewayConfigSet(ctx.celloDir, key, rest.join(" "), opts);
       }
-      // An empty string is a legitimate VALUE (it clears a list), so `set <key> ""` must reach the
-      // daemon rather than falling through to the usage text.
-      if (sub === "set" && key && rest.length === 0 && positional.length >= 3) {
-        return gatewayConfigSet(ctx.celloDir, key, "", opts);
-      }
       return { stdout: helpForSpec("config"), stderr: "", exitCode: 1 };
     },
   },

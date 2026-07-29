@@ -85,4 +85,13 @@ export default [
       "no-restricted-imports": "off",
     },
   },
+  {
+    // A duplicate object key silently discards one of the two values. The config spread only
+    // carries `tsPlugin.configs.recommended.rules`, NOT `eslint:recommended`, so core rules like
+    // this one are off unless named — and a mechanical 58-file edit left 13 duplicate
+    // `securityGateway` keys that typecheck and lint both reported clean (M9 review F8). A gate
+    // that cannot see the corruption a bulk edit causes is not covering bulk edits.
+    files: ["core/*/src/**/*.ts"],
+    rules: { "no-dupe-keys": "error" },
+  },
 ];
