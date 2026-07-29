@@ -18,15 +18,21 @@
  *     column present and the rows un-backfilled, which would skip the one-time step FOREVER;
  *   - a RETHROW, because a migration that fails silently is a schema nobody can trust.
  *
- * DIRECTION OF THE BACKFILL. Existing rows become `accepted`, and that is correct rather than
- * lenient: every row that predates this column is portal-issued, minted about the operator, for the
- * operator, at their own action — there was never a third party whose decision was pending. Making
- * them `pending` would silently render every phone/email signal already in every wallet
- * unpresentable, which is a data-loss-shaped bug that raises no error.
+ * DIRECTION OF THE BACKFILL — ENFORCED BY THE SQL, NOT BY AN ARGUMENT ABOUT THE PAST.
+ * Portal-issued rows become `accepted`: they were minted about the operator, for the operator, at
+ * their own action, so there was never a third party whose decision was pending, and making them
+ * `pending` would silently render every phone/email signal already in every wallet unpresentable —
+ * a data-loss-shaped bug that raises no error. Agent-issued rows become `pending`, because somebody
+ * else authored them.
  *
- * NEW rows are a different question and are handled at the write path: an `issuer_kind: agent`
- * signal is inserted `pending`, because it is exactly the case where somebody else authored an
- * object about you.
+ * An earlier version backfilled everything to `accepted` on the reasoning that nothing agent-issued
+ * could exist yet. That was true only by RELEASE TIMING — the daemon has accepted
+ * `issuer_kind: agent` since M10 — so a dev or staging wallet that picked one up during M10B
+ * integration testing would have had it backfilled to presentable at boot, which is exactly the
+ * D-23 violation this file exists to prevent. Two WHERE clauses make it a property of the code.
+ *
+ * NEW rows are handled at the write path on the same axis: `putWalletSignal` inserts `pending` for
+ * `issuer_kind: agent` and `accepted` otherwise.
  */
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
@@ -52,21 +58,47 @@ export function migrateWalletAddConsentState(db: DaemonDatabase, logger: Logger)
   // appears later is not a legacy row, and promoting it would be the clobber this file prevents.
   if (columns.has("consent_state")) return;
 
-  db.exec("BEGIN");
+  // BEGIN IMMEDIATE, not DEFERRED: a deferred transaction takes no write lock, so two daemons on one
+  // DB — a named real condition in this project — can both pass the gate above and the loser dies at
+  // boot on `duplicate column name`. It does not clobber, but it is a baffling crash. The lock also
+  // makes the re-read below meaningful.
+  db.exec("BEGIN IMMEDIATE");
   try {
+    // Re-read the gate under the lock: the PRAGMA above is a check-then-act outside any transaction.
+    const underLock = new Set(
+      (db.prepare("PRAGMA table_info(wallet_trust_signals)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (underLock.has("consent_state")) { db.exec("COMMIT"); return; }
     // No DEFAULT — see the header. The rows are given their value by the explicit backfill below.
     db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN consent_state TEXT");
-    const res = db
-      .prepare(`UPDATE wallet_trust_signals SET consent_state = '${CONSENT_ACCEPTED}'`)
+    // THE DIRECTION IS ENFORCED, NOT ARGUED (review F5). The header's reasoning — "everything
+    // predating this column is portal-issued" — is true TODAY only by release timing: the daemon has
+    // accepted `issuer_kind: agent` since M10, and a dev or staging wallet that picked one up during
+    // M10B integration testing would be backfilled straight to `accepted` and presentable, which is
+    // the D-23 violation this unit exists to prevent, silently, at boot. Two WHERE clauses make the
+    // claim a property of the code instead of a property of the calendar.
+    const acceptedRes = db
+      .prepare(`UPDATE wallet_trust_signals SET consent_state = '${CONSENT_ACCEPTED}' WHERE issuer_kind <> 'agent'`)
       .run();
+    const pendingRes = db
+      .prepare("UPDATE wallet_trust_signals SET consent_state = 'pending' WHERE issuer_kind = 'agent'")
+      .run();
+    const res = { changes: Number(acceptedRes.changes) + Number(pendingRes.changes) };
     db.exec("COMMIT");
     logger.info("signal.consent.migrated", {
-      backfilled: Number(res.changes),
-      to: CONSENT_ACCEPTED,
-      reason: "rows predating consent are portal-issued — minted for the operator, at their own action",
+      backfilled: res.changes,
+      accepted: Number(acceptedRes.changes),
+      pending: Number(pendingRes.changes),
+      reason: "portal-issued rows were minted for the operator at their own action; agent-issued rows need consent",
     });
   } catch (err: unknown) {
-    db.exec("ROLLBACK");
+    // A FAILING ROLLBACK MUST NOT MASK THE REAL ERROR (review F6, and the pattern this file claims to
+    // follow guards it — `contacts-tier-migration.ts` — I copied the shape minus its most important
+    // two lines). SQLite auto-aborts the transaction on SQLITE_FULL/SQLITE_IOERR, so a bare ROLLBACK
+    // then throws "cannot rollback - no transaction is active" — BEFORE the log and BEFORE the
+    // rethrow. The operator gets a transaction-layer message for a full disk, and
+    // `signal.consent.migration_failed` never fires at all.
+    try { db.exec("ROLLBACK"); } catch { /* the failing statement may already have aborted the txn */ }
     // RETHROW. A swallowed failure here leaves the daemon running against a schema it believes has
     // consent and does not — which presents unconsented endorsements while every test passes.
     logger.error("signal.consent.migration_failed", {

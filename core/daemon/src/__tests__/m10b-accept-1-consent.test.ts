@@ -30,6 +30,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgentKeys } from "./helpers/seed-agents.js";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
+import { hashTrustSignalEnvelope, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { migrateWalletAddConsentState } from "../consent-migration.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -142,7 +143,6 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
       expect(got.consent_state).toBeNull();   // untouched — NOT promoted to accepted
       expect(present()).not.toContain(HASH("9"));  // and unpresentable, fail-closed
     });
-;
 
     it("IS IDEMPOTENT — a second run is a no-op, not a re-backfill", () => {
       expect(() => migrateWalletAddConsentState(db, silent)).not.toThrow();
@@ -226,6 +226,114 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
       expect(present()).not.toContain(HASH("8"));
       store.setConsentState(HASH("8"), "accepted");
       expect(present()).toContain(HASH("8"));
+    });
+  });
+
+  // ── Review F1/F2/F3 — consent must stop ERASURE and cover EVERY read path ──────────────────────
+  describe("an unconsented signal cannot destroy a consented one", () => {
+    /**
+     * Drive the REAL delivery path, because supersession lives there.
+     *
+     * The first version of these tests used `putWalletSignal` directly — and `putWalletSignal` does
+     * not supersede anything, so "the rogue did not supersede" held trivially and the tests were
+     * hollow. The control test ("the same issuer's re-issue still supersedes") is what exposed it by
+     * failing. Building a real envelope and letting the store hash it is the only way these
+     * assertions mean anything.
+     */
+    const deliver = (o: {
+      subject?: string; issuerKind: "portal" | "agent"; issuerPubkey: string;
+      type: string; supersedes?: string | null; issuedAt?: number;
+    }): string => {
+      const env: TrustSignalEnvelope = {
+        subject_kind: "agent",
+        subject: o.subject ?? alicePubkey,
+        issuer_kind: o.issuerKind,
+        issuer_pubkey: o.issuerPubkey,
+        type: o.type,
+        schema_version: 1,
+        payload: new Uint8Array([1, 2, 3]),
+        issued_at: o.issuedAt ?? 1_768_000_000,
+        expires_at: null,
+        supersedes_hash: o.supersedes ? new Uint8Array(Buffer.from(o.supersedes, "hex")) : null,
+      };
+      const hash = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
+      store.deliverWalletSignal(env, hash);
+      return hash;
+    };
+
+    it("F1: a PENDING rogue endorsement does not supersede the subject's ACCEPTED one", () => {
+      // The half of the threat consent did NOT close. A rogue agent-issued delivery lands pending and
+      // is unpresentable — but before this fix its insert superseded Alice's own accepted endorsement
+      // of the same type, and she presented NOTHING. Blocking display while permitting deletion
+      // leaves the stranger in control of what her counterparties see.
+      const good = deliver({ issuerKind: "agent", issuerPubkey: "bb".repeat(32), type: "endorsement" });
+      store.setConsentState(good, "accepted");
+      expect(present()).toContain(good);
+
+      const rogue = deliver({ issuerKind: "agent", issuerPubkey: "cc".repeat(32), type: "endorsement", issuedAt: 1_768_000_001 });
+
+      expect(store.getWalletSignal(rogue)!.consentState).toBe("pending");
+      expect(store.getWalletSignal(good)!.status).toBe("active");   // NOT superseded
+      expect(present()).toContain(good);                            // ...and still presentable
+    });
+
+    it("F2: a rogue issuer cannot supersede ANOTHER issuer's signal by naming its hash", () => {
+      // Pre-existing since M10: supersedes_hash was honoured without asking whether the new issuer
+      // was entitled to supersede the target, so anyone who could get one signal delivered could
+      // knock out ANY row — phone and email included — just by naming its hash.
+      const phone = deliver({ issuerKind: "portal", issuerPubkey: "aa".repeat(32), type: "phone" });
+      expect(present()).toContain(phone);
+
+      const rogue = deliver({ issuerKind: "agent", issuerPubkey: "cc".repeat(32), type: "endorsement", supersedes: phone });
+      store.setConsentState(rogue, "accepted");   // even CONSENTED, it has no authority here
+
+      expect(store.getWalletSignal(phone)!.status).toBe("active");
+      expect(present()).toContain(phone);
+    });
+
+    it("the SAME issuer's re-issue still supersedes — the fix must not break supersession", () => {
+      // The control, and the test that caught the hollow first draft. Without it, "rogues cannot
+      // supersede" would be satisfied by an implementation where nothing supersedes anything, which
+      // silently breaks track-record renewal.
+      const v1 = deliver({ issuerKind: "portal", issuerPubkey: "aa".repeat(32), type: "phone" });
+      const v2 = deliver({ issuerKind: "portal", issuerPubkey: "aa".repeat(32), type: "phone", supersedes: v1, issuedAt: 1_768_000_002 });
+
+      expect(store.getWalletSignal(v1)!.status).toBe("superseded");
+      expect(present()).toContain(v2);
+    });
+
+    it("supersession is APPLIED when a pending signal is accepted, not silently lost", () => {
+      // Deferring the effect must not DROP it: an accepted re-issue has to supersede what it
+      // replaces, or the operator ends up presenting both versions.
+      const v1 = deliver({ issuerKind: "agent", issuerPubkey: "bb".repeat(32), type: "endorsement" });
+      store.setConsentState(v1, "accepted");
+      const v2 = deliver({ issuerKind: "agent", issuerPubkey: "bb".repeat(32), type: "endorsement", supersedes: v1, issuedAt: 1_768_000_003 });
+
+      expect(store.getWalletSignal(v1)!.status).toBe("active");      // deferred while pending
+      store.setConsentState(v2, "accepted");
+      expect(store.getWalletSignal(v1)!.status).toBe("superseded");  // applied on acceptance
+    });
+  });
+
+  describe("F3: EVERY read path carries the consent predicate, not just listAllActive", () => {
+    it("listPresentableTypes does not enumerate a PENDING signal's type", () => {
+      // It is the live validator for --include/--exclude. Without the predicate,
+      // `--include endorsement` on a wallet holding only a PENDING endorsement validates OK and then
+      // presents nothing — the daemon telling the operator the type is fine and silently omitting it,
+      // which is the exact lie DOD-END-SCOPE-FIX-1 removed along the scoping dimension.
+      store.putWalletSignal(envelope({ signalHash: HASH("3"), subject: alicePubkey, issuerKind: "agent", type: "endorsement" }));
+      expect(store.listPresentableTypes(alicePubkey)).not.toContain("endorsement");
+      store.setConsentState(HASH("3"), "accepted");
+      expect(store.listPresentableTypes(alicePubkey)).toContain("endorsement");
+    });
+
+    it("listPresentable — named for presentability — does not return unconsented rows", () => {
+      // Exported, and the only implementation of the account-subject half. Returning pending rows
+      // makes it a loaded gun for whoever wires that half later.
+      store.putWalletSignal(envelope({ signalHash: HASH("4"), subject: alicePubkey, issuerKind: "agent" }));
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
+      store.setConsentState(HASH("4"), "refused");
+      expect(store.listPresentable({ agentPubkeyHex: alicePubkey, accountId: "acct-x" })).toEqual([]);
     });
   });
 });

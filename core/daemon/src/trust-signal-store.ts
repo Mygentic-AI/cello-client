@@ -84,8 +84,13 @@ export interface WalletSignalInput {
 export interface WalletSignalRow extends WalletSignalInput {
   receivedAt: number;
   /** M10B-D14r2 — may this be presented at all. Distinct from `defaultPresent`, which answers the
-   *  different question of whether to include it BY DEFAULT once it may be presented. */
-  consentState: ConsentState;
+   *  different question of whether to include it BY DEFAULT once it may be presented.
+   *
+   *  NULLABLE, because the COLUMN is (SQLite cannot ADD COLUMN NOT NULL without a default). Declaring
+   *  it non-null would be a type that lies to every future consumer — and the consumer who then
+   *  writes `!== "refused"` ships a NULL straight through as presentable. The predicate tests for
+   *  exactly `accepted`, so NULL fails closed; the type must say so too. */
+  consentState: ConsentState | null;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
   defaultPresent: boolean;
 }
@@ -376,24 +381,79 @@ export class TrustSignalStore {
       status: "active",
     });
     if (inserted) {
-      // Mark the explicitly superseded hash (from the envelope field) as superseded.
-      if (supersedesHash) {
-        this.setWalletStatus(supersedesHash, "superseded");
+      // ⚠️ SUPERSESSION IS A DESTRUCTIVE WRITE BY A THIRD PARTY, so it is gated twice.
+      //
+      // GATE 1 — CONSENT (M10B / DOD-END-ACCEPT-1 review F1). An `issuer_kind: agent` delivery lands
+      // `pending` and is unpresentable, which stops a rogue endorsement being DISPLAYED. It does not
+      // stop it ERASING: without this gate the rogue's insert superseded the subject's own ACCEPTED
+      // endorsement of the same type, and Alice presented NOTHING. Consent that blocks display but
+      // not deletion closes half the threat Andre named. An unconsented signal supersedes nothing;
+      // `setConsentState` re-runs these effects if and when the subject accepts it.
+      //
+      // GATE 2 — AUTHORITY (review F2, pre-existing since M10). `supersedes_hash` was honoured
+      // without asking whether the new issuer is entitled to supersede the target, so any third
+      // party who could get one signal delivered could knock out ANY row in the wallet — including
+      // phone and email — just by naming its hash. Supersession now requires the SAME ISSUER: for an
+      // agent the key IS the identity, and for the portal it is the one logical issuer. This mirrors
+      // what the directory does in V54, where an unauthorised write must not change what a third
+      // party can present.
+      const consented = this.getWalletSignal(claimedHash)?.consentState === CONSENT_ACCEPTED;
+      if (consented) {
+        this.#applySupersession(envelope, claimedHash, supersedesHash);
+      } else {
+        this.#logger.info("signal.supersede.deferred", {
+          signalHash: claimedHash,
+          issuerKind: envelope.issuer_kind,
+          reason: "not consented — supersession is re-evaluated on acceptance",
+        });
       }
-      // Type-dedup: any OTHER active signal of the same (subject_kind, subject, type) is also
-      // superseded by the new one — this cleans up duplicates delivered without supersedes_hash set
-      // (e.g. the same type re-minted on a fresh portal login with no prior-hash lookup).
-      this.#db
-        .prepare(
-          `UPDATE wallet_trust_signals
-              SET status = 'superseded'
-            WHERE subject_kind = ? AND subject = ? AND type = ?
-              AND signal_hash != ?
-              AND status = 'active'`,
-        )
-        .run(envelope.subject_kind, envelope.subject, envelope.type, claimedHash);
     }
     return { stored: inserted };
+  }
+
+  /**
+   * Apply a newly-consented signal's supersession effects, with the ISSUER-AUTHORITY check.
+   *
+   * Extracted so acceptance can re-run it: a signal that arrived `pending` supersedes nothing until
+   * the subject accepts it, and at that moment the same rules must apply as if it had arrived
+   * accepted. One implementation, so the two entry points cannot drift.
+   */
+  #applySupersession(
+    envelope: { subject_kind: string; subject: string; type: string; issuer_kind: string; issuer_pubkey: string },
+    claimedHash: string,
+    supersedesHash: string | null,
+  ): void {
+    if (supersedesHash) {
+      const target = this.getWalletSignal(supersedesHash);
+      // SAME ISSUER, or refuse. A missing target is NOT an invitation to proceed (§5a): if we cannot
+      // see what is being superseded we cannot judge the authority, so we do not act.
+      const authorized = target !== null && target.issuerPubkey === envelope.issuer_pubkey;
+      if (authorized) {
+        this.setWalletStatus(supersedesHash, "superseded");
+      } else {
+        this.#logger.warn("signal.supersede.refused", {
+          signalHash: claimedHash,
+          supersedesHash,
+          reason: target === null ? "target_not_held" : "issuer_mismatch",
+          newIssuer: envelope.issuer_pubkey.slice(0, 16),
+          targetIssuer: target === null ? null : target.issuerPubkey.slice(0, 16),
+        });
+      }
+    }
+    // Type-dedup: another active signal of the same (subject_kind, subject, type) is superseded by
+    // the new one — duplicates delivered without supersedes_hash (e.g. a type re-minted on a fresh
+    // portal login with no prior-hash lookup). SCOPED TO THE SAME ISSUER for the same reason: a
+    // stranger's endorsement is not a newer version of yours just because it shares a type string.
+    this.#db
+      .prepare(
+        `UPDATE wallet_trust_signals
+            SET status = 'superseded'
+          WHERE subject_kind = ? AND subject = ? AND type = ?
+            AND signal_hash != ?
+            AND issuer_pubkey = ?
+            AND status = 'active'`,
+      )
+      .run(envelope.subject_kind, envelope.subject, envelope.type, claimedHash, envelope.issuer_pubkey);
   }
 
   getWalletSignal(signalHash: string): WalletSignalRow | null {
@@ -473,7 +533,8 @@ export class TrustSignalStore {
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
             AND ( (subject_kind = 'account' AND subject = ?)
-               OR (subject_kind = 'agent'   AND subject = ?) )`,
+               OR (subject_kind = 'agent'   AND subject = ?) )
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
       )
       .all(nowSec, opts.accountId, opts.agentPubkeyHex) as unknown as EnvelopeDbRow[];
     return rows.map(toWalletRow);
@@ -625,7 +686,8 @@ export class TrustSignalStore {
         `SELECT DISTINCT type FROM wallet_trust_signals
           WHERE status = 'active'
             AND (expires_at IS NULL OR expires_at > ?)
-            AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+            AND consent_state = '${CONSENT_ACCEPTED}'`,
       )
       .all(now, presentingAgentPubkeyHex) as Array<{ type: string }>;
     return rows.map((r) => r.type);
@@ -643,11 +705,31 @@ export class TrustSignalStore {
     const res = this.#db
       .prepare("UPDATE wallet_trust_signals SET consent_state = ? WHERE signal_hash = ?")
       .run(state, signalHash);
-    if (Number(res.changes) > 0) {
-      this.#logger.info("signal.consent.changed", { signalHash, consentState: state });
-      return true;
+    if (Number(res.changes) === 0) return false;
+    this.#logger.info("signal.consent.changed", { signalHash, consentState: state });
+
+    // ACCEPTANCE IS WHEN SUPERSESSION BECOMES LEGITIMATE (review F1). Delivery deliberately defers
+    // it — an unconsented signal must not erase a consented one — so the effects are applied here
+    // instead, through the SAME authority-checked path, at the moment the subject says yes. Without
+    // this an accepted re-issue would sit alongside the endorsement it replaces rather than
+    // superseding it, and the operator would present both.
+    if (state === CONSENT_ACCEPTED) {
+      const row = this.getWalletSignal(signalHash);
+      if (row) {
+        this.#applySupersession(
+          {
+            subject_kind: row.subjectKind,
+            subject: row.subject,
+            type: row.type,
+            issuer_kind: row.issuerKind,
+            issuer_pubkey: row.issuerPubkey,
+          },
+          signalHash,
+          row.supersedesHash,
+        );
+      }
     }
-    return false;
+    return true;
   }
 
   /** Set the persistent default-presentation flag for a wallet signal. */
