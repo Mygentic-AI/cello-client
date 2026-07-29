@@ -35,6 +35,7 @@ import {
   contactRemove,
   contactList,
   contactSetTier,
+  contactSetSignal,
   consentList,
   consentAccept,
   consentRefuse,
@@ -796,6 +797,11 @@ export const COMMANDS: readonly CommandSpec[] = [
       "                              A higher tier RAISES their limits; it never removes the caps.\n" +
       "                              It does NOT change content screening — that is not yet active.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
+      "    set-signal <hash> on|off|clear\n" +
+      "                              show or withhold ONE trust signal from THIS person. 'clear'\n" +
+      "                              removes the choice (the signal's own default applies again) —\n" +
+      "                              which is not the same as 'off'. Can only narrow: it never\n" +
+      "                              presents something you have not accepted.\n" +
       "    set-moniker <name>        YOUR pet name for THEM (empty clears it). Always wins over the\n" +
       "                              name they offer — the one thing they cannot spoof.\n" +
       "\n" +
@@ -820,6 +826,14 @@ export const COMMANDS: readonly CommandSpec[] = [
         // The rest of the args form the away text; empty → clear.
         const message = positional.slice(2).join(" ");
         return contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, o);
+      }
+      if (op === "set-signal") {
+        // `cello contact <pubkey> set-signal <hash> <on|off|clear>`. Three words, because there are
+        // three states: shown, withheld, and no-opinion. A boolean flag could not express the third.
+        const [hash, choice] = positional.slice(2);
+        const present = choice === "on" ? true : choice === "off" ? false : choice === "clear" ? null : undefined;
+        if (!hash || present === undefined) return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
+        return contactSetSignal(ctx.celloDir, pubkey, hash, present, o);
       }
       if (op === "set-moniker") {
         // Empty → null clears it, mirroring the tool.

@@ -162,6 +162,10 @@ cello_contact_remove({ pubkey, agent? })
 cello_contact_set_tier({ pubkey, tier })     — 0=blocked 1=stranger 2=known 3=trusted 4=vip
 cello_contact_set_away({ pubkey, message })  — what THIS peer hears when you are away
 cello_contact_set_moniker({ pubkey, moniker })— YOUR pet name for THEM (they cannot spoof it)
+cello_contact_set_signal({ pubkey, hash_prefix, present })
+                                             — show/withhold ONE trust signal from THIS person.
+                                               present: true | false | null (null CLEARS the choice,
+                                               which is not the same as false)
 ```
 
 **Trust signals** — verifiable claims about you (GitHub account age, phone, email, endorsements from other people's agents) that your agent presents to contacts during a session. Each carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is YOURS (may it be shown at all).

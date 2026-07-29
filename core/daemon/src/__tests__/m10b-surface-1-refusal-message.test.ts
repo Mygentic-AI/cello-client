@@ -36,8 +36,15 @@ describe("M10B-D4 — refusing with a message", () => {
     // Each early return in the message path spreads `refused`, so `ok: true` and the recorded state
     // survive. A path that returned `ok: false` would tell Alice her refusal did not happen when it
     // did — and she would try again on a signal that is already refused.
-    const returns = [...handler.matchAll(/return \{ \.\.\.refused[^}]*\}/g)].map((m) => m[0]);
-    expect(returns.length).toBeGreaterThanOrEqual(3); // no-message, account-subject, submit-failed, success
+    // `\s*` after the brace, NOT a literal space: one of these returns is formatted across lines,
+    // and a space-only pattern silently missed it — which is how a "floor" assertion of >= 3 passed
+    // while there were 4. A counting test that cannot see all the things it counts is worse than no
+    // counting test, because the number looks authoritative.
+    const returns = [...handler.matchAll(/return \{\s*\.\.\.refused[\s\S]*?\n/g)].map((m) => m[0]);
+    // EXACT, not a floor. A `>=` threshold permits one of these paths to be DELETED with the test
+    // still green — and the account-subject branch is precisely the one a future "let's just allow
+    // account messages" change would remove. When this number moves, that failure IS the review.
+    expect(returns.length).toBe(4); // no-message, account-subject, submit-failed, success
     for (const r of returns) expect(r).not.toMatch(/ok:\s*false/);
   });
 
@@ -124,10 +131,14 @@ describe("submitForAgent — the guards every submission passes through", () => 
     expect(helper).toMatch(/stored: sent\.stored/);
   });
 
-  it("takes the signing key from the SELECTED agent, with no way to name another", () => {
-    // INV-ATTRIBUTION by construction: the provider is looked up from sel.name, and there is no
-    // parameter through which a caller could pass a different identity.
+  it("resolves the identity ITSELF — there is no identity parameter to get wrong", () => {
+    // INV-ATTRIBUTION, structurally. This replaces an assertion that could not fail: it checked the
+    // ABSENCE of `opts.keyProvider`/`opts.submitterPubkey`, neither of which ever existed, while the
+    // real hole — a caller-supplied `sel: {name, pubkey}` — went unasserted. The helper now takes
+    // `connectionId` and resolves the selection internally, so a caller has nowhere to put a lie.
+    expect(helper).toMatch(/resolveSelectedAgent\(opts\.connectionId\)/);
     expect(helper).toMatch(/keyProviders\.get\(sel\.name\)/);
-    expect(helper).not.toMatch(/opts\.(keyProvider|submitterPubkey)/);
+    // The option bag must carry NO identity field of any shape.
+    expect(helper).not.toMatch(/sel:\s*\{/);
   });
 });

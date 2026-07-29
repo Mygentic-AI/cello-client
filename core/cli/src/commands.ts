@@ -713,9 +713,21 @@ export async function trustSignals(
 
   if (sub === "issue") {
     const [subject, ...rest] = args;
-    const body = rest.join(" ");
+    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
+    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
+    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
+    // convention every shell user already knows.
+    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
     if (!subject || body.length === 0) {
-      return { exitCode: 1, output: "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>" };
+      return {
+        exitCode: 1,
+        output:
+          "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>\n" +
+          "\n" +
+          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
+          "before it so it is read as text:\n" +
+          "  cello trust-signals issue <pubkey> -- cut p99 by -30ms on the auth path",
+      };
     }
     try {
       const result = (await withIpc(lock.socketPath, (client) =>

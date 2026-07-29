@@ -271,6 +271,15 @@ server.tool("cello_consent_refuse", "Refuse a trust signal issued about the curr
   return jsonText(result);
 });
 
+server.tool("cello_contact_set_signal", "Choose whether ONE trust signal is presented to ONE counterparty — finer than the signal's global default, because an endorsement that is right for a prospective client is not necessarily right for a competitor. Pass present:null to CLEAR the choice (fall back to the signal's default), which is different from false (never show it to this person). This can only NARROW what is presented: it cannot show a signal you have not accepted.", {
+  pubkey: z.string().describe("The counterparty's public key, 64 hex characters"),
+  hash_prefix: z.string().describe("The signal hash or a prefix of it (min 8 hex chars) — see cello_trust_signals_list"),
+  present: z.boolean().nullable().describe("true = show it to them · false = never show it to them · null = clear the choice"),
+}, async ({ pubkey, hash_prefix, present }) => {
+  const result = await proxy.call("cello_contact_set_signal", { pubkey, hash_prefix, present });
+  return jsonText(result);
+});
+
 // DOD-AWAY-TIER-1: per-contact away message. Forward-only (D7).
 server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom away message for a specific contact — the text they receive when they reach you and you're away. It is the most specific level of away-text resolution (per-contact → per-tier → agent default → system default). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),

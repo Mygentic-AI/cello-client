@@ -184,4 +184,33 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
     expect(checkArgs("register-agent", ["alice", "token-123"])).toEqual({ kind: "ok" });
     expect(checkArgs("refresh", ["alice"])).toEqual({ kind: "ok" });
   });
+
+  // M10B / DOD-END-SURFACE-1 F8 — verbs that take FREE PROSE.
+  describe("the `--` terminator protects prose from flag parsing", () => {
+    it("a dash-leading token after `--` is text, not an unknown flag", () => {
+      // "cut p99 by -30ms" is a perfectly ordinary thing to write in an endorsement.
+      expect(checkArgs("trust-signals", ["issue", "ab", "--", "cut", "p99", "by", "-30ms"]))
+        .toEqual({ kind: "ok" });
+    });
+
+    it("`-h` after `--` does NOT hijack the command into printing help", () => {
+      // This was the surprising half: the terminator was honoured for unknown flags and ignored for
+      // help, so mentioning a flag in prose silently replaced the operator's action with a help page.
+      expect(checkArgs("trust-signals", ["issue", "ab", "--", "she", "explained", "the", "-h", "flag"]))
+        .toEqual({ kind: "ok" });
+    });
+
+    it("still reports help when `-h` comes BEFORE any terminator", () => {
+      // The counterpart. Without this, "fixing" the above by deleting the help check entirely would
+      // pass — and `cello trust-signals -h` would stop working.
+      expect(checkArgs("trust-signals", ["issue", "-h"])).toEqual({ kind: "help" });
+      expect(checkArgs("trust-signals", ["-h", "--", "text"])).toEqual({ kind: "help" });
+    });
+
+    it("still rejects an unknown flag that appears BEFORE the terminator", () => {
+      expect(checkArgs("trust-signals", ["issue", "--bogus", "--", "text"]))
+        .toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    });
+  });
+
 });

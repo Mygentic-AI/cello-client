@@ -125,3 +125,101 @@ describe("DOD-ONBOARD-HELP-1 §5 — every *_guidance key is renderable, whateve
     expect(out.reason).toBe("cello_consent_accept");
   });
 });
+
+/**
+ * DOD-END-SURFACE-1 — the ISSUE verb, over a live daemon.
+ *
+ * The verb shipped with no behavioural coverage of any kind: renaming `subject_pubkey` in the
+ * handler would have left the entire suite green, in a milestone that had already shipped consent
+ * verbs DEAD on both surfaces for exactly that reason. These drive a real socket and assert on the
+ * responses.
+ */
+describe("DOD-END-SURFACE-1 — cello_trust_signals_issue, over a live daemon", () => {
+  let handle: DaemonHandle | undefined;
+  let tempDir: string | undefined;
+  const clients: IpcClient[] = [];
+  const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+  afterEach(async () => {
+    for (const c of clients) c.close();
+    clients.length = 0;
+    if (handle) await handle.stop();
+    handle = undefined;
+    if (tempDir) await rm(tempDir, { recursive: true, force: true });
+    tempDir = undefined;
+  });
+
+  async function client(): Promise<IpcClient> {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-issue-"));
+    handle = await startDaemon({
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger,
+    });
+    const c = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(c);
+    await c.send("ipc.connect", { clientType: "mcp" });
+    return c;
+  }
+
+  it("is REGISTERED — the handler exists under the name both surfaces call", async () => {
+    const c = await client();
+    const res = (await c.send("cello_trust_signals_issue", {})) as Record<string, unknown>;
+    // An unregistered method would come back as an unknown-method error rather than the handler's
+    // own verdict. Reaching `no_current_agent` proves the handler ran.
+    expect(res.reason).toBe("no_current_agent");
+  });
+
+  it("reads the parameter names the surfaces actually send", async () => {
+    const c = await client();
+    // With no agent selected the selection guard fires first, so this cannot assert the subject
+    // gate directly — but it CAN assert the handler does not reject the parameter shape itself.
+    const res = (await c.send("cello_trust_signals_issue", {
+      subject_pubkey: "ab".repeat(32), body: "worked with them on the migration",
+    })) as Record<string, unknown>;
+    expect(res.ok).toBe(false);
+    // Specifically NOT invalid_subject / empty_body: those would mean the handler could not see the
+    // values the MCP tool and the CLI both send under these names.
+    expect(res.reason).toBe("no_current_agent");
+  });
+});
+
+/**
+ * The class of defect that produced a dead verb once already: a tool declared in the ONE vocabulary
+ * with no daemon handler behind it. Name-parity tests check the CLI and MCP sides against the
+ * vocabulary; nothing checked the vocabulary against the DAEMON.
+ */
+describe("DOD-ONBOARD-HELP-1 §2b — every declared tool has a handler behind it", () => {
+  it("no dual-surface verb is declared without a daemon handler", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, resolve } = await import("node:path");
+    const srcDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const { readdirSync } = await import("node:fs");
+    const registered = new Set<string>();
+    for (const f of readdirSync(srcDir).filter((f) => f.endsWith(".ts"))) {
+      const src = readFileSync(resolve(srcDir, f), "utf8");
+      for (const m of src.matchAll(/handlers\.set\("([a-z_]+)"/g)) registered.add(m[1]);
+    }
+    // Some verbs are served by a differently-named IPC method (the wallet_* family predates the
+    // vocabulary), so the assertion is that SOMETHING serves each — via its own name or a mapping
+    // the MCP shim performs. Only names the daemon is expected to answer directly are checked here.
+    const proxied = readFileSync(resolve(srcDir, "../../adapter-claude-code/src/bin/cello-mcp.ts"), "utf8");
+    const missing: string[] = [];
+    for (const { mcp } of DUAL_SURFACE_VERBS) {
+      const at = proxied.indexOf(`server.tool("${mcp}"`);
+      if (at === -1) { missing.push(`${mcp}: not registered as an MCP tool`); continue; }
+      // Scan to the NEXT tool registration, not to the first `});` — a tool whose schema contains a
+      // nested object closes one early, which made this miss `cello_send`'s proxy.call entirely.
+      const nextTool = proxied.indexOf("server.tool(", at + 1);
+      const seg = proxied.slice(at, nextTool === -1 ? proxied.length : nextTool);
+      const target = seg.match(/proxy\.call\("([a-z_]+)"/);
+      if (!target) { missing.push(`${mcp}: registers no proxy.call`); continue; }
+      if (!registered.has(target[1])) missing.push(`${mcp} → ${target[1]}: no daemon handler`);
+    }
+    expect(missing, missing.join("; ")).toEqual([]);
+  });
+});

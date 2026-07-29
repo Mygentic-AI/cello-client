@@ -199,8 +199,21 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           include: signalFilter?.include,
           exclude: signalFilter?.exclude,
         });
-        if (eligible.length > 0) {
-          trustSignals = eligible.map((s) => ({
+        // M10B / DOD-END-SURFACE-1 — the per-counterparty choice, applied LAST and only ever to
+        // NARROW. `listAllActive` has already enforced consent (accepted-only, in SQL) and the
+        // caller's per-call filter; this can drop a signal from that set but can never add one, so
+        // an explicit `present: true` for a contact cannot resurrect something consent excluded.
+        // A signal with no recorded choice keeps whatever the previous stages decided.
+        const prefs = sessionNodeManager.getContactSignalPrefs(agentName, targetHex);
+        const selected = prefs.size === 0 ? eligible : eligible.filter((s) => prefs.get(s.signalHash) !== false);
+        const omittedByContact = eligible.length - selected.length;
+        if (omittedByContact > 0) {
+          logger.info("signal.presentation.contact_omitted", {
+            agentName, target: targetHex.slice(0, 16), omitted: omittedByContact, correlationId,
+          });
+        }
+        if (selected.length > 0) {
+          trustSignals = selected.map((s) => ({
             hash: s.signalHash,
             blob: encodeTrustSignalEnvelope({
               subject_kind: s.subjectKind,
@@ -231,6 +244,11 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             agentName,
             target: targetHex.slice(0, 16),
             heldTotal: store.listAllWalletSignals().length,
+            // Three different silences that used to look identical. `eligibleBeforeContactPrefs > 0`
+            // with nothing sent means the OPERATOR omitted them for this counterparty — a choice, not
+            // a fault — and without this field it reads the same as a scoping bug.
+            eligibleBeforeContactPrefs: eligible.length,
+            contactPrefsApplied: prefs.size,
             filter: signalFilter ?? null,
             correlationId,
           });

@@ -70,7 +70,14 @@ export type ArgsCheck =
  *  - after a POSIX `--` terminator, everything is a positional VALUE, verbatim.
  */
 export function checkArgs(command: string, args: string[]): ArgsCheck {
-  if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
+  // The help check MUST respect the `--` terminator too. It used to scan the whole argv, so
+  // `cello trust-signals issue <pubkey> -- she walked me through the -h flag` printed help instead
+  // of issuing the signal — the terminator was honoured for unknown flags and ignored for help,
+  // which is the surprising half. Commands that take free prose (issue, consent refuse, contact
+  // set-away) are exactly the ones where a bare `-h` appears as ordinary text.
+  const terminator = args.indexOf("--");
+  const flagArgs = terminator === -1 ? args : args.slice(0, terminator);
+  if (flagArgs.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const known = flagsFor(command);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];

@@ -289,6 +289,7 @@ export const IPC_METHODS = {
   "contact-set-tier": "cello_contact_set_tier",
   "contact-set-away": "cello_contact_set_away",
   "contact-set-moniker": "cello_contact_set_moniker",
+  "contact-set-signal": "cello_contact_set_signal",
   "settings-get": "cello_settings_get",
   "settings-set": "cello_settings_set",
   "moniker-set": "cello_set_moniker",
@@ -553,4 +554,12 @@ export function consentRefuse(celloDir: string, hashPrefix: string, message: str
   const params: Record<string, unknown> = { hash_prefix: hashPrefix };
   if (message !== null && message.length > 0) params.message = message;
   return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], params, opts);
+}
+
+/** `cello contact <pubkey> set-signal <hash> <on|off|clear>` → cello_contact_set_signal.
+ *  `clear` sends null — distinct from `off`, which is an explicit "never show this to them". */
+export function contactSetSignal(
+  celloDir: string, pubkey: string, hashPrefix: string, present: boolean | null, opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["contact-set-signal"], { pubkey, hash_prefix: hashPrefix, present }, opts);
 }

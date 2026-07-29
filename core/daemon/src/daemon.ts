@@ -1949,19 +1949,29 @@ async function startDaemonHoldingLock(
    * not reach the transport, and the CAUSE of a refusal must survive to the operator. Duplicating
    * those means the next verb gets whichever subset its author remembered.
    *
-   * INV-ATTRIBUTION holds by construction: the key provider is looked up from the SELECTED agent's
-   * name and there is no parameter to pass a different identity.
+   * INV-ATTRIBUTION holds BY CONSTRUCTION, and it did not before: this used to take the resolved
+   * `sel` as a parameter, which is exactly a parameter through which a caller could name a different
+   * identity. Both call sites happened to pass the right one, so the invariant held by CONVENTION
+   * while the comment claimed structure — and the test that "pinned" it asserted the absence of two
+   * identifiers that had never existed, so it could not fail. It now takes `connectionId` and
+   * resolves the selection itself. There is no identity input left to get wrong.
    */
   async function submitForAgent(opts: {
-    sel: { name: string; pubkey: string };
+    connectionId: string;
     op: SubmissionOp;
     subjectKind: SignalSubjectKind;
     subject: string;
     body: string;
     /** Prefixed onto every failure guidance so the operator knows what DID happen. */
     context: string;
-  }): Promise<{ queued: true; stored: boolean; submissionId: string } | { queued: false; reason: string; guidance: string }> {
-    const { sel, context } = opts;
+  }): Promise<
+    | { queued: true; stored: boolean; submissionId: string; storedWarning?: string }
+    | { queued: false; reason: string; guidance: string }
+  > {
+    const { context } = opts;
+    const resolved = resolveSelectedAgent(opts.connectionId);
+    if (!resolved.ok) return { queued: false, reason: resolved.reason, guidance: `${context} ${resolved.guidance}` };
+    const sel = resolved;
     if (opts.body.length > MAX_SUBMISSION_BODY_CHARS) {
       return { queued: false, reason: "message_too_long",
         guidance: `${context} it is ${opts.body.length} characters and the limit is ${MAX_SUBMISSION_BODY_CHARS}.` };
@@ -2001,10 +2011,26 @@ async function startDaemonHoldingLock(
       if (!sent.ok) {
         return { queued: false, reason: sent.reason, guidance: `${context} ${sent.guidance ?? sent.reason}` };
       }
-      logger.info("signal.submission.queued", {
+      // F4: `sendSealedSubmission` ALREADY logs `signal.submission.queued` / `.duplicate`. Logging
+      // `queued` again here doubled every count-based alarm and, worse, emitted `queued` right after
+      // `duplicate` — partially erasing the very distinction the directory's queue repository exists
+      // to preserve. A distinct name, only for what the send layer does not know (which agent, which
+      // op).
+      logger.info("signal.submission.attributed", {
         agentName: sel.name, op: opts.op, submissionId: composed.submissionId, stored: sent.stored,
       });
-      return { queued: true, stored: sent.stored, submissionId: composed.submissionId };
+      // F1: `stored: false` means a node reports it ALREADY HELD this submission id. That is either
+      // a benign retry or single-node censorship — an operator pre-inserting garbage under a
+      // clear-text id — and they are indistinguishable from here. Reporting it as unqualified
+      // success is what makes the attack silent. The warning lives in the SHARED path, not at one
+      // call site, because the refuse verb had it and the issue verb did not: the same omission
+      // would otherwise be available to every verb added after this one.
+      return {
+        queued: true, stored: sent.stored, submissionId: composed.submissionId,
+        ...(sent.stored ? {} : {
+          storedWarning: "A directory node accepted it but reports it already held this submission id. If nothing arrives for the recipient, send it again — re-sending is safe, the submission id is derived from the content.",
+        }),
+      };
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       logger.warn("signal.submission.refused", { agentName: sel.name, op: opts.op, reason });
@@ -2038,16 +2064,25 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "empty_body",
         guidance: "An issued signal needs text — it is the claim you are making about them, in your own words." };
     }
-    // SELF-ISSUANCE IS REFUSED AT THE SOURCE. The portal enforces INV-NO-SELF-STANDING properly (it
-    // is the only party that can see account linkage), but an agent endorsing ITSELF is detectable
-    // right here with certainty, and refusing early gives the operator a real answer instead of a
-    // silent rejection at intake minutes later.
-    if (subject === sel.pubkey.toLowerCase()) {
+    // SELF-ISSUANCE IS REFUSED AT THE SOURCE, and across EVERY agent on this daemon — not just the
+    // selected one. The check used to compare against `sel.pubkey` alone, which let an operator
+    // running two of their own agents issue from one about the other and sail through a guard whose
+    // comment claimed certainty. That configuration is not exotic: solo multi-agent is CELLO's first
+    // wedge, so it is the most likely way to hit this, not the least.
+    //
+    // The portal remains the real enforcer of INV-NO-SELF-STANDING — only it can see account
+    // linkage, and only it can catch two agents under one account on different machines. But the
+    // daemon knows its OWN agents with certainty, and refusing here gives the operator a real answer
+    // now instead of a silent rejection at intake minutes later.
+    const localSelf = loadedAgents.find((a) => a.pubkey.toLowerCase() === subject);
+    if (localSelf) {
       return { ok: false, reason: "self_subject",
-        guidance: "An agent cannot issue a trust signal about itself — standing has to come from somebody else." };
+        guidance: localSelf.name === sel.name
+          ? "An agent cannot issue a trust signal about itself — standing has to come from somebody else."
+          : `'${sel.name}' and '${localSelf.name}' are both your agents on this machine, so a signal from one about the other would be you vouching for yourself. Standing has to come from somebody else.` };
     }
     const res = await submitForAgent({
-      sel: { name: sel.name, pubkey: sel.pubkey },
+      connectionId,
       op: "submit", subjectKind: "agent", subject, body,
       context: "The signal was NOT submitted:",
     });
@@ -2057,7 +2092,53 @@ async function startDaemonHoldingLock(
       // Deliberately NOT "issued". Nothing is minted yet: the portal must still drain, authenticate,
       // scan and mint, and the subject must then ACCEPT it before anyone else can see it. Reporting
       // this as a completed endorsement would promise three steps that have not happened.
-      guidance: `Submitted for '${sel.name}'. The portal will scan and mint it, then the subject must ACCEPT it before it is visible to anyone — a signal they have not accepted is inert. Nothing here is final until they decide.`,
+      guidance: res.storedWarning
+        ? `Submitted for '${sel.name}'. ${res.storedWarning}`
+        : `Submitted for '${sel.name}'. The portal will scan and mint it, then the subject must ACCEPT it before it is visible to anyone — a signal they have not accepted is inert. Nothing here is final until they decide.`,
+    };
+  });
+
+  /**
+   * M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
+   *
+   * `present: null` CLEARS the choice rather than setting it false. Those are different states and
+   * the surface must keep them apart: cleared means "no opinion, use the signal's default", false
+   * means "specifically not this person". An operator who could only toggle true/false would be
+   * unable to undo an omission without first knowing what the default had been.
+   */
+  handlers.set("cello_contact_set_signal", async (params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey.toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) {
+      return { ok: false, reason: "invalid_pubkey", guidance: "pubkey must be the counterparty's 32-byte public key as 64 hex characters." };
+    }
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : "";
+    if (prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters — see cello_trust_signals_list." };
+    }
+    const present = params?.present === null ? null : typeof params?.present === "boolean" ? params.present : undefined;
+    if (present === undefined) {
+      return { ok: false, reason: "invalid_present", guidance: "present must be true (show it to them), false (never show it to them), or null (clear the choice and fall back to the signal's default)." };
+    }
+    // Resolve the prefix against signals this agent actually holds, so a typo cannot silently write
+    // a preference about a hash that does not exist and sit there doing nothing forever.
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const match = store.listAllWalletSignals().filter((r) => r.signalHash.startsWith(prefix));
+    if (match.length === 0) {
+      return { ok: false, reason: "signal_not_found", guidance: `No signal in this wallet starts with '${prefix}'.` };
+    }
+    if (match.length > 1) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: `'${prefix}' matches ${match.length} signals — use more characters.` };
+    }
+    sessionNodeManager.setContactSignalPref(sel.name, pubkey, match[0].signalHash, present);
+    return {
+      ok: true, signal_hash: match[0].signalHash, pubkey, present,
+      guidance: present === null
+        ? "Choice cleared — this signal now follows its own default for this contact."
+        : present
+          ? "This signal will be presented to this contact when a session forms, if you have accepted it."
+          : "This signal will NOT be presented to this contact, whatever its default.",
     };
   });
 
@@ -2175,7 +2256,7 @@ async function startDaemonHoldingLock(
     // the row rather than hardcoded: it is inside the TBS, so a hardcoded value would be a SIGNED
     // field asserting something false.
     const res = await submitForAgent({
-      sel: { name: sel.name, pubkey: sel.pubkey },
+      connectionId,
       op: "refuse", subjectKind: item.subjectKind, subject: item.signalHash, body: message,
       context: "The refusal is recorded. Your message was NOT sent:",
     });
@@ -2191,7 +2272,7 @@ async function startDaemonHoldingLock(
     // that could ever tell them apart.
     return {
       ...refused, message_queued: true, stored: res.stored, submission_id: res.submissionId,
-      ...(res.stored ? {} : { guidance: "The refusal is recorded and your message was accepted by a directory node, but that node reports it already held this submission id. If the issuer never receives it, re-run the refusal — re-sending is safe." }),
+      ...(res.storedWarning ? { guidance: `The refusal is recorded. ${res.storedWarning}` } : {}),
     };
   });
 
