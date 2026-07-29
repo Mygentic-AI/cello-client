@@ -297,6 +297,66 @@ describe("createDirectoryEndpointResolver", () => {
 // sticky-until-fail (no flapping back to a recovered primary), null only when NOTHING
 // resolves. Each roster member returned by getConsortiumRoster is already reachable
 // (its /bootstrap resolved), so a member's presence in the roster IS its reachability.
+// M12: a primary that RESOLVES but is not a CONSORTIUM MEMBER is a black hole. Failover used to
+// trigger only on UNREACHABILITY, so the compiled-in default URL after a consortium move resolved
+// forever while every connection died at step-6 auth with `key_not_in_manifest`. Membership, not
+// reachability, is the test.
+describe("M12: roster failover routes around a reachable NON-MEMBER primary", () => {
+  const OUTSIDER: DirectoryEndpoint = { peerId: "PEERoutsider", multiaddr: "/ip4/127.0.0.1/tcp/9999/p2p/PEERoutsider" };
+  const A: ConsortiumEndpoint = { nodeId: "gcp-a", pubkey: "a".repeat(64), peerId: "PEERa", multiaddr: "/ip4/127.0.0.1/tcp/5001/p2p/PEERa" };
+  const B: ConsortiumEndpoint = { nodeId: "gcp-b", pubkey: "b".repeat(64), peerId: "PEERb", multiaddr: "/ip4/127.0.0.1/tcp/5002/p2p/PEERb" };
+
+  it("a reachable primary ABSENT from the roster is rejected and a member is used", async () => {
+    const resolve = createRosterAwareEndpointResolver({
+      primaryResolver: async () => OUTSIDER, // always resolves — the black hole
+      getConsortiumRoster: async () => [A, B],
+      getManifestPeerIds: () => new Set([A.peerId, B.peerId]),
+      logger: silentLogger,
+      shuffle: (xs) => xs,
+    });
+    const got = await resolve();
+    expect(got?.peerId).not.toBe(OUTSIDER.peerId);
+    expect([A.peerId, B.peerId]).toContain(got?.peerId);
+  });
+
+  it("NO manifest membership (M6 back-compat) leaves the primary untouched", async () => {
+    const resolve = createRosterAwareEndpointResolver({
+      primaryResolver: async () => OUTSIDER,
+      getConsortiumRoster: async () => [],
+      getManifestPeerIds: () => null,
+      logger: silentLogger,
+      shuffle: (xs) => xs,
+    });
+    expect((await resolve())?.peerId).toBe(OUTSIDER.peerId);
+  });
+
+  it("a member that is momentarily ABSENT from the reachable roster is NOT disqualified", async () => {
+    // The distinction that matters: membership is DECLARED, the roster is who answered just now.
+    // Checking against the roster would route around a node that is merely restarting.
+    const resolve = createRosterAwareEndpointResolver({
+      primaryResolver: async () => ({ peerId: A.peerId, multiaddr: A.multiaddr }),
+      getConsortiumRoster: async () => [B], // A is a member but did NOT answer this probe
+      getManifestPeerIds: () => new Set([A.peerId, B.peerId]),
+      logger: silentLogger,
+      shuffle: (xs) => xs,
+    });
+    expect((await resolve())?.peerId).toBe(A.peerId);
+  });
+
+  it("a member primary costs NO roster probe at all — membership is local", async () => {
+    let rosterProbes = 0;
+    const resolve = createRosterAwareEndpointResolver({
+      primaryResolver: async () => ({ peerId: A.peerId, multiaddr: A.multiaddr }),
+      getConsortiumRoster: async () => { rosterProbes++; return [A, B]; },
+      getManifestPeerIds: () => new Set([A.peerId, B.peerId]),
+      logger: silentLogger,
+      shuffle: (xs) => xs,
+    });
+    for (let i = 0; i < 3; i++) expect((await resolve())?.peerId).toBe(A.peerId);
+    expect(rosterProbes).toBe(0);
+  });
+});
+
 describe("createRosterAwareEndpointResolver (FINDING-4 failover)", () => {
   const US1: DirectoryEndpoint = { peerId: "PEERus1", multiaddr: "/ip4/127.0.0.1/tcp/5001/p2p/PEERus1" };
   const US1_C: ConsortiumEndpoint = { nodeId: "us1", pubkey: "a".repeat(64), peerId: "PEERus1", multiaddr: US1.multiaddr! };

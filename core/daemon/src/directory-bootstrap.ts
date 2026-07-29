@@ -309,6 +309,12 @@ export interface RosterAwareResolverOptions {
    * invariant). Tests inject an identity shuffle for deterministic ordering.
    */
   shuffle?: <T>(items: T[]) => T[];
+  /**
+   * DECLARED consortium member peer ids, from the verified manifest. Local and free — never a
+   * network probe. Absent (or empty) disables the membership check entirely, which is the M6
+   * back-compat path where there is no manifest to be a member of.
+   */
+  getManifestPeerIds?: () => Set<string> | null;
 }
 
 /** In-place-safe Fisher-Yates shuffle returning a NEW array (never mutates the input). */
@@ -364,6 +370,25 @@ export function createRosterAwareEndpointResolver(
   // whose independent roster probe still lists it must never be re-picked as its own fallback.
   let primaryPeerId: string | null = null;
 
+  /** Pick a reachable roster member that is neither the current pointer nor the primary. */
+  function selectFallback(roster: ConsortiumEndpoint[]): DirectoryEndpoint {
+    const excluded = new Set([current?.peerId, primaryPeerId].filter((p): p is string => !!p));
+    const others = roster.filter((e) => !excluded.has(e.peerId));
+    const ordered = shuffle(others.length > 0 ? others : roster);
+    const chosen = ordered[0];
+    const next: DirectoryEndpoint = { peerId: chosen.peerId, multiaddr: chosen.multiaddr };
+    if (!current || current.peerId !== chosen.peerId) {
+      opts.logger.warn("directory.bootstrap.failover", {
+        from: current?.peerId ?? null,
+        to: chosen.peerId,
+        nodeId: chosen.nodeId,
+      });
+    }
+    current = next;
+    stuckToFallback = true;
+    return next;
+  }
+
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
     // 1. Sticky-until-fail: keep the current fallback while it is still reachable.
     if (stuckToFallback && current) {
@@ -378,9 +403,33 @@ export function createRosterAwareEndpointResolver(
       opts.logger.warn("directory.bootstrap.failover.lost", { peerId: current.peerId });
     }
 
-    // 2. Primary-first (and the healthy steady state — no roster probe when it resolves).
+    // 2. Primary-first (and the healthy steady state — no roster probe once the primary is known
+    //    to be a consortium member).
     const primary = await opts.primaryResolver();
     if (primary) {
+      // A primary that RESOLVES but is not a MEMBER of this consortium is a black hole, and used to
+      // be a permanent one: failover triggered only on UNREACHABILITY, so the compiled-in default
+      // URL after a consortium move resolved forever while every connection died at step-6 identity
+      // auth with `key_not_in_manifest`. Reachability was never the right test.
+      //
+      // Checked against DECLARED manifest membership, never against the reachable roster. The
+      // roster is the set that answered /bootstrap just now; a genuine member that is momentarily
+      // down is absent from it, and disqualifying on that would route around a node that is merely
+      // restarting — turning a blip into a failover. Membership is also LOCAL, so this costs no
+      // probe at all and the healthy path is unchanged.
+      const members = opts.getManifestPeerIds?.() ?? null;
+      if (members && members.size > 0 && !members.has(primary.peerId)) {
+        opts.logger.warn("directory.bootstrap.primary.not_in_consortium", {
+          peerId: primary.peerId,
+          memberCount: members.size,
+        });
+        primaryPeerId = primary.peerId; // exclude it from the fallback pick below
+        const roster = await opts.getConsortiumRoster();
+        if (roster && roster.length > 0) return selectFallback(roster);
+        // No reachable member either — return null so the caller retries rather than hand back a
+        // directory we KNOW will reject us.
+        return null;
+      }
       if (stuckToFallback) {
         opts.logger.info("directory.bootstrap.failover", { to: primary.peerId, restored: true });
       }

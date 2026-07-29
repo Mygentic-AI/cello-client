@@ -189,10 +189,21 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
     return m ? await manifestNodesToEndpoints(m.nodes, { logger, fetchFn }) : null;
   };
 
+  // DECLARED membership, straight off the verified manifest — no probe. Lets the resolver reject a
+  // primary that resolves but belongs to a different consortium (the compiled-in default URL after
+  // a consortium move) without mistaking a momentarily-down member for a non-member.
+  const getManifestPeerIds = (): Set<string> | null => {
+    const m = manifestProvider?.getCurrentManifest();
+    if (!m) return null;
+    const ids = m.nodes.map((n) => n.peerId).filter((p): p is string => typeof p === "string" && p.length > 0);
+    return ids.length > 0 ? new Set(ids) : null;
+  };
+
   const failoverEndpointResolver = directoryEndpointResolver
     ? createRosterAwareEndpointResolver({
         primaryResolver: directoryEndpointResolver,
         getConsortiumRoster: resolveConsortiumRoster,
+        getManifestPeerIds,
         logger,
       })
     : undefined;
