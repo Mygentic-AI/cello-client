@@ -1929,7 +1929,7 @@ async function startDaemonHoldingLock(
     return { ok: true, name, pubkey: rec.pubkey };
   };
 
-  handlers.set("consent_list_pending", async (_params, connectionId) => {
+  handlers.set("cello_consent_list", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
@@ -1949,7 +1949,7 @@ async function startDaemonHoldingLock(
     return { ok: true, agent: sel.name, pending: items };
   });
 
-  handlers.set("consent_accept", async (params, connectionId) => {
+  handlers.set("cello_consent_accept", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -1968,7 +1968,7 @@ async function startDaemonHoldingLock(
     return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
   });
 
-  handlers.set("consent_refuse", async (params, connectionId) => {
+  handlers.set("cello_consent_refuse", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;

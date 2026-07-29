@@ -292,6 +292,9 @@ export const IPC_METHODS = {
   "settings-get": "cello_settings_get",
   "settings-set": "cello_settings_set",
   "moniker-set": "cello_set_moniker",
+  "consent-list": "cello_consent_list",
+  "consent-accept": "cello_consent_accept",
+  "consent-refuse": "cello_consent_refuse",
 } as const;
 
 // ─── Group A: agent lifecycle ──────────────────────────────────────────────────────────────────
@@ -528,4 +531,23 @@ export function awaitSession(
   opts: ParityOptions & { timeoutMs?: number },
 ): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["await-session"], defined({ timeout_ms: opts.timeoutMs }), opts);
+}
+
+// ─── Group: consent (M10B / DOD-END-SURFACE-1) ─────────────────────────────────────────────────
+// No `agent` argument on any of the three: they are scoped to the SELECTED agent by the daemon.
+// Consent is a statement about oneself; naming another agent would be accepting on its behalf.
+
+/** `cello consent list` → cello_consent_list. */
+export function consentList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["consent-list"], {}, opts);
+}
+
+/** `cello consent accept <signal-hash>` → cello_consent_accept. */
+export function consentAccept(celloDir: string, signalHash: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["consent-accept"], { signal_hash: signalHash }, opts);
+}
+
+/** `cello consent refuse <signal-hash>` → cello_consent_refuse. */
+export function consentRefuse(celloDir: string, signalHash: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], { signal_hash: signalHash }, opts);
 }

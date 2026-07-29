@@ -51,7 +51,7 @@ describe("F1: usage string lists every command", () => {
         // Contacts
         "contacts", "contact",
         // Trust & endorsements
-        "trust-signals",
+        "trust-signals", "consent",
         // Other
         "settings", "moniker", "telegram", "bridge",
       ].sort(),

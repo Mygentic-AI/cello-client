@@ -69,6 +69,10 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_contact_set_tier", cli: "cello contact <pubkey> set-tier" },
   { mcp: "cello_contact_set_away", cli: "cello contact <pubkey> set-away" },
   { mcp: "cello_contact_set_moniker", cli: "cello contact <pubkey> set-moniker" },
+  // Consent (M10B / DOD-END-SURFACE-1) — deciding on signals others issued ABOUT this agent
+  { mcp: "cello_consent_list", cli: "cello consent list" },
+  { mcp: "cello_consent_accept", cli: "cello consent accept" },
+  { mcp: "cello_consent_refuse", cli: "cello consent refuse" },
   // Other
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },

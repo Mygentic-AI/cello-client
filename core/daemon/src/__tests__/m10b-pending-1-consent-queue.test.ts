@@ -207,4 +207,22 @@ describe("DOD-END-PENDING-1 — the pending-consent queue", () => {
       expect(store.listPendingConsent(alice)).toEqual([]);
     });
   });
+
+  describe("DOD-END-SURFACE-1 — the nudge and the verbs are separate steps", () => {
+    it("the COUNT is what agent selection reads, and reading it does not mark notified", () => {
+      // cello_use_agent surfaces a NUMBER; consent_list_pending is what shows the items and records
+      // that the operator saw them. If selection marked notified, the operator would be marked told
+      // about something they were never shown — and the next selection would say nothing, so the
+      // endorsement would sit there in silence. That is the failure the two lifetimes exist to stop.
+      store.putWalletSignal(envelope({ signalHash: HASH("1") }));
+
+      expect(store.countUnnotifiedConsent(alice)).toBe(1);
+      expect(store.countUnnotifiedConsent(alice)).toBe(1);   // reading again still says 1
+      expect(store.listPendingConsent(alice)).toHaveLength(1);
+
+      store.markConsentNotified(alice);                       // what LISTING does
+      expect(store.countUnnotifiedConsent(alice)).toBe(0);    // the nudge goes quiet...
+      expect(store.listPendingConsent(alice)).toHaveLength(1); // ...the decision does not
+    });
+  });
 });

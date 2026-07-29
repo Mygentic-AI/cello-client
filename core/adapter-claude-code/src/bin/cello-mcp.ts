@@ -200,6 +200,31 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
   return jsonText(result);
 });
 
+// ─── DOD-END-SURFACE-1 — consent verbs (M10B) ──────────────────────────────────────────────────
+// An endorsement someone wrote ABOUT this agent does not become visible to a counterparty until the
+// agent accepts it. These three are that decision. All are scoped to the CURRENTLY SELECTED agent —
+// there is no `agent` parameter, deliberately: consent is a statement about oneself, and letting a
+// caller name a different agent would be letting one agent accept on another's behalf.
+
+server.tool("cello_consent_list", "List trust signals (e.g. endorsements) that other parties have issued ABOUT the currently selected agent and that are waiting on its decision. Nothing here is visible to counterparties yet — a pending signal is inert until accepted. Listing marks them as seen, which silences the 'items waiting' nudge on agent selection; it does NOT decide them, and they stay listed until accepted or refused.", {}, async () => {
+  const result = await proxy.call("cello_consent_list", {});
+  return jsonText(result);
+});
+
+server.tool("cello_consent_accept", "Accept a trust signal issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
+  signal_hash: z.string().describe("Hex signal hash of the pending item, as shown by cello_consent_list"),
+}, async ({ signal_hash }) => {
+  const result = await proxy.call("cello_consent_accept", { signal_hash });
+  return jsonText(result);
+});
+
+server.tool("cello_consent_refuse", "Refuse a trust signal issued about the currently selected agent. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused signal is inert everywhere it is checked.", {
+  signal_hash: z.string().describe("Hex signal hash of the pending item, as shown by cello_consent_list"),
+}, async ({ signal_hash }) => {
+  const result = await proxy.call("cello_consent_refuse", { signal_hash });
+  return jsonText(result);
+});
+
 // DOD-AWAY-TIER-1: per-contact away message. Forward-only (D7).
 server.tool("cello_contact_set_away", "Set (or clear, by passing null) a custom away message for a specific contact — the text they receive when they reach you and you're away. It is the most specific level of away-text resolution (per-contact → per-tier → agent default → system default). Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),

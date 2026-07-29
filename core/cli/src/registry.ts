@@ -35,6 +35,9 @@ import {
   contactRemove,
   contactList,
   contactSetTier,
+  consentList,
+  consentAccept,
+  consentRefuse,
   contactSetAway,
   listAgents,
   startAgent,
@@ -857,6 +860,38 @@ export const COMMANDS: readonly CommandSpec[] = [
     async run(ctx, args) {
       const [sub, ...rest] = args;
       return legacy(await trustSignals(ctx.celloDir, sub ?? "", rest));
+    },
+  },
+
+  {
+    name: "consent",
+    group: "Trust & endorsements",
+    summary: "Decide on trust signals OTHERS have issued about you (accept or refuse).",
+    help:
+      "Usage:\n" +
+      "  cello consent list                    — signals others issued about you, awaiting your decision\n" +
+      "  cello consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
+      "  cello consent refuse <hash>           — refuse one: it stays inert and is never presented\n" +
+      "\n" +
+      "Anyone can write an endorsement ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
+      "until you accept it: nothing pending is presented, counted, or visible to a counterparty. That is\n" +
+      "the point of this command. Read the endorser's words in 'list' before accepting, because\n" +
+      "accepting is what puts your name behind someone else's claim about you.\n" +
+      "\n" +
+      "Refusing is not a deletion — the record stays so the decision is auditable — but a refused signal\n" +
+      "is indistinguishable from one that was never issued, everywhere it is checked.\n" +
+      "\n" +
+      "These act on the SELECTED agent and take no --agent flag: consent is a statement about oneself,\n" +
+      "and one agent does not accept on another's behalf. Select with 'cello use-agent <name>'.",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      const o = { pretty };
+      const [sub, hash] = positional;
+      if (sub === "list") return consentList(ctx.celloDir, o);
+      if (sub === "accept" && hash) return consentAccept(ctx.celloDir, hash, o);
+      if (sub === "refuse" && hash) return consentRefuse(ctx.celloDir, hash, o);
+      return { stdout: helpForSpec("consent"), stderr: "", exitCode: 1 };
     },
   },
 
