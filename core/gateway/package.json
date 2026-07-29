@@ -16,6 +16,10 @@
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     },
+    "./detect": {
+      "import": "./dist/detect/index.js",
+      "types": "./dist/detect/index.d.ts"
+    },
     "./package.json": "./package.json"
   },
   "bin": {
