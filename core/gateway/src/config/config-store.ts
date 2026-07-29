@@ -1,24 +1,21 @@
 /**
- * M9-CFG-001 — the gateway's own versioned config store (INV-4).
+ * M9-CFG-001 — the gateway's versioned config store (INV-4 as amended by M9C-D2).
  *
- * The gateway owns its configuration; the daemon never does. This store lives in the gateway's own
- * local DB file (node:sqlite — the same library the daemon uses, a separate file), is append-only and
- * versioned, and enforces the §7 governance asymmetry:
+ * The store is append-only and versioned, and enforces the §7 governance asymmetry:
  *
  *   - TIGHTENING a guard (making the gateway MORE restrictive) is free — no confirmation.
  *   - LOOSENING a guard (making it LESS restrictive — enabling autonomous override, adding a value to
  *     the PII whitelist, raising/removing the rate cap, allowing another language) requires an explicit
- *     `confirmed` flag. Without it the change is REJECTED and not versioned. (The human confirmation —
- *     WebAuthn in the portal — is the front-end's job; this store is the enforcement point.)
+ *     `confirmed` flag. Without it the change is REJECTED and not versioned. (The human confirmation
+ *     is the CLI prompt — the portal passkey later; this store is the enforcement point.)
  *
  * Every applied change appends a row whose `fingerprint` is hash-chained to the previous version, so
  * the change history is tamper-evident and ready to attest to the directory in Phase 2 (M9-ATTEST-001).
  *
- * Encryption-at-rest: the daemon opens node:sqlite without a cipher key today, so this store matches
- * that (a separate FILE, per INV-4); SQLCipher-style key encryption is a cross-cutting gap shared with
- * the daemon's DB, not a CFG-001-local concern.
+ * Encryption-at-rest (DOD-M9C-STORE-1): the store lives in the gateway's SQLCipher file, opened with
+ * the daemon's key via a key FILE path — fail-closed, no plaintext fallback (see store/encrypted-db.ts).
  */
-import { DatabaseSync } from "node:sqlite";
+import { openEncryptedStoreDb, type StoreDb } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
 /** Whether a config change makes the gateway more restrictive (tighten), less (loosen), or neither. */
@@ -127,12 +124,13 @@ CREATE TABLE IF NOT EXISTS config_versions (
 `;
 
 export class GatewayConfigStore {
-  readonly #db: DatabaseSync;
+  readonly #db: StoreDb;
   #closed = false;
 
-  constructor(dbPath: string) {
-    this.#db = new DatabaseSync(dbPath);
-    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
+  /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
+   *  `keyFilePath` — the daemon's own key file (M9C-D8/D9). Throws GatewayStoreError fail-closed. */
+  constructor(dbPath: string, keyFilePath: string) {
+    this.#db = openEncryptedStoreDb(dbPath, keyFilePath);
     this.#db.exec(DDL);
   }
 

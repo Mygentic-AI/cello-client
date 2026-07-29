@@ -40,12 +40,25 @@ async function main(): Promise<void> {
   compileInjectionPatterns();
   compileSecretRules();
 
-  // M9-CFG-001 (INV-4): the gateway owns its config. When CELLO_GATEWAY_CONFIG_DB is set, the versioned
-  // config store is the SOURCE OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars
-  // are the bootstrap fallback for any key the store has not set. Each setting defaults to its TIGHTEST
-  // value (empty whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
-  const configDbPath = process.env["CELLO_GATEWAY_CONFIG_DB"];
-  const config = configDbPath ? new GatewayConfigStore(configDbPath) : undefined;
+  // DOD-M9C-STORE-1 (M9C-D9): ONE encrypted store file holds both the config versions and the
+  // security records, keyed by the daemon's key file — the daemon's spawn plumbing passes the two
+  // paths (M9C-D8: a key FILE path, never key bytes). Both stores fail closed: a missing or wrong
+  // key throws GatewayStoreError, which exits the process rather than screening unconfigured.
+  const storeDbPath = process.env["CELLO_GATEWAY_STORE_DB"];
+  const storeKeyFile = process.env["CELLO_GATEWAY_STORE_KEY_FILE"];
+  if ((storeDbPath === undefined) !== (storeKeyFile === undefined)) {
+    // Half-configured storage is a plumbing bug, not a degraded mode to run through: it would
+    // silently drop either the operator's config or the whole audit trail.
+    process.stderr.write("cello-gateway: CELLO_GATEWAY_STORE_DB and CELLO_GATEWAY_STORE_KEY_FILE must be set together\n");
+    process.exit(2);
+    return;
+  }
+
+  // M9-CFG-001 (INV-4): the gateway owns its config. When the store is configured it is the SOURCE
+  // OF TRUTH (with its tighten-free / loosen-confirmed governance); env vars are the bootstrap
+  // fallback for any key the store has not set. Each setting defaults to its TIGHTEST value (empty
+  // whitelist, override off, no rate cap) so an absent/empty config never silently loosens.
+  const config = storeDbPath && storeKeyFile ? new GatewayConfigStore(storeDbPath, storeKeyFile) : undefined;
   const cfg = <T>(key: string, envFallback: T): T => {
     const v = config?.get(key);
     return v !== undefined ? (v as T) : envFallback;
@@ -72,12 +85,11 @@ async function main(): Promise<void> {
   const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });
   const inbound = new InboundScreener();
 
-  // M9-REC-001 (INV-4): the gateway records what it did to EVERY message in its own local store,
-  // hash-chained for tamper-evidence. Enabled when CELLO_GATEWAY_RECORD_DB is set. The verdict's
-  // disposition maps to the record: allow → clean (a clean pass IS recorded — an absent record is
-  // itself evidence of suppression), redact/block/warn verbatim.
-  const recordDbPath = process.env["CELLO_GATEWAY_RECORD_DB"];
-  const records = recordDbPath ? new GatewayRecordStore(recordDbPath) : undefined;
+  // M9-REC-001 (INV-4): the gateway records what it did to EVERY message, hash-chained for
+  // tamper-evidence, in the same encrypted store as the config (M9C-D9). The verdict's disposition
+  // maps to the record: allow → clean (a clean pass IS recorded — an absent record is itself
+  // evidence of suppression), redact/block/warn verbatim.
+  const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile) : undefined;
   const recordOutcome = (direction: "inbound" | "outbound", v: ScreenVerdict, content: Uint8Array, correlationId?: string): void => {
     if (!records) return;
     const disposition: RecordDisposition = v.disposition === "allow" ? "clean" : v.disposition;

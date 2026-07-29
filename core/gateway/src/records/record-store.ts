@@ -2,7 +2,8 @@
  * M9-REC-001 — local security-pass records.
  *
  * The gateway records what it did to EVERY message it screens — clean / redacted / blocked / warned —
- * in its own local DB (node:sqlite, the gateway's file, INV-4). Each record is hash-chained to the
+ * in the gateway's SQLCipher store, opened with the daemon's key (DOD-M9C-STORE-1; INV-4 as amended).
+ * Each record is hash-chained to the
  * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so a NAIVELY
  * edited, deleted (mid-chain), or reordered record breaks the chain and `verifyChain()` returns false.
  * A CLEAN pass is recorded too: an ABSENT record for a delivered message is itself evidence of suppression.
@@ -16,7 +17,7 @@
  * for cross-node tamper detection is Phase-2 (M9-ATTEST-001); the fingerprint computed here is exactly
  * what gets attested, so Phase 2 is an add, not a rework.
  */
-import { DatabaseSync } from "node:sqlite";
+import { openEncryptedStoreDb, type StoreDb } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
 export type RecordDisposition = "clean" | "redact" | "block" | "warn";
@@ -67,12 +68,13 @@ function fingerprintOf(
 }
 
 export class GatewayRecordStore {
-  readonly #db: DatabaseSync;
+  readonly #db: StoreDb;
   #closed = false;
 
-  constructor(dbPath: string) {
-    this.#db = new DatabaseSync(dbPath);
-    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
+  /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
+   *  `keyFilePath` — the daemon's own key file (M9C-D8/D9). Throws GatewayStoreError fail-closed. */
+  constructor(dbPath: string, keyFilePath: string) {
+    this.#db = openEncryptedStoreDb(dbPath, keyFilePath);
     this.#db.exec(DDL);
   }
 

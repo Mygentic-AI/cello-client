@@ -66,21 +66,14 @@ export default [
     },
   },
   {
-    // KNOWN DEBT — the only production files still importing node:sqlite. Do not add to this list.
-    // When it is empty, delete this block; the debt is paid.
+    // KNOWN DEBT — the only production file still importing node:sqlite. Do not add to this list;
+    // it only ever shrinks. When it is empty, delete this block; the debt is paid.
     //   - daemon/identity-migration.ts : reads a legacy PLAINTEXT db to migrate it into SQLCipher.
     //       SQLCipher can open plaintext directly, so this is convertible with no migration risk.
-    //   - gateway/records/record-store.ts, gateway/config/config-store.ts : these are PRIMARY
-    //       stores, writing hash-chained security records + gateway config UNENCRYPTED to disk.
-    //       Their header comments justify this with "the daemon opens node:sqlite without a cipher
-    //       key today" — false since 2026-06-25, when the daemon moved to SQLCipher. Converting
-    //       them needs sqlcipher-db lifted out of core/daemon (core/gateway cannot import it:
-    //       daemon depends on gateway, not the reverse) AND a plaintext→encrypted migration for
-    //       existing installs.
+    // (The two gateway stores left this list on 2026-07-29 — DOD-M9C-STORE-1 gave core/gateway its
+    // own SQLCipher opener, keyed by the daemon's key file, so neither store can write plaintext.)
     files: [
       "core/daemon/src/identity-migration.ts",
-      "core/gateway/src/records/record-store.ts",
-      "core/gateway/src/config/config-store.ts",
     ],
     rules: { "no-restricted-imports": "off" },
   },

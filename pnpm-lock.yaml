@@ -139,6 +139,9 @@ importers:
 
   core/gateway:
     dependencies:
+      '@signalapp/sqlcipher':
+        specifier: ^3.3.5
+        version: 3.3.5
       re2-wasm:
         specifier: ^1.0.2
         version: 1.0.2

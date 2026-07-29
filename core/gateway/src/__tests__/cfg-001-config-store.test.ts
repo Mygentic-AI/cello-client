@@ -1,26 +1,32 @@
 /**
  * M9-CFG-001 — the gateway's own versioned config store (INV-4).
  *
- * The store lives in the gateway's own local DB (node:sqlite, same library as the daemon — a separate
- * file from the daemon's), is append-only/versioned, and enforces the §7 governance rule:
+ * The store lives in the gateway's SQLCipher file, opened with the daemon's key (DOD-M9C-STORE-1),
+ * is append-only/versioned, and enforces the §7 governance rule:
  * **TIGHTENING a guard is free; LOOSENING one requires explicit confirmation.** Each version is
  * hash-chained (a per-row fingerprint over key+version+value+prev) so the change history is
  * tamper-evident and attested-ready (the cheap half of Phase-2 attestation).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openEncryptedStoreDb } from "../store/encrypted-db.js";
 import { GatewayConfigStore } from "../config/config-store.js";
 
 describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-confirmed", () => {
   let dir: string;
+  let dbPath: string;
+  let keyPath: string;
   let store: GatewayConfigStore;
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "cello-cfg-"));
-    store = new GatewayConfigStore(join(dir, "config.db"));
+    dbPath = join(dir, "config.db");
+    keyPath = join(dir, "store.key");
+    await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
+    store = new GatewayConfigStore(dbPath, keyPath);
   });
   afterEach(async () => {
     store.close();
@@ -116,10 +122,10 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     store.close();
     // Tamper: silently widen v1's whitelist in the DB, leaving its stored fingerprint untouched. On
     // reopen the recomputed fingerprint no longer matches the stored one → the chain must reject it.
-    const raw = new DatabaseSync(join(dir, "config.db"));
+    const raw = openEncryptedStoreDb(dbPath, keyPath);
     raw.prepare(`UPDATE config_versions SET value_json = '["a@x.example","evil@attacker.example"]' WHERE key = 'pii_whitelist' AND version = 1`).run();
     raw.close();
-    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    const reopened = new GatewayConfigStore(dbPath, keyPath);
     expect(reopened.verifyChain("pii_whitelist")).toBe(false); // tamper detected
     reopened.close();
   });
@@ -130,10 +136,10 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     store.set("autonomous_override", false); // v3 (tighten)
     expect(store.verifyChain("autonomous_override")).toBe(true);
     store.close();
-    const raw = new DatabaseSync(join(dir, "config.db"));
+    const raw = openEncryptedStoreDb(dbPath, keyPath);
     raw.prepare(`DELETE FROM config_versions WHERE key = 'autonomous_override' AND version = 2`).run();
     raw.close();
-    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    const reopened = new GatewayConfigStore(dbPath, keyPath);
     expect(reopened.verifyChain("autonomous_override")).toBe(false); // v3's prev_fingerprint no longer matches
     reopened.close();
   });
@@ -166,10 +172,10 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     store.set("autonomous_override", true, { confirmed: true }); // v2 loosen, confirmed=1
     expect(store.verifyChain("autonomous_override")).toBe(true);
     store.close();
-    const raw = new DatabaseSync(join(dir, "config.db"));
+    const raw = openEncryptedStoreDb(dbPath, keyPath);
     raw.prepare(`UPDATE config_versions SET confirmed = 0 WHERE key = 'autonomous_override' AND version = 2`).run();
     raw.close();
-    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    const reopened = new GatewayConfigStore(dbPath, keyPath);
     expect(reopened.verifyChain("autonomous_override")).toBe(false); // a forged "unconfirmed" loosen is caught
     reopened.close();
   });
@@ -194,7 +200,7 @@ describe("M9-CFG-001 GatewayConfigStore — versioned, tighten-free / loosen-con
     store.set("autonomous_override", false);
     store.set("rate_max_per_window", 3);
     store.close();
-    const reopened = new GatewayConfigStore(join(dir, "config.db"));
+    const reopened = new GatewayConfigStore(dbPath, keyPath);
     expect(reopened.get("autonomous_override")).toBe(false);
     expect(reopened.get("rate_max_per_window")).toBe(3);
     reopened.close();

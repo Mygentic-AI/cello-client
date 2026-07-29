@@ -18,8 +18,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, readFile } from "node:fs/promises";
-import { readFileSync, readdirSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -481,10 +481,13 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("REC-001: BOTH gateways record every screened message (outbound clean+redact on A, inbound clean on B), hash-chained", async () => {
-      const recDbA = join(tempDir, "gw-records-a.db");
-      const recDbB = join(tempDir, "gw-records-b.db");
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_RECORD_DB: recDbA });
-      const b = await spawnGateway("gb", { CELLO_GATEWAY_RECORD_DB: recDbB });
+      const recDbA = join(tempDir, "gw-store-a.db");
+      const recDbB = join(tempDir, "gw-store-b.db");
+      // DOD-M9C-STORE-1: the store is SQLCipher, keyed by a key FILE the spawner names (M9C-D8).
+      const keyFile = join(tempDir, "gw-store.key");
+      writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: recDbA, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
+      const b = await spawnGateway("gb", { CELLO_GATEWAY_STORE_DB: recDbB, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       // A clean send (recorded as clean — a clean pass IS recorded) and a secret send (recorded redact).
       expect(((await clientA.send("cello_send", { session_id: SID_HEX, content: "all clean here, talk soon" })) as Record<string, unknown>).ok).toBe(true);
@@ -500,7 +503,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       await a.gw.stop();
       await b.gw.stop();
 
-      const storeA = new GatewayRecordStore(recDbA);
+      const storeA = new GatewayRecordStore(recDbA, keyFile);
       const aRecords = storeA.all().filter((r) => r.direction === "outbound");
       const aOut = aRecords.map((r) => r.disposition);
       expect(aOut).toContain("clean"); // the clean pass was recorded, not just the redaction
@@ -513,7 +516,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
 
       // INBOUND producer (finding 2): B's gateway recorded the inbound screen — deleting the inbound
       // recording wiring would leave B's log with no inbound record and fail this.
-      const storeB = new GatewayRecordStore(recDbB);
+      const storeB = new GatewayRecordStore(recDbB, keyFile);
       const bIn = storeB.all().filter((r) => r.direction === "inbound");
       expect(bIn.length).toBeGreaterThanOrEqual(1);
       expect(bIn.map((r) => r.disposition)).toContain("clean");
@@ -526,13 +529,15 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       // requires confirmation (the §7 governance gate). The spawned gateway then reads the store as its
       // source of truth — proving the store, not just env, drives live behavior.
       const cfgDb = join(tempDir, "gw-config.db");
-      const cstore = new GatewayConfigStore(cfgDb);
+      const cfgKeyFile = join(tempDir, "gw-config.key");
+      writeFileSync(cfgKeyFile, randomBytes(32), { mode: 0o600 });
+      const cstore = new GatewayConfigStore(cfgDb, cfgKeyFile);
       const r = cstore.set("pii_whitelist", ["owner@self.example"], { confirmed: true });
       expect(r.ok).toBe(true);
       expect(r.ok && r.direction).toBe("loosen"); // adding to the [] baseline is a loosen — confirmed here
       cstore.close();
 
-      const a = await spawnGateway("ga", { CELLO_GATEWAY_CONFIG_DB: cfgDb });
+      const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: cfgDb, CELLO_GATEWAY_STORE_KEY_FILE: cfgKeyFile });
       const b = await spawnGateway("gb");
       const { clientA, clientB } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
       const sent = await clientA.send("cello_send", { session_id: SID_HEX, content: "contact me at owner@self.example" }) as Record<string, unknown>;
