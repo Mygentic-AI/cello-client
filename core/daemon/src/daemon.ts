@@ -53,6 +53,13 @@ import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import { composeSealedSubmission, sendSealedSubmission } from "./signal-submission.js";
+
+/**
+ * Cap on a refusal message (M10B-D4). Generous for prose — the point is not to police what the
+ * operator writes, it is that an UNBOUNDED string reaches a signer, a sealer and a transport, and
+ * fails in the transport where the error names the wrong subsystem.
+ */
+const MAX_REFUSAL_MESSAGE_CHARS = 4000;
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -1934,16 +1941,35 @@ async function startDaemonHoldingLock(
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-    const items = store.listPendingConsent(sel.pubkey).map((r) => ({
-      signal_hash: r.signalHash,
-      type: r.type,
-      issuer_pubkey: r.issuerPubkey,
-      issued_at: r.issuedAt,
-      // The payload is the ENDORSER'S OWN WORDS and is returned raw, unparsed, for the operator to
-      // read before deciding. It is not interpreted here and it is never presented to anyone until
-      // they accept — that is the entire point of the decision they are being asked to make.
-      payload_bytes: r.payload.length,
-    }));
+    const items = store.listPendingConsent(sel.pubkey).map((r) => {
+      // THE PAYLOAD IS THE POINT OF THIS CALL. The operator is being asked to stand behind a claim
+      // somebody else wrote about them, and they cannot make that decision from a byte count. An
+      // earlier version returned `payload_bytes` while both surfaces instructed the operator to
+      // "read the plaintext before accepting" — so following the instruction produced a number, and
+      // accepting was necessarily blind. Decoded here, exactly as `wallet_view_signal` does it.
+      //
+      // Undecodable payloads fall back to hex rather than throwing: one unreadable item must not
+      // make every other pending decision unreachable, and hex is honest about what it is.
+      let payload: unknown;
+      try {
+        payload = decodeCbor(r.payload);
+      } catch {
+        payload = Buffer.from(r.payload).toString("hex");
+      }
+      return {
+        signal_hash: r.signalHash,
+        type: r.type,
+        subject_kind: r.subjectKind,
+        issuer_kind: r.issuerKind,
+        issuer_pubkey: r.issuerPubkey,
+        issued_at: r.issuedAt,
+        // UNTRUSTED, and labelled as such on the way out. These are the issuer's own words, carried
+        // verbatim and never restated in any other voice (INV-UNTRUSTED). A consuming model must
+        // quote and attribute them — "<issuer> says: …" — never adopt them as its own statement.
+        payload,
+        payload_is_untrusted_text: true,
+      };
+    });
     // Seeing the list IS being told. Marking here rather than in cello_use_agent means the operator
     // is never marked notified about something they were not actually shown.
     store.markConsentNotified(sel.pubkey);
@@ -1965,7 +1991,13 @@ async function startDaemonHoldingLock(
       // decision this scoping exists to prevent.
       return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
     }
-    store.setConsentState(item.signalHash, "accepted");
+    // The write RESULT is checked, not assumed. `setConsentState` returns false when zero rows
+    // changed; reporting "accepted" regardless would tell the operator a decision was recorded that
+    // was not, and the next presentation would silently omit it.
+    if (!store.setConsentState(item.signalHash, "accepted")) {
+      return { ok: false, reason: "consent_write_failed",
+        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+    }
     return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
   });
 
@@ -1985,13 +2017,56 @@ async function startDaemonHoldingLock(
     // getting out. A refusal that only takes effect if the network cooperates would leave a signal
     // Alice believes she rejected sitting in an unrefused state — the exact failure INV-CONSENT
     // exists to prevent. The message is a courtesy layered on top of a decision already made.
-    store.setConsentState(item.signalHash, "refused");
+    //
+    // And the write is CHECKED. The ordering above is worth nothing if nothing confirms the record
+    // happened: without this, the code would go on to sign and send Bob a refusal message about a
+    // decision that is not in the database.
+    if (!store.setConsentState(item.signalHash, "refused")) {
+      return { ok: false, reason: "consent_write_failed",
+        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+    }
     const refused = { ok: true as const, signal_hash: item.signalHash, consent_state: "refused" as const };
 
     // M10B-D4: the message back to the issuer is the subject's CHOICE. Silence is the default, and a
     // silent refusal tells Bob NOTHING — which is what keeps D-24 intact for anyone who wants it.
     const message = typeof params?.message === "string" ? params.message.trim() : "";
-    if (message.length === 0) return { ...refused, issuer_notified: false };
+    if (message.length === 0) return { ...refused, message_queued: false };
+
+    // A CAP, because the CLI joins every trailing positional into this string and a paste is
+    // unbounded. Without it a multi-megabyte body is CBOR-encoded, signed, sealed, and pushed at the
+    // signaling stream, where it dies as `signaling_lost` — a TRANSPORT label for a payload-size
+    // bug, which is exactly the error-substitution failure that sends an operator to the wrong
+    // subsystem for a day.
+    if (message.length > MAX_REFUSAL_MESSAGE_CHARS) {
+      return { ...refused, message_queued: false, message_error: "message_too_long",
+        guidance: `The refusal is recorded. Your message was NOT sent: it is ${message.length} characters and the limit is ${MAX_REFUSAL_MESSAGE_CHARS}.` };
+    }
+
+    // ACCOUNT-SUBJECT ITEMS DO NOT GET A MESSAGE YET, and this is a refusal, not an oversight.
+    //
+    // `listPendingConsent` scopes with `(subject_kind <> 'agent' OR lower(subject) = ?)`, so EVERY
+    // agent on this daemon can see — and therefore refuse — an account-subject item. The refusal
+    // itself is defensible (it is the account's own decision, and any of its agents speaks for it),
+    // but the MESSAGE is signed with THIS agent's K_local, so the issuer would receive a signed
+    // statement from an agent that was not the subject of anything. Which agent may speak for an
+    // account is an open question this milestone has not answered (see the note in
+    // trust-signal-store.ts), and signing is not the place to guess at it.
+    //
+    // So the decision stands and the courtesy is withheld, with the reason named.
+    if (item.subjectKind !== "agent") {
+      return { ...refused, message_queued: false, message_error: "account_subject_message_unsupported",
+        guidance: `The refusal is recorded. Your message was NOT sent: this signal is about the ACCOUNT rather than about '${sel.name}', and a message would be signed by this agent alone — which agent may speak for an account is not yet settled.` };
+    }
+
+    // F3: the agent must already be ONLINE. `getAgentSignaling` is not a getter — for an agent with
+    // no manager it CONSTRUCTS one, which dials and authenticates to the directory immediately and
+    // installs an unbounded reconnect loop. Calling it here would silently bring a stopped agent
+    // online: the directory would route sessions to it while no standing receiver exists, producing
+    // `standing_receiver_unavailable` — and `cello status` would still report it offline.
+    if (!onlineAgents.has(sel.name)) {
+      return { ...refused, message_queued: false, message_error: "agent_offline",
+        guidance: `The refusal is recorded. Your message was NOT sent: agent '${sel.name}' is not started. Run cello_start_agent and refuse again with the same message — re-sending is safe, the submission id is derived from the content.` };
+    }
 
     // It rides the submission queue as the `refuse` op: operator-authored free text scanned at
     // intake exactly like the endorsement body — the same injection surface pointed the other way.
@@ -1999,20 +2074,24 @@ async function startDaemonHoldingLock(
     const kp = keyProviders.get(sel.name);
     if (!kp) {
       logger.warn("signal.refusal.refused", { agentName: sel.name, reason: "key_provider_absent" });
-      return { ...refused, issuer_notified: false, message_error: "key_provider_absent",
+      return { ...refused, message_queued: false, message_error: "key_provider_absent",
         guidance: `The refusal is recorded. Your message was NOT sent: no signing key is loaded for '${sel.name}'.` };
     }
     try {
       const composed = await composeSealedSubmission({
         manifest: verifiedManifest, keyProvider: kp, op: "refuse",
-        subjectKind: "agent", subject: item.signalHash, body: message,
+        // The subject of a refusal is the TARGET SIGNAL HASH, and `subject_kind` describes what the
+        // REFUSED SIGNAL was about — it is carried through from the row rather than hardcoded. A
+        // hardcoded "agent" would be a SIGNED field asserting something false for every
+        // account-subject refusal, and `subject_kind` is inside the TBS, so the lie would be signed.
+        subjectKind: item.subjectKind, subject: item.signalHash, body: message,
         issuedAt: Math.floor(Date.now() / 1000), logger,
       });
       if (!composed.ok) {
         // ERRORS NAME THEIR CAUSE: composeSealedSubmission's refusals (manifest_unavailable,
-        // intake_key_absent, intake_key_malformed) say WHICH check refused, and that reason
-        // survives here rather than collapsing into a generic send failure.
-        return { ...refused, issuer_notified: false, message_error: composed.reason,
+        // manifest_expired, intake_key_absent, intake_key_malformed) say WHICH check refused, and
+        // that reason survives here rather than collapsing into a generic send failure.
+        return { ...refused, message_queued: false, message_error: composed.reason,
           guidance: `The refusal is recorded. Your message was NOT sent: ${composed.guidance}` };
       }
       const sent = await sendSealedSubmission({
@@ -2021,16 +2100,29 @@ async function startDaemonHoldingLock(
         ciphertext: composed.ciphertext, logger,
       });
       if (!sent.ok) {
-        return { ...refused, issuer_notified: false, message_error: sent.reason,
+        return { ...refused, message_queued: false, message_error: sent.reason,
           guidance: `The refusal is recorded. Your message was NOT sent: ${sent.guidance ?? sent.reason}. Retrying is safe — the submission id is derived from the content.` };
       }
-      logger.info("signal.refusal.sent", { agentName: sel.name, submissionId: composed.submissionId });
-      return { ...refused, issuer_notified: true, submission_id: composed.submissionId };
+      logger.info("signal.refusal.queued", {
+        agentName: sel.name, submissionId: composed.submissionId, stored: sent.stored,
+      });
+      // `message_queued`, NOT `issuer_notified`. A directory node acked a sealed blob; the portal has
+      // not drained it, scanned it, minted it, or delivered anything to the issuer. Claiming the
+      // issuer was notified asserts four steps that have not happened.
+      //
+      // `stored` is carried through rather than collapsed into plain success: it is the ONE signal
+      // that separates a benign duplicate from single-node censorship (an operator pre-inserting
+      // garbage under a clear-text submission_id), and folding the two together destroys the only
+      // information that could ever tell them apart.
+      return {
+        ...refused, message_queued: true, stored: sent.stored, submission_id: composed.submissionId,
+        ...(sent.stored ? {} : { guidance: "The refusal is recorded and your message was accepted by a directory node, but that node reports it already held this submission id. If the issuer never receives it, re-run the refusal — re-sending is safe." }),
+      };
     } catch (err: unknown) {
       // A throw here must not un-refuse anything, and must not read as a clean refusal either.
       const reason = err instanceof Error ? err.message : String(err);
       logger.warn("signal.refusal.refused", { agentName: sel.name, reason });
-      return { ...refused, issuer_notified: false, message_error: reason,
+      return { ...refused, message_queued: false, message_error: reason,
         guidance: `The refusal is recorded. Your message was NOT sent: ${reason}` };
     }
   });

@@ -133,9 +133,14 @@ export interface ReceivedSignalRow extends ReceivedSignalInput {
  *
  *   issued_at / expires_at  — epoch **SECONDS**. These are ENVELOPE fields: they are HASHED, so the
  *                             protocol fixed the unit and we do not get to choose it.
- *   received_at / verified_at — epoch **MILLISECONDS** (`Date.now()`). Local bookkeeping only, never
+ *   received_at / verified_at / consent_notified_at
+ *                           — epoch **MILLISECONDS** (`Date.now()`). Local bookkeeping only, never
  *                             hashed, and matching the house convention of every other daemon table
- *                             (`contacts.added_at`, `sessions.updated_at`).
+ *                             (`contacts.added_at`, `sessions.updated_at`). A review read
+ *                             `consent_notified_at` as an outlier among "seconds" siblings and
+ *                             proposed converting it; that is backwards — it is not hashed and not
+ *                             compared against `expires_at`, so it belongs with this group. Named
+ *                             here so the next reader does not have to re-derive it.
  *
  * A factor-of-1000 error between them does not throw. Compared against a 1970 timestamp, every
  * expiry is still in the future — so the failure mode is an expired signal being cheerfully
@@ -824,13 +829,18 @@ export class TrustSignalStore {
     requireAgentPubkeyHex(agentPubkeyHex, "markConsentNotified");
     const res = this.#db
       .prepare(
+        // The predicate MUST match countUnnotifiedConsent's exactly. It did not: this omitted the
+        // status and expiry clauses, so it marked rows the counter never counted — the mark and the
+        // count drifting apart is precisely how an item goes quiet without ever being shown.
         `UPDATE wallet_trust_signals
             SET consent_notified_at = ?
           WHERE consent_state = 'pending'
             AND consent_notified_at IS NULL
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
             AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
       )
-      .run(Date.now(), agentPubkeyHex);
+      .run(Date.now(), Math.floor(Date.now() / 1000), agentPubkeyHex);
     const n = Number(res.changes);
     if (n > 0) this.#logger.info("signal.consent.notified", { agentPubkey: agentPubkeyHex.slice(0, 16), count: n });
     return n;

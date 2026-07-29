@@ -53,7 +53,7 @@ describe("M10B-D4 — refusing with a message", () => {
     // A silent refusal must tell Bob nothing — that is what keeps D-24 intact for anyone who wants
     // it. Sending "" would still deliver him a refusal notice, which is the opposite.
     expect(handler).toMatch(/\.trim\(\)/);
-    expect(handler).toMatch(/message\.length === 0.*issuer_notified: false/s);
+    expect(handler).toMatch(/message\.length === 0.*message_queued: false/s);
   });
 
   it("sends the message as the `refuse` op with the TARGET SIGNAL HASH as subject", () => {
@@ -61,6 +61,17 @@ describe("M10B-D4 — refusing with a message", () => {
     expect(handler).toMatch(/subject: item\.signalHash/);
     // Never the endorsement body and never a type string — the discriminator is the protocol verb.
     expect(handler).not.toMatch(/"endorsement"/);
+  });
+
+  it("never claims the ISSUER was notified — a directory ack is not a delivery", () => {
+    // `issuer_notified: true` asserted four steps that had not happened: the portal had not drained
+    // the queue, scanned it, minted anything, or delivered anything. The only true statement at this
+    // point is that a directory node accepted a sealed blob.
+    expect(handler).not.toMatch(/issuer_notified:/);
+    expect(handler).toMatch(/message_queued: true/);
+    // And `stored` survives: it is the one signal separating a benign duplicate from single-node
+    // censorship, and collapsing it into plain success destroys that distinction permanently.
+    expect(handler).toMatch(/stored: sent\.stored/);
   });
 
   it("the message is inside the signed TBS — the issuer cannot be shown different words", () => {

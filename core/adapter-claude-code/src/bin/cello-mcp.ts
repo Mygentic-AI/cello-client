@@ -200,6 +200,43 @@ server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=bloc
   return jsonText(result);
 });
 
+// ─── DOD-END-SURFACE-1 — the wallet's own trust signals, at MCP parity with `cello trust-signals`.
+// These existed on the CLI only, which is the DOD-SETTINGS-SURFACE-1 mistake: an agent driving CELLO
+// through MCP could hold signals it could neither read nor control.
+
+server.tool("cello_trust_signals_list", "List the trust signals held in this wallet — verifiable claims about you (GitHub account age, phone, email, endorsements from others) that are presented to contacts during sessions. Each row carries TWO independent answers: `status` is the directory's (is the notarization live) and `consent_state` is yours (may it be shown at all). Only an 'accepted' signal is presentable, whatever `default_present` says.", {}, async () => {
+  const result = await proxy.call("wallet_list_signals", {});
+  return jsonText(result);
+});
+
+server.tool("cello_trust_signals_view", "Decode and display one trust signal's full payload — the actual claim, its issuer, and its framing. For a signal someone else issued ABOUT you, this is the text you are being asked to stand behind; read it before accepting.", {
+  hash_prefix: z.string().describe("The signal hash, or a prefix of it (min 8 hex chars), as shown by cello_trust_signals_list"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("wallet_view_signal", { hash_prefix });
+  return jsonText(result);
+});
+
+server.tool("cello_trust_signals_enable", "Include a signal in the default presentation bundle sent to contacts. This controls DEFAULT PRESENTATION only — it cannot make a pending or refused signal presentable, because consent is the prior question.", {
+  hash_prefix: z.string().describe("The signal hash, or a prefix of it (min 8 hex chars)"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("wallet_enable_signal", { hash_prefix });
+  return jsonText(result);
+});
+
+server.tool("cello_trust_signals_disable", "Exclude a signal from the default presentation bundle. The signal is kept and stays valid — this is about what you routinely show, not about retracting anything.", {
+  hash_prefix: z.string().describe("The signal hash, or a prefix of it (min 8 hex chars)"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("wallet_disable_signal", { hash_prefix });
+  return jsonText(result);
+});
+
+server.tool("cello_trust_signals_revoke", "Tombstone a signal at the directory AND delete it locally. This is the correct way to retract a signal: the directory stops delivering it to other agents. It is NOT reversible and it is not the same as disabling — disable hides it from your default bundle, revoke destroys it.", {
+  hash_prefix: z.string().describe("The signal hash, or a prefix of it (min 8 hex chars)"),
+}, async ({ hash_prefix }) => {
+  const result = await proxy.call("wallet_revoke_signal", { hash_prefix });
+  return jsonText(result);
+});
+
 // ─── DOD-END-SURFACE-1 — consent verbs (M10B) ──────────────────────────────────────────────────
 // An endorsement someone wrote ABOUT this agent does not become visible to a counterparty until the
 // agent accepts it. These three are that decision. All are scoped to the CURRENTLY SELECTED agent —

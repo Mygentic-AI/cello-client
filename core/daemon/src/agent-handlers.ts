@@ -397,7 +397,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     //
     // COUNT ONLY, and do NOT mark notified here. Marking on selection would mark them told about
     // something they were never shown — the nudge says a number, the LIST is what shows the items,
-    // and `consent_list_pending` is what records that they saw it. The two lifetimes stay separate
+    // and `cello_consent_list` is what records that they saw it. The two lifetimes stay separate
     // (M10B-D5): the notification goes quiet once seen, the ITEMS persist until decided.
     //
     // A failure here must NOT break selection, for the same reason the registration read above does

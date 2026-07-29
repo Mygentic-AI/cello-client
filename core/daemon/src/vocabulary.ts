@@ -69,6 +69,12 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_contact_set_tier", cli: "cello contact <pubkey> set-tier" },
   { mcp: "cello_contact_set_away", cli: "cello contact <pubkey> set-away" },
   { mcp: "cello_contact_set_moniker", cli: "cello contact <pubkey> set-moniker" },
+  // The wallet's own trust signals (M10B / DOD-END-SURFACE-1 — CLI-only until now)
+  { mcp: "cello_trust_signals_list", cli: "cello trust-signals list" },
+  { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
+  { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
+  { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
+  { mcp: "cello_trust_signals_revoke", cli: "cello trust-signals revoke" },
   // Consent (M10B / DOD-END-SURFACE-1) — deciding on signals others issued ABOUT this agent
   { mcp: "cello_consent_list", cli: "cello consent list" },
   { mcp: "cello_consent_accept", cli: "cello consent accept" },
@@ -232,12 +238,21 @@ export function toCliGuidance(text: string): string {
 export type ClientSurface = "cli" | "mcp";
 
 /**
- * The response keys that carry an INSTRUCTION TO A HUMAN — the ones that name a command to run.
+ * Does this response key carry an INSTRUCTION TO A HUMAN — one that names a command to run?
  *
- * `reason` is deliberately absent and must stay absent: it is a machine-readable code that scripts
- * branch on (`reason === "session_not_current"`). Rewriting it would silently break every caller.
+ * A SUFFIX RULE, not a fixed set, and that is the whole point. It was a set of three literals until
+ * `pending_consent_guidance` was added by a handler that had no idea a registry existed; the key was
+ * therefore not rewritten, and a CLI operator was told to run `cello_consent_list` — a thing you
+ * cannot type. The class of bug is "someone invents a new *_guidance key", so the fix has to close
+ * the class: any key ending in `guidance` is an instruction, whatever its prefix.
+ *
+ * `reason` is deliberately excluded and must stay excluded: it is a machine-readable code that
+ * scripts branch on (`reason === "session_not_current"`). Rewriting it would silently break every
+ * caller.
  */
-const INSTRUCTION_KEYS = new Set(["guidance", "warning_guidance", "notice"]);
+function isInstructionKey(key: string): boolean {
+  return key === "notice" || key.endsWith("guidance");
+}
 
 /**
  * Render a handler's response for the surface that asked.
@@ -273,7 +288,7 @@ function renderCli(value: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const [key, v] of Object.entries(record)) {
     let next: unknown = v;
-    if (INSTRUCTION_KEYS.has(key) && typeof v === "string") {
+    if (isInstructionKey(key) && typeof v === "string") {
       next = toCliGuidance(v);
     } else if (v !== null && typeof v === "object") {
       next = renderCli(v);

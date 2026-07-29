@@ -209,3 +209,87 @@ describe("DOD-END-SUBMIT-1 — INV-ZEROBUMP", () => {
     expect(body.op).toBe("withdraw");
   });
 });
+
+/**
+ * M10B-D4 / DOD-END-SURFACE-1 — the refusal message, exercised through the REAL composer.
+ *
+ * The handler-side test for this is a source audit, and a review showed four wrong implementations
+ * that pass it — including one that seals with a DIFFERENT agent's key provider, which is the
+ * attribution claim itself. These go through compose → seal → open → decode, so the assertions are
+ * about bytes rather than about the shape of the source.
+ */
+describe("M10B-D4 — a refusal rides the same sealed path", () => {
+  const refuse = (over: Record<string, unknown> = {}) =>
+    compose({
+      op: "refuse",
+      subject: "bb".repeat(32), // the TARGET SIGNAL HASH, not a pubkey
+      body: "This says I led the migration; I reviewed it. Happy to be endorsed for the review.",
+      ...over,
+    });
+
+  it("round-trips the operator's message byte-for-byte", async () => {
+    const res = await refuse();
+    if (!res.ok) throw new Error(`expected ok, got ${res.reason}`);
+    const { body } = decodeSubmission(openSealed(intakeSeed, res.ciphertext)!);
+    expect(body.op).toBe("refuse");
+    expect(body.subject).toBe("bb".repeat(32));
+    // What Alice typed is what Bob reads. An implementation that passed `body: ""` — one of the
+    // bypasses the source audit could not see — fails here.
+    expect(body.body).toBe("This says I led the migration; I reviewed it. Happy to be endorsed for the review.");
+  });
+
+  it("attributes the submission to the SIGNING key, and to nothing else", async () => {
+    // INV-ATTRIBUTION at the byte level. The compile-time guard proves no OVERRIDE parameter exists;
+    // it cannot prove the right provider was passed. Compose with a second identity and assert the
+    // two submissions carry different, correct submitter_pubkeys.
+    const other = new InMemoryKeyProvider(new Uint8Array(randomBytes(32)));
+    const mine = await refuse();
+    const theirs = await refuse({ keyProvider: other });
+    if (!mine.ok || !theirs.ok) throw new Error("expected both to compose");
+
+    const a = decodeSubmission(openSealed(intakeSeed, mine.ciphertext)!).body;
+    const b = decodeSubmission(openSealed(intakeSeed, theirs.ciphertext)!).body;
+    expect(a.submitter_pubkey).toBe(Buffer.from(await submitter.getPublicKey()).toString("hex"));
+    expect(b.submitter_pubkey).toBe(Buffer.from(await other.getPublicKey()).toString("hex"));
+    expect(a.submitter_pubkey).not.toBe(b.submitter_pubkey);
+    // And the signature verifies against the claimed key — a body claiming P with any other
+    // signature proves nothing (RFC 8032: Ed25519 has no key recovery).
+    const signed = decodeSubmission(openSealed(intakeSeed, mine.ciphertext)!);
+    expect(verify(Buffer.from(a.submitter_pubkey, "hex"), buildSubmissionTbs(a), signed.signature)).toBe(true);
+  });
+
+  it("REFUSES on an EXPIRED manifest — a startup check does not stay true forever", async () => {
+    // The manifest is verified once at daemon start and held for the process lifetime. Three weeks
+    // later its window may have closed and the portal may have rotated the intake key, while the
+    // key itself is still present and well-formed — so the presence checks all pass and the message
+    // is sealed to a retired key. The portal cannot open it and cannot attribute it: it vanishes
+    // with no error anywhere, after the operator was told it was sent.
+    const res = await refuse({
+      manifest: manifest({ expires: "2026-01-02T00:00:00Z" }),
+      nowMs: () => Date.parse("2026-07-29T00:00:00Z"),
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("manifest_expired");
+    // Names the manifest and the expiry instant — an operator would never guess "consortium
+    // manifest" from a message that simply failed to arrive.
+    expect(res.guidance).toContain("2026-01-02T00:00:00Z");
+    expect(res.guidance).toMatch(/manifest/i);
+  });
+
+  it("composes when the manifest is still inside its window — the gate is not just 'always refuse'", async () => {
+    const res = await refuse({
+      manifest: manifest({ expires: "2027-01-01T00:00:00Z" }),
+      nowMs: () => Date.parse("2026-07-29T00:00:00Z"),
+    });
+    expect(res.ok).toBe(true);
+  });
+
+  it("REFUSES an unparseable expiry rather than treating it as valid", async () => {
+    // §5a: an unrecognised shape is refused, never read as "no expiry, therefore fine".
+    const res = await refuse({ manifest: manifest({ expires: "not-a-date" }) });
+    expect(res.ok).toBe(false);
+    if (res.ok) throw new Error("unreachable");
+    expect(res.reason).toBe("manifest_expired");
+  });
+});

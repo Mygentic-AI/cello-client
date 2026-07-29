@@ -52,6 +52,7 @@ const INTAKE_PUBKEY_RE = /^[0-9a-f]{64}$/;
  */
 export type SubmissionRefusalReason =
   | "manifest_unavailable"
+  | "manifest_expired"
   | "intake_key_absent"
   | "intake_key_malformed";
 
@@ -68,6 +69,9 @@ export type ComposeSubmissionResult =
       ciphertext: Uint8Array;
     }
   | { ok: false; reason: SubmissionRefusalReason; guidance: string };
+
+/** Epoch millis, injectable so the expiry check is testable without waiting three weeks. */
+export type NowMs = () => number;
 
 export interface ComposeSubmissionOptions {
   /** The VERIFIED consortium manifest, or null if none is loaded. Officer-signed, which is why it is
@@ -87,6 +91,8 @@ export interface ComposeSubmissionOptions {
   /** Integer epoch SECONDS. Inside the signed body, so the verifier's clock-skew bound applies. */
   issuedAt: number;
   logger: Logger;
+  /** Injectable clock for the manifest-expiry gate. Defaults to `Date.now`. */
+  nowMs?: NowMs;
 }
 
 /**
@@ -138,6 +144,37 @@ export async function composeSealedSubmission(
       guidance:
         "No verified consortium manifest is loaded, so the portal's intake key is unknown. " +
         "A submission is never sent unsealed. Check the daemon's manifest configuration and retry.",
+    };
+  }
+
+  // THE MANIFEST IS A STARTUP SNAPSHOT, AND ITS VALIDITY IS TIME-LIMITED.
+  //
+  // `verifyStartupManifest` checked the signatures, the window and the anti-rollback ONCE, at daemon
+  // start, and the daemon then holds that object for its whole lifetime — nothing refreshes it. So
+  // the startup gate's guarantee decays: three weeks later the window may have closed and the portal
+  // may have rotated the intake key, while this code would still happily seal to the retired one.
+  //
+  // The operator would be told the message was sent. The portal could not open it. By this module's
+  // own definition that arrives as unattributable POISON with no reply possible — the message simply
+  // vanishes, with no error anywhere. An EXPIRED input is an UNVERIFIED input (§5a), so it refuses
+  // and names the cause rather than trusting a check whose expiry has passed.
+  const now = (opts.nowMs ?? Date.now)();
+  const expiresAt = Date.parse(manifest.expires);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    logger.warn("signal.submission.refused", {
+      reason: "manifest_expired",
+      manifestVersion: manifest.version,
+      expiresAt: manifest.expires,
+      op: opts.op,
+    });
+    return {
+      ok: false,
+      reason: "manifest_expired",
+      guidance:
+        `The consortium manifest verified at daemon start (v${manifest.version}) expired at ` +
+        `${manifest.expires}, so its portal intake key can no longer be trusted — sealing to a ` +
+        "retired key produces a message the portal cannot open and cannot even attribute. " +
+        "Restart the daemon to load and verify a current manifest, then retry.",
     };
   }
 
@@ -225,7 +262,12 @@ export type SubmissionSendFailure =
   | "directory_unreachable"
   | "submission_write_timeout"
   | "submission_unsupported_by_node"
-  | "submission_refused_by_node";
+  | "submission_refused_by_node"
+  // The two the TRANSPORT returns. They were missing while the code cast `sent.reason` into this
+  // union, which made the declared type a lie a consumer could branch on: an operator surface that
+  // switched on this union would have no case for either of the values it most often receives.
+  | "signaling_reconnecting"
+  | "signaling_lost";
 
 export type SendSubmissionResult =
   | {

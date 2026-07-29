@@ -36,6 +36,7 @@ import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildChannelParams } from "../channel-params.js";
+import { DUAL_SURFACE_VERBS } from "@cello-protocol/daemon";
 
 setupV3Tests();
 
@@ -158,5 +159,19 @@ describe("AC-008: SKILL.md references M1 tools and not M0-removed tools", () => 
     expect(content).not.toContain("cello_list_sessions");
     expect(content).not.toContain("cello_get_sealed_receipt");
     expect(content).not.toContain("cello_receive_session");
+  });
+
+  /**
+   * The check above names a FIXED SAMPLE of live tools, so it passes vacuously for anything added
+   * later — which is how five trust-signal tools and three consent verbs shipped in the tarball with
+   * SKILL.md silent about all eight. An agent driving CELLO over MCP reads this file to learn what
+   * it can call; a capability missing here is a capability that does not exist as far as it knows.
+   *
+   * Driven off the vocabulary instead of a sample, so a new tool fails this until it is documented.
+   */
+  it("documents EVERY dual-surface tool — no sampling", async () => {
+    const content = await readFile(join(__dirname, "../../SKILL.md"), "utf-8");
+    const undocumented = DUAL_SURFACE_VERBS.map((v) => v.mcp).filter((m) => !content.includes(m));
+    expect(undocumented, `SKILL.md ships in the connect tarball and omits: ${undocumented.join(", ")}`).toEqual([]);
   });
 });
