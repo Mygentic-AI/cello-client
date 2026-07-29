@@ -74,11 +74,21 @@ async function bootDaemon(celloDir: string, waitFor: string, timeoutMs = 30_000)
 async function stopDaemon(d: BootedDaemon): Promise<void> {
   if (d.child.exitCode !== null) return;
   d.child.kill("SIGTERM");
-  const deadline = Date.now() + 10_000;
+  // 5s, not 10s: this runs inside afterEach, and a graceful-exit budget that equals the hook's own
+  // budget can never fit inside it. A daemon that has not gone in 5s is not going gracefully.
+  const deadline = Date.now() + 5_000;
   while (Date.now() < deadline && d.child.exitCode === null) {
     await new Promise((r) => setTimeout(r, 100));
   }
-  if (d.child.exitCode === null) d.child.kill("SIGKILL");
+  if (d.child.exitCode === null) {
+    d.child.kill("SIGKILL");
+    // Do not return while the process is still dying — the next test mkdtemps a new CELLO_DIR, but
+    // a surviving daemon still holds this one's sidecar and store locks.
+    const hard = Date.now() + 3_000;
+    while (Date.now() < hard && d.child.exitCode === null) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
 }
 
 describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => {
@@ -95,10 +105,14 @@ describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "cello-m9c-gate-"));
   });
+  // EXPLICIT timeout. vitest gives a hook 10s by default, and this one stops a real daemon process
+  // and its spawned sidecar — which on a loaded CI runner takes longer than a local machine ever
+  // shows. The failure mode is a hook timeout that reads as a broken test rather than a slow one,
+  // and it fails the Build step that gates publishing.
   afterEach(async () => {
     if (booted) { await stopDaemon(booted); booted = undefined; }
     await rm(dir, { recursive: true, force: true });
-  });
+  }, 30_000);
 
   it("announces mode:'enforcing' at boot — the field an operator greps, from a stock install", async () => {
     booted = await bootDaemon(dir, "security.gateway.connected");
