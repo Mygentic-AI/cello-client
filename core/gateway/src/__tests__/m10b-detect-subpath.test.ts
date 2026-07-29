@@ -100,15 +100,21 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
     // disposition that never refuses anything, and its tests would still pass.
     const mod = await import("../detect/index.js");
     expect(Object.keys(mod).sort()).toEqual([
+      // M10B-D15: the corpus-introspection exports expose WHICH RULES ARE ACTIVE, which is what
+      // lets the portal DERIVE `scanner_version` rather than hand-maintain a constant that goes
+      // stale the first time someone edits a regex. And `initLinearRegex` is here because the
+      // corpus CANNOT COMPILE without it — omitting it made this subpath look complete while being
+      // unusable: compileInjectionPatterns runs, leaves `compiled` null, and every rule silently
+      // matches nothing, which is the degrade-open behaviour fail-closed intake must not inherit.
+      // None of them judges anything, so M10B-D16 holds: the corpus is shared, the policy is the
+      // portal's.
       "compileInjectionPatterns",
       "compileSecretRules",
-      // M10B-D15: the three corpus-introspection exports. They expose WHICH RULES ARE ACTIVE, which
-      // is what lets the portal DERIVE `scanner_version` instead of hand-maintaining a constant that
-      // goes stale the first time someone edits a regex. Still not a verdict — none of them judges
-      // anything, so M10B-D16 (the corpus is shared, the policy is the portal's) is intact.
       "detectorCorpusDigest",
+      "initLinearRegex",
       "injectionPatternIds",
       "injectionPatternsReady",
+      "linearRegexEngine",
       "redactSecrets",
       "scanInjectionPatterns",
       "secretRuleIds",

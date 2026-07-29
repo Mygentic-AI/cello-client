@@ -32,4 +32,12 @@
 export { compileInjectionPatterns, injectionPatternsReady, scanInjectionPatterns, injectionPatternIds } from "./injection-patterns.js";
 export { compileSecretRules, secretRulesReady, redactSecrets, secretRuleIds } from "./secrets.js";
 export { detectorCorpusDigest } from "./corpus-digest.js";
+/**
+ * The RE2 engine initializer, exported because THE CORPUS CANNOT COMPILE WITHOUT IT. Omitting it
+ * made this subpath look complete while being unusable: `compileInjectionPatterns` runs, leaves
+ * `compiled` null, and every rule silently matches nothing — the exact degrade-open behaviour a
+ * fail-closed intake must never inherit. A consumer has no other way to reach it, since the exports
+ * map deliberately offers no deep-import escape.
+ */
+export { initLinearRegex, linearRegexEngine } from "./linear-regex.js";
 export type { SecretFinding, SecretScanResult } from "./secrets.js";
