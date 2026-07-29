@@ -16,6 +16,18 @@ export type {
   SignalIssuerKind,
 } from "./trust-signal.js";
 
+// M10B / DOD-END-SUBMIT-1 — the sealed submission wire contract (M10B-D2). ONE implementation,
+// because the daemon signs these bytes and the portal verifies and re-derives them; a byte-identical
+// local copy on each side is how two implementations drift into disagreeing (M10B-D28).
+export {
+  SUBMISSION_DOMAIN,
+  buildSubmissionTbs,
+  encodeSubmission,
+  decodeSubmission,
+  submissionId,
+} from "./submission.js";
+export type { SubmissionBody, SubmissionOp, SignedSubmission } from "./submission.js";
+
 export type {
   MessageEnvelope,
   MessageEnvelopeV1,

@@ -75,6 +75,21 @@ export interface OfficerSignature {
 }
 
 /** The full consortium manifest with threshold signatures. */
+/**
+ * The portal's intake encryption key, as published in the manifest (M10B-D11).
+ *
+ * OPTIONAL, and a daemon that does not find it must REFUSE to submit and name the reason — never
+ * fall back to sending unsealed (§5a ABSENT IS NOT FINE). An unsealed submission hands the directory
+ * every endorsement in the clear, which is the one property the sealed queue exists to provide.
+ */
+export interface ManifestIntakeKey {
+  /** Which key this is. Recorded on every queue row, so a rotated-out private key can be retained
+   *  until no undrained row references it — retention driven by the queue, not by a timer. */
+  key_id: string;
+  /** Ed25519 public key, hex. Submissions are sealed to this. */
+  pubkey: string;
+}
+
 export interface ConsortiumManifest {
   version: number;
   /** ISO 8601 timestamp — manifest is not valid before this time. */
@@ -83,6 +98,19 @@ export interface ConsortiumManifest {
   expires: string;
   nodes: ConsortiumNode[];
   signatures: OfficerSignature[];
+  /**
+   * M10B-D11 — the portal's intake key. Additive and optional: manifests written before it still
+   * verify byte-for-byte, because `canonicalManifestBody` builds the signed body from
+   * `Object.keys(manifest)` minus `signatures`, an OPEN field set. So a new top-level field is
+   * automatically covered by the officer signatures — which is the whole reason the manifest is the
+   * right channel for a SEALING key. An unauthenticated channel (a `/bootstrap` route, client
+   * config) is not a shortcut here: a substituted intake key means every endorsement is sealed to
+   * the attacker.
+   *
+   * Rotation is a manifest version bump the daemon's existing poll rolls forward, under its
+   * `manifest_version_rollback` guard.
+   */
+  intake_key?: ManifestIntakeKey;
 }
 
 /** Distinct error codes for manifest verification failures. */
