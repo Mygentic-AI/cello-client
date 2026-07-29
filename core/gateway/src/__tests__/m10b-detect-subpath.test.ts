@@ -102,9 +102,16 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
     expect(Object.keys(mod).sort()).toEqual([
       "compileInjectionPatterns",
       "compileSecretRules",
+      // M10B-D15: the three corpus-introspection exports. They expose WHICH RULES ARE ACTIVE, which
+      // is what lets the portal DERIVE `scanner_version` instead of hand-maintaining a constant that
+      // goes stale the first time someone edits a regex. Still not a verdict — none of them judges
+      // anything, so M10B-D16 (the corpus is shared, the policy is the portal's) is intact.
+      "detectorCorpusDigest",
+      "injectionPatternIds",
       "injectionPatternsReady",
       "redactSecrets",
       "scanInjectionPatterns",
+      "secretRuleIds",
       "secretRulesReady",
     ]);
   });

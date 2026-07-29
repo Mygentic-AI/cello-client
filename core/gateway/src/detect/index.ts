@@ -29,6 +29,7 @@
  * tests and never refuses anything (`M10B-D16`). The corpus is shared; the policy is the portal's.
  */
 
-export { compileInjectionPatterns, injectionPatternsReady, scanInjectionPatterns } from "./injection-patterns.js";
-export { compileSecretRules, secretRulesReady, redactSecrets } from "./secrets.js";
+export { compileInjectionPatterns, injectionPatternsReady, scanInjectionPatterns, injectionPatternIds } from "./injection-patterns.js";
+export { compileSecretRules, secretRulesReady, redactSecrets, secretRuleIds } from "./secrets.js";
+export { detectorCorpusDigest } from "./corpus-digest.js";
 export type { SecretFinding, SecretScanResult } from "./secrets.js";
