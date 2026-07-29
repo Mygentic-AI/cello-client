@@ -422,12 +422,12 @@ export function settingsSet(celloDir: string, key: string, value: string, opts: 
 
 /** `cello config list` → every guard with its value AND its governance (version, direction, confirmed). */
 export function gatewayConfigList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_gateway_config_list", {}, opts, false);
+  return ipcCommand(celloDir, "cello_config_list", {}, opts, false);
 }
 
 /** `cello config get <key>` → one guard, plus whether its version chain still verifies. */
 export function gatewayConfigGet(celloDir: string, key: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, "cello_gateway_config_get", { key }, opts, false);
+  return ipcCommand(celloDir, "cello_config_get", { key }, opts, false);
 }
 
 /**
@@ -450,7 +450,7 @@ export function gatewayConfigSet(
   prompt: (question: string) => Promise<boolean> = confirmAtTty,
 ): Promise<CliOutput> {
   return withDaemon(celloDir, opts, false, async (client) => {
-    const first = (await client.send("cello_gateway_config_set", { key, value })) as Record<string, unknown>;
+    const first = (await client.send("cello_config_set", { key, value })) as Record<string, unknown>;
     if (first.reason !== "needs_confirmation") return first;
 
     const agreed = await prompt(
@@ -464,7 +464,7 @@ export function gatewayConfigSet(
       // absence of a stored row is the proof.
       return { ok: false, reason: "declined", guidance: `'${key}' was NOT changed.` };
     }
-    return (await client.send("cello_gateway_config_set", { key, value, confirmed: true })) as Record<string, unknown>;
+    return (await client.send("cello_config_set", { key, value, confirmed: true })) as Record<string, unknown>;
   });
 }
 

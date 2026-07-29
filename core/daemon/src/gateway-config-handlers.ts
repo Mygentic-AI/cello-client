@@ -107,7 +107,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
 
   // Read the whole surface. Shows the GOVERNANCE, not just the value (M9C-D18): after an incident
   // the question is not "what is this set to" but "who weakened it, and did a human agree".
-  handlers.set("cello_gateway_config_list", async () =>
+  handlers.set("cello_config_list", async () =>
     withStore((store) => ({
       ok: true,
       config: GATEWAY_CONFIG_KEYS.map((key) => {
@@ -128,7 +128,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     })),
   );
 
-  handlers.set("cello_gateway_config_get", async (params) => {
+  handlers.set("cello_config_get", async (params) => {
     const key = typeof params?.key === "string" ? params.key : undefined;
     if (!key || !(GATEWAY_CONFIG_KEYS as readonly string[]).includes(key)) {
       return {
@@ -153,7 +153,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     });
   });
 
-  handlers.set("cello_gateway_config_set", async (params, connectionId) => {
+  handlers.set("cello_config_set", async (params, connectionId) => {
     const key = typeof params?.key === "string" ? params.key : undefined;
     if (!key || !(GATEWAY_CONFIG_KEYS as readonly string[]).includes(key)) {
       return { ok: false, reason: "unknown_key", guidance: `Provide one of: ${GATEWAY_CONFIG_KEYS.join(", ")}.` };

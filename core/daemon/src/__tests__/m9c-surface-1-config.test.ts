@@ -51,7 +51,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
   it("INV-10: an MCP caller CANNOT loosen a guard — refused, and NO row is written", async () => {
-    const res = await call("cello_gateway_config_set", { key: "autonomous_override", value: true }, "mcp-conn");
+    const res = await call("cello_config_set", { key: "autonomous_override", value: true }, "mcp-conn");
     expect(res.ok).toBe(false);
     expect(res.reason).toBe("loosen_requires_cli");
     expect(String(res.guidance)).toContain("cello config set autonomous_override");
@@ -65,7 +65,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   });
 
   it("a CLI caller without confirmation is refused with needs_confirmation — and still writes no row", async () => {
-    const res = await call("cello_gateway_config_set", { key: "autonomous_override", value: true });
+    const res = await call("cello_config_set", { key: "autonomous_override", value: true });
     expect(res.ok).toBe(false);
     expect(res.reason).toBe("needs_confirmation");
     expect(res.direction).toBe("loosen");
@@ -76,7 +76,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   });
 
   it("a CONFIRMED loosening from the CLI applies, is marked confirmed, and restarts the sidecar", async () => {
-    const res = await call("cello_gateway_config_set", { key: "autonomous_override", value: true, confirmed: true });
+    const res = await call("cello_config_set", { key: "autonomous_override", value: true, confirmed: true });
     expect(res.ok).toBe(true);
     expect(res.direction).toBe("loosen");
     expect(res.confirmed).toBe(true);
@@ -92,8 +92,8 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   });
 
   it("a TIGHTENING needs no confirmation — from MCP too", async () => {
-    await call("cello_gateway_config_set", { key: "autonomous_override", value: true, confirmed: true });
-    const res = await call("cello_gateway_config_set", { key: "autonomous_override", value: false }, "mcp-conn");
+    await call("cello_config_set", { key: "autonomous_override", value: true, confirmed: true });
+    const res = await call("cello_config_set", { key: "autonomous_override", value: false }, "mcp-conn");
     expect(res.ok).toBe(true);
     expect(res.direction).toBe("tighten");
     expect(res.confirmed).toBe(false);
@@ -101,7 +101,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
 
   it("a restart failure reports STORED BUT NOT APPLIED — never a bare ok", async () => {
     restartFails = true;
-    const res = await call("cello_gateway_config_set", { key: "autonomous_override", value: true, confirmed: true });
+    const res = await call("cello_config_set", { key: "autonomous_override", value: true, confirmed: true });
     // The change IS stored (the row exists), so ok:true is honest — but the operator must not
     // believe the running gateway changed.
     expect(res.ok).toBe(true);
@@ -111,8 +111,8 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   });
 
   it("list reports the GOVERNANCE — value, version, direction, confirmed — and null for unset", async () => {
-    await call("cello_gateway_config_set", { key: "rate_max_per_window", value: 10 });
-    const res = await call("cello_gateway_config_list", {});
+    await call("cello_config_set", { key: "rate_max_per_window", value: 10 });
+    const res = await call("cello_config_list", {});
     const rows = res.config as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(5);
     const rate = rows.find((r) => r.key === "rate_max_per_window")!;
@@ -126,34 +126,34 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
   });
 
   it("each refusal names its own cause — unknown key and bad value never share one label", async () => {
-    const unknown = await call("cello_gateway_config_set", { key: "not_a_key", value: 1 });
+    const unknown = await call("cello_config_set", { key: "not_a_key", value: 1 });
     expect(unknown.reason).toBe("unknown_key");
-    const bad = await call("cello_gateway_config_set", { key: "rate_max_per_window", value: "banana" });
+    const bad = await call("cello_config_set", { key: "rate_max_per_window", value: "banana" });
     expect(bad.reason).toBe("invalid_value");
-    const missing = await call("cello_gateway_config_set", { key: "rate_max_per_window" });
+    const missing = await call("cello_config_set", { key: "rate_max_per_window" });
     expect(missing.reason).toBe("missing_params");
   });
 
   it("get reports the value plus its chain validity", async () => {
-    await call("cello_gateway_config_set", { key: "rate_window_ms", value: 120000 });
-    const res = await call("cello_gateway_config_get", { key: "rate_window_ms" });
+    await call("cello_config_set", { key: "rate_window_ms", value: 120000 });
+    const res = await call("cello_config_get", { key: "rate_window_ms" });
     expect(res.ok).toBe(true);
     expect(res.value).toBe(120000);
     expect(res.chainValid).toBe(true);
   });
 
   it("a comma-separated list is parsed, and an EMPTY string clears rather than storing an empty member", async () => {
-    const set = await call("cello_gateway_config_set", {
+    const set = await call("cello_config_set", {
       key: "pii_whitelist", value: "me@example.com, you@example.com", confirmed: true,
     });
     expect(set.ok).toBe(true);
-    const got = await call("cello_gateway_config_get", { key: "pii_whitelist" });
+    const got = await call("cello_config_get", { key: "pii_whitelist" });
     expect(got.value).toEqual(["me@example.com", "you@example.com"]);
 
-    const cleared = await call("cello_gateway_config_set", { key: "pii_whitelist", value: "" });
+    const cleared = await call("cello_config_set", { key: "pii_whitelist", value: "" });
     expect(cleared.ok).toBe(true);
     expect(cleared.direction).toBe("tighten"); // removing members tightens
-    const after = await call("cello_gateway_config_get", { key: "pii_whitelist" });
+    const after = await call("cello_config_get", { key: "pii_whitelist" });
     expect(after.value).toEqual([]);
   });
 });
