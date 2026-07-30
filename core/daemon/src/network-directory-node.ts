@@ -620,6 +620,46 @@ export async function bootstrapNetworkKeyShares(
  * @param opts.threshold - minimum signers required (t in t-of-n)
  * @param opts.directoryNodes - the n directory nodes (each will hold a share)
  */
+/**
+ * Refuse a DKG whose participants do not hold DISTINCT FROST identifiers.
+ *
+ * A node's identifier is derived from its OWN deployed `NODE_ID`, not from the manifest entry naming
+ * it — so two entries with distinct nodeIds, deployed on boxes that share one `NODE_ID`, collide here
+ * and pass every string comparison in the consortium. Two participants sharing an identifier are ONE
+ * participant, so the quorum is smaller than it looks.
+ *
+ * `DKG.round2` does reject this (`@noble/curves` throws `Duplicate id=…`), so the value here is
+ * DIAGNOSIS, not detection: that throw arrives from inside a crypto library and has to survive every
+ * catch between there and the operator — one of which was discarding it entirely until recently.
+ * Refusing here names the cause while the participant list is still in hand.
+ *
+ * Exported for test: the call site can only be reached through a live multi-node DKG, so the logic is
+ * proven here and its PLACEMENT (before round 2, and before the share-routing map that would silently
+ * merge two colliding participants' shares) is a review property.
+ *
+ * @param identifiers round-1 identifiers, in participant order
+ * @param describe    names participant `i` for the message — index 0 is the client
+ */
+export function assertDistinctFrostIdentifiers(
+  identifiers: readonly string[],
+  describe: (index: number) => string,
+): void {
+  const seen = new Map<string, number>();
+  for (let i = 0; i < identifiers.length; i++) {
+    const id = identifiers[i]!;
+    const prev = seen.get(id);
+    if (prev !== undefined) {
+      throw new Error(
+        `DKG round 1 produced a DUPLICATE FROST identifier: ${describe(prev)} and ${describe(i)} both ` +
+          `derived ${id.slice(0, 24)}… — two participants sharing one identifier are one participant, ` +
+          `so the quorum is smaller than it looks. Most likely two directory nodes are deployed with ` +
+          `the same NODE_ID.`,
+      );
+    }
+    seen.set(id, i);
+  }
+}
+
 export async function runNetworkDkg(
   agentPubkey: Uint8Array,
   opts: {
@@ -673,30 +713,13 @@ export async function runNetworkDkg(
   // allRound1 = client + all directory node broadcasts
   const allRound1: DkgRound1Broadcast[] = [clientRound1Broadcast, ...nodeRound1Broadcasts];
 
-  // DOD-INV-NODEID, enforced where it is actually decidable. Every check upstream compares MANIFEST
-  // nodeId strings, but a node's FROST identifier is derived from its OWN deployed NODE_ID
-  // (directory-side `frost-handler.ts`). So two entries with DISTINCT nodeIds, deployed on boxes that
-  // share one NODE_ID, collide here and pass every string check in the consortium.
-  //
-  // These are the identifiers actually in play, so this is the first point where the collapse is
-  // visible. `DKG.round2` below does reject it — @noble/curves throws `Duplicate id=…` — but as an
-  // exception from inside a crypto library, which then had to survive every catch between here and
-  // the operator. Refusing here names the cause while the node list is still in hand.
-  const seenIdentifiers = new Map<string, number>();
-  for (let i = 0; i < allRound1.length; i++) {
-    const prev = seenIdentifiers.get(allRound1[i]!.identifier);
-    if (prev !== undefined) {
-      // Index 0 is the client; 1..n are opts.directoryNodes[0..n-1].
-      const who = (idx: number) => (idx === 0 ? "the client" : `directory node ${opts.directoryNodes[idx - 1]?.id ?? idx}`);
-      throw new Error(
-        `DKG round 1 produced a DUPLICATE FROST identifier: ${who(prev)} and ${who(i)} both derived ` +
-          `${allRound1[i]!.identifier.slice(0, 24)}… — two participants sharing one identifier are one ` +
-          `participant, so the quorum is smaller than it looks. Most likely two directory nodes are ` +
-          `deployed with the same NODE_ID.`,
-      );
-    }
-    seenIdentifiers.set(allRound1[i]!.identifier, i);
-  }
+  // DOD-INV-NODEID, checked here because this is the first point where the identifiers ACTUALLY in
+  // play are visible — every check upstream compares manifest nodeId STRINGS. See
+  // `assertDistinctFrostIdentifiers`.
+  assertDistinctFrostIdentifiers(
+    allRound1.map((b) => b.identifier),
+    (idx) => (idx === 0 ? "the client" : `directory node ${opts.directoryNodes[idx - 1]?.id ?? idx}`),
+  );
 
   // ─── Round 2 ────────────────────────────────────────────────────────────────
   // Client runs DKG.round2 locally (receives others' round1 → generates shares for others).
