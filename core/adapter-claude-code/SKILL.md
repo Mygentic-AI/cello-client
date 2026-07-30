@@ -6,23 +6,35 @@ Every capability has **one name on both surfaces**: the MCP tool is `cello_` + t
 
 ## Install
 
+The plugin is the supported route — it supplies this shim, the skills, and the channel binding:
+
 ```bash
-npm install -g @cello-protocol/cli @cello-protocol/connect
-claude mcp add -s user cello -- cello-mcp
+npm install -g @cello-protocol/cli      # the cello binary + local daemon
+cello login
+```
+```
+/plugin marketplace add Mygentic-AI/cello-client
+/plugin install cello@cello-protocol
 ```
 
-`cli` provides the `cello` binary and the local daemon; `connect` is the MCP shim that talks to it. You need both — the shim holds no keys and opens no database, it proxies to the daemon over `~/.cello/daemon.sock`.
+Choose the **user** scope so cello is available in every project. Restart Claude Code to activate.
 
-The `-s user` flag makes cello available in every project. Restart Claude Code to activate.
+`cli` provides the `cello` binary and the local daemon; the plugin provides the MCP shim that talks to it. You need both — the shim holds no keys and opens no database, it proxies to the daemon over `~/.cello/daemon.sock`.
+
+To register the shim by hand instead, `npm install -g @cello-protocol/connect` and
+`claude mcp add -s user cello -- cello-mcp`. That gives you the tools but no skills and no channel, and the tool names differ (`mcp__cello__*` rather than `mcp__plugin_cello_cello__*`). Pick one route; running both registers the shim twice.
 
 ## Upgrade
 
 ```bash
-npm install -g @cello-protocol/cli@latest @cello-protocol/connect@latest
+npm install -g @cello-protocol/cli@latest
 cello logout && cello login     # restart the daemon onto the new binary
 ```
+```
+/plugin update cello@cello-protocol
+```
 
-Then restart Claude Code (or run `/mcp`). No `claude mcp remove` / `claude mcp add` required — the binary name `cello-mcp` stays constant across versions.
+Then restart Claude Code. The daemon must restart for a new binary to take effect — `npm install` alone replaces the file on disk while the old process keeps running, which surfaces later as `Unknown IPC method`.
 
 ## Setup (first time) — in the shell, not via MCP
 
@@ -58,10 +70,12 @@ loop:
 **Read before you write.** If the other side has spoken and you have not read it, `cello_send` is REFUSED with `session_not_current` and tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole conversation), then send again. You cannot reply to something you never saw.
 
 ### Push-driven (zero polling)
-Run Claude Code with `--channels server:cello`. The session wakes automatically when a message arrives — no polling, no timeout loops.
+Run Claude Code with the CELLO channel enabled. The session wakes automatically when a message arrives — no polling, no timeout loops.
 ```bash
-claude --channels server:cello
+claude --channels plugin:cello@cello-protocol
 ```
+
+Channels are a research preview and `--channels` accepts only allowlisted plugins. If the startup banner says *"not on the approved channels allowlist"*, the channel did **not** register and no events arrive. Either launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, or have an org admin add `{ "marketplace": "cello-protocol", "plugin": "cello" }` to `allowedChannelPlugins` in managed settings — noting that setting it replaces the Anthropic allowlist entirely, so every other channel you use must be listed there too.
 
 ### Coming back after being away
 ```

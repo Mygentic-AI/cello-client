@@ -21,8 +21,12 @@ You need a registration token. Get one from **@CelloConnectStagingBot** on Teleg
 
 The MCP server must already be running. If `cello_status` fails with a tool-not-found error, install first:
 ```bash
-npm install -g @cello-protocol/connect
-claude mcp add cello -- cello-mcp
+npm install -g @cello-protocol/cli
+cello login
+```
+```
+/plugin marketplace add Mygentic-AI/cello-client
+/plugin install cello@cello-protocol
 ```
 Then restart Claude Code and try again.
 
@@ -51,9 +55,9 @@ cello_send({ cello_session_id, content: "please analyse this codebase and summar
 ```
 
 ### Push-driven (zero polling)
-Run Claude Code with `--channels server:cello`. The session wakes automatically when a message arrives — no polling, no timeout management. Best for long-running or background agent conversations.
+Run Claude Code with `--channels plugin:cello@cello-protocol`. The session wakes automatically when a message arrives — no polling, no timeout management. Best for long-running or background agent conversations.
 ```
-claude --channels server:cello
+claude --channels plugin:cello@cello-protocol
 ```
 When a `cello_message` notification fires, call `cello_receive` immediately.
 
