@@ -673,6 +673,31 @@ export async function runNetworkDkg(
   // allRound1 = client + all directory node broadcasts
   const allRound1: DkgRound1Broadcast[] = [clientRound1Broadcast, ...nodeRound1Broadcasts];
 
+  // DOD-INV-NODEID, enforced where it is actually decidable. Every check upstream compares MANIFEST
+  // nodeId strings, but a node's FROST identifier is derived from its OWN deployed NODE_ID
+  // (directory-side `frost-handler.ts`). So two entries with DISTINCT nodeIds, deployed on boxes that
+  // share one NODE_ID, collide here and pass every string check in the consortium.
+  //
+  // These are the identifiers actually in play, so this is the first point where the collapse is
+  // visible. `DKG.round2` below does reject it — @noble/curves throws `Duplicate id=…` — but as an
+  // exception from inside a crypto library, which then had to survive every catch between here and
+  // the operator. Refusing here names the cause while the node list is still in hand.
+  const seenIdentifiers = new Map<string, number>();
+  for (let i = 0; i < allRound1.length; i++) {
+    const prev = seenIdentifiers.get(allRound1[i]!.identifier);
+    if (prev !== undefined) {
+      // Index 0 is the client; 1..n are opts.directoryNodes[0..n-1].
+      const who = (idx: number) => (idx === 0 ? "the client" : `directory node ${opts.directoryNodes[idx - 1]?.id ?? idx}`);
+      throw new Error(
+        `DKG round 1 produced a DUPLICATE FROST identifier: ${who(prev)} and ${who(i)} both derived ` +
+          `${allRound1[i]!.identifier.slice(0, 24)}… — two participants sharing one identifier are one ` +
+          `participant, so the quorum is smaller than it looks. Most likely two directory nodes are ` +
+          `deployed with the same NODE_ID.`,
+      );
+    }
+    seenIdentifiers.set(allRound1[i]!.identifier, i);
+  }
+
   // ─── Round 2 ────────────────────────────────────────────────────────────────
   // Client runs DKG.round2 locally (receives others' round1 → generates shares for others).
   // All directory nodes run round2 in parallel.
