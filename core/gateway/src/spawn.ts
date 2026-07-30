@@ -13,8 +13,6 @@ export const GATEWAY_READY_TOKEN = "GATEWAY_READY";
 
 export interface SpawnGatewayOptions {
   socketPath: string;
-  /** When set, the gateway appends one request-log line per screen request here. */
-  requestLogPath?: string;
   /**
    * The gateway entry to run. Defaults to this package's built dist bin
    * (dist/bin/cello-gateway.js) run with node — the production path.
@@ -54,7 +52,6 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
       ...process.env,
       ...opts.env,
       CELLO_GATEWAY_SOCKET: opts.socketPath,
-      ...(opts.requestLogPath ? { CELLO_GATEWAY_REQUEST_LOG: opts.requestLogPath } : {}),
     },
   });
 

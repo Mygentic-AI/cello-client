@@ -2,7 +2,7 @@
 /**
  * cello-gateway — the gateway program entry point.
  *
- * Reads its socket path (and optional request-log path) from the environment, starts the
+ * Reads its socket path and store paths from the environment, starts the
  * gateway server, and prints a READY line so a parent (spawnGatewaySidecar) knows it is
  * listening. M9-CORE-001 runs the pass-through screen; later stories wire the detection
  * pipeline into createGatewayServer's `screen` option here.
@@ -45,7 +45,6 @@ async function main(): Promise<void> {
     process.exit(2);
     return;
   }
-  const requestLogPath = process.env["CELLO_GATEWAY_REQUEST_LOG"];
 
   // The real screen compositions. Config (PII whitelist, rate limit) is M9-CFG-001; defaults here
   // (no whitelist, no rate cap) until that lands. Secret detection (M9-OUT-001) slots into the
@@ -141,7 +140,6 @@ async function main(): Promise<void> {
 
   const handle = await createGatewayServer({
     socketPath,
-    ...(requestLogPath ? { requestLogPath } : {}),
     screen: async (req): Promise<ScreenVerdict> => {
       // Catch a screener fault HERE (not in the server's outer catch) so the screen_error block is
       // RECORDED — otherwise a screened-and-blocked message would leave no audit row (code-review MED).
