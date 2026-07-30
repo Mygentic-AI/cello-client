@@ -2109,26 +2109,80 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "agent_not_loaded",
         guidance: `Agent '${sel.name}' has no key loaded, so a sealed result could not be opened. Restart the daemon and select the agent again.` };
     }
-    const res = await fetchSubmissionResults({
-      signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
-      keyProvider: kp as { openContentSeal?: (c: Uint8Array) => Promise<Uint8Array | null> },
-      logger,
-    });
-    if (!res.ok) return { ok: false, reason: res.reason, guidance: res.guidance };
-    return {
-      ok: true,
-      results: res.results.map((r) => ({
+    // ── ASK EVERY NODE, AND SAY WHICH ONES DID NOT ANSWER ─────────────────────────────────────────
+    // An outcome is recorded on whichever node accepted the submission, and this agent is connected
+    // to ONE node — routinely not the same one. Asking only home turns "your refusal is on another
+    // node" into "you have no results", which is the answer that makes a counterparty look silent
+    // when they were not.
+    //
+    // A NODE THAT DOES NOT ANSWER IS `unreachable`, NEVER an empty result. If a timeout collapsed
+    // into "nothing here", a down node could silently produce a negative answer — the same lie in a
+    // new place. The caller is told what was actually covered.
+    const seen = new Map<string, ReturnType<typeof mapResult>>();
+    const unreachable: string[] = [];
+    function mapResult(r: { submissionId: string; outcome: string; reason: string | null; signalHash: string | null; message: string | null; createdAt: string }) {
+      return {
         submission_id: r.submissionId,
         outcome: r.outcome,
         reason: r.reason,
         signal_hash: r.signalHash,
-        // The subject's own words, already opened. NULL when there was no message or it would not
-        // open — the outcome stands either way, which is why a failed decrypt does not drop the row.
         message: r.message,
         created_at: r.createdAt,
-      })),
+      };
+    }
+    const opener = kp as { openContentSeal?: (c: Uint8Array) => Promise<Uint8Array | null> };
+
+    // Home node first — it needs no connection and answers fastest.
+    const home = await fetchSubmissionResults({
+      signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
+      keyProvider: opener,
+      logger,
+    });
+    if (home.ok) for (const r of home.results) seen.set(r.submissionId, mapResult(r));
+    else unreachable.push("home");
+
+    // Then every OTHER node in the consortium, over a transient visiting connection — the same
+    // mechanism a cross-node session uses. Each is independent: one node refusing to answer must not
+    // stop the others being asked.
+    const roster = (await resolveConsortiumRoster().catch(() => null)) ?? [];
+    for (const node of roster) {
+      let visit: ReturnType<typeof openVisitingConnection> | null = null;
+      try {
+        visit = openVisitingConnection(
+          sel.name, kp, sel.pubkey,
+          { peerId: node.peerId, multiaddr: node.multiaddr },
+          randomUUID(), node.nodeId,
+        );
+        const r = await fetchSubmissionResults({ signaling: visit.mgr, keyProvider: opener, logger });
+        if (r.ok) for (const x of r.results) { if (!seen.has(x.submissionId)) seen.set(x.submissionId, mapResult(x)); }
+        else unreachable.push(node.nodeId);
+      } catch {
+        unreachable.push(node.nodeId);
+      } finally {
+        // ALWAYS torn down. A visiting connection left open holds a stream the directory will drain
+        // its durable notification queue down — the bug this connection type has already caused once.
+        await visit?.stop("results fetch complete").catch(() => {});
+      }
+    }
+
+    if (seen.size === 0 && unreachable.length > 0 && unreachable.length >= roster.length) {
+      // EVERY node we tried failed. Reporting an empty list here would be the exact lie this fan-out
+      // exists to prevent.
+      return {
+        ok: false,
+        reason: "results_unreachable",
+        guidance: `No directory node answered (${unreachable.join(", ")}). Your outcomes are held until you collect them — nothing is lost. Retry when connectivity returns.`,
+      };
+    }
+    return {
+      ok: true,
+      // WHAT WAS ACTUALLY COVERED. An empty list from a partial sweep means "nothing on the nodes we
+      // reached", which is a different claim from "nothing exists".
+      ...(unreachable.length > 0 ? { unreachable_nodes: unreachable } : {}),
+      results: [...seen.values()],
     };
   });
+
 
   handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
