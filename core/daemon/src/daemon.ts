@@ -1200,6 +1200,44 @@ async function startDaemonHoldingLock(
   // the session's relay endpoint; we seal the content to the recipient (E2E — the relay never sees
   // plaintext, INV-3) and deposit it to that relay's store-and-forward mailbox via the standing
   // receiver node. The recipient pulls + recovers it at the witnessed sequence (R1) on next online.
+  // Fix #1 EXTENSION (cross-node seal-liveness) — the AUTO-ACKNOWLEDGE half.
+  //
+  // close-session-handler already re-opens a transient visiting connection to the broker for its
+  // own path. The auto-ack path had no such guard, and it is the one that fires FIRST whenever the
+  // counterparty closes first: it submits a seal leaf, the directory answers within ~60ms by pushing
+  // `seal_verified` to the INITIATOR, finds no stream (the initiator released its visiting
+  // connection after setup), ENQUEUES the frame, and then blocks waiting for a co-signature it never
+  // asked for. Proven on GCP — leaf 18:41:56.555, directory `seal.certificate.deferred`
+  // (initiator_stream_absent) 18:41:56.615, broker reconnect 18:42:01.529: five seconds too late.
+  //
+  // Returns null for same-node sessions (no broker entry) — those reach the initiator on its home
+  // stream and need no visiting connection.
+  sessionNodeManager.setEnsureSealBroker(async (agentName, sessionId) => {
+    const brokerNode = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
+    if (!brokerNode) return null;
+    const kp = keyProviders.get(agentName);
+    if (!kp) {
+      logger.warn("session.seal.autoack.broker.no_keyprovider", { agentName, brokerNode });
+      return null;
+    }
+    const pubHex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const roster = await resolveConsortiumRoster();
+    const target = roster?.find((e) => e.nodeId === brokerNode) ?? null;
+    if (!target) {
+      logger.warn("session.seal.autoack.broker.unresolved", { agentName, brokerNode });
+      return null;
+    }
+    const correlationId = randomUUID();
+    const conn = openVisitingConnection(agentName, kp, pubHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, brokerNode);
+    if (await waitForSignalingConnected(conn.mgr, 10_000)) {
+      logger.info("session.seal.autoack.broker.reconnected", { agentName, brokerNode, correlationId });
+      return conn;
+    }
+    await conn.stop("autoack-seal-broker-unreachable");
+    logger.warn("session.seal.autoack.broker.unreachable", { agentName, brokerNode, correlationId });
+    return null;
+  });
+
   sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {

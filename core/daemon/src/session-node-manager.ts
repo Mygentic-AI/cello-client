@@ -304,6 +304,23 @@ export class SessionNodeManager {
   // because the NotificationDispatcher is built later than this manager in
   // daemon.ts (it depends on the IPC server). Never required — when unset,
   // state changes are persisted and logged but no push notification is emitted.
+  /**
+   * Fix #1 EXTENSION (cross-node seal-liveness), injected by daemon.ts because the broker-dial
+   * machinery (consortium roster + visiting connections) lives above this class.
+   *
+   * The AUTO-ACKNOWLEDGE path below submits a seal leaf, and the directory answers it within ~60ms
+   * by pushing `seal_verified` to the INITIATOR. On a cross-node session the initiator released its
+   * visiting connection to the broker after setup, so that push finds no stream, the directory
+   * ENQUEUES the frame instead, and the seal blocks forever waiting for a co-signature it never
+   * asked for. close-session-handler already guards its own path this way; the auto-ack path did
+   * not, and it is the path that fires FIRST whenever the counterparty closes first.
+   *
+   * Unset (single-node / M6 back-compat) is fine: the initiator is reachable on its home stream.
+   */
+  #ensureSealBroker:
+    | ((agentName: string, sessionId: string) => Promise<{ stop: (reason: string) => Promise<void> } | null>)
+    | undefined;
+
   #onSessionStateChanged:
     | ((
         agentName: string,
@@ -1550,6 +1567,13 @@ export class SessionNodeManager {
    * Called by the composition root (daemon.ts) after the NotificationDispatcher
    * exists. Setter injection avoids a construction-order/circular dependency.
    */
+  /** Fix #1 EXTENSION: inject the broker-connection opener. Setter injection, same construction-order reason. */
+  setEnsureSealBroker(
+    cb: (agentName: string, sessionId: string) => Promise<{ stop: (reason: string) => Promise<void> } | null>,
+  ): void {
+    this.#ensureSealBroker = cb;
+  }
+
   setOnSessionStateChanged(
     cb: (
       agentName: string,
@@ -3283,7 +3307,29 @@ export class SessionNodeManager {
     const responderPubkey = entry?.relayClient?.senderPubkeyHex ?? "unknown";
     // submitSealLeaf owns the #responderSealSubmitted idempotency mark (set synchronously at its
     // top), so the auto-ack does not pre-mark — it just reacts to the result.
-    void this.submitSealLeaf(agentName, sessionId, correlationId)
+    // Establish the broker visiting connection BEFORE submitting, not after. The directory acts on
+    // the leaf in ~60ms and pushes `seal_verified` straight back; if the stream is not up by then it
+    // defers the frame and the seal stalls. Proven on GCP: leaf submitted 18:41:56.555, directory
+    // deferred at 18:41:56.615 (initiator_stream_absent), the explicit-close path opened the
+    // connection at 18:42:01.529 — five seconds too late.
+    void (async () => {
+      let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
+      try {
+        sealBrokerConn = (await this.#ensureSealBroker?.(agentName, sessionId)) ?? null;
+      } catch (err: unknown) {
+        // Best-effort: a same-node session needs no visiting connection, and a failure here must not
+        // suppress the seal leaf — losing the leaf is strictly worse than racing the push.
+        this.#logger.warn("session.seal.autoack.broker.failed", {
+          sessionId,
+          correlationId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return this.submitSealLeaf(agentName, sessionId, correlationId)
+        .finally(() => {
+          if (sealBrokerConn) void sealBrokerConn.stop("autoack-seal-complete").catch(() => {});
+        });
+    })()
       .then((result) => {
         if (result.ok) {
           // SI-001: the responder SEAL leaf was signed by B's OWN node (K_local) in submitSealLeaf.
