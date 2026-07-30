@@ -24,6 +24,24 @@ export const KNOWN_COMMANDS: ReadonlySet<string> = new Set(commandNames());
 export type KnownCommand = string;
 
 /**
+ * The flags that come BEFORE any command — `cello --version`, `cello --help`.
+ *
+ * They were treated as unknown COMMANDS, so `cello --version` printed the entire help text and
+ * exited 1. That is the first thing anyone runs to check an install, and it answered by looking
+ * broken while being fine. `--help` had the same shape: correct output, exit 1, which is what a
+ * script checks. The comment in `USAGE` above has always called it "the top-level `cello --help`" —
+ * the text existed for a flag the dispatcher never actually recognised.
+ *
+ * Kept as a pure function here rather than an `if` in the bin, so it is testable without spawning
+ * the binary — the reason every other argument rule lives in this module.
+ */
+export function topLevelFlag(command: string | undefined): "version" | "help" | undefined {
+  if (command === "--version" || command === "-v") return "version";
+  if (command === "--help" || command === "-h") return "help";
+  return undefined;
+}
+
+/**
  * The top-level `cello --help`.
  *
  * Opens with what CELLO is + the onboarding path a first-time user needs. The command list is a

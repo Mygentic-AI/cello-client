@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
-import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS } from "../cli-args.js";
+import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS, topLevelFlag } from "../cli-args.js";
 
 describe("F1: usage string lists every command", () => {
   it("mentions refresh and receipts (previously missing) alongside the rest", () => {
@@ -213,4 +213,29 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
     });
   });
 
+});
+
+// `cello --version` printed the whole help text and exited 1 — it was dispatched as an unknown
+// COMMAND. It is the first thing anyone runs to check an install, so it answered by looking broken
+// while being fine; `--help` had the same shape (right output, exit 1, which is what a script reads).
+describe("top-level flags are flags, not unknown commands", () => {
+  it("recognises --version/-v and --help/-h", () => {
+    expect(topLevelFlag("--version")).toBe("version");
+    expect(topLevelFlag("-v")).toBe("version");
+    expect(topLevelFlag("--help")).toBe("help");
+    expect(topLevelFlag("-h")).toBe("help");
+  });
+
+  it("claims nothing else — a real command and a genuine typo both still dispatch normally", () => {
+    for (const c of ["status", "sessions", "--versio", "-V", "version", "", undefined]) {
+      expect(topLevelFlag(c), `${String(c)} must not be treated as a top-level flag`).toBeUndefined();
+    }
+  });
+
+  it("does not shadow a command of the same name — none of these are dispatchable commands", () => {
+    // If a command named `--help` ever existed, answering the flag first would silently shadow it.
+    for (const c of ["--version", "-v", "--help", "-h"]) {
+      expect(KNOWN_COMMANDS.has(c)).toBe(false);
+    }
+  });
 });
