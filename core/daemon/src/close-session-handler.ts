@@ -302,6 +302,31 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // auto-ack's submission drives the same bilateral seal).
         if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
           pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
+
+          // THE SEAL MAY HAVE ALREADY SUCCEEDED. `submitSealLeaf` reports `session_node_unavailable`
+          // when the in-memory node entry is gone, and one way it goes is the session sealing —
+          // teardown runs BEFORE the record's status flips to "sealed", so a close landing in that
+          // window missed the AC-010 already-sealed check above and arrived here instead. Both
+          // parties closing at once is the ordinary case (each operator ends the conversation), so
+          // whichever call arrives second hit it.
+          //
+          // Returning the raw reason there is an exit-point label with the wrong diagnosis attached:
+          // the guidance below blames relay reachability, when the relay was fine and the seal is
+          // notarized and DURABLE. Worse, the operator who asked to close is told it failed and gets
+          // no root — the receipt is the whole point of closing.
+          //
+          // The root is read from THIS agent's own database, never from a directory's word: local
+          // state the agent already computed and persisted. That distinction is why this is a fix and
+          // the fetched-receipt path was not.
+          const localCert = sessionNodeManager.getSealCertificate(record.agent_name, sessionId);
+          if (localCert?.sealed_root) {
+            logger.info("session.seal.completed", {
+              sessionId, sealedRoot: localCert.sealed_root, role: "already_sealed_locally", correlationId,
+            });
+            crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`);
+            return { ok: true, sealed_root: localCert.sealed_root, legibility: localCert.legibility };
+          }
+
           if (submit.reason === "relay_unavailable") {
             // No relay witness for this session (direct/interrupted) — fall back to the
             // directory-mediated bilateral-ack seal.
