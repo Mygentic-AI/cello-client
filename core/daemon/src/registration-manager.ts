@@ -341,7 +341,18 @@ export class RegistrationManager {
           directoryNodeIds: roster ? roster.map((e) => e.nodeId) : undefined,
         };
       }
-    } catch {
+    } catch (err: unknown) {
+      // NOT a bare catch. Everything runNetworkDkg can throw was being discarded here, and this is
+      // the client's own log — where the operator actually is. The messages destroyed included the
+      // only diagnosis of a colliding FROST identifier (`Duplicate id=5375…`, thrown by
+      // @noble/curves DKG.round2 when two nodes derive the same identifier) and the
+      // commitment-vs-primary_pubkey mismatch, plus every stream/transport failure from
+      // dkgRound1WithNode / dkgRound2WithNode. All of them reached the operator as `dkg_failed` —
+      // one exit-point label standing in for a dozen unrelated causes, sending them to debug FROST
+      // when the cause was a duplicate nodeId in a manifest or an unreachable node.
+      this.#ctx.logger.error("registration.dkg.failed", {
+        reason: err instanceof Error ? err.message : String(err),
+      });
       return { error: "dkg_failed" };
     }
     // SI-003/AC-005: AWAIT the share persist (was fire-and-forget) before register reports success —
