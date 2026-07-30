@@ -31,6 +31,9 @@ export interface ConfigVersionRow {
   direction: ConfigDirection;
   confirmed: boolean;
   fingerprint: string;
+  /** WHEN it changed. Stored all along; `history()` used to drop it, so the surface could not show
+   *  provenance (review F9 of the earlier pass). */
+  changedAt: number;
 }
 
 /** Classify a change for one key. `prev` is the current value (never undefined — the first set is
@@ -131,7 +134,16 @@ export class GatewayConfigStore {
    *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
   constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
     this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
-    this.#db.exec(DDL);
+    try {
+      this.#db.exec(DDL);
+    } catch (err) {
+      // Review F8: the connection is already open at this point. A DDL throw — SQLITE_BUSY past the
+      // busy_timeout is reachable on a file shared with the sidecar — used to leak the native handle
+      // and cache nothing, so every retry opened another one. An fd leak against a lock-sensitive
+      // file is a slow way to make the whole store unopenable.
+      try { this.#db.close(); } catch { /* the throw below is the real error */ }
+      throw err;
+    }
   }
 
   /** Set `key` to `value`. Loosening requires `opts.confirmed`; tightening/neutral is free. The FIRST
@@ -188,14 +200,15 @@ export class GatewayConfigStore {
   /** The full append-only version history for `key`, oldest first. */
   history(key: string): ConfigVersionRow[] {
     const rows = this.#db
-      .prepare(`SELECT version, value_json, direction, confirmed, fingerprint FROM config_versions WHERE key = ? ORDER BY version ASC`)
-      .all(key) as Array<{ version: number; value_json: string; direction: string; confirmed: number; fingerprint: string }>;
+      .prepare(`SELECT version, value_json, direction, confirmed, fingerprint, changed_at FROM config_versions WHERE key = ? ORDER BY version ASC`)
+      .all(key) as Array<{ version: number; value_json: string; direction: string; confirmed: number; fingerprint: string; changed_at: number }>;
     return rows.map((r) => ({
       version: r.version,
       value: JSON.parse(r.value_json) as unknown,
       direction: r.direction as ConfigDirection,
       confirmed: r.confirmed === 1,
       fingerprint: r.fingerprint,
+      changedAt: r.changed_at,
     }));
   }
 

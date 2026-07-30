@@ -2446,7 +2446,7 @@ async function startDaemonHoldingLock(
   // DOD-M9B-SURFACE-1: the security layer's control surface. Registered here, defined in its own
   // module — it needs the cello dir, a logger, and the connection's client type, and nothing else
   // about sessions or ceremonies.
-  registerGatewayConfigHandlers({
+  const disposeGatewayConfigStores = registerGatewayConfigHandlers({
     handlers,
     celloDir,
     logger,
@@ -2859,6 +2859,10 @@ async function startDaemonHoldingLock(
           });
         });
       }
+      // AFTER onShutdown, never before (review F9): the sidecar is gone by now, so closing these is
+      // the last connection and unlinks nothing anyone is still writing to. Reversed, this would BE
+      // the F1/F2 defect.
+      disposeGatewayConfigStores();
       // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
       // held. In the real binary the process exits and the kernel reclaims it — but an in-process
       // caller (vitest, an embedder) whose shutdown throws would otherwise find every subsequent

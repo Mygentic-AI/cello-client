@@ -8,8 +8,7 @@
  * reads it to prove screening happened on the real daemon↔gateway channel.
  */
 import { createServer, type Server, type Socket } from "node:net";
-import { appendFile, rm } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
 import type { ScreenDirection, ScreenVerdict, GovernanceDecision } from "./types.js";

@@ -262,3 +262,56 @@ describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(after.value).toEqual([]);
   });
 });
+
+describe("M9B closeout — provenance on the config surface and a released handle", () => {
+  let dir2: string;
+  let handlers2: Map<string, IpcHandler>;
+  let dispose: (() => void) | undefined;
+
+  beforeEach(async () => {
+    dir2 = await mkdtemp(join(tmpdir(), "cello-m9b-closeout-"));
+    await writeFile(join(dir2, "sessions.db.key"), randomBytes(32), { mode: 0o600 });
+    handlers2 = new Map();
+    dispose = registerGatewayConfigHandlers({
+      handlers: handlers2,
+      celloDir: dir2,
+      logger: noopLogger,
+      getClientType: () => "cli",
+    });
+  });
+  afterEach(async () => {
+    // The disposer is the point: without it the temp dir is removed under two open SQLite handles.
+    dispose?.();
+    await rm(dir2, { recursive: true, force: true });
+  });
+
+  const call2 = (m: string, p: Record<string, unknown>) =>
+    handlers2.get(m)!(p, "cli-conn") as Promise<Record<string, unknown>>;
+
+  it("list reports changedAt and chainValid — the two things an incident actually needs", async () => {
+    const before = Date.now();
+    expect((await call2("cello_config_set", { key: "rate_max_per_window", value: 7 })).ok).toBe(true);
+
+    const rows = (await call2("cello_config_list", {})).config as Array<Record<string, unknown>>;
+    const set = rows.find((r) => r.key === "rate_max_per_window")!;
+    expect(set.changedAt).toBeGreaterThanOrEqual(before);
+    expect(set.chainValid).toBe(true);
+
+    // An unset key has no timestamp to report — null, not a fabricated one.
+    expect(rows.find((r) => r.key === "language_allow")!.changedAt).toBeNull();
+  });
+
+  it("the disposer releases the handles and a later open still works", async () => {
+    await call2("cello_config_set", { key: "rate_max_per_window", value: 3 });
+    dispose?.();
+    dispose = undefined;
+    // Reopening must see the committed row — the disposer must not have destroyed anything.
+    const fresh = new GatewayConfigStore(join(dir2, "gateway.db"), join(dir2, "sessions.db.key"));
+    try {
+      expect(fresh.get("rate_max_per_window")).toBe(3);
+      expect(fresh.verifyChain("rate_max_per_window")).toBe(true);
+    } finally {
+      fresh.close();
+    }
+  });
+});

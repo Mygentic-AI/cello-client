@@ -47,6 +47,7 @@
  * releases them, and the sidecar is torn down before the daemon exits (INV-9 shutdown ordering).
  */
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
@@ -146,7 +147,16 @@ function storeFault(message: string): { ok: false; reason: string; guidance: str
   };
 }
 
-export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): void {
+/**
+ * Release the held store handles (review F9). Safe in production either way — the bin calls
+ * `process.exit(0)` and a sqlcipher handle blocks nothing — but `stop()` had no way to let go, and
+ * the daemon explicitly supports in-process callers (vitest, embedders) for exactly this class of
+ * leak. MUST run AFTER `onShutdown` tears the sidecar down: while the sidecar lives, closing here
+ * would be the very unlink that F1/F2 is about.
+ */
+export type GatewayConfigDisposer = () => void;
+
+export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): GatewayConfigDisposer {
   const { handlers, celloDir, logger, getClientType, restartSecurityGateway } = deps;
 
   // ONE handle, opened lazily, never closed per call — see the header. Closing is what unlinks the
@@ -226,6 +236,11 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
           version: latest?.version ?? 0,
           lastChange: latest?.direction ?? null,
           confirmed: latest?.confirmed ?? false,
+          // WHEN, and whether the version chain still verifies. `list` is the command someone runs
+          // AFTER an incident, and until now it showed neither — so it could not answer "who
+          // weakened this, when, and did a human agree" (review F9 of the earlier pass).
+          changedAt: latest?.changedAt ?? null,
+          chainValid: store.verifyChain(key),
         };
       }),
     })),
@@ -313,6 +328,10 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
   });
 
   handlers.set("cello_config_set", async (params, connectionId) => {
+    // One id for the whole fan-out: changed -> applied | restart_failed, and the restarted sidecar's
+    // own boot lines. This is the multi-event async flow the project's correlationId rule exists for,
+    // and the config path had none because it has no inbound id to inherit — so mint one (review F12).
+    const correlationId = randomUUID();
     const key = typeof params?.key === "string" ? params.key : undefined;
     if (!key || !(GATEWAY_CONFIG_KEYS as readonly string[]).includes(key)) {
       return { ok: false, reason: "unknown_key", guidance: `Provide one of: ${GATEWAY_CONFIG_KEYS.join(", ")}.` };
@@ -344,14 +363,14 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       const attempt = store.set(key, parsed.value);
       if (attempt.ok) {
         logger.info("gateway.config.changed", {
-          key, direction: attempt.direction, version: attempt.version, confirmed: false, surface,
+          key, direction: attempt.direction, version: attempt.version, confirmed: false, surface, correlationId,
         });
         return applied(key, attempt.direction, attempt.version, false);
       }
 
       // It is a loosening. Three ways to be refused, and they are different failures.
       if (surface !== "cli") {
-        logger.warn("gateway.config.loosen_refused", { key, surface, reason: "loosen_requires_cli" });
+        logger.warn("gateway.config.loosen_refused", { key, surface, reason: "loosen_requires_cli", correlationId });
         return {
           ok: false,
           reason: "loosen_requires_cli",
@@ -362,7 +381,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         };
       }
       if (!confirmed) {
-        logger.warn("gateway.config.loosen_refused", { key, surface, reason: "needs_confirmation" });
+        logger.warn("gateway.config.loosen_refused", { key, surface, reason: "needs_confirmation", correlationId });
         const history = store.history(key);
         const latest = history[history.length - 1];
         return {
@@ -384,7 +403,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
         return { ok: false, reason: result.reason, guidance: "The config store rejected a confirmed change. Check the daemon log." };
       }
       logger.info("gateway.config.changed", {
-        key, direction: result.direction, version: result.version, confirmed: true, surface,
+        key, direction: result.direction, version: result.version, confirmed: true, surface, correlationId,
       });
       return applied(key, result.direction, result.version, true);
     });
@@ -395,14 +414,14 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       if (!restartSecurityGateway) return { ...base, applied: false as const };
       return restartSecurityGateway().then(
         () => {
-          logger.info("gateway.config.applied", { key: k, restarted: true });
+          logger.info("gateway.config.applied", { key: k, restarted: true, correlationId });
           return { ...base, applied: true as const };
         },
         (err: unknown) => {
           // STORED BUT NOT APPLIED. Never a bare ok: the operator would believe a guard changed
           // when the running gateway still holds the old value.
           const error = err instanceof Error ? err.message : String(err);
-          logger.error("gateway.config.restart_failed", { key: k, error });
+          logger.error("gateway.config.restart_failed", { key: k, error, correlationId });
           return {
             ...base,
             applied: false as const,
@@ -415,4 +434,11 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       );
     }
   });
+
+  return (): void => {
+    try { configStore?.close(); } catch { /* best-effort */ }
+    try { recordStore?.close(); } catch { /* best-effort */ }
+    configStore = undefined;
+    recordStore = undefined;
+  };
 }

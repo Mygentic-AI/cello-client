@@ -5,7 +5,7 @@
  * seam later stories plug into, and the fail-closed / never-hang guarantees (INV-6 / SI-001).
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -30,7 +30,6 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix socket", () => {
   let tempDir: string;
   let sockPath: string;
-  let logPath: string;
   const servers: GatewayServerHandle[] = [];
   const clients: LocalSidecarGatewayClient[] = [];
   const rawServers: Server[] = [];
@@ -39,7 +38,6 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     tempDir = await mkdtemp(join(tmpdir(), "cello-gw-"));
     // Keep the UDS path short (macOS sun_path ~104 chars).
     sockPath = join(tempDir, "g.sock");
-    logPath = join(tempDir, "req.log");
   });
   afterEach(async () => {
     for (const c of clients) { try { await c.close(); } catch { /* ignore */ } }
@@ -50,7 +48,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
   });
 
   async function startServer(screen?: Parameters<typeof createGatewayServer>[0]["screen"]): Promise<void> {
-    const h = await createGatewayServer({ socketPath: sockPath, requestLogPath: logPath, ...(screen ? { screen } : {}) });
+    const h = await createGatewayServer({ socketPath: sockPath, ...(screen ? { screen } : {}) });
     servers.push(h);
   }
   function makeClient(deadlineMs = 5_000, path = sockPath): LocalSidecarGatewayClient {
@@ -59,7 +57,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     return c;
   }
 
-  it("pass-through ALLOWS and returns the original content; the request log records the screen", async () => {
+  it("pass-through ALLOWS and returns the original content", async () => {
     await startServer(); // default pass-through
     const client = makeClient();
     const content = new TextEncoder().encode("hello peer");
@@ -68,25 +66,9 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(v.disposition).toBe("allow");
     expect(v.content).toBeDefined();
     expect(Buffer.from(v.content!).toString()).toBe("hello peer");
-
-    const log = (await readFile(logPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    expect(log).toHaveLength(1);
-    expect(log[0].method).toBe("screen_outbound");
-    expect(log[0].direction).toBe("outbound");
-    expect(log[0].agentName).toBe("alice");
-    expect(log[0].bytes).toBe(content.length);
   });
 
-  it("inbound and outbound are logged distinctly with the right direction", async () => {
-    await startServer();
-    const client = makeClient();
-    await client.screenOutbound(new TextEncoder().encode("out"), ctx({ direction: "outbound" }));
-    await client.screenInbound(new TextEncoder().encode("in"), ctx({ direction: "inbound" }));
-
-    const log = (await readFile(logPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    expect(log.map((e) => e.direction)).toEqual(["outbound", "inbound"]);
-    expect(log.map((e) => e.method)).toEqual(["screen_outbound", "screen_inbound"]);
-  });
+  
 
   it("a screen function can REDACT — the transformed bytes round-trip back to the daemon", async () => {
     // Proves the verdict-content plumbing later stories (M9-OUT-*) depend on.

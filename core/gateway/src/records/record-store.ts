@@ -75,7 +75,16 @@ export class GatewayRecordStore {
    *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
   constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
     this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
-    this.#db.exec(DDL);
+    try {
+      this.#db.exec(DDL);
+    } catch (err) {
+      // Review F8: the connection is already open at this point. A DDL throw — SQLITE_BUSY past the
+      // busy_timeout is reachable on a file shared with the sidecar — used to leak the native handle
+      // and cache nothing, so every retry opened another one. An fd leak against a lock-sensitive
+      // file is a slow way to make the whole store unopenable.
+      try { this.#db.close(); } catch { /* the throw below is the real error */ }
+      throw err;
+    }
   }
 
   /** Append a security-pass record for one screened message, hash-chained to the prior record. */

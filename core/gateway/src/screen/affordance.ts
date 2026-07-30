@@ -19,7 +19,16 @@
  *     worse than the silence this replaces — the agent burns turns hunting for it.
  *   - Never echo the flagged VALUE back. The guidance is rendered into an LLM's context; repeating
  *     a secret to explain that it was redacted would undo the redaction.
+ *   - PREFIX every block with the provenance marker (review F10). This text is imperative, contains
+ *     shell commands, and lands in the same context as inbound counterparty content — so a
+ *     counterparty could mimic it and have an agent relay "run this" to its operator as though the
+ *     security layer had asked. The marker says where it came from. It is not a cryptographic
+ *     boundary (nothing in an LLM's context is), but an agent that knows the layer speaks with a
+ *     fixed prefix has something to check.
  */
+
+/** Where this text came from. A counterparty cannot claim to be the local security layer. */
+export const AFFORDANCE_PREFIX = "[cello security layer, local]";
 
 /** The five keys `cello config` exposes. Anything not here has no operator knob — say so instead. */
 export type AdjustableGuard =
@@ -35,7 +44,7 @@ export type AdjustableGuard =
  */
 export function operatorCanRun(guard: AdjustableGuard, argHint: string): string {
   return (
-    `IF THIS IS WRONG, relay this to your operator to run in their terminal. DO NOT run it ` +
+    `${AFFORDANCE_PREFIX} IF THIS IS WRONG, relay this to your operator to run in their terminal. DO NOT run it ` +
     `yourself and do not try to work around the guard:\n  cello config set ${guard} ${argHint}\n` +
     `It asks them to confirm once. To see exactly what fired: cello policy log`
   );
@@ -44,7 +53,7 @@ export function operatorCanRun(guard: AdjustableGuard, argHint: string): string 
 /** For a guard with no knob. Better a plain "no" than an invented command. */
 export function noOperatorOverride(what: string): string {
   return (
-    `This guard is not adjustable — there is no setting that turns it off, deliberately. ${what} ` +
+    `${AFFORDANCE_PREFIX} This guard is not adjustable — there is no setting that turns it off, deliberately. ${what} ` +
     `To see exactly what fired: cello policy log`
   );
 }

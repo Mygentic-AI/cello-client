@@ -17,8 +17,8 @@
  * explicitly). The only addition is a gateway sidecar per daemon.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir, readFile } from "node:fs/promises";
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,14 +72,6 @@ function makeInjectableSignaling(injectRef: { inject?: (frame: unknown) => void 
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function readGatewayLog(path: string): Promise<Array<Record<string, unknown>>> {
-  try {
-    const raw = await readFile(path, "utf8");
-    return raw.trim().length === 0 ? [] : raw.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
-  } catch {
-    return []; // not yet created = no requests screened
-  }
-}
 
 const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 7));
 const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
@@ -115,15 +107,33 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     return Buffer.from(await kp.getPublicKey()).toString("hex");
   }
 
-  /** Spawn a gateway sidecar; return its handle + request-log path. `env` seeds gateway config
-   *  (CELLO_GATEWAY_STORE_DB / _STORE_KEY_FILE — plumbing only; every POLICY value comes from the
- *  store, since DOD-M9B-ENV-1 removed the env fallbacks). */
-  async function spawnGateway(tag: string, env?: Record<string, string>): Promise<{ gw: SpawnedGateway; sock: string; log: string }> {
+  /**
+   * Spawn a gateway sidecar with its own ENCRYPTED store. Proof-of-screening is read back from
+   * that store — the plaintext request log this used to use was a debug side-channel outside the
+   * encrypted set (it kept M8C's DOD-CRYPTO-AT-REST-1 open) and was removed rather than guarded.
+   * `env` may override the store paths to seed config; POLICY values only ever come from the store,
+   * since DOD-M9B-ENV-1 removed the env fallbacks.
+   */
+  async function spawnGateway(tag: string, env?: Record<string, string>): Promise<{ gw: SpawnedGateway; sock: string; storeDb: string; storeKey: string }> {
     const sock = join(tempDir, `${tag}.sock`);
-    const log = join(tempDir, `${tag}.log`);
-    const gw = await spawnGatewaySidecar({ socketPath: sock, requestLogPath: log, ...(env ? { env } : {}) });
+    const storeDb = env?.["CELLO_GATEWAY_STORE_DB"] ?? join(tempDir, `${tag}-store.db`);
+    const storeKey = env?.["CELLO_GATEWAY_STORE_KEY_FILE"] ?? join(tempDir, `${tag}-store.key`);
+    if (!existsSync(storeKey)) writeFileSync(storeKey, randomBytes(32), { mode: 0o600 });
+    const gw = await spawnGatewaySidecar({
+      socketPath: sock,
+      env: { ...(env ?? {}), CELLO_GATEWAY_STORE_DB: storeDb, CELLO_GATEWAY_STORE_KEY_FILE: storeKey },
+    });
     gateways.push(gw);
-    return { gw, sock, log };
+    return { gw, sock, storeDb, storeKey };
+  }
+
+  /** Read the gateway's encrypted security records — the durable proof-of-screening. */
+  async function gatewayRecords(dbPath: string, keyPath: string): Promise<Array<{ direction: string; contentHash: string }>> {
+    try {
+      const store = new GatewayRecordStore(dbPath, keyPath);
+      try { return store.all().map((r) => ({ direction: r.direction, contentHash: r.contentHash })); }
+      finally { store.close(); }
+    } catch { return []; }
   }
 
   async function startOne(opts: {
@@ -283,17 +293,17 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const expectedFp = createHash("sha256").update(Buffer.from(text)).digest("hex");
 
     // AC-001: A's gateway PROCESS recorded the outbound screen for this exact content.
-    const aLog = await readGatewayLog(a.log);
-    const outbound = aLog.filter((e) => e.direction === "outbound");
+    const aRecs = await gatewayRecords(a.storeDb, a.storeKey);
+    const outbound = aRecs.filter((e) => e.direction === "outbound");
     expect(outbound.length).toBeGreaterThanOrEqual(1);
-    expect(outbound.some((e) => e.contentSha256 === expectedFp)).toBe(true);
+    expect(outbound.some((e) => e.contentHash === expectedFp)).toBe(true);
 
     // AC-002: B's gateway PROCESS recorded the inbound screen of the exact same bytes — and
     // (proof it ran BEFORE delivery) cello_receive only returned content after that screen.
-    const bLog = await readGatewayLog(b.log);
-    const inbound = bLog.filter((e) => e.direction === "inbound");
+    const bRecs = await gatewayRecords(b.storeDb, b.storeKey);
+    const inbound = bRecs.filter((e) => e.direction === "inbound");
     expect(inbound.length).toBeGreaterThanOrEqual(1);
-    expect(inbound.some((e) => e.contentSha256 === expectedFp)).toBe(true);
+    expect(inbound.some((e) => e.contentHash === expectedFp)).toBe(true);
   }, 40_000);
 
   it("SI-001/DB-001 outbound: with A's gateway down, cello_send fails closed and nothing reaches B", async () => {

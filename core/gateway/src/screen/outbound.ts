@@ -12,6 +12,7 @@
  * `redact` stage once its binding is chosen.
  */
 import { OutboundRateLimiter, type RateLimitConfig } from "../detect/rate-limit.js";
+import { AFFORDANCE_PREFIX } from "./affordance.js";
 import { OutboundPIIScreener, type PIIEvent } from "../detect/pii.js";
 import { screenOutboundExfil } from "../detect/exfil.js";
 import { redactSecrets } from "../detect/secrets.js";
@@ -225,7 +226,8 @@ export class OutboundScreener {
         // the point of the gate), but it CAN relay them, and relaying an exact command is the
         // difference between a stuck operator and a two-second fix.
         guidance:
-          `NOT SENT. ${rejected.length} item(s) cannot be allowed autonomously because ` +
+          `${AFFORDANCE_PREFIX} NOT SENT. ${rejected.length} item(s) cannot be allowed ` +
+          `autonomously because ` +
           `autonomous_override is OFF.\n` +
           `WHAT YOU CAN DO NOW: re-send with those flag(s) set to "redact" — the value is replaced ` +
           `by a typed placeholder and the message goes.\n` +
