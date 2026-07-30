@@ -662,6 +662,8 @@ export async function trustSignals(
           supersedes_hash: string | null;
           default_present: boolean;
           consent_state: string | null;
+          /** M10B / DOD-END-COUNT-1 — the endorser and the subject are the same operator. */
+          same_operator?: boolean;
         }>;
         reason?: string;
       };
@@ -694,14 +696,25 @@ export async function trustSignals(
           : s.consent_state === "refused" ? "refused"
           : "awaiting";
         const inc = presentable(s) ? (s.default_present ? "✓" : "–") : "✗";
-        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${consent.padEnd(9)}  ${inc.padEnd(4)}  ${date}`;
+        // M10B / DOD-END-COUNT-1 — MCP/CLI parity (DOD-END-SURFACE-1). The daemon returns
+        // `same_operator` and the MCP surface shows it; without this column the CLI operator sees two
+        // endorsements as identical when one is capped — a recipient's floor excludes a co-owned
+        // endorsement from `min_count` — and that reads as the protocol behaving arbitrarily.
+        const own = s.same_operator === true ? "own" : "—";
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${consent.padEnd(9)}  ${own.padEnd(5)}  ${inc.padEnd(4)}  ${date}`;
       });
-      const header = `  ${"type".padEnd(22)}  hash          status        consent    include  issued`;
-      const divider = "  " + "─".repeat(84);
+      const header = `  ${"type".padEnd(22)}  hash          status        consent    co-own  include  issued`;
+      const divider = "  " + "─".repeat(92);
       const consentLegend = anyAwaiting
         ? `\n  consent: PENDING = someone issued this ABOUT you and it awaits your decision — it is NOT\n           shown to anyone until you accept.  Run 'cello consent list' to read and decide.\n           refused = you refused it; it stays inert.  ✗ = not presentable, whatever 'include' says.`
         : "";
-      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'${consentLegend}`;
+      // The co-own legend appears only when a co-owned signal is present: a line explaining a column
+      // that reads "—" on every row is noise, and its APPEARANCE is what makes the operator look.
+      const anyCoOwned = signals.some((s) => s.same_operator === true);
+      const coOwnLegend = anyCoOwned
+        ? `\n  co-own:  'own' = the endorser and the subject are your own agents. Still shown to contacts,\n           but it does NOT count toward a counterparty's minimum-endorsements requirement.`
+        : "";
+      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'${coOwnLegend}${consentLegend}`;
       const footer = !showAll && supersededCount > 0
         ? `\n  (${supersededCount} superseded not shown — run with --all to include)`
         : "";

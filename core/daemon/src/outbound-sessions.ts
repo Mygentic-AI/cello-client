@@ -192,7 +192,9 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         if (!agentRec) {
           // Not reachable through a loaded agent's own session, and refusing is the only safe
           // answer: an unresolved presenter cannot be scoped, and presenting unscoped is the defect.
-          throw new Error(`presenting agent '${agentName}' is not loaded — cannot scope the wallet`);
+    // NOTE: this throw is CAUGHT by this function's own catch below and downgraded to a warn — the
+      // session then forms with no signals. Not a refusal of the session; a refusal to PRESENT.
+      throw new Error(`presenting agent '${agentName}' is not loaded — cannot scope the wallet`);
         }
         const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
         const eligible = store.listAllActive({
@@ -319,6 +321,13 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         }
       }
     } catch (err: unknown) {
+      // DEGRADES, it does not refuse — and the comment on the throw above used to claim otherwise.
+      // A wallet read that fails (including the deliberate "agent not loaded" throw, which is
+      // annotated "refusing is the only safe answer") lands here, is downgraded to a warn, and the
+      // session proceeds with NO signals attached. That behaviour is CORRECT — presenting unscoped is
+      // the actual danger and presenting nothing is safe — but the code and the comment disagreed
+      // about which one happens, and a comment that misdescribes the control flow is worse than
+      // either, because the next reader trusts it instead of the code.
       logger.warn("signal.presentation.read_failed", {
         agentName,
         reason: err instanceof Error ? err.message : String(err),

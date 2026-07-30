@@ -243,10 +243,34 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
   for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
     try {
       db.exec(`ALTER TABLE ${table} ADD COLUMN same_operator INTEGER NOT NULL DEFAULT 0`);
-    } catch {
-      // Column already exists — safe to ignore. Unlike the consent migration there is no backfill:
-      // 0 (not co-owned) is the correct value for every pre-existing row, because no signal minted
-      // before the slot existed could have carried the flag.
+    } catch (err) {
+      // VERIFY, DO NOT ASSUME, THE FAILURE WAS "already exists".
+      //
+      // A bare swallow here rests on the assumption that duplicate-column is the ONLY way this can
+      // fail. It is not: `sqlcipher-db.ts` sets no `busy_timeout`, so SQLITE_BUSY returns immediately
+      // — and "two daemons on one DB" is a named real condition in this project, not a hypothetical.
+      // SQLITE_READONLY and SQLITE_FULL swallow identically.
+      //
+      // What that costs: the ALTER silently does not run, then `putReceivedSignal` throws "table has
+      // no column named same_operator", which is caught upstream as a WARN — so the session forms
+      // normally and NO presented signal is ever stored. On the wallet side it surfaces as a delivery
+      // rejection with no ACK, and the directory re-delivers forever. A migration that fails silently
+      // is indistinguishable from one that worked until something much later looks wrong.
+      //
+      // So re-read the schema and rethrow if the column is genuinely absent. The idempotent case
+      // stays silent; every other cause becomes loud. This mirrors `migrateWalletAddConsentState`
+      // below, which checks `PRAGMA table_info` for exactly this reason.
+      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      if (!cols.includes("same_operator")) {
+        throw new Error(
+          `failed to add same_operator to ${table} and the column is still absent — the daemon cannot ` +
+          `store or present trust signals in this state: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // Present: the ALTER was a genuine no-op. No backfill is needed either — 0 (not co-owned) is
+      // correct for every pre-existing row, because no signal minted before the slot existed could
+      // have carried the flag.
     }
   }
   // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent

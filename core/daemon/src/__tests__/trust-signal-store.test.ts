@@ -686,4 +686,47 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(db.prepare("SELECT COUNT(*) AS n FROM agents").get()).toMatchObject({ n: before.n });
     });
   });
+
+  describe("the same_operator migration verifies rather than assumes (review F4)", () => {
+    it("is a silent no-op when the column already exists", () => {
+      // Idempotence: ensureTrustSignalSchema runs on every daemon start, so the second call must not
+      // throw. This is the case the bare catch was written for, and it still has to hold.
+      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
+      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
+      for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
+        const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+        expect(cols, `${table} has the column`).toContain("same_operator");
+      }
+    });
+
+    it("THROWS when the ALTER fails and the column is genuinely absent", () => {
+      // The failure the bare swallow hid. Any non-duplicate cause — SQLITE_BUSY from a second daemon
+      // on the same DB, READONLY, FULL — used to be swallowed, after which putReceivedSignal throws
+      // "no column named same_operator", is caught upstream as a WARN, and the daemon runs with
+      // sessions forming normally while NO presented signal is ever stored.
+      //
+      // Simulated by making the ALTER fail on a table that has no such column: a stand-in table is
+      // created, then `prepare` is stubbed so the ALTER path errors and the PRAGMA reports the truth.
+      const probe = { ...db } as unknown as typeof db;
+      const realPrepare = db.prepare.bind(db);
+      let alterAttempted = false;
+      (probe as unknown as { exec: (sql: string) => void }).exec = (sql: string) => {
+        if (sql.includes("ADD COLUMN same_operator")) {
+          alterAttempted = true;
+          throw new Error("database is locked");
+        }
+        db.exec(sql);
+      };
+      (probe as unknown as { prepare: typeof realPrepare }).prepare = ((sql: string) => {
+        if (sql.startsWith("PRAGMA table_info")) {
+          // Report the column as absent — i.e. the ALTER really did not take effect.
+          return { all: () => [{ name: "signal_hash" }] } as unknown as ReturnType<typeof realPrepare>;
+        }
+        return realPrepare(sql);
+      }) as typeof realPrepare;
+
+      expect(() => ensureTrustSignalSchema(probe, silent)).toThrow(/same_operator/);
+      expect(alterAttempted, "the ALTER was actually attempted").toBe(true);
+    });
+  });
 });
