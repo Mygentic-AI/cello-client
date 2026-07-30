@@ -52,48 +52,6 @@ export interface CloseSessionDeps {
   handleActiveSealFlow: (sessionId: string, record: SessionRecord, correlationId: string) => Promise<ActiveSealResult>;
 }
 
-/**
- * DOD-SEAL-BROKER-1 (receipt fetch): ask the directory this agent is connected to whether it already
- * holds a receipt for this session.
- *
- * Returns null on: no signaling, no receipt, a non-participant refusal, or no answer in time. All of
- * those mean "carry on and escalate" — this is a shortcut for when the seal already happened, never a
- * gate. It must not be able to BLOCK a seal that has not happened.
- */
-async function fetchSealResult(
-  signaling: SignalingManager | undefined,
-  sessionIdHex: string,
-  correlationId: string,
-  logger: Logger,
-): Promise<{ sealedRootHex: string } | null> {
-  if (!signaling || signaling.status !== "connected") return null;
-  const sessionId = new Uint8Array(Buffer.from(sessionIdHex, "hex"));
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (v: { sealedRootHex: string } | null): void => {
-      if (settled) return;
-      settled = true;
-      unregister();
-      clearTimeout(timer);
-      resolve(v);
-    };
-    const unregister = signaling.registerInboundHandler((frame) => {
-      const t = frame["type"];
-      if (t !== "seal_result" && t !== "seal_result_none") return;
-      if (t === "seal_result_none") { done(null); return; }
-      const root = frame["sealed_root"];
-      const rootHex = root instanceof Uint8Array ? Buffer.from(root).toString("hex") : String(root ?? "");
-      done(/^[0-9a-f]{64}$/.test(rootHex) ? { sealedRootHex: rootHex } : null);
-    });
-    // Short on purpose: this runs AFTER an 11-minute wait, so the agent has waited long enough. If the
-    // directory does not answer promptly, escalating is the better use of the next second.
-    const timer = setTimeout(() => {
-      logger.debug("session.seal.result.fetch.timeout", { sessionId: sessionIdHex, correlationId });
-      done(null);
-    }, 5_000);
-    void signaling.sendRaw({ type: "seal_result_request", session_id: sessionId }).catch(() => done(null));
-  });
-}
 
 export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   const {
@@ -377,28 +335,6 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           // a reader gets it on the same surface that proves the seal — receipt-not-assent,
           // per-party frontiers, attestation modes, and final_message.answered.
           return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
-        }
-
-        // DOD-SEAL-BROKER-1 (receipt fetch): the bilateral wait expired. Before escalating to a
-        // unilateral seal, ASK whether the seal already succeeded.
-        //
-        // Necessary, not belt-and-braces: the directory that adjudicates a seal pushes `session_sealed`
-        // from its LOCAL stream map, so a participant homed on a different directory is never handed it
-        // — notification_queue is per-node and not replicated. This agent can therefore be waiting on a
-        // push that will never arrive, for a seal that is notarized and DURABLE, and escalating would
-        // ask for a second seal of an already-sealed session.
-        //
-        // The directory this agent IS connected to already holds the receipt, because
-        // seal_notarizations replicates. One question, no cross-node delivery.
-        const fetched = await fetchSealResult(signalingFor(record.agent_name), sessionId, correlationId, logger);
-        if (fetched) {
-          logger.info("session.seal.completed", { sessionId, sealedRoot: fetched.sealedRootHex, role: "fetched", correlationId });
-          crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`);
-          // No `legibility`: the readable certificate is derived at signing time and never stored, so
-          // returning one here would mean re-deriving it — and a re-derivation differing even slightly
-          // would give the two parties receipts that disagree about the same conversation. The signed
-          // root IS the proof. The asymmetry is deliberate and visible rather than hidden.
-          return { ok: true, sealed_root: fetched.sealedRootHex };
         }
 
         // M8B FINDING-1: `responder_seal_already_submitted` has two producers — (a) the auto-ack
