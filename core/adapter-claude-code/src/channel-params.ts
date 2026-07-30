@@ -18,11 +18,6 @@
  * conflation that shipped the broken doorbell.
  */
 
-function short(v: unknown): string {
-  const s = v == null ? "" : String(v);
-  return s.length > 12 ? `${s.slice(0, 12)}…` : s;
-}
-
 /** Shim-side fingerprint — mirrors the daemon's who-label format for old-daemon frames. */
 function shimFingerprint(pubkey: unknown): string {
   const s = typeof pubkey === "string" && pubkey.length >= 8 ? pubkey.slice(0, 8) : null;
@@ -79,10 +74,12 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
           return `CELLO — session with ${who} is now "${String(data["state"] ?? "changed")}".`;
       }
     }
-    // Agent NAMES are never shortened — `short()` is for pubkeys/fingerprints. These two cases used
-    // it anyway and rendered "CELLO_Feedba…", contradicting the rule stated in the
+    // Agent NAMES are never shortened. These two cases ran the name through a 12-char `short()`
+    // helper and rendered "CELLO_Feedba…", contradicting the rule stated in the
     // session_state_changed branch above ("AC3's 'never truncates a name' applies to YOUR agent name
-    // too; only fingerprints shorten"). A mangled name reads like a different agent.
+    // too; only fingerprints shorten"). A mangled name reads like a different agent. Removing the
+    // last two callers left `short()` with none — fingerprints are rendered by shimFingerprint,
+    // which slices independently — so it was deleted rather than left as a helper nobody calls.
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
