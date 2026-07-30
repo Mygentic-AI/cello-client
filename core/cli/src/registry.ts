@@ -31,6 +31,7 @@ import {
 import { splitAgentFlag } from "./arg-parse.js";
 import {
   IPC_METHODS,
+  listSessions,
   contactAdd,
   contactRemove,
   contactList,
@@ -692,13 +693,19 @@ export const COMMANDS: readonly CommandSpec[] = [
     group: "Sessions & receipts",
     summary: "List your sessions (open by default; --all/--closed/--failed to filter).",
     help:
-      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
+      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N] [--agent <name>] [--all-agents]\n" +
+      "  Lists the SELECTED agent's session history (defaults to open). --all filters by status;\n" +
+      "  --all-agents lists every agent's sessions on this daemon, each row labelled with its agent.",
     flags: [
       { name: "--open" },
       { name: "--closed" },
       { name: "--failed" },
       { name: "--all" },
       { name: "--limit", consumesValue: true },
+      // DOD-CLI-SESSIONS-SCOPE-1: `--all` filters by STATUS; `--all-agents` widens the PRINCIPAL.
+      // Two different axes that both read as "all" in a hurry — hence the explicit suffix.
+      { name: "--all-agents" },
+      ...AGENT_FLAG,
     ],
     async run(ctx, args) {
       let filter: SessionFilter | undefined;
@@ -712,7 +719,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         const n = Number(args[limitIdx + 1]);
         if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
       }
-      return legacy(await sessions(ctx.celloDir, { filter, limit }));
+      // Scoped to the selected agent, like the MCP tool. --all-agents opts into the daemon-wide
+      // view, which cannot be agent-scoped and therefore takes the non-parity path.
+      if (args.includes("--all-agents")) {
+        return legacy(await sessions(ctx.celloDir, { filter, limit }));
+      }
+      const { agent, pretty } = parityOpts(args);
+      return listSessions(ctx.celloDir, { filter, limit, agent, pretty });
     },
   },
   {

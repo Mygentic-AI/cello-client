@@ -50,6 +50,7 @@ vi.mock("../parity-commands.js", async (importOriginal) => {
     stopAgent: stub(),
     useAgent: stub(),
     inbox: stub(),
+    listSessions: stub(),
     transcript: stub(),
     contactSetMoniker: stub(),
     contactAdd: stub(),
@@ -125,21 +126,34 @@ describe("T2: the registry forwards EXACTLY what the old switch forwarded", () =
     expect(commands.relayReceipts).toHaveBeenCalledWith(CELLO_DIR, "dave");
   });
 
+  // DOD-CLI-SESSIONS-SCOPE-1: the default route moved from commands.sessions (daemon-wide) to
+  // parity.listSessions (agent-scoped). The filter/limit parsing this test was written to protect is
+  // unchanged and asserted against the new target; the daemon-wide call survives only behind
+  // --all-agents, which is asserted separately below so the branch cannot rot.
   it("sessions: filter precedence (all > closed > failed > open) and --limit parsing", async () => {
+    const scoped = { agent: undefined, pretty: false };
     await run("sessions", []);
-    expect(commands.sessions).toHaveBeenCalledWith(CELLO_DIR, { filter: undefined, limit: undefined });
+    expect(parity.listSessions).toHaveBeenCalledWith(CELLO_DIR, { filter: undefined, limit: undefined, ...scoped });
 
     await run("sessions", ["--all", "--closed"]); // --all wins
-    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "all", limit: undefined });
+    expect(parity.listSessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "all", limit: undefined, ...scoped });
 
     await run("sessions", ["--closed", "--failed"]); // --closed wins over --failed
-    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "closed", limit: undefined });
+    expect(parity.listSessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "closed", limit: undefined, ...scoped });
 
     await run("sessions", ["--open", "--limit", "5"]);
-    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "open", limit: 5 });
+    expect(parity.listSessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "open", limit: 5, ...scoped });
 
     await run("sessions", ["--limit", "notanumber"]); // non-numeric → ignored, not NaN
-    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: undefined, limit: undefined });
+    expect(parity.listSessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: undefined, limit: undefined, ...scoped });
+  });
+
+  it("sessions --all-agents keeps the daemon-wide route (the only caller left for it)", async () => {
+    // The opt-in branch. Without this, deleting commands.sessions would look safe: nothing else calls
+    // it now, and the scoped default would keep every other assertion green.
+    await run("sessions", ["--all-agents", "--closed"]);
+    expect(commands.sessions).toHaveBeenLastCalledWith(CELLO_DIR, { filter: "closed", limit: undefined });
+    expect(parity.listSessions).not.toHaveBeenCalled();
   });
 
   it("contact: every sub-verb routes to its OWN function (not a neighbour)", async () => {

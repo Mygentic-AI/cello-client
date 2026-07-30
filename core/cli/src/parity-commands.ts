@@ -274,6 +274,7 @@ export const IPC_METHODS = {
   "stop-agent": "cello_stop_agent",
   "use-agent": "cello_use_agent",
   inbox: "cello_check_notifications",
+  sessions: "cello_list_sessions",
   transcript: "cello_get_transcript",
   "sealed-receipt": "cello_get_sealed_receipt",
   "initiate-session": "cello_initiate_session",
@@ -343,6 +344,33 @@ export function inbox(
   opts: ParityOptions & { scope?: "current" | "all" },
 ): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS.inbox, defined({ scope: opts.scope }), opts);
+}
+
+/**
+ * `cello sessions` → cello_list_sessions: THIS agent's sessions, matching the MCP tool exactly.
+ *
+ * DOD-CLI-SESSIONS-SCOPE-1. It used to call the daemon-wide `list_sessions` instead, whose comment
+ * explained why — "for the `cello sessions` CLI which has no current agent". That was true when it
+ * was written and stopped being true when `use-agent` became durable: the CLI has a persisted
+ * selection now, and every other agent-scoped command replays it. The effect of the stale premise
+ * was that `cello sessions` answered for ALL agents while `cello_sessions` answered for one, so the
+ * two surfaces reported different open-session sets for the same selection — and a multi-agent
+ * operator read another agent's rows as their own.
+ *
+ * The daemon-wide view is still reachable, as `--all-agents`, because it is genuinely useful for
+ * "what is open anywhere on this machine". It is opt-in: a listing that silently answers for a
+ * principal you did not ask about is the bug, not the feature.
+ */
+export function listSessions(
+  celloDir: string,
+  opts: ParityOptions & { filter?: string; limit?: number },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS.sessions,
+    defined({ filter: opts.filter, limit: opts.limit }),
+    opts,
+  );
 }
 
 /** `cello transcript <session-id>` → cello_get_transcript (durable, survives a daemon restart). */
