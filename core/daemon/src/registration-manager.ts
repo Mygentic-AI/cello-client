@@ -151,7 +151,7 @@ export class RegistrationManager {
    * Register this agent with the directory.
    * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
    */
-  async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string }> {
+  async register(phoneStub: string = "", preAuthToken?: string): Promise<RegistrationState | { error: string; detail?: string }> {
     // Step 1: already registered
     if (this.#registrationState) {
       return { error: "already_registered" };
@@ -352,8 +352,19 @@ export class RegistrationManager {
       // when the cause was a duplicate nodeId in a manifest or an unreachable node.
       this.#ctx.logger.error("registration.dkg.failed", {
         reason: err instanceof Error ? err.message : String(err),
+        // WHICH registration and WHICH nodes. `reason` alone cannot be acted on: on a multi-agent
+        // daemon the operator cannot tell which agent failed, and a nested
+        // "dkgRound2: no response received" does not say from whom. These are also what let this line
+        // be correlated with the registration.dkg.quorum_mismatch warning that may precede it.
+        agentPubkey: kLocalPubkeyHex,
+        directoryNodeIds: roster ? roster.map((e) => e.nodeId) : undefined,
+        // The stack, not just the message — a wrapped throw from two frames down otherwise loses the
+        // frame that names the node.
+        stack: err instanceof Error ? err.stack : undefined,
       });
-      return { error: "dkg_failed" };
+      // The cause travels WITH the code. `dkg_failed` is the closed protocol union the wire needs;
+      // `detail` is what lets the operator-facing guidance say which failure it actually was.
+      return { error: "dkg_failed", detail: err instanceof Error ? err.message : String(err) };
     }
     // SI-003/AC-005: AWAIT the share persist (was fire-and-forget) before register reports success —
     // so a register-success guarantees the share is durably committed (no can't-sign zombie).

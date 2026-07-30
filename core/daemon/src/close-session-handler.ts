@@ -303,22 +303,37 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         if (!submit.ok && submit.reason !== "responder_seal_already_submitted") {
           pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
 
-          // THE SEAL MAY HAVE ALREADY SUCCEEDED. `submitSealLeaf` reports `session_node_unavailable`
-          // when the in-memory node entry is gone, and one way it goes is the session sealing —
-          // teardown runs BEFORE the record's status flips to "sealed", so a close landing in that
-          // window missed the AC-010 already-sealed check above and arrived here instead. Both
-          // parties closing at once is the ordinary case (each operator ends the conversation), so
-          // whichever call arrives second hit it.
+          // THE SEAL MAY HAVE ALREADY SUCCEEDED, so returning the raw reason is an exit-point label
+          // with the wrong diagnosis attached: the guidance below blames relay reachability when the
+          // relay was fine and the seal is notarized and DURABLE. The operator who asked to close is
+          // told it failed and gets no root — the receipt being the whole point of closing.
           //
-          // Returning the raw reason there is an exit-point label with the wrong diagnosis attached:
-          // the guidance below blames relay reachability, when the relay was fine and the seal is
-          // notarized and DURABLE. Worse, the operator who asked to close is told it failed and gets
-          // no root — the receipt is the whole point of closing.
+          // HOW the window opens (corrected — my first version named a mechanism that does not
+          // exist): it is NOT that teardown precedes the status flip. In `destroySessionNode` the
+          // flip happens BEFORE `#activeNodes.delete`, so that ordering is safe. The real producers
+          // are (a) `record` is a snapshot taken at the top of this handler, before a broker dial that
+          // can take up to 10s, so it can be stale by now; and (b) `retireSessionNode` stops the node
+          // WITHOUT changing the DB status, and `destroySessionNode` then early-returns above the
+          // flip. Both parties closing at once is the ordinary case, so whichever call arrives second
+          // meets it.
           //
-          // The root is read from THIS agent's own database, never from a directory's word: local
-          // state the agent already computed and persisted. That distinction is why this is a fix and
-          // the fetched-receipt path was not.
-          const localCert = sessionNodeManager.getSealCertificate(record.agent_name, sessionId);
+          // SCOPED to that reason. This previously fired on EVERY `!submit.ok`, while justifying
+          // itself for one — and a future failure (a tree mismatch, a signing failure) would have been
+          // absorbed into `ok:true` with an old root and never surfaced.
+          //
+          // Why this is not the fetched-receipt path wearing a different hat — the distinction is
+          // narrower than I first wrote, so stated exactly: the stored cert passed the
+          // field-completeness gate, passed the independent frontier re-derivation (the client never
+          // takes the directory's word for that value), and where this agent holds the signer key it
+          // was cryptographically verified. None of those were true of a fetched root. It is also not
+          // a new claim — `cello_get_sealed_receipt` already returns this exact cert with no status
+          // gate. Honest caveat: for a NON-initiator the stored cert is recorded `verified:false`,
+          // so it is ultimately directory-attested over an authenticated channel — the same trust the
+          // ordinary bilateral close already returns, not a new one introduced here.
+          const localCert =
+            submit.reason === "session_node_unavailable"
+              ? sessionNodeManager.getSealCertificate(record.agent_name, sessionId)
+              : null;
           if (localCert?.sealed_root) {
             logger.info("session.seal.completed", {
               sessionId, sealedRoot: localCert.sealed_root, role: "already_sealed_locally", correlationId,

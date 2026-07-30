@@ -60,6 +60,14 @@ import {
 
 
 /** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
+/**
+ * How long the auto-acknowledge path holds its broker visiting connection AFTER submitting the seal
+ * leaf. The directory pushes `seal_verified` back ~60ms later (measured on GCP), so releasing on
+ * submit closed the stream before the frame it was opened for. Generous against 60ms, and bounded so
+ * a stalled seal cannot leak the connection.
+ */
+const AUTOACK_BROKER_GRACE_MS = 30_000;
+
 const MAX_REFUSED_PARKED_ENTRIES = 512;
 
 // Persistence bounds are TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-migration). The two
@@ -3325,10 +3333,29 @@ export class SessionNodeManager {
           reason: err instanceof Error ? err.message : String(err),
         });
       }
-      return this.submitSealLeaf(agentName, sessionId, correlationId)
-        .finally(() => {
-          if (sealBrokerConn) void sealBrokerConn.stop("autoack-seal-complete").catch(() => {});
-        });
+      const submitted = await this.submitSealLeaf(agentName, sessionId, correlationId);
+      // RELEASE AFTER A GRACE WINDOW, not when the submit resolves.
+      //
+      // `submitSealLeaf` settles at the relay ack plus a local root computation — milliseconds — while
+      // the frame this connection exists to catch arrives ~60ms LATER (the timeline in the comment
+      // above is the measurement). Releasing on submit therefore closed the stream before the push it
+      // was opened for, which is the stall it was written to prevent.
+      //
+      // It is worse than a lost race. The directory drains its DURABLE notification queue on ANY
+      // stream that authenticates — visiting included — and DELETES each row once sent. So a visiting
+      // stream that authenticates and dies milliseconds later invites the directory to send-and-delete
+      // queued seal frames into a closing stream: the receipt is gone from the queue and never
+      // arrived. That is permanent loss, not a retry.
+      //
+      // The close path holds its connection around the entire bilateral wait; this path has no waiter
+      // to hang off, so it uses a bounded grace instead — generous against a ~60ms push, and bounded
+      // so a stalled seal cannot leak the connection. Unref'd: it must never hold the process open.
+      if (sealBrokerConn) {
+        const conn = sealBrokerConn;
+        const t = setTimeout(() => { void conn.stop("autoack-seal-grace-elapsed").catch(() => {}); }, AUTOACK_BROKER_GRACE_MS);
+        t.unref?.();
+      }
+      return submitted;
     })()
       .then((result) => {
         if (result.ok) {

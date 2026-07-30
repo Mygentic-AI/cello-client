@@ -218,6 +218,11 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     const promise = mgr.register("", "token");
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
-    expect(await promise).toEqual({ error: "dkg_failed" });
+    // The wire code stays the closed protocol union; `detail` carries the underlying cause so the
+    // operator-facing guidance can name it instead of asserting "verify the preAuthToken" — which is
+    // wrong for a colliding NODE_ID, a commitment mismatch, or an unreachable node.
+    const outcome = (await promise) as { error: string; detail?: string };
+    expect(outcome.error).toBe("dkg_failed");
+    expect(outcome.detail, "the cause must travel with the code, not be discarded").toBeTruthy();
   });
 });

@@ -36,7 +36,7 @@ export interface RegisterHandlerDeps {
   startAgentInternal: (name: string) => { ok: true } | { ok: false; reason: string; guidance: string };
   directoryEndpointResolver?: () => Promise<import("./signaling-connect.js").DirectoryEndpoint | null>;
   loadedAgents: Array<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
-  registrationGuidance: (reason: string) => string;
+  registrationGuidance: (reason: string, detail?: string) => string;
   manifestProvider?: IManifestProvider;
 }
 
@@ -154,7 +154,13 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
           // Terminal failure for THIS agent — drop its dedicated signaling manager so it
           // does not reconnect forever for an unregistered agent (re-created on retry).
           await dropAgentSignaling(name);
-          return { ok: false, reason: result.error, guidance: registrationGuidance(result.error) };
+          // `detail` is the underlying cause when the manager captured one — the wire `reason` stays
+          // the closed union, the guidance gets to be accurate.
+          return {
+            ok: false,
+            reason: result.error,
+            guidance: registrationGuidance(result.error, (result as { detail?: string }).detail),
+          };
         }
         // PERSIST-002 (AC-013): the identity row (K_local + share + ML-DSA + registration) is durably
         // committed at this point (RegistrationManager awaits the persist before returning success).

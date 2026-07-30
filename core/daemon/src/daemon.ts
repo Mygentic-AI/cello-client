@@ -1732,18 +1732,30 @@ async function startDaemonHoldingLock(
     perAgentSignaling,
   });
 
-  const registrationGuidance = (reason: string): string => {
+  // `detail` carries the ACTUAL cause when one is known. The wire code stays `dkg_failed` — it is a
+  // closed protocol union — but this string is a local daemon→IPC message, so it can say what really
+  // happened instead of asserting a guess.
+  const registrationGuidance = (reason: string, detail?: string): string => {
     switch (reason) {
       case "already_registered":
         return "This agent is already registered with the directory. No action needed.";
       case "directory_unreachable":
         return "The directory signaling stream is not connected (or its bootstrap endpoint could not be resolved). Wait for directory_signaling to show connected in cello status, then retry.";
       case "dkg_failed":
-        return "The FROST DKG ceremony with the directory failed. This usually means the directory rejected the pre-authorization token or a node was unavailable mid-ceremony. Verify the preAuthToken is valid/unused and retry.";
+        // NOT "this usually means the pre-auth token". That diagnosis is confidently wrong for the
+        // causes that actually occur — a colliding NODE_ID across two directory boxes, a commitment
+        // that does not match the client's primary_pubkey, a node dropping mid-ceremony — and it sends
+        // the operator to the wrong subsystem. The cause is now captured one call frame away
+        // (registration.dkg.failed), so it is reported rather than guessed at.
+        return detail
+          ? `The FROST DKG ceremony with the directory failed: ${detail}`
+          : "The FROST DKG ceremony with the directory failed, and no underlying cause was captured. Check the daemon log for registration.dkg.failed, which carries the reason.";
       case "timeout":
         return "The directory did not respond within the registration timeout. Retry once directory_signaling is connected.";
       default:
-        return `Registration failed: ${reason}. Check the daemon logs (registration.* events) and that the preAuthToken is valid.`;
+        return detail
+          ? `Registration failed: ${reason} — ${detail}`
+          : `Registration failed: ${reason}. Check the daemon logs (registration.* events).`;
     }
   };
 
