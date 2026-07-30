@@ -1829,6 +1829,13 @@ async function startDaemonHoldingLock(
       // answers "include it by default"; this answers the prior question, "may it be presented at
       // all".
       consent_state: r.consentState,
+      // M10B / DOD-END-COUNT-1. The operator holds an endorsement whose worth is CAPPED — a
+      // recipient's floor excludes it from `min_count` — and until now nothing told them so. Two
+      // endorsements looked identical in this list while one could clear a counterparty's bar and the
+      // other could not, which is the kind of invisible difference that reads as the protocol being
+      // arbitrary. It is a portal-attested envelope field, so surfacing it discloses nothing the
+      // recipient will not already see.
+      same_operator: r.sameOperator,
     }));
     return { ok: true, signals: rows };
   });
