@@ -70,7 +70,7 @@ export default [
     // it only ever shrinks. When it is empty, delete this block; the debt is paid.
     //   - daemon/identity-migration.ts : reads a legacy PLAINTEXT db to migrate it into SQLCipher.
     //       SQLCipher can open plaintext directly, so this is convertible with no migration risk.
-    // (The two gateway stores left this list on 2026-07-29 — DOD-M9C-STORE-1 gave core/gateway its
+    // (The two gateway stores left this list on 2026-07-29 — DOD-M9B-STORE-1 gave core/gateway its
     // own SQLCipher opener, keyed by the daemon's key file, so neither store can write plaintext.)
     files: [
       "core/daemon/src/identity-migration.ts",
