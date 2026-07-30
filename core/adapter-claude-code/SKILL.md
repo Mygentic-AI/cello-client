@@ -75,7 +75,16 @@ Run Claude Code with the CELLO channel enabled. The session wakes automatically 
 claude --channels plugin:cello@cello-protocol
 ```
 
-Channels are a research preview and `--channels` accepts only allowlisted plugins. If the startup banner says *"not on the approved channels allowlist"*, the channel did **not** register and no events arrive. Either launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, or have an org admin add `{ "marketplace": "cello-protocol", "plugin": "cello" }` to `allowedChannelPlugins` in managed settings — noting that setting it replaces the Anthropic allowlist entirely, so every other channel you use must be listed there too.
+Channels are a research preview and `--channels` accepts only allowlisted plugins. If the startup banner says *"not on the approved channels allowlist"*, the channel did **not** register and no events arrive.
+
+You can approve CELLO yourself — `managed-settings.json` is an ordinary local file, no organization involved:
+
+```bash
+sudo mkdir -p "/Library/Application Support/ClaudeCode"     # Linux: /etc/claude-code
+```
+then add `{ "marketplace": "cello-protocol", "plugin": "cello" }` to `allowedChannelPlugins` alongside `"channelsEnabled": true`. **That setting replaces the Anthropic allowlist rather than extending it**, so list every other channel you use (telegram, discord, imessage, fakechat from `claude-plugins-official`) in the same array, and merge rather than overwrite if the file already exists.
+
+Or skip it and launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, which prompts once per launch.
 
 ### Coming back after being away
 ```
@@ -179,7 +188,9 @@ agent you selected with `cello_use_agent`.
 cello_contacts({ agent? })
 cello_contact_add({ pubkey, moniker?, agent? })
 cello_contact_remove({ pubkey, agent? })
-cello_contact_set_tier({ pubkey, tier })     — 0=blocked 1=stranger 2=known 3=trusted 4=vip
+cello_contact_set_tier({ pubkey, tier })     — 0=blocked 1=unknown 2=known 3=whitelisted 4=vip
+                                             (these names are also the settings keys, e.g.
+                                              bounds.unknown.max_sessions — "stranger"/"trusted" are not)
 cello_contact_set_away({ pubkey, message })  — what THIS peer hears when you are away
 cello_contact_set_moniker({ pubkey, moniker })— YOUR pet name for THEM (they cannot spoof it)
 cello_contact_set_signal({ pubkey, hash_prefix, present })

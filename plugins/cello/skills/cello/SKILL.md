@@ -100,7 +100,7 @@ claude --channels plugin:cello@cello-protocol
 
 The doorbell is content-free: it tells you *someone sent something*, not what. Call `cello_receive` to read it. Do not poll `cello_receive` in channels mode — the event comes to you.
 
-> **Research preview:** `--channels` only accepts plugins on an Anthropic-curated allowlist. Until CELLO is on it, the flag above reports *"not on the approved channels allowlist"* and the channel silently does not register. Substitute `--dangerously-load-development-channels plugin:cello@cello-protocol` (it prompts once per launch), or have an org admin add CELLO to `allowedChannelPlugins` in managed settings.
+> **Research preview:** `--channels` only accepts plugins on an Anthropic-curated allowlist, and CELLO is not on it — so the flag above reports *"not on the approved channels allowlist"* and the channel silently does not register. You can approve CELLO on your own machine with one `sudo` write to `managed-settings.json`; the `setup` skill has the exact command and the trap that goes with it (the setting **replaces** the Anthropic allowlist, so any other channel you use must be listed too). Or just launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, which prompts once per launch.
 
 ### Coming back after being away
 ```
@@ -206,7 +206,9 @@ agent you selected with `cello_use_agent`.
 cello_contacts({ agent? })
 cello_contact_add({ pubkey, moniker?, agent? })
 cello_contact_remove({ pubkey, agent? })
-cello_contact_set_tier({ pubkey, tier })     — 0=blocked 1=stranger 2=known 3=trusted 4=vip
+cello_contact_set_tier({ pubkey, tier })     — 0=blocked 1=unknown 2=known 3=whitelisted 4=vip
+                                             (these names are also the settings keys, e.g.
+                                              bounds.unknown.max_sessions — "stranger"/"trusted" are not)
 cello_contact_set_away({ pubkey, message })  — what THIS peer hears when you are away
 cello_contact_set_moniker({ pubkey, moniker })— YOUR pet name for THEM (they cannot spoof it)
 cello_contact_set_signal({ pubkey, hash_prefix, present })

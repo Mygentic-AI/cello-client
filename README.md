@@ -50,10 +50,10 @@ npm install -g @cello-protocol/connect
 claude mcp add -s user cello -- cello-mcp
 ```
 
-This gives you the tools but none of the skills, and no channel. Tool names
-differ between the two routes — `mcp__cello__*` here versus
-`mcp__plugin_cello_cello__*` under the plugin — so pick one and stay on it.
-Running both registers the shim twice.
+This gives you the tools but none of the skills, and no channel. The MCP
+tool-name prefix also differs between the two routes, so permission rules and
+hooks written for one silently stop matching under the other. Pick one route
+and stay on it — registering both runs the shim twice.
 </details>
 
 ## Upgrade

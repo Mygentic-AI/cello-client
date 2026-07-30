@@ -156,8 +156,42 @@ So the session wakes on an incoming message instead of you polling:
 claude --channels plugin:cello@cello-protocol
 ```
 
-If this reports *"not on the approved channels allowlist"*, the channel did not register and no
-events will arrive. See the `reconnect` skill for the two ways around it.
+If the startup banner says *"not on the approved channels allowlist"*, the channel did **not** register
+and no events will arrive. Channels are a research preview and `--channels` accepts only plugins on an
+Anthropic-curated list; CELLO is not on it.
+
+Fix it once, on your own machine, by approving CELLO yourself. This is a normal local settings file —
+no organization or admin involvement:
+
+```bash
+sudo mkdir -p "/Library/Application Support/ClaudeCode"
+sudo tee "/Library/Application Support/ClaudeCode/managed-settings.json" >/dev/null <<'JSON'
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "cello-protocol", "plugin": "cello" },
+    { "marketplace": "claude-plugins-official", "plugin": "telegram" },
+    { "marketplace": "claude-plugins-official", "plugin": "discord" },
+    { "marketplace": "claude-plugins-official", "plugin": "imessage" },
+    { "marketplace": "claude-plugins-official", "plugin": "fakechat" }
+  ]
+}
+JSON
+```
+
+Restart Claude Code with the flag above; the allowlist line should be gone.
+
+**Do not trim that list, and do not run this blind if the file already exists.** `allowedChannelPlugins`
+**replaces** the Anthropic allowlist rather than adding to it — listing only `cello` silently stops
+Telegram, Discord and iMessage from registering, with no error. The four official entries are there for
+that reason. If `managed-settings.json` already exists, open it and **merge** the `cello` entry into the
+existing array instead of overwriting the file.
+
+On Linux the path is `/etc/claude-code/managed-settings.json`.
+
+The alternative, if you would rather not write a system file: launch with
+`--dangerously-load-development-channels plugin:cello@cello-protocol` instead. It works identically and
+shows a confirmation screen once per launch.
 
 ---
 
