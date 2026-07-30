@@ -36,9 +36,15 @@
  * daemon on 2026-07-29:
  *
  *   1. sidecar screens a message  -> record written, visible, `-wal` present
- *   2. a reader opens and CLOSES  -> SQLite unlinks `-wal`/`-shm` out from under the live sidecar
+ *   2. a reader opens and CLOSES  -> `-wal`/`-shm` unlinked out from under the sidecar
  *   3. sidecar screens again      -> the write lands in the now-orphaned WAL
  *   4. a fresh reader sees        -> only the FIRST record. Everything after step 2 is lost.
+ *
+ * PRECISION ADDED 2026-07-30 (review M1): step 2 only unlinks when that reader is the LAST
+ * connection open — a non-last close is harmless, which is measurable in one script. The reason the
+ * live sequence hit it anyway is `cello config set`, which SIGTERMs the sidecar to apply the change:
+ * during the restart the per-call handle IS the last one. Do not soften the rule below on the
+ * strength of the correction — "only sometimes destroys the audit trail" is not a design.
  *
  * So `cello policy log` and `cello config list` — the surfaces that exist to show what the layer
  * did — were silently destroying the record of what it did next. Holding the handle open means no
@@ -81,7 +87,7 @@ export interface GatewayConfigHandlerDeps {
    * Restart the screening sidecar so a stored change actually applies (M9B-D17). Supplied by the
    * composition root, which owns the sidecar's lifecycle. Absent in tests that assert storage only.
    */
-  restartSecurityGateway?: () => Promise<void>;
+  restartSecurityGateway?: (correlationId?: string) => Promise<void>;
 }
 
 /** Parse a wire value into the type the store's validator expects for that key. */
@@ -159,8 +165,8 @@ export type GatewayConfigDisposer = () => void;
 export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): GatewayConfigDisposer {
   const { handlers, celloDir, logger, getClientType, restartSecurityGateway } = deps;
 
-  // ONE handle, opened lazily, never closed per call — see the header. Closing is what unlinks the
-  // WAL and orphans every subsequent sidecar write.
+  // ONE handle, opened lazily, never closed per call — see the header. Never closing means this
+  // handle can never be the last-closer that unlinks the WAL while the sidecar is mid-restart.
   let configStore: GatewayConfigStore | undefined;
   const openStore = (): GatewayConfigStore => {
     if (!configStore) {
@@ -196,6 +202,13 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       const code = (err as { code?: string } | null)?.code ?? "config_store_unavailable";
       const guidance = (err as { guidance?: string } | null)?.guidance
         ?? "The security layer's config store could not be opened. Check the daemon log.";
+      // Review M4: LOG IT. This is the worst failure this surface has — the governance store
+      // unopenable, locked, or plaintext — and it used to exist ONLY in a CLI response the operator
+      // may never have run. "Check the daemon log" while writing nothing to the daemon log is a
+      // dead end, and the project's error-path-coverage rule exists for exactly this.
+      logger.error("gateway.config.store_unavailable", {
+        reason: code, error: err instanceof Error ? err.message : String(err), store: "config",
+      });
       return { ok: false, reason: code, guidance };
     }
     try {
@@ -214,8 +227,8 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       // store_locked / store_key_mismatch. The read path deserves the same.
       return storeFault(message);
     }
-    // NO `finally { store.close() }`. The close is the defect: it unlinks the WAL from under the
-    // sidecar and every record it writes afterwards is lost.
+    // NO `finally { store.close() }`. The close is the defect: closed as the last connection during
+    // a sidecar restart, it unlinks the WAL and every record written afterwards is lost.
   };
 
   // Read the whole surface. Shows the GOVERNANCE, not just the value (M9B-D18): after an incident
@@ -240,7 +253,10 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
           // AFTER an incident, and until now it showed neither — so it could not answer "who
           // weakened this, when, and did a human agree" (review F9 of the earlier pass).
           changedAt: latest?.changedAt ?? null,
-          chainValid: store.verifyChain(key),
+          // `null` for a key with NO rows, not `true` (review L5). An empty chain verifies
+          // vacuously, and "nothing to verify" must not read the same as "verified intact" on the
+          // one field whose whole job is tamper detection.
+          chainValid: latest ? store.verifyChain(key) : null,
         };
       }),
     })),
@@ -266,7 +282,10 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
         version: latest?.version ?? 0,
         lastChange: latest?.direction ?? null,
         confirmed: latest?.confirmed ?? false,
-        chainValid: store.verifyChain(key),
+        // Review L4: `get` is the NARROWER, more natural command ("what is autonomous_override
+        // set to?"), and it was the one that could not answer WHEN. Same two fields as `list`.
+        changedAt: latest?.changedAt ?? null,
+        chainValid: latest ? store.verifyChain(key) : null,
       };
     });
   });
@@ -296,6 +315,11 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       const code = (err as { code?: string } | null)?.code ?? "record_store_unavailable";
       const guidance = (err as { guidance?: string } | null)?.guidance
         ?? "The security layer's record store could not be opened. Check the daemon log.";
+      // Review M4, and worse here than for config: an unopenable RECORD store means the audit trail
+      // itself is unreadable, which is the one failure that must never be quiet.
+      logger.error("gateway.config.store_unavailable", {
+        reason: code, error: err instanceof Error ? err.message : String(err), store: "records",
+      });
       return { ok: false, reason: code, guidance };
     }
     try {
@@ -328,9 +352,11 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
   });
 
   handlers.set("cello_config_set", async (params, connectionId) => {
-    // One id for the whole fan-out: changed -> applied | restart_failed, and the restarted sidecar's
-    // own boot lines. This is the multi-event async flow the project's correlationId rule exists for,
-    // and the config path had none because it has no inbound id to inherit — so mint one (review F12).
+    // One id for the whole fan-out: changed -> applied | restart_failed, AND the restarted sidecar's
+    // own boot lines — the last of those was claimed before it was true (review M2), so the id is now
+    // actually passed to the restart and into the child's environment. This is the multi-event async
+    // flow the project's correlationId rule exists for, and the config path had none because it has
+    // no inbound id to inherit — so mint one (review F12).
     const correlationId = randomUUID();
     const key = typeof params?.key === "string" ? params.key : undefined;
     if (!key || !(GATEWAY_CONFIG_KEYS as readonly string[]).includes(key)) {
@@ -412,7 +438,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
     function applied(k: string, direction: ConfigDirection, version: number, wasConfirmed: boolean) {
       const base = { ok: true as const, key: k, direction, version, confirmed: wasConfirmed };
       if (!restartSecurityGateway) return { ...base, applied: false as const };
-      return restartSecurityGateway().then(
+      return restartSecurityGateway(correlationId).then(
         () => {
           logger.info("gateway.config.applied", { key: k, restarted: true, correlationId });
           return { ...base, applied: true as const };

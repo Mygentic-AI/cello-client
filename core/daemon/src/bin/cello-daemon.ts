@@ -73,7 +73,7 @@ const version = process.env.CELLO_VERSION || "0.0.1";
  * against it and find out why. A dead agent with a cryptic startup error diagnoses nothing, and a
  * silent downgrade to passthrough is the original bug wearing a hat.
  */
-async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined }> {
+async function startSecurityLayer(correlationId?: string): Promise<{ client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined }> {
   const socketPath = join(celloDir, "gateway.sock");
   const client = new LocalSidecarGatewayClient({ socketPath, logger });
 
@@ -92,14 +92,19 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
       env: {
         CELLO_GATEWAY_STORE_DB: join(celloDir, "gateway.db"),
         CELLO_GATEWAY_STORE_KEY_FILE: keyFilePath,
+        // Review M2: the child's own boot lines join the flow that RESTARTED it. Without this the
+        // operator sees `gateway.config.applied{correlationId}` and, on the next line, a sidecar
+        // that failed to open its store with no way to tie the two together — which is the exact
+        // correlation the config surface exists to provide.
+        ...(correlationId !== undefined ? { CELLO_GATEWAY_CORRELATION_ID: correlationId } : {}),
       },
     });
-    logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath });
+    logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath, ...(correlationId !== undefined ? { correlationId } : {}) });
     sidecar.process.once("exit", (code, signal) => {
       // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
       // line is how the operator learns the screening process died rather than inferring it from
       // a wall of blocked sends.
-      logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none" });
+      logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none", ...(correlationId !== undefined ? { correlationId } : {}) });
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -112,7 +117,7 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
     const guidance = (err as { guidance?: string } | null)?.guidance
       ?? "The security layer could not start, so nothing can be sent or received: every message " +
          "fails closed. Fix the cause below and restart the daemon.";
-    logger.error("security.gateway.spawn_failed", { reason: code, error: message, guidance });
+    logger.error("security.gateway.spawn_failed", { reason: code, error: message, guidance, ...(correlationId !== undefined ? { correlationId } : {}) });
     client.setUnavailableCause(code, `${guidance} (cause: ${message})`);
   }
   return { client, sidecar };
@@ -172,9 +177,9 @@ async function main(): Promise<void> {
    * needs no involvement. A failure PROPAGATES — the caller reports stored-but-not-applied rather
    * than telling the operator a guard changed when it did not.
    */
-  const restartSecurityGateway = async (): Promise<void> => {
+  const restartSecurityGateway = async (correlationId?: string): Promise<void> => {
     if (security.sidecar) await security.sidecar.stop();
-    const restarted = await startSecurityLayer();
+    const restarted = await startSecurityLayer(correlationId);
     security.sidecar = restarted.sidecar;
     if (!restarted.sidecar) throw new Error("the screening process did not come back up");
   };

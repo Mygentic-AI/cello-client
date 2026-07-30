@@ -318,7 +318,7 @@ export interface DaemonConfig {
    * and have no effect — the operator told `ok`, the running gateway unchanged. Supplied by the
    * composition root, which owns the sidecar's lifecycle; absent in tests that assert storage only.
    */
-  restartSecurityGateway?: () => Promise<void>;
+  restartSecurityGateway?: (correlationId?: string) => Promise<void>;
   /**
    * Tear down whatever the composition root started alongside the daemon — today the screening
    * sidecar. Called at the END of the daemon's own stop(), so it runs on EVERY exit path, not just

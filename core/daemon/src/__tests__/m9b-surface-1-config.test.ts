@@ -314,4 +314,107 @@ describe("M9B closeout — provenance on the config surface and a released handl
       fresh.close();
     }
   });
+
+  /**
+   * Review H4: the test above passes with the disposer stubbed to `() => {}` — it opens a THIRD
+   * handle and reads the committed row either way, so nothing in it observes release. This one
+   * cannot be faked: the handler caches one handle for the process lifetime, so a SECOND
+   * `gateway.store.opened` can only happen if the first was genuinely closed AND uncached.
+   */
+  it("H4: release is OBSERVED — a post-dispose call re-opens the store rather than reusing it", async () => {
+    const opens: Array<Record<string, unknown>> = [];
+    const recording: Logger = {
+      debug() {}, warn() {}, error() {},
+      info(event: string, context?: Record<string, unknown>) {
+        if (event === "gateway.store.opened") opens.push(context ?? {});
+      },
+    };
+    const dir3 = await mkdtemp(join(tmpdir(), "cello-m9b-dispose-"));
+    await writeFile(join(dir3, "sessions.db.key"), randomBytes(32), { mode: 0o600 });
+    const h3 = new Map<string, IpcHandler>();
+    let d3: (() => void) | undefined = registerGatewayConfigHandlers({
+      handlers: h3, celloDir: dir3, logger: recording, getClientType: () => "cli",
+      restartSecurityGateway: async () => {},
+    });
+    const c3 = (m: string, p: Record<string, unknown>) => h3.get(m)!(p, "cli-conn") as Promise<Record<string, unknown>>;
+    try {
+      await c3("cello_config_list", {});
+      expect(opens).toHaveLength(1); // lazily opened once...
+      await c3("cello_config_list", {});
+      expect(opens).toHaveLength(1); // ...and REUSED, never re-opened per call (the F1/F2 fix)
+
+      d3?.(); d3 = undefined;
+
+      await c3("cello_config_list", {});
+      // The only way this is 2 is if the disposer actually closed and uncached the handle.
+      expect(opens).toHaveLength(2);
+    } finally {
+      d3?.();
+      await rm(dir3, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Review M3: `chainValid` on this surface was only ever asserted TRUE, so replacing the
+   * expression with the literal `true` passed the suite — a truncated audit view asserting its own
+   * integrity, which is the exact shape of the F1/F2 bug this milestone spent a day on.
+   */
+  it("M3: chainValid goes FALSE when a config row is tampered with, and null when there is nothing to verify", async () => {
+    expect((await call2("cello_config_set", { key: "rate_max_per_window", value: 11 })).ok).toBe(true);
+    expect((await call2("cello_config_set", { key: "rate_window_ms", value: 60_000 })).ok).toBe(true);
+
+    // Edit one row's stored value directly in the DB — the naive tamper the chain exists to catch,
+    // done exactly as the record-store twin above does it (same door, same key, no new API).
+    const { openEncryptedStoreDb } = await import("@cello-protocol/gateway");
+    const raw = openEncryptedStoreDb(join(dir2, "gateway.db"), join(dir2, "sessions.db.key"));
+    raw.prepare("UPDATE config_versions SET value_json = '999' WHERE key = 'rate_max_per_window' AND version = 1").run();
+    raw.close();
+
+    const rows = (await call2("cello_config_list", {})).config as Array<Record<string, unknown>>;
+    expect(rows.find((r) => r.key === "rate_max_per_window")!.chainValid).toBe(false);
+    // Scoped to the tampered key — an unrelated key still verifies, or the field says nothing useful.
+    expect(rows.find((r) => r.key === "rate_window_ms")!.chainValid).toBe(true);
+    // And a key with NO rows reports null: "nothing to verify" is not "verified intact" (L5).
+    expect(rows.find((r) => r.key === "language_allow")!.chainValid).toBeNull();
+
+    const got = await call2("cello_config_get", { key: "rate_max_per_window" });
+    expect(got.chainValid).toBe(false);
+    expect(got.changedAt).toBeGreaterThan(0); // L4: `get` reports WHEN, same as `list`
+  });
+
+  /**
+   * Review M2: the commit claimed one id spans `changed` -> `applied` AND the restarted sidecar's
+   * boot lines. No test asserted any of it, and the sidecar half was simply false.
+   */
+  it("M2: one correlationId spans changed -> applied, and reaches the restart", async () => {
+    const events: Array<{ event: string; context: Record<string, unknown> }> = [];
+    const recording: Logger = {
+      debug() {}, warn() {},
+      info(event: string, context?: Record<string, unknown>) { events.push({ event, context: context ?? {} }); },
+      error(event: string, context?: Record<string, unknown>) { events.push({ event, context: context ?? {} }); },
+    };
+    const dir4 = await mkdtemp(join(tmpdir(), "cello-m9b-corr-"));
+    await writeFile(join(dir4, "sessions.db.key"), randomBytes(32), { mode: 0o600 });
+    const h4 = new Map<string, IpcHandler>();
+    const restartIds: Array<string | undefined> = [];
+    const d4 = registerGatewayConfigHandlers({
+      handlers: h4, celloDir: dir4, logger: recording, getClientType: () => "cli",
+      restartSecurityGateway: async (correlationId?: string) => { restartIds.push(correlationId); },
+    });
+    try {
+      const res = await (h4.get("cello_config_set")!({ key: "rate_max_per_window", value: 5 }, "cli-conn") as Promise<Record<string, unknown>>);
+      expect(res.ok).toBe(true);
+
+      const changed = events.find((e) => e.event === "gateway.config.changed")!;
+      const applied = events.find((e) => e.event === "gateway.config.applied")!;
+      const id = changed.context.correlationId;
+      expect(typeof id).toBe("string");
+      expect(applied.context.correlationId).toBe(id);
+      // The half that was claimed but not built: the id reaches the process being restarted.
+      expect(restartIds).toEqual([id]);
+    } finally {
+      d4();
+      await rm(dir4, { recursive: true, force: true });
+    }
+  });
 });

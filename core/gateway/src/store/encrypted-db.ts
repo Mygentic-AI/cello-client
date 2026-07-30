@@ -143,7 +143,13 @@ export type StoreEventSink = (event: string, context: Record<string, unknown>) =
 
 /** The gateway bin's sink: one structured line on stderr, never stdout. */
 export const stderrStoreEventSink: StoreEventSink = (event, context) => {
-  process.stderr.write(`${JSON.stringify({ level: "info", event, ...context })}\n`);
+  // CELLO_GATEWAY_CORRELATION_ID is set by the daemon ONLY when this process was spawned as part of
+  // a larger flow — today, a `cello config set` that had to restart the sidecar to apply (review
+  // M2). Stamping it here is what lets an operator tie `gateway.config.applied` to the store lines
+  // of the process that restart produced; without it the two sit next to each other in the log with
+  // nothing connecting them. Absent on a normal boot, because there is no flow to correlate with.
+  const correlationId = process.env.CELLO_GATEWAY_CORRELATION_ID;
+  process.stderr.write(`${JSON.stringify({ level: "info", event, ...context, ...(correlationId ? { correlationId } : {}) })}\n`);
 };
 
 function loadEngine(): SignalModule {

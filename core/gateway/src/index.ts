@@ -42,6 +42,11 @@ export type { GatewayStoreErrorCode, StoreEventSink } from "./store/encrypted-db
 export { GatewayRecordStore } from "./records/record-store.js";
 export type { RecordDisposition, RecordDirection, RecordInput, SecurityRecord } from "./records/record-store.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
+// The provenance marker is EXPORTED because it has consumers outside this package: the MCP tool
+// descriptions and SKILL.md teach it to the agent, and the daemon's own guidance is marked with it.
+// Review H2: F10 shipped it unexported and unspoken, so the agent that was supposed to "have
+// something to check" was never told the marker existed. A marker no consumer knows is decoration.
+export { AFFORDANCE_PREFIX, withProvenance } from "./screen/affordance.js";
 // PassthroughGatewayClient is NOT exported here — it lives at `@cello-protocol/gateway/testing`
 // (DOD-M9B-WIRE-1). An always-allow client on the production barrel is how the security layer
 // shipped inert; reaching for it should be a deliberate act, visible in a diff.

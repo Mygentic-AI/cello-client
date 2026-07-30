@@ -192,6 +192,13 @@ async function main(): Promise<void> {
   });
 
   // Signal readiness to the parent (spawnGatewaySidecar waits for this).
+  const bootCorrelationId = process.env.CELLO_GATEWAY_CORRELATION_ID;
+  if (bootCorrelationId) {
+    // The restarted sidecar names the flow that restarted it (review M2). The commit that claimed
+    // "plus the restarted sidecar's own boot lines" shipped without this, which is why the claim
+    // was false — the id reached `applied` and stopped there.
+    process.stderr.write(`${JSON.stringify({ level: "info", event: "gateway.boot", correlationId: bootCorrelationId, socketPath })}\n`);
+  }
   process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine}\n`);
 
   let stopping = false;
@@ -199,13 +206,22 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     void handle.stop().then(() => {
-      // DO NOT close() these. Review F1/F2, reproduced against @signalapp/sqlcipher 3.3.5: ANY
-      // connection's close unlinks `-wal`/`-shm` — not just the last one. The daemon holds long-
-      // lived handles on this same file, and `restartSecurityGateway` SIGTERMs this process on
-      // every successful `cello config set`. So closing here left the daemon's handle permanently
-      // stale: `cello policy log` under-reported for the rest of that daemon's life while still
-      // reporting chainValid:true, and the next config write through the stale handle returned ok
-      // and left the store SQLITE_CORRUPT.
+      // DO NOT close() these.
+      //
+      // CORRECTED 2026-07-30 (review M1). This comment used to assert, as reproduced fact, that
+      // "ANY connection's close unlinks `-wal`/`-shm` — not just the last one." That is WRONG, and
+      // measuring it takes one script: with a second connection open, a close leaves `-wal`/`-shm`
+      // in place, the holder's later writes succeed, and a fresh reader sees them. It is the LAST
+      // closer that checkpoints and unlinks — ordinary SQLite behaviour.
+      //
+      // The conclusion does not change, and the real reason is sharper than the wrong one:
+      // `restartSecurityGateway` SIGTERMs this process on every successful `cello config set`, so
+      // during that window this sidecar is DEAD and a per-call daemon handle is the last one open.
+      // That is how the live defect happened — `cello policy log` under-reporting for the rest of
+      // that daemon's life while still reporting chainValid:true, and the next write through the
+      // stale handle returning ok on a SQLITE_CORRUPT store.
+      //
+      // Checkpoint instead, and never be in the business of guessing who is last.
       //
       // Checkpoint instead: fold the WAL into the main file so nothing is lost, and let process
       // exit release the descriptors. Exit unlinks nothing that another process is still using.

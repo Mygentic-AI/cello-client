@@ -1,8 +1,12 @@
 /**
  * Gateway building blocks: the server + the local-sidecar client over a REAL Unix domain
  * socket (in-process server, real socket I/O — the separate-process seam is proven in the
- * daemon integration test). Covers the verdict round-trip, the request log, the screen-function
- * seam later stories plug into, and the fail-closed / never-hang guarantees (INV-6 / SI-001).
+ * daemon integration test). Covers the verdict round-trip, the screen-function seam later stories
+ * plug into, and the fail-closed / never-hang guarantees (INV-6 / SI-001).
+ *
+ * The request-log cases that used to live here went with the feature (M8C DOD-CRYPTO-AT-REST-1):
+ * proof-of-screening is asserted against the ENCRYPTED record store in the daemon integration
+ * tests, which is where the direction round-trip is now covered too.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -12,6 +16,7 @@ import { tmpdir } from "node:os";
 import { createGatewayServer, type GatewayServerHandle } from "../server.js";
 import { LocalSidecarGatewayClient } from "../client.js";
 import type { ScreenContext } from "../types.js";
+import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 
 const ctx = (over: Partial<ScreenContext> = {}): ScreenContext => ({
   direction: "outbound",
@@ -68,7 +73,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(Buffer.from(v.content!).toString()).toBe("hello peer");
   });
 
-  
+
 
   it("a screen function can REDACT — the transformed bytes round-trip back to the daemon", async () => {
     // Proves the verdict-content plumbing later stories (M9-OUT-*) depend on.
@@ -90,7 +95,11 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(v.disposition).toBe("block");
     expect(v.content).toBeUndefined();
     expect(v.reason).toBe("injection_detected");
-    expect(v.guidance).toBe("Message not sent.");
+    // The gateway's guidance reaches the daemon MARKED (review H3): the client stamps every
+    // agent-visible guidance with the provenance marker at this boundary, so the assertion is
+    // "the gateway's text arrived, and it arrived attributed" — not byte equality.
+    expect(v.guidance).toContain("Message not sent.");
+    expect(v.guidance).toContain(AFFORDANCE_PREFIX);
   });
 
   it("FAIL-CLOSED when the gateway socket does not exist — block(gateway_unavailable), and it does NOT hang", async () => {

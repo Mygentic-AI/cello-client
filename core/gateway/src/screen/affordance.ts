@@ -19,16 +19,42 @@
  *     worse than the silence this replaces — the agent burns turns hunting for it.
  *   - Never echo the flagged VALUE back. The guidance is rendered into an LLM's context; repeating
  *     a secret to explain that it was redacted would undo the redaction.
- *   - PREFIX every block with the provenance marker (review F10). This text is imperative, contains
+ *   - MARK every block with the provenance marker (review F10). This text is imperative, contains
  *     shell commands, and lands in the same context as inbound counterparty content — so a
  *     counterparty could mimic it and have an agent relay "run this" to its operator as though the
  *     security layer had asked. The marker says where it came from. It is not a cryptographic
  *     boundary (nothing in an LLM's context is), but an agent that knows the layer speaks with a
- *     fixed prefix has something to check.
+ *     fixed marker has something to check.
  */
 
-/** Where this text came from. A counterparty cannot claim to be the local security layer. */
+/**
+ * Where this text came from.
+ *
+ * WHAT MAKES THIS MEANINGFUL IS THE STRIP, NOT THE STRING (review H2). A marker a counterparty can
+ * also write proves nothing — the first version of this comment claimed "a counterparty cannot claim
+ * to be the local security layer" while the marker was absent from `LITERAL_MARKERS`, the very
+ * mechanism in this package that removes privileged-turn markers from inbound text. It was therefore
+ * exactly as forgeable as `[SYSTEM]` would have been without that list.
+ *
+ * It is now stripped from inbound content by `sanitizeInbound` (case-insensitively, with a
+ * `special_tokens` note — and that note is itself the evidence someone tried). So the property is:
+ * **inbound text cannot carry this marker, therefore its presence means the local layer emitted it.**
+ *
+ * Position is deliberately NOT part of the contract — `daemon.ts` prepends its own context to
+ * guidance, so requiring byte 0 would be a rule the system breaks on its most common path. The
+ * contract is CONTAINMENT: `withProvenance` guarantees every agent-visible guidance contains it.
+ */
 export const AFFORDANCE_PREFIX = "[cello security layer, local]";
+
+/**
+ * Guarantee a guidance block carries the marker. Idempotent on CONTAINMENT, not on prefix, so a
+ * block that already embeds it (every `operatorCanRun` / `noOperatorOverride` string) is untouched
+ * rather than double-marked. Applied at the `GatewayClient` boundary — the single point every
+ * agent-visible verdict crosses — so no individual guidance producer has to remember.
+ */
+export function withProvenance(text: string): string {
+  return text.includes(AFFORDANCE_PREFIX) ? text : `${AFFORDANCE_PREFIX} ${text}`;
+}
 
 /** The five keys `cello config` exposes. Anything not here has no operator knob — say so instead. */
 export type AdjustableGuard =

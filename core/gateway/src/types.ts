@@ -12,6 +12,8 @@
  * dispositions are declared but never produced.
  */
 
+import { withProvenance } from "./screen/affordance.js";
+
 /** Which direction the content is flowing relative to the daemon. */
 export type ScreenDirection = "outbound" | "inbound";
 
@@ -144,11 +146,15 @@ export function failClosedVerdict(direction: ScreenDirection, reason: string = G
   return {
     disposition: "block",
     reason,
-    guidance:
+    // withProvenance, not a bare string: this is the MOST-EMITTED guidance in the layer (every
+    // gateway-down message), so it was the one a counterparty could imitate most credibly while
+    // F10 marked only the affordance blocks (review H3).
+    guidance: withProvenance(
       direction === "outbound"
         ? `Fail-closed: ${cause}, so this message was NOT sent. Nothing left the machine. ` +
           "Check that the gateway sidecar is running, then retry."
         : `Fail-closed: ${cause}, so inbound content was not delivered to the agent. It was left ` +
           "unacknowledged, so the sender redelivers it on a later attempt — screened once the gateway responds.",
+    ),
   };
 }

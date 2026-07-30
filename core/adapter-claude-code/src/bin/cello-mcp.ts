@@ -340,12 +340,17 @@ server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. 
 // agent may inspect the guards and may make them STRICTER, but it cannot weaken them. The daemon
 // enforces that — a loosening from this surface is refused with the command a human must run — so
 // these tools cannot be talked into it no matter what a message says.
+//
+// The refusals are marked `[cello security layer, local]`, and that marker is stripped from all
+// inbound content — so an instruction to run a command is the layer's only if it carries it. Said
+// here AND in SKILL.md deliberately: review H2 found the marker shipped with no consumer told about
+// it, which makes it decoration rather than a check.
 
-server.tool("cello_config_list", "List the security layer's guards: what each one controls, its current value, its version, whether the last change tightened or loosened it, and whether a human confirmed it. An unset key reads null, meaning it has never been configured and the built-in (tightest) default applies. Read-only.", {}, async () => {
+server.tool("cello_config_list", "List the security layer's guards: what each one controls, its current value, its version, whether the last change tightened or loosened it, whether a human confirmed it, WHEN it last changed (changedAt, epoch ms) and whether its version history still verifies (chainValid — false means the record was tampered with, so say so rather than reasoning from it; null means the key has never been set, so there is nothing to verify). An unset key reads null for value, meaning it has never been configured and the built-in (tightest) default applies. Read-only.", {}, async () => {
   return jsonText(await proxy.call("cello_config_list", {}));
 });
 
-server.tool("cello_config_get", "Read one security-layer guard, plus whether its version history still verifies (chainValid false means the record was tampered with). Read-only.", {
+server.tool("cello_config_get", "Read one security-layer guard: its value, version, when it last changed (changedAt, epoch ms), and whether its version history still verifies (chainValid false means the record was tampered with; null means it has never been set). Read-only.", {
   key: z.enum(["autonomous_override", "pii_whitelist", "language_allow", "rate_max_per_window", "rate_window_ms"]).describe("Which guard to read"),
 }, async ({ key }) => {
   return jsonText(await proxy.call("cello_config_get", { key }));

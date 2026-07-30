@@ -3,9 +3,16 @@
  *
  * Listens on a Unix domain socket, accepts length-prefixed JSON screen requests, runs them
  * through a screen function (M9-CORE-001 ships the pass-through default; later stories inject
- * the detection pipeline here), and writes a request-log line per request BEFORE replying.
- * The request log is the gateway's own record that it saw the content — the integration test
- * reads it to prove screening happened on the real daemon↔gateway channel.
+ * the detection pipeline here), and replies with the verdict.
+ *
+ * PROOF THAT SCREENING HAPPENED lives in the ENCRYPTED record store, not here. This server used to
+ * append a plaintext request-log line per request, and the integration tests read that file; it was
+ * deleted because it duplicated the record store's audit trail outside SQLCipher (M8C
+ * `DOD-CRYPTO-AT-REST-1`). The tests now read the record store, which is the stronger assertion.
+ * The write-before-reply ORDERING that mattered is preserved where the records are actually written
+ * — `bin/cello-gateway.ts` calls `recordOutcome` synchronously before returning the verdict, so the
+ * daemon cannot act on a verdict the gateway never recorded, and a record-write throw becomes a
+ * fail-closed `screen_error` block.
  */
 import { createServer, type Server, type Socket } from "node:net";
 import { rm } from "node:fs/promises";
@@ -41,7 +48,6 @@ const NOOP_LOGGER: GatewayLogger = {
 
 export interface GatewayServerOptions {
   socketPath: string;
-  /** When set, one JSON line per screen request is appended here (the gateway's request log). */
   /** The screen function. Defaults to pass-through (always allow). */
   screen?: GatewayScreenFn;
   logger?: GatewayLogger;
@@ -86,9 +92,10 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
     const direction: ScreenDirection = req.method === SCREEN_OUTBOUND ? "outbound" : "inbound";
     const content = Buffer.from(req.content, "base64");
 
-    // Record that the gateway saw this content BEFORE producing the verdict — so the daemon
-    // cannot act on a verdict the gateway never logged (the test's ordering assertion).
-
+    // The record-before-reply ordering is NOT enforced here — this server only routes to `screen`.
+    // It is enforced by the injected screen fn in `bin/cello-gateway.ts`, which records the outcome
+    // synchronously before returning. Stated rather than deleted because the constraint is real and
+    // load-bearing; the plaintext log that used to implement it here is gone, not the requirement.
     let verdict: ScreenVerdict;
     try {
       verdict = await screen({

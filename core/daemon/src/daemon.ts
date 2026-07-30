@@ -2859,9 +2859,10 @@ async function startDaemonHoldingLock(
           });
         });
       }
-      // AFTER onShutdown, never before (review F9): the sidecar is gone by now, so closing these is
-      // the last connection and unlinks nothing anyone is still writing to. Reversed, this would BE
-      // the F1/F2 defect.
+      // AFTER onShutdown, never before (review F9). onShutdown is `stopSecurityLayer`, which awaits
+      // the sidecar's exit — so by here we ARE the last holder, and the last closer is the one that
+      // may safely checkpoint and unlink (measured, review M1). Reversed, these handles would close
+      // while the sidecar is still writing, which is the F1/F2 defect exactly.
       disposeGatewayConfigStores();
       // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
       // held. In the real binary the process exits and the kernel reclaims it — but an in-process

@@ -6,9 +6,16 @@
  * (spawnGatewaySidecar). Proves the seam against the real channel, not an in-process stub:
  *
  *   AC-001  outbound is screened by the gateway PROCESS before content reaches the wire
- *           (its request log records the screen; and with the gateway down, nothing is sent).
+ *           (its ENCRYPTED record store holds the outbound pass record; with the gateway down,
+ *           nothing is sent).
  *   AC-002  inbound is screened by the gateway PROCESS before cello_receive can drain it
- *           (its request log records the inbound screen; with B's gateway down, B receives nothing).
+ *           (B's record store holds the INBOUND record for the same contentHash A recorded
+ *           outbound — one message followed through both agents' screens; with B's gateway down,
+ *           B receives nothing).
+ *
+ * The proof-of-screening assertions read the SQLCipher record store, not the plaintext request log
+ * that used to exist (M8C DOD-CRYPTO-AT-REST-1). Direction is covered here, at the two-process
+ * altitude, since the server-level direction test went with the log.
  *   AC-003  core/daemon holds no detection pipeline — only the interface + the two call sites.
  *   SI-001 / DB-001  a configured-but-unreachable gateway fails closed: outbound returns
  *           gateway_unavailable and nothing is sent; inbound is held and never delivered ungated.
@@ -133,7 +140,11 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
       const store = new GatewayRecordStore(dbPath, keyPath);
       try { return store.all().map((r) => ({ direction: r.direction, contentHash: r.contentHash })); }
       finally { store.close(); }
-    } catch { return []; }
+    } catch (err) {
+      // Review L7: a loud throw, never `[]` — see the note on the twin helper in m9-gate-1. An
+      // unreadable audit store must not be able to masquerade as an empty one.
+      throw new Error(`could not read the gateway record store at ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async function startOne(opts: {

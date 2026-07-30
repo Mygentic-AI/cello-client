@@ -14,7 +14,10 @@
  * `sessionNodeManager.ingestReceivedContent` — the exact method this gate drives. So driving it against
  * a real spawned `cello-gateway` proves a recovered message is screened identically to a direct one:
  * a clean recovered message is delivered, a recovered terminal-block (non-English) records its leaf but
- * is never delivered, and the gateway's request log records the inbound screen of the recovered bytes.
+ * is never delivered, and the gateway's ENCRYPTED RECORD STORE holds the inbound security-pass record
+ * for the recovered bytes — hash-chained, keyed by contentHash. (It used to read a plaintext request
+ * log; that file is gone with M8C DOD-CRYPTO-AT-REST-1, and asserting on the durable audit trail is
+ * the stronger claim: a record that is absent is itself evidence of suppression.)
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -71,7 +74,14 @@ async function gatewayRecords(dbPath: string, keyPath: string): Promise<Array<{ 
     const store = new GatewayRecordStore(dbPath, keyPath);
     try { return store.all().map((r) => ({ direction: r.direction, contentHash: r.contentHash })); }
     finally { store.close(); }
-  } catch { return []; }
+  } catch (err) {
+    // Review L7: do NOT swallow into `[]`. Every assertion on this helper today is positive, so a
+    // store fault fails loud by accident — but the first negative assertion (`toHaveLength(0)`,
+    // `.some(...)).toBe(false)`) would read a store that cannot open as "correctly nothing was
+    // recorded". That is the screened-but-unrecorded shape this milestone exists to prevent,
+    // reproduced inside its own test helper.
+    throw new Error(`could not read the gateway record store at ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 const SID = "44".repeat(16);

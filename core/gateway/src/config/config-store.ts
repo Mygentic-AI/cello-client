@@ -234,8 +234,9 @@ export class GatewayConfigStore {
   }
 
   /**
-   * Fold the WAL back into the main file WITHOUT closing (review F1/F2). Closing unlinks
-   * `-wal`/`-shm` for every process sharing the file, including the daemon's long-lived handles.
+   * Fold the WAL back into the main file WITHOUT closing (review F1/F2). See the twin comment on
+   * `GatewayRecordStore.checkpoint` for the measured rule: it is the LAST closer that unlinks, and
+   * a sidecar being SIGTERMed mid-restart is exactly when a per-call handle becomes the last one.
    */
   checkpoint(): void {
     this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");

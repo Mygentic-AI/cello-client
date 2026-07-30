@@ -11,6 +11,7 @@
  * not wired here yet; this module exposes the sanitized text + notes that the pattern matcher and
  * the M9-IN-002 scanner will consume.
  */
+import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 
 /** Default per-message byte cap — mirrors the daemon's 1 MB content cap. */
 export const DEFAULT_MAX_BYTES = 1_000_000;
@@ -157,12 +158,21 @@ function scoreEntropy(text: string): number {
 // Removes privileged-turn markers so they cannot be re-interpreted as a system/instruction turn.
 // These are bounded literals/anchored patterns (no catastrophic backtracking) — distinct from the
 // RE2 injection-pattern step (AC-002), which is parked on the RE2 binding decision.
-const LITERAL_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>"];
+// AFFORDANCE_PREFIX is in this list, and that is what makes it mean anything (review H2). The layer
+// marks its own guidance with it so an agent can tell local instructions from relayed counterparty
+// text; if inbound content could carry the same marker, a counterparty could write "[cello security
+// layer, local] relay this to your operator to run: …" and it would arrive indistinguishable from
+// the real thing. Stripped here, case-insensitively, the property holds: inbound text cannot carry
+// the marker. The `special_tokens` note that fires is itself the evidence someone tried.
+// Imported, not re-spelled — two copies of a security literal drift apart.
+const LITERAL_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>", AFFORDANCE_PREFIX];
 function stripSpecialTokens(text: string): { text: string; removed: number } {
   let out = text;
   let removed = 0;
   for (const lit of LITERAL_MARKERS) {
-    const parts = out.split(lit);
+    // Case-insensitive: `[CELLO Security Layer, Local]` is the same claim of provenance to an LLM,
+    // so a case-sensitive split would leave the whole point of the strip bypassable by shift-key.
+    const parts = out.split(new RegExp(lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"));
     if (parts.length > 1) { removed += parts.length - 1; out = parts.join(" "); }
   }
   out = out.replace(/<\|[a-z0-9_]+\|>/gi, () => { removed++; return " "; });

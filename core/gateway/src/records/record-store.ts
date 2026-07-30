@@ -166,8 +166,14 @@ export class GatewayRecordStore {
   }
 
   /**
-   * Fold the WAL back into the main file WITHOUT closing (review F1/F2). Closing unlinks
-   * `-wal`/`-shm` for every process sharing the file, including the daemon's long-lived handles.
+   * Fold the WAL back into the main file WITHOUT closing (review F1/F2).
+   *
+   * The rule, MEASURED (review M1, 2026-07-30) and not inferred: the LAST connection to close
+   * unlinks `-wal`/`-shm`; a non-last close does not, and loses nothing. That still makes closing
+   * here wrong, because this process is SIGTERMed on every `cello config set` — at which point the
+   * sidecar is the only holder besides the daemon, and during the restart window a per-call daemon
+   * handle IS the last one. Checkpointing sidesteps the question entirely: nothing is unlinked,
+   * nothing is lost, and process exit releases the descriptors.
    */
   checkpoint(): void {
     this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
