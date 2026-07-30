@@ -94,7 +94,7 @@ describe("DOD-INV-CANONICAL — frozen cross-party envelope vectors", () => {
     // trust-signal-envelope.test.ts). If the implementation ever drifts away from RFC 8949, it
     // cannot quietly take the vector file with it.
     const REFERENCE_HEX =
-      "8b" +
+      "8c" +
       "6d" + "43454c4c4f2d545349472d7631" + // text(13) "CELLO-TSIG-v1"
       "65" + "6167656e74" +                 // text(5)  "agent"
       "67" + "6167656e742d31" +             // text(7)  "agent-1"
@@ -104,16 +104,17 @@ describe("DOD-INV-CANONICAL — frozen cross-party envelope vectors", () => {
       "01" +                                // uint(1)
       "44" + "01020304" +                   // bytes(4)
       "1a" + "3b9aca00" +                   // uint(1000000000)
-      "f6" +                                // null
-      "f6";                                 // null
+      "f6" +                                // null      <- expires_at
+      "f6" +                                // null      <- supersedes_hash
+      "f4";                                 // false     <- same_operator (M10B, appended slot 12)
     const reference = loaded.vectors.find((v) => v.name.startsWith("reference"));
     expect(reference, "the reference vector must not be removed from the file").toBeDefined();
     expect(reference!.preimage_hex).toBe(REFERENCE_HEX);
   });
 
-  it("every vector's arity is 11 — the fixed-slot rule holds across all of them (M10-D17)", () => {
+  it("every vector's arity is 12 — the fixed-slot rule holds across all of them (M10-D17)", () => {
     for (const v of loaded.vectors) {
-      expect(v.preimage_hex.slice(0, 2), v.name).toBe("8b");
+      expect(v.preimage_hex.slice(0, 2), v.name).toBe("8c");
     }
   });
 

@@ -54,6 +54,7 @@ function makeEnvelope(over: Partial<TrustSignalEnvelope> = {}): TrustSignalEnvel
     issued_at: 1_768_000_000,
     expires_at: null,
     supersedes_hash: null,
+    same_operator: false,
     ...over,
   };
 }
@@ -110,6 +111,9 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
       issuedAt: decoded.issued_at,
       expiresAt: decoded.expires_at,
       supersedesHash: decoded.supersedes_hash === null ? null : Buffer.from(decoded.supersedes_hash).toString("hex"),
+      // From the DECODED envelope, so the round-trip proves the slot survives encode -> decode ->
+      // store rather than being re-supplied by the test.
+      sameOperator: decoded.same_operator,
       verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });

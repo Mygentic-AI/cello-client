@@ -258,6 +258,7 @@ describe("DOD-END-ACCEPT-1 — consent state", () => {
         issued_at: o.issuedAt ?? 1_768_000_000,
         expires_at: null,
         supersedes_hash: o.supersedes ? new Uint8Array(Buffer.from(o.supersedes, "hex")) : null,
+        same_operator: false,
       };
       const hash = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
       store.deliverWalletSignal(env, hash);

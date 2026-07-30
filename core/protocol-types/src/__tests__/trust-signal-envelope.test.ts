@@ -49,6 +49,7 @@ function referenceEnvelope(): TrustSignalEnvelope {
     issued_at: 1_000_000_000,
     expires_at: null,
     supersedes_hash: null,
+    same_operator: false,
   };
 }
 
@@ -56,7 +57,7 @@ function referenceEnvelope(): TrustSignalEnvelope {
  * Hand-derived per RFC 8949 §3, element by element. If the implementation disagrees with THIS, the
  * implementation is wrong — not the vector.
  *
- *   8b                          array(11)
+ *   8c                          array(12)
  *   6d 43454c4c4f2d545349472d7631    text(13) "CELLO-TSIG-v1"   <- domain tag, slot 0
  *   65 6167656e74                    text(5)  "agent"           <- subject_kind
  *   67 6167656e742d31                text(7)  "agent-1"         <- subject
@@ -68,9 +69,15 @@ function referenceEnvelope(): TrustSignalEnvelope {
  *   1a 3b9aca00                      uint(1000000000)           <- issued_at (epoch SECONDS)
  *   f6                               null                       <- expires_at
  *   f6                               null                       <- supersedes_hash
+ *   f4                               false                      <- same_operator
+ *
+ * `same_operator` was APPENDED (M10B / DOD-END-COUNT-1), never inserted: field order IS the wire
+ * format, so placing it earlier would shift every later slot and invalidate every signature already
+ * made over this shape. It is encoded as a CBOR simple value — f4 false / f5 true — never as 0/1,
+ * because an integer here would be indistinguishable from a future numeric field at that position.
  */
 const REFERENCE_HEX =
-  "8b" +
+  "8c" +
   "6d" + "43454c4c4f2d545349472d7631" +
   "65" + "6167656e74" +
   "67" + "6167656e742d31" +
@@ -81,7 +88,8 @@ const REFERENCE_HEX =
   "44" + "01020304" +
   "1a" + "3b9aca00" +
   "f6" +
-  "f6";
+  "f6" +
+  "f4";
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
@@ -100,7 +108,7 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       expect(TRUST_SIGNAL_DOMAIN).toBe("CELLO-TSIG-v1");
       const bytes = encodeTrustSignalEnvelope(referenceEnvelope());
       // array(11) header, then the domain text string.
-      expect(bytes[0]).toBe(0x8b);
+      expect(bytes[0]).toBe(0x8c);
       expect(hex(bytes.slice(1, 15))).toBe("6d43454c4c4f2d545349472d7631");
     });
 
@@ -185,6 +193,7 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       // Under a CBOR map this is exactly where the silent, intermittent divergence would come from.
       const a: TrustSignalEnvelope = referenceEnvelope();
       const b: TrustSignalEnvelope = {
+        same_operator: false,
         supersedes_hash: null,
         expires_at: null,
         issued_at: 1_000_000_000,
@@ -227,6 +236,9 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
           type: `type_${rnd(1e4)}`,
           schema_version: rnd(8) + 1,
           payload: new Uint8Array(Array.from({ length: rnd(64) }, () => rnd(256))),
+          // VARIED, not fixed: a property test that always sent `false` could not catch an encoder
+          // that dropped the slot when it was false.
+          same_operator: rnd(2) === 0,
           issued_at: ts(),
           expires_at: rnd(2) === 0 ? null : ts(),
           supersedes_hash: rnd(2) === 0 ? null : new Uint8Array(Array.from({ length: 32 }, () => rnd(256))),
@@ -353,19 +365,19 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       const noSupersede = { ...referenceEnvelope(), expires_at: 42, supersedes_hash: null };
       const a = encodeTrustSignalEnvelope(noExpiry);
       const b = encodeTrustSignalEnvelope(noSupersede);
-      expect(a[0]).toBe(0x8b); // always 11 elements
-      expect(b[0]).toBe(0x8b);
+      expect(a[0]).toBe(0x8c); // always 12 elements
+      expect(b[0]).toBe(0x8c);
       expect(hex(a)).not.toBe(hex(b));
     });
 
-    it("every envelope encodes to exactly 11 elements, whatever is null", () => {
+    it("every envelope encodes to exactly 12 elements, whatever is null", () => {
       const variants: TrustSignalEnvelope[] = [
         { ...referenceEnvelope(), expires_at: null, supersedes_hash: null },
         { ...referenceEnvelope(), expires_at: 1, supersedes_hash: null },
         { ...referenceEnvelope(), expires_at: null, supersedes_hash: new Uint8Array(32) },
         { ...referenceEnvelope(), expires_at: 1, supersedes_hash: new Uint8Array(32) },
       ];
-      for (const v of variants) expect(encodeTrustSignalEnvelope(v)[0]).toBe(0x8b);
+      for (const v of variants) expect(encodeTrustSignalEnvelope(v)[0]).toBe(0x8c);
     });
   });
 
@@ -435,6 +447,7 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
         issued_at: 5_000_000_000,                  // > 2^32 — the uint64 boundary the encoder coerces
         expires_at: 6_000_000_000,
         supersedes_hash: new Uint8Array(32).fill(7),
+        same_operator: false,
       };
       const decoded = decodeTrustSignalEnvelope(encodeTrustSignalEnvelope(env));
       expect(decoded).toEqual(env);
@@ -443,22 +456,28 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
     });
 
     it("REFUSES bytes whose domain tag is not CELLO-TSIG-v1 (not a trust-signal envelope)", () => {
+      // TWELVE elements, so this reaches the DOMAIN check rather than tripping arity first — the test
+      // is about the tag, and an arity failure here would silently stop testing that.
       const wrongDomain = encodeCbor([
         "CELLO-OTHER-v1", "agent", "agent-1", "portal", "aabb", "phone", 1,
-        new Uint8Array([1, 2, 3, 4]), 1_000_000_000, null, null,
+        new Uint8Array([1, 2, 3, 4]), 1_000_000_000, null, null, false,
       ]);
       expect(() => decodeTrustSignalEnvelope(wrongDomain)).toThrow(/domain tag/i);
     });
 
-    it("REFUSES the wrong arity — a 10- or 12-element array is not the fixed 11-slot preimage", () => {
-      const tooShort = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null]);
-      const tooLong = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null, null, "extra"]);
-      expect(() => decodeTrustSignalEnvelope(tooShort)).toThrow(/11-element/i);
-      expect(() => decodeTrustSignalEnvelope(tooLong)).toThrow(/11-element/i);
+    it("REFUSES the wrong arity — an 11- or 13-element array is not the fixed 12-slot preimage", () => {
+      // 11 is specifically the PRE-M10B shape. A signal minted before `same_operator` existed decodes
+      // to eleven elements, and it must be REFUSED rather than read with every slot in place and the
+      // flag defaulted — silently treating an old signal as `same_operator: false` is exactly how the
+      // farming hole would survive the fix.
+      const preM10B = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null, null]);
+      const tooLong = encodeCbor([TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1, new Uint8Array([1]), 1_000_000_000, null, null, false, "extra"]);
+      expect(() => decodeTrustSignalEnvelope(preM10B)).toThrow(/12-element/i);
+      expect(() => decodeTrustSignalEnvelope(tooLong)).toThrow(/12-element/i);
     });
 
     it("REFUSES a non-array preimage", () => {
-      expect(() => decodeTrustSignalEnvelope(encodeCbor({ not: "an array" }))).toThrow(/11-element/i);
+      expect(() => decodeTrustSignalEnvelope(encodeCbor({ not: "an array" }))).toThrow(/12-element/i);
     });
 
     it("REFUSES NON-CANONICAL bytes — a >2^32 timestamp float-encoded (not the uint64 the encoder emits)", () => {
@@ -468,7 +487,7 @@ describe("DOD-CBOR-1 — the canonical trust-signal envelope", () => {
       const bigTs = 4_294_968_296; // > 2^32
       const nonCanonical = encodeCbor([
         TRUST_SIGNAL_DOMAIN, "agent", "agent-1", "portal", "aabb", "phone", 1,
-        new Uint8Array([1, 2, 3, 4]), bigTs, null, null,
+        new Uint8Array([1, 2, 3, 4]), bigTs, null, null, false,
       ]);
       expect(() => decodeTrustSignalEnvelope(nonCanonical)).toThrow(/canonical/i);
     });

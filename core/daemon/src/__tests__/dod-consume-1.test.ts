@@ -79,6 +79,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: false,
     };
     const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
     store.putReceivedSignal({
@@ -148,6 +149,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: false,
     };
     const hash2 = Buffer.from(hashTrustSignalEnvelope(env2)).toString("hex");
     store.putReceivedSignal({
@@ -189,6 +191,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: false,
     };
     const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
     store.putReceivedSignal({

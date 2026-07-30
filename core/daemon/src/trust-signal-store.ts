@@ -79,6 +79,8 @@ export interface WalletSignalInput {
   status: SignalStatus | string;
   /** Whether this signal is included in the default presentation bundle. When absent, derived from type suffix. */
   defaultPresent?: boolean;
+  /** Envelope slot 12 (policy D-29). Defaults false — absent means "not co-owned", never "unknown". */
+  sameOperator?: boolean;
 }
 
 export interface WalletSignalRow extends WalletSignalInput {
@@ -91,6 +93,8 @@ export interface WalletSignalRow extends WalletSignalInput {
    *  writes `!== "refused"` ships a NULL straight through as presentable. The predicate tests for
    *  exactly `accepted`, so NULL fails closed; the type must say so too. */
   consentState: ConsentState | null;
+  /** Envelope slot 12: issuer and subject are the same operator (policy D-29). */
+  sameOperator: boolean;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
   defaultPresent: boolean;
 }
@@ -182,6 +186,11 @@ const CREATE_WALLET_SQL = `
     -- told. Separate from consent_state because the item and the notification have different
     -- lifetimes: the decision persists until made, the nag stops once seen.
     consent_notified_at INTEGER,
+    -- M10B / DOD-END-COUNT-1. Stored because the PRESENTER must re-encode the envelope byte-identically
+    -- to what was notarized: re-encoding with the wrong value changes the hash and the recipient's
+    -- verification fails. It is also what a recipient's floor predicate reads to exclude co-ownership
+    -- endorsements from a min_count.
+    same_operator INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -291,6 +300,7 @@ function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
   return {
     signalHash: r.signal_hash,
     consentState: (r as unknown as { consent_state: string }).consent_state as ConsentState,
+    sameOperator: (r as unknown as { same_operator?: number }).same_operator === 1,
     subjectKind: r.subject_kind as "account" | "agent",
     subject: r.subject,
     issuerKind: r.issuer_kind as "portal" | "agent",
@@ -343,8 +353,8 @@ export class TrustSignalStore {
         `INSERT OR IGNORE INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
             payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present,
-            consent_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            consent_state, same_operator)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.signalHash, s.subjectKind, s.subject, s.issuerKind, s.issuerPubkey, s.type, s.schemaVersion,
@@ -356,6 +366,7 @@ export class TrustSignalStore {
         // `portal`-issued one was minted for them, at their own action, and has no third party to
         // wait for. Written at the one insert path, and the SQL predicate fails closed regardless.
         s.issuerKind === "agent" ? "pending" : CONSENT_ACCEPTED,
+        s.sameOperator === true ? 1 : 0,
       );
     if (res.changes > 0) {
       this.#logger.info("signal.wallet.stored", {

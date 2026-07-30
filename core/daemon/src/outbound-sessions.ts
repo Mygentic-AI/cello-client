@@ -226,6 +226,10 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
               issued_at: s.issuedAt,
               expires_at: s.expiresAt,
               supersedes_hash: s.supersedesHash === null ? null : new Uint8Array(Buffer.from(s.supersedesHash, "hex")),
+              // THE STORED VALUE, never a literal. Re-encoding with the wrong value changes the
+              // envelope bytes, so the hash stops matching what the directory notarized and the
+              // recipient rejects a perfectly valid signal.
+              same_operator: s.sameOperator,
             }),
           }));
           logger.info("signal.presentation.attached", {

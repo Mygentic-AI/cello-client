@@ -431,7 +431,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       const env = {
         subject_kind: "account" as const, subject: "acct-x", issuer_kind: "portal" as const,
         issuer_pubkey: "aabb", type: "phone", schema_version: 1, payload: new Uint8Array([1, 2, 3]),
-        issued_at: 1_768_000_000, expires_at: null, supersedes_hash: null, ...over,
+        issued_at: 1_768_000_000, expires_at: null, supersedes_hash: null, same_operator: false, ...over,
       };
       return { env, hash: Buffer.from(hashTrustSignalEnvelopeFn(env)).toString("hex") };
     }
