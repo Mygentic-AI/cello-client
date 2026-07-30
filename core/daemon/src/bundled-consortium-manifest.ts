@@ -37,7 +37,7 @@ import type { ConsortiumManifestInput } from "@cello-protocol/crypto";
 
 /** The signed consortium manifest (roster of sovereign directory nodes). */
 export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
-  version: 1,
+  version: 2,
   not_before: "2026-01-01T00:00:00Z",
   expires: "2030-01-01T00:00:00Z",
   nodes: [
@@ -63,11 +63,18 @@ export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
       endpoint: "http://directory-ap1.cello.mygentic.ai",
     },
   ],
+  // M10B / DOD-END-INGRESS-1 — the PORTAL INTAKE KEY. A submitting daemon seals its trust-signal
+  // submission to this key so the DIRECTORY cannot read it; without it `cello_trust_signals_issue`
+  // refuses with `intake_key_absent` rather than sending in the clear. It has to be in the BUNDLED
+  // manifest and not only in the served one, because a cold-boot daemon that cannot yet reach a
+  // directory falls back to this constant — and "your first submission fails until you have polled"
+  // is indistinguishable from the feature being broken.
+  intake_key: { key_id: "intake-dev-1", pubkey: "87da56bf2ca5ef75d62d88dfed1f667f9fa565ee0a5306aeeef50f5d7053b3d1" },
   signatures: [
     {
       officerIndex: 0,
       signature:
-        "1a372676e83ae323be8dbc6f8b786b3424706999efcccd70027798cbca91fe0b60cb35ac1e1af21078f24618d1f740b61bdcf06da03c5f90acc48d954039a104",
+        "2e19962eab0a30dd6b740462baae42eadb583ffd835cc353a9deb1838bc4980ea3aef02ac2c11182fc1bfbc404b2249152e99966edff1c4d7391063715e6390a",
     },
   ],
 };
