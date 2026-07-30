@@ -283,6 +283,31 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     });
   });
 
+
+  // ── THE ATTESTATION MUST NOT CLAIM A CHECK THAT DID NOT HAPPEN ──────────────────────────────────
+  // It previously said each signal "was checked against the CELLO directory's notary ledger at the
+  // moment of this session: its hash is present and its status is active." Nothing does that: the
+  // receive path hard-codes `verdict: "active"` and the daemon never queries the ledger. A false
+  // verification claim is the exact failure INV-UNTRUSTED exists to prevent, except committed by
+  // CELLO itself, in the one sentence a consuming model is most likely to trust.
+  //
+  // These assertions are deliberately about ABSENCE. Asserting the new wording alone would let the
+  // old claim be re-added alongside it.
+  it("does NOT claim a live directory/ledger check, and says currency was not re-checked", () => {
+    storeSignal("phone", "portal", { claim: "has verified phone" });
+    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }))!;
+
+    expect(out.directory_attestation, "must not claim the ledger was consulted").not.toMatch(/notary ledger/i);
+    expect(out.directory_attestation, "must not claim a live status check").not.toMatch(/status is active/i);
+    // And it must say so POSITIVELY — silence about currency reads as currency being fine.
+    expect(out.directory_attestation).toMatch(/NOT a live check of CURRENCY|not.*re-quer/i);
+    expect(out.directory_attestation, "names the consequence, not just the gap").toMatch(/revoked, withdrawn or superseded/i);
+    // The machine-readable companion, so a consumer need not parse prose.
+    expect(out.currency_rechecked, "FALSE until DOD-VERIFY-1's re-check actually lands").toBe(false);
+    // What DID happen is still stated — the cryptographic check is real and load-bearing.
+    expect(out.directory_attestation).toMatch(/re-hashes to its signal_hash/i);
+  });
+
 });
 
 // Test the PRODUCTION projection function, not a local mirror.

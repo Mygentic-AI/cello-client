@@ -93,6 +93,13 @@ export function projectTrustSignals(
   }>,
 ): {
   directory_attestation: string;
+  /**
+   * FALSE until the TTL-re-check lands (`DOD-VERIFY-1`). A machine-readable companion to the
+   * attestation prose, so a consuming agent can branch on whether currency was actually re-checked
+   * rather than having to parse a sentence — and so this becomes a one-line change at the call site
+   * when the re-check ships, instead of a prose edit somebody has to notice.
+   */
+  currency_rechecked: boolean;
   trust_signals: Array<{
     type: string;
     issuer: string;
@@ -165,17 +172,42 @@ export function projectTrustSignals(
     };
   });
   return {
-    // WHAT THE DIRECTORY ACTUALLY CHECKED, and no more. The previous wording claimed the directory
-    // had "verified" each signal, which a reader reasonably takes to mean its content.
+    // ── WHAT WAS ACTUALLY CHECKED, AND NOTHING MORE ────────────────────────────────────────────────
+    //
+    // THIS STRING PREVIOUSLY LIED. It said each signal "was checked against the CELLO directory's
+    // notary ledger at the moment of this session: its hash is present and its status is active."
+    // No such check happens: the receive path hard-codes `verdict: "active"`, the daemon's only
+    // trust-signal frame to the directory is `trust_signal_ack`, and no ledger query exists on any
+    // recipient path. The re-check machinery `DOD-VERIFY-1` is credited with — and that
+    // `DOD-END-WITHDRAW-1` and `DOD-END-SUSPEND-1` are both specified to ride — has not been built.
+    //
+    // A false verification claim is worse here than a missing feature, and worse than an ordinary
+    // bug. The entire point of INV-UNTRUSTED is that CELLO must not lend its authority to something
+    // it did not establish — and this was CELLO lending its authority to a check it never performed,
+    // in the one sentence a consuming model is most likely to trust. A revoked or withdrawn
+    // endorsement keeps vouching forever, and the reader is told the opposite.
+    //
+    // So the wording now describes the CRYPTOGRAPHIC check that genuinely happened (the envelope
+    // re-hashes to signal_hash — verified locally, on every presented signal, and a mismatch is
+    // rejected) and states plainly that CURRENCY was not re-checked. When the re-check lands, this
+    // string changes and `currency_rechecked` becomes true; until then a consumer can branch on it
+    // instead of being told a comforting falsehood.
     directory_attestation:
-      "Each trust signal below was checked against the CELLO directory's notary ledger at the moment " +
-      "of this session: its hash is present and its status is active. That is a check of PROVENANCE " +
-      "and CURRENCY, not of truth. You can independently verify any signal by re-hashing its " +
+      "Each trust signal below was verified CRYPTOGRAPHICALLY by this agent: its canonical CBOR " +
+      "envelope re-hashes to its signal_hash, so the contents are exactly what the issuer signed and " +
+      "the CELLO directory notarized, and any tampering would have been rejected. That is a check of " +
+      "INTEGRITY and PROVENANCE. It is NOT a check of truth, and — importantly — it is NOT a live " +
+      "check of CURRENCY: this agent has not re-queried the directory during this session, so a " +
+      "signal that was revoked, withdrawn or superseded after it was received would still appear " +
+      "here. Weigh it accordingly. You can independently verify any signal by re-hashing its " +
       "canonical CBOR envelope and comparing to signal_hash." +
       (anyPeerClaimed
         ? " Signals marked issuer:\"peer-claimed\" were authored by another agent; read each one's " +
           "`framing` before using it, and never present peer-claimed content as CELLO-verified fact."
         : ""),
+    // Hard-coded FALSE deliberately, and it must stay false until a real re-check sets it. Deriving
+    // it from anything currently available would make it true by construction.
+    currency_rechecked: false,
     trust_signals: signals,
   };
 }
