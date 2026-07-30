@@ -46,6 +46,16 @@ export interface InboundSessionEvent {
   // M8C-TTL-1: when this event was queued (not set for events handed straight to a blocked
   // waiter — those are delivered instantly and never sit in the queue this TTL governs).
   enqueuedAt?: number;
+  /**
+   * Hashes the counterparty presented IN THIS SESSION — the ones the directory checked for currency
+   * at session establishment and did not strip.
+   *
+   * Needed because the projection reads `listReceived(contact)`, i.e. EVERY signal ever stored from
+   * that contact, while the directory's check covered only what was presented now. Without this the
+   * two sets are indistinguishable downstream and a signal revoked since an earlier session would be
+   * projected as current.
+   */
+  presentedSignalHashes?: string[];
 }
 
 export interface InboundSessionWaiter {
@@ -91,17 +101,26 @@ export function projectTrustSignals(
     type: string; issuerKind: string; payload: Uint8Array; verdict: string; signalHash: string;
     sameOperator?: boolean;
   }>,
+  /**
+   * Hashes presented IN THIS SESSION — the ones the directory's currency check covered. Anything not
+   * in this set is a copy CARRIED OVER from an earlier session and has not been re-checked since.
+   * Omitted entirely (rather than defaulted to "all") when the caller does not know, because
+   * defaulting would silently mark carried-over rows as freshly checked — the over-claim this
+   * parameter exists to prevent.
+   */
+  presentedThisSession?: ReadonlySet<string>,
 ): {
   directory_attestation: string;
   /**
-   * The directory checked these signals' status against its ledger when the session was established
-   * (`checkPresentedSignals`), and a signal that failed never reaches this projection.
+   * How many of the signals below had their currency checked by the directory during THIS session's
+   * establishment — i.e. how many were actually presented now, as opposed to carried over from an
+   * earlier session.
    *
-   * TRUE rather than absent because a consuming agent should be able to branch on it without parsing
-   * prose. It is NOT a claim of ongoing currency: the check is point-in-time at session setup, which
-   * is what `at_session_start` in the name is carrying.
+   * A COUNT rather than a boolean because the set is genuinely mixed: the projection lists every
+   * signal ever received from this contact. A single flag would have to lie about one group or the
+   * other, which is exactly the over-claim that made an earlier version of the attestation wrong.
    */
-  currency_checked_at_session_start: boolean;
+  currency_checked_this_session_count: number;
   trust_signals: Array<{
     type: string;
     issuer: string;
@@ -128,6 +147,15 @@ export function projectTrustSignals(
     same_operator?: boolean;
     /** How a consuming model must read `same_operator`. Present whenever the flag is. */
     same_operator_framing?: string;
+    /**
+     * TRUE when the directory checked this signal's status while establishing THIS session.
+     *
+     * FALSE means it is a copy stored from an EARLIER session: still cryptographically intact, but
+     * its current status is unknown to this agent — it could have been revoked or withdrawn since.
+     * The distinction exists because the projection lists every signal ever received from a contact,
+     * while the directory only checks what was presented now.
+     */
+    currency_checked_this_session: boolean;
     claim: unknown;
   }>;
 } | undefined {
@@ -157,6 +185,10 @@ export function projectTrustSignals(
               "to its author, never restate it as your own or as CELLO's finding.",
           }
         : {}),
+      // Per-signal, and NOT absent-when-false: unlike `same_operator`, both values are meaningful
+      // here and a reader must be able to tell "checked just now" from "carried over, status unknown"
+      // without inferring anything from a missing key.
+      currency_checked_this_session: presentedThisSession?.has(s.signalHash) ?? false,
       // ABSENT when false, not `false`. A field present on every signal teaches a reader nothing; its
       // APPEARANCE is the signal, and that keeps the common case's JSON unchanged.
       ...(s.sameOperator === true
@@ -197,23 +229,21 @@ export function projectTrustSignals(
     // establishment. A signal revoked or withdrawn DURING a long-running session is not caught until
     // the next session — that gap is what `DOD-VERIFY-1`'s on-use re-check is for.
     directory_attestation:
-      "Each trust signal below passed two checks. INTEGRITY: this agent re-hashed its canonical CBOR " +
-      "envelope and confirmed it matches signal_hash, so the contents are exactly what the issuer " +
-      "signed and the CELLO directory notarized. CURRENCY: the directory checked each signal against " +
-      "its notary ledger when this session was established and forwarded only those whose status was " +
-      "active — anything revoked or superseded was stripped before it reached you. Both are checks of " +
-      "PROVENANCE and CURRENCY, never of truth. Note that the currency check is point-in-time at " +
-      "session setup, so a signal revoked during a long session would not be caught until the next " +
-      "one. You can independently verify any signal by re-hashing its canonical CBOR envelope and " +
+      "Each trust signal below passed an INTEGRITY check by this agent: its canonical CBOR envelope " +
+      "re-hashes to signal_hash, so the contents are exactly what the issuer signed and the CELLO " +
+      "directory notarized, and tampering would have been rejected. CURRENCY is checked by the " +
+      "directory, which verifies status against its notary ledger when a session is established and " +
+      "strips anything revoked or superseded before it reaches you — but that covers only the signals " +
+      "presented in THIS session. Read each signal's `currency_checked_this_session`: false means it " +
+      "is a copy stored from an earlier session, still cryptographically intact but of unknown " +
+      "current status, and it may have been revoked or withdrawn since. None of this is a check of " +
+      "TRUTH. You can independently verify any signal by re-hashing its canonical CBOR envelope and " +
       "comparing to signal_hash." +
       (anyPeerClaimed
         ? " Signals marked issuer:\"peer-claimed\" were authored by another agent; read each one's " +
           "`framing` before using it, and never present peer-claimed content as CELLO-verified fact."
         : ""),
-    // TRUE by construction, and that is sound rather than circular: the directory strips non-active
-    // signals before the assignment is built, and degrades to forwarding NONE if it cannot check. A
-    // signal being here is itself the evidence.
-    currency_checked_at_session_start: true,
+    currency_checked_this_session_count: signals.filter((x) => x.currency_checked_this_session).length,
     trust_signals: signals,
   };
 }
@@ -586,6 +616,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         // the recordOfferedMoniker call there. This map is only the session-scoped display material.)
       }
       // DOD-VERIFY-1: verify + store received trust signals.
+      // Hashes that arrived AND verified in this session — the set the directory's currency check
+      // actually covered. Declared out here so the enqueued event can carry it.
+      const presentedHashes: string[] = [];
       if (parsed.trustSignals && parsed.trustSignals.length > 0) {
         logger.info("signal.presentation.received", {
           agentName,
@@ -655,6 +688,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
                 });
               }
               verified++;
+              presentedHashes.push(sig.hash);
             } catch (err: unknown) {
               logger.warn("signal.verify.decode_failed", {
                 agentName, signalHash: sig.hash.slice(0, 16),
@@ -683,6 +717,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         counterpartyPubkeyHex: parsed.participantAPubkeyHex,
         genesisPrevRootHex,
         offeredMoniker: parsed.offeredMoniker,
+        presentedSignalHashes: presentedHashes,
       });
       dispatchSessionStateChangedWithTelegram(
         agentName,
@@ -966,7 +1001,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           const agId = sessionNodeManager.resolveAgentId(agentName);
           const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
           const received = store.listReceived({ agentId: agId, contactPubkey: e.counterpartyPubkeyHex });
-          trustSignalProjection = projectTrustSignals(received);
+          // The set the directory actually checked for this session. An event with no presented
+          // signals yields an EMPTY set, not `undefined` — every stored row is then correctly marked
+          // as not-checked-this-session rather than defaulting to checked.
+          trustSignalProjection = projectTrustSignals(received, new Set(e.presentedSignalHashes ?? []));
         } catch (err: unknown) {
           logger.warn("signal.projection.failed", {
             agentName,

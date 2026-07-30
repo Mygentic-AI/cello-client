@@ -284,28 +284,50 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
   });
 
 
-  // ── THE ATTESTATION MUST DESCRIBE BOTH CHECKS, AND CONFLATE NEITHER ─────────────────────────────
-  // Two parties check two different things: this daemon re-hashes the envelope (INTEGRITY), and the
+  // ── THE ATTESTATION MUST MATCH THE MIXED SET IT DESCRIBES ───────────────────────────────────────
+  // Two parties check two different things: this daemon re-hashes each envelope (INTEGRITY), and the
   // DIRECTORY checks status against its ledger at session establishment (CURRENCY,
-  // `checkPresentedSignals` → `signal_records_effective`). Arrival implies the second ran, because a
-  // directory that cannot check forwards no signals at all.
+  // `checkPresentedSignals` → `signal_records_effective`), stripping non-active ones.
   //
-  // The point-in-time assertion is the load-bearing one. I once rewrote this string to claim currency
-  // was NOT checked — having grepped only the daemon — and that was false. The correct nuance is
-  // narrower and must not drift in either direction: checked at SETUP, not continuously.
-  it("states both checks, and that currency is point-in-time at session setup", () => {
-    storeSignal("phone", "portal", { claim: "has verified phone" });
-    const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }))!;
+  // The subtlety that made two earlier versions of this string WRONG, in opposite directions: the
+  // projection lists every signal ever received from a contact, but the directory only checked the
+  // ones presented in THIS session. Claiming no currency check happened was false; claiming it
+  // covered "each signal below" was also false. It is a MIXED set, and the wording plus the
+  // per-signal flag have to say so.
+  it("names both checks and scopes currency to the signals presented THIS session", () => {
+    const fresh = storeSignal("phone", "portal", { claim: "has verified phone" });
+    const carried = storeSignal("email", "portal", { claim: "has verified email" });
+    const out = projectTrustSignals(
+      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
+      new Set([fresh]),
+    )!;
 
-    expect(out.directory_attestation, "the local integrity check").toMatch(/re-hashed its canonical CBOR/i);
-    expect(out.directory_attestation, "the directory's currency check").toMatch(/notary ledger when this session was established/i);
-    expect(out.directory_attestation, "and that non-active signals were stripped").toMatch(/stripped before it reached you/i);
-    // NEITHER over- nor under-claiming: it must say point-in-time...
-    expect(out.directory_attestation).toMatch(/point-in-time at session setup/i);
-    // ...and must NOT claim the agent itself re-queried, which it never does.
-    expect(out.directory_attestation, "the daemon does not re-query the ledger").not.toMatch(/this agent (has )?re-?quer/i);
-    expect(out.directory_attestation, "never a claim about truth").toMatch(/never of truth/i);
-    expect(out.currency_checked_at_session_start).toBe(true);
+    expect(out.directory_attestation, "the local integrity check").toMatch(/re-hashes to signal_hash/i);
+    expect(out.directory_attestation, "the directory's currency check").toMatch(/notary ledger when a session is established/i);
+    expect(out.directory_attestation, "scoped to THIS session, not to everything listed").toMatch(/only the signals presented in THIS session/i);
+    expect(out.directory_attestation, "points the reader at the per-signal flag").toMatch(/currency_checked_this_session/);
+    expect(out.directory_attestation, "and names the consequence for carried-over copies").toMatch(/revoked or withdrawn since/i);
+    expect(out.directory_attestation, "never a claim about truth").toMatch(/check of\s+TRUTH/i);
+    // Must NOT claim the agent itself re-queried the ledger — it never does.
+    expect(out.directory_attestation).not.toMatch(/this agent (has )?re-?quer/i);
+
+    // The per-signal split is the load-bearing part.
+    const bySig = new Map(out.trust_signals.map((x) => [x.signal_hash, x]));
+    expect(bySig.get(fresh)!.currency_checked_this_session, "presented now → checked").toBe(true);
+    expect(bySig.get(carried)!.currency_checked_this_session, "carried over → NOT checked").toBe(false);
+    expect(out.currency_checked_this_session_count, "a count, because the set is mixed").toBe(1);
+  });
+
+  it("marks EVERY signal unchecked when the session presented none", () => {
+    // The default that matters: a session with no presented signals must not let stored rows inherit
+    // "checked". Passing an empty set is the honest answer, and `?? false` is what enforces it.
+    storeSignal("phone", "portal", { claim: "has verified phone" });
+    const out = projectTrustSignals(
+      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
+      new Set(),
+    )!;
+    expect(out.trust_signals[0].currency_checked_this_session).toBe(false);
+    expect(out.currency_checked_this_session_count).toBe(0);
   });
 
 });
@@ -345,7 +367,7 @@ describe("M10B-D13 — peer-claimed content is framed as peer-claimed", () => {
     const out = projectTrustSignals([sig("agent", { claim: "x", statement: "Alice is great" })])!;
     // The attestation must not claim the directory verified the SIGNAL — only its provenance.
     expect(out.directory_attestation).not.toMatch(/each verified by the CELLO directory/i);
-    expect(out.directory_attestation).toMatch(/provenance|not of truth/i);
+    expect(out.directory_attestation).toMatch(/check of\s+TRUTH/i);
     // And it must warn about the peer-claimed one specifically.
     expect(out.directory_attestation).toMatch(/peer-claimed/i);
   });
