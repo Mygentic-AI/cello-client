@@ -446,6 +446,44 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(new Uint8Array(got!.payload)).toEqual(new Uint8Array([1, 2, 3]));
     });
 
+    // ── A DELIVERED SIGNAL MUST STILL BE PRESENTABLE ───────────────────────────────────────────────
+    // Delivery verifies the hash and stores the FIELDS; presentation RE-ENCODES from those fields and
+    // sends the stored hash beside the bytes. So the wallet round-trip has to be byte-exact, and
+    // nothing tested that: delivery asserted "stored", presentation asserted "attached", and a field
+    // lost in between made the RECIPIENT reject a valid signal one hop away.
+    //
+    // This is the assertion that closes the gap, and it is parameterized over same_operator because
+    // that is the field the round-trip actually dropped — `deliverWalletSignal` did not pass it to
+    // `putWalletSignal`, so a co-owned signal was delivered as true and stored as false. Only the
+    // TRUE case fails; a suite that tested the default would have passed while the bug shipped.
+    for (const sameOperator of [false, true]) {
+      it(`round-trips every envelope field through the wallet — same_operator: ${sameOperator}`, () => {
+        const { env, hash } = deliverable({ same_operator: sameOperator });
+        expect(store.deliverWalletSignal(env, hash).stored).toBe(true);
+
+        const row = store.getWalletSignal(hash);
+        expect(row, "the delivered signal is in the wallet").not.toBeNull();
+
+        // Re-encode from the STORED ROW exactly as the presenter does, and re-derive the hash. If any
+        // field did not survive, this is not the notarized hash and the signal is unpresentable.
+        const rehashed = Buffer.from(hashTrustSignalEnvelopeFn({
+          subject_kind: row!.subjectKind,
+          subject: row!.subject,
+          issuer_kind: row!.issuerKind,
+          issuer_pubkey: row!.issuerPubkey,
+          type: row!.type,
+          schema_version: row!.schemaVersion,
+          payload: new Uint8Array(row!.payload),
+          issued_at: row!.issuedAt,
+          expires_at: row!.expiresAt,
+          supersedes_hash: row!.supersedesHash === null ? null : new Uint8Array(Buffer.from(row!.supersedesHash, "hex")),
+          same_operator: row!.sameOperator,
+        })).toString("hex");
+        expect(rehashed, "the wallet row must re-derive the notarized hash").toBe(hash);
+        expect(row!.sameOperator, "the delivered flag, not the column default").toBe(sameOperator);
+      });
+    }
+
     it("REFUSES a delivery whose envelope does not hash to the claimed hash — never stored", () => {
       // The holder's own chokepoint: a tampered/corrupted delivery must not enter the wallet, or it
       // would present a signal the directory never notarized.

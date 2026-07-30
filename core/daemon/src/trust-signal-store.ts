@@ -424,6 +424,12 @@ export class TrustSignalStore {
       issuedAt: envelope.issued_at,
       expiresAt: envelope.expires_at,
       supersedesHash,
+      // THE DELIVERED FLAG, not the column default. Omitting this stored `false` for a co-owned
+      // endorsement, and the damage was not the wrong flag — it was that PRESENTATION re-encodes from
+      // this row, so the envelope bytes no longer hashed to the notarized hash and the RECIPIENT
+      // rejected a perfectly valid signal. A field dropped on the way into the wallet is silent until
+      // it surfaces one hop away as somebody else's `hash_mismatch`.
+      sameOperator: envelope.same_operator,
       status: "active",
     });
     if (inserted) {

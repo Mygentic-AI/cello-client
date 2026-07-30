@@ -11,6 +11,7 @@
  * which is why the seal listeners are a single bundle and not three separate registrations).
  */
 import { SignalingManager, type CelloNode } from "@cello-protocol/transport";
+import { createHash } from "node:crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
@@ -26,7 +27,7 @@ import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { TIER } from "./contacts-tier-migration.js";
-import { encodeTrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { encodeTrustSignalEnvelope, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 
 export interface OutboundSessionDeps {
   logger: Logger;
@@ -213,9 +214,19 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           });
         }
         if (selected.length > 0) {
-          trustSignals = selected.map((s) => ({
-            hash: s.signalHash,
-            blob: encodeTrustSignalEnvelope({
+          // ── PRESENT NOTHING YOU CANNOT REPRODUCE ────────────────────────────────────────────────
+          // Presentation re-encodes the envelope from the WALLET ROW and sends the notarized hash
+          // beside it. If any stored field does not round-trip, the bytes and the hash disagree — and
+          // the only party that finds out is the RECIPIENT, who logs `hash_mismatch` and drops it. From
+          // the presenter's side that is indistinguishable from success: the session forms, the log
+          // says `attached: 1`, and the operator's endorsement silently never counts anywhere.
+          //
+          // So the presenter re-derives its own hash and refuses to send a signal it cannot reproduce,
+          // naming the two hashes. A wallet round-trip defect is now a loud error at the party that
+          // owns the row, not a silent rejection one hop away.
+          const reproducible: typeof selected = [];
+          for (const s of selected) {
+            const blob = encodeTrustSignalEnvelope({
               subject_kind: s.subjectKind,
               subject: s.subject,
               issuer_kind: s.issuerKind,
@@ -230,11 +241,60 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
               // envelope bytes, so the hash stops matching what the directory notarized and the
               // recipient rejects a perfectly valid signal.
               same_operator: s.sameOperator,
-            }),
+            });
+            const derived = Buffer.from(hashTrustSignalEnvelope({
+              subject_kind: s.subjectKind, subject: s.subject, issuer_kind: s.issuerKind,
+              issuer_pubkey: s.issuerPubkey, type: s.type, schema_version: s.schemaVersion,
+              payload: s.payload, issued_at: s.issuedAt, expires_at: s.expiresAt,
+              supersedes_hash: s.supersedesHash === null ? null : new Uint8Array(Buffer.from(s.supersedesHash, "hex")),
+              same_operator: s.sameOperator,
+            })).toString("hex");
+            if (derived !== s.signalHash) {
+              logger.error("signal.presentation.unreproducible", {
+                agentName,
+                notarized: s.signalHash.slice(0, 16),
+                derived: derived.slice(0, 16),
+                type: s.type,
+                issuerKind: s.issuerKind,
+                sameOperator: s.sameOperator,
+                expiresAt: s.expiresAt,
+                issuedAt: s.issuedAt,
+                subjectKind: s.subjectKind,
+                subject: s.subject,
+                issuerPubkey: s.issuerPubkey.slice(0, 16),
+                supersedesHash: s.supersedesHash,
+                schemaVersion: s.schemaVersion,
+                payloadLen: s.payload.length,
+                payloadSha: createHash("sha256").update(Buffer.from(s.payload)).digest("hex").slice(0, 16),
+                correlationId,
+              });
+              continue;
+            }
+            reproducible.push({ ...s, presentedBlob: blob } as typeof s & { presentedBlob: Uint8Array });
+          }
+          trustSignals = reproducible.map((s) => ({
+            hash: s.signalHash,
+            blob: (s as typeof s & { presentedBlob: Uint8Array }).presentedBlob,
           }));
-          logger.info("signal.presentation.attached", {
-            agentName, target: targetHex.slice(0, 16), count: trustSignals.length, correlationId,
-          });
+          if (trustSignals.length === 0) {
+            // EVERY selected signal failed its own reproducibility check. "attached: 0" would be a lie
+            // in the one case that matters most — the wallet held presentable rows and not one of them
+            // could be re-encoded — and it reads identically to holding nothing at all.
+            logger.error("signal.presentation.all_unreproducible", {
+              agentName, target: targetHex.slice(0, 16), selected: selected.length, correlationId,
+            });
+            trustSignals = undefined;
+          } else {
+            logger.info("signal.presentation.attached", {
+              agentName,
+              target: targetHex.slice(0, 16),
+              count: trustSignals.length,
+              // Non-zero means some rows were selected and then dropped — visible here rather than only
+              // in the per-signal errors above.
+              ...(selected.length !== trustSignals.length ? { droppedUnreproducible: selected.length - trustSignals.length } : {}),
+              correlationId,
+            });
+          }
         } else {
           // A ZERO-ROW PRESENTATION IS THE FAILURE THIS UNIT EXISTS TO PREVENT, so it must not be
           // the one outcome that emits nothing. Without this line "the operator holds no signals"

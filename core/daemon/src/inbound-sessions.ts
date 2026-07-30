@@ -20,7 +20,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
-import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
@@ -537,8 +537,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
               const envelope = decodeTrustSignalEnvelope(sig.blob);
               const hashBytes = new Uint8Array(Buffer.from(sig.hash, "hex"));
               if (!verifyTrustSignalHash(envelope, hashBytes)) {
+                // BOTH hashes, or this warning cannot be acted on. Logging only the CLAIMED hash says
+                // "these two values differ" while showing one of them — which is how far a live
+                // investigation got before this line was widened. The recomputed hash is what says
+                // WHICH side moved, and `sameOperator` is named explicitly because it is the newest
+                // slot and therefore the first suspect when a presenter and a minter disagree.
                 logger.warn("signal.verify.hash_mismatch", {
-                  agentName, signalHash: sig.hash.slice(0, 16), correlationId,
+                  agentName,
+                  signalHash: sig.hash.slice(0, 16),
+                  recomputed: Buffer.from(hashTrustSignalEnvelope(envelope)).toString("hex").slice(0, 16),
+                  type: envelope.type,
+                  issuerKind: envelope.issuer_kind,
+                  sameOperator: envelope.same_operator,
+                  correlationId,
                 });
                 rejected++;
                 continue;
