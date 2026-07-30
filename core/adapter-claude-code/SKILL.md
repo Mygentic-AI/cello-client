@@ -22,7 +22,7 @@ Choose the **user** scope so cello is available in every project. Restart Claude
 `cli` provides the `cello` binary and the local daemon; the plugin provides the MCP shim that talks to it. You need both — the shim holds no keys and opens no database, it proxies to the daemon over `~/.cello/daemon.sock`.
 
 To register the shim by hand instead, `npm install -g @cello-protocol/connect` and
-`claude mcp add -s user cello -- cello-mcp`. That gives you the tools but no skills and no channel, and the tool names differ (`mcp__cello__*` rather than `mcp__plugin_cello_cello__*`). Pick one route; running both registers the shim twice.
+`claude mcp add -s user cello -- cello-mcp`. That gives you the tools but no skills and no channel, and the MCP tool-name prefix differs between the two routes — so permission rules and hooks written for one route silently stop matching under the other. Pick one route and stay on it; registering both runs the shim twice.
 
 ## Upgrade
 

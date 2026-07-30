@@ -34,10 +34,11 @@ if (process.stdin.isTTY) {
     "\n" +
     "This is a CELLO MCP server. It communicates with the CELLO daemon process.\n" +
     "\n" +
-    "Run `cello login` to start the daemon first, then use this as an MCP server:\n" +
-    "  claude mcp add cello -- cello-mcp\n" +
+    "Run `cello login` to start the daemon first, then install the CELLO plugin:\n" +
+    "  /plugin marketplace add Mygentic-AI/cello-client\n" +
+    "  /plugin install cello@cello-protocol\n" +
     "\n" +
-    "Then restart Claude Code (or run /mcp) to activate CELLO.\n",
+    "Then restart Claude Code to activate CELLO.\n",
   );
   process.exit(0);
 }
@@ -618,7 +619,10 @@ proxy.onNotification((frame) => {
   // Claude Code needs a `content` field to render the channel tag body — forwarding the bare frame
   // as `params` (no `content`) means the doorbell never surfaces at all.
   // buildChannelParams synthesizes a content-free announcement; message content still never rides.
-  const params = buildChannelParams(data);
+  // `type` is passed in: it was resolved above with the `frame.notification` fallback that the
+  // frame actually uses. Letting buildChannelParams re-derive it from `data` is what produced the
+  // generic `CELLO event: cello_event.` doorbell in production.
+  const params = buildChannelParams(data, type);
   server.server
     .notification({ method: "notifications/claude/channel", params })
     .then(() => {

@@ -83,10 +83,16 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       return `CELLO: agent ${short(data["agent"])} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
       return `CELLO: current agent changed to ${short(data["toAgent"] ?? data["agent"])}.`;
+    case "shutdown":
+      // ACTIONABLE, not suppressed. The daemon dying is the one housekeeping event the operator
+      // must know about: every cello_* tool is about to fail, and the failure (`daemon_not_running`)
+      // reads like a protocol bug rather than "your daemon stopped." Name the recovery here.
+      return `⚠️ CELLO — the local daemon stopped. Tools will fail until you run \`cello login\`.`;
     default:
       return `CELLO event: ${type}.`;
   }
 }
+
 
 /**
  * Translate a content-free daemon doorbell frame's `data` blob into the Claude Code channel
@@ -96,8 +102,14 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
  */
 export function buildChannelParams(
   data: Record<string, unknown>,
+  type: string,
 ): { content: string; meta: Record<string, string> } {
-  const type = typeof data["type"] === "string" ? (data["type"] as string) : "cello_event";
+  // `type` is REQUIRED and comes from the caller, which resolved it as
+  // `data.type ?? String(frame.notification)`. It is deliberately NOT re-derived from `data` here:
+  // real daemon frames carry the type on `frame.notification`, not in `data`, so a local
+  // `data.type ?? "cello_event"` fallback silently bypassed every announcement below and rendered
+  // the placeholder `CELLO event: cello_event.` in production while every test passed — the test
+  // fixtures were the only frames that ever had `data.type` (2026-07-30).
   const meta: Record<string, string> = {};
   for (const [k, v] of Object.entries(data)) {
     // Identifier-safe keys only (Claude Code drops others); scalars only; never a `content` key
