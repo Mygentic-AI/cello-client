@@ -128,6 +128,24 @@ export interface ReceivedSignalInput extends Omit<WalletSignalInput, "status"> {
   verdict: SignalStatus;
 }
 
+/** The submission verbs. Mirrors protocol-types' `SubmissionOp` without importing it into storage. */
+export type SubmissionOpName = "submit" | "withdraw" | "refuse";
+
+export interface IssuedSubmissionInput {
+  agentId: string;
+  /** Content-derived sha256 of the signed body (`M10B-D20`) — the handle a withdrawal names. */
+  submissionId: string;
+  subjectPubkey: string;
+  op: SubmissionOpName;
+  intakeKeyId: string;
+  /** What the accepting node said: false = it already held this id. */
+  stored: boolean;
+}
+
+export interface IssuedSubmissionRow extends IssuedSubmissionInput {
+  submittedAt: number;
+}
+
 export interface ReceivedSignalRow extends ReceivedSignalInput {
   receivedAt: number;
 }
@@ -217,9 +235,43 @@ const CREATE_RECEIVED_SQL = `
  * an FK's parent at DML time, not at DDL time, so creating this first would not fail here; it would
  * fail later, on the first insert, which is a far worse place to find out.
  */
+/**
+ * What THIS daemon has SUBMITTED about other agents — the third table, and the one that was missing.
+ *
+ * The wallet holds signals ABOUT me; `contact_trust_signals` holds signals PRESENTED to me. Neither
+ * records what I SAID ABOUT SOMEONE ELSE, so an operator who endorsed a counterparty had no way to
+ * see it afterwards and — the part that matters — `DOD-END-WITHDRAW-1` had nothing to NAME: you
+ * cannot withdraw a submission whose id you never kept. The submission id is content-derived, so it
+ * is reproducible in principle, but only by re-composing the exact original body, which the operator
+ * no longer has.
+ *
+ * NO BODY IS STORED. The text was the operator's own words about a third party; keeping it here
+ * would put in the clear, on disk, the one thing the whole sealed-submission path exists to keep
+ * from being readable by anyone but the portal. The id, the subject and the verb are enough to name
+ * a submission for withdrawal, which is what this table is for.
+ */
+const CREATE_ISSUED_SQL = `
+  CREATE TABLE IF NOT EXISTS issued_submissions (
+    submission_id  TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    subject_pubkey TEXT NOT NULL,
+    op             TEXT NOT NULL,
+    intake_key_id  TEXT NOT NULL,
+    -- Whether the accepting node reported it as newly stored. FALSE means a node already held this
+    -- id: a benign retry, or single-node censorship, and they are indistinguishable from here.
+    stored         INTEGER NOT NULL,
+    submitted_at   INTEGER NOT NULL,
+    -- Content-derived, so the same body re-submitted is the SAME row rather than a second one. Keyed
+    -- with agent_id because two agents on one daemon can each submit about the same subject, and the
+    -- rows are per-agent facts.
+    PRIMARY KEY (agent_id, submission_id)
+  );
+`;
+
 export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): void {
   db.exec(CREATE_WALLET_SQL);
   db.exec(CREATE_RECEIVED_SQL);
+  db.exec(CREATE_ISSUED_SQL);
   // Presentation reads by subject; nothing reads by `type`, and nothing may (INV-ZERO-BUMP — an
   // index predicated on a type VALUE is a per-type construct in the schema).
   db.exec("CREATE INDEX IF NOT EXISTS idx_wallet_signals_subject ON wallet_trust_signals (subject_kind, subject)");
@@ -932,6 +984,47 @@ export class TrustSignalStore {
    * when WE last re-verified, and a stale value that looked fresh would be worse than no value at
    * all (freshness is re-checked on use — M10-D4).
    */
+  /**
+   * Record a submission THIS daemon sent. Idempotent on (agent_id, submission_id): the id is
+   * content-derived, so a safe re-submit is the SAME row rather than a second one — which is what
+   * makes "re-sending is safe" true at this layer too, not just at the directory's.
+   *
+   * `stored` is UPDATED on conflict, and that direction is deliberate: a retry that finally lands as
+   * newly-stored should not keep reporting the earlier duplicate answer.
+   */
+  recordIssuedSubmission(s: IssuedSubmissionInput): void {
+    this.#db
+      .prepare(
+        `INSERT INTO issued_submissions
+           (agent_id, submission_id, subject_pubkey, op, intake_key_id, stored, submitted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (agent_id, submission_id) DO UPDATE SET stored = excluded.stored`,
+      )
+      .run(s.agentId, s.submissionId, s.subjectPubkey, s.op, s.intakeKeyId, s.stored ? 1 : 0, Date.now());
+    this.#logger.info("signal.submission.recorded", {
+      agentId: s.agentId, submissionId: s.submissionId, op: s.op, stored: s.stored,
+    });
+  }
+
+  /** What this agent has submitted, newest first. No body — see the table comment. */
+  listIssuedSubmissions(agentId: string): IssuedSubmissionRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT agent_id, submission_id, subject_pubkey, op, intake_key_id, stored, submitted_at
+           FROM issued_submissions WHERE agent_id = ? ORDER BY submitted_at DESC`,
+      )
+      .all(agentId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      agentId: String(r["agent_id"]),
+      submissionId: String(r["submission_id"]),
+      subjectPubkey: String(r["subject_pubkey"]),
+      op: String(r["op"]) as SubmissionOpName,
+      intakeKeyId: String(r["intake_key_id"]),
+      stored: r["stored"] === 1,
+      submittedAt: Number(r["submitted_at"]),
+    }));
+  }
+
   putReceivedSignal(s: ReceivedSignalInput): void {
     this.#db
       .prepare(

@@ -729,4 +729,67 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(alterAttempted, "the ALTER was actually attempted").toBe(true);
     });
   });
+
+  // ── WHAT I SUBMITTED ABOUT OTHERS (M10B / DOD-END-SURFACE-1, DOD-END-WITHDRAW-1) ────────────────
+  // The third table. The wallet holds signals ABOUT me and contact_trust_signals holds signals
+  // PRESENTED to me; neither recorded what I SAID about someone else — so withdrawal had nothing to
+  // NAME. The id is content-derived and therefore reproducible in principle, but only by re-composing
+  // the exact original body, which the operator no longer has once it is sent.
+  describe("issued submissions — the handle a withdrawal names", () => {
+    const issued = (over: Partial<Parameters<typeof store.recordIssuedSubmission>[0]> = {}) => ({
+      agentId: "agent-1", submissionId: HASH("d"), subjectPubkey: HASH("e"),
+      op: "submit" as const, intakeKeyId: "intake-1", stored: true, ...over,
+    });
+
+    it("records a submission and lists it back for that agent", () => {
+      store.recordIssuedSubmission(issued());
+      const rows = store.listIssuedSubmissions("agent-1");
+      expect(rows).toHaveLength(1);
+      expect(rows[0].submissionId).toBe(HASH("d"));
+      expect(rows[0].op).toBe("submit");
+      expect(rows[0].stored).toBe(true);
+      expect(rows[0].submittedAt).toBeGreaterThan(0);
+    });
+
+    it("NEVER stores the body — the operator's words about a third party stay sealed", () => {
+      // The property this table's shape exists to guarantee. A `body` column would put in the clear,
+      // on disk, the one thing the sealed-submission path is for. Asserted on the SCHEMA rather than
+      // on a row, so adding the column later fails here even if nothing writes to it yet.
+      const cols = (db.prepare("PRAGMA table_info(issued_submissions)").all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      expect(cols).not.toContain("body");
+      expect(cols).not.toContain("statement");
+      expect(cols).not.toContain("text");
+      expect(cols, "the handle itself must be there").toContain("submission_id");
+    });
+
+    it("a re-submit is the SAME row, and a later success updates `stored`", () => {
+      // "Re-sending is safe" has to be true at this layer too, or the operator's own list grows a
+      // duplicate every time they retry something the directory correctly deduped.
+      store.recordIssuedSubmission(issued({ stored: false }));
+      store.recordIssuedSubmission(issued({ stored: true }));
+      const rows = store.listIssuedSubmissions("agent-1");
+      expect(rows, "content-derived id → one row").toHaveLength(1);
+      expect(rows[0].stored, "a retry that finally lands must not keep reporting the duplicate answer").toBe(true);
+    });
+
+    it("is scoped PER AGENT — two agents on one daemon do not see each other's submissions", () => {
+      // Solo multi-agent is the first wedge, so two agents on one daemon is the ordinary case. These
+      // are per-agent facts: what agent A said about someone is not agent B's to list or withdraw.
+      store.recordIssuedSubmission(issued({ agentId: "agent-1" }));
+      store.recordIssuedSubmission(issued({ agentId: "agent-2", submissionId: HASH("f") }));
+      expect(store.listIssuedSubmissions("agent-1")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-2")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-1")[0].submissionId).toBe(HASH("d"));
+    });
+
+    it("the same id from a DIFFERENT agent is a separate row, not a conflict", () => {
+      // The PK is (agent_id, submission_id). Keying on submission_id alone would let one agent's
+      // submission silently overwrite another's when both endorse the same subject identically.
+      store.recordIssuedSubmission(issued({ agentId: "agent-1" }));
+      store.recordIssuedSubmission(issued({ agentId: "agent-2" }));
+      expect(store.listIssuedSubmissions("agent-1")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-2")).toHaveLength(1);
+    });
+  });
 });

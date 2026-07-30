@@ -2037,6 +2037,31 @@ async function startDaemonHoldingLock(
       logger.info("signal.submission.attributed", {
         agentName: sel.name, op: opts.op, submissionId: composed.submissionId, stored: sent.stored,
       });
+      // KEEP THE HANDLE, or a withdrawal has nothing to name. The submission id is content-derived,
+      // so it is reproducible in principle — but only by re-composing the exact original body, which
+      // the operator no longer has once they have sent it. Recorded in the SHARED path so every verb
+      // added after this one is covered by construction, which is the same reasoning as the
+      // `storedWarning` below.
+      //
+      // Best-effort on purpose: the submission IS accepted at this point, and failing the call over
+      // a local bookkeeping write would turn a success into a reported failure and invite a re-send
+      // of something already queued. Logged loudly instead.
+      try {
+        const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+        store.recordIssuedSubmission({
+          agentId: sessionNodeManager.resolveAgentId(sel.name),
+          submissionId: composed.submissionId,
+          subjectPubkey: opts.subject,
+          op: opts.op,
+          intakeKeyId: composed.intakeKeyId,
+          stored: sent.stored,
+        });
+      } catch (err: unknown) {
+        logger.error("signal.submission.record_failed", {
+          agentName: sel.name, submissionId: composed.submissionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
       // F1: `stored: false` means a node reports it ALREADY HELD this submission id. That is either
       // a benign retry or single-node censorship — an operator pre-inserting garbage under a
       // clear-text id — and they are indistinguishable from here. Reporting it as unqualified
@@ -2069,6 +2094,33 @@ async function startDaemonHoldingLock(
    * No account identifier crosses the wire — the portal resolves agent → account at intake, and the
    * directory is hash-only by design.
    */
+  // M10B / DOD-END-SURFACE-1 — "see what I have submitted about others". The wallet list answers
+  // "what do people say about ME"; this answers the other direction, and it is the prerequisite for
+  // withdrawal: you cannot withdraw a submission you cannot name.
+  handlers.set("wallet_list_issued", async (_params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const rows = store.listIssuedSubmissions(sessionNodeManager.resolveAgentId(sel.name)).map((r) => ({
+      submission_id: r.submissionId,
+      subject_pubkey: r.subjectPubkey,
+      op: r.op,
+      intake_key_id: r.intakeKeyId,
+      // FALSE means a node already held this id — a benign retry, or single-node censorship. The
+      // operator sees the distinction here rather than only in the moment they submitted.
+      stored: r.stored,
+      submitted_at: r.submittedAt,
+    }));
+    return {
+      ok: true,
+      issued: rows,
+      // NO BODY, and say so rather than letting its absence read as a bug. The text was the
+      // operator's own words about a third party; keeping it on disk in the clear is exactly what
+      // the sealed-submission path exists to prevent.
+      note: "The text you wrote is NOT stored locally — only the handle, subject and verb. That is deliberate: your words about someone else are sealed to the portal and are not kept in the clear on this machine.",
+    };
+  });
+
   handlers.set("cello_trust_signals_issue", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
