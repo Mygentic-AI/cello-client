@@ -348,7 +348,7 @@ export function verifyTrustSignalHash(envelope: TrustSignalEnvelope, expected: U
  * Decode canonical envelope bytes back into the envelope — the inverse of `encodeTrustSignalEnvelope`,
  * and the ONE decoder every party shares (INV-CANONICAL / M10-D7 — the holder's daemon that RECEIVES a
  * delivered signal must decode with the SAME code the directory and portal encode with, never a vendored
- * copy). The preimage is a fixed-order 11-element ARRAY (M10-D15); element 0 is the domain tag.
+ * copy). The preimage is a fixed-order 12-element ARRAY (M10-D15); element 0 is the domain tag.
  *
  * REFUSES anything that is not EXACTLY canonical: it re-encodes the decoded envelope with
  * `encodeTrustSignalEnvelope` and compares the bytes to the input. If they differ — a number that came

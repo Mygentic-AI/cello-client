@@ -47,6 +47,7 @@ interface Vector {
     expires_at: number | null;
     /** hex in the file, RAW BYTES in the preimage */
     supersedes_hash: string | null;
+    same_operator: boolean;
   };
   preimage_hex: string;
   signal_hash_hex: string;
@@ -68,7 +69,30 @@ const loaded = JSON.parse(readFileSync(VECTORS, "utf8")) as { vectors: Vector[] 
 
 describe("DOD-INV-CANONICAL — frozen cross-party envelope vectors", () => {
   it("guards against a vacuous pass — the vector file really was loaded", () => {
-    expect(loaded.vectors.length).toBeGreaterThanOrEqual(6);
+    expect(loaded.vectors.length).toBeGreaterThanOrEqual(8);
+  });
+
+  it("ANCHOR: a co-owned vector encodes slot 12 as CBOR true (f5) — hardcoding false passes without it", () => {
+    // Every other vector carries `same_operator: false`, which encodes as `f4` — and `f4` is ALSO what a
+    // party that ignored the field and hardcoded `false` would emit. That is not hypothetical: the
+    // presenter in the daemon was written exactly that way and had to be corrected to re-encode the
+    // STORED value. With only false-vectors frozen, that bug re-hashes every vector correctly and ships.
+    //
+    // So one vector must be true, and the assertion is on the BYTE (f5), hand-derived from RFC 8949
+    // §3.3's simple values rather than from the encoder — otherwise the check is circular.
+    const coOwned = loaded.vectors.find((v) => v.envelope.same_operator === true);
+    expect(coOwned, "a same_operator:true vector must not be removed from the file").toBeDefined();
+    expect(coOwned!.preimage_hex.slice(-2), "slot 12 must be f5 (true), never f4 (false)").toBe("f5");
+    // And the LIVE encoding of flag-on must differ from the LIVE encoding of flag-off. Both sides live,
+    // deliberately: comparing the flag-off encoding to the FROZEN hash proves nothing, because those
+    // differ even for an encoder that ignores the field entirely (I wrote it that way first and the
+    // revert test showed the assertion never fired). Live-vs-live is what fails when the slot is dropped.
+    const on = toEnvelope(coOwned!);
+    const off = { ...on, same_operator: false };
+    expect(
+      hex(hashTrustSignalEnvelope(on)),
+      "flipping same_operator MUST change the hash — otherwise the slot is not in the preimage",
+    ).not.toBe(hex(hashTrustSignalEnvelope(off)));
   });
 
   it.each(loaded.vectors.map((v) => [v.name, v] as const))(

@@ -138,6 +138,24 @@
       },
       "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a69618a001b0000000125413e00f6f4",
       "signal_hash_hex": "0c96c300e89a039a7fc967d555711db009aa7404256e009d2bd1b79aad52fdd7"
+    },
+    {
+      "name": "SAME-OPERATOR true — co-owned endorsement (M10B slot 12 must encode f5, not f4)",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "agent",
+        "issuer_pubkey": "ccdd",
+        "type": "endorsement",
+        "schema_version": 1,
+        "payload": "01020304",
+        "issued_at": 1000000000,
+        "expires_at": null,
+        "supersedes_hash": null,
+        "same_operator": true
+      },
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d31656167656e7464636364646b656e646f7273656d656e740144010203041a3b9aca00f6f6f5",
+      "signal_hash_hex": "d2ea0c5ff8b556a11f836517cd778c476cfae0f7cad07794736f6921f44fd36b"
     }
   ],
   "wire_version_note": "REGENERATED 2026-07-30 for the M10B envelope change: `same_operator` was APPENDED as slot 12 (DOD-END-COUNT-1). This was a deliberate PROTOCOL BREAK, not a drift — every hash below differs from its pre-M10B value, and any signal minted under the 11-slot shape is unreadable by the current decoder (it refuses on arity rather than defaulting the flag, so an old signal can never be silently treated as same_operator:false). Taken now precisely because the stranded set is empty: alpha, no users, no production signals. Doing it after launch would strand real endorsements."
