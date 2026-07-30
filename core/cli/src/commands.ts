@@ -647,6 +647,42 @@ export async function trustSignals(
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
   }
 
+  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
+  // rather than folded into `list`: listing what you hold must keep working when the directory is
+  // unreachable, and a remote failure must not break a local read.
+  if (sub === "results") {
+    try {
+      const res = (await withIpc(lock.socketPath, (client) => client.send("wallet_fetch_results"))) as {
+        ok: boolean;
+        reason?: string;
+        guidance?: string;
+        results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
+      };
+      if (!res.ok) {
+        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
+      }
+      const rows = res.results ?? [];
+      if (rows.length === 0) {
+        return { exitCode: 0, output: "No outcomes waiting. Results are held until you collect them, so nothing has been missed." };
+      }
+      const lines = rows.map((r) => {
+        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
+        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
+        // operator's claim, and running it into the status columns would read as CELLO's verdict.
+        return r.message ? `${head}\n      they said: "${r.message}"` : head;
+      });
+      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
+      return {
+        exitCode: 0,
+        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
+          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
+          "  Re-submitting a corrected version is the intended next step.",
+      };
+    } catch (err) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   if (sub === "list") {
     const showAll = args.includes("--all");
     try {
@@ -876,6 +912,7 @@ export async function trustSignals(
     output:
       "Usage:\n" +
       "  cello trust-signals list [--all]      — show active signals (--all includes superseded)\n" +
+      "  cello trust-signals results           — what happened to endorsements you submitted\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
       "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +

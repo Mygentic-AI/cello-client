@@ -53,7 +53,7 @@ import { createNode, SignalingManager, type ConnectResult, type CelloNode } from
 import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
-import { composeSealedSubmission, sendSealedSubmission } from "./signal-submission.js";
+import { composeSealedSubmission, sendSealedSubmission, fetchSubmissionResults } from "./signal-submission.js";
 import type { SubmissionOp, SignalSubjectKind } from "@cello-protocol/protocol-types";
 
 /**
@@ -2097,6 +2097,39 @@ async function startDaemonHoldingLock(
   // M10B / DOD-END-SURFACE-1 — "see what I have submitted about others". The wallet list answers
   // "what do people say about ME"; this answers the other direction, and it is the prerequisite for
   // withdrawal: you cannot withdraw a submission you cannot name.
+  // M10B / `M10B-D25r2` — collect this agent's outcomes from the directory and open any sealed
+  // message with k_local. Separate from `wallet_list_issued` because it is a NETWORK call: listing
+  // what you submitted must keep working when the directory is unreachable, and folding a fetch into
+  // it would make a local read fail for a remote reason.
+  handlers.set("wallet_fetch_results", async (_params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const kp = keyProviders.get(sel.name);
+    if (!kp) {
+      return { ok: false, reason: "agent_not_loaded",
+        guidance: `Agent '${sel.name}' has no key loaded, so a sealed result could not be opened. Restart the daemon and select the agent again.` };
+    }
+    const res = await fetchSubmissionResults({
+      signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
+      keyProvider: kp as { openContentSeal?: (c: Uint8Array) => Promise<Uint8Array | null> },
+      logger,
+    });
+    if (!res.ok) return { ok: false, reason: res.reason, guidance: res.guidance };
+    return {
+      ok: true,
+      results: res.results.map((r) => ({
+        submission_id: r.submissionId,
+        outcome: r.outcome,
+        reason: r.reason,
+        signal_hash: r.signalHash,
+        // The subject's own words, already opened. NULL when there was no message or it would not
+        // open — the outcome stands either way, which is why a failed decrypt does not drop the row.
+        message: r.message,
+        created_at: r.createdAt,
+      })),
+    };
+  });
+
   handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
