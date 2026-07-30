@@ -284,28 +284,28 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
   });
 
 
-  // ── THE ATTESTATION MUST NOT CLAIM A CHECK THAT DID NOT HAPPEN ──────────────────────────────────
-  // It previously said each signal "was checked against the CELLO directory's notary ledger at the
-  // moment of this session: its hash is present and its status is active." Nothing does that: the
-  // receive path hard-codes `verdict: "active"` and the daemon never queries the ledger. A false
-  // verification claim is the exact failure INV-UNTRUSTED exists to prevent, except committed by
-  // CELLO itself, in the one sentence a consuming model is most likely to trust.
+  // ── THE ATTESTATION MUST DESCRIBE BOTH CHECKS, AND CONFLATE NEITHER ─────────────────────────────
+  // Two parties check two different things: this daemon re-hashes the envelope (INTEGRITY), and the
+  // DIRECTORY checks status against its ledger at session establishment (CURRENCY,
+  // `checkPresentedSignals` → `signal_records_effective`). Arrival implies the second ran, because a
+  // directory that cannot check forwards no signals at all.
   //
-  // These assertions are deliberately about ABSENCE. Asserting the new wording alone would let the
-  // old claim be re-added alongside it.
-  it("does NOT claim a live directory/ledger check, and says currency was not re-checked", () => {
+  // The point-in-time assertion is the load-bearing one. I once rewrote this string to claim currency
+  // was NOT checked — having grepped only the daemon — and that was false. The correct nuance is
+  // narrower and must not drift in either direction: checked at SETUP, not continuously.
+  it("states both checks, and that currency is point-in-time at session setup", () => {
     storeSignal("phone", "portal", { claim: "has verified phone" });
     const out = projectTrustSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }))!;
 
-    expect(out.directory_attestation, "must not claim the ledger was consulted").not.toMatch(/notary ledger/i);
-    expect(out.directory_attestation, "must not claim a live status check").not.toMatch(/status is active/i);
-    // And it must say so POSITIVELY — silence about currency reads as currency being fine.
-    expect(out.directory_attestation).toMatch(/NOT a live check of CURRENCY|not.*re-quer/i);
-    expect(out.directory_attestation, "names the consequence, not just the gap").toMatch(/revoked, withdrawn or superseded/i);
-    // The machine-readable companion, so a consumer need not parse prose.
-    expect(out.currency_rechecked, "FALSE until DOD-VERIFY-1's re-check actually lands").toBe(false);
-    // What DID happen is still stated — the cryptographic check is real and load-bearing.
-    expect(out.directory_attestation).toMatch(/re-hashes to its signal_hash/i);
+    expect(out.directory_attestation, "the local integrity check").toMatch(/re-hashed its canonical CBOR/i);
+    expect(out.directory_attestation, "the directory's currency check").toMatch(/notary ledger when this session was established/i);
+    expect(out.directory_attestation, "and that non-active signals were stripped").toMatch(/stripped before it reached you/i);
+    // NEITHER over- nor under-claiming: it must say point-in-time...
+    expect(out.directory_attestation).toMatch(/point-in-time at session setup/i);
+    // ...and must NOT claim the agent itself re-queried, which it never does.
+    expect(out.directory_attestation, "the daemon does not re-query the ledger").not.toMatch(/this agent (has )?re-?quer/i);
+    expect(out.directory_attestation, "never a claim about truth").toMatch(/never of truth/i);
+    expect(out.currency_checked_at_session_start).toBe(true);
   });
 
 });
