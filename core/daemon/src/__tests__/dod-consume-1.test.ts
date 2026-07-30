@@ -17,6 +17,7 @@ import { seedAgents } from "./helpers/seed-agents.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore } from "../trust-signal-store.js";
+import { evaluateSignalPolicy } from "../signal-requirement-policy.js";
 import { encodeCbor, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -66,7 +67,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  function storeSignal(type: string, issuerKind: "portal" | "agent", claim: unknown) {
+  function storeSignal(type: string, issuerKind: "portal" | "agent", claim: unknown, sameOperator = false) {
     const payload = encodeCbor(claim) as Uint8Array;
     const env = {
       subject_kind: "agent" as const,
@@ -79,7 +80,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
-      same_operator: false,
+      same_operator: sameOperator,
     };
     const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
     store.putReceivedSignal({
@@ -96,6 +97,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issuedAt: 1_768_000_000,
       expiresAt: null,
       supersedesHash: null,
+      sameOperator,
       verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });
@@ -218,6 +220,69 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     expect(projected[0].claim).toBeNull();
     expect(projected[0].type).toBe("broken");
   });
+
+  // ── DOD-END-COUNT-1 THROUGH THE REAL STORE PATH ─────────────────────────────────────────────────
+  // The predicate tests build `ReceivedSignalRow` objects by hand, so they prove the FILTER works and
+  // nothing about whether a signal that actually ARRIVED ever carries the flag. It did not:
+  // `putReceivedSignal` omitted `same_operator` from its INSERT, the column took its 0 default, and
+  // every received endorsement read as not-co-owned. The ten-agents-under-one-operator defence was
+  // inert in production while its unit tests were green — a store-level default is exactly the kind of
+  // gap hand-built rows cannot see.
+  //
+  // So these go through putReceivedSignal → listReceived → evaluateSignalPolicy, the real chain.
+  describe("the co-ownership flag survives the store, so the count exclusion is not inert", () => {
+    it("a co-owned endorsement that ARRIVED through the store is excluded from min_count", () => {
+      storeSignal("endorsement", "agent", { statement: "my other agent is great" }, true);
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received, "it is stored and active").toHaveLength(1);
+      expect(received[0].sameOperator, "READ BACK as co-owned — this is what the INSERT was dropping").toBe(true);
+
+      const verdict = evaluateSignalPolicy({ min_count: 1 }, received);
+      expect(verdict.pass, "one co-owned endorsement must not clear a floor of one").toBe(false);
+      expect(verdict.actual_count, "the COUNTABLE total, which is zero").toBe(0);
+      expect(verdict.excluded_same_operator, "and the operator is told why").toBe(1);
+    });
+
+    it("a third-party endorsement that arrived the same way DOES clear it", () => {
+      // The negative control. Without it, a store that returned `sameOperator: true` for everything
+      // would satisfy the test above and break every genuine endorsement.
+      storeSignal("endorsement", "agent", { statement: "she shipped it clean" }, false);
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received[0].sameOperator).toBe(false);
+      expect(evaluateSignalPolicy({ min_count: 1 }, received).pass).toBe(true);
+    });
+
+    it("ten co-owned endorsements do not clear a floor of three — the farming shape, end to end", () => {
+      for (let i = 0; i < 10; i++) {
+        storeSignal("endorsement", "agent", { statement: `agent ${i} vouches` }, true);
+      }
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received, "all ten are stored — they are genuine, notarized signals").toHaveLength(10);
+      const verdict = evaluateSignalPolicy({ min_count: 3 }, received);
+      expect(verdict.pass, "ten of one operator's own agents is not three endorsements").toBe(false);
+      expect(verdict.excluded_same_operator).toBe(10);
+    });
+
+    it("the recipient's PROJECTION surfaces co-ownership with its own framing", () => {
+      // DOD-END-JOURNEY-1 case (b) requires the recipient to SEE the fact, not merely have it
+      // silently discounted. A consuming model cannot read the statement correctly without it: the
+      // same sentence is a stranger's assessment or an operator's claim about their own fleet.
+      storeSignal("endorsement", "agent", { statement: "her agent never drops a session" }, true);
+      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
+      const sig = projected[0] as unknown as { same_operator?: boolean; same_operator_framing?: string };
+      expect(sig.same_operator, "the flag reaches the LLM-facing JSON").toBe(true);
+      expect(String(sig.same_operator_framing), "and says it does not count toward a minimum").toMatch(/does NOT count/i);
+    });
+
+    it("a third-party endorsement OMITS the flag entirely rather than sending false", () => {
+      // Absent, not `false`: a field present on every signal teaches a reader nothing, and its
+      // appearance is what carries the meaning.
+      storeSignal("endorsement", "agent", { statement: "she shipped it clean" }, false);
+      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
+      expect(Object.keys(projected[0])).not.toContain("same_operator");
+    });
+  });
+
 });
 
 // Test the PRODUCTION projection function, not a local mirror.

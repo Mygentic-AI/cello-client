@@ -200,6 +200,11 @@ const CREATE_RECEIVED_SQL = `
     agent_id        TEXT NOT NULL,
     contact_pubkey  TEXT NOT NULL,
     ${ENVELOPE_COLUMNS},
+    -- M10B / DOD-END-COUNT-1 — what the recipient's floor predicate reads to exclude co-ownership
+    -- from a min_count. It lives on BOTH tables and is NOT in ENVELOPE_COLUMNS, which is a wart worth
+    -- naming: the wallet needs it to re-encode the envelope byte-identically at presentation, and
+    -- this table needs it for the predicate. Same envelope field, two different reasons.
+    same_operator   INTEGER NOT NULL DEFAULT 0,
     verified_at     INTEGER NOT NULL,
     received_at     INTEGER NOT NULL,
     PRIMARY KEY (agent_id, contact_pubkey, signal_hash),
@@ -223,6 +228,26 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
     db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN default_present INTEGER NOT NULL DEFAULT 1");
   } catch {
     // Column already exists — safe to ignore.
+  }
+  // M10B / DOD-END-COUNT-1 — additive on BOTH tables, for databases created before the slot existed.
+  //
+  // WITHOUT THESE THE UPGRADE PATH IS BROKEN, not merely incomplete: the fresh DDL above gained the
+  // column, so a NEW operator works while an EXISTING one — anyone whose wallet predates it — hits
+  // "table has no column named same_operator" on the first insert and cannot receive or present any
+  // signal at all. Adding a column to the CREATE and stopping there is the classic client-side
+  // migration miss, and it is invisible in CI because every test database is fresh.
+  //
+  // `NOT NULL DEFAULT 0` is legal for ALTER (SQLite only refuses NOT NULL with NO default), so the
+  // migrated schema is identical to the fresh one — the repo's "fresh == migrated" rule holds here,
+  // unlike `consent_state` below where it could not.
+  for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN same_operator INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists — safe to ignore. Unlike the consent migration there is no backfill:
+      // 0 (not co-owned) is the correct value for every pre-existing row, because no signal minted
+      // before the slot existed could have carried the flag.
+    }
   }
   // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent
   // ALTER whose only expected failure is "already exists"; it is NOT safe for a migration with a
@@ -888,9 +913,9 @@ export class TrustSignalStore {
       .prepare(
         `INSERT INTO contact_trust_signals
            (agent_id, contact_pubkey, signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey,
-            type, schema_version, payload, issued_at, expires_at, supersedes_hash, status,
-            verified_at, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            type, schema_version, payload, issued_at, expires_at, supersedes_hash, same_operator,
+            status, verified_at, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (agent_id, contact_pubkey, signal_hash)
            DO UPDATE SET
              verified_at = excluded.verified_at,
@@ -905,7 +930,13 @@ export class TrustSignalStore {
       .run(
         s.agentId, s.contactPubkey, s.signalHash, s.subjectKind, s.subject, s.issuerKind,
         s.issuerPubkey, s.type, s.schemaVersion, toBuf(s.payload), s.issuedAt, s.expiresAt,
-        s.supersedesHash, s.verdict, s.verifiedAt, Date.now(),
+        // WITHOUT THIS THE COUNT EXCLUSION IS INERT. `evaluateSignalPolicy` filters on `sameOperator`,
+        // and this insert is the ONLY way a received signal ever gets one — omitting it meant the column
+        // always took its `0` default, every received endorsement read as not-co-owned, and
+        // DOD-END-COUNT-1's ten-agents-under-one-operator defence silently did nothing in production.
+        // The unit tests did not catch it because they construct rows directly rather than arriving
+        // through this path, which is exactly the gap a store-level default hides.
+        s.supersedesHash, s.sameOperator === true ? 1 : 0, s.verdict, s.verifiedAt, Date.now(),
       );
     this.#logger.info("signal.received.stored", {
       agentId: s.agentId, signalHash: s.signalHash, type: s.type, issuerKind: s.issuerKind,
