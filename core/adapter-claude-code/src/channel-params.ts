@@ -79,10 +79,21 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
           return `CELLO — session with ${who} is now "${String(data["state"] ?? "changed")}".`;
       }
     }
+    // Agent NAMES are never shortened — `short()` is for pubkeys/fingerprints. These two cases used
+    // it anyway and rendered "CELLO_Feedba…", contradicting the rule stated in the
+    // session_state_changed branch above ("AC3's 'never truncates a name' applies to YOUR agent name
+    // too; only fingerprints shorten"). A mangled name reads like a different agent.
     case "agent_state_changed":
-      return `CELLO: agent ${short(data["agent"])} is now ${String(data["state"] ?? "changed")}.`;
+      return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
-      return `CELLO: current agent changed to ${short(data["toAgent"] ?? data["agent"])}.`;
+      return `CELLO — you are now acting as ${String(data["toAgent"] ?? data["agent"] ?? "your agent")}.`;
+    // The counterpart to `shutdown`, and the reason this exists: after `cello logout && cello login`
+    // the operator was told the daemon STOPPED and never told it came back. The reconnect only wrote
+    // to the shim's stderr, which no agent reads. The only thing that did arrive was the
+    // agent_current_changed from the handshake replay — an agent-switch notice standing in for an
+    // announcement that did not exist, which is why the doorbell read as wrong rather than missing.
+    case "daemon_reconnected":
+      return `✅ CELLO — the local daemon is back${data["agent"] !== undefined ? ` and you are acting as ${String(data["agent"])}` : ""}. Tools work again.`;
     case "shutdown":
       // ACTIONABLE, not suppressed. The daemon dying is the one housekeeping event the operator
       // must know about: every cello_* tool is about to fail, and the failure (`daemon_not_running`)

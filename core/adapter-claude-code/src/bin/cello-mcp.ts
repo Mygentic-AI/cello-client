@@ -609,6 +609,25 @@ if (process.env.CELLO_MCP_TRACE === "1") {
 // current type (agent_state_changed / agent_current_changed / session_state_changed) AND the
 // future `cello_message` (MSGWAKE) ride the same hop — no per-type allowlist that would silently
 // drop a new type.
+// The daemon coming BACK is an event too, and it was the one nobody sent. `shutdown` is pushed by
+// the dying daemon; a fresh one cannot push anything, because it has never heard of this client. So
+// the shim announces its own reconnect — the only party that knows both that the daemon died and
+// that it is back. Without it, `cello logout && cello login` left the agent holding a ⚠️ "daemon
+// stopped" notice forever, and the agent_current_changed from the handshake replay was the only
+// hint anything had recovered.
+proxy.onReconnect(() => {
+  const agent = proxy.currentAgent;
+  const data: Record<string, unknown> = agent ? { agent } : {};
+  const params = buildChannelParams(data, "daemon_reconnected");
+  server.server
+    .notification({ method: "notifications/claude/channel", params })
+    .then(() => logEvent("notification.channel.forwarded", { type: "daemon_reconnected", agent }))
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      logEvent("notification.push.failed", { type: "daemon_reconnected", agent, error: message });
+    });
+});
+
 proxy.onNotification((frame) => {
   // The daemon frame's `data` blob is content-free (agent, type, agentName, sessionId, state,
   // counterpartyPubkey) — no message content ever rides a push (INV-CONTENTFREE / SI-001).

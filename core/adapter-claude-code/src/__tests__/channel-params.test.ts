@@ -146,7 +146,10 @@ describe("buildChannelParams — the type comes from the caller, not from data",
   it("renders per-type text when the type is NOT in `data` (the real daemon frame shape)", () => {
     const { content } = buildChannelParams({ agent: "alice", toAgent: "bob" }, "agent_current_changed");
     expect(content).not.toContain("cello_event");
-    expect(content).toContain("current agent changed");
+    // Asserts that the AGENT-SWITCH branch ran, not its exact prose — the wording changed when the
+    // message was rewritten in operator terms, and pinning the sentence made a copy edit look like
+    // a regression of the type-resolution bug this test actually guards.
+    expect(content).toContain("bob");
   });
 
   it("a real message frame with no `data.type` still announces a message, not a generic event", () => {
@@ -166,3 +169,40 @@ describe("buildChannelParams — the type comes from the caller, not from data",
   });
 });
 
+
+// The doorbell after `cello logout && cello login`. The operator got "⚠️ the daemon stopped" and then
+// nothing when it came back — the reconnect only reached the shim's stderr. What DID arrive was an
+// agent-switch notice from the handshake replay, standing in for an announcement that did not exist.
+describe("daemon lifecycle: coming back is an event, and names are not truncated", () => {
+  it("announces the daemon returning, and names the restored agent", () => {
+    const { content } = buildChannelParams({ agent: "CELLO_Feedback" }, "daemon_reconnected");
+    expect(content).toContain("daemon is back");
+    expect(content).toContain("CELLO_Feedback");
+    expect(content).not.toContain("stopped");
+  });
+
+  it("still announces the return when no agent was selected", () => {
+    const { content } = buildChannelParams({}, "daemon_reconnected");
+    expect(content).toContain("daemon is back");
+    expect(content).not.toContain("undefined");
+    expect(content).not.toContain("null");
+  });
+
+  it("NEVER truncates an agent name — `short()` is for fingerprints, not names", () => {
+    // It rendered "CELLO_Feedba…", contradicting the rule the session_state_changed branch states
+    // outright. A mangled name reads as a different agent.
+    for (const type of ["agent_current_changed", "agent_state_changed", "daemon_reconnected"]) {
+      const { content } = buildChannelParams(
+        { agent: "CELLO_Feedback", toAgent: "CELLO_Feedback", state: "online" },
+        type,
+      );
+      expect(content, `${type} truncated the agent name`).toContain("CELLO_Feedback");
+      expect(content, `${type} left an ellipsis in a name`).not.toContain("…");
+    }
+  });
+
+  it("says what the agent switch MEANS, not which internal field changed", () => {
+    const { content } = buildChannelParams({ toAgent: "Ms_Chelly" }, "agent_current_changed");
+    expect(content).toContain("you are now acting as Ms_Chelly");
+  });
+});
