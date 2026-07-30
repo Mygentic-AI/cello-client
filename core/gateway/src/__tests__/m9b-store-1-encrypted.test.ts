@@ -1,6 +1,6 @@
 /**
- * DOD-M9C-STORE-1 — custody: the gateway stores are SQLCipher-encrypted, keyed by the daemon's
- * key file, fail-closed on a missing or wrong key, and share ONE encrypted file (M9C-D9).
+ * DOD-M9B-STORE-1 — custody: the gateway stores are SQLCipher-encrypted, keyed by the daemon's
+ * key file, fail-closed on a missing or wrong key, and share ONE encrypted file (M9B-D9).
  *
  * The revert test lives in the assertions themselves: a node:sqlite implementation of the stores
  * passes none of these — its file carries the plaintext magic, and it opens fine without any key.
@@ -16,13 +16,13 @@ import { GatewayStoreError } from "../store/encrypted-db.js";
 
 const PLAINTEXT_MAGIC = Buffer.concat([Buffer.from("SQLite format 3", "latin1"), Buffer.from([0x00])]);
 
-describe("DOD-M9C-STORE-1 — encrypted gateway stores (fail-closed custody)", () => {
+describe("DOD-M9B-STORE-1 — encrypted gateway stores (fail-closed custody)", () => {
   let dir: string;
   let dbPath: string;
   let keyPath: string;
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "cello-m9c-store-"));
+    dir = await mkdtemp(join(tmpdir(), "cello-m9b-store-"));
     dbPath = join(dir, "gateway.db");
     keyPath = join(dir, "sessions.db.key");
     await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
@@ -57,7 +57,7 @@ describe("DOD-M9C-STORE-1 — encrypted gateway stores (fail-closed custody)", (
     expect((thrown as GatewayStoreError).guidance.length).toBeGreaterThan(0);
   });
 
-  it("both stores share ONE encrypted file and round-trip across reopen WITH the key (M9C-D9)", () => {
+  it("both stores share ONE encrypted file and round-trip across reopen WITH the key (M9B-D9)", () => {
     const config = new GatewayConfigStore(dbPath, keyPath);
     const records = new GatewayRecordStore(dbPath, keyPath);
     expect(config.set("autonomous_override", false).ok).toBe(true);

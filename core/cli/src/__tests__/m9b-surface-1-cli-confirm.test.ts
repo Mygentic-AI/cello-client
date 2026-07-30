@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-SURFACE-1 — the CLI confirmation flow. The reviewer found this entirely untested: the
+ * DOD-M9B-SURFACE-1 — the CLI confirmation flow. The reviewer found this entirely untested: the
  * `prompt` parameter of `gatewayConfigSet` existed for injection and nothing in the repo ever
  * called it, so the two-phase flow, the declined path and the non-TTY refusal were all unproven.
  *
@@ -27,7 +27,7 @@ function emitted(out: { stdout: string; stderr: string }): Record<string, unknow
   return JSON.parse(text) as Record<string, unknown>;
 }
 
-describe("DOD-M9C-SURFACE-1 — the CLI two-phase confirmation", () => {
+describe("DOD-M9B-SURFACE-1 — the CLI two-phase confirmation", () => {
   let dir: string;
   let handle: DaemonHandle | undefined;
 
@@ -37,7 +37,7 @@ describe("DOD-M9C-SURFACE-1 — the CLI two-phase confirmation", () => {
   };
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "cello-m9c-cliconfirm-"));
+    dir = await mkdtemp(join(tmpdir(), "cello-m9b-cliconfirm-"));
     await mkdir(join(dir, "agents"), { recursive: true });
     // The store is opened with the daemon's key; seed it so the handlers can reach it.
     await writeFile(join(dir, "sessions.db.key"), randomBytes(32), { mode: 0o600 });

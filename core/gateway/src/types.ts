@@ -115,7 +115,7 @@ export type GatewayMode = "enforcing" | "passthrough";
 
 export interface SecurityGatewayClient {
   /**
-   * Declared by the implementation, never computed by the caller (M9C-D11). The daemon announces
+   * Declared by the implementation, never computed by the caller (M9B-D11). The daemon announces
    * this at boot, and it is the field an operator greps to know whether their agent is screened —
    * so it must come from the object that will actually do (or not do) the screening. The defect
    * this closes: the daemon used to announce `config.securityGateway ? "sidecar" : "passthrough"`,

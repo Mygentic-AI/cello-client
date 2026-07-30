@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-SURFACE-1 — the security layer's control surface (policy D-4).
+ * DOD-M9B-SURFACE-1 — the security layer's control surface (policy D-4).
  *
  * The gateway's config store has enforced tighten-free / loosen-confirmed since June 2026, and
  * NOTHING in the product could ever satisfy the confirmation — there was no CLI, no MCP tool, no
@@ -74,10 +74,10 @@ export interface GatewayConfigHandlerDeps {
   handlers: Map<string, IpcHandler>;
   celloDir: string;
   logger: Logger;
-  /** Read this connection's declared client type — `"mcp"` or `"cli"` (M9C-D15). */
+  /** Read this connection's declared client type — `"mcp"` or `"cli"` (M9B-D15). */
   getClientType: (connectionId: string) => string | undefined;
   /**
-   * Restart the screening sidecar so a stored change actually applies (M9C-D17). Supplied by the
+   * Restart the screening sidecar so a stored change actually applies (M9B-D17). Supplied by the
    * composition root, which owns the sidecar's lifecycle. Absent in tests that assert storage only.
    */
   restartSecurityGateway?: () => Promise<void>;
@@ -208,7 +208,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     // sidecar and every record it writes afterwards is lost.
   };
 
-  // Read the whole surface. Shows the GOVERNANCE, not just the value (M9C-D18): after an incident
+  // Read the whole surface. Shows the GOVERNANCE, not just the value (M9B-D18): after an incident
   // the question is not "what is this set to" but "who weakened it, and did a human agree".
   handlers.set("cello_config_list", async () =>
     withStore((store) => ({
@@ -256,7 +256,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
     });
   });
 
-  // DOD-M9C-AUDIT-1 (policy D-11) — "what did my policy do?"
+  // DOD-M9B-AUDIT-1 (policy D-11) — "what did my policy do?"
   //
   // This ships WITH the enforcement flip, by decision, and not later: it is the concrete answer to
   // the question D-2 raised — *"I have ongoing development everywhere, and if a new error appears
@@ -389,7 +389,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): v
       return applied(key, result.direction, result.version, true);
     });
 
-    /** Store the change, then make it REAL — the gateway reads config only at boot (M9C-D17). */
+    /** Store the change, then make it REAL — the gateway reads config only at boot (M9B-D17). */
     function applied(k: string, direction: ConfigDirection, version: number, wasConfirmed: boolean) {
       const base = { ok: true as const, key: k, direction, version, confirmed: wasConfirmed };
       if (!restartSecurityGateway) return { ...base, applied: false as const };

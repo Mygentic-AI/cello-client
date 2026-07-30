@@ -2,7 +2,7 @@
  * M9-REC-001 — local security-pass records.
  *
  * The gateway records what it did to EVERY message it screens — clean / redacted / blocked / warned —
- * in the gateway's SQLCipher store, opened with the daemon's key (DOD-M9C-STORE-1; INV-4 as amended).
+ * in the gateway's SQLCipher store, opened with the daemon's key (DOD-M9B-STORE-1; INV-4 as amended).
  * Each record is hash-chained to the
  * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so a NAIVELY
  * edited, deleted (mid-chain), or reordered record breaks the chain and `verifyChain()` returns false.
@@ -72,7 +72,7 @@ export class GatewayRecordStore {
   #closed = false;
 
   /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
-   *  `keyFilePath` — the daemon's own key file (M9C-D8/D9). Throws GatewayStoreError fail-closed. */
+   *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
   constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
     this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
     this.#db.exec(DDL);

@@ -117,7 +117,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
 
   /** Spawn a gateway sidecar; return its handle + request-log path. `env` seeds gateway config
    *  (CELLO_GATEWAY_STORE_DB / _STORE_KEY_FILE — plumbing only; every POLICY value comes from the
- *  store, since DOD-M9C-ENV-1 removed the env fallbacks). */
+ *  store, since DOD-M9B-ENV-1 removed the env fallbacks). */
   async function spawnGateway(tag: string, env?: Record<string, string>): Promise<{ gw: SpawnedGateway; sock: string; log: string }> {
     const sock = join(tempDir, `${tag}.sock`);
     const log = join(tempDir, `${tag}.log`);
@@ -258,7 +258,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const { clientA, clientB, aEvents, bEvents } = await bringUpSession({ aGatewaySock: a.sock, bGatewaySock: b.sock });
 
     // H1 observability: each daemon announced its gateway mode at startup. The value is
-    // "enforcing", not "sidecar" (M9C-D11): the old word named the TRANSPORT SHAPE, which tells an
+    // "enforcing", not "sidecar" (M9B-D11): the old word named the TRANSPORT SHAPE, which tells an
     // operator nothing about whether their agent is screened — and "sidecar" would still have been
     // announced by a daemon whose sidecar never screened anything. The mode now names what the
     // client DOES with content, and it comes from the client object rather than a caller-side
@@ -450,7 +450,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     }, 40_000);
 
     it("OUT-002 whitelist: a WHITELISTED own-email passes SILENTLY (no warn) and is delivered intact", async () => {
-      // A's gateway is seeded through its STORE — the only way in since DOD-M9C-ENV-1 removed the
+      // A's gateway is seeded through its STORE — the only way in since DOD-M9B-ENV-1 removed the
       // env fallbacks (policy D-5). Whitelisting is a LOOSENING, so it is written confirmed: the
       // test stands in for the human at the CLI prompt. Sharing your own email must be frictionless
       // — passes silently, no governance round-trip — the done-condition's silent-pass.
@@ -499,7 +499,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     it("REC-001: BOTH gateways record every screened message (outbound clean+redact on A, inbound clean on B), hash-chained", async () => {
       const recDbA = join(tempDir, "gw-store-a.db");
       const recDbB = join(tempDir, "gw-store-b.db");
-      // DOD-M9C-STORE-1: the store is SQLCipher, keyed by a key FILE the spawner names (M9C-D8).
+      // DOD-M9B-STORE-1: the store is SQLCipher, keyed by a key FILE the spawner names (M9B-D8).
       const keyFile = join(tempDir, "gw-store.key");
       writeFileSync(keyFile, randomBytes(32), { mode: 0o600 });
       const a = await spawnGateway("ga", { CELLO_GATEWAY_STORE_DB: recDbA, CELLO_GATEWAY_STORE_KEY_FILE: keyFile });
@@ -570,7 +570,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
 
     it("OUT-004 rate limit: over-rate sends are throttled with a distinct rate_limited reason + guidance", async () => {
       // A's gateway is seeded with a 2-per-window cap through its STORE — the env fallbacks are gone
-      // (DOD-M9C-ENV-1). Setting a cap TIGHTENS (no cap is the loosest state), so it needs no
+      // (DOD-M9B-ENV-1). Setting a cap TIGHTENS (no cap is the loosest state), so it needs no
       // confirmation. The first two clean sends go out; the third is throttled — a distinct
       // top-level reason (not the generic block), with guidance.
       const rlDb = join(tempDir, "gw-rl.db");

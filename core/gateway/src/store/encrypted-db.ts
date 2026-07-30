@@ -1,14 +1,14 @@
 /**
- * The gateway's encrypted store engine (DOD-M9C-STORE-1, INV-4 as amended).
+ * The gateway's encrypted store engine (DOD-M9B-STORE-1, INV-4 as amended).
  *
- * One SQLCipher file holds BOTH gateway stores (config versions + security records — M9C-D9),
- * keyed by the daemon's key: the caller hands over the KEY FILE PATH (M9C-D8 — never key bytes in
+ * One SQLCipher file holds BOTH gateway stores (config versions + security records — M9B-D9),
+ * keyed by the daemon's key: the caller hands over the KEY FILE PATH (M9B-D8 — never key bytes in
  * env or argv), and this module reads the same raw 32-byte key file the daemon uses for its own
  * database. Same key, same backup set — that is policy D-3's "one key, covered by backup".
  *
  * FAILS CLOSED. A missing key file, a malformed key, or a key that does not decrypt the file each
  * refuse with a distinct code. There is no plaintext fallback and no plaintext read path: no
- * production plaintext gateway store has ever existed (M9C-D7), so nothing here consults one.
+ * production plaintext gateway store has ever existed (M9B-D7), so nothing here consults one.
  *
  * This deliberately does NOT import from core/daemon (the dependency points the other way); the
  * ~50 lines shared with the daemon's opener are the price of the package boundary. WAL is enabled
@@ -221,7 +221,7 @@ export function openEncryptedStoreDb(dbPath: string, keyFilePath: string, onEven
   inner.pragma(`key = "x'${keyHex}'"`);
 
   // busy_timeout FIRST — before the verify read and before the WAL pragma, both of which take
-  // locks. This file is shared with the daemon (M9C-D9), so a contended startup is ordinary, and
+  // locks. This file is shared with the daemon (M9B-D9), so a contended startup is ordinary, and
   // with the SQLite default timeout of 0 the very first contended open returns SQLITE_BUSY
   // instantly — which the verify-read catch below would then report as a wrong key. Setting it
   // last (as this did) turns lock contention into "your key is wrong. Restore it from backup."

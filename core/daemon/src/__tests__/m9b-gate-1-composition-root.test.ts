@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-GATE-1 — THE ENFORCER, and the lesson of this whole milestone encoded as a test.
+ * DOD-M9B-GATE-1 — THE ENFORCER, and the lesson of this whole milestone encoded as a test.
  *
  * M9's original gate spawned real processes and screened real messages, and it was green for weeks
  * while the shipped product screened NOTHING. The gate injected the gateway client itself — it
@@ -91,7 +91,7 @@ async function stopDaemon(d: BootedDaemon): Promise<void> {
   }
 }
 
-describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => {
+describe("DOD-M9B-GATE-1 — the SHIPPED daemon runs the security layer", () => {
   let dir: string;
   let booted: BootedDaemon | undefined;
 
@@ -103,7 +103,7 @@ describe("DOD-M9C-GATE-1 — the SHIPPED daemon runs the security layer", () => 
   }, 320_000);
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "cello-m9c-gate-"));
+    dir = await mkdtemp(join(tmpdir(), "cello-m9b-gate-"));
   });
   // EXPLICIT timeout. vitest gives a hook 10s by default, and this one stops a real daemon process
   // and its spawned sidecar — which on a loaded CI runner takes longer than a local machine ever

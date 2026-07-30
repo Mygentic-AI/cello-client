@@ -1,7 +1,7 @@
 /**
  * M9-CFG-001 — the gateway's own versioned config store (INV-4).
  *
- * The store lives in the gateway's SQLCipher file, opened with the daemon's key (DOD-M9C-STORE-1),
+ * The store lives in the gateway's SQLCipher file, opened with the daemon's key (DOD-M9B-STORE-1),
  * is append-only/versioned, and enforces the §7 governance rule:
  * **TIGHTENING a guard is free; LOOSENING one requires explicit confirmation.** Each version is
  * hash-chained (a per-row fingerprint over key+version+value+prev) so the change history is

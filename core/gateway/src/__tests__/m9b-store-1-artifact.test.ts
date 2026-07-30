@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-STORE-1 — absence asserted on the BUILT ARTIFACT, not on source.
+ * DOD-M9B-STORE-1 — absence asserted on the BUILT ARTIFACT, not on source.
  *
  * Source-level greps have missed this three times in this project: `tsc --build --clean` does not
  * remove an output whose source is gone, so a deleted file's `dist/` artifact survives and a warm
@@ -28,7 +28,7 @@ function walk(dir: string): string[] {
   return out;
 }
 
-describe("DOD-M9C-STORE-1 — the SHIPPED artifact carries no node:sqlite", () => {
+describe("DOD-M9B-STORE-1 — the SHIPPED artifact carries no node:sqlite", () => {
   beforeAll(() => {
     execFileSync("npx", ["tsc", "--build"], { cwd: PKG_ROOT, stdio: "pipe", timeout: 180_000 });
   }, 200_000);

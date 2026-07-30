@@ -19,7 +19,7 @@ import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 
 // Re-export the TYPE for daemon consumers (the composition root supplies the impl). The always-allow
 // implementation is NOT re-exported here — it lives at `@cello-protocol/daemon/testing`, so a
-// production file cannot reach it by ordinary import (DOD-M9C-WIRE-1, INV-9).
+// production file cannot reach it by ordinary import (DOD-M9B-WIRE-1, INV-9).
 export type { SecurityGatewayClient };
 
 // Re-export manifest interfaces for consumers of the daemon package
@@ -304,7 +304,7 @@ export interface DaemonConfig {
    * before it enters the receive buffer. The daemon holds ONLY this narrow interface — all
    * detection lives in the separate gateway program.
    *
-   * REQUIRED (INV-9, M9C-D10). It was optional, defaulting to `PassthroughGatewayClient`, and
+   * REQUIRED (INV-9, M9B-D10). It was optional, defaulting to `PassthroughGatewayClient`, and
    * because no production caller ever set it, every shipped daemon screened NOTHING while
    * announcing that the gateway was connected. An optional field with a permissive default made
    * the invariant hold by CONVENTION while the comment claimed it held by construction. Now the
@@ -313,7 +313,7 @@ export interface DaemonConfig {
    */
   securityGateway: SecurityGatewayClient;
   /**
-   * Restart the screening sidecar so a stored config change actually applies (M9C-D17). The
+   * Restart the screening sidecar so a stored config change actually applies (M9B-D17). The
    * gateway reads its config only at boot, so without this a confirmed loosening would be recorded
    * and have no effect — the operator told `ok`, the running gateway unchanged. Supplied by the
    * composition root, which owns the sidecar's lifecycle; absent in tests that assert storage only.

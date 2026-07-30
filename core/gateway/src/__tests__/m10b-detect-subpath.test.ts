@@ -64,7 +64,7 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
   const reachable = transitiveLocalImports(join(SRC, "detect/index.ts"));
 
   it("NEVER reaches node:sqlite — VERBOTEN, and the reason the subpath exists at all", () => {
-    // A denylist against regression. Note what it can and cannot see as of DOD-M9C-STORE-1
+    // A denylist against regression. Note what it can and cannot see as of DOD-M9B-STORE-1
     // (2026-07-29): the stores no longer import node:sqlite at all — they load SQLCipher, a NATIVE
     // prebuilt, through createRequire inside a function, which this static scan cannot detect. So
     // the live guard against the barrel's weight is the structural filename assertion below

@@ -268,7 +268,7 @@ async function startDaemonHoldingLock(
     );
   }
   const securityGateway: SecurityGatewayClient = config.securityGateway;
-  // Observability: announce the mode the CLIENT declares (M9C-D11), never a ternary over the
+  // Observability: announce the mode the CLIENT declares (M9B-D11), never a ternary over the
   // config. The sidecar socket connects lazily on the first screen, so this reports which adapter
   // is wired, not a live socket handshake — but it reports it from the object that will do the
   // screening, so a wiring mistake shows up here instead of hiding behind a correct-looking line.
@@ -2443,7 +2443,7 @@ async function startDaemonHoldingLock(
     });
   }
 
-  // DOD-M9C-SURFACE-1: the security layer's control surface. Registered here, defined in its own
+  // DOD-M9B-SURFACE-1: the security layer's control surface. Registered here, defined in its own
   // module — it needs the cello dir, a logger, and the connection's client type, and nothing else
   // about sessions or ceremonies.
   registerGatewayConfigHandlers({
@@ -2839,7 +2839,7 @@ async function startDaemonHoldingLock(
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();
     } finally {
-      // DOD-M9C-WIRE-1: tear down whatever the composition root started alongside us — today the
+      // DOD-M9B-WIRE-1: tear down whatever the composition root started alongside us — today the
       // screening sidecar. Two reasons it is HERE and not only in the bin's signal handler:
       // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
       // function and never touches the signal path; and a spawned child's stdio pipes keep this

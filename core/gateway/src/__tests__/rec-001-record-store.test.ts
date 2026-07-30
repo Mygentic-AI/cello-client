@@ -3,7 +3,7 @@
  * attestation is Phase-2 M9-ATTEST-001).
  *
  * The gateway records what it did to EVERY message — clean / redacted / blocked / warned — in its own
- * SQLCipher store (DOD-M9C-STORE-1), each record hash-chained to the prior one so tampering is
+ * SQLCipher store (DOD-M9B-STORE-1), each record hash-chained to the prior one so tampering is
  * detectable. A clean pass is recorded too (an absent record for a delivered message is itself evidence
  * of suppression). Each record carries a fingerprint, ready to attest to the directory in Phase 2.
  */

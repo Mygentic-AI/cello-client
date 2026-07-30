@@ -1,5 +1,5 @@
 /**
- * M9-CFG-001 — the gateway's versioned config store (INV-4 as amended by M9C-D2).
+ * M9-CFG-001 — the gateway's versioned config store (INV-4 as amended by M9B-D2).
  *
  * The store is append-only and versioned, and enforces the §7 governance asymmetry:
  *
@@ -12,7 +12,7 @@
  * Every applied change appends a row whose `fingerprint` is hash-chained to the previous version, so
  * the change history is tamper-evident and ready to attest to the directory in Phase 2 (M9-ATTEST-001).
  *
- * Encryption-at-rest (DOD-M9C-STORE-1): the store lives in the gateway's SQLCipher file, opened with
+ * Encryption-at-rest (DOD-M9B-STORE-1): the store lives in the gateway's SQLCipher file, opened with
  * the daemon's key via a key FILE path — fail-closed, no plaintext fallback (see store/encrypted-db.ts).
  */
 import { openEncryptedStoreDb, type StoreDb, type StoreEventSink } from "../store/encrypted-db.js";
@@ -128,7 +128,7 @@ export class GatewayConfigStore {
   #closed = false;
 
   /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
-   *  `keyFilePath` — the daemon's own key file (M9C-D8/D9). Throws GatewayStoreError fail-closed. */
+   *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
   constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
     this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
     this.#db.exec(DDL);

@@ -414,7 +414,7 @@ export function settingsSet(celloDir: string, key: string, value: string, opts: 
   return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
 }
 
-// ─── DOD-M9C-SURFACE-1: the security layer's control surface (policy D-4) ──────────────────────
+// ─── DOD-M9B-SURFACE-1: the security layer's control surface (policy D-4) ──────────────────────
 //
 // NOT agent-scoped: the security layer screens every message on this machine regardless of which
 // agent is selected, so its config is per-INSTALL. Passing agentScoped=false keeps `cello config`
@@ -439,7 +439,7 @@ export function gatewayConfigGet(celloDir: string, key: string, opts: ParityOpti
  * row written) and answers `needs_confirmation` — only then do we prompt, and only then do we
  * re-send with `confirmed: true`.
  *
- * There is deliberately NO `--yes` flag (M9C-D16). A flag that lets a script confirm a loosening is
+ * There is deliberately NO `--yes` flag (M9B-D16). A flag that lets a script confirm a loosening is
  * the environment-variable bypass with a friendlier name, and removing that bypass is the sibling
  * decision (D-5). If stdin is not a TTY there is no human here, so the answer is no.
  */
@@ -525,7 +525,7 @@ async function confirmAtTty(question: string): Promise<ConfirmAnswer> {
 }
 
 /**
- * `cello policy log` → cello_policy_log (DOD-M9C-AUDIT-1, policy D-11).
+ * `cello policy log` → cello_policy_log (DOD-M9B-AUDIT-1, policy D-11).
  *
  * Ships with the enforcement flip by decision: it is the answer to "did this new error come from
  * the security layer or from my own change?" — a lookup instead of a guess.

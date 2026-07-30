@@ -43,7 +43,7 @@ export { GatewayRecordStore } from "./records/record-store.js";
 export type { RecordDisposition, RecordDirection, RecordInput, SecurityRecord } from "./records/record-store.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
 // PassthroughGatewayClient is NOT exported here — it lives at `@cello-protocol/gateway/testing`
-// (DOD-M9C-WIRE-1). An always-allow client on the production barrel is how the security layer
+// (DOD-M9B-WIRE-1). An always-allow client on the production barrel is how the security layer
 // shipped inert; reaching for it should be a deliberate act, visible in a diff.
 
 // Wire protocol (shared by the local sidecar; Phase 2's mTLS gateway reuses these shapes).

@@ -159,7 +159,7 @@ server.tool("cello_agents", "List all agents with state from this connection's p
 // ─── Contact whitelist tools (CC-9) ─────────────────────────────────────────
 // The per-agent whitelist is load-bearing: a known contact is fast-tracked and exempt from the
 // unknown-sender gate + the ABUSE-1 acceptance caps. Those caps ARE enforced. CONTENT screening
-// (prompt-injection defense) IS live as of DOD-M9C-WIRE-1 — the daemon spawns the screening
+// (prompt-injection defense) IS live as of DOD-M9B-WIRE-1 — the daemon spawns the screening
 // sidecar and runs enforcing; this comment previously said the opposite, which was true when the
 // layer was inert and shipped in the tarball claiming so
 // description here may tell the operator's agent that message text is screened.
@@ -334,9 +334,9 @@ server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. 
   return jsonText(result);
 });
 
-// ─── DOD-M9C-SURFACE-1: the security layer's guards, READ and TIGHTEN only ──────────────────
+// ─── DOD-M9B-SURFACE-1: the security layer's guards, READ and TIGHTEN only ──────────────────
 //
-// Deliberately asymmetric with the CLI, and it is a DECISION, not a parity gap (M9C-D3/D15): an
+// Deliberately asymmetric with the CLI, and it is a DECISION, not a parity gap (M9B-D3/D15): an
 // agent may inspect the guards and may make them STRICTER, but it cannot weaken them. The daemon
 // enforces that — a loosening from this surface is refused with the command a human must run — so
 // these tools cannot be talked into it no matter what a message says.

@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-STORE-1 — the gateway bin REFUSES to start half-configured.
+ * DOD-M9B-STORE-1 — the gateway bin REFUSES to start half-configured.
  *
  * The reviewer proved this guard was hollow: deleting it left every test in both repos green. It
  * is also the guard that carried the empty-string hole — `CELLO_GATEWAY_STORE_DB=""` with a valid
@@ -35,7 +35,7 @@ function runBin(env: Record<string, string>): Promise<{ code: number | null; std
   });
 }
 
-describe("DOD-M9C-STORE-1 — the bin refuses half-configured storage", () => {
+describe("DOD-M9B-STORE-1 — the bin refuses half-configured storage", () => {
   let dir: string;
   let keyPath: string;
 
@@ -44,7 +44,7 @@ describe("DOD-M9C-STORE-1 — the bin refuses half-configured storage", () => {
   }, 200_000);
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "cello-m9c-bin-"));
+    dir = await mkdtemp(join(tmpdir(), "cello-m9b-bin-"));
     keyPath = join(dir, "store.key");
     await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
   });

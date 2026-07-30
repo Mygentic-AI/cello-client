@@ -1,6 +1,6 @@
 /**
  * TEST-ONLY exports. Reachable as `@cello-protocol/gateway/testing`, deliberately NOT from the
- * package barrel (DOD-M9C-WIRE-1: "the stub moves to test-only visibility").
+ * package barrel (DOD-M9B-WIRE-1: "the stub moves to test-only visibility").
  *
  * `PassthroughGatewayClient` screens nothing and allows everything. It was the daemon's DEFAULT
  * once, and because no production caller ever overrode it, the entire security layer shipped inert

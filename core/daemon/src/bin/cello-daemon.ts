@@ -60,14 +60,14 @@ const lockFilePath = join(celloDir, "daemon.lock");
 const version = process.env.CELLO_VERSION || "0.0.1";
 
 /**
- * Bring up the security and governance layer (DOD-M9C-WIRE-1, policy D-2).
+ * Bring up the security and governance layer (DOD-M9B-WIRE-1, policy D-2).
  *
  * THE DEFECT THIS EXISTS TO CLOSE: this function did not exist. `startDaemon` was called without a
  * gateway, fell back to an always-allow stub, and every shipped daemon screened nothing while
  * logging `security.gateway.connected`. The layer was fully built, unit-green and gate-green the
  * whole time — the gate injected the client the product never did.
  *
- * Fail-closed, never passthrough (M9C-D12): if the sidecar cannot be spawned, the client is STILL
+ * Fail-closed, never passthrough (M9B-D12): if the sidecar cannot be spawned, the client is STILL
  * the enforcing one. It fails closed on every call (`gateway_unavailable`, INV-6), the failure is
  * announced, and the daemon stays up so the operator can run `cello config` / `cello policy log`
  * against it and find out why. A dead agent with a cryptic startup error diagnoses nothing, and a
@@ -78,10 +78,10 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
   const client = new LocalSidecarGatewayClient({ socketPath, logger });
 
   // The sidecar opens the encrypted store at startup, but the key file is only created when the
-  // daemon first opens its own database — which happens AFTER this. So resolve it here (M9C-D13):
+  // daemon first opens its own database — which happens AFTER this. So resolve it here (M9B-D13):
   // the same idempotent call the daemon makes, which on a fresh install is the one that generates
   // the key. The bytes are deliberately unused; only the side effect matters, and the key never
-  // travels to the child — the child gets the PATH (M9C-D8).
+  // travels to the child — the child gets the PATH (M9B-D8).
   const keyFilePath = dbKeyPathFor(join(celloDir, "sessions.db"));
   let sidecar: SpawnedGateway | undefined;
   try {
@@ -96,7 +96,7 @@ async function startSecurityLayer(): Promise<{ client: LocalSidecarGatewayClient
     });
     logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath });
     sidecar.process.once("exit", (code, signal) => {
-      // No auto-restart (M9C-D14). Every subsequent screen fails closed with a real cause; this
+      // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
       // line is how the operator learns the screening process died rather than inferring it from
       // a wall of blocked sends.
       logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none" });
@@ -166,7 +166,7 @@ async function main(): Promise<void> {
   securityLayer = security;
 
   /**
-   * Restart the sidecar so a stored config change takes effect (M9C-D17). The gateway reads its
+   * Restart the sidecar so a stored config change takes effect (M9B-D17). The gateway reads its
    * config only at boot, so without this a confirmed loosening is recorded and does nothing.
    * The socket path is unchanged and `LocalSidecarGatewayClient` reconnects lazily, so the client
    * needs no involvement. A failure PROPAGATES — the caller reports stored-but-not-applied rather

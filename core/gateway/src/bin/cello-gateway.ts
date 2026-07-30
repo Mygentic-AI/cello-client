@@ -56,9 +56,9 @@ async function main(): Promise<void> {
   compileInjectionPatterns();
   compileSecretRules();
 
-  // DOD-M9C-STORE-1 (M9C-D9): ONE encrypted store file holds both the config versions and the
+  // DOD-M9B-STORE-1 (M9B-D9): ONE encrypted store file holds both the config versions and the
   // security records, keyed by the daemon's key file — the daemon's spawn plumbing passes the two
-  // paths (M9C-D8: a key FILE path, never key bytes). Both stores fail closed: a missing or wrong
+  // paths (M9B-D8: a key FILE path, never key bytes). Both stores fail closed: a missing or wrong
   // key throws GatewayStoreError, which exits the process rather than screening unconfigured.
   // `|| undefined` so the guard below and the two call sites read the SAME value. Testing
   // `=== undefined` here while the call sites test truthiness let CELLO_GATEWAY_STORE_DB="" pass
@@ -75,7 +75,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // M9-CFG-001 (INV-4) + DOD-M9C-ENV-1 (policy D-5): the gateway owns its config, and the STORE IS
+  // M9-CFG-001 (INV-4) + DOD-M9B-ENV-1 (policy D-5): the gateway owns its config, and the STORE IS
   // THE ONLY SOURCE. There is deliberately no environment fallback for any policy value.
   //
   // There used to be four: CELLO_GATEWAY_AUTONOMOUS_OVERRIDE, _PII_WHITELIST,
@@ -112,7 +112,7 @@ async function main(): Promise<void> {
   const inbound = new InboundScreener();
 
   // M9-REC-001 (INV-4): the gateway records what it did to EVERY message, hash-chained for
-  // tamper-evidence, in the same encrypted store as the config (M9C-D9). The verdict's disposition
+  // tamper-evidence, in the same encrypted store as the config (M9B-D9). The verdict's disposition
   // maps to the record: allow → clean (a clean pass IS recorded — an absent record is itself
   // evidence of suppression), redact/block/warn verbatim.
   const records = storeDbPath && storeKeyFile ? new GatewayRecordStore(storeDbPath, storeKeyFile, stderrStoreEventSink) : undefined;

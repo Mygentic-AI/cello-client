@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-SURFACE-1 — the control surface, and INV-10: the loosen gate has no side door.
+ * DOD-M9B-SURFACE-1 — the control surface, and INV-10: the loosen gate has no side door.
  *
  * The central assertion is not "the verb works" — it is that an MCP caller CANNOT weaken a guard,
  * and that a refused loosening leaves NO ROW. A refusal that still persisted would be the whole
@@ -17,7 +17,7 @@ import type { Logger } from "../types.js";
 
 const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
-describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () => {
+describe("DOD-M9B-SURFACE-1 — gateway config surface + the loosen gate", () => {
   let dir: string;
   let handlers: Map<string, IpcHandler>;
   let clientTypes: Map<string, string>;
@@ -31,7 +31,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
     new GatewayConfigStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "cello-m9c-surface-"));
+    dir = await mkdtemp(join(tmpdir(), "cello-m9b-surface-"));
     await writeFile(join(dir, "sessions.db.key"), randomBytes(32), { mode: 0o600 });
     handlers = new Map();
     clientTypes = new Map([["cli-conn", "cli"], ["mcp-conn", "mcp"]]);
@@ -187,7 +187,7 @@ describe("DOD-M9C-SURFACE-1 — gateway config surface + the loosen gate", () =>
     expect(res.chainValid).toBe(true);
   });
 
-  // ─── DOD-M9C-AUDIT-1: what did my policy do? ───────────────────────────────────────────────
+  // ─── DOD-M9B-AUDIT-1: what did my policy do? ───────────────────────────────────────────────
 
   it("the policy log reports what the layer did, newest first, with the rule that fired", async () => {
     const records = new GatewayRecordStore(join(dir, "gateway.db"), join(dir, "sessions.db.key"));

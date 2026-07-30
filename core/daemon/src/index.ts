@@ -19,7 +19,7 @@ export type {
   IManifestPollScheduler,
   IDirectoryChallengeVerifier,
 } from "./types.js";
-// PassthroughGatewayClient is at `@cello-protocol/daemon/testing`, not here (DOD-M9C-WIRE-1).
+// PassthroughGatewayClient is at `@cello-protocol/daemon/testing`, not here (DOD-M9B-WIRE-1).
 export { ErrorCodes } from "./types.js";
 
 export { startDaemon, type DaemonHandle } from "./daemon.js";

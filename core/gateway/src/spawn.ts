@@ -46,7 +46,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
     // stdin is a PIPE, not "ignore", and it is the child's death switch (review F5). A daemon that
     // dies without running its shutdown path — SIGKILL, a crash, the OOM killer — leaves the
     // gateway alive holding the encrypted store's write lock. The NEXT daemon's gateway then hits
-    // `store_locked`, exits before ready, and with no auto-restart (M9C-D14) that daemon spends its
+    // `store_locked`, exits before ready, and with no auto-restart (M9B-D14) that daemon spends its
     // whole life fail-closed on one boot log line. When the parent dies the kernel closes this
     // pipe, and the child exits on the `end` event.
     stdio: ["pipe", "pipe", "pipe"],

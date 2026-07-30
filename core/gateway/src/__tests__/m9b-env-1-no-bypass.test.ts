@@ -1,5 +1,5 @@
 /**
- * DOD-M9C-ENV-1 (policy D-5) — the environment cannot loosen a guard. Proven, not asserted.
+ * DOD-M9B-ENV-1 (policy D-5) — the environment cannot loosen a guard. Proven, not asserted.
  *
  * Four variables used to sit UNDER the config store as defaults, so anyone who could set an
  * environment variable could enable autonomous override, seed the PII whitelist, or raise the
@@ -42,7 +42,7 @@ function walk(dir: string): string[] {
   return out;
 }
 
-describe("DOD-M9C-ENV-1 — the environment is not a config surface", () => {
+describe("DOD-M9B-ENV-1 — the environment is not a config surface", () => {
   beforeAll(() => {
     execFileSync("npx", ["tsc", "--build"], { cwd: PKG_ROOT, stdio: "pipe", timeout: 180_000 });
   }, 200_000);
@@ -72,7 +72,7 @@ describe("DOD-M9C-ENV-1 — the environment is not a config surface", () => {
   });
 
   it("a PII value 'whitelisted' only by the environment is STILL redacted or warned — the bypass is inert", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "cello-m9c-env-"));
+    const dir = await mkdtemp(join(tmpdir(), "cello-m9b-env-"));
     try {
       const keyPath = join(dir, "store.key");
       await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
