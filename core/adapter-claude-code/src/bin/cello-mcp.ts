@@ -279,23 +279,23 @@ server.tool("cello_trust_signals_revoke", "Tombstone a signal at the directory A
 // there is no `agent` parameter, deliberately: consent is a statement about oneself, and letting a
 // caller name a different agent would be letting one agent accept on another's behalf.
 
-server.tool("cello_consent_list", "List trust signals (e.g. endorsements) that other parties have issued ABOUT the currently selected agent and that are waiting on its decision. Nothing here is visible to counterparties yet — a pending signal is inert until accepted. Listing marks them as seen, which silences the 'items waiting' nudge on agent selection; it does NOT decide them, and they stay listed until accepted or refused.", {}, async () => {
-  const result = await proxy.call("cello_consent_list", {});
+server.tool("cello_attestation_consent_list", "List trust signals (e.g. endorsements) that other parties have issued ABOUT the currently selected agent and that are waiting on its decision. Nothing here is visible to counterparties yet — a pending signal is inert until accepted. Listing marks them as seen, which silences the 'items waiting' nudge on agent selection; it does NOT decide them, and they stay listed until accepted or refused.", {}, async () => {
+  const result = await proxy.call("cello_attestation_consent_list", {});
   return jsonText(result);
 });
 
-server.tool("cello_consent_accept", "Accept a trust signal issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
-  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_consent_list"),
+server.tool("cello_attestation_consent_accept", "Accept a trust signal issued about the currently selected agent, making it presentable to counterparties. Read the plaintext (via cello_attestation_consent_list) before accepting: accepting is what puts YOUR name behind someone else's claim about you.", {
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_attestation_consent_list"),
 }, async ({ hash_prefix }) => {
-  const result = await proxy.call("cello_consent_accept", { hash_prefix });
+  const result = await proxy.call("cello_attestation_consent_accept", { hash_prefix });
   return jsonText(result);
 });
 
-server.tool("cello_consent_refuse", "Refuse a trust signal issued about the currently selected agent. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused signal is inert everywhere it is checked. OPTIONALLY send the issuer a message saying why: there is no edit, so refuse-and-reissue is how a wrong endorsement gets corrected. Without a message the issuer is told nothing at all. The refusal itself takes effect whether or not the message reaches them.", {
-  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_consent_list"),
+server.tool("cello_attestation_consent_refuse", "Refuse a trust signal issued about the currently selected agent. It stays refused and is never presented. Refusing is not a deletion — the record remains so the decision is auditable — but a refused signal is inert everywhere it is checked. OPTIONALLY send the issuer a message saying why: there is no edit, so refuse-and-reissue is how a wrong endorsement gets corrected. Without a message the issuer is told nothing at all. The refusal itself takes effect whether or not the message reaches them.", {
+  hash_prefix: z.string().describe("Signal hash of the pending item, or a prefix of it (min 8 hex chars), as shown by cello_attestation_consent_list"),
   message: z.string().optional().describe("Optional note back to the issuer, e.g. what to change so you would accept a reissued one. Omit to refuse silently — the issuer then learns nothing."),
 }, async ({ hash_prefix, message }) => {
-  const result = await proxy.call("cello_consent_refuse", message ? { hash_prefix, message } : { hash_prefix });
+  const result = await proxy.call("cello_attestation_consent_refuse", message ? { hash_prefix, message } : { hash_prefix });
   return jsonText(result);
 });
 

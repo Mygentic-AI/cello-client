@@ -294,9 +294,9 @@ export const IPC_METHODS = {
   "settings-get": "cello_settings_get",
   "settings-set": "cello_settings_set",
   "moniker-set": "cello_set_moniker",
-  "consent-list": "cello_consent_list",
-  "consent-accept": "cello_consent_accept",
-  "consent-refuse": "cello_consent_refuse",
+  "attestation-consent-list": "cello_attestation_consent_list",
+  "attestation-consent-accept": "cello_attestation_consent_accept",
+  "attestation-consent-refuse": "cello_attestation_consent_refuse",
 } as const;
 
 // ─── Group A: agent lifecycle ──────────────────────────────────────────────────────────────────
@@ -691,26 +691,26 @@ export function awaitSession(
   return ipcCommand(celloDir, IPC_METHODS["await-session"], defined({ timeout_ms: opts.timeoutMs }), opts);
 }
 
-// ─── Group: consent (M10B / DOD-END-SURFACE-1) ─────────────────────────────────────────────────
+// ─── Group: attestation-consent (M10B / DOD-END-SURFACE-1) ─────────────────────────────────────────────────
 // No `agent` argument on any of the three: they are scoped to the SELECTED agent by the daemon.
 // Consent is a statement about oneself; naming another agent would be accepting on its behalf.
 
-/** `cello consent list` → cello_consent_list. */
-export function consentList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["consent-list"], {}, opts);
+/** `cello attestation-consent list` → cello_attestation_consent_list. */
+export function attestationConsentList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["attestation-consent-list"], {}, opts);
 }
 
-/** `cello consent accept <signal-hash>` → cello_consent_accept. */
-export function consentAccept(celloDir: string, hashPrefix: string, opts: ParityOptions): Promise<CliOutput> {
-  return ipcCommand(celloDir, IPC_METHODS["consent-accept"], { hash_prefix: hashPrefix }, opts);
+/** `cello attestation-consent accept <signal-hash>` → cello_attestation_consent_accept. */
+export function attestationConsentAccept(celloDir: string, hashPrefix: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["attestation-consent-accept"], { hash_prefix: hashPrefix }, opts);
 }
 
-/** `cello consent refuse <hash> [message…]` → cello_consent_refuse. An empty message is OMITTED, not
+/** `cello attestation-consent refuse <hash> [message…]` → cello_attestation_consent_refuse. An empty message is OMITTED, not
  *  sent as "": silence is the default and it must be the literal absence of the field (M10B-D4). */
-export function consentRefuse(celloDir: string, hashPrefix: string, message: string | null, opts: ParityOptions): Promise<CliOutput> {
+export function attestationConsentRefuse(celloDir: string, hashPrefix: string, message: string | null, opts: ParityOptions): Promise<CliOutput> {
   const params: Record<string, unknown> = { hash_prefix: hashPrefix };
   if (message !== null && message.length > 0) params.message = message;
-  return ipcCommand(celloDir, IPC_METHODS["consent-refuse"], params, opts);
+  return ipcCommand(celloDir, IPC_METHODS["attestation-consent-refuse"], params, opts);
 }
 
 /** `cello contact <pubkey> set-signal <hash> <on|off|clear>` → cello_contact_set_signal.

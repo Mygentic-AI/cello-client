@@ -38,9 +38,9 @@ import {
   contactList,
   contactSetTier,
   contactSetSignal,
-  consentList,
-  consentAccept,
-  consentRefuse,
+  attestationConsentList,
+  attestationConsentAccept,
+  attestationConsentRefuse,
   contactSetAway,
   listAgents,
   startAgent,
@@ -880,12 +880,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "attestations",
     group: "Attestations",
-    summary: "Vouch for another agent in your own words, and see what became of it.",
+    summary: "Endorse agents, issue general attestations, and check their status.",
     help:
       "Usage:\n" +
       "  cello attestations issue <pubkey> <text\u2026>\n" +
-      "                                        \u2014 attest to something you have seen them do\n" +
-      "  cello attestations issued             \u2014 what happened to the ones you wrote\n" +
+      "                                        \u2014 endorse them for something you have seen them do\n" +
+      "  cello attestations issued             \u2014 the status of every attestation you have issued\n" +
       "\n" +
       "An attestation is YOUR words about ANOTHER agent \u2014 the person-to-person half of trust. The\n" +
       "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +
@@ -941,20 +941,21 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
 
   {
-    name: "consent",
+    name: "attestation-consent",
     group: "Attestations",
     summary: "Decide on attestations OTHERS have written about you (accept or refuse).",
     help:
       "Usage:\n" +
-      "  cello consent list                    — signals others issued about you, awaiting your decision\n" +
-      "  cello consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
-      "  cello consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
-      "                                          Anything after the hash is a message back to the issuer\n" +
-      "                                          (optional). With no message they are told nothing.\n" +
+      "  cello attestation-consent list                    — attestations others wrote about you, awaiting your decision\n" +
+      "  cello attestation-consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
+      "  cello attestation-consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
+      "                                                    Anything after the hash is a message back to the\n" +
+      "                                                    issuer (optional). With no message they are told\n" +
+      "                                                    nothing.\n" +
       "\n" +
-      "Anyone can write an endorsement ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
+      "Anyone can write an attestation ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
       "until you accept it: nothing pending is presented, counted, or visible to a counterparty. That is\n" +
-      "the point of this command. Read the endorser's words in 'list' before accepting, because\n" +
+      "the point of this command. Read the attester's words in 'list' before accepting, because\n" +
       "accepting is what puts your name behind someone else's claim about you.\n" +
       "\n" +
       "Refusing is not a deletion — the record stays so the decision is auditable — but a refused signal\n" +
@@ -967,12 +968,12 @@ export const COMMANDS: readonly CommandSpec[] = [
       const { pretty, positional } = parityOpts(args);
       const o = { pretty };
       const [sub, hash] = positional;
-      if (sub === "list") return consentList(ctx.celloDir, o);
-      if (sub === "accept" && hash) return consentAccept(ctx.celloDir, hash, o);
+      if (sub === "list") return attestationConsentList(ctx.celloDir, o);
+      if (sub === "accept" && hash) return attestationConsentAccept(ctx.celloDir, hash, o);
       if (sub === "refuse" && hash) {
         // Everything after the hash is the message — free text, so it is joined rather than parsed.
         const msg = positional.slice(2).join(" ");
-        return consentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
+        return attestationConsentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
       }
       return { stdout: helpForSpec("consent"), stderr: "", exitCode: 1 };
     },

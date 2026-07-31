@@ -99,32 +99,32 @@ describe("DOD-END-SURFACE-1 — the pending-consent nudge, over a live daemon", 
  * defect shipped, so the key is pinned directly here.
  *
  * The bug: the renderer's instruction-key set was three literals, and `pending_consent_guidance` was
- * not one of them, so a CLI operator was told to run `cello_consent_list` — untypeable. The class is
+ * not one of them, so a CLI operator was told to run `cello_attestation_consent_list` — untypeable. The class is
  * "a handler invents a new *_guidance key without knowing a registry exists", so the assertion is
  * over the CLASS, not this one key.
  */
 describe("DOD-ONBOARD-HELP-1 §5 — every *_guidance key is renderable, whatever its prefix", () => {
   it("rewrites pending_consent_guidance for a CLI caller", () => {
     const out = renderForSurface(
-      { ok: true, pending_consent: 3, pending_consent_guidance: "Run cello_consent_list to read them." },
+      { ok: true, pending_consent: 3, pending_consent_guidance: "Run cello_attestation_consent_list to read them." },
       "cli",
     ) as Record<string, unknown>;
-    expect(out.pending_consent_guidance).toBe("Run cello consent list to read them.");
+    expect(out.pending_consent_guidance).toBe("Run cello attestation-consent list to read them.");
   });
 
   it("rewrites an arbitrary NEW *_guidance key — the fix closes the class, not the instance", () => {
     // A key nobody has written yet. If this fails, someone narrowed the rule back to a literal set
     // and the next handler to invent a key will ship the same defect.
     const out = renderForSurface(
-      { ok: false, quota_guidance: "Run cello_consent_accept to decide." },
+      { ok: false, quota_guidance: "Run cello_attestation_consent_accept to decide." },
       "cli",
     ) as Record<string, unknown>;
-    expect(out.quota_guidance).toBe("Run cello consent accept to decide.");
+    expect(out.quota_guidance).toBe("Run cello attestation-consent accept to decide.");
   });
 
   it("still leaves `reason` alone — scripts branch on it", () => {
-    const out = renderForSurface({ ok: false, reason: "cello_consent_accept" }, "cli") as Record<string, unknown>;
-    expect(out.reason).toBe("cello_consent_accept");
+    const out = renderForSurface({ ok: false, reason: "cello_attestation_consent_accept" }, "cli") as Record<string, unknown>;
+    expect(out.reason).toBe("cello_attestation_consent_accept");
   });
 });
 

@@ -2349,7 +2349,7 @@ async function startDaemonHoldingLock(
     };
   });
 
-  handlers.set("cello_consent_list", async (_params, connectionId) => {
+  handlers.set("cello_attestation_consent_list", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
@@ -2388,7 +2388,7 @@ async function startDaemonHoldingLock(
     return { ok: true, agent: sel.name, pending: items };
   });
 
-  handlers.set("cello_consent_accept", async (params, connectionId) => {
+  handlers.set("cello_attestation_consent_accept", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -2408,12 +2408,12 @@ async function startDaemonHoldingLock(
     // was not, and the next presentation would silently omit it.
     if (!store.setConsentState(item.signalHash, "accepted")) {
       return { ok: false, reason: "consent_write_failed",
-        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_attestation_consent_list and retry.` };
     }
     return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
   });
 
-  handlers.set("cello_consent_refuse", async (params, connectionId) => {
+  handlers.set("cello_attestation_consent_refuse", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -2435,7 +2435,7 @@ async function startDaemonHoldingLock(
     // decision that is not in the database.
     if (!store.setConsentState(item.signalHash, "refused")) {
       return { ok: false, reason: "consent_write_failed",
-        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_attestation_consent_list and retry.` };
     }
     const refused = { ok: true as const, signal_hash: item.signalHash, consent_state: "refused" as const };
 

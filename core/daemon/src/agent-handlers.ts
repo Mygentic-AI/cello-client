@@ -397,7 +397,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     //
     // COUNT ONLY, and do NOT mark notified here. Marking on selection would mark them told about
     // something they were never shown — the nudge says a number, the LIST is what shows the items,
-    // and `cello_consent_list` is what records that they saw it. The two lifetimes stay separate
+    // and `cello_attestation_consent_list` is what records that they saw it. The two lifetimes stay separate
     // (M10B-D5): the notification goes quiet once seen, the ITEMS persist until decided.
     //
     // A failure here must NOT break selection, for the same reason the registration read above does
@@ -411,7 +411,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
           result["pending_consent"] = pending;
           result["pending_consent_guidance"] =
             `${pending} item${pending === 1 ? "" : "s"} awaiting your decision for '${name}'. ` +
-            `Run cello_consent_list to read ${pending === 1 ? "it" : "them"} and accept or refuse.`;
+            `Run cello_attestation_consent_list to read ${pending === 1 ? "it" : "them"} and accept or refuse.`;
         }
       }
     } catch (err: unknown) {
@@ -420,7 +420,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       });
       result["pending_consent"] = "unknown";
       result["pending_consent_guidance"] =
-        `Could not read pending consent items for '${name}' — run cello_consent_list to check directly.`;
+        `Could not read pending consent items for '${name}' — run cello_attestation_consent_list to check directly.`;
     }
     return result;
   });

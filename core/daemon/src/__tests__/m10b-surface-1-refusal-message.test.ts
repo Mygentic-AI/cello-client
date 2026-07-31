@@ -15,8 +15,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 describe("M10B-D4 — refusing with a message", () => {
   const daemon = readFileSync(resolve(here, "../daemon.ts"), "utf8");
   const handler = (() => {
-    const start = daemon.indexOf('handlers.set("cello_consent_refuse"');
-    expect(start, "cello_consent_refuse is registered").toBeGreaterThan(-1);
+    const start = daemon.indexOf('handlers.set("cello_attestation_consent_refuse"');
+    expect(start, "cello_attestation_consent_refuse is registered").toBeGreaterThan(-1);
     const next = daemon.indexOf("handlers.set(", start + 1);
     return daemon.slice(start, next === -1 ? daemon.length : next);
   })();

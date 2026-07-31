@@ -10,7 +10,7 @@ const repo = resolve(here, "../../../..");
  * DOD-END-SURFACE-1 — the two surfaces must send the parameter the DAEMON READS.
  *
  * This exists because the first cut of the consent verbs shipped `signal_hash` from both the MCP tool
- * and the CLI while `cello_consent_accept`/`_refuse` read `hash_prefix`. Every call would have come
+ * and the CLI while `cello_attestation_consent_accept`/`_refuse` read `hash_prefix`. Every call would have come
  * back `invalid_prefix` — a dead verb on both surfaces, with green name-parity tests either side of
  * it, because name parity checks that the TOOL exists, never that its arguments arrive.
  *
@@ -32,7 +32,7 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
   }
 
   for (const verb of ["accept", "refuse"] as const) {
-    const method = `cello_consent_${verb}`;
+    const method = `cello_attestation_consent_${verb}`;
 
     it(`${method}: the MCP tool sends a parameter the handler reads`, () => {
       // The call may be an inline literal OR a conditional (`cond ? {a, b} : {a}`), so read every
@@ -52,8 +52,8 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     it(`${method}: the CLI sends a parameter the handler reads`, () => {
       // Same: the CLI may pass a literal or build a `params` record first (optional fields are
       // OMITTED rather than sent empty), so read the whole function body.
-      const at = cli.indexOf(`export function consent${verb[0].toUpperCase()}${verb.slice(1)}(`);
-      expect(at, `consent-${verb} is dispatched by the CLI`).toBeGreaterThan(-1);
+      const at = cli.indexOf(`export function attestationConsent${verb[0].toUpperCase()}${verb.slice(1)}(`);
+      expect(at, `attestation-consent-${verb} is dispatched by the CLI`).toBeGreaterThan(-1);
       // Start AFTER the signature line — the function's own opening brace is not an object literal,
       // and reading it as one made `params:` (a type annotation) look like a parameter being sent.
       const sigEnd = cli.indexOf("\n", at);
@@ -74,6 +74,6 @@ describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () =
     // If paramsReadBy silently returned an empty set, every assertion above would pass by vacuity on
     // the `for` loop never running... except it wouldn't, because `sent` is non-empty and each name is
     // checked against `read`. Pin the extractor directly anyway.
-    expect(paramsReadBy("cello_consent_accept")).toContain("hash_prefix");
+    expect(paramsReadBy("cello_attestation_consent_accept")).toContain("hash_prefix");
   });
 });

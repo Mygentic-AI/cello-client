@@ -79,9 +79,9 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },
   { mcp: "cello_trust_signals_revoke", cli: "cello trust-signals revoke" },
   // Consent (M10B / DOD-END-SURFACE-1) — deciding on signals others issued ABOUT this agent
-  { mcp: "cello_consent_list", cli: "cello consent list" },
-  { mcp: "cello_consent_accept", cli: "cello consent accept" },
-  { mcp: "cello_consent_refuse", cli: "cello consent refuse" },
+  { mcp: "cello_attestation_consent_list", cli: "cello attestation-consent list" },
+  { mcp: "cello_attestation_consent_accept", cli: "cello attestation-consent accept" },
+  { mcp: "cello_attestation_consent_refuse", cli: "cello attestation-consent refuse" },
   // Other
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },
@@ -254,7 +254,7 @@ export type ClientSurface = "cli" | "mcp";
  *
  * A SUFFIX RULE, not a fixed set, and that is the whole point. It was a set of three literals until
  * `pending_consent_guidance` was added by a handler that had no idea a registry existed; the key was
- * therefore not rewritten, and a CLI operator was told to run `cello_consent_list` — a thing you
+ * therefore not rewritten, and a CLI operator was told to run `cello_attestation_consent_list` — a thing you
  * cannot type. The class of bug is "someone invents a new *_guidance key", so the fix has to close
  * the class: any key ending in `guidance` is an instruction, whatever its prefix.
  *
