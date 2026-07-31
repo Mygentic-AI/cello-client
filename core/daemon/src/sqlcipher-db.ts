@@ -325,6 +325,25 @@ export function openEncryptedDatabase(
     logger?.warn("persist.db.wal.unavailable", { error: err instanceof Error ? err.message : String(err) });
   }
 
+  // WAIT FOR A BUSY LOCK INSTEAD OF FAILING THE WRITE INSTANTLY.
+  //
+  // SQLite's default busy timeout is ZERO: a second writer does not queue, it returns SQLITE_BUSY on
+  // the spot. This database has more than one connection by design — the daemon holds one, the CLI
+  // and the identity migration open their own — so "another writer held the lock for 3ms" is an
+  // ORDINARY event here, not an exceptional one, and answering it with an immediate failure turns a
+  // routine overlap into a lost write.
+  //
+  // The write that made this concrete is the shutdown UPDATE that marks live sessions `interrupted`:
+  // it is caught and logged, and the daemon then exits 0. A machine under load could therefore report
+  // a clean shutdown while leaving sessions marked `active` forever — rows that look live to every
+  // later read but have no node behind them. A timeout does not paper over that; it removes the
+  // contention that caused it, and a lock genuinely held for 5 s is a real fault that still surfaces.
+  try {
+    inner.pragma("busy_timeout=5000");
+  } catch (err: unknown) {
+    logger?.warn("persist.db.busy_timeout.unavailable", { error: err instanceof Error ? err.message : String(err) });
+  }
+
   // M10-D19: FOREIGN KEY enforcement. SQLite defaults this OFF — and with it off, a declared
   // `FOREIGN KEY` is DECORATIVE: SQLite happily accepts an orphan row, so a schema that looks like it
   // enforces a relationship enforces nothing. INV-AGENT-SCOPED depends on this being real (a received

@@ -1359,6 +1359,14 @@ describe("SessionNodeManager — integration tests", () => {
       },
     );
 
+    // KEEP THE DAEMON'S OWN LOG. When this test failed in CI it asserted only on the row status, so
+    // the whole diagnosis was "expected interrupted, got active" — a symptom with its cause thrown
+    // away. gracefulShutdown CATCHES a failed interrupt-write and logs it, so the reason is in this
+    // stream and nowhere else; without it the next failure is another guessing exercise.
+    let daemonLog = "";
+    child.stdout!.on("data", (c: Buffer) => { daemonLog += c.toString("utf-8"); });
+    child.stderr!.on("data", (c: Buffer) => { daemonLog += c.toString("utf-8"); });
+
     // Wait for daemon.started
     await new Promise<void>((resolve, reject) => {
       let buf = "";
@@ -1412,8 +1420,16 @@ describe("SessionNodeManager — integration tests", () => {
     const rows = db2.prepare("SELECT session_id, status FROM sessions WHERE session_id IN (?,?)").all("sigterm-s1","sigterm-s2") as Array<{session_id: string; status: string}>;
     db2.close();
     expect(rows.length).toBe(2);
+    // THE WRITE MUST NOT HAVE FAILED QUIETLY. The daemon swallows this error and still exits 0, so
+    // asserting the status alone cannot tell "shutdown never ran" from "shutdown ran and the write
+    // was refused" — and only the second one means an operator can get a clean-looking shutdown that
+    // leaves sessions marked active. Name it here.
+    expect(
+      daemonLog.includes("session.interrupt.db.write.failed"),
+      `the daemon logged a failed interrupt-write during shutdown:\n${daemonLog.slice(-2000)}`,
+    ).toBe(false);
     for (const row of rows) {
-      expect(row.status).toBe("interrupted");
+      expect(row.status, `daemon log:\n${daemonLog.slice(-2000)}`).toBe("interrupted");
     }
   }, 30_000);
 
