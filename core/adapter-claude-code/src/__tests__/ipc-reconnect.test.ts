@@ -25,6 +25,20 @@ import { createServer, type Server, type Socket } from "node:net";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Wait for a condition, up to `timeoutMs`.
+ *
+ * Replaces `await sleep(100)` before an assertion. A fixed sleep encodes a GUESS about how long the
+ * machine takes, so it is simultaneously too slow locally and too fast on a loaded CI runner — where
+ * "notifications resume after reconnect" failed with an EMPTY list on 2026-07-31 while passing on
+ * every developer machine. This waits for the thing itself and still fails, bounded, if it never
+ * happens: the assertion keeps all its teeth, only the arbitrary timing goes.
+ */
+async function waitFor(cond: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < deadline) await sleep(10);
+}
+
 interface FakeDaemon {
   server: Server;
   sockets: Socket[];
@@ -209,7 +223,7 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     });
 
     await proxy.call("cello_status"); // forces the reconnect to complete
-    await sleep(100);
+    await waitFor(() => seen.length > 0);
     expect(seen).toContain("cello_message");
     proxy.close();
   }, 20_000);
@@ -234,7 +248,7 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     await killDaemon(daemon, socketPath);
     daemon = await fakeDaemon(socketPath, []);
     await proxy.call("cello_status"); // forces the reconnect to complete
-    await sleep(100);
+    await waitFor(() => agentAtFire.length > 0);
 
     expect(agentAtFire.length, "a reconnect must announce exactly once").toBe(1);
     // Fired after the handshake replay, so the announcement is true when it arrives rather than
