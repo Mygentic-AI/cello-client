@@ -18,6 +18,7 @@ import {
   manifestNodesToEndpoints,
   type ConsortiumEndpoint,
 } from "../directory-bootstrap.js";
+import { BUNDLED_CONSORTIUM_MANIFEST } from "../bundled-consortium-manifest.js";
 import type { DirectoryEndpoint } from "../signaling-connect.js";
 import type { Logger } from "../types.js";
 
@@ -43,8 +44,13 @@ describe("resolveDirectoryUrl", () => {
     expect(resolveDirectoryUrl({ CELLO_DIRECTORY_URL: "http://dev.example" })).toBe("http://dev.example");
   });
 
-  it("falls back to the production URL when unset", () => {
-    expect(resolveDirectoryUrl({})).toBe(PRODUCTION_DIRECTORY_URL);
+  it("falls back to a RANDOM bundled endpoint when unset — not always the same one", () => {
+    // The old behaviour returned PRODUCTION_DIRECTORY_URL (gcp-use1). Now it picks randomly so
+    // clients spread across the consortium from cold boot rather than piling onto one node.
+    // The result must still be one of the bundled endpoints (same step-6 safety property).
+    const url = resolveDirectoryUrl({});
+    const bundledEndpoints = BUNDLED_CONSORTIUM_MANIFEST.nodes.map((n) => String((n as Record<string, unknown>)["endpoint"]));
+    expect(bundledEndpoints).toContain(url);
   });
 });
 

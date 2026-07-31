@@ -16,6 +16,7 @@
  */
 
 import type { ConsortiumNode } from "@cello-protocol/protocol-types";
+import { BUNDLED_CONSORTIUM_MANIFEST } from "./bundled-consortium-manifest.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { Logger } from "./types.js";
 
@@ -40,11 +41,34 @@ import type { Logger } from "./types.js";
 export const PRODUCTION_DIRECTORY_URL = "http://34.75.172.108:9090";
 
 /**
- * Resolve the directory URL from the environment, falling back to the production
- * endpoint when CELLO_DIRECTORY_URL is not set.
+ * The bundled manifest's endpoint list, used by resolveDirectoryUrl to distribute cold-boot
+ * clients across the consortium instead of always landing on the same node.
+ *
+ * Import is lazy (inside the function) to avoid a circular dependency with bundled-consortium-manifest.
+ * Extracted as a separate export for testing.
+ */
+export function pickRandomBundledEndpoint(
+  nodes: ReadonlyArray<Record<string, unknown>>,
+): string {
+  const endpoint = nodes[Math.floor(Math.random() * nodes.length)]["endpoint"];
+  return typeof endpoint === "string" ? endpoint : PRODUCTION_DIRECTORY_URL;
+}
+
+/**
+ * Resolve the directory URL from the environment, falling back to a RANDOMLY SELECTED
+ * bundled manifest endpoint when CELLO_DIRECTORY_URL is not set.
+ *
+ * Random, not fixed: every fresh daemon picks a different consortium node. Without this
+ * all clients land on the same node (whichever `PRODUCTION_DIRECTORY_URL` names), and the
+ * other nodes only ever appear as failover. That was fine with one user; it does not scale.
+ *
+ * The random pick changes on every process start. Daemons that are already running and have
+ * established a directory connection are unaffected — they stay connected to their current node
+ * and only re-pick on the next login/restart.
  */
 export function resolveDirectoryUrl(env: Record<string, string | undefined> = process.env): string {
-  return env["CELLO_DIRECTORY_URL"] ?? PRODUCTION_DIRECTORY_URL;
+  if (env["CELLO_DIRECTORY_URL"]) return env["CELLO_DIRECTORY_URL"];
+  return pickRandomBundledEndpoint(BUNDLED_CONSORTIUM_MANIFEST.nodes as ReadonlyArray<Record<string, unknown>>);
 }
 
 /**
@@ -452,6 +476,8 @@ export function createRosterAwareEndpointResolver(
   }
 
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
+
+
     // 1. Sticky-until-fail: keep the current fallback while it is still reachable.
     if (stuckToFallback && current) {
       const roster = await opts.getConsortiumRoster();
