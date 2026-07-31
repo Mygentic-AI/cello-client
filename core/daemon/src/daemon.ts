@@ -2207,6 +2207,16 @@ async function startDaemonHoldingLock(
           { peerId: node.peerId, multiaddr: node.multiaddr },
           randomUUID(), node.nodeId,
         );
+        // WAIT FOR THE CONNECTION BEFORE USING IT. openVisitingConnection returns SYNCHRONOUSLY and the
+        // manager dials in the background, so asking it for results on the next line finds it still
+        // connecting and gets `signaling_reconnecting` — every node, instantly. Observed live once the
+        // environment was awake: three regions "unreachable" within 3ms of each other, which no real
+        // network failure looks like. The seal-broker path above already does this; this one did not.
+        if (!(await waitForSignalingConnected(visit.mgr, 10_000))) {
+          logger.warn("signal.results.node.unreachable", { nodeId: node.nodeId, reason: "visiting_connect_timeout" });
+          unreachable.push(node.nodeId);
+          continue;
+        }
         const r = await fetchSubmissionResults({ signaling: visit.mgr, keyProvider: opener, logger });
         if (r.ok) for (const x of r.results) { if (!seen.has(x.submissionId)) seen.set(x.submissionId, mapResult(x)); }
         else {
