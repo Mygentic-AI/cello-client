@@ -22,13 +22,15 @@
  *     adversarial defense; it is enabled by default alongside the roster.
  *
  * nodeId MUST equal the directory's reported NODE_ID (`<cloud>-<region>`, e.g. `gcp-use1`); the step-6 verifier
- * looks the node up by nodeId. pubkey MUST equal /cello/<env>/directory/manifest-signer-pubkey for
- * that region (derived from the directory's node-private-key). endpoint is the HTTP /bootstrap base.
+ * looks the node up by nodeId. pubkey MUST equal the node's own Ed25519 signing key, which the
+ * regeneration script below reads from GCP Secret Manager (`cello-<nodeId>-node-key`) rather than
+ * being transcribed. endpoint is the HTTP /bootstrap base, and MUST be the node's ADDRESS — see
+ * PRODUCTION_DIRECTORY_URL in directory-bootstrap.ts for why a hostname here disables step-6.
  *
  * Regeneration: on directory node-key or officer-key rotation, re-sign with
- * infra/scripts/sign-gcp-consortium-manifest and update this constant + BUNDLED_CONSORTIUM_ROOT_KEYS.
- * The officer signing key lives in Secrets Manager (GCP Secret Manager `cello-consortium-officer-key-0`); only its
- * PUBLIC key is embedded here.
+ * `infra/scripts/sign-gcp-consortium-manifest.mjs` (in the trustless-cello repo) and update this
+ * constant + BUNDLED_CONSORTIUM_ROOT_KEYS. The officer signing key lives in GCP Secret Manager as
+ * `cello-consortium-officer-key-0`; only its PUBLIC key is embedded here.
  *
  * Crypto reference: RFC 8032 (Ed25519 threshold signatures, verified by verifyManifest).
  */

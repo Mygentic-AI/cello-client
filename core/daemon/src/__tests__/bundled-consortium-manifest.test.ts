@@ -28,6 +28,7 @@ import {
   BUNDLED_CONSORTIUM_THRESHOLD,
 } from "../bundled-consortium-manifest.js";
 import { PRODUCTION_DIRECTORY_URL } from "../directory-bootstrap.js";
+import { validatorNodes } from "@cello-protocol/protocol-types";
 import { EmbeddedManifestProvider } from "../file-manifest-provider.js";
 import { buildManifestDeps } from "../manifest-deps.js";
 import type { Logger } from "../types.js";
@@ -77,16 +78,30 @@ describe("FINDING-4: bundled consortium manifest constant", () => {
     }
   });
 
-  it("is a THREE-node roster whose majority threshold tolerates one node being down", () => {
-    // The redundancy invariant, stated as arithmetic rather than left implied by the roster length:
-    // T = majority(N) = 2 of 3, so a single sovereign node failing must not strand a client.
-    const n = BUNDLED_CONSORTIUM_MANIFEST.nodes.length;
-    expect(n).toBe(3);
-    expect(Math.floor(n / 2) + 1).toBe(2);
-    // Distinct signing keys — two nodes sharing one would let a single host answer as two members.
-    expect(new Set(BUNDLED_CONSORTIUM_MANIFEST.nodes.map((x) => x["pubkey"])).size).toBe(n);
-    // Distinct regions: the whole point is that one region going down cannot take the rest with it.
-    expect(new Set(BUNDLED_CONSORTIUM_MANIFEST.nodes.map((x) => x["region"])).size).toBe(n);
+  it("is a THREE-VALIDATOR roster with distinct keys and distinct regions", () => {
+    // Counted through validatorNodes(), the same helper the quorum is derived from — an earlier
+    // version of this test computed `Math.floor(n / 2) + 1` and asserted it equalled 2, which is
+    // arithmetic on a literal that no production code runs. It would have stayed green against a
+    // client demanding all three nodes.
+    const validators = validatorNodes(BUNDLED_CONSORTIUM_MANIFEST.nodes as never);
+    expect(validators).toHaveLength(3);
+    // Distinct signing keys — two nodes sharing one would let a single host answer as two members
+    // of the quorum, which is the redundancy invariant defeated while looking satisfied.
+    expect(new Set(validators.map((x) => x.pubkey)).size).toBe(validators.length);
+    // Distinct regions: one region going down must not be able to take the rest with it.
+    expect(new Set(validators.map((x) => x.region)).size).toBe(validators.length);
+  });
+
+  it("carries the intake key, so a cold-boot daemon can seal its first submission", () => {
+    // Without this the signature test is the only thing standing between a v1 manifest and every
+    // trust-signal submission refusing with `intake_key_absent` — and that test fails with
+    // "expected false to be true", which names nothing. This one names the field.
+    const intake = (BUNDLED_CONSORTIUM_MANIFEST as unknown as {
+      intake_key?: { key_id?: string; pubkey?: string };
+    }).intake_key;
+    expect(intake, "a manifest with no intake_key refuses every submission").toBeDefined();
+    expect(intake?.key_id).toBe("intake-dev-1");
+    expect(String(intake?.pubkey)).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("PRODUCTION_DIRECTORY_URL is one of the bundled endpoints — or cold boot loses step-6", () => {
@@ -153,6 +168,28 @@ describe("FINDING-4: buildManifestDeps default (bundled) vs override (env) path"
     // the provider actually verifies + exposes the 3-node roster
     const m = await deps.manifestProvider!.loadAndVerify(deps.manifestRootKeys!, deps.manifestThreshold!);
     expect(m.nodes).toHaveLength(3);
+  });
+
+  it("WARNS when the skipped directory is public, and only informs for local dev", () => {
+    // The two cases are not equivalent and must not read alike. 127.0.0.1 is the e2e harness and is
+    // designed; a public host here is a client running against a real directory with identity
+    // authentication off — weaker than the operator believes, and previously the ONLY signal was the
+    // absence of a different log line.
+    const lines: Array<{ level: string; event: string; detail: Record<string, unknown> }> = [];
+    const rec = (level: string) => (event: string, detail?: Record<string, unknown>) =>
+      lines.push({ level, event, detail: detail ?? {} });
+    const logger = { info: rec("info"), warn: rec("warn"), error: rec("error"), debug: rec("debug") };
+
+    process.env.CELLO_DIRECTORY_URL = "http://127.0.0.1:9099";
+    buildManifestDeps(logger as never);
+    expect(lines.at(-1)?.level, "loopback is designed — must not cry wolf").toBe("info");
+
+    lines.length = 0;
+    process.env.CELLO_DIRECTORY_URL = "http://directory-use1.cello.mygentic.ai:9090";
+    buildManifestDeps(logger as never);
+    const last = lines.at(-1);
+    expect(last?.level, "a public directory outside the roster is a downgrade").toBe("warn");
+    expect(last?.detail["step6"]).toBe("disabled");
   });
 
   it("with no env: does NOT load the bundle when pointed at a non-bundled directory (M6 path)", () => {

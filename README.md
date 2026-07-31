@@ -250,7 +250,7 @@ is a map of what exists, not the last word on syntax.
 | Variable | Default | Description |
 |---|---|---|
 | `CELLO_DIR` | `~/.cello` | Home for the daemon socket, key material, and the encrypted database. Set it to run a second, isolated identity. |
-| `CELLO_DIRECTORY_URL` | `http://directory-us1.cello.mygentic.ai` | Bootstrap entry point — the daemon resolves the full multi-node directory consortium from here. Override for local or staging. |
+| `CELLO_DIRECTORY_URL` | `http://34.75.172.108:9090` | Bootstrap entry point — the daemon resolves the full directory consortium from here. **Must match a node in the bundled roster exactly.** Overriding it with anything else — including a DNS name for the very same node — turns OFF directory identity authentication, silently. Override only for local or staging. |
 | `CELLO_LISTEN_ADDR` | `/ip4/0.0.0.0/tcp/0` | libp2p listen address. |
 
 ## Troubleshooting

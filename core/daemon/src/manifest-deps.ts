@@ -78,11 +78,25 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
     // directory on 127.0.0.1 — the bundled node pubkeys don't describe it, so enforcing step-6 would
     // wrongly reject every connection (key_not_in_manifest). In that case fall through to the M6
     // backward-compat path (no roster, no step-6); those deployments opt into step-6 explicitly by
-    // supplying a matching manifest via CELLO_CONSORTIUM_MANIFEST. Unset URL → the production default
-    // (directory-us1.cello.mygentic.ai), which IS in the bundle, so real operators get the full posture.
+    // supplying a matching manifest via CELLO_CONSORTIUM_MANIFEST. Unset URL → the production default,
+    // which is a bundled node's ADDRESS and so matches, giving real operators the full posture.
+    //
+    // The comparison is byte-equality against the roster, not "reaches the same machine". A DNS name
+    // for a bundled node does NOT match and lands here, in the branch that turns step-6 off — which
+    // is why PRODUCTION_DIRECTORY_URL is an address. Do not "tidy" either into a hostname.
     const directoryUrl = normalizeUrl(resolveDirectoryUrl());
     if (!BUNDLED_ENDPOINTS.has(directoryUrl)) {
-      logger.info("daemon.manifest.bundled.skipped", { directoryUrl, reason: "directory_not_in_bundled_roster" });
+      // Two very different situations reach here and they must not log the same way. A loopback or
+      // private address is local dev or the e2e harness pointing at its own directory — designed and
+      // benign. Anything else is a client running against a PUBLIC directory with identity
+      // authentication off, which is a weaker client than the operator believes they have, and the
+      // only previous signal was the absence of a different log line.
+      const isLocal = /^https?:\/\/(localhost|127\.|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(
+        directoryUrl,
+      );
+      const detail = { directoryUrl, reason: "directory_not_in_bundled_roster", step6: "disabled" };
+      if (isLocal) logger.info("daemon.manifest.bundled.skipped", detail);
+      else logger.warn("daemon.manifest.bundled.skipped", detail);
       return {};
     }
     const manifestProvider = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);

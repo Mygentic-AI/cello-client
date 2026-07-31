@@ -5,7 +5,7 @@
  * adapter, which sits ABOVE it as a thin IPC proxy.
  *
  * Mechanism:
- *   1. resolveDirectoryUrl(env): CELLO_DIRECTORY_URL or the production ALB URL.
+ *   1. resolveDirectoryUrl(env): CELLO_DIRECTORY_URL or PRODUCTION_DIRECTORY_URL.
  *   2. GET ${url}/bootstrap → { multiaddr } containing "/p2p/<peerId>".
  *   3. The peer ID is the segment after the final "/p2p/" in the multiaddr.
  *
@@ -164,8 +164,10 @@ export interface ConsortiumEndpoint {
  * `/bootstrap` probe, or return `null` if it is not a usable bootstrap base.
  *
  * CONTRACT: a manifest `endpoint` is the node's HTTP(S) `/bootstrap` base — production
- * directories serve `/bootstrap` over plaintext HTTP behind the ALB (matching
- * PRODUCTION_DIRECTORY_URL, which is `http://…:80`). The wss libp2p DIAL address is
+ * directories serve `/bootstrap` over plaintext HTTP on port 9090, directly (there is no load
+ * balancer in front of them), matching PRODUCTION_DIRECTORY_URL. 8080 on the same host speaks the
+ * libp2p WebSocket upgrade and answers plain HTTP with 400, so pointing this at 8080 resolves as
+ * zero reachable nodes from a perfectly valid manifest. The wss libp2p DIAL address is
  * returned BY `/bootstrap`; it is NOT the endpoint. Do NOT accept (or port-guess) a
  * `wss://host:443` value — mapping that to `http://host:443` speaks plaintext to the
  * TLS port and silently fails. Anything
