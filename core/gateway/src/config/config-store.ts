@@ -1,24 +1,21 @@
 /**
- * M9-CFG-001 — the gateway's own versioned config store (INV-4).
+ * M9-CFG-001 — the gateway's versioned config store (INV-4 as amended by M9B-D2).
  *
- * The gateway owns its configuration; the daemon never does. This store lives in the gateway's own
- * local DB file (node:sqlite — the same library the daemon uses, a separate file), is append-only and
- * versioned, and enforces the §7 governance asymmetry:
+ * The store is append-only and versioned, and enforces the §7 governance asymmetry:
  *
  *   - TIGHTENING a guard (making the gateway MORE restrictive) is free — no confirmation.
  *   - LOOSENING a guard (making it LESS restrictive — enabling autonomous override, adding a value to
  *     the PII whitelist, raising/removing the rate cap, allowing another language) requires an explicit
- *     `confirmed` flag. Without it the change is REJECTED and not versioned. (The human confirmation —
- *     WebAuthn in the portal — is the front-end's job; this store is the enforcement point.)
+ *     `confirmed` flag. Without it the change is REJECTED and not versioned. (The human confirmation
+ *     is the CLI prompt — the portal passkey later; this store is the enforcement point.)
  *
  * Every applied change appends a row whose `fingerprint` is hash-chained to the previous version, so
  * the change history is tamper-evident and ready to attest to the directory in Phase 2 (M9-ATTEST-001).
  *
- * Encryption-at-rest: the daemon opens node:sqlite without a cipher key today, so this store matches
- * that (a separate FILE, per INV-4); SQLCipher-style key encryption is a cross-cutting gap shared with
- * the daemon's DB, not a CFG-001-local concern.
+ * Encryption-at-rest (DOD-M9B-STORE-1): the store lives in the gateway's SQLCipher file, opened with
+ * the daemon's key via a key FILE path — fail-closed, no plaintext fallback (see store/encrypted-db.ts).
  */
-import { DatabaseSync } from "node:sqlite";
+import { openEncryptedStoreDb, type StoreDb, type StoreEventSink } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
 /** Whether a config change makes the gateway more restrictive (tighten), less (loosen), or neither. */
@@ -34,6 +31,9 @@ export interface ConfigVersionRow {
   direction: ConfigDirection;
   confirmed: boolean;
   fingerprint: string;
+  /** WHEN it changed. Stored all along; `history()` used to drop it, so the surface could not show
+   *  provenance (review F9 of the earlier pass). */
+  changedAt: number;
 }
 
 /** Classify a change for one key. `prev` is the current value (never undefined — the first set is
@@ -127,13 +127,23 @@ CREATE TABLE IF NOT EXISTS config_versions (
 `;
 
 export class GatewayConfigStore {
-  readonly #db: DatabaseSync;
+  readonly #db: StoreDb;
   #closed = false;
 
-  constructor(dbPath: string) {
-    this.#db = new DatabaseSync(dbPath);
-    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
-    this.#db.exec(DDL);
+  /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
+   *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
+  constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
+    this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
+    try {
+      this.#db.exec(DDL);
+    } catch (err) {
+      // Review F8: the connection is already open at this point. A DDL throw — SQLITE_BUSY past the
+      // busy_timeout is reachable on a file shared with the sidecar — used to leak the native handle
+      // and cache nothing, so every retry opened another one. An fd leak against a lock-sensitive
+      // file is a slow way to make the whole store unopenable.
+      try { this.#db.close(); } catch { /* the throw below is the real error */ }
+      throw err;
+    }
   }
 
   /** Set `key` to `value`. Loosening requires `opts.confirmed`; tightening/neutral is free. The FIRST
@@ -190,14 +200,15 @@ export class GatewayConfigStore {
   /** The full append-only version history for `key`, oldest first. */
   history(key: string): ConfigVersionRow[] {
     const rows = this.#db
-      .prepare(`SELECT version, value_json, direction, confirmed, fingerprint FROM config_versions WHERE key = ? ORDER BY version ASC`)
-      .all(key) as Array<{ version: number; value_json: string; direction: string; confirmed: number; fingerprint: string }>;
+      .prepare(`SELECT version, value_json, direction, confirmed, fingerprint, changed_at FROM config_versions WHERE key = ? ORDER BY version ASC`)
+      .all(key) as Array<{ version: number; value_json: string; direction: string; confirmed: number; fingerprint: string; changed_at: number }>;
     return rows.map((r) => ({
       version: r.version,
       value: JSON.parse(r.value_json) as unknown,
       direction: r.direction as ConfigDirection,
       confirmed: r.confirmed === 1,
       fingerprint: r.fingerprint,
+      changedAt: r.changed_at,
     }));
   }
 
@@ -220,6 +231,15 @@ export class GatewayConfigStore {
       prevFingerprint = r.fingerprint;
     }
     return true;
+  }
+
+  /**
+   * Fold the WAL back into the main file WITHOUT closing (review F1/F2). See the twin comment on
+   * `GatewayRecordStore.checkpoint` for the measured rule: it is the LAST closer that unlinks, and
+   * a sidecar being SIGTERMed mid-restart is exactly when a per-call handle becomes the last one.
+   */
+  checkpoint(): void {
+    this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   }
 
   close(): void {

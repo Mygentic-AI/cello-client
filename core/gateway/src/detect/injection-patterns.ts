@@ -38,6 +38,20 @@ export function compileInjectionPatterns(): void {
   compiled = PATTERN_SOURCES.map(({ id, src }) => ({ id, re: new LinearRegex(src, "i") }));
 }
 
+/**
+ * The ids of the patterns that ACTUALLY COMPILED, in corpus order — the input to the intake
+ * scanner's derived `scanner_version` (`M10B-D15`).
+ *
+ * The ACTIVE set, not the source list, and the difference is the point: if two deployments compile
+ * different subsets (a different RE2 build, a rule that fails to compile), their digests diverge —
+ * which is what makes "byte-identical across nodes" mechanically checkable rather than aspirational.
+ * Returns null when nothing is compiled, so a caller that must fail closed can tell "no rules" from
+ * "not ready".
+ */
+export function injectionPatternIds(): string[] | null {
+  return compiled === null ? null : compiled.map((c) => c.id);
+}
+
 /** Whether the patterns are compiled (the RE2 engine was initialized). */
 export function injectionPatternsReady(): boolean {
   return compiled !== null;

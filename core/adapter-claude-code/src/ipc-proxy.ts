@@ -75,6 +75,7 @@ export class IpcProxy {
   #pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   #buffer = "";
   #notificationHandler: ((frame: Record<string, unknown>) => void) | null = null;
+  #reconnectHandler: (() => void) | null = null;
 
   #reconnectTimer: NodeJS.Timeout | null = null;
   #reconnectAttempt = 0;
@@ -104,6 +105,26 @@ export class IpcProxy {
    */
   onNotification(handler: (frame: Record<string, unknown>) => void): void {
     this.#notificationHandler = handler;
+  }
+
+  /**
+   * Register a handler fired when the proxy RE-connects to a daemon, after the handshake replay has
+   * restored the session — never on the first connect, which the caller already knows about because
+   * `connect()` returned.
+   *
+   * It exists because the daemon coming back was invisible to the agent: `shutdown` is pushed by the
+   * dying daemon, but nothing announces the new one, since a fresh daemon has no idea a client is
+   * waiting. Only the shim knows, and it was writing "reconnected to the CELLO daemon" to stderr,
+   * which no agent reads. Fired AFTER the replay so the announcement is true when it arrives — the
+   * agent selection is already restored, not still in flight.
+   */
+  onReconnect(handler: () => void): void {
+    this.#reconnectHandler = handler;
+  }
+
+  /** The agent this connection is routing to, as restored by the handshake replay. */
+  get currentAgent(): string | null {
+    return this.#currentAgent;
   }
 
   /**
@@ -203,6 +224,13 @@ export class IpcProxy {
 
       this.#reconnectAttempt = 0;
       process.stderr.write("cello-mcp: reconnected to the CELLO daemon\n");
+      // Announce BEFORE releasing waiters so the operator's agent learns the daemon is back before
+      // the first unblocked call returns. A throwing handler must not abort the reconnect — the
+      // connection is already good, and losing it over a failed announcement would be a strictly
+      // worse outcome than a missing doorbell.
+      try {
+        this.#reconnectHandler?.();
+      } catch { /* announcement is best-effort; the reconnect itself has already succeeded */ }
       this.#releaseWaiters();
     } catch {
       this.#connected = false;

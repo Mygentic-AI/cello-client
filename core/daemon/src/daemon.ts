@@ -43,7 +43,8 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
-import { PassthroughGatewayClient, type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { type SecurityGatewayClient } from "@cello-protocol/gateway";
+import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
@@ -52,6 +53,15 @@ import { createNode, SignalingManager, type ConnectResult, type CelloNode } from
 import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
+import { composeSealedSubmission, sendSealedSubmission, fetchSubmissionResults } from "./signal-submission.js";
+import type { SubmissionOp, SignalSubjectKind } from "@cello-protocol/protocol-types";
+
+/**
+ * Cap on a refusal message (M10B-D4). Generous for prose — the point is not to police what the
+ * operator writes, it is that an UNBOUNDED string reaches a signer, a sealer and a transport, and
+ * fails in the transport where the error names the wrong subsystem.
+ */
+const MAX_SUBMISSION_BODY_CHARS = 4000;
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
@@ -243,16 +253,26 @@ async function startDaemonHoldingLock(
   await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
 
   // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
-  // cello_send and the inbound screen inside SessionNodeManager. Absent config falls back to a
-  // PassthroughGatewayClient (always-allow), so pre-M9 daemons behave exactly as before while
-  // still returning a verdict (SI-001).
-  const securityGateway: SecurityGatewayClient = config.securityGateway ?? new PassthroughGatewayClient();
-  // M9-CORE-001 observability: announce the gateway mode at startup. The sidecar socket connects
-  // lazily on the first screen, so this records which adapter is wired (sidecar vs the always-allow
-  // passthrough default), not a live socket handshake.
-  logger.info("security.gateway.connected", {
-    mode: config.securityGateway ? "sidecar" : "passthrough",
-  });
+  // cello_send and the inbound screen inside SessionNodeManager. REQUIRED (INV-9): there is no
+  // fallback, because the fallback WAS the bug — an always-allow default that nothing in the
+  // product ever overrode.
+  // The type says required, but tests are excluded from typecheck and JS callers exist, so the
+  // absence has to be LOUD here rather than a TypeError three lines later that names the wrong
+  // subsystem. A test that genuinely does not screen says so by passing the passthrough client.
+  if (!config.securityGateway) {
+    throw new Error(
+      "startDaemon: securityGateway is required (INV-9). The daemon no longer defaults to " +
+        "always-allow screening, because that default shipped a security layer that never ran. " +
+        "Pass a LocalSidecarGatewayClient in production, or new PassthroughGatewayClient() if " +
+        "this caller deliberately does not screen.",
+    );
+  }
+  const securityGateway: SecurityGatewayClient = config.securityGateway;
+  // Observability: announce the mode the CLIENT declares (M9B-D11), never a ternary over the
+  // config. The sidecar socket connects lazily on the first screen, so this reports which adapter
+  // is wired, not a live socket handshake — but it reports it from the object that will do the
+  // screening, so a wiring mistake shows up here instead of hiding behind a correct-looking line.
+  logger.info("security.gateway.connected", { mode: securityGateway.mode });
 
   const sessionNodeManager = new SessionNodeManager({
     factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
@@ -272,7 +292,7 @@ async function startDaemonHoldingLock(
   // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
   // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
   // because only we hold the DB handle and the singleton lock a refusal has to release.
-  const { manifestVerified, verifiedManifestVersion } = await verifyStartupManifest({
+  const { manifestVerified, verifiedManifestVersion, verifiedManifest } = await verifyStartupManifest({
     manifestProvider,
     manifestRootKeys,
     manifestThreshold,
@@ -1859,6 +1879,13 @@ async function startDaemonHoldingLock(
       // answers "include it by default"; this answers the prior question, "may it be presented at
       // all".
       consent_state: r.consentState,
+      // M10B / DOD-END-COUNT-1. The operator holds an endorsement whose worth is CAPPED — a
+      // recipient's floor excludes it from `min_count` — and until now nothing told them so. Two
+      // endorsements looked identical in this list while one could clear a counterparty's bar and the
+      // other could not, which is the kind of invisible difference that reads as the protocol being
+      // arbitrary. It is a portal-attested envelope field, so surfacing it discloses nothing the
+      // recipient will not already see.
+      same_operator: r.sameOperator,
     }));
     return { ok: true, signals: rows };
   });
@@ -1979,27 +2006,389 @@ async function startDaemonHoldingLock(
     return { ok: true, name, pubkey: rec.pubkey };
   };
 
-  handlers.set("consent_list_pending", async (_params, connectionId) => {
+
+  /**
+   * Compose → seal → send ONE submission on behalf of the selected agent, applying every guard that
+   * must hold for any of them.
+   *
+   * Extracted because `refuse` and `issue` are the same journey with a different `op`, and a second
+   * hand-written copy is how two paths that must agree stop agreeing. The guards are the point: an
+   * agent that is not started must not be brought online by a side effect, an unbounded body must
+   * not reach the transport, and the CAUSE of a refusal must survive to the operator. Duplicating
+   * those means the next verb gets whichever subset its author remembered.
+   *
+   * INV-ATTRIBUTION holds BY CONSTRUCTION, and it did not before: this used to take the resolved
+   * `sel` as a parameter, which is exactly a parameter through which a caller could name a different
+   * identity. Both call sites happened to pass the right one, so the invariant held by CONVENTION
+   * while the comment claimed structure — and the test that "pinned" it asserted the absence of two
+   * identifiers that had never existed, so it could not fail. It now takes `connectionId` and
+   * resolves the selection itself. There is no identity input left to get wrong.
+   */
+  async function submitForAgent(opts: {
+    connectionId: string;
+    op: SubmissionOp;
+    subjectKind: SignalSubjectKind;
+    subject: string;
+    body: string;
+    /** Prefixed onto every failure guidance so the operator knows what DID happen. */
+    context: string;
+  }): Promise<
+    | { queued: true; stored: boolean; submissionId: string; storedWarning?: string }
+    | { queued: false; reason: string; guidance: string }
+  > {
+    const { context } = opts;
+    const resolved = resolveSelectedAgent(opts.connectionId);
+    if (!resolved.ok) return { queued: false, reason: resolved.reason, guidance: `${context} ${resolved.guidance}` };
+    const sel = resolved;
+    if (opts.body.length > MAX_SUBMISSION_BODY_CHARS) {
+      return { queued: false, reason: "message_too_long",
+        guidance: `${context} it is ${opts.body.length} characters and the limit is ${MAX_SUBMISSION_BODY_CHARS}.` };
+    }
+    // `getAgentSignaling` is NOT a getter — for an agent with no manager it CONSTRUCTS one, which
+    // dials and authenticates to the directory immediately and installs an unbounded reconnect loop.
+    // Calling it on a stopped agent would silently bring it online: the directory would route
+    // sessions to it while no standing receiver exists (`standing_receiver_unavailable`), and
+    // `cello status` would still report it offline.
+    if (!onlineAgents.has(sel.name)) {
+      return { queued: false, reason: "agent_offline",
+        guidance: `${context} agent '${sel.name}' is not started. Run cello_start_agent and try again — re-sending is safe, the submission id is derived from the content.` };
+    }
+    const kp = keyProviders.get(sel.name);
+    if (!kp) {
+      logger.warn("signal.submission.refused", { agentName: sel.name, reason: "key_provider_absent", op: opts.op });
+      return { queued: false, reason: "key_provider_absent",
+        guidance: `${context} no signing key is loaded for '${sel.name}'.` };
+    }
+    try {
+      const composed = await composeSealedSubmission({
+        manifest: verifiedManifest, keyProvider: kp, op: opts.op,
+        subjectKind: opts.subjectKind, subject: opts.subject, body: opts.body,
+        issuedAt: Math.floor(Date.now() / 1000), logger,
+      });
+      if (!composed.ok) {
+        // ERRORS NAME THEIR CAUSE: manifest_unavailable / manifest_expired / intake_key_absent /
+        // intake_key_malformed each say WHICH check refused, and that survives rather than
+        // collapsing into a generic send failure that points at the network.
+        return { queued: false, reason: composed.reason, guidance: `${context} ${composed.guidance}` };
+      }
+      const sent = await sendSealedSubmission({
+        signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
+        submissionId: composed.submissionId, intakeKeyId: composed.intakeKeyId,
+        ciphertext: composed.ciphertext, logger,
+      });
+      if (!sent.ok) {
+        return { queued: false, reason: sent.reason, guidance: `${context} ${sent.guidance ?? sent.reason}` };
+      }
+      // F4: `sendSealedSubmission` ALREADY logs `signal.submission.queued` / `.duplicate`. Logging
+      // `queued` again here doubled every count-based alarm and, worse, emitted `queued` right after
+      // `duplicate` — partially erasing the very distinction the directory's queue repository exists
+      // to preserve. A distinct name, only for what the send layer does not know (which agent, which
+      // op).
+      logger.info("signal.submission.attributed", {
+        agentName: sel.name, op: opts.op, submissionId: composed.submissionId, stored: sent.stored,
+      });
+      // KEEP THE HANDLE, or a withdrawal has nothing to name. The submission id is content-derived,
+      // so it is reproducible in principle — but only by re-composing the exact original body, which
+      // the operator no longer has once they have sent it. Recorded in the SHARED path so every verb
+      // added after this one is covered by construction, which is the same reasoning as the
+      // `storedWarning` below.
+      //
+      // Best-effort on purpose: the submission IS accepted at this point, and failing the call over
+      // a local bookkeeping write would turn a success into a reported failure and invite a re-send
+      // of something already queued. Logged loudly instead.
+      try {
+        const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+        store.recordIssuedSubmission({
+          agentId: sessionNodeManager.resolveAgentId(sel.name),
+          submissionId: composed.submissionId,
+          subjectPubkey: opts.subject,
+          op: opts.op,
+          intakeKeyId: composed.intakeKeyId,
+          stored: sent.stored,
+        });
+      } catch (err: unknown) {
+        logger.error("signal.submission.record_failed", {
+          agentName: sel.name, submissionId: composed.submissionId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+      // F1: `stored: false` means a node reports it ALREADY HELD this submission id. That is either
+      // a benign retry or single-node censorship — an operator pre-inserting garbage under a
+      // clear-text id — and they are indistinguishable from here. Reporting it as unqualified
+      // success is what makes the attack silent. The warning lives in the SHARED path, not at one
+      // call site, because the refuse verb had it and the issue verb did not: the same omission
+      // would otherwise be available to every verb added after this one.
+      return {
+        queued: true, stored: sent.stored, submissionId: composed.submissionId,
+        ...(sent.stored ? {} : {
+          storedWarning: "A directory node accepted it but reports it already held this submission id. If nothing arrives for the recipient, send it again — re-sending is safe, the submission id is derived from the content.",
+        }),
+      };
+    } catch (err: unknown) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn("signal.submission.refused", { agentName: sel.name, op: opts.op, reason });
+      return { queued: false, reason, guidance: `${context} ${reason}` };
+    }
+  }
+
+  /**
+   * M10B / DOD-END-SURFACE-1 — issue a trust signal ABOUT a counterparty.
+   *
+   * NOTE WHAT IS NOT HERE: a `type` parameter, and the word "endorsement" anywhere in the path. The
+   * submission wire carries no type field — the PORTAL decides what it mints from a submission — so
+   * a second client-sourced type needs no new verb, no new parameter and no client change. That is
+   * INV-ZEROBUMP holding by construction rather than by discipline, and it is what
+   * `DOD-END-PLAYBOOK-1` has to prove with an empty diff.
+   *
+   * The subject is the counterparty's K_local pubkey: the only identifier a contact actually holds.
+   * No account identifier crosses the wire — the portal resolves agent → account at intake, and the
+   * directory is hash-only by design.
+   */
+  // M10B / DOD-END-SURFACE-1 — "see what I have submitted about others". The wallet list answers
+  // "what do people say about ME"; this answers the other direction, and it is the prerequisite for
+  // withdrawal: you cannot withdraw a submission you cannot name.
+  // M10B / `M10B-D25r2` — collect this agent's outcomes from the directory and open any sealed
+  // message with k_local. Separate from `wallet_list_issued` because it is a NETWORK call: listing
+  // what you submitted must keep working when the directory is unreachable, and folding a fetch into
+  // it would make a local read fail for a remote reason.
+  handlers.set("wallet_fetch_results", async (_params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const kp = keyProviders.get(sel.name);
+    if (!kp) {
+      return { ok: false, reason: "agent_not_loaded",
+        guidance: `Agent '${sel.name}' has no key loaded, so a sealed result could not be opened. Restart the daemon and select the agent again.` };
+    }
+    // ── ASK EVERY NODE, AND SAY WHICH ONES DID NOT ANSWER ─────────────────────────────────────────
+    // An outcome is recorded on whichever node accepted the submission, and this agent is connected
+    // to ONE node — routinely not the same one. Asking only home turns "your refusal is on another
+    // node" into "you have no results", which is the answer that makes a counterparty look silent
+    // when they were not.
+    //
+    // A NODE THAT DOES NOT ANSWER IS `unreachable`, NEVER an empty result. If a timeout collapsed
+    // into "nothing here", a down node could silently produce a negative answer — the same lie in a
+    // new place. The caller is told what was actually covered.
+    const seen = new Map<string, ReturnType<typeof mapResult>>();
+    const unreachable: string[] = [];
+    function mapResult(r: { submissionId: string; outcome: string; reason: string | null; signalHash: string | null; message: string | null; createdAt: string }) {
+      return {
+        submission_id: r.submissionId,
+        outcome: r.outcome,
+        reason: r.reason,
+        signal_hash: r.signalHash,
+        message: r.message,
+        created_at: r.createdAt,
+      };
+    }
+    const opener = kp as { openContentSeal?: (c: Uint8Array) => Promise<Uint8Array | null> };
+
+    // Home node first — it needs no connection and answers fastest.
+    const home = await fetchSubmissionResults({
+      signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
+      keyProvider: opener,
+      logger,
+    });
+    if (home.ok) for (const r of home.results) seen.set(r.submissionId, mapResult(r));
+    else unreachable.push("home");
+
+    // Then every OTHER node in the consortium, over a transient visiting connection — the same
+    // mechanism a cross-node session uses. Each is independent: one node refusing to answer must not
+    // stop the others being asked.
+    const roster = (await resolveConsortiumRoster().catch(() => null)) ?? [];
+    for (const node of roster) {
+      let visit: ReturnType<typeof openVisitingConnection> | null = null;
+      try {
+        visit = openVisitingConnection(
+          sel.name, kp, sel.pubkey,
+          { peerId: node.peerId, multiaddr: node.multiaddr },
+          randomUUID(), node.nodeId,
+        );
+        const r = await fetchSubmissionResults({ signaling: visit.mgr, keyProvider: opener, logger });
+        if (r.ok) for (const x of r.results) { if (!seen.has(x.submissionId)) seen.set(x.submissionId, mapResult(x)); }
+        else unreachable.push(node.nodeId);
+      } catch {
+        unreachable.push(node.nodeId);
+      } finally {
+        // ALWAYS torn down. A visiting connection left open holds a stream the directory will drain
+        // its durable notification queue down — the bug this connection type has already caused once.
+        await visit?.stop("results fetch complete").catch(() => {});
+      }
+    }
+
+    if (seen.size === 0 && unreachable.length > 0 && unreachable.length >= roster.length) {
+      // EVERY node we tried failed. Reporting an empty list here would be the exact lie this fan-out
+      // exists to prevent.
+      return {
+        ok: false,
+        reason: "results_unreachable",
+        guidance: `No directory node answered (${unreachable.join(", ")}). Your outcomes are held until you collect them — nothing is lost. Retry when connectivity returns.`,
+      };
+    }
+    return {
+      ok: true,
+      // WHAT WAS ACTUALLY COVERED. An empty list from a partial sweep means "nothing on the nodes we
+      // reached", which is a different claim from "nothing exists".
+      ...(unreachable.length > 0 ? { unreachable_nodes: unreachable } : {}),
+      results: [...seen.values()],
+    };
+  });
+
+
+  handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-    const items = store.listPendingConsent(sel.pubkey).map((r) => ({
-      signal_hash: r.signalHash,
-      type: r.type,
-      issuer_pubkey: r.issuerPubkey,
-      issued_at: r.issuedAt,
-      // The payload is the ENDORSER'S OWN WORDS and is returned raw, unparsed, for the operator to
-      // read before deciding. It is not interpreted here and it is never presented to anyone until
-      // they accept — that is the entire point of the decision they are being asked to make.
-      payload_bytes: r.payload.length,
+    const rows = store.listIssuedSubmissions(sessionNodeManager.resolveAgentId(sel.name)).map((r) => ({
+      submission_id: r.submissionId,
+      subject_pubkey: r.subjectPubkey,
+      op: r.op,
+      intake_key_id: r.intakeKeyId,
+      // FALSE means a node already held this id — a benign retry, or single-node censorship. The
+      // operator sees the distinction here rather than only in the moment they submitted.
+      stored: r.stored,
+      submitted_at: r.submittedAt,
     }));
+    return {
+      ok: true,
+      issued: rows,
+      // NO BODY, and say so rather than letting its absence read as a bug. The text was the
+      // operator's own words about a third party; keeping it on disk in the clear is exactly what
+      // the sealed-submission path exists to prevent.
+      note: "The text you wrote is NOT stored locally — only the handle, subject and verb. That is deliberate: your words about someone else are sealed to the portal and are not kept in the clear on this machine.",
+    };
+  });
+
+  handlers.set("cello_trust_signals_issue", async (params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const subject = typeof params?.subject_pubkey === "string" ? params.subject_pubkey.toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(subject)) {
+      return { ok: false, reason: "invalid_subject",
+        guidance: "subject_pubkey must be the counterparty's 32-byte public key as 64 hex characters — run cello_contacts to see the peers you know." };
+    }
+    const body = typeof params?.body === "string" ? params.body.trim() : "";
+    if (body.length === 0) {
+      return { ok: false, reason: "empty_body",
+        guidance: "An issued signal needs text — it is the claim you are making about them, in your own words." };
+    }
+    // SELF-ISSUANCE IS REFUSED AT THE SOURCE, and across EVERY agent on this daemon — not just the
+    // selected one. The check used to compare against `sel.pubkey` alone, which let an operator
+    // running two of their own agents issue from one about the other and sail through a guard whose
+    // comment claimed certainty. That configuration is not exotic: solo multi-agent is CELLO's first
+    // wedge, so it is the most likely way to hit this, not the least.
+    //
+    // The portal remains the real enforcer of INV-NO-SELF-STANDING — only it can see account
+    // linkage, and only it can catch two agents under one account on different machines. But the
+    // daemon knows its OWN agents with certainty, and refusing here gives the operator a real answer
+    // now instead of a silent rejection at intake minutes later.
+    const localSelf = loadedAgents.find((a) => a.pubkey.toLowerCase() === subject);
+    if (localSelf) {
+      return { ok: false, reason: "self_subject",
+        guidance: localSelf.name === sel.name
+          ? "An agent cannot issue a trust signal about itself — standing has to come from somebody else."
+          : `'${sel.name}' and '${localSelf.name}' are both your agents on this machine, so a signal from one about the other would be you vouching for yourself. Standing has to come from somebody else.` };
+    }
+    const res = await submitForAgent({
+      connectionId,
+      op: "submit", subjectKind: "agent", subject, body,
+      context: "The signal was NOT submitted:",
+    });
+    if (!res.queued) return { ok: false, reason: res.reason, guidance: res.guidance };
+    return {
+      ok: true, queued: true, stored: res.stored, submission_id: res.submissionId,
+      // Deliberately NOT "issued". Nothing is minted yet: the portal must still drain, authenticate,
+      // scan and mint, and the subject must then ACCEPT it before anyone else can see it. Reporting
+      // this as a completed endorsement would promise three steps that have not happened.
+      guidance: res.storedWarning
+        ? `Submitted for '${sel.name}'. ${res.storedWarning}`
+        : `Submitted for '${sel.name}'. The portal will scan and mint it, then the subject must ACCEPT it before it is visible to anyone — a signal they have not accepted is inert. Nothing here is final until they decide.`,
+    };
+  });
+
+  /**
+   * M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
+   *
+   * `present: null` CLEARS the choice rather than setting it false. Those are different states and
+   * the surface must keep them apart: cleared means "no opinion, use the signal's default", false
+   * means "specifically not this person". An operator who could only toggle true/false would be
+   * unable to undo an omission without first knowing what the default had been.
+   */
+  handlers.set("cello_contact_set_signal", async (params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const pubkey = typeof params?.pubkey === "string" ? params.pubkey.toLowerCase() : "";
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) {
+      return { ok: false, reason: "invalid_pubkey", guidance: "pubkey must be the counterparty's 32-byte public key as 64 hex characters." };
+    }
+    const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : "";
+    if (prefix.length < 8) {
+      return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters — see cello_trust_signals_list." };
+    }
+    const present = params?.present === null ? null : typeof params?.present === "boolean" ? params.present : undefined;
+    if (present === undefined) {
+      return { ok: false, reason: "invalid_present", guidance: "present must be true (show it to them), false (never show it to them), or null (clear the choice and fall back to the signal's default)." };
+    }
+    // Resolve the prefix against signals this agent actually holds, so a typo cannot silently write
+    // a preference about a hash that does not exist and sit there doing nothing forever.
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const match = store.listAllWalletSignals().filter((r) => r.signalHash.startsWith(prefix));
+    if (match.length === 0) {
+      return { ok: false, reason: "signal_not_found", guidance: `No signal in this wallet starts with '${prefix}'.` };
+    }
+    if (match.length > 1) {
+      return { ok: false, reason: "ambiguous_prefix", guidance: `'${prefix}' matches ${match.length} signals — use more characters.` };
+    }
+    sessionNodeManager.setContactSignalPref(sel.name, pubkey, match[0].signalHash, present);
+    return {
+      ok: true, signal_hash: match[0].signalHash, pubkey, present,
+      guidance: present === null
+        ? "Choice cleared — this signal now follows its own default for this contact."
+        : present
+          ? "This signal will be presented to this contact when a session forms, if you have accepted it."
+          : "This signal will NOT be presented to this contact, whatever its default.",
+    };
+  });
+
+  handlers.set("cello_consent_list", async (_params, connectionId) => {
+    const sel = resolveSelectedAgent(connectionId);
+    if (!sel.ok) return sel;
+    const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+    const items = store.listPendingConsent(sel.pubkey).map((r) => {
+      // THE PAYLOAD IS THE POINT OF THIS CALL. The operator is being asked to stand behind a claim
+      // somebody else wrote about them, and they cannot make that decision from a byte count. An
+      // earlier version returned `payload_bytes` while both surfaces instructed the operator to
+      // "read the plaintext before accepting" — so following the instruction produced a number, and
+      // accepting was necessarily blind. Decoded here, exactly as `wallet_view_signal` does it.
+      //
+      // Undecodable payloads fall back to hex rather than throwing: one unreadable item must not
+      // make every other pending decision unreachable, and hex is honest about what it is.
+      let payload: unknown;
+      try {
+        payload = decodeCbor(r.payload);
+      } catch {
+        payload = Buffer.from(r.payload).toString("hex");
+      }
+      return {
+        signal_hash: r.signalHash,
+        type: r.type,
+        subject_kind: r.subjectKind,
+        issuer_kind: r.issuerKind,
+        issuer_pubkey: r.issuerPubkey,
+        issued_at: r.issuedAt,
+        // UNTRUSTED, and labelled as such on the way out. These are the issuer's own words, carried
+        // verbatim and never restated in any other voice (INV-UNTRUSTED). A consuming model must
+        // quote and attribute them — "<issuer> says: …" — never adopt them as its own statement.
+        payload,
+        payload_is_untrusted_text: true,
+      };
+    });
     // Seeing the list IS being told. Marking here rather than in cello_use_agent means the operator
     // is never marked notified about something they were not actually shown.
     store.markConsentNotified(sel.pubkey);
     return { ok: true, agent: sel.name, pending: items };
   });
 
-  handlers.set("consent_accept", async (params, connectionId) => {
+  handlers.set("cello_consent_accept", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -2014,11 +2403,17 @@ async function startDaemonHoldingLock(
       // decision this scoping exists to prevent.
       return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
     }
-    store.setConsentState(item.signalHash, "accepted");
+    // The write RESULT is checked, not assumed. `setConsentState` returns false when zero rows
+    // changed; reporting "accepted" regardless would tell the operator a decision was recorded that
+    // was not, and the next presentation would silently omit it.
+    if (!store.setConsentState(item.signalHash, "accepted")) {
+      return { ok: false, reason: "consent_write_failed",
+        guidance: `The acceptance was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+    }
     return { ok: true, signal_hash: item.signalHash, consent_state: "accepted" };
   });
 
-  handlers.set("consent_refuse", async (params, connectionId) => {
+  handlers.set("cello_consent_refuse", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const prefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
@@ -2030,16 +2425,61 @@ async function startDaemonHoldingLock(
     if (!item) {
       return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
     }
-    store.setConsentState(item.signalHash, "refused");
-    // M10B-D4: the refusal MESSAGE back to the issuer is the subject's CHOICE and rides the
-    // submission queue as an `op` — it is not sent here, and it is not sent automatically. Accepting
-    // the message parameter without a carrier would be a promise this verb cannot keep, so the
-    // parameter is deliberately not taken yet; the refusal itself is complete and durable.
+    // ORDER IS LOAD-BEARING: the refusal is recorded FIRST and is never conditional on the message
+    // getting out. A refusal that only takes effect if the network cooperates would leave a signal
+    // Alice believes she rejected sitting in an unrefused state — the exact failure INV-CONSENT
+    // exists to prevent. The message is a courtesy layered on top of a decision already made.
+    //
+    // And the write is CHECKED. The ordering above is worth nothing if nothing confirms the record
+    // happened: without this, the code would go on to sign and send Bob a refusal message about a
+    // decision that is not in the database.
+    if (!store.setConsentState(item.signalHash, "refused")) {
+      return { ok: false, reason: "consent_write_failed",
+        guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_consent_list and retry.` };
+    }
+    const refused = { ok: true as const, signal_hash: item.signalHash, consent_state: "refused" as const };
+
+    // M10B-D4: the message back to the issuer is the subject's CHOICE. Silence is the default, and a
+    // silent refusal tells Bob NOTHING — which is what keeps D-24 intact for anyone who wants it.
+    const message = typeof params?.message === "string" ? params.message.trim() : "";
+    if (message.length === 0) return { ...refused, message_queued: false };
+
+    // ACCOUNT-SUBJECT ITEMS DO NOT GET A MESSAGE YET, and this is a refusal, not an oversight.
+    //
+    // `listPendingConsent` scopes with `(subject_kind <> 'agent' OR lower(subject) = ?)`, so EVERY
+    // agent on this daemon can see — and therefore refuse — an account-subject item. The refusal
+    // itself is defensible (it is the account's own decision, and any of its agents speaks for it),
+    // but the MESSAGE is signed with THIS agent's K_local, so the issuer would receive a signed
+    // statement from an agent that was not the subject of anything. Which agent may speak for an
+    // account is an open question this milestone has not answered, and signing is not the place to
+    // guess at it. So the decision stands and the courtesy is withheld, with the reason named.
+    if (item.subjectKind !== "agent") {
+      return { ...refused, message_queued: false, message_error: "account_subject_message_unsupported",
+        guidance: `The refusal is recorded. Your message was NOT sent: this signal is about the ACCOUNT rather than about '${sel.name}', and a message would be signed by this agent alone — which agent may speak for an account is not yet settled.` };
+    }
+
+    // Rides the submission queue as the `refuse` op. The SUBJECT is the target signal hash (as it is
+    // for a withdrawal — both verbs act on an existing signal), and `subject_kind` is carried from
+    // the row rather than hardcoded: it is inside the TBS, so a hardcoded value would be a SIGNED
+    // field asserting something false.
+    const res = await submitForAgent({
+      connectionId,
+      op: "refuse", subjectKind: item.subjectKind, subject: item.signalHash, body: message,
+      context: "The refusal is recorded. Your message was NOT sent:",
+    });
+    if (!res.queued) {
+      return { ...refused, message_queued: false, message_error: res.reason, guidance: res.guidance };
+    }
+    // `message_queued`, NOT `issuer_notified`. A directory node acked a sealed blob; the portal has
+    // not drained it, scanned it, minted it, or delivered anything to the issuer.
+    //
+    // `stored` is carried through rather than collapsed into plain success: it is the ONE signal
+    // separating a benign duplicate from single-node censorship (an operator pre-inserting garbage
+    // under a clear-text submission_id), and folding them together destroys the only information
+    // that could ever tell them apart.
     return {
-      ok: true,
-      signal_hash: item.signalHash,
-      consent_state: "refused",
-      note: "The issuer is not notified. Sending a refusal message requires the submission carrier (DOD-END-SUBMIT-1 wiring).",
+      ...refused, message_queued: true, stored: res.stored, submission_id: res.submissionId,
+      ...(res.storedWarning ? { guidance: `The refusal is recorded. ${res.storedWarning}` } : {}),
     };
   });
 
@@ -2198,6 +2638,17 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
     });
   }
+
+  // DOD-M9B-SURFACE-1: the security layer's control surface. Registered here, defined in its own
+  // module — it needs the cello dir, a logger, and the connection's client type, and nothing else
+  // about sessions or ceremonies.
+  const disposeGatewayConfigStores = registerGatewayConfigHandlers({
+    handlers,
+    celloDir,
+    logger,
+    getClientType: (connectionId) => perConnectionState.get(connectionId)?.clientType,
+    ...(config.restartSecurityGateway ? { restartSecurityGateway: config.restartSecurityGateway } : {}),
+  });
 
   // The session READ surface (session-read-handlers.ts): sealed receipt, transcript, list, name.
   // All four read the PERSISTED store, so they survive a restart and a fresh connection.
@@ -2584,6 +3035,31 @@ async function startDaemonHoldingLock(
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();
     } finally {
+      // DOD-M9B-WIRE-1: tear down whatever the composition root started alongside us — today the
+      // screening sidecar. Two reasons it is HERE and not only in the bin's signal handler:
+      // `cello logout` stops the daemon through the IPC `shutdown` verb, which reaches this
+      // function and never touches the signal path; and a spawned child's stdio pipes keep this
+      // process's event loop alive, so a daemon stopped that way would never actually exit.
+      //
+      // FIRST in the finally, BEFORE the singleton lock is released (review F4). The comment below
+      // states the property the lock provides — "while we hold it, no successor daemon can start"
+      // — and the sidecar teardown needs exactly that property: the `shutdown` verb acknowledges
+      // immediately without awaiting this drain, so `cello logout && cello login` can race a new
+      // daemon into existence. Releasing the lock first would let its gateway spawn while ours
+      // still holds gateway.db's write lock, which the 3s busy_timeout usually hides — making the
+      // failure intermittent rather than absent.
+      if (config.onShutdown) {
+        await config.onShutdown().catch((err: unknown) => {
+          logger.error("daemon.shutdown.hook_failed", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
+      // AFTER onShutdown, never before (review F9). onShutdown is `stopSecurityLayer`, which awaits
+      // the sidecar's exit — so by here we ARE the last holder, and the last closer is the one that
+      // may safely checkpoint and unlink (measured, review M1). Reversed, these handles would close
+      // while the sidecar is still writing, which is the F1/F2 defect exactly.
+      disposeGatewayConfigStores();
       // DOD-SINGLE-DAEMON-1: in a `finally`, because a throw anywhere above must not leave the lock
       // held. In the real binary the process exits and the kernel reclaims it — but an in-process
       // caller (vitest, an embedder) whose shutdown throws would otherwise find every subsequent

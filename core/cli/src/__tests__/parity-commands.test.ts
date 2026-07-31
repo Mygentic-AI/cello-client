@@ -21,12 +21,15 @@ import { mkdtemp, rm, readFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger } from "@cello-protocol/daemon";
+import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import {
+  IPC_METHODS,
   listAgents,
   startAgent,
   stopAgent,
   useAgent,
   inbox,
+  listSessions,
   transcript,
   contactSetMoniker,
   initiate,
@@ -50,6 +53,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
   function makeConfig(): DaemonConfig {
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -380,6 +384,57 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
   // fallback is ambiguous, so the command the operator explicitly scoped fails (or, with exactly one
   // agent online, silently runs as whoever happened to be up — which is worse).
   //
+  // DOD-CLI-SESSIONS-SCOPE-1 — `cello sessions` answered for EVERY agent while `cello_sessions`
+  // answered for one, so the two surfaces disagreed about what was open for the same selection. It
+  // called the daemon-wide `list_sessions`, whose comment justified itself with "the CLI has no
+  // current agent" — true when written, false since `use-agent` became durable.
+  //
+  // The discriminator below needs no sessions to exist. Two agents online means the daemon's
+  // sole-online fallback cannot resolve, so a SCOPED call must answer no_current_agent without a
+  // selection and succeed with one. The old daemon-wide handler ignored the agent entirely and would
+  // have returned rows in both cases — it cannot pass either half.
+  describe("§1.4 — `cello sessions` is scoped to the selected agent (not daemon-wide)", () => {
+    it("refuses without a selection when several agents are online, and succeeds with one", async () => {
+      await createAgent(tempDir, "alice");
+      await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "alice", {});
+      await startAgent(tempDir, "bob", {});
+
+      const unscoped = await listSessions(tempDir, {});
+      expect(unscoped.exitCode, "an agent-scoped listing must not answer with no agent selected").toBe(1);
+      expect(unscoped.stdout).toBe("");
+      // The CLI refuses BEFORE dispatching (no_agent_selected, naming the candidates) rather than
+      // letting the daemon answer no_current_agent — either is a refusal; assert the refusal, not
+      // which layer produced it.
+      expect(unscoped.stderr).toMatch(/no_agent_selected|no_current_agent/);
+
+      await useAgent(tempDir, "alice", {});
+      const scoped = await listSessions(tempDir, {});
+      expect(scoped.exitCode, `sessions must honor use-agent, got: ${scoped.stderr}`).toBe(0);
+      expect(JSON.parse(scoped.stdout).ok).toBe(true);
+    });
+
+    // The two tests here prove the PARITY PATH is used (agent replay, refusal without a selection).
+    // They cannot prove the METHOD is the scoped one: with no sessions in the temp daemon, the
+    // daemon-wide handler answers ok too, so pointing this back at `list_sessions` passes both. That
+    // is exactly the regression to guard, so the wire name is asserted directly. Verified by
+    // mutation: flipping the constant fails this and only this.
+    it("dispatches to the AGENT-SCOPED daemon handler, not the daemon-wide one", () => {
+      expect(IPC_METHODS.sessions).toBe("cello_list_sessions");
+    });
+
+    it("honors an explicit --agent, like every other agent-scoped command", async () => {
+      await createAgent(tempDir, "alice");
+      await createAgent(tempDir, "bob");
+      await startAgent(tempDir, "alice", {});
+      await startAgent(tempDir, "bob", {});
+
+      const out = await listSessions(tempDir, { agent: "bob" });
+      expect(out.exitCode, `--agent must resolve without a persisted selection, got: ${out.stderr}`).toBe(0);
+      expect(JSON.parse(out.stdout).ok).toBe(true);
+    });
+  });
+
   // These commands are agent-scoped and MUST resolve the agent the same way as every other one.
   describe("§1.3 — settings/moniker honor `use-agent` like every other agent-scoped command", () => {
     it("`cello settings set` applies to the SELECTED agent when several are online", async () => {
@@ -471,6 +526,7 @@ describe("current-agent persistence is a plain file", () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-parity-file-"));
     try {
       const handle2 = await startDaemon({
+    securityGateway: new PassthroughGatewayClient(),
         celloDir: dir,
         socketPath: join(dir, "daemon.sock"),
         lockFilePath: join(dir, "daemon.lock"),

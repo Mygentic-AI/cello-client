@@ -36,6 +36,7 @@ import type { DaemonDatabase } from "../sqlcipher-db.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -133,7 +134,7 @@ describe("cello_list_sessions: SessionNodeManager.getSessionsForAgent", () => {
   it("LIST-1: returns the agent's sessions across every status, excludes other agents", async () => {
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "sessions.db");
-    const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger, dbPath });
     await mgr.initialize();
     const db = mgr.getDb();
     // Production always has these rows: the daemon creates an agent long before it has a session.
@@ -156,7 +157,7 @@ describe("cello_list_sessions: SessionNodeManager.getSessionsForAgent", () => {
   it("LIST-1: returns an empty array for an agent with no sessions", async () => {
     const { logger } = makeLogger();
     const dbPath = join(tempDir, "sessions.db");
-    const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger, dbPath });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger, dbPath });
     await mgr.initialize();
     // "an agent with no sessions" means a REAL agent that has not opened one — not a name that was
     // never created. A nonexistent name is now a loud programming error (agent_id_unresolved), not
@@ -194,6 +195,7 @@ describe("cello_list_sessions: MCP handler", () => {
   function makeConfig(): DaemonConfig {
     const { logger } = makeLogger();
     return {
+      securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -226,7 +228,7 @@ describe("cello_list_sessions: MCP handler", () => {
   it("LIST-3: filter (open default / closed / failed / all) + limit, scoped to the current agent", async () => {
     // Pre-populate the sessions DB before the daemon opens it (matches SESSION-001 AC-006 pattern).
     // The schema comes from the manager's own initialize() — never a second, hand-rolled copy.
-    const seedMgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "sessions.db") });
+    const seedMgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger().logger, dbPath: join(tempDir, "sessions.db") });
     await seedMgr.initialize();
     const db = seedMgr.getDb();
     const ids = await seedAgents(db, ["alice", "bob"]);

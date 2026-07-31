@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/gateway",
-  "version": "0.0.7",
+  "version": "0.0.21",
   "private": false,
   "type": "module",
   "engines": {
@@ -15,6 +15,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./testing": {
+      "import": "./dist/testing.js",
+      "types": "./dist/testing.d.ts"
     },
     "./detect": {
       "import": "./dist/detect/index.js",
@@ -37,6 +41,7 @@
     "re2-wasm": "^1.0.2"
   },
   "optionalDependencies": {
+    "@signalapp/sqlcipher": "^3.3.5",
     "re2": "^1.25.0"
   },
   "devDependencies": {

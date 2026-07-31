@@ -1,17 +1,22 @@
 /**
  * Gateway building blocks: the server + the local-sidecar client over a REAL Unix domain
  * socket (in-process server, real socket I/O — the separate-process seam is proven in the
- * daemon integration test). Covers the verdict round-trip, the request log, the screen-function
- * seam later stories plug into, and the fail-closed / never-hang guarantees (INV-6 / SI-001).
+ * daemon integration test). Covers the verdict round-trip, the screen-function seam later stories
+ * plug into, and the fail-closed / never-hang guarantees (INV-6 / SI-001).
+ *
+ * The request-log cases that used to live here went with the feature (M8C DOD-CRYPTO-AT-REST-1):
+ * proof-of-screening is asserted against the ENCRYPTED record store in the daemon integration
+ * tests, which is where the direction round-trip is now covered too.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createGatewayServer, type GatewayServerHandle } from "../server.js";
 import { LocalSidecarGatewayClient } from "../client.js";
 import type { ScreenContext } from "../types.js";
+import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 
 const ctx = (over: Partial<ScreenContext> = {}): ScreenContext => ({
   direction: "outbound",
@@ -30,7 +35,6 @@ const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix socket", () => {
   let tempDir: string;
   let sockPath: string;
-  let logPath: string;
   const servers: GatewayServerHandle[] = [];
   const clients: LocalSidecarGatewayClient[] = [];
   const rawServers: Server[] = [];
@@ -39,7 +43,6 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     tempDir = await mkdtemp(join(tmpdir(), "cello-gw-"));
     // Keep the UDS path short (macOS sun_path ~104 chars).
     sockPath = join(tempDir, "g.sock");
-    logPath = join(tempDir, "req.log");
   });
   afterEach(async () => {
     for (const c of clients) { try { await c.close(); } catch { /* ignore */ } }
@@ -50,7 +53,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
   });
 
   async function startServer(screen?: Parameters<typeof createGatewayServer>[0]["screen"]): Promise<void> {
-    const h = await createGatewayServer({ socketPath: sockPath, requestLogPath: logPath, ...(screen ? { screen } : {}) });
+    const h = await createGatewayServer({ socketPath: sockPath, ...(screen ? { screen } : {}) });
     servers.push(h);
   }
   function makeClient(deadlineMs = 5_000, path = sockPath): LocalSidecarGatewayClient {
@@ -59,7 +62,7 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     return c;
   }
 
-  it("pass-through ALLOWS and returns the original content; the request log records the screen", async () => {
+  it("pass-through ALLOWS and returns the original content", async () => {
     await startServer(); // default pass-through
     const client = makeClient();
     const content = new TextEncoder().encode("hello peer");
@@ -68,25 +71,9 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(v.disposition).toBe("allow");
     expect(v.content).toBeDefined();
     expect(Buffer.from(v.content!).toString()).toBe("hello peer");
-
-    const log = (await readFile(logPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    expect(log).toHaveLength(1);
-    expect(log[0].method).toBe("screen_outbound");
-    expect(log[0].direction).toBe("outbound");
-    expect(log[0].agentName).toBe("alice");
-    expect(log[0].bytes).toBe(content.length);
   });
 
-  it("inbound and outbound are logged distinctly with the right direction", async () => {
-    await startServer();
-    const client = makeClient();
-    await client.screenOutbound(new TextEncoder().encode("out"), ctx({ direction: "outbound" }));
-    await client.screenInbound(new TextEncoder().encode("in"), ctx({ direction: "inbound" }));
 
-    const log = (await readFile(logPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
-    expect(log.map((e) => e.direction)).toEqual(["outbound", "inbound"]);
-    expect(log.map((e) => e.method)).toEqual(["screen_outbound", "screen_inbound"]);
-  });
 
   it("a screen function can REDACT — the transformed bytes round-trip back to the daemon", async () => {
     // Proves the verdict-content plumbing later stories (M9-OUT-*) depend on.
@@ -108,7 +95,11 @@ describe("gateway sidecar: server + LocalSidecarGatewayClient over a real Unix s
     expect(v.disposition).toBe("block");
     expect(v.content).toBeUndefined();
     expect(v.reason).toBe("injection_detected");
-    expect(v.guidance).toBe("Message not sent.");
+    // The gateway's guidance reaches the daemon MARKED (review H3): the client stamps every
+    // agent-visible guidance with the provenance marker at this boundary, so the assertion is
+    // "the gateway's text arrived, and it arrived attributed" — not byte equality.
+    expect(v.guidance).toContain("Message not sent.");
+    expect(v.guidance).toContain(AFFORDANCE_PREFIX);
   });
 
   it("FAIL-CLOSED when the gateway socket does not exist — block(gateway_unavailable), and it does NOT hang", async () => {

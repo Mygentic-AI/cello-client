@@ -12,7 +12,10 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { LocalSidecarGatewayClient, spawnGatewaySidecar, type SpawnedGateway } from "@cello-protocol/gateway";
 import { startDaemon } from "../daemon.js";
+import { resolveDbKey, dbKeyPathFor } from "../sqlcipher-db.js";
 import { createDirectoryEndpointResolver } from "../directory-bootstrap.js";
 import { buildManifestDeps } from "../manifest-deps.js";
 import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
@@ -56,6 +59,88 @@ const socketPath = join(celloDir, "daemon.sock");
 const lockFilePath = join(celloDir, "daemon.lock");
 const version = process.env.CELLO_VERSION || "0.0.1";
 
+/**
+ * Bring up the security and governance layer (DOD-M9B-WIRE-1, policy D-2).
+ *
+ * THE DEFECT THIS EXISTS TO CLOSE: this function did not exist. `startDaemon` was called without a
+ * gateway, fell back to an always-allow stub, and every shipped daemon screened nothing while
+ * logging `security.gateway.connected`. The layer was fully built, unit-green and gate-green the
+ * whole time — the gate injected the client the product never did.
+ *
+ * Fail-closed, never passthrough (M9B-D12): if the sidecar cannot be spawned, the client is STILL
+ * the enforcing one. It fails closed on every call (`gateway_unavailable`, INV-6), the failure is
+ * announced, and the daemon stays up so the operator can run `cello config` / `cello policy log`
+ * against it and find out why. A dead agent with a cryptic startup error diagnoses nothing, and a
+ * silent downgrade to passthrough is the original bug wearing a hat.
+ */
+async function startSecurityLayer(correlationId?: string): Promise<{ client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined }> {
+  const socketPath = join(celloDir, "gateway.sock");
+  const client = new LocalSidecarGatewayClient({ socketPath, logger });
+
+  // The sidecar opens the encrypted store at startup, but the key file is only created when the
+  // daemon first opens its own database — which happens AFTER this. So resolve it here (M9B-D13):
+  // the same idempotent call the daemon makes, which on a fresh install is the one that generates
+  // the key. The bytes are deliberately unused; only the side effect matters, and the key never
+  // travels to the child — the child gets the PATH (M9B-D8).
+  const keyFilePath = dbKeyPathFor(join(celloDir, "sessions.db"));
+  let sidecar: SpawnedGateway | undefined;
+  try {
+    mkdirSync(celloDir, { recursive: true, mode: 0o700 });
+    resolveDbKey(join(celloDir, "sessions.db"), keyFilePath);
+    sidecar = await spawnGatewaySidecar({
+      socketPath,
+      env: {
+        CELLO_GATEWAY_STORE_DB: join(celloDir, "gateway.db"),
+        CELLO_GATEWAY_STORE_KEY_FILE: keyFilePath,
+        // Review M2: the child's own boot lines join the flow that RESTARTED it. Without this the
+        // operator sees `gateway.config.applied{correlationId}` and, on the next line, a sidecar
+        // that failed to open its store with no way to tie the two together — which is the exact
+        // correlation the config surface exists to provide.
+        ...(correlationId !== undefined ? { CELLO_GATEWAY_CORRELATION_ID: correlationId } : {}),
+      },
+    });
+    logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath, ...(correlationId !== undefined ? { correlationId } : {}) });
+    sidecar.process.once("exit", (code, signal) => {
+      // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
+      // line is how the operator learns the screening process died rather than inferring it from
+      // a wall of blocked sends.
+      logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none", ...(correlationId !== undefined ? { correlationId } : {}) });
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    // The gateway's own errors carry a code and actionable guidance; the spawner appends the
+    // child's stderr tail. Keep BOTH, and hand them to the client so every later refusal names
+    // this cause instead of the generic "could not be reached, retry" (review F2) — which points
+    // at the transport when the fault was a key file, a lock, or a stale plaintext store, and
+    // suggests a retry that can never succeed.
+    const code = (err as { code?: string } | null)?.code ?? "sidecar_spawn_failed";
+    const guidance = (err as { guidance?: string } | null)?.guidance
+      ?? "The security layer could not start, so nothing can be sent or received: every message " +
+         "fails closed. Fix the cause below and restart the daemon.";
+    logger.error("security.gateway.spawn_failed", { reason: code, error: message, guidance, ...(correlationId !== undefined ? { correlationId } : {}) });
+    client.setUnavailableCause(code, `${guidance} (cause: ${message})`);
+  }
+  return { client, sidecar };
+}
+
+/**
+ * Stop the screening sidecar. Idempotent, and safe to call when the spawn failed.
+ *
+ * An orphaned gateway holds the encrypted store's write lock against the NEXT daemon, and its
+ * stdio pipes keep this process's event loop alive — so a daemon stopped over IPC would never
+ * actually exit. Both are why this is wired into the daemon's own stop() rather than only into
+ * the signal handler.
+ */
+let securityLayer: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } | undefined;
+async function stopSecurityLayer(): Promise<void> {
+  if (!securityLayer) return;
+  await securityLayer.client.close();
+  if (securityLayer.sidecar) {
+    await securityLayer.sidecar.stop();
+    logger.info("security.gateway.stopped", {});
+  }
+}
+
 async function main(): Promise<void> {
   // M7 Keystone (Part 1): give the daemon its door to the directory. The resolver
   // discovers the directory endpoint via GET ${CELLO_DIRECTORY_URL}/bootstrap (the
@@ -79,6 +164,26 @@ async function main(): Promise<void> {
   // node pubkeys in it. Both dialers (keystone + per-agent) receive the verifier via startDaemon.
   const manifest = buildManifestDeps(logger);
 
+  // D-2: the security and governance layer runs ENFORCING in the shipped daemon. This is the line
+  // whose absence made every guard M9 built inert.
+  const security: { client: LocalSidecarGatewayClient; sidecar: SpawnedGateway | undefined } =
+    await startSecurityLayer();
+  securityLayer = security;
+
+  /**
+   * Restart the sidecar so a stored config change takes effect (M9B-D17). The gateway reads its
+   * config only at boot, so without this a confirmed loosening is recorded and does nothing.
+   * The socket path is unchanged and `LocalSidecarGatewayClient` reconnects lazily, so the client
+   * needs no involvement. A failure PROPAGATES — the caller reports stored-but-not-applied rather
+   * than telling the operator a guard changed when it did not.
+   */
+  const restartSecurityGateway = async (correlationId?: string): Promise<void> => {
+    if (security.sidecar) await security.sidecar.stop();
+    const restarted = await startSecurityLayer(correlationId);
+    security.sidecar = restarted.sidecar;
+    if (!restarted.sidecar) throw new Error("the screening process did not come back up");
+  };
+
   const handle = await startDaemon({
     celloDir,
     socketPath,
@@ -88,11 +193,17 @@ async function main(): Promise<void> {
     logger,
     directoryEndpointResolver,
     ...manifest,
+    securityGateway: security.client,
+    restartSecurityGateway,
+    onShutdown: stopSecurityLayer,
     registryPubkey: REGISTRY_SIGNER_PUBKEY,
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
 
   const shutdown = async (signal: string): Promise<void> => {
+    // handle.stop() runs onShutdown (stopSecurityLayer) for us — the teardown lives there so that
+    // `cello logout`, which stops the daemon over IPC and never reaches this handler, tears the
+    // sidecar down too.
     await handle.stop(signal);
     process.exit(0);
   };

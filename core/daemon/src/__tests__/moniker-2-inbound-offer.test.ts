@@ -12,6 +12,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -121,6 +122,7 @@ describe("MONIKER-2: inbound assignment moniker → wire-boundary validation →
     const captured: Record<string, unknown>[] = [];
     const injectRef: { inject?: (frame: unknown) => void } = {};
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),

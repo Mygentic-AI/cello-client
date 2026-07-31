@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
@@ -110,6 +111,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     logger: Logger; node: CelloNode; signalingConnect?: () => Promise<ConnectResult>; sessionNegotiator?: SessionNegotiator;
   }): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger: opts.logger, sessionNodeFactory: new FixedFactory(opts.node),
       signalingConnect: opts.signalingConnect, sessionNegotiator: opts.sessionNegotiator,

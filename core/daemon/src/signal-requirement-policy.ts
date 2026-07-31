@@ -30,6 +30,8 @@ export interface PolicyEvaluation {
   missing_types?: string[];
   missing_issuer_kind?: boolean;
   actual_count?: number;
+  /** How many active signals were excluded from the count as same-operator co-ownership (D-29). */
+  excluded_same_operator?: number;
 }
 
 /**
@@ -40,13 +42,41 @@ export interface PolicyEvaluation {
  */
 export function evaluateSignalPolicy(
   policy: SignalRequirementPolicy,
-  signals: ReadonlyArray<Pick<ReceivedSignalRow, "type" | "issuerKind" | "verdict">>,
+  signals: ReadonlyArray<Pick<ReceivedSignalRow, "type" | "issuerKind" | "verdict" | "sameOperator">>,
 ): PolicyEvaluation {
   const active = signals.filter((s) => s.verdict === "active");
 
   if (policy.min_count !== undefined && policy.min_count > 0) {
-    if (active.length < policy.min_count) {
-      return { pass: false, actual_count: active.length };
+    // ── DOD-END-COUNT-1: CO-OWNERSHIP DOES NOT COUNT TOWARD A FLOOR ────────────────────────────
+    //
+    // The attack this closes: Alice runs ten agents, has each endorse one of the others, and presents
+    // all ten. Every endorsement is genuine — properly signed, notarized, active. A naive
+    // `active.length >= min_count` passes, and Alice has manufactured standing out of her own
+    // machines.
+    //
+    // `sameOperator` is an ENVELOPE field precisely so this line can read it. A floor predicate may
+    // not open the payload — payload shape is per-type (reading it would make this function need
+    // updating for every new signal type) and the payload mixes portal-attested fields with
+    // attacker-authored text under indistinguishable keys. On the envelope the preimage is a closed
+    // set, so the flag is portal-attested by construction and cannot be forged without breaking the
+    // notarized hash.
+    //
+    // EXCLUDED, not merely discounted. These endorsements are still PRESENTED and still readable —
+    // "these two agents are the same operator" is a true and useful fact, and D-27 caps its worth at
+    // the endorser's own tier. What it must never do is help clear a COUNT, because a count is
+    // exactly the thing one operator can inflate alone.
+    const countable = active.filter((s) => s.sameOperator !== true);
+    if (countable.length < policy.min_count) {
+      // The reported count is the COUNTABLE one, and the excluded total rides alongside it. Reporting
+      // `active.length` would tell an operator they have enough when the predicate says otherwise —
+      // and reporting only the countable number would leave them unable to see why.
+      return {
+        pass: false,
+        actual_count: countable.length,
+        ...(active.length !== countable.length
+          ? { excluded_same_operator: active.length - countable.length }
+          : {}),
+      };
     }
   }
 

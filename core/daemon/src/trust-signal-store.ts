@@ -79,6 +79,8 @@ export interface WalletSignalInput {
   status: SignalStatus | string;
   /** Whether this signal is included in the default presentation bundle. When absent, derived from type suffix. */
   defaultPresent?: boolean;
+  /** Envelope slot 12 (policy D-29). Defaults false — absent means "not co-owned", never "unknown". */
+  sameOperator?: boolean;
 }
 
 export interface WalletSignalRow extends WalletSignalInput {
@@ -91,6 +93,8 @@ export interface WalletSignalRow extends WalletSignalInput {
    *  writes `!== "refused"` ships a NULL straight through as presentable. The predicate tests for
    *  exactly `accepted`, so NULL fails closed; the type must say so too. */
   consentState: ConsentState | null;
+  /** Envelope slot 12: issuer and subject are the same operator (policy D-29). */
+  sameOperator: boolean;
   /** True = included in the default presentation bundle. _id signals default false; everything else true. */
   defaultPresent: boolean;
 }
@@ -124,6 +128,24 @@ export interface ReceivedSignalInput extends Omit<WalletSignalInput, "status"> {
   verdict: SignalStatus;
 }
 
+/** The submission verbs. Mirrors protocol-types' `SubmissionOp` without importing it into storage. */
+export type SubmissionOpName = "submit" | "withdraw" | "refuse";
+
+export interface IssuedSubmissionInput {
+  agentId: string;
+  /** Content-derived sha256 of the signed body (`M10B-D20`) — the handle a withdrawal names. */
+  submissionId: string;
+  subjectPubkey: string;
+  op: SubmissionOpName;
+  intakeKeyId: string;
+  /** What the accepting node said: false = it already held this id. */
+  stored: boolean;
+}
+
+export interface IssuedSubmissionRow extends IssuedSubmissionInput {
+  submittedAt: number;
+}
+
 export interface ReceivedSignalRow extends ReceivedSignalInput {
   receivedAt: number;
 }
@@ -133,9 +155,14 @@ export interface ReceivedSignalRow extends ReceivedSignalInput {
  *
  *   issued_at / expires_at  — epoch **SECONDS**. These are ENVELOPE fields: they are HASHED, so the
  *                             protocol fixed the unit and we do not get to choose it.
- *   received_at / verified_at — epoch **MILLISECONDS** (`Date.now()`). Local bookkeeping only, never
+ *   received_at / verified_at / consent_notified_at
+ *                           — epoch **MILLISECONDS** (`Date.now()`). Local bookkeeping only, never
  *                             hashed, and matching the house convention of every other daemon table
- *                             (`contacts.added_at`, `sessions.updated_at`).
+ *                             (`contacts.added_at`, `sessions.updated_at`). A review read
+ *                             `consent_notified_at` as an outlier among "seconds" siblings and
+ *                             proposed converting it; that is backwards — it is not hashed and not
+ *                             compared against `expires_at`, so it belongs with this group. Named
+ *                             here so the next reader does not have to re-derive it.
  *
  * A factor-of-1000 error between them does not throw. Compared against a 1970 timestamp, every
  * expiry is still in the future — so the failure mode is an expired signal being cheerfully
@@ -177,6 +204,11 @@ const CREATE_WALLET_SQL = `
     -- told. Separate from consent_state because the item and the notification have different
     -- lifetimes: the decision persists until made, the nag stops once seen.
     consent_notified_at INTEGER,
+    -- M10B / DOD-END-COUNT-1. Stored because the PRESENTER must re-encode the envelope byte-identically
+    -- to what was notarized: re-encoding with the wrong value changes the hash and the recipient's
+    -- verification fails. It is also what a recipient's floor predicate reads to exclude co-ownership
+    -- endorsements from a min_count.
+    same_operator INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (signal_hash)
   );
 `;
@@ -186,6 +218,11 @@ const CREATE_RECEIVED_SQL = `
     agent_id        TEXT NOT NULL,
     contact_pubkey  TEXT NOT NULL,
     ${ENVELOPE_COLUMNS},
+    -- M10B / DOD-END-COUNT-1 — what the recipient's floor predicate reads to exclude co-ownership
+    -- from a min_count. It lives on BOTH tables and is NOT in ENVELOPE_COLUMNS, which is a wart worth
+    -- naming: the wallet needs it to re-encode the envelope byte-identically at presentation, and
+    -- this table needs it for the predicate. Same envelope field, two different reasons.
+    same_operator   INTEGER NOT NULL DEFAULT 0,
     verified_at     INTEGER NOT NULL,
     received_at     INTEGER NOT NULL,
     PRIMARY KEY (agent_id, contact_pubkey, signal_hash),
@@ -198,9 +235,43 @@ const CREATE_RECEIVED_SQL = `
  * an FK's parent at DML time, not at DDL time, so creating this first would not fail here; it would
  * fail later, on the first insert, which is a far worse place to find out.
  */
+/**
+ * What THIS daemon has SUBMITTED about other agents — the third table, and the one that was missing.
+ *
+ * The wallet holds signals ABOUT me; `contact_trust_signals` holds signals PRESENTED to me. Neither
+ * records what I SAID ABOUT SOMEONE ELSE, so an operator who endorsed a counterparty had no way to
+ * see it afterwards and — the part that matters — `DOD-END-WITHDRAW-1` had nothing to NAME: you
+ * cannot withdraw a submission whose id you never kept. The submission id is content-derived, so it
+ * is reproducible in principle, but only by re-composing the exact original body, which the operator
+ * no longer has.
+ *
+ * NO BODY IS STORED. The text was the operator's own words about a third party; keeping it here
+ * would put in the clear, on disk, the one thing the whole sealed-submission path exists to keep
+ * from being readable by anyone but the portal. The id, the subject and the verb are enough to name
+ * a submission for withdrawal, which is what this table is for.
+ */
+const CREATE_ISSUED_SQL = `
+  CREATE TABLE IF NOT EXISTS issued_submissions (
+    submission_id  TEXT NOT NULL,
+    agent_id       TEXT NOT NULL,
+    subject_pubkey TEXT NOT NULL,
+    op             TEXT NOT NULL,
+    intake_key_id  TEXT NOT NULL,
+    -- Whether the accepting node reported it as newly stored. FALSE means a node already held this
+    -- id: a benign retry, or single-node censorship, and they are indistinguishable from here.
+    stored         INTEGER NOT NULL,
+    submitted_at   INTEGER NOT NULL,
+    -- Content-derived, so the same body re-submitted is the SAME row rather than a second one. Keyed
+    -- with agent_id because two agents on one daemon can each submit about the same subject, and the
+    -- rows are per-agent facts.
+    PRIMARY KEY (agent_id, submission_id)
+  );
+`;
+
 export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): void {
   db.exec(CREATE_WALLET_SQL);
   db.exec(CREATE_RECEIVED_SQL);
+  db.exec(CREATE_ISSUED_SQL);
   // Presentation reads by subject; nothing reads by `type`, and nothing may (INV-ZERO-BUMP — an
   // index predicated on a type VALUE is a per-type construct in the schema).
   db.exec("CREATE INDEX IF NOT EXISTS idx_wallet_signals_subject ON wallet_trust_signals (subject_kind, subject)");
@@ -209,6 +280,50 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
     db.exec("ALTER TABLE wallet_trust_signals ADD COLUMN default_present INTEGER NOT NULL DEFAULT 1");
   } catch {
     // Column already exists — safe to ignore.
+  }
+  // M10B / DOD-END-COUNT-1 — additive on BOTH tables, for databases created before the slot existed.
+  //
+  // WITHOUT THESE THE UPGRADE PATH IS BROKEN, not merely incomplete: the fresh DDL above gained the
+  // column, so a NEW operator works while an EXISTING one — anyone whose wallet predates it — hits
+  // "table has no column named same_operator" on the first insert and cannot receive or present any
+  // signal at all. Adding a column to the CREATE and stopping there is the classic client-side
+  // migration miss, and it is invisible in CI because every test database is fresh.
+  //
+  // `NOT NULL DEFAULT 0` is legal for ALTER (SQLite only refuses NOT NULL with NO default), so the
+  // migrated schema is identical to the fresh one — the repo's "fresh == migrated" rule holds here,
+  // unlike `consent_state` below where it could not.
+  for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN same_operator INTEGER NOT NULL DEFAULT 0`);
+    } catch (err) {
+      // VERIFY, DO NOT ASSUME, THE FAILURE WAS "already exists".
+      //
+      // A bare swallow here rests on the assumption that duplicate-column is the ONLY way this can
+      // fail. It is not: `sqlcipher-db.ts` sets no `busy_timeout`, so SQLITE_BUSY returns immediately
+      // — and "two daemons on one DB" is a named real condition in this project, not a hypothetical.
+      // SQLITE_READONLY and SQLITE_FULL swallow identically.
+      //
+      // What that costs: the ALTER silently does not run, then `putReceivedSignal` throws "table has
+      // no column named same_operator", which is caught upstream as a WARN — so the session forms
+      // normally and NO presented signal is ever stored. On the wallet side it surfaces as a delivery
+      // rejection with no ACK, and the directory re-delivers forever. A migration that fails silently
+      // is indistinguishable from one that worked until something much later looks wrong.
+      //
+      // So re-read the schema and rethrow if the column is genuinely absent. The idempotent case
+      // stays silent; every other cause becomes loud. This mirrors `migrateWalletAddConsentState`
+      // below, which checks `PRAGMA table_info` for exactly this reason.
+      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      if (!cols.includes("same_operator")) {
+        throw new Error(
+          `failed to add same_operator to ${table} and the column is still absent — the daemon cannot ` +
+          `store or present trust signals in this state: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      // Present: the ALTER was a genuine no-op. No backfill is needed either — 0 (not co-owned) is
+      // correct for every pre-existing row, because no signal minted before the slot existed could
+      // have carried the flag.
+    }
   }
   // M10B-D14r2 — DELIBERATELY OUTSIDE the try/catch above. That swallow is safe for an idempotent
   // ALTER whose only expected failure is "already exists"; it is NOT safe for a migration with a
@@ -286,6 +401,7 @@ function toWalletRow(r: EnvelopeDbRow): WalletSignalRow {
   return {
     signalHash: r.signal_hash,
     consentState: (r as unknown as { consent_state: string }).consent_state as ConsentState,
+    sameOperator: (r as unknown as { same_operator?: number }).same_operator === 1,
     subjectKind: r.subject_kind as "account" | "agent",
     subject: r.subject,
     issuerKind: r.issuer_kind as "portal" | "agent",
@@ -338,8 +454,8 @@ export class TrustSignalStore {
         `INSERT OR IGNORE INTO wallet_trust_signals
            (signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version,
             payload, issued_at, expires_at, supersedes_hash, status, received_at, default_present,
-            consent_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            consent_state, same_operator)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         s.signalHash, s.subjectKind, s.subject, s.issuerKind, s.issuerPubkey, s.type, s.schemaVersion,
@@ -351,6 +467,7 @@ export class TrustSignalStore {
         // `portal`-issued one was minted for them, at their own action, and has no third party to
         // wait for. Written at the one insert path, and the SQL predicate fails closed regardless.
         s.issuerKind === "agent" ? "pending" : CONSENT_ACCEPTED,
+        s.sameOperator === true ? 1 : 0,
       );
     if (res.changes > 0) {
       this.#logger.info("signal.wallet.stored", {
@@ -408,6 +525,12 @@ export class TrustSignalStore {
       issuedAt: envelope.issued_at,
       expiresAt: envelope.expires_at,
       supersedesHash,
+      // THE DELIVERED FLAG, not the column default. Omitting this stored `false` for a co-owned
+      // endorsement, and the damage was not the wrong flag — it was that PRESENTATION re-encodes from
+      // this row, so the envelope bytes no longer hashed to the notarized hash and the RECIPIENT
+      // rejected a perfectly valid signal. A field dropped on the way into the wallet is silent until
+      // it surfaces one hop away as somebody else's `hash_mismatch`.
+      sameOperator: envelope.same_operator,
       status: "active",
     });
     if (inserted) {
@@ -824,13 +947,18 @@ export class TrustSignalStore {
     requireAgentPubkeyHex(agentPubkeyHex, "markConsentNotified");
     const res = this.#db
       .prepare(
+        // The predicate MUST match countUnnotifiedConsent's exactly. It did not: this omitted the
+        // status and expiry clauses, so it marked rows the counter never counted — the mark and the
+        // count drifting apart is precisely how an item goes quiet without ever being shown.
         `UPDATE wallet_trust_signals
             SET consent_notified_at = ?
           WHERE consent_state = 'pending'
             AND consent_notified_at IS NULL
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > ?)
             AND (subject_kind <> 'agent' OR lower(subject) = ?)`,
       )
-      .run(Date.now(), agentPubkeyHex);
+      .run(Date.now(), Math.floor(Date.now() / 1000), agentPubkeyHex);
     const n = Number(res.changes);
     if (n > 0) this.#logger.info("signal.consent.notified", { agentPubkey: agentPubkeyHex.slice(0, 16), count: n });
     return n;
@@ -856,14 +984,55 @@ export class TrustSignalStore {
    * when WE last re-verified, and a stale value that looked fresh would be worse than no value at
    * all (freshness is re-checked on use — M10-D4).
    */
+  /**
+   * Record a submission THIS daemon sent. Idempotent on (agent_id, submission_id): the id is
+   * content-derived, so a safe re-submit is the SAME row rather than a second one — which is what
+   * makes "re-sending is safe" true at this layer too, not just at the directory's.
+   *
+   * `stored` is UPDATED on conflict, and that direction is deliberate: a retry that finally lands as
+   * newly-stored should not keep reporting the earlier duplicate answer.
+   */
+  recordIssuedSubmission(s: IssuedSubmissionInput): void {
+    this.#db
+      .prepare(
+        `INSERT INTO issued_submissions
+           (agent_id, submission_id, subject_pubkey, op, intake_key_id, stored, submitted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (agent_id, submission_id) DO UPDATE SET stored = excluded.stored`,
+      )
+      .run(s.agentId, s.submissionId, s.subjectPubkey, s.op, s.intakeKeyId, s.stored ? 1 : 0, Date.now());
+    this.#logger.info("signal.submission.recorded", {
+      agentId: s.agentId, submissionId: s.submissionId, op: s.op, stored: s.stored,
+    });
+  }
+
+  /** What this agent has submitted, newest first. No body — see the table comment. */
+  listIssuedSubmissions(agentId: string): IssuedSubmissionRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT agent_id, submission_id, subject_pubkey, op, intake_key_id, stored, submitted_at
+           FROM issued_submissions WHERE agent_id = ? ORDER BY submitted_at DESC`,
+      )
+      .all(agentId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      agentId: String(r["agent_id"]),
+      submissionId: String(r["submission_id"]),
+      subjectPubkey: String(r["subject_pubkey"]),
+      op: String(r["op"]) as SubmissionOpName,
+      intakeKeyId: String(r["intake_key_id"]),
+      stored: r["stored"] === 1,
+      submittedAt: Number(r["submitted_at"]),
+    }));
+  }
+
   putReceivedSignal(s: ReceivedSignalInput): void {
     this.#db
       .prepare(
         `INSERT INTO contact_trust_signals
            (agent_id, contact_pubkey, signal_hash, subject_kind, subject, issuer_kind, issuer_pubkey,
-            type, schema_version, payload, issued_at, expires_at, supersedes_hash, status,
-            verified_at, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            type, schema_version, payload, issued_at, expires_at, supersedes_hash, same_operator,
+            status, verified_at, received_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (agent_id, contact_pubkey, signal_hash)
            DO UPDATE SET
              verified_at = excluded.verified_at,
@@ -878,7 +1047,13 @@ export class TrustSignalStore {
       .run(
         s.agentId, s.contactPubkey, s.signalHash, s.subjectKind, s.subject, s.issuerKind,
         s.issuerPubkey, s.type, s.schemaVersion, toBuf(s.payload), s.issuedAt, s.expiresAt,
-        s.supersedesHash, s.verdict, s.verifiedAt, Date.now(),
+        // WITHOUT THIS THE COUNT EXCLUSION IS INERT. `evaluateSignalPolicy` filters on `sameOperator`,
+        // and this insert is the ONLY way a received signal ever gets one — omitting it meant the column
+        // always took its `0` default, every received endorsement read as not-co-owned, and
+        // DOD-END-COUNT-1's ten-agents-under-one-operator defence silently did nothing in production.
+        // The unit tests did not catch it because they construct rows directly rather than arriving
+        // through this path, which is exactly the gap a store-level default hides.
+        s.supersedesHash, s.sameOperator === true ? 1 : 0, s.verdict, s.verifiedAt, Date.now(),
       );
     this.#logger.info("signal.received.stored", {
       agentId: s.agentId, signalHash: s.signalHash, type: s.type, issuerKind: s.issuerKind,

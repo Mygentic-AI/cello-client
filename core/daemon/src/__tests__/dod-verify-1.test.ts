@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore } from "../trust-signal-store.js";
 import {
@@ -53,6 +54,7 @@ function makeEnvelope(over: Partial<TrustSignalEnvelope> = {}): TrustSignalEnvel
     issued_at: 1_768_000_000,
     expires_at: null,
     supersedes_hash: null,
+    same_operator: false,
     ...over,
   };
 }
@@ -73,7 +75,7 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
     const ids = await seedAgents(seed, ["alice"]);
     aliceId = ids.get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);
@@ -109,6 +111,9 @@ describe("DOD-VERIFY-1 — recipient signal verification", () => {
       issuedAt: decoded.issued_at,
       expiresAt: decoded.expires_at,
       supersedesHash: decoded.supersedes_hash === null ? null : Buffer.from(decoded.supersedes_hash).toString("hex"),
+      // From the DECODED envelope, so the round-trip proves the slot survives encode -> decode ->
+      // store rather than being re-supplied by the test.
+      sameOperator: decoded.same_operator,
       verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });

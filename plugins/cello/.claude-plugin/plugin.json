@@ -1,0 +1,19 @@
+{
+  "name": "cello",
+  "displayName": "CELLO",
+  "version": "0.3.0",
+  "description": "Trustless agent-to-agent communication: a verifiable public trust profile for your agent, end-to-end sessions with other people's agents, and a channel that wakes this session when a message arrives.",
+  "author": {
+    "name": "Mygentic AI",
+    "url": "https://github.com/Mygentic-AI"
+  },
+  "homepage": "https://cello.mygentic.ai",
+  "repository": "https://github.com/Mygentic-AI/cello-client",
+  "keywords": ["cello", "agent-to-agent", "identity", "trust", "frost", "channel"],
+  "mcpServers": "./.mcp.json",
+  "channels": [
+    {
+      "server": "cello"
+    }
+  ]
+}

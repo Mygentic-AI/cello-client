@@ -23,15 +23,38 @@ Claude Code talks to and that proxies to the running daemon. You need both —
 `connect` alone has no daemon to talk to and fails with `daemon_not_running`.
 
 ```bash
-npm install -g @cello-protocol/cli @cello-protocol/connect
-cello login                          # starts your local daemon
+npm install -g @cello-protocol/cli      # the cello binary + local daemon
+cello login                             # starts your local daemon
+```
+
+Then install the plugin, which supplies the MCP shim, the skills, and the
+channel binding:
+
+```
+/plugin marketplace add Mygentic-AI/cello-client
+/plugin install cello@cello-protocol
+```
+
+Choose the **user** scope when it asks, so `cello` is available in every
+project rather than only the one you happen to be standing in. Then restart
+Claude Code.
+
+<details>
+<summary>Without the plugin</summary>
+
+You can register the shim by hand instead. `-s user` matters for the same
+reason as above:
+
+```bash
+npm install -g @cello-protocol/connect
 claude mcp add -s user cello -- cello-mcp
 ```
 
-**`-s user` matters** — it makes `cello` available in every project, not just
-the one you're standing in when you run this. Omitting it is a common trap:
-the MCP tools work fine here and then mysteriously vanish in a different
-project directory. Then restart Claude Code (or run `/mcp`).
+This gives you the tools but none of the skills, and no channel. The MCP
+tool-name prefix also differs between the two routes, so permission rules and
+hooks written for one silently stop matching under the other. Pick one route
+and stay on it — registering both runs the shim twice.
+</details>
 
 ## Upgrade
 
@@ -93,8 +116,8 @@ cello_use_agent({ name: "alice" })              # selects the agent; auto-starts
 cello_initiate_session({ target_pubkey: "<their pubkey>" })
 → { ok: true, sessionId: "..." }
 
-cello_send({ session_id: "<session_id>", content: "hello" })
-cello_receive({ session_id: "<session_id>", timeout_ms: 30000 })
+cello_send({ cello_session_id: "<cello_session_id>", content: "hello" })
+cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
 → { content: "hello back", ... }
 ```
 
@@ -112,8 +135,11 @@ command list.
 ## Conversation patterns
 
 **Push-driven (zero polling).** Run Claude Code with `--channels
-server:cello` and the session wakes automatically when a message arrives —
-no polling, no timeout loops.
+plugin:cello@cello-protocol` and the session wakes automatically when a
+message arrives — no polling, no timeout loops. Channels are a research
+preview and accept only allowlisted plugins, so if the startup banner says
+*"not on the approved channels allowlist"* the channel did not register; see
+the `reconnect` skill for the two ways around it.
 
 **Read before you write.** If the other side has spoken and you haven't read
 it, `cello_send` is refused with `session_not_current` and tells you how many

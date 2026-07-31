@@ -2,7 +2,8 @@
  * M9-REC-001 — local security-pass records.
  *
  * The gateway records what it did to EVERY message it screens — clean / redacted / blocked / warned —
- * in its own local DB (node:sqlite, the gateway's file, INV-4). Each record is hash-chained to the
+ * in the gateway's SQLCipher store, opened with the daemon's key (DOD-M9B-STORE-1; INV-4 as amended).
+ * Each record is hash-chained to the
  * prior one (a per-record fingerprint over the record fields + the previous fingerprint), so a NAIVELY
  * edited, deleted (mid-chain), or reordered record breaks the chain and `verifyChain()` returns false.
  * A CLEAN pass is recorded too: an ABSENT record for a delivered message is itself evidence of suppression.
@@ -16,7 +17,7 @@
  * for cross-node tamper detection is Phase-2 (M9-ATTEST-001); the fingerprint computed here is exactly
  * what gets attested, so Phase 2 is an add, not a rework.
  */
-import { DatabaseSync } from "node:sqlite";
+import { openEncryptedStoreDb, type StoreDb, type StoreEventSink } from "../store/encrypted-db.js";
 import { createHash } from "node:crypto";
 
 export type RecordDisposition = "clean" | "redact" | "block" | "warn";
@@ -67,13 +68,23 @@ function fingerprintOf(
 }
 
 export class GatewayRecordStore {
-  readonly #db: DatabaseSync;
+  readonly #db: StoreDb;
   #closed = false;
 
-  constructor(dbPath: string) {
-    this.#db = new DatabaseSync(dbPath);
-    this.#db.exec(`PRAGMA busy_timeout = 3000;`); // tolerate brief lock contention from an orphan gateway
-    this.#db.exec(DDL);
+  /** Opens (creating if absent) the encrypted store at `dbPath`, keyed by the raw 32-byte key in
+   *  `keyFilePath` — the daemon's own key file (M9B-D8/D9). Throws GatewayStoreError fail-closed. */
+  constructor(dbPath: string, keyFilePath: string, onEvent?: StoreEventSink) {
+    this.#db = openEncryptedStoreDb(dbPath, keyFilePath, onEvent);
+    try {
+      this.#db.exec(DDL);
+    } catch (err) {
+      // Review F8: the connection is already open at this point. A DDL throw — SQLITE_BUSY past the
+      // busy_timeout is reachable on a file shared with the sidecar — used to leak the native handle
+      // and cache nothing, so every retry opened another one. An fd leak against a lock-sensitive
+      // file is a slow way to make the whole store unopenable.
+      try { this.#db.close(); } catch { /* the throw below is the real error */ }
+      throw err;
+    }
   }
 
   /** Append a security-pass record for one screened message, hash-chained to the prior record. */
@@ -152,6 +163,20 @@ export class GatewayRecordStore {
       prevFingerprint = r.fingerprint;
     }
     return true;
+  }
+
+  /**
+   * Fold the WAL back into the main file WITHOUT closing (review F1/F2).
+   *
+   * The rule, MEASURED (review M1, 2026-07-30) and not inferred: the LAST connection to close
+   * unlinks `-wal`/`-shm`; a non-last close does not, and loses nothing. That still makes closing
+   * here wrong, because this process is SIGTERMed on every `cello config set` — at which point the
+   * sidecar is the only holder besides the daemon, and during the restart window a per-call daemon
+   * handle IS the last one. Checkpointing sidesteps the question entirely: nothing is unlinked,
+   * nothing is lost, and process exit releases the descriptors.
+   */
+  checkpoint(): void {
+    this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
   }
 
   close(): void {

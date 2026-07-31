@@ -17,7 +17,7 @@
  *     collapsed into plain success.
  */
 import { describe, it, expect } from "vitest";
-import { sendSealedSubmission } from "../signal-submission.js";
+import { sendSealedSubmission, fetchSubmissionResults } from "../signal-submission.js";
 import type { Logger } from "../types.js";
 
 const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
@@ -171,5 +171,87 @@ describe("DOD-END-SUBMIT-1 — failure modes that would otherwise be silent or m
     const unsent = signalingThatReplies(null, { ok: false as unknown as true, reason: "signaling_lost" } as never);
     await send(unsent);
     expect(unsent.handlers.length, "send-failure path").toBe(0);
+  });
+});
+
+// ── THE RETURN LEG (M10B-D25r2) ──────────────────────────────────────────────────────────────────
+describe("fetchSubmissionResults — collecting what happened to what I submitted", () => {
+  const opener = (out: Uint8Array | null) => ({
+    openContentSeal: async () => out,
+  });
+
+  it("carries NO identity in the request — the directory scopes by the authenticated stream", async () => {
+    // The absence IS the security property. A pubkey field would be a field to forge, and would let
+    // any agent that can dial a node collect another's outcomes.
+    const signaling = signalingThatReplies({ type: "submission_results", results: [] });
+    await fetchSubmissionResults({ signaling, keyProvider: opener(null), logger: recording, timeoutMs: 200 });
+    expect(signaling.sent).toHaveLength(1);
+    expect(Object.keys(signaling.sent[0] as Record<string, unknown>)).toEqual(["type"]);
+  });
+
+  it("opens a sealed refusal message with k_local", async () => {
+    const signaling = signalingThatReplies({
+      type: "submission_results",
+      results: [{
+        submission_id: "cd".repeat(32), outcome: "refused", reason: "subject_refused",
+        signal_hash: "ef".repeat(32), ciphertext: new Uint8Array([9, 9, 9]), created_at: "2026-07-30T00:00:00Z",
+      }],
+    });
+    const res = await fetchSubmissionResults({
+      signaling, keyProvider: opener(new TextEncoder().encode("Please drop the migration claim.")),
+      logger: recording, timeoutMs: 200,
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.results[0].outcome).toBe("refused");
+    expect(res.results[0].message, "the subject's own words, decrypted").toBe("Please drop the migration claim.");
+  });
+
+  it("keeps the OUTCOME when the message will not open", async () => {
+    // A key problem must not hide a refusal. The outcome and reason are still true and still the
+    // thing the issuer most needs — dropping the row would report "nothing happened" instead.
+    const signaling = signalingThatReplies({
+      type: "submission_results",
+      results: [{
+        submission_id: "cd".repeat(32), outcome: "refused", reason: "subject_refused",
+        signal_hash: null, ciphertext: new Uint8Array([9, 9, 9]), created_at: "2026-07-30T00:00:00Z",
+      }],
+    });
+    const res = await fetchSubmissionResults({ signaling, keyProvider: opener(null), logger: recording, timeoutMs: 200 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.results, "the row survives").toHaveLength(1);
+    expect(res.results[0].outcome).toBe("refused");
+    expect(res.results[0].message, "but the message is absent, not invented").toBeNull();
+    expect(events.some((e) => e.event === "signal.results.seal_unopenable"), "and it is said out loud").toBe(true);
+  });
+
+  it("DROPS a row with no id or outcome, loudly — there is nothing to correlate it against", async () => {
+    const signaling = signalingThatReplies({
+      type: "submission_results",
+      results: [{ outcome: "refused" }, { submission_id: "cd".repeat(32) }],
+    });
+    const res = await fetchSubmissionResults({ signaling, keyProvider: opener(null), logger: recording, timeoutMs: 200 });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.results).toHaveLength(0);
+    expect(events.filter((e) => e.event === "signal.results.malformed_row")).toHaveLength(2);
+  });
+
+  it("NAMES a timeout rather than reporting an empty result set", async () => {
+    // Silence and "you have no outcomes" are the same shape otherwise — and the wrong one of those
+    // is what an operator waiting on a refusal would be told.
+    const signaling = signalingThatReplies(null);
+    const res = await fetchSubmissionResults({ signaling, keyProvider: opener(null), logger: recording, timeoutMs: 60 });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toBe("submission_results_timeout");
+    expect(res.guidance, "and says the outcomes are still held").toMatch(/still held/i);
+  });
+
+  it("unregisters its handler on every path", async () => {
+    const signaling = signalingThatReplies(null);
+    await fetchSubmissionResults({ signaling, keyProvider: opener(null), logger: recording, timeoutMs: 60 });
+    expect(signaling.handlers, "a leaked handler accumulates on a shared stream").toHaveLength(0);
   });
 });

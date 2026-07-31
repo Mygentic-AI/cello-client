@@ -31,10 +31,15 @@ import {
 import { splitAgentFlag } from "./arg-parse.js";
 import {
   IPC_METHODS,
+  listSessions,
   contactAdd,
   contactRemove,
   contactList,
   contactSetTier,
+  contactSetSignal,
+  consentList,
+  consentAccept,
+  consentRefuse,
   contactSetAway,
   listAgents,
   startAgent,
@@ -53,6 +58,10 @@ import {
   awaitSession,
   settingsGet,
   settingsSet,
+  gatewayConfigList,
+  gatewayConfigGet,
+  gatewayConfigSet,
+  policyLog,
   monikerSet,
 } from "./parity-commands.js";
 
@@ -97,6 +106,10 @@ export const GROUP_ORDER = [
   "Sessions & receipts",
   "Contacts",
   "Trust & endorsements",
+  // The security and governance layer's own surfaces. Its own group because burying them under
+  // "Other" is how an operator fails to find the one command that unblocks a misfiring guard —
+  // and how an agent that hits that guard has nothing concrete to relay.
+  "Security",
   "Other",
 ] as const;
 
@@ -680,13 +693,19 @@ export const COMMANDS: readonly CommandSpec[] = [
     group: "Sessions & receipts",
     summary: "List your sessions (open by default; --all/--closed/--failed to filter).",
     help:
-      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N]  — list session history (defaults to open).",
+      "Usage: cello sessions [--open|--closed|--failed|--all] [--limit N] [--agent <name>] [--all-agents]\n" +
+      "  Lists the SELECTED agent's session history (defaults to open). --all filters by status;\n" +
+      "  --all-agents lists every agent's sessions on this daemon, each row labelled with its agent.",
     flags: [
       { name: "--open" },
       { name: "--closed" },
       { name: "--failed" },
       { name: "--all" },
       { name: "--limit", consumesValue: true },
+      // DOD-CLI-SESSIONS-SCOPE-1: `--all` filters by STATUS; `--all-agents` widens the PRINCIPAL.
+      // Two different axes that both read as "all" in a hurry — hence the explicit suffix.
+      { name: "--all-agents" },
+      ...AGENT_FLAG,
     ],
     async run(ctx, args) {
       let filter: SessionFilter | undefined;
@@ -700,7 +719,13 @@ export const COMMANDS: readonly CommandSpec[] = [
         const n = Number(args[limitIdx + 1]);
         if (Number.isFinite(n) && n > 0) limit = Math.floor(n);
       }
-      return legacy(await sessions(ctx.celloDir, { filter, limit }));
+      // Scoped to the selected agent, like the MCP tool. --all-agents opts into the daemon-wide
+      // view, which cannot be agent-scoped and therefore takes the non-parity path.
+      if (args.includes("--all-agents")) {
+        return legacy(await sessions(ctx.celloDir, { filter, limit }));
+      }
+      const { agent, pretty } = parityOpts(args);
+      return listSessions(ctx.celloDir, { filter, limit, agent, pretty });
     },
   },
   {
@@ -793,6 +818,11 @@ export const COMMANDS: readonly CommandSpec[] = [
       "                              A higher tier RAISES their limits; it never removes the caps.\n" +
       "                              It does NOT change content screening — that is not yet active.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
+      "    set-signal <hash> on|off|clear\n" +
+      "                              show or withhold ONE trust signal from THIS person. 'clear'\n" +
+      "                              removes the choice (the signal's own default applies again) —\n" +
+      "                              which is not the same as 'off'. Can only narrow: it never\n" +
+      "                              presents something you have not accepted.\n" +
       "    set-moniker <name>        YOUR pet name for THEM (empty clears it). Always wins over the\n" +
       "                              name they offer — the one thing they cannot spoof.\n" +
       "\n" +
@@ -818,6 +848,14 @@ export const COMMANDS: readonly CommandSpec[] = [
         const message = positional.slice(2).join(" ");
         return contactSetAway(ctx.celloDir, pubkey, message.length > 0 ? message : null, o);
       }
+      if (op === "set-signal") {
+        // `cello contact <pubkey> set-signal <hash> <on|off|clear>`. Three words, because there are
+        // three states: shown, withheld, and no-opinion. A boolean flag could not express the third.
+        const [hash, choice] = positional.slice(2);
+        const present = choice === "on" ? true : choice === "off" ? false : choice === "clear" ? null : undefined;
+        if (!hash || present === undefined) return { stdout: helpForSpec("contact"), stderr: "", exitCode: 1 };
+        return contactSetSignal(ctx.celloDir, pubkey, hash, present, o);
+      }
       if (op === "set-moniker") {
         // Empty → null clears it, mirroring the tool.
         const moniker = positional.slice(2).join(" ");
@@ -835,6 +873,8 @@ export const COMMANDS: readonly CommandSpec[] = [
     flags: [{ name: "--all" }],
     help:
       "Usage:\n" +
+      "  cello trust-signals issue <pubkey> <text…>\n" +
+      "                                        — vouch for a counterparty in your own words\n" +
       "  cello trust-signals list              — show every signal (type, hash, status, default, issued)\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
@@ -860,7 +900,100 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
 
+  {
+    name: "consent",
+    group: "Trust & endorsements",
+    summary: "Decide on trust signals OTHERS have issued about you (accept or refuse).",
+    help:
+      "Usage:\n" +
+      "  cello consent list                    — signals others issued about you, awaiting your decision\n" +
+      "  cello consent accept <hash>           — accept one: it becomes presentable to counterparties\n" +
+      "  cello consent refuse <hash> [why…]    — refuse one: it stays inert and is never presented.\n" +
+      "                                          Anything after the hash is a message back to the issuer\n" +
+      "                                          (optional). With no message they are told nothing.\n" +
+      "\n" +
+      "Anyone can write an endorsement ABOUT your agent — it lands in your wallet unbidden. It is INERT\n" +
+      "until you accept it: nothing pending is presented, counted, or visible to a counterparty. That is\n" +
+      "the point of this command. Read the endorser's words in 'list' before accepting, because\n" +
+      "accepting is what puts your name behind someone else's claim about you.\n" +
+      "\n" +
+      "Refusing is not a deletion — the record stays so the decision is auditable — but a refused signal\n" +
+      "is indistinguishable from one that was never issued, everywhere it is checked.\n" +
+      "\n" +
+      "These act on the SELECTED agent and take no --agent flag: consent is a statement about oneself,\n" +
+      "and one agent does not accept on another's behalf. Select with 'cello use-agent <name>'.",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      const o = { pretty };
+      const [sub, hash] = positional;
+      if (sub === "list") return consentList(ctx.celloDir, o);
+      if (sub === "accept" && hash) return consentAccept(ctx.celloDir, hash, o);
+      if (sub === "refuse" && hash) {
+        // Everything after the hash is the message — free text, so it is joined rather than parsed.
+        const msg = positional.slice(2).join(" ");
+        return consentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
+      }
+      return { stdout: helpForSpec("consent"), stderr: "", exitCode: 1 };
+    },
+  },
+
   // ═══ Other ══════════════════════════════════════════════════════════════════════════════════
+  {
+    name: "policy",
+    group: "Security",
+    summary: "Show what the security layer did to your messages — newest first.",
+    help:
+      "Usage: cello policy log [--limit <n>] [--since <ms-epoch>]\n" +
+      "  Every screened message and what happened to it: clean, redacted, blocked or warned, with\n" +
+      "  the rule that fired and the correlation id. This is how you tell whether\n" +
+      "  a new failure came from the security layer or from something else — it is a lookup, not a\n" +
+      "  guess. Default 50 entries, max 500. `chainValid: false` means the log itself was tampered\n" +
+      "  with; do not reason from its contents until that is explained.\n" +
+      "  Example:  cello policy log --limit 20",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      if (positional[0] !== "log") return { stdout: helpForSpec("policy"), stderr: "", exitCode: 1 };
+      const { value: limitRaw } = takeValueFlag(positional, "--limit");
+      const { value: sinceRaw } = takeValueFlag(positional, "--since");
+      const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
+      const sinceMs = sinceRaw !== undefined ? Number(sinceRaw) : undefined;
+      return policyLog(ctx.celloDir, {
+        pretty,
+        ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+        ...(sinceMs !== undefined && Number.isFinite(sinceMs) ? { sinceMs } : {}),
+      });
+    },
+  },
+  {
+    name: "config",
+    group: "Security",
+    summary: "Read or change the security layer's guards (screening, redaction, rate limits).",
+    help:
+      "Usage: cello config list | cello config get <key> | cello config set <key> <value>\n" +
+      "  The security layer's own guards. Per-INSTALL, not per-agent — they apply to every agent here.\n" +
+      "  Keys: autonomous_override (true|false), pii_whitelist (comma-separated, empty string clears),\n" +
+      "        language_allow (comma-separated), rate_max_per_window (number, 0 = no cap), rate_window_ms.\n" +
+      "  TIGHTENING a guard applies immediately. LOOSENING one asks you to confirm at the terminal —\n" +
+      "  there is no --yes flag, because a flag a script can pass is not a human. Every change is\n" +
+      "  versioned and hash-chained; 'list' shows the version, the direction, and whether a human\n" +
+      "  confirmed it. Example:  cello config set pii_whitelist me@example.com",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, positional } = parityOpts(args);
+      const opts = { pretty };
+      const [sub, key, ...rest] = positional;
+      if (sub === "list") return gatewayConfigList(ctx.celloDir, opts);
+      if (sub === "get" && key) return gatewayConfigGet(ctx.celloDir, key, opts);
+      // The value is the REST of the line joined, so a comma-separated list survives a shell that
+      // split it on spaces (`pii_whitelist a@x.example, b@x.example`).
+      if (sub === "set" && key && rest.length > 0) {
+        return gatewayConfigSet(ctx.celloDir, key, rest.join(" "), opts);
+      }
+      return { stdout: helpForSpec("config"), stderr: "", exitCode: 1 };
+    },
+  },
   {
     name: "settings",
     group: "Other",

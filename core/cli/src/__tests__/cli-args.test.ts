@@ -10,7 +10,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
-import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS } from "../cli-args.js";
+import { USAGE, helpForCommand, checkArgs, splitAgentFlag, KNOWN_COMMANDS, topLevelFlag } from "../cli-args.js";
 
 describe("F1: usage string lists every command", () => {
   it("mentions refresh and receipts (previously missing) alongside the rest", () => {
@@ -51,9 +51,9 @@ describe("F1: usage string lists every command", () => {
         // Contacts
         "contacts", "contact",
         // Trust & endorsements
-        "trust-signals",
+        "trust-signals", "consent",
         // Other
-        "settings", "moniker", "telegram", "bridge",
+        "settings", "moniker", "telegram", "bridge", "config", "policy",
       ].sort(),
     );
   });
@@ -183,5 +183,59 @@ describe("F2: unknown flags are rejected, not coerced to positionals", () => {
   it("plain positionals pass through untouched", () => {
     expect(checkArgs("register-agent", ["alice", "token-123"])).toEqual({ kind: "ok" });
     expect(checkArgs("refresh", ["alice"])).toEqual({ kind: "ok" });
+  });
+
+  // M10B / DOD-END-SURFACE-1 F8 — verbs that take FREE PROSE.
+  describe("the `--` terminator protects prose from flag parsing", () => {
+    it("a dash-leading token after `--` is text, not an unknown flag", () => {
+      // "cut p99 by -30ms" is a perfectly ordinary thing to write in an endorsement.
+      expect(checkArgs("trust-signals", ["issue", "ab", "--", "cut", "p99", "by", "-30ms"]))
+        .toEqual({ kind: "ok" });
+    });
+
+    it("`-h` after `--` does NOT hijack the command into printing help", () => {
+      // This was the surprising half: the terminator was honoured for unknown flags and ignored for
+      // help, so mentioning a flag in prose silently replaced the operator's action with a help page.
+      expect(checkArgs("trust-signals", ["issue", "ab", "--", "she", "explained", "the", "-h", "flag"]))
+        .toEqual({ kind: "ok" });
+    });
+
+    it("still reports help when `-h` comes BEFORE any terminator", () => {
+      // The counterpart. Without this, "fixing" the above by deleting the help check entirely would
+      // pass — and `cello trust-signals -h` would stop working.
+      expect(checkArgs("trust-signals", ["issue", "-h"])).toEqual({ kind: "help" });
+      expect(checkArgs("trust-signals", ["-h", "--", "text"])).toEqual({ kind: "help" });
+    });
+
+    it("still rejects an unknown flag that appears BEFORE the terminator", () => {
+      expect(checkArgs("trust-signals", ["issue", "--bogus", "--", "text"]))
+        .toEqual({ kind: "unknown_flag", flag: "--bogus" });
+    });
+  });
+
+});
+
+// `cello --version` printed the whole help text and exited 1 — it was dispatched as an unknown
+// COMMAND. It is the first thing anyone runs to check an install, so it answered by looking broken
+// while being fine; `--help` had the same shape (right output, exit 1, which is what a script reads).
+describe("top-level flags are flags, not unknown commands", () => {
+  it("recognises --version/-v and --help/-h", () => {
+    expect(topLevelFlag("--version")).toBe("version");
+    expect(topLevelFlag("-v")).toBe("version");
+    expect(topLevelFlag("--help")).toBe("help");
+    expect(topLevelFlag("-h")).toBe("help");
+  });
+
+  it("claims nothing else — a real command and a genuine typo both still dispatch normally", () => {
+    for (const c of ["status", "sessions", "--versio", "-V", "version", "", undefined]) {
+      expect(topLevelFlag(c), `${String(c)} must not be treated as a top-level flag`).toBeUndefined();
+    }
+  });
+
+  it("does not shadow a command of the same name — none of these are dispatchable commands", () => {
+    // If a command named `--help` ever existed, answering the flag first would silently shadow it.
+    for (const c of ["--version", "-v", "--help", "-h"]) {
+      expect(KNOWN_COMMANDS.has(c)).toBe(false);
+    }
   });
 });

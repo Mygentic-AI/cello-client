@@ -72,6 +72,20 @@ export interface TrustSignalEnvelope {
   payload: Uint8Array;
   /** Integer epoch SECONDS. */
   issued_at: number;
+  /**
+   * Co-ownership: the issuer and the subject are the SAME OPERATOR (policy D-29).
+   *
+   * ON THE ENVELOPE, not in the payload, and that placement is the whole point. A recipient's floor
+   * predicate must exclude these from a `min_count` — otherwise ten agents under one operator
+   * manufacture standing — and a floor predicate may only read the envelope. It cannot read the
+   * payload for two reasons: payload shape is per-TYPE (so reading it makes the predicate need
+   * updating for every new signal type, breaking INV-ZEROBUMP), and the payload mixes
+   * portal-attested fields with attacker-authored text under indistinguishable CBOR keys.
+   *
+   * Here it is unambiguous: the preimage is a CLOSED set, so this slot is portal-attested by
+   * construction and cannot be forged without breaking the notarized hash.
+   */
+  same_operator: boolean;
   /** Integer epoch SECONDS, or null for a signal that never expires. */
   expires_at: number | null;
   /** The 32-byte hash this envelope replaces, or null for a first mint. */
@@ -91,6 +105,10 @@ const PREIMAGE_FIELDS = [
   "issued_at",
   "expires_at",
   "supersedes_hash",
+  // M10B / DOD-END-COUNT-1 — APPENDED, never inserted. Field order IS the wire format: putting this
+  // anywhere but the end would change the preimage of every existing field position and invalidate
+  // every signature already made.
+  "same_operator",
 ] as const;
 
 /** Sanity bound on epoch-SECOND timestamps. A millisecond timestamp (~1.7e12) is the classic
@@ -271,7 +289,9 @@ function toPreimage(envelope: TrustSignalEnvelope): unknown[] {
   }
 
   // FIXED ORDER. Element 0 is the domain tag; the nullable slots keep their position so arity is
-  // always 11 and no field can be mistaken for another (M10-D17).
+  // always 12 and no field can be mistaken for another (M10-D17). `same_operator` is APPENDED —
+  // inserting it anywhere earlier would shift every later field's position and invalidate every
+  // signature already made over this shape.
   return [
     TRUST_SIGNAL_DOMAIN,
     subject_kind,
@@ -284,6 +304,9 @@ function toPreimage(envelope: TrustSignalEnvelope): unknown[] {
     issuedAt,
     expiresAt,
     supersedes_hash,
+    // Always a boolean, never absent: a predicate deciding whether this counts toward a floor must
+    // not have to distinguish "not same-operator" from "field missing".
+    envelope.same_operator === true,
   ];
 }
 
@@ -325,7 +348,7 @@ export function verifyTrustSignalHash(envelope: TrustSignalEnvelope, expected: U
  * Decode canonical envelope bytes back into the envelope — the inverse of `encodeTrustSignalEnvelope`,
  * and the ONE decoder every party shares (INV-CANONICAL / M10-D7 — the holder's daemon that RECEIVES a
  * delivered signal must decode with the SAME code the directory and portal encode with, never a vendored
- * copy). The preimage is a fixed-order 11-element ARRAY (M10-D15); element 0 is the domain tag.
+ * copy). The preimage is a fixed-order 12-element ARRAY (M10-D15); element 0 is the domain tag.
  *
  * REFUSES anything that is not EXACTLY canonical: it re-encodes the decoded envelope with
  * `encodeTrustSignalEnvelope` and compares the bytes to the input. If they differ — a number that came
@@ -343,13 +366,13 @@ export function verifyTrustSignalHash(envelope: TrustSignalEnvelope, expected: U
  */
 export function decodeTrustSignalEnvelope(bytes: Uint8Array): TrustSignalEnvelope {
   const arr = decodeCbor(bytes);
-  if (!Array.isArray(arr) || arr.length !== 11) {
+  if (!Array.isArray(arr) || arr.length !== 12) {
     throw new Error(
-      `trust-signal envelope must be an 11-element CBOR array (the fixed preimage), got ` +
+      `trust-signal envelope must be a 12-element CBOR array (the fixed preimage), got ` +
       `${Array.isArray(arr) ? `${arr.length} elements` : typeof arr}`,
     );
   }
-  const [domain, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version, payload, issued_at, expires_at, supersedes_hash] =
+  const [domain, subject_kind, subject, issuer_kind, issuer_pubkey, type, schema_version, payload, issued_at, expires_at, supersedes_hash, same_operator] =
     arr as unknown[];
   if (domain !== TRUST_SIGNAL_DOMAIN) {
     throw new Error(`trust-signal envelope domain tag is '${String(domain)}', expected '${TRUST_SIGNAL_DOMAIN}' — not a trust-signal envelope`);
@@ -374,6 +397,10 @@ export function decodeTrustSignalEnvelope(bytes: Uint8Array): TrustSignalEnvelop
     issued_at: Number(issued_at),
     expires_at: expires_at === null || expires_at === undefined ? null : Number(expires_at),
     supersedes_hash: supersedes_hash === null || supersedes_hash === undefined ? null : asBytes(supersedes_hash, "supersedes_hash"),
+    // STRICT: anything that is not exactly `true` is false. A truthy non-boolean would let two
+    // implementations disagree about whether a signal counts, which is a split-brain on a policy
+    // decision rather than a formatting nicety.
+    same_operator: same_operator === true,
   };
   // Canonical check: re-encode with the SAME encoder every party runs and compare EXACTLY.
   const reencoded = encodeTrustSignalEnvelope(env);

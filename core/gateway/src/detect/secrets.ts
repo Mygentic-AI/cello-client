@@ -18,6 +18,15 @@ import { GITLEAKS_RULES, GITLEAKS_STOPWORDS, GITLEAKS_ALLOW_REGEXES } from "./gi
 interface CompiledRule { id: string; re: LinearRegex; keywords: string[]; entropy: number }
 
 let RULES: CompiledRule[] | null = null;
+
+/**
+ * The ids of the secret rules that ACTUALLY COMPILED — see `injectionPatternIds` for why the active
+ * set rather than the source list. `compileSecretRules` deliberately skips a rule that will not
+ * compile under RE2, so the two can differ, and the digest must follow what is really running.
+ */
+export function secretRuleIds(): string[] | null {
+  return RULES === null ? null : RULES.map((r) => r.id);
+}
 let STOPWORDS: string[] = [];
 let ALLOW: LinearRegex[] = [];
 

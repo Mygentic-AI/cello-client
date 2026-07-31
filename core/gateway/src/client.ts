@@ -19,7 +19,8 @@ import {
   type WireScreenRequest,
   type WireScreenResponse,
 } from "./protocol.js";
-import { failClosedVerdict, GOVERNANCE_TIMEOUT, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
+import { withProvenance } from "./screen/affordance.js";
+import { failClosedVerdict, GOVERNANCE_TIMEOUT, type GatewayMode, type ScreenContext, type ScreenVerdict, type SecurityGatewayClient } from "./types.js";
 import type { GatewayLogger } from "./server.js";
 
 const NOOP_LOGGER: GatewayLogger = { info() {}, warn() {}, error() {} };
@@ -40,6 +41,12 @@ export interface LocalSidecarGatewayClientOptions {
 }
 
 export class LocalSidecarGatewayClient implements SecurityGatewayClient {
+  /**
+   * `enforcing` — and it stays `enforcing` even when the socket is down, because a client whose
+   * gateway is unreachable does not start allowing content: it fails closed (`gateway_unavailable`).
+   * The mode describes what this client DOES with content, not whether the socket happens to be up.
+   */
+  readonly mode: GatewayMode = "enforcing";
   readonly #socketPath: string;
   readonly #deadlineMs: number;
   readonly #logger: GatewayLogger;
@@ -49,10 +56,30 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
   #nextId = 1;
   #closed = false;
 
+  /**
+   * Why the gateway is unreachable, when the composition root already knows (review F2).
+   *
+   * Without this, a sidecar that never started surfaced as `gateway_unavailable` on every message
+   * — an exit-point label that says "the transport failed, check the gateway is running and
+   * retry". But the gateway is not running and never will be, retrying can never work, and the
+   * actual cause (a missing key file, a store locked by an orphan, a leftover plaintext store, a
+   * missing binary) was logged once at boot and then thrown away. The spawner already captures
+   * the child's coded, guided stderr; this is where it survives to the operator.
+   */
+  #unavailable: { reason: string; guidance: string } | undefined;
+
   constructor(opts: LocalSidecarGatewayClientOptions) {
     this.#socketPath = opts.socketPath;
     this.#deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
     this.#logger = opts.logger ?? NOOP_LOGGER;
+  }
+
+  /**
+   * Record why the sidecar could not be started, so every later refusal names THAT rather than the
+   * generic unreachable label. Called by the composition root when the spawn fails.
+   */
+  setUnavailableCause(reason: string, guidance: string): void {
+    this.#unavailable = { reason, guidance };
   }
 
   screenOutbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict> {
@@ -88,6 +115,12 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
         direction,
         error: err instanceof Error ? err.message : String(err),
       });
+      // The known cause wins over the generic one (F2): "your daemon key file is missing" sends
+      // the operator to the right place; "the gateway could not be reached, retry" does not.
+      if (this.#unavailable) {
+        const verdict = failClosedVerdict(direction, this.#unavailable.reason);
+        return { ...verdict, guidance: withProvenance(this.#unavailable.guidance) };
+      }
       return failClosedVerdict(direction);
     }
 
@@ -199,7 +232,10 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
       verdict.content = Buffer.from(wire.content, "base64");
     }
     if (wire.reason !== undefined) verdict.reason = wire.reason;
-    if (wire.guidance !== undefined) verdict.guidance = wire.guidance;
+    // Review H3: mark it HERE, not at each of the eight producers. This is the one point every
+    // agent-visible verdict crosses, so "every guidance carries the marker" is structural rather
+    // than a rule each new guard has to remember (and F10 shipped with four producers that hadn't).
+    if (wire.guidance !== undefined) verdict.guidance = withProvenance(wire.guidance);
     if (wire.events !== undefined) verdict.events = wire.events;
     if (wire.terminal !== undefined) verdict.terminal = wire.terminal;
     pending.resolve(verdict);

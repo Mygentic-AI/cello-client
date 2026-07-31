@@ -46,6 +46,50 @@ const SSN_RE = /\b\d{3}-\d{2}-\d{4}\b/g;
 const CC_RE = /\b(?:\d[ -]?){13,19}\b/g;
 const PHONE_RE = /\+?\d[\d\s().-]{7,}\d/g;
 
+/**
+ * A DATE IS NOT A PHONE NUMBER, and agents write dates constantly.
+ *
+ * `PHONE_RE` includes `-` in its character class, so `2026-07-29` matches it — and because the PII
+ * disposition is WARN, the message is NOT SENT until the operator resolves the flag. Reported from
+ * live use within hours of the enforcing flip (2026-07-29): an agent citing a date had its message
+ * refused twice and could not clear it itself, because `allow_once` is gated on
+ * `autonomous_override`, which is off by default and settable only by a human at a terminal.
+ *
+ * The exclusions below are shapes that CANNOT be a phone number, so nothing real is weakened:
+ *   - ISO 8601 dates and datetimes — `2026-07-29`, `2026-07-29T18:33:51`.
+ *   - Digit runs longer than 15, which exceeds the E.164 maximum.
+ *
+ * Deliberately NOT excluded: bare 11-13 digit runs like a commit number or an epoch timestamp.
+ * Those overlap the legitimate phone range (a country-code number is 11 digits), and silently
+ * passing them would weaken the guard to fix an annoyance. They still warn, and that is the correct
+ * trade — but it is why the operator escape hatch has to work.
+ */
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/;
+
+/**
+ * A date is not a phone number — but a date FOLLOWED BY one is still a phone number.
+ *
+ * `PHONE_RE`'s character class contains space, `-`, `(`, `)` and `.`, so `2026-07-29 415-555-2671`
+ * is ONE greedy match. The first version of this predicate tested `ISO_DATE_RE` (start-anchored,
+ * no `$`) against the whole match and discarded it — so prefixing eleven characters walked a real
+ * phone number straight past the guard. Review finding F3, and it was a security regression I
+ * introduced while fixing a false positive.
+ *
+ * So: strip a leading ISO date if there is one, then judge WHAT REMAINS. A bare date has nothing
+ * left and is not a phone; a date plus a number still has the number.
+ *
+ * The former ">15 digits cannot be a phone" rule is GONE (F4): `4155552671000000` is a real
+ * number with six zeros stapled on, and it passed. The reported false positive was dates, never
+ * long ids, so the rule bought nothing and cost a covert channel.
+ */
+function isPlausiblePhone(value: string): boolean {
+  const trimmed = value.trim();
+  const remainder = trimmed.replace(ISO_DATE_RE, "");
+  // Nothing but a date -> not a phone. Anything left -> judge the remainder on its own merits.
+  const digits = remainder.replace(/\D/g, "");
+  return digits.length >= 7;
+}
+
 function flagIdFor(category: string, value: string): string {
   return createHash("sha256").update(`${category}:${value}`).digest("hex").slice(0, 12);
 }
@@ -108,7 +152,7 @@ export class OutboundPIIScreener {
     collect(IP_RE, "pii:ip", 1, validIp);
     collect(SSN_RE, "pii:ssn", 2, () => true);
     collect(CC_RE, "pii:credit_card", 3, (v) => luhnValid(v.replace(/[^0-9]/g, "")));
-    collect(PHONE_RE, "pii:phone", 4, (v) => v.replace(/\D/g, "").length >= 7);
+    collect(PHONE_RE, "pii:phone", 4, isPlausiblePhone);
 
     // Resolve overlaps: a higher-priority (more specific) match wins its character span.
     candidates.sort((a, b) => a.priority - b.priority || a.start - b.start);

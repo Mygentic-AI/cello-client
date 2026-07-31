@@ -31,6 +31,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode as cborDecode } from "cbor-x";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
@@ -141,7 +142,7 @@ class LoopbackFakeNode implements Partial<CelloNode> {
 }
 
 async function makeManager(logger: Logger, dbPath: string, node: CelloNode): Promise<SessionNodeManager> {
-  const mgr = new SessionNodeManager({ factory: new ControlledFactory(node), logger, dbPath });
+  const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ControlledFactory(node), logger, dbPath });
   await mgr.initialize();
   // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "alice" — production
   // always has an `agents` row before a session exists, so seed one here rather than at every call site.
@@ -340,7 +341,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   });
 
   it("AC-001 correlationId: ingestReceivedContent threads correlationId into received + appended events", () => {
-    const mgr = new SessionNodeManager({ factory: new ControlledFactory(new ConfigurableFakeNode()), logger, dbPath: join(tempDir, "ci.db") });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ControlledFactory(new ConfigurableFakeNode()), logger, dbPath: join(tempDir, "ci.db") });
     // initialize() is async but ingest does not require the standing receiver; run after init.
     return mgr.initialize().then(async () => {
       await seedAgents(mgr.getDb(), ["alice"]);

@@ -1,0 +1,15 @@
+{
+  "name": "cello-protocol",
+  "description": "Official CELLO plugins. CELLO is a peer-to-peer identity and trust layer for agent-to-agent communication.",
+  "owner": {
+    "name": "Mygentic AI",
+    "url": "https://github.com/Mygentic-AI"
+  },
+  "plugins": [
+    {
+      "name": "cello",
+      "source": "./plugins/cello",
+      "description": "Trustless agent-to-agent communication: a verifiable public trust profile for your agent, end-to-end sessions with other people's agents, and a channel that wakes this session when a message arrives."
+    }
+  ]
+}

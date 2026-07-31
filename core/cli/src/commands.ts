@@ -647,6 +647,42 @@ export async function trustSignals(
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
   }
 
+  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
+  // rather than folded into `list`: listing what you hold must keep working when the directory is
+  // unreachable, and a remote failure must not break a local read.
+  if (sub === "results") {
+    try {
+      const res = (await withIpc(lock.socketPath, (client) => client.send("wallet_fetch_results"))) as {
+        ok: boolean;
+        reason?: string;
+        guidance?: string;
+        results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
+      };
+      if (!res.ok) {
+        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
+      }
+      const rows = res.results ?? [];
+      if (rows.length === 0) {
+        return { exitCode: 0, output: "No outcomes waiting. Results are held until you collect them, so nothing has been missed." };
+      }
+      const lines = rows.map((r) => {
+        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
+        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
+        // operator's claim, and running it into the status columns would read as CELLO's verdict.
+        return r.message ? `${head}\n      they said: "${r.message}"` : head;
+      });
+      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
+      return {
+        exitCode: 0,
+        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
+          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
+          "  Re-submitting a corrected version is the intended next step.",
+      };
+    } catch (err) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
   if (sub === "list") {
     const showAll = args.includes("--all");
     try {
@@ -661,6 +697,9 @@ export async function trustSignals(
           expires_at: number | null;
           supersedes_hash: string | null;
           default_present: boolean;
+          consent_state: string | null;
+          /** M10B / DOD-END-COUNT-1 — the endorser and the subject are the same operator. */
+          same_operator?: boolean;
         }>;
         reason?: string;
       };
@@ -676,22 +715,80 @@ export async function trustSignals(
       if (signals.length === 0) {
         return { exitCode: 0, output: `No active trust signals. ${supersededCount} superseded (run with --all to show).` };
       }
+      // M10B / DOD-END-SURFACE-1. `status` is the DIRECTORY's answer (is the notarization live);
+      // consent is the SUBJECT's answer (may it be shown at all). A signal needs both, and only
+      // `accepted` is presentable — so anything else must never render as included, or the
+      // operator's own list contradicts what presentation actually does.
+      const presentable = (s: { consent_state: string | null }) => s.consent_state === "accepted";
+      const anyAwaiting = signals.some((s) => !presentable(s));
       const lines = signals.map((s) => {
         const date = new Date(s.issued_at * 1000).toISOString().slice(0, 10);
         const hash = s.signal_hash.slice(0, 12) + "…";
         const status = s.status === "active" ? "active" : s.status === "superseded" ? "superseded" : s.status;
-        const inc = s.default_present ? "✓" : "–";
-        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${inc.padEnd(4)}  ${date}`;
+        // ABSENT IS NOT FINE (§5a): an unset or unrecognised consent state reads as "awaiting", never
+        // as presentable. The attacker never has to defeat this check — they omit what triggers it.
+        const consent = s.consent_state === "accepted" ? "—"
+          : s.consent_state === "pending" ? "PENDING"
+          : s.consent_state === "refused" ? "refused"
+          : "awaiting";
+        const inc = presentable(s) ? (s.default_present ? "✓" : "–") : "✗";
+        // M10B / DOD-END-COUNT-1 — MCP/CLI parity (DOD-END-SURFACE-1). The daemon returns
+        // `same_operator` and the MCP surface shows it; without this column the CLI operator sees two
+        // endorsements as identical when one is capped — a recipient's floor excludes a co-owned
+        // endorsement from `min_count` — and that reads as the protocol behaving arbitrarily.
+        const own = s.same_operator === true ? "own" : "—";
+        return `  ${s.type.padEnd(22)}  ${hash}  ${status.padEnd(12)}  ${consent.padEnd(9)}  ${own.padEnd(5)}  ${inc.padEnd(4)}  ${date}`;
       });
-      const header = `  ${"type".padEnd(22)}  hash          status        include  issued`;
-      const divider = "  " + "─".repeat(72);
-      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'`;
+      const header = `  ${"type".padEnd(22)}  hash          status        consent    co-own  include  issued`;
+      const divider = "  " + "─".repeat(92);
+      const consentLegend = anyAwaiting
+        ? `\n  consent: PENDING = someone issued this ABOUT you and it awaits your decision — it is NOT\n           shown to anyone until you accept.  Run 'cello consent list' to read and decide.\n           refused = you refused it; it stays inert.  ✗ = not presentable, whatever 'include' says.`
+        : "";
+      // The co-own legend appears only when a co-owned signal is present: a line explaining a column
+      // that reads "—" on every row is noise, and its APPEARANCE is what makes the operator look.
+      const anyCoOwned = signals.some((s) => s.same_operator === true);
+      const coOwnLegend = anyCoOwned
+        ? `\n  co-own:  'own' = the endorser and the subject are your own agents. Still shown to contacts,\n           but it does NOT count toward a counterparty's minimum-endorsements requirement.`
+        : "";
+      const legend = `\n  include: ✓ = presented to contacts by default  – = excluded from presentation\n           To change: 'cello trust-signals enable <hash>'  or  'cello trust-signals disable <hash>'${coOwnLegend}${consentLegend}`;
       const footer = !showAll && supersededCount > 0
         ? `\n  (${supersededCount} superseded not shown — run with --all to include)`
         : "";
       return { exitCode: 0, output: [header, divider, ...lines].join("\n") + legend + footer };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "issue") {
+    const [subject, ...rest] = args;
+    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
+    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
+    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
+    // convention every shell user already knows.
+    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
+    if (!subject || body.length === 0) {
+      return {
+        exitCode: 1,
+        output:
+          "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>\n" +
+          "\n" +
+          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
+          "before it so it is read as text:\n" +
+          "  cello trust-signals issue <pubkey> -- cut p99 by -30ms on the auth path",
+      };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_trust_signals_issue", { subject_pubkey: subject, body }))) as {
+        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      }
+      return { exitCode: 0, output: result.guidance ?? "Submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
@@ -815,6 +912,7 @@ export async function trustSignals(
     output:
       "Usage:\n" +
       "  cello trust-signals list [--all]      — show active signals (--all includes superseded)\n" +
+      "  cello trust-signals results           — what happened to endorsements you submitted\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
       "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +

@@ -12,6 +12,8 @@
  * dispositions are declared but never produced.
  */
 
+import { withProvenance } from "./screen/affordance.js";
+
 /** Which direction the content is flowing relative to the daemon. */
 export type ScreenDirection = "outbound" | "inbound";
 
@@ -110,7 +112,18 @@ export interface ScreenVerdict {
  * deadline. A timeout or unreachable gateway resolves to a fail-closed `block`
  * (`gateway_unavailable`), never a rejected/never-settling promise (INV-6 / SI-001).
  */
+/** What a client actually does to content. `enforcing` screens; `passthrough` allows everything. */
+export type GatewayMode = "enforcing" | "passthrough";
+
 export interface SecurityGatewayClient {
+  /**
+   * Declared by the implementation, never computed by the caller (M9B-D11). The daemon announces
+   * this at boot, and it is the field an operator greps to know whether their agent is screened —
+   * so it must come from the object that will actually do (or not do) the screening. The defect
+   * this closes: the daemon used to announce `config.securityGateway ? "sidecar" : "passthrough"`,
+   * so the boot line described the caller's intent rather than the object's behavior.
+   */
+  readonly mode: GatewayMode;
   screenOutbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict>;
   screenInbound(content: Uint8Array, ctx: ScreenContext): Promise<ScreenVerdict>;
 }
@@ -133,11 +146,15 @@ export function failClosedVerdict(direction: ScreenDirection, reason: string = G
   return {
     disposition: "block",
     reason,
-    guidance:
+    // withProvenance, not a bare string: this is the MOST-EMITTED guidance in the layer (every
+    // gateway-down message), so it was the one a counterparty could imitate most credibly while
+    // F10 marked only the affordance blocks (review H3).
+    guidance: withProvenance(
       direction === "outbound"
         ? `Fail-closed: ${cause}, so this message was NOT sent. Nothing left the machine. ` +
           "Check that the gateway sidecar is running, then retry."
         : `Fail-closed: ${cause}, so inbound content was not delivered to the agent. It was left ` +
           "unacknowledged, so the sender redelivers it on a later attempt — screened once the gateway responds.",
+    ),
   };
 }

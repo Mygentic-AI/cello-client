@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { createNode } from "@cello-protocol/transport";
 import { generateKeypair } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgents } from "./helpers/seed-agents.js";
@@ -97,7 +98,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
   function makeManager(): { manager: SessionNodeManager; events: LogEvent[] } {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `snm-${Math.random().toString(36).slice(2)}.db`);
-    const manager = new SessionNodeManager({ factory: new RealNodeFactory(), logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new RealNodeFactory(), logger, dbPath });
     managers.push(manager);
     return { manager, events };
   }

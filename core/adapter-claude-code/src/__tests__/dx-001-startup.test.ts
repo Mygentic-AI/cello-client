@@ -106,9 +106,11 @@ describe("AC-002: TTY detection output format", () => {
     // isTTY check must appear BEFORE server.connect() — the guard runs before the server starts
     expect(iTtyPos).toBeLessThan(serverConnectPos);
 
-    // The TTY output must contain the install command (catches accidental removal/truncation)
-    // M6B-005: global install pattern — binary name, not npx version-pinned form
-    const installCmdPos = source.indexOf("claude mcp add cello -- cello-mcp");
+    // The TTY output must contain the install command (catches accidental removal/truncation).
+    // M6B-005 asserted the `claude mcp add` form; 2026-07-30 the plugin became the supported route,
+    // so the guard tracks THAT command instead. Still a guard against silent truncation — what
+    // changed is which install the operator is told to run, not whether they are told one.
+    const installCmdPos = source.indexOf("/plugin install cello@cello-protocol");
     expect(installCmdPos).toBeGreaterThan(-1);
     // The install command must be inside the isTTY block (before server.connect)
     expect(installCmdPos).toBeLessThan(serverConnectPos);

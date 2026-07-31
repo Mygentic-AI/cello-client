@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { TIER } from "../contacts-tier-migration.js";
 import type { SecurityGatewayClient, ScreenContext, ScreenVerdict } from "@cello-protocol/gateway";
@@ -193,6 +194,7 @@ describe("M8C-AWAY-1: away response", () => {
 
   async function start(logger: Logger, node: CelloNode, signalingConnect?: () => Promise<ConnectResult>, securityGateway?: SecurityGatewayClient): Promise<Awaited<ReturnType<typeof startDaemon>>> {
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
       maxConnections: 16, version: "0.0.1-test", logger, sessionNodeFactory: new FixedFactory(node), signalingConnect,
       ...(securityGateway ? { securityGateway } : {}),

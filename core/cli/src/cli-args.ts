@@ -24,6 +24,24 @@ export const KNOWN_COMMANDS: ReadonlySet<string> = new Set(commandNames());
 export type KnownCommand = string;
 
 /**
+ * The flags that come BEFORE any command — `cello --version`, `cello --help`.
+ *
+ * They were treated as unknown COMMANDS, so `cello --version` printed the entire help text and
+ * exited 1. That is the first thing anyone runs to check an install, and it answered by looking
+ * broken while being fine. `--help` had the same shape: correct output, exit 1, which is what a
+ * script checks. The comment in `USAGE` above has always called it "the top-level `cello --help`" —
+ * the text existed for a flag the dispatcher never actually recognised.
+ *
+ * Kept as a pure function here rather than an `if` in the bin, so it is testable without spawning
+ * the binary — the reason every other argument rule lives in this module.
+ */
+export function topLevelFlag(command: string | undefined): "version" | "help" | undefined {
+  if (command === "--version" || command === "-v") return "version";
+  if (command === "--help" || command === "-h") return "help";
+  return undefined;
+}
+
+/**
  * The top-level `cello --help`.
  *
  * Opens with what CELLO is + the onboarding path a first-time user needs. The command list is a
@@ -70,7 +88,14 @@ export type ArgsCheck =
  *  - after a POSIX `--` terminator, everything is a positional VALUE, verbatim.
  */
 export function checkArgs(command: string, args: string[]): ArgsCheck {
-  if (args.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
+  // The help check MUST respect the `--` terminator too. It used to scan the whole argv, so
+  // `cello trust-signals issue <pubkey> -- she walked me through the -h flag` printed help instead
+  // of issuing the signal — the terminator was honoured for unknown flags and ignored for help,
+  // which is the surprising half. Commands that take free prose (issue, consent refuse, contact
+  // set-away) are exactly the ones where a bare `-h` appears as ordinary text.
+  const terminator = args.indexOf("--");
+  const flagArgs = terminator === -1 ? args : args.slice(0, terminator);
+  if (flagArgs.some((a) => a === "--help" || a === "-h")) return { kind: "help" };
   const known = flagsFor(command);
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];

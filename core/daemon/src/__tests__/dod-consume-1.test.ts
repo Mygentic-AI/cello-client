@@ -14,8 +14,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore } from "../trust-signal-store.js";
+import { evaluateSignalPolicy } from "../signal-requirement-policy.js";
 import { encodeCbor, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -53,7 +55,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     const ids = await seedAgents(seed, ["alice"]);
     aliceId = ids.get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);
@@ -65,7 +67,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  function storeSignal(type: string, issuerKind: "portal" | "agent", claim: unknown) {
+  function storeSignal(type: string, issuerKind: "portal" | "agent", claim: unknown, sameOperator = false) {
     const payload = encodeCbor(claim) as Uint8Array;
     const env = {
       subject_kind: "agent" as const,
@@ -78,6 +80,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: sameOperator,
     };
     const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
     store.putReceivedSignal({
@@ -94,6 +97,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issuedAt: 1_768_000_000,
       expiresAt: null,
       supersedesHash: null,
+      sameOperator,
       verifiedAt: 1_768_000_100_000,
       verdict: "active",
     });
@@ -147,6 +151,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: false,
     };
     const hash2 = Buffer.from(hashTrustSignalEnvelope(env2)).toString("hex");
     store.putReceivedSignal({
@@ -188,6 +193,7 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
       issued_at: 1_768_000_000,
       expires_at: null,
       supersedes_hash: null,
+      same_operator: false,
     };
     const hashHex = Buffer.from(hashTrustSignalEnvelope(env)).toString("hex");
     store.putReceivedSignal({
@@ -214,6 +220,116 @@ describe("DOD-CONSUME-1 — trust signal projection to LLM", () => {
     expect(projected[0].claim).toBeNull();
     expect(projected[0].type).toBe("broken");
   });
+
+  // ── DOD-END-COUNT-1 THROUGH THE REAL STORE PATH ─────────────────────────────────────────────────
+  // The predicate tests build `ReceivedSignalRow` objects by hand, so they prove the FILTER works and
+  // nothing about whether a signal that actually ARRIVED ever carries the flag. It did not:
+  // `putReceivedSignal` omitted `same_operator` from its INSERT, the column took its 0 default, and
+  // every received endorsement read as not-co-owned. The ten-agents-under-one-operator defence was
+  // inert in production while its unit tests were green — a store-level default is exactly the kind of
+  // gap hand-built rows cannot see.
+  //
+  // So these go through putReceivedSignal → listReceived → evaluateSignalPolicy, the real chain.
+  describe("the co-ownership flag survives the store, so the count exclusion is not inert", () => {
+    it("a co-owned endorsement that ARRIVED through the store is excluded from min_count", () => {
+      storeSignal("endorsement", "agent", { statement: "my other agent is great" }, true);
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received, "it is stored and active").toHaveLength(1);
+      expect(received[0].sameOperator, "READ BACK as co-owned — this is what the INSERT was dropping").toBe(true);
+
+      const verdict = evaluateSignalPolicy({ min_count: 1 }, received);
+      expect(verdict.pass, "one co-owned endorsement must not clear a floor of one").toBe(false);
+      expect(verdict.actual_count, "the COUNTABLE total, which is zero").toBe(0);
+      expect(verdict.excluded_same_operator, "and the operator is told why").toBe(1);
+    });
+
+    it("a third-party endorsement that arrived the same way DOES clear it", () => {
+      // The negative control. Without it, a store that returned `sameOperator: true` for everything
+      // would satisfy the test above and break every genuine endorsement.
+      storeSignal("endorsement", "agent", { statement: "she shipped it clean" }, false);
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received[0].sameOperator).toBe(false);
+      expect(evaluateSignalPolicy({ min_count: 1 }, received).pass).toBe(true);
+    });
+
+    it("ten co-owned endorsements do not clear a floor of three — the farming shape, end to end", () => {
+      for (let i = 0; i < 10; i++) {
+        storeSignal("endorsement", "agent", { statement: `agent ${i} vouches` }, true);
+      }
+      const received = store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY });
+      expect(received, "all ten are stored — they are genuine, notarized signals").toHaveLength(10);
+      const verdict = evaluateSignalPolicy({ min_count: 3 }, received);
+      expect(verdict.pass, "ten of one operator's own agents is not three endorsements").toBe(false);
+      expect(verdict.excluded_same_operator).toBe(10);
+    });
+
+    it("the recipient's PROJECTION surfaces co-ownership with its own framing", () => {
+      // DOD-END-JOURNEY-1 case (b) requires the recipient to SEE the fact, not merely have it
+      // silently discounted. A consuming model cannot read the statement correctly without it: the
+      // same sentence is a stranger's assessment or an operator's claim about their own fleet.
+      storeSignal("endorsement", "agent", { statement: "her agent never drops a session" }, true);
+      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
+      const sig = projected[0] as unknown as { same_operator?: boolean; same_operator_framing?: string };
+      expect(sig.same_operator, "the flag reaches the LLM-facing JSON").toBe(true);
+      expect(String(sig.same_operator_framing), "and says it does not count toward a minimum").toMatch(/does NOT count/i);
+    });
+
+    it("a third-party endorsement OMITS the flag entirely rather than sending false", () => {
+      // Absent, not `false`: a field present on every signal teaches a reader nothing, and its
+      // appearance is what carries the meaning.
+      storeSignal("endorsement", "agent", { statement: "she shipped it clean" }, false);
+      const projected = projectSignals(store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }));
+      expect(Object.keys(projected[0])).not.toContain("same_operator");
+    });
+  });
+
+
+  // ── THE ATTESTATION MUST MATCH THE MIXED SET IT DESCRIBES ───────────────────────────────────────
+  // Two parties check two different things: this daemon re-hashes each envelope (INTEGRITY), and the
+  // DIRECTORY checks status against its ledger at session establishment (CURRENCY,
+  // `checkPresentedSignals` → `signal_records_effective`), stripping non-active ones.
+  //
+  // The subtlety that made two earlier versions of this string WRONG, in opposite directions: the
+  // projection lists every signal ever received from a contact, but the directory only checked the
+  // ones presented in THIS session. Claiming no currency check happened was false; claiming it
+  // covered "each signal below" was also false. It is a MIXED set, and the wording plus the
+  // per-signal flag have to say so.
+  it("names both checks and scopes currency to the signals presented THIS session", () => {
+    const fresh = storeSignal("phone", "portal", { claim: "has verified phone" });
+    const carried = storeSignal("email", "portal", { claim: "has verified email" });
+    const out = projectTrustSignals(
+      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
+      new Set([fresh]),
+    )!;
+
+    expect(out.directory_attestation, "the local integrity check").toMatch(/re-hashes to signal_hash/i);
+    expect(out.directory_attestation, "the directory's currency check").toMatch(/notary ledger when a session is established/i);
+    expect(out.directory_attestation, "scoped to THIS session, not to everything listed").toMatch(/only the signals presented in THIS session/i);
+    expect(out.directory_attestation, "points the reader at the per-signal flag").toMatch(/currency_checked_this_session/);
+    expect(out.directory_attestation, "and names the consequence for carried-over copies").toMatch(/revoked or withdrawn since/i);
+    expect(out.directory_attestation, "never a claim about truth").toMatch(/check of\s+TRUTH/i);
+    // Must NOT claim the agent itself re-queried the ledger — it never does.
+    expect(out.directory_attestation).not.toMatch(/this agent (has )?re-?quer/i);
+
+    // The per-signal split is the load-bearing part.
+    const bySig = new Map(out.trust_signals.map((x) => [x.signal_hash, x]));
+    expect(bySig.get(fresh)!.currency_checked_this_session, "presented now → checked").toBe(true);
+    expect(bySig.get(carried)!.currency_checked_this_session, "carried over → NOT checked").toBe(false);
+    expect(out.currency_checked_this_session_count, "a count, because the set is mixed").toBe(1);
+  });
+
+  it("marks EVERY signal unchecked when the session presented none", () => {
+    // The default that matters: a session with no presented signals must not let stored rows inherit
+    // "checked". Passing an empty set is the honest answer, and `?? false` is what enforces it.
+    storeSignal("phone", "portal", { claim: "has verified phone" });
+    const out = projectTrustSignals(
+      store.listReceived({ agentId: aliceId, contactPubkey: CONTACT_PUBKEY }),
+      new Set(),
+    )!;
+    expect(out.trust_signals[0].currency_checked_this_session).toBe(false);
+    expect(out.currency_checked_this_session_count).toBe(0);
+  });
+
 });
 
 // Test the PRODUCTION projection function, not a local mirror.
@@ -224,3 +340,62 @@ function projectSignals(received: ReceivedSignalRow[]): Array<{ type: string; is
   const result = projectTrustSignals(received);
   return result?.trust_signals ?? [];
 }
+
+/**
+ * M10B / `M10B-D13` — the framing SPLITS on issuer_kind, and the wrapper matters as much as the
+ * payload.
+ *
+ * The projection previously wrapped every signal in one sentence — "each verified by the CELLO
+ * directory… confirmed active" — with `directory_verified: true`, regardless of author. For a
+ * portal-issued fact that is accurate. For an agent-issued endorsement it launders authority: the
+ * directory checked that the HASH is notarized, and nothing about whether the claim is true.
+ *
+ * D13 states the trap precisely: the payload split alone does NOT satisfy INV-UNTRUSTED. A live
+ * journey asserting only on fields nested inside `claim` would pass while a stranger's sentence
+ * reached the model under CELLO's authority.
+ */
+describe("M10B-D13 — peer-claimed content is framed as peer-claimed", () => {
+  const sig = (issuerKind: string, payload: Record<string, unknown>) => ({
+    type: "endorsement",
+    issuerKind,
+    payload: encodeCbor(payload),
+    verdict: "active",
+    signalHash: "ab".repeat(32),
+  });
+
+  it("does NOT tell a model that peer-claimed content was verified by CELLO", () => {
+    const out = projectTrustSignals([sig("agent", { claim: "x", statement: "Alice is great" })])!;
+    // The attestation must not claim the directory verified the SIGNAL — only its provenance.
+    expect(out.directory_attestation).not.toMatch(/each verified by the CELLO directory/i);
+    expect(out.directory_attestation).toMatch(/check of\s+TRUTH/i);
+    // And it must warn about the peer-claimed one specifically.
+    expect(out.directory_attestation).toMatch(/peer-claimed/i);
+  });
+
+  it("marks a peer-claimed signal and tells the model how to treat it", () => {
+    const [s] = projectTrustSignals([sig("agent", { statement: "Alice is great" })])!.trust_signals;
+    expect(s.issuer).toBe("peer-claimed");
+    expect(s.content_is_peer_claimed).toBe(true);
+    expect(String(s.framing)).toMatch(/did NOT verify|does not vouch/i);
+    expect(String(s.framing)).toMatch(/quote and attribute|never restate/i);
+  });
+
+  it("leaves PORTAL-issued facts framed as platform-verified — not 'warn about everything'", () => {
+    // The counterpart. Without it, satisfying the above by flagging every signal would pass, and a
+    // caveat that fires on the normal case teaches a model to ignore it.
+    const [s] = projectTrustSignals([sig("portal", { claim: "verified phone" })])!.trust_signals;
+    expect(s.issuer).toBe("platform-verified");
+    expect(s.content_is_peer_claimed).toBe(false);
+    expect(s.framing, "a portal fact needs no untrusted-content warning").toBeUndefined();
+    // And with no peer-claimed signal present, the attestation carries no peer-claimed caveat.
+    const out = projectTrustSignals([sig("portal", { claim: "verified phone" })])!;
+    expect(out.directory_attestation).not.toMatch(/peer-claimed/i);
+  });
+
+  it("still reports the hash as notarized for both — that check IS real", () => {
+    // `directory_verified` is hash-level and true either way; what differs is what it means about
+    // the CONTENT. Collapsing the two would be the opposite error.
+    expect(projectTrustSignals([sig("agent", {})])!.trust_signals[0].directory_verified).toBe(true);
+    expect(projectTrustSignals([sig("portal", {})])!.trust_signals[0].directory_verified).toBe(true);
+  });
+});

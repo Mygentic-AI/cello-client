@@ -18,6 +18,7 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgents } from "./helpers/seed-agents.js";
@@ -56,7 +57,7 @@ describe("AC-004: direct-session liveness flips to 'gone' on real session-node d
   it("tracks 'alive' on connect and 'gone' on a real peer disconnect, emitting WARN", async () => {
     const { entries, logger } = makeLogger();
     const dbPath = join(mkdtempSync(join(tmpdir(), "cello-session-003-")), "sessions.db");
-    const mgr = new SessionNodeManager({ factory: new RealNodeFactory(), logger, dbPath });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new RealNodeFactory(), logger, dbPath });
     await mgr.initialize();
     // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
     await seedAgents(mgr.getDb(), ["agentA"]);
@@ -106,7 +107,7 @@ describe("AC-004: direct-session liveness flips to 'gone' on real session-node d
   it("returns 'unknown' for a session with no node / no observation", () => {
     const { logger } = makeLogger();
     const dbPath = join(mkdtempSync(join(tmpdir(), "cello-session-003-")), "sessions.db");
-    const mgr = new SessionNodeManager({ factory: new RealNodeFactory(), logger, dbPath });
+    const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new RealNodeFactory(), logger, dbPath });
     expect(mgr.getSessionLiveness("agentA", "never-tracked")).toBe("unknown");
   });
 });

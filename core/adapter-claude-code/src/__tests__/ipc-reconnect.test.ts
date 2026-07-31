@@ -214,6 +214,54 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     proxy.close();
   }, 20_000);
 
+  // The daemon coming BACK had no announcement: `shutdown` is pushed by the dying daemon, and a
+  // fresh one cannot push anything because it has never heard of this client. So the operator's
+  // agent kept a ⚠️ "daemon stopped" notice with nothing to retract it. Only the shim knows both
+  // halves — hence a reconnect hook rather than a daemon notification.
+  it("fires onReconnect AFTER the replay — and never on the first connect", async () => {
+    const { IpcProxy } = await import("../ipc-proxy.js");
+    const socketPath = join(tempDir, "d.sock");
+    daemon = await fakeDaemon(socketPath, []);
+
+    const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    const agentAtFire: Array<string | null> = [];
+    proxy.onReconnect(() => agentAtFire.push(proxy.currentAgent));
+
+    await proxy.connect();
+    await proxy.call("cello_use_agent", { name: "alice" });
+    expect(agentAtFire, "the first connect is not a RE-connect — the caller already knows").toEqual([]);
+
+    await killDaemon(daemon, socketPath);
+    daemon = await fakeDaemon(socketPath, []);
+    await proxy.call("cello_status"); // forces the reconnect to complete
+    await sleep(100);
+
+    expect(agentAtFire.length, "a reconnect must announce exactly once").toBe(1);
+    // Fired after the handshake replay, so the announcement is true when it arrives rather than
+    // naming an agent that is still being restored.
+    expect(agentAtFire[0]).toBe("alice");
+    proxy.close();
+  }, 20_000);
+
+  it("a throwing onReconnect handler does not break the reconnect", async () => {
+    const { IpcProxy } = await import("../ipc-proxy.js");
+    const socketPath = join(tempDir, "d.sock");
+    daemon = await fakeDaemon(socketPath, []);
+
+    const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    await proxy.connect();
+    proxy.onReconnect(() => { throw new Error("announcement blew up"); });
+
+    await killDaemon(daemon, socketPath);
+    daemon = await fakeDaemon(socketPath, []);
+
+    // The connection is already good by the time the handler runs; losing it over a failed
+    // announcement would be strictly worse than a missing doorbell.
+    const result = await proxy.call("cello_status");
+    expect(result).toBeDefined();
+    proxy.close();
+  }, 20_000);
+
   it("the lost-connection guidance names the remedy", async () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
     const proxy = new IpcProxy(join(tempDir, "nope.sock"), { clientType: "mcp" });

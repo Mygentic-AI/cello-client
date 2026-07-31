@@ -64,9 +64,13 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
   const reachable = transitiveLocalImports(join(SRC, "detect/index.ts"));
 
   it("NEVER reaches node:sqlite — VERBOTEN, and the reason the subpath exists at all", () => {
-    // The package barrel re-exports GatewayConfigStore/GatewayRecordStore, which both statically
-    // import node:sqlite. Importing the barrel from a Next.js Fargate app pulls it in.
+    // A denylist against regression. Note what it can and cannot see as of DOD-M9B-STORE-1
+    // (2026-07-29): the stores no longer import node:sqlite at all — they load SQLCipher, a NATIVE
+    // prebuilt, through createRequire inside a function, which this static scan cannot detect. So
+    // the live guard against the barrel's weight is the structural filename assertion below
+    // ("NEVER reaches the gateway server, its stores, or the sidecar spawner"), not this line.
     expect([...bareSpecifiers(reachable)]).not.toContain("node:sqlite");
+    expect([...bareSpecifiers(reachable)]).not.toContain("@signalapp/sqlcipher");
   });
 
   it("NEVER reaches the DeBERTa Layer-2 scanner — it degrades OPEN and intake must fail CLOSED", () => {
@@ -100,11 +104,24 @@ describe("DOD-END-SCAN-1 / M10B-D17 — the ./detect subpath is narrow by constr
     // disposition that never refuses anything, and its tests would still pass.
     const mod = await import("../detect/index.js");
     expect(Object.keys(mod).sort()).toEqual([
+      // M10B-D15: the corpus-introspection exports expose WHICH RULES ARE ACTIVE, which is what
+      // lets the portal DERIVE `scanner_version` rather than hand-maintain a constant that goes
+      // stale the first time someone edits a regex. And `initLinearRegex` is here because the
+      // corpus CANNOT COMPILE without it — omitting it made this subpath look complete while being
+      // unusable: compileInjectionPatterns runs, leaves `compiled` null, and every rule silently
+      // matches nothing, which is the degrade-open behaviour fail-closed intake must not inherit.
+      // None of them judges anything, so M10B-D16 holds: the corpus is shared, the policy is the
+      // portal's.
       "compileInjectionPatterns",
       "compileSecretRules",
+      "detectorCorpusDigest",
+      "initLinearRegex",
+      "injectionPatternIds",
       "injectionPatternsReady",
+      "linearRegexEngine",
       "redactSecrets",
       "scanInjectionPatterns",
+      "secretRuleIds",
       "secretRulesReady",
     ]);
   });

@@ -14,13 +14,17 @@
  * `sessionNodeManager.ingestReceivedContent` — the exact method this gate drives. So driving it against
  * a real spawned `cello-gateway` proves a recovered message is screened identically to a direct one:
  * a clean recovered message is delivered, a recovered terminal-block (non-English) records its leaf but
- * is never delivered, and the gateway's request log records the inbound screen of the recovered bytes.
+ * is never delivered, and the gateway's ENCRYPTED RECORD STORE holds the inbound security-pass record
+ * for the recovered bytes — hash-chained, keyed by contentHash. (It used to read a plaintext request
+ * log; that file is gone with M8C DOD-CRYPTO-AT-REST-1, and asserting on the durable audit trail is
+ * the stronger claim: a record that is absent is itself evidence of suppression.)
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { Logger } from "../types.js";
@@ -58,11 +62,26 @@ class SharedFactory implements ISessionNodeFactory {
   async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }
 }
 
-async function gatewayLog(path: string): Promise<Array<Record<string, unknown>>> {
+/**
+ * Proof-of-screening now comes from the gateway's ENCRYPTED record store, not a plaintext request
+ * log. The request log was a debug side-channel writing metadata and a content fingerprint to a
+ * file outside the encrypted store — it duplicated this store and kept M8C's
+ * DOD-CRYPTO-AT-REST-1 open, so it was removed rather than guarded.
+ */
+async function gatewayRecords(dbPath: string, keyPath: string): Promise<Array<{ direction: string; contentHash: string }>> {
+  const { GatewayRecordStore } = await import("@cello-protocol/gateway");
   try {
-    const raw = await readFile(path, "utf8");
-    return raw.trim() ? raw.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>) : [];
-  } catch { return []; }
+    const store = new GatewayRecordStore(dbPath, keyPath);
+    try { return store.all().map((r) => ({ direction: r.direction, contentHash: r.contentHash })); }
+    finally { store.close(); }
+  } catch (err) {
+    // Review L7: do NOT swallow into `[]`. Every assertion on this helper today is positive, so a
+    // store fault fails loud by accident — but the first negative assertion (`toHaveLength(0)`,
+    // `.some(...)).toBe(false)`) would read a store that cannot open as "correctly nothing was
+    // recorded". That is the screened-but-unrecorded shape this milestone exists to prevent,
+    // reproduced inside its own test helper.
+    throw new Error(`could not read the gateway record store at ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 const SID = "44".repeat(16);
@@ -83,10 +102,15 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  async function setup(): Promise<{ mgr: SessionNodeManager; logPath: string }> {
+  async function setup(): Promise<{ mgr: SessionNodeManager; storeDb: string; storeKey: string }> {
     const sock = join(tempDir, "gw.sock");
-    const logPath = join(tempDir, "gw.log");
-    const gw = await spawnGatewaySidecar({ socketPath: sock, requestLogPath: logPath });
+    const storeDb = join(tempDir, "gw-store.db");
+    const storeKey = join(tempDir, "gw-store.key");
+    writeFileSync(storeKey, randomBytes(32), { mode: 0o600 });
+    const gw = await spawnGatewaySidecar({
+      socketPath: sock,
+      env: { CELLO_GATEWAY_STORE_DB: storeDb, CELLO_GATEWAY_STORE_KEY_FILE: storeKey },
+    });
     gateways.push(gw);
     const client = new LocalSidecarGatewayClient({ socketPath: sock, deadlineMs: 2_000 });
     const dbPath = join(tempDir, "snm.db");
@@ -96,11 +120,11 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
     await seedAgents(mgr.getDb(), ["alice"]);
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-gate1");
-    return { mgr, logPath };
+    return { mgr, storeDb, storeKey };
   }
 
   it("a CLEAN recovered message is screened by the real gateway and DELIVERED to the agent", async () => {
-    const { mgr, logPath } = await setup();
+    const { mgr, storeDb, storeKey } = await setup();
     const content = enc("recovered-from-park, perfectly fine");
     const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
     expect(res.ok).toBe(true);
@@ -110,8 +134,8 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
 
     // The REAL gateway process logged the inbound screen of these exact bytes (proof-of-screening).
     const fp = createHash("sha256").update(content).digest("hex");
-    const log = await gatewayLog(logPath);
-    expect(log.some((e) => e.direction === "inbound" && e.contentSha256 === fp)).toBe(true);
+    const records = await gatewayRecords(storeDb, storeKey);
+    expect(records.some((e) => e.direction === "inbound" && e.contentHash === fp)).toBe(true);
   }, 30_000);
 
   it("a recovered TERMINAL-block (non-English) is screened the SAME as direct: leaf recorded, NEVER delivered", async () => {

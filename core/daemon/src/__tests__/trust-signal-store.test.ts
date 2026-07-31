@@ -27,6 +27,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgentKeys } from "./helpers/seed-agents.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import { TrustSignalStore, ensureTrustSignalSchema, type WalletSignalInput } from "../trust-signal-store.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
@@ -106,7 +107,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
     alicePubkey = agents.get("alice")!.pubkeyHex;
     bobPubkey = agents.get("bob")!.pubkeyHex;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
     store = new TrustSignalStore(db, silent);
@@ -430,7 +431,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       const env = {
         subject_kind: "account" as const, subject: "acct-x", issuer_kind: "portal" as const,
         issuer_pubkey: "aabb", type: "phone", schema_version: 1, payload: new Uint8Array([1, 2, 3]),
-        issued_at: 1_768_000_000, expires_at: null, supersedes_hash: null, ...over,
+        issued_at: 1_768_000_000, expires_at: null, supersedes_hash: null, same_operator: false, ...over,
       };
       return { env, hash: Buffer.from(hashTrustSignalEnvelopeFn(env)).toString("hex") };
     }
@@ -444,6 +445,44 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       expect(got!.type).toBe("phone");
       expect(new Uint8Array(got!.payload)).toEqual(new Uint8Array([1, 2, 3]));
     });
+
+    // ── A DELIVERED SIGNAL MUST STILL BE PRESENTABLE ───────────────────────────────────────────────
+    // Delivery verifies the hash and stores the FIELDS; presentation RE-ENCODES from those fields and
+    // sends the stored hash beside the bytes. So the wallet round-trip has to be byte-exact, and
+    // nothing tested that: delivery asserted "stored", presentation asserted "attached", and a field
+    // lost in between made the RECIPIENT reject a valid signal one hop away.
+    //
+    // This is the assertion that closes the gap, and it is parameterized over same_operator because
+    // that is the field the round-trip actually dropped — `deliverWalletSignal` did not pass it to
+    // `putWalletSignal`, so a co-owned signal was delivered as true and stored as false. Only the
+    // TRUE case fails; a suite that tested the default would have passed while the bug shipped.
+    for (const sameOperator of [false, true]) {
+      it(`round-trips every envelope field through the wallet — same_operator: ${sameOperator}`, () => {
+        const { env, hash } = deliverable({ same_operator: sameOperator });
+        expect(store.deliverWalletSignal(env, hash).stored).toBe(true);
+
+        const row = store.getWalletSignal(hash);
+        expect(row, "the delivered signal is in the wallet").not.toBeNull();
+
+        // Re-encode from the STORED ROW exactly as the presenter does, and re-derive the hash. If any
+        // field did not survive, this is not the notarized hash and the signal is unpresentable.
+        const rehashed = Buffer.from(hashTrustSignalEnvelopeFn({
+          subject_kind: row!.subjectKind,
+          subject: row!.subject,
+          issuer_kind: row!.issuerKind,
+          issuer_pubkey: row!.issuerPubkey,
+          type: row!.type,
+          schema_version: row!.schemaVersion,
+          payload: new Uint8Array(row!.payload),
+          issued_at: row!.issuedAt,
+          expires_at: row!.expiresAt,
+          supersedes_hash: row!.supersedesHash === null ? null : new Uint8Array(Buffer.from(row!.supersedesHash, "hex")),
+          same_operator: row!.sameOperator,
+        })).toString("hex");
+        expect(rehashed, "the wallet row must re-derive the notarized hash").toBe(hash);
+        expect(row!.sameOperator, "the delivered flag, not the column default").toBe(sameOperator);
+      });
+    }
 
     it("REFUSES a delivery whose envelope does not hash to the claimed hash — never stored", () => {
       // The holder's own chokepoint: a tampered/corrupted delivery must not enter the wallet, or it
@@ -535,7 +574,7 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       const dir2 = await mkdtemp(join(tmpdir(), "dod-store-client-1-fresh-"));
       try {
         const p2 = join(dir2, "sessions.db");
-        const mgr2 = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath: p2 });
+        const mgr2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: p2 });
         await mgr2.initialize();
         const fresh = mgr2.getDb();
         ensureTrustSignalSchema(fresh, silent); // applied again, exactly as an upgrade would
@@ -645,6 +684,112 @@ describe("DOD-STORE-CLIENT-1 — client trust-signal storage", () => {
       ).toBeUndefined();
       // The migration is surgical: it drops ONLY the scaffold, leaving every other table intact.
       expect(db.prepare("SELECT COUNT(*) AS n FROM agents").get()).toMatchObject({ n: before.n });
+    });
+  });
+
+  describe("the same_operator migration verifies rather than assumes (review F4)", () => {
+    it("is a silent no-op when the column already exists", () => {
+      // Idempotence: ensureTrustSignalSchema runs on every daemon start, so the second call must not
+      // throw. This is the case the bare catch was written for, and it still has to hold.
+      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
+      expect(() => ensureTrustSignalSchema(db, silent)).not.toThrow();
+      for (const table of ["wallet_trust_signals", "contact_trust_signals"]) {
+        const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+        expect(cols, `${table} has the column`).toContain("same_operator");
+      }
+    });
+
+    it("THROWS when the ALTER fails and the column is genuinely absent", () => {
+      // The failure the bare swallow hid. Any non-duplicate cause — SQLITE_BUSY from a second daemon
+      // on the same DB, READONLY, FULL — used to be swallowed, after which putReceivedSignal throws
+      // "no column named same_operator", is caught upstream as a WARN, and the daemon runs with
+      // sessions forming normally while NO presented signal is ever stored.
+      //
+      // Simulated by making the ALTER fail on a table that has no such column: a stand-in table is
+      // created, then `prepare` is stubbed so the ALTER path errors and the PRAGMA reports the truth.
+      const probe = { ...db } as unknown as typeof db;
+      const realPrepare = db.prepare.bind(db);
+      let alterAttempted = false;
+      (probe as unknown as { exec: (sql: string) => void }).exec = (sql: string) => {
+        if (sql.includes("ADD COLUMN same_operator")) {
+          alterAttempted = true;
+          throw new Error("database is locked");
+        }
+        db.exec(sql);
+      };
+      (probe as unknown as { prepare: typeof realPrepare }).prepare = ((sql: string) => {
+        if (sql.startsWith("PRAGMA table_info")) {
+          // Report the column as absent — i.e. the ALTER really did not take effect.
+          return { all: () => [{ name: "signal_hash" }] } as unknown as ReturnType<typeof realPrepare>;
+        }
+        return realPrepare(sql);
+      }) as typeof realPrepare;
+
+      expect(() => ensureTrustSignalSchema(probe, silent)).toThrow(/same_operator/);
+      expect(alterAttempted, "the ALTER was actually attempted").toBe(true);
+    });
+  });
+
+  // ── WHAT I SUBMITTED ABOUT OTHERS (M10B / DOD-END-SURFACE-1, DOD-END-WITHDRAW-1) ────────────────
+  // The third table. The wallet holds signals ABOUT me and contact_trust_signals holds signals
+  // PRESENTED to me; neither recorded what I SAID about someone else — so withdrawal had nothing to
+  // NAME. The id is content-derived and therefore reproducible in principle, but only by re-composing
+  // the exact original body, which the operator no longer has once it is sent.
+  describe("issued submissions — the handle a withdrawal names", () => {
+    const issued = (over: Partial<Parameters<typeof store.recordIssuedSubmission>[0]> = {}) => ({
+      agentId: "agent-1", submissionId: HASH("d"), subjectPubkey: HASH("e"),
+      op: "submit" as const, intakeKeyId: "intake-1", stored: true, ...over,
+    });
+
+    it("records a submission and lists it back for that agent", () => {
+      store.recordIssuedSubmission(issued());
+      const rows = store.listIssuedSubmissions("agent-1");
+      expect(rows).toHaveLength(1);
+      expect(rows[0].submissionId).toBe(HASH("d"));
+      expect(rows[0].op).toBe("submit");
+      expect(rows[0].stored).toBe(true);
+      expect(rows[0].submittedAt).toBeGreaterThan(0);
+    });
+
+    it("NEVER stores the body — the operator's words about a third party stay sealed", () => {
+      // The property this table's shape exists to guarantee. A `body` column would put in the clear,
+      // on disk, the one thing the sealed-submission path is for. Asserted on the SCHEMA rather than
+      // on a row, so adding the column later fails here even if nothing writes to it yet.
+      const cols = (db.prepare("PRAGMA table_info(issued_submissions)").all() as Array<{ name: string }>)
+        .map((c) => c.name);
+      expect(cols).not.toContain("body");
+      expect(cols).not.toContain("statement");
+      expect(cols).not.toContain("text");
+      expect(cols, "the handle itself must be there").toContain("submission_id");
+    });
+
+    it("a re-submit is the SAME row, and a later success updates `stored`", () => {
+      // "Re-sending is safe" has to be true at this layer too, or the operator's own list grows a
+      // duplicate every time they retry something the directory correctly deduped.
+      store.recordIssuedSubmission(issued({ stored: false }));
+      store.recordIssuedSubmission(issued({ stored: true }));
+      const rows = store.listIssuedSubmissions("agent-1");
+      expect(rows, "content-derived id → one row").toHaveLength(1);
+      expect(rows[0].stored, "a retry that finally lands must not keep reporting the duplicate answer").toBe(true);
+    });
+
+    it("is scoped PER AGENT — two agents on one daemon do not see each other's submissions", () => {
+      // Solo multi-agent is the first wedge, so two agents on one daemon is the ordinary case. These
+      // are per-agent facts: what agent A said about someone is not agent B's to list or withdraw.
+      store.recordIssuedSubmission(issued({ agentId: "agent-1" }));
+      store.recordIssuedSubmission(issued({ agentId: "agent-2", submissionId: HASH("f") }));
+      expect(store.listIssuedSubmissions("agent-1")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-2")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-1")[0].submissionId).toBe(HASH("d"));
+    });
+
+    it("the same id from a DIFFERENT agent is a separate row, not a conflict", () => {
+      // The PK is (agent_id, submission_id). Keying on submission_id alone would let one agent's
+      // submission silently overwrite another's when both endorse the same subject identically.
+      store.recordIssuedSubmission(issued({ agentId: "agent-1" }));
+      store.recordIssuedSubmission(issued({ agentId: "agent-2" }));
+      expect(store.listIssuedSubmissions("agent-1")).toHaveLength(1);
+      expect(store.listIssuedSubmissions("agent-2")).toHaveLength(1);
     });
   });
 });

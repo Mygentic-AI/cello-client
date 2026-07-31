@@ -25,10 +25,11 @@
         "payload": "01020304",
         "issued_at": 1000000000,
         "expires_at": null,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a3b9aca00f6f6",
-      "signal_hash_hex": "760af64a292f96bffde522e21a8fcae0c31fc7826c4e2c947939a2da50803672"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a3b9aca00f6f6f4",
+      "signal_hash_hex": "96e30a27bf5f39133a6f44f9032cabbc073684940c9f47e8b0d42b7110672334"
     },
     {
       "name": "account subject — one envelope, every agent under the account presents it (M10-D5)",
@@ -42,10 +43,11 @@
         "payload": "a1646b696e64",
         "issued_at": 1768000000,
         "expires_at": 1799536000,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631676163636f756e7469616363745f3766336166706f7274616c6c33643466366132623863316565656d61696c0146a1646b696e641a69618a001a6b42bd80f6",
-      "signal_hash_hex": "2b7ace095f07efbd1c8f5efef701a8969d2c6c8efb3f6291b27eefcd287fba16"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631676163636f756e7469616363745f3766336166706f7274616c6c33643466366132623863316565656d61696c0146a1646b696e641a69618a001a6b42bd80f6f4",
+      "signal_hash_hex": "c5126749f59f52aadee9a2576b497e54b675a7df4353bb0d07c3ec2ec129a2aa"
     },
     {
       "name": "supersession — a re-minted track-record signal replacing an earlier one",
@@ -59,10 +61,11 @@
         "payload": "deadbeef",
         "issued_at": 1768000123,
         "expires_at": 1768604923,
-        "supersedes_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        "supersedes_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626d73657373696f6e5f636f756e740244deadbeef1a69618a7b1a696ac4fb58201111111111111111111111111111111111111111111111111111111111111111",
-      "signal_hash_hex": "0184ae76433d9c4caf892d438bff3f64d44f0eed57470f0c141fee86b18e0bbb"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626d73657373696f6e5f636f756e740244deadbeef1a69618a7b1a696ac4fb58201111111111111111111111111111111111111111111111111111111111111111f4",
+      "signal_hash_hex": "c96160b56f2bd5d3ad0cd3ebe2e10854de8b5252815118a74d68f4e308572d7d"
     },
     {
       "name": "agent issuer — quoted-untrusted framing at the LLM (INV-FRAMING)",
@@ -76,10 +79,11 @@
         "payload": "",
         "issued_at": 1768000000,
         "expires_at": null,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d32656167656e746866663030666630306b656e646f7273656d656e7401401a69618a00f6f6",
-      "signal_hash_hex": "39d148391745fa3ea26b8fe57b5633c4bec7064a896527abb9300355b02ec5a6"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d32656167656e746866663030666630306b656e646f7273656d656e7401401a69618a00f6f6f4",
+      "signal_hash_hex": "210d535fa3fb88b5ba3c899ee88bb44b1c31c7098e8d8f26117fe513158b99e4"
     },
     {
       "name": "UNKNOWN type — a type this code has never seen must hash identically (INV-TYPE-CARRY)",
@@ -93,10 +97,11 @@
         "payload": "00",
         "issued_at": 1768000000,
         "expires_at": null,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c6461616262781c736f6d655f747970655f696e76656e7465645f6e6578745f796561720141001a69618a00f6f6",
-      "signal_hash_hex": "9a637f2ca5b4fbb0f78c9eb2d33cfc433706290a7c4a4e6bf2628d258b90f1c9"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c6461616262781c736f6d655f747970655f696e76656e7465645f6e6578745f796561720141001a69618a00f6f6f4",
+      "signal_hash_hex": "17f23e4940c96296143765bcd2b951ffa76932594b8b63010bd1656bf3b0a454"
     },
     {
       "name": "payload that LOOKS like CBOR — embedded verbatim, never parsed",
@@ -110,10 +115,11 @@
         "payload": "d840009fff",
         "issued_at": 1768000000,
         "expires_at": null,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626b63616e6172795f746573740145d840009fff1a69618a00f6f6",
-      "signal_hash_hex": "5dc67366d7b8fc515a6d638b432d90e29a2f9841101a3ac1745ca7b602e2f837"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626b63616e6172795f746573740145d840009fff1a69618a00f6f6f4",
+      "signal_hash_hex": "cf39fc07ac45f942a561350001322c53d1bc793687837f84fefde2f861bc56b9"
     },
     {
       "name": "FAR-FUTURE expiry past 2^32 — must hash as a CBOR uint64 (1b...), NEVER a float64 (fb...)",
@@ -127,10 +133,30 @@
         "payload": "01020304",
         "issued_at": 1768000000,
         "expires_at": 4920000000,
-        "supersedes_hash": null
+        "supersedes_hash": null,
+        "same_operator": false
       },
-      "preimage_hex": "8b6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a69618a001b0000000125413e00f6",
-      "signal_hash_hex": "3c95520077ca1bb25f360c886008691bab1114e1ecad43ba90558df5d5a0b79e"
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d3166706f7274616c64616162626570686f6e650144010203041a69618a001b0000000125413e00f6f4",
+      "signal_hash_hex": "0c96c300e89a039a7fc967d555711db009aa7404256e009d2bd1b79aad52fdd7"
+    },
+    {
+      "name": "SAME-OPERATOR true — co-owned endorsement (M10B slot 12 must encode f5, not f4)",
+      "envelope": {
+        "subject_kind": "agent",
+        "subject": "agent-1",
+        "issuer_kind": "agent",
+        "issuer_pubkey": "ccdd",
+        "type": "endorsement",
+        "schema_version": 1,
+        "payload": "01020304",
+        "issued_at": 1000000000,
+        "expires_at": null,
+        "supersedes_hash": null,
+        "same_operator": true
+      },
+      "preimage_hex": "8c6d43454c4c4f2d545349472d7631656167656e74676167656e742d31656167656e7464636364646b656e646f7273656d656e740144010203041a3b9aca00f6f6f5",
+      "signal_hash_hex": "d2ea0c5ff8b556a11f836517cd778c476cfae0f7cad07794736f6921f44fd36b"
     }
-  ]
+  ],
+  "wire_version_note": "REGENERATED 2026-07-30 for the M10B envelope change: `same_operator` was APPENDED as slot 12 (DOD-END-COUNT-1). This was a deliberate PROTOCOL BREAK, not a drift — every hash below differs from its pre-M10B value, and any signal minted under the 11-slot shape is unreadable by the current decoder (it refuses on arity rather than defaulting the flag, so an old signal can never be silently treated as same_operator:false). Taken now precisely because the stranded set is empty: alpha, no users, no production signals. Doing it after launch would strand real endorsements."
 }

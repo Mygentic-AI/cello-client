@@ -52,7 +52,6 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import {
-  PassthroughGatewayClient,
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
   type SecurityGatewayClient,
@@ -411,9 +410,10 @@ export class SessionNodeManager {
     standingReceiverWatchdogIntervalMs?: number;
     /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
-     * PassthroughGatewayClient (always-allow) is used — the pre-M9 behavior.
+     * REQUIRED — there is no always-allow default (INV-9). A caller that does not screen must
+     * say so by passing PassthroughGatewayClient from `@cello-protocol/gateway/testing`.
      */
-    securityGateway?: SecurityGatewayClient;
+    securityGateway: SecurityGatewayClient;
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
@@ -425,7 +425,21 @@ export class SessionNodeManager {
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
-    this.#securityGateway = opts.securityGateway ?? new PassthroughGatewayClient();
+    // REQUIRED, no fallback (INV-9, audit finding). This line used to read
+    // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
+    // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
+    // was hardened to throw while this constructor was not, so the inbound screen had a silent
+    // always-allow path that nothing in the product reached TODAY and any future refactor could.
+    // "Currently unreachable" is a property of today's call sites, not of the code.
+    if (!opts.securityGateway) {
+      throw new Error(
+        "SessionNodeManager: securityGateway is required (INV-9). The inbound screen has no " +
+          "always-allow fallback, because that fallback is how the entire security layer shipped " +
+          "inert. Pass a real client, or new PassthroughGatewayClient() from a test that " +
+          "deliberately does not screen.",
+      );
+    }
+    this.#securityGateway = opts.securityGateway;
   }
 
   /**
@@ -679,6 +693,26 @@ export class SessionNodeManager {
     // MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
     // SQLite has no ADD COLUMN IF NOT EXISTS, so the ALTER is PRAGMA-guarded to stay
     // idempotent; existing rows → NULL, no data loss.
+    // M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
+    //
+    // `default_present` on the signal answers "show this by default"; this answers "show THIS signal
+    // to THIS person", which is the finer question an operator actually has: an endorsement that is
+    // right for a prospective client is not necessarily right for a competitor. Absent row = no
+    // opinion → the signal's own default applies, so this table only ever holds explicit choices.
+    //
+    // Keys on `agent_id`, never `agent_name` — the name is a mutable display label that is reusable
+    // after retirement, so keying on it would silently hand a NEW agent the retired one's
+    // disclosure choices. Same key as `contacts`, which this is an extension of.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS contact_signal_prefs (
+        agent_id TEXT NOT NULL,
+        contact_pubkey TEXT NOT NULL,
+        signal_hash TEXT NOT NULL,
+        present INTEGER NOT NULL,
+        set_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, contact_pubkey, signal_hash)
+      )
+    `);
     const contactCols = this.#db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>;
     if (!contactCols.some((c) => c.name === "moniker")) {
       this.#db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");
@@ -1200,6 +1234,58 @@ export class SessionNodeManager {
     // pending notice for this contact (whether they adopted the offered name or chose their own).
     if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
     return res.changes > 0;
+  }
+
+  /**
+   * M10B / DOD-END-SURFACE-1 — decide whether ONE signal is presented to ONE counterparty.
+   *
+   * `present: null` CLEARS the choice, which is not the same as `false`: cleared means "no opinion,
+   * use the signal's own default", while false means "specifically not this person". Collapsing
+   * them would make an operator unable to undo an omission without knowing what the default was.
+   *
+   * Deliberately does NOT require an existing contact row, unlike the tier/moniker/away setters. A
+   * decision about what to disclose is meaningful before a relationship is established — indeed
+   * that is when it matters most — and refusing here would force the operator to add someone as a
+   * contact in order to withhold something from them.
+   */
+  setContactSignalPref(agentName: string, pubkey: string, signalHash: string, present: boolean | null): void {
+    if (!this.#db) throw new Error(`setContactSignalPref('${agentName}'): database not initialized`);
+    const agentId = this.#requireAgentId(agentName);
+    if (present === null) {
+      this.#db
+        .prepare("DELETE FROM contact_signal_prefs WHERE agent_id = ? AND contact_pubkey = ? AND signal_hash = ?")
+        .run(agentId, pubkey, signalHash);
+      this.#logger.info("signal.presentation.pref.cleared", { agentName, pubkey: pubkey.slice(0, 16), signalHash: signalHash.slice(0, 16) });
+      return;
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO contact_signal_prefs (agent_id, contact_pubkey, signal_hash, present, set_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(agent_id, contact_pubkey, signal_hash) DO UPDATE SET present = excluded.present, set_at = excluded.set_at`,
+      )
+      .run(agentId, pubkey, signalHash, present ? 1 : 0, Date.now());
+    this.#logger.info("signal.presentation.pref.set", {
+      agentName, pubkey: pubkey.slice(0, 16), signalHash: signalHash.slice(0, 16), present,
+    });
+  }
+
+  /**
+   * The explicit per-counterparty choices for this contact: signal hash → present.
+   *
+   * A signal ABSENT from this map has no choice recorded and falls back to its own
+   * `default_present`. Returns an EMPTY map on an uninitialised DB rather than throwing, because
+   * this is a preference read on the presentation path and losing preferences must not break a
+   * session — but note the direction that failure takes: with no preferences, `default_present`
+   * decides, and consent still gates everything upstream in SQL. It can therefore only fall back to
+   * the operator's standing default, never to disclosing something consent has not cleared.
+   */
+  getContactSignalPrefs(agentName: string, pubkey: string): Map<string, boolean> {
+    if (!this.#db) return new Map();
+    const rows = this.#db
+      .prepare("SELECT signal_hash, present FROM contact_signal_prefs WHERE agent_id = ? AND contact_pubkey = ?")
+      .all(this.#requireAgentId(agentName), pubkey) as Array<{ signal_hash: string; present: number }>;
+    return new Map(rows.map((r) => [r.signal_hash, r.present !== 0]));
   }
 
   /** DOD-AWAY-TIER-1: set (or clear, with null) a contact's per-contact away message. Returns false

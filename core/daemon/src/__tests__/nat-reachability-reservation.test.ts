@@ -30,6 +30,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { SessionConnectionGater } from "../session-connection-gater.js";
 import { ProductionSessionNodeFactory } from "../daemon.js";
@@ -182,7 +183,7 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
   async function makeManager() {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const manager = new SessionNodeManager({ factory: new ProductionSessionNodeFactory(), logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ProductionSessionNodeFactory(), logger, dbPath });
     await manager.initialize();
     return { manager, events };
   }
@@ -279,7 +280,7 @@ describe("R7+R8: directory-provided relay endpoints (Phase 2 client half)", () =
   async function makeManager() {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const manager = new SessionNodeManager({ factory: new ProductionSessionNodeFactory(), logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ProductionSessionNodeFactory(), logger, dbPath });
     await manager.initialize();
     return { manager, events };
   }
@@ -365,7 +366,7 @@ describe("R9+R10: directory-supplied endpoints are untrusted input", () => {
   async function makeManager() {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `sessions-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const manager = new SessionNodeManager({ factory: new ProductionSessionNodeFactory(), logger, dbPath });
+    const manager = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new ProductionSessionNodeFactory(), logger, dbPath });
     await manager.initialize();
     return { manager, events };
   }
@@ -452,6 +453,7 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
   it("R11a: an UNREACHABLE relay is rejected — the receiver still comes up", async () => {
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, "sessions-a.db"),
@@ -485,6 +487,7 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
     const relay = await startHopRelay();
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory: new HangingCircuitFactory(),
       logger,
       dbPath: join(tempDir, "sessions-b.db"),
@@ -515,6 +518,7 @@ describe("R11: an unreachable relay must NOT prevent the standing receiver from 
     const relay = await startHopRelay();
     const { logger } = makeLogger();
     const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, "sessions-c.db"),
@@ -565,6 +569,7 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
   function makeManager(dbName: string) {
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
       factory: new ProductionSessionNodeFactory(),
       logger,
       dbPath: join(tempDir, dbName),

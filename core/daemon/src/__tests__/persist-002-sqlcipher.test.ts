@@ -22,6 +22,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -77,7 +78,7 @@ afterEach(async () => {
 });
 
 async function initManager(dbPath: string): Promise<SessionNodeManager> {
-  const mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger(), dbPath });
+  const mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger(), dbPath });
   await mgr.initialize();
   return mgr;
 }
@@ -197,7 +198,7 @@ describe("PERSIST-002 Unit 1 — SQLCipher engine (AC-001/AC-010/AC-011, SI-002)
 
     // The DAEMON path must fail closed — a regression that catches the mismatch and silently
     // recreates a fresh (or plaintext) store would be caught here.
-    const mgr2 = new SessionNodeManager({ factory: new StubNodeFactory(), logger: makeLogger(), dbPath });
+    const mgr2 = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: makeLogger(), dbPath });
     let thrown: unknown;
     try {
       await mgr2.initialize();

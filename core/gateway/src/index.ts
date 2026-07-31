@@ -5,6 +5,7 @@
  * (`SecurityGatewayClient` + verdict types) and a client implementation; all detection lives
  * here. M9-CORE-001 ships the seam with a pass-through; later stories add the pipeline.
  */
+export type { GatewayMode } from "./types.js";
 export type {
   ScreenDirection,
   ScreenDisposition,
@@ -36,10 +37,19 @@ export type { InstallResult, InstallOptions } from "./detect/model-installer.js"
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
 export { GatewayConfigStore } from "./config/config-store.js";
 export type { ConfigDirection, SetResult, ConfigVersionRow } from "./config/config-store.js";
+export { GatewayStoreError, stderrStoreEventSink, openEncryptedStoreDb } from "./store/encrypted-db.js";
+export type { GatewayStoreErrorCode, StoreEventSink } from "./store/encrypted-db.js";
 export { GatewayRecordStore } from "./records/record-store.js";
 export type { RecordDisposition, RecordDirection, RecordInput, SecurityRecord } from "./records/record-store.js";
 export { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, failClosedVerdict } from "./types.js";
-export { PassthroughGatewayClient } from "./passthrough.js";
+// The provenance marker is EXPORTED because it has consumers outside this package: the MCP tool
+// descriptions and SKILL.md teach it to the agent, and the daemon's own guidance is marked with it.
+// Review H2: F10 shipped it unexported and unspoken, so the agent that was supposed to "have
+// something to check" was never told the marker existed. A marker no consumer knows is decoration.
+export { AFFORDANCE_PREFIX, withProvenance } from "./screen/affordance.js";
+// PassthroughGatewayClient is NOT exported here — it lives at `@cello-protocol/gateway/testing`
+// (DOD-M9B-WIRE-1). An always-allow client on the production barrel is how the security layer
+// shipped inert; reaching for it should be a deliberate act, visible in a diff.
 
 // Wire protocol (shared by the local sidecar; Phase 2's mTLS gateway reuses these shapes).
 export {

@@ -15,7 +15,7 @@
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
-import { KNOWN_COMMANDS, USAGE, checkArgs, helpForCommand } from "../cli-args.js";
+import { KNOWN_COMMANDS, USAGE, checkArgs, helpForCommand, topLevelFlag } from "../cli-args.js";
 import { findCommand, type CommandContext } from "../registry.js";
 import type { Logger } from "@cello-protocol/daemon";
 
@@ -47,6 +47,21 @@ const daemonPkgPath = require.resolve("@cello-protocol/daemon/package.json");
 const daemonBin = join(dirname(daemonPkgPath), "dist/bin/cello-daemon.js");
 
 async function main(): Promise<void> {
+  // `cello --version` / `--help` are FLAGS, not commands — answer them before the command lookup,
+  // which would otherwise treat them as an unknown command (help text, exit 1).
+  const topFlag = topLevelFlag(command);
+  if (topFlag === "version") {
+    const pkg = require("../../package.json") as { version: string };
+    process.stdout.write(`${pkg.version}\n`);
+    process.exit(0);
+    return;
+  }
+  if (topFlag === "help") {
+    process.stdout.write(USAGE + "\n");
+    process.exit(0);
+    return;
+  }
+
   const spec = command ? findCommand(command) : undefined;
 
   if (!spec || !KNOWN_COMMANDS.has(command)) {

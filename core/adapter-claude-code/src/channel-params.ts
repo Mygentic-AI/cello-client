@@ -18,11 +18,6 @@
  * conflation that shipped the broken doorbell.
  */
 
-function short(v: unknown): string {
-  const s = v == null ? "" : String(v);
-  return s.length > 12 ? `${s.slice(0, 12)}…` : s;
-}
-
 /** Shim-side fingerprint — mirrors the daemon's who-label format for old-daemon frames. */
 function shimFingerprint(pubkey: unknown): string {
   const s = typeof pubkey === "string" && pubkey.length >= 8 ? pubkey.slice(0, 8) : null;
@@ -79,14 +74,33 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
           return `CELLO — session with ${who} is now "${String(data["state"] ?? "changed")}".`;
       }
     }
+    // Agent NAMES are never shortened. These two cases ran the name through a 12-char `short()`
+    // helper and rendered "CELLO_Feedba…", contradicting the rule stated in the
+    // session_state_changed branch above ("AC3's 'never truncates a name' applies to YOUR agent name
+    // too; only fingerprints shorten"). A mangled name reads like a different agent. Removing the
+    // last two callers left `short()` with none — fingerprints are rendered by shimFingerprint,
+    // which slices independently — so it was deleted rather than left as a helper nobody calls.
     case "agent_state_changed":
-      return `CELLO: agent ${short(data["agent"])} is now ${String(data["state"] ?? "changed")}.`;
+      return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
-      return `CELLO: current agent changed to ${short(data["toAgent"] ?? data["agent"])}.`;
+      return `CELLO — you are now acting as ${String(data["toAgent"] ?? data["agent"] ?? "your agent")}.`;
+    // The counterpart to `shutdown`, and the reason this exists: after `cello logout && cello login`
+    // the operator was told the daemon STOPPED and never told it came back. The reconnect only wrote
+    // to the shim's stderr, which no agent reads. The only thing that did arrive was the
+    // agent_current_changed from the handshake replay — an agent-switch notice standing in for an
+    // announcement that did not exist, which is why the doorbell read as wrong rather than missing.
+    case "daemon_reconnected":
+      return `✅ CELLO — the local daemon is back${data["agent"] !== undefined ? ` and you are acting as ${String(data["agent"])}` : ""}. Tools work again.`;
+    case "shutdown":
+      // ACTIONABLE, not suppressed. The daemon dying is the one housekeeping event the operator
+      // must know about: every cello_* tool is about to fail, and the failure (`daemon_not_running`)
+      // reads like a protocol bug rather than "your daemon stopped." Name the recovery here.
+      return `⚠️ CELLO — the local daemon stopped. Tools will fail until you run \`cello login\`.`;
     default:
       return `CELLO event: ${type}.`;
   }
 }
+
 
 /**
  * Translate a content-free daemon doorbell frame's `data` blob into the Claude Code channel
@@ -96,8 +110,14 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
  */
 export function buildChannelParams(
   data: Record<string, unknown>,
+  type: string,
 ): { content: string; meta: Record<string, string> } {
-  const type = typeof data["type"] === "string" ? (data["type"] as string) : "cello_event";
+  // `type` is REQUIRED and comes from the caller, which resolved it as
+  // `data.type ?? String(frame.notification)`. It is deliberately NOT re-derived from `data` here:
+  // real daemon frames carry the type on `frame.notification`, not in `data`, so a local
+  // `data.type ?? "cello_event"` fallback silently bypassed every announcement below and rendered
+  // the placeholder `CELLO event: cello_event.` in production while every test passed — the test
+  // fixtures were the only frames that ever had `data.type` (2026-07-30).
   const meta: Record<string, string> = {};
   for (const [k, v] of Object.entries(data)) {
     // Identifier-safe keys only (Claude Code drops others); scalars only; never a `content` key

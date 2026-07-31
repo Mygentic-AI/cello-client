@@ -3,13 +3,19 @@
  *
  * Listens on a Unix domain socket, accepts length-prefixed JSON screen requests, runs them
  * through a screen function (M9-CORE-001 ships the pass-through default; later stories inject
- * the detection pipeline here), and writes a request-log line per request BEFORE replying.
- * The request log is the gateway's own record that it saw the content — the integration test
- * reads it to prove screening happened on the real daemon↔gateway channel.
+ * the detection pipeline here), and replies with the verdict.
+ *
+ * PROOF THAT SCREENING HAPPENED lives in the ENCRYPTED record store, not here. This server used to
+ * append a plaintext request-log line per request, and the integration tests read that file; it was
+ * deleted because it duplicated the record store's audit trail outside SQLCipher (M8C
+ * `DOD-CRYPTO-AT-REST-1`). The tests now read the record store, which is the stronger assertion.
+ * The write-before-reply ORDERING that mattered is preserved where the records are actually written
+ * — `bin/cello-gateway.ts` calls `recordOutcome` synchronously before returning the verdict, so the
+ * daemon cannot act on a verdict the gateway never recorded, and a record-write throw becomes a
+ * fail-closed `screen_error` block.
  */
 import { createServer, type Server, type Socket } from "node:net";
-import { appendFile, rm } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
 import { FrameDecoder, encodeFrame, SCREEN_OUTBOUND } from "./protocol.js";
 import type { WireScreenRequest, WireScreenResponse } from "./protocol.js";
 import type { ScreenDirection, ScreenVerdict, GovernanceDecision } from "./types.js";
@@ -42,8 +48,6 @@ const NOOP_LOGGER: GatewayLogger = {
 
 export interface GatewayServerOptions {
   socketPath: string;
-  /** When set, one JSON line per screen request is appended here (the gateway's request log). */
-  requestLogPath?: string;
   /** The screen function. Defaults to pass-through (always allow). */
   screen?: GatewayScreenFn;
   logger?: GatewayLogger;
@@ -60,7 +64,7 @@ const ALLOW_ALL: GatewayScreenFn = () => ({ disposition: "allow" });
 export async function createGatewayServer(opts: GatewayServerOptions): Promise<GatewayServerHandle> {
   const screen = opts.screen ?? ALLOW_ALL;
   const logger = opts.logger ?? NOOP_LOGGER;
-  const { socketPath, requestLogPath } = opts;
+  const { socketPath } = opts;
 
   // A stale socket file from a crashed prior run makes listen() fail with EADDRINUSE. Remove it.
   await rm(socketPath, { force: true });
@@ -88,31 +92,10 @@ export async function createGatewayServer(opts: GatewayServerOptions): Promise<G
     const direction: ScreenDirection = req.method === SCREEN_OUTBOUND ? "outbound" : "inbound";
     const content = Buffer.from(req.content, "base64");
 
-    // Record that the gateway saw this content BEFORE producing the verdict — so the daemon
-    // cannot act on a verdict the gateway never logged (the test's ordering assertion).
-    if (requestLogPath) {
-      const line = JSON.stringify({
-        ts: Date.now(),
-        id: req.id,
-        method: req.method,
-        direction,
-        agentName: req.ctx.agentName,
-        sessionId: req.ctx.sessionId,
-        correlationId: req.ctx.correlationId,
-        bytes: content.length,
-        // A fingerprint of the exact bytes screened — proof-of-screening that binds identity,
-        // not just length, so a test (or audit) can confirm the gateway saw THIS content.
-        contentSha256: createHash("sha256").update(content).digest("hex"),
-      });
-      try {
-        await appendFile(requestLogPath, line + "\n");
-      } catch (err) {
-        logger.error("gateway.request_log.append.failed", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
+    // The record-before-reply ordering is NOT enforced here — this server only routes to `screen`.
+    // It is enforced by the injected screen fn in `bin/cello-gateway.ts`, which records the outcome
+    // synchronously before returning. Stated rather than deleted because the constraint is real and
+    // load-bearing; the plaintext log that used to implement it here is gone, not the requirement.
     let verdict: ScreenVerdict;
     try {
       verdict = await screen({

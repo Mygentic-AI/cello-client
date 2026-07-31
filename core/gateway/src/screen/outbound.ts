@@ -12,6 +12,7 @@
  * `redact` stage once its binding is chosen.
  */
 import { OutboundRateLimiter, type RateLimitConfig } from "../detect/rate-limit.js";
+import { AFFORDANCE_PREFIX } from "./affordance.js";
 import { OutboundPIIScreener, type PIIEvent } from "../detect/pii.js";
 import { screenOutboundExfil } from "../detect/exfil.js";
 import { redactSecrets } from "../detect/secrets.js";
@@ -219,11 +220,23 @@ export class OutboundScreener {
       return {
         reWarn: true,
         warnEvents: rejected.map(warnEvent),
+        // TELL THE AGENT WHAT IT CAN DO. The recurring failure this closes: an agent hits a guard,
+        // is told what happened, and is never told what is available — so it retries the same thing,
+        // or gives up, or invents a workaround. It cannot run the loosening commands itself (that is
+        // the point of the gate), but it CAN relay them, and relaying an exact command is the
+        // difference between a stuck operator and a two-second fix.
         guidance:
-          `NOT SENT. ${rejected.length} item(s) cannot be allowed autonomously because the gateway's ` +
-          `autonomous_override is OFF. Re-send with those flag(s) set to "redact" (a typed placeholder), ` +
-          `or have the operator whitelist the value(s) — only the operator can authorize sending personal ` +
-          `data the gateway flagged.`,
+          `${AFFORDANCE_PREFIX} NOT SENT. ${rejected.length} item(s) cannot be allowed ` +
+          `autonomously because ` +
+          `autonomous_override is OFF.\n` +
+          `WHAT YOU CAN DO NOW: re-send with those flag(s) set to "redact" — the value is replaced ` +
+          `by a typed placeholder and the message goes.\n` +
+          `IF THE FLAG IS WRONG (a date, an id, your own address), relay these to your operator to ` +
+          `run in their terminal. DO NOT run them yourself and do not work around the guard:\n` +
+          `  cello config list                          # FIRST — 'set' REPLACES the whitelist\n` +
+          `  cello config set pii_whitelist <existing,values,plus,new>\n` +
+          `  cello config set autonomous_override true  # or: let agents clear their own flags\n` +
+          `Either prompts them to confirm once. To see exactly what fired: cello policy log`,
         redact: [], allowOnce: [], whitelistAddRequested: [],
       };
     }

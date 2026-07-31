@@ -52,6 +52,7 @@ const INTAKE_PUBKEY_RE = /^[0-9a-f]{64}$/;
  */
 export type SubmissionRefusalReason =
   | "manifest_unavailable"
+  | "manifest_expired"
   | "intake_key_absent"
   | "intake_key_malformed";
 
@@ -68,6 +69,9 @@ export type ComposeSubmissionResult =
       ciphertext: Uint8Array;
     }
   | { ok: false; reason: SubmissionRefusalReason; guidance: string };
+
+/** Epoch millis, injectable so the expiry check is testable without waiting three weeks. */
+export type NowMs = () => number;
 
 export interface ComposeSubmissionOptions {
   /** The VERIFIED consortium manifest, or null if none is loaded. Officer-signed, which is why it is
@@ -87,6 +91,8 @@ export interface ComposeSubmissionOptions {
   /** Integer epoch SECONDS. Inside the signed body, so the verifier's clock-skew bound applies. */
   issuedAt: number;
   logger: Logger;
+  /** Injectable clock for the manifest-expiry gate. Defaults to `Date.now`. */
+  nowMs?: NowMs;
 }
 
 /**
@@ -138,6 +144,37 @@ export async function composeSealedSubmission(
       guidance:
         "No verified consortium manifest is loaded, so the portal's intake key is unknown. " +
         "A submission is never sent unsealed. Check the daemon's manifest configuration and retry.",
+    };
+  }
+
+  // THE MANIFEST IS A STARTUP SNAPSHOT, AND ITS VALIDITY IS TIME-LIMITED.
+  //
+  // `verifyStartupManifest` checked the signatures, the window and the anti-rollback ONCE, at daemon
+  // start, and the daemon then holds that object for its whole lifetime — nothing refreshes it. So
+  // the startup gate's guarantee decays: three weeks later the window may have closed and the portal
+  // may have rotated the intake key, while this code would still happily seal to the retired one.
+  //
+  // The operator would be told the message was sent. The portal could not open it. By this module's
+  // own definition that arrives as unattributable POISON with no reply possible — the message simply
+  // vanishes, with no error anywhere. An EXPIRED input is an UNVERIFIED input (§5a), so it refuses
+  // and names the cause rather than trusting a check whose expiry has passed.
+  const now = (opts.nowMs ?? Date.now)();
+  const expiresAt = Date.parse(manifest.expires);
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    logger.warn("signal.submission.refused", {
+      reason: "manifest_expired",
+      manifestVersion: manifest.version,
+      expiresAt: manifest.expires,
+      op: opts.op,
+    });
+    return {
+      ok: false,
+      reason: "manifest_expired",
+      guidance:
+        `The consortium manifest verified at daemon start (v${manifest.version}) expired at ` +
+        `${manifest.expires}, so its portal intake key can no longer be trusted — sealing to a ` +
+        "retired key produces a message the portal cannot open and cannot even attribute. " +
+        "Restart the daemon to load and verify a current manifest, then retry.",
     };
   }
 
@@ -225,7 +262,12 @@ export type SubmissionSendFailure =
   | "directory_unreachable"
   | "submission_write_timeout"
   | "submission_unsupported_by_node"
-  | "submission_refused_by_node";
+  | "submission_refused_by_node"
+  // The two the TRANSPORT returns. They were missing while the code cast `sent.reason` into this
+  // union, which made the declared type a lie a consumer could branch on: an operator surface that
+  // switched on this union would have no case for either of the values it most often receives.
+  | "signaling_reconnecting"
+  | "signaling_lost";
 
 export type SendSubmissionResult =
   | {
@@ -374,6 +416,123 @@ export async function sendSealedSubmission(deps: {
       stored,
     });
     return { ok: true, submissionId: id, stored };
+  } finally {
+    unregister();
+  }
+}
+
+// ─── The return leg ──────────────────────────────────────────────────────────────────────────────
+
+/** One outcome the directory holds for this agent. `message` is present only when one was sealed. */
+export interface SubmissionResult {
+  submissionId: string;
+  outcome: string;
+  reason: string | null;
+  signalHash: string | null;
+  /** The refusal message, already opened with k_local. Null when there was none, or it would not open. */
+  message: string | null;
+  createdAt: string;
+}
+
+/**
+ * M10B / `M10B-D25r2` — ask the directory what happened to what this agent submitted.
+ *
+ * THE REQUEST CARRIES NO IDENTITY, and that absence is the point: the directory scopes the answer to
+ * the key that authenticated the stream. A pubkey parameter would be a parameter to forge, and would
+ * let any agent that can dial a node collect another's outcomes — including refusal ciphertexts
+ * sealed to somebody else, unopenable by them but never theirs to hold.
+ *
+ * ONE TIMEOUT, NO RETRY. An outcome is durable at the directory until acked, so a caller that missed
+ * it simply asks again — a retry loop here would only add load to a node that is already slow.
+ */
+export async function fetchSubmissionResults(opts: {
+  signaling: SubmissionSignaling;
+  keyProvider: { openContentSeal?: (ciphertext: Uint8Array) => Promise<Uint8Array | null> };
+  logger: Logger;
+  timeoutMs?: number;
+}): Promise<{ ok: true; results: SubmissionResult[] } | { ok: false; reason: string; guidance: string }> {
+  const { signaling, keyProvider, logger } = opts;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+
+  let resolveFrame!: (f: Record<string, unknown>) => void;
+  const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
+  const unregister = signaling.registerInboundHandler((frame) => {
+    const t = frame["type"];
+    if (t === "submission_results" || t === "submission_results_error") resolveFrame(frame);
+  });
+
+  try {
+    const sent = await signaling.sendRaw({ type: "submission_results_request" });
+    if (!sent.ok) {
+      const cause = sent.reason ?? "directory_unreachable";
+      return {
+        ok: false,
+        reason: cause,
+        guidance:
+          `The request was not handed to a directory node (${cause}). Outcomes are held until you ` +
+          "collect them, so nothing is lost — try again once the stream is back.",
+      };
+    }
+
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeoutP = new Promise<Record<string, unknown>>((r) => { timer = setTimeout(() => r({ type: "__timeout__" }), timeoutMs); });
+    const frame = await Promise.race([pending, timeoutP]);
+    clearTimeout(timer);
+
+    if (frame["type"] === "__timeout__") {
+      return {
+        ok: false,
+        reason: "submission_results_timeout",
+        guidance:
+          `The node did not answer within ${timeoutMs}ms. Your outcomes are still held — this is a ` +
+          "slow or old node, not a lost result. An older node that does not know the frame answers " +
+          "nothing at all, which looks the same from here.",
+      };
+    }
+    if (frame["type"] === "submission_results_error") {
+      const reason = typeof frame["reason"] === "string" ? frame["reason"] : "unspecified";
+      return { ok: false, reason, guidance: `The directory could not serve your results: ${reason}.` };
+    }
+
+    const raw = Array.isArray(frame["results"]) ? (frame["results"] as Array<Record<string, unknown>>) : [];
+    const results: SubmissionResult[] = [];
+    for (const r of raw) {
+      const submissionId = typeof r["submission_id"] === "string" ? r["submission_id"] : null;
+      const outcome = typeof r["outcome"] === "string" ? r["outcome"] : null;
+      // A row missing its id or outcome is unusable — there is nothing to correlate it against and
+      // nothing to report. Dropped LOUDLY rather than surfaced as a result with empty fields.
+      if (!submissionId || !outcome) {
+        logger.warn("signal.results.malformed_row", {});
+        continue;
+      }
+
+      // THE MESSAGE IS OPENED HERE, by k_local, and a failure to open is NOT a failure of the
+      // result: the outcome and reason are still true and still worth reporting. Swallowing the
+      // whole row because its message would not decrypt would hide a refusal behind a key problem.
+      let message: string | null = null;
+      const ct = r["ciphertext"];
+      if (ct instanceof Uint8Array && ct.length > 0 && keyProvider.openContentSeal) {
+        try {
+          const opened = await keyProvider.openContentSeal(ct);
+          message = opened ? new TextDecoder().decode(opened) : null;
+          if (!opened) logger.warn("signal.results.seal_unopenable", { submissionId });
+        } catch {
+          logger.warn("signal.results.seal_unopenable", { submissionId });
+        }
+      }
+
+      results.push({
+        submissionId,
+        outcome,
+        reason: typeof r["reason"] === "string" ? r["reason"] : null,
+        signalHash: typeof r["signal_hash"] === "string" ? r["signal_hash"] : null,
+        message,
+        createdAt: typeof r["created_at"] === "string" ? r["created_at"] : "",
+      });
+    }
+
+    logger.info("signal.results.fetched", { count: results.length });
+    return { ok: true, results };
   } finally {
     unregister();
   }

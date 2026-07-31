@@ -35,6 +35,7 @@ import * as lp from "it-length-prefixed";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
 import { buildSealTbs } from "@cello-protocol/protocol-types";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
@@ -262,6 +263,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
 
     const { logger, events } = makeLogger();
     const config: DaemonConfig = {
+    securityGateway: new PassthroughGatewayClient(),
       celloDir: dirA,
       socketPath: join(dirA, "daemon.sock"),
       lockFilePath: join(dirA, "daemon.lock"),

@@ -16,6 +16,7 @@ import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { TIER, DEFAULT_TIER_BOUNDS } from "../contacts-tier-migration.js";
 import { boundSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY, validateSettingValue } from "../agent-settings-keys.js";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager, type ISessionNodeFactory, type SessionNodeConfig } from "../session-node-manager.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Logger } from "../types.js";
@@ -80,7 +81,7 @@ describe("DOD-TIER-BOUNDS-SETTINGS — resolveTierBound + the override in effect
     const seed = openTestDb(dbPath);
     alice = (await seedAgents(seed, ["alice"])).get("alice")!;
     seed.close();
-    mgr = new SessionNodeManager({ factory: new StubNodeFactory(), logger: silent, dbPath });
+    mgr = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath });
     await mgr.initialize();
     db = mgr.getDb();
   });
