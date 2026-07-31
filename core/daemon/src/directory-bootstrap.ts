@@ -182,10 +182,27 @@ export function mapEndpointToBootstrapBase(endpoint: string): string | null {
   return null;
 }
 
+/** Why one consortium node could not be resolved, for the operator-facing surface. */
+export interface NodeResolveFailure {
+  nodeId: string;
+  endpoint: string;
+  reason: string;
+  detail?: string;
+}
+
 export interface ManifestResolveOptions {
   logger: Logger;
   /** Injectable fetch for testing. */
   fetchFn?: typeof fetch;
+  /**
+   * Called for each node that could not be resolved.
+   *
+   * A `warn` in the log is not a surface. When this host's resolver held a cached NXDOMAIN after a
+   * wake, this fired 26 times per node while the operator was shown `counterparty_offline`, then
+   * `directory_below_threshold`, then `ceremony_exhausted` — three errors that each point somewhere
+   * other than DNS. The information existed the whole time and nothing carried it to a human.
+   */
+  onNodeUnresolved?: (failure: NodeResolveFailure) => void;
 }
 
 /**
@@ -220,6 +237,12 @@ export async function manifestNodesToEndpoints(
       const probe = await fetchBootstrapResult(base, fetchFn);
       if (!probe.ok) {
         opts.logger.warn("directory.consortium.node.unresolved", {
+          nodeId: node.nodeId,
+          endpoint: node.endpoint,
+          reason: probe.reason,
+          detail: probe.detail,
+        });
+        opts.onNodeUnresolved?.({
           nodeId: node.nodeId,
           endpoint: node.endpoint,
           reason: probe.reason,

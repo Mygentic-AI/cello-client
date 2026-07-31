@@ -317,7 +317,7 @@ async function startDaemonHoldingLock(
   }
 
   // The manifest poll starts only AFTER the refuse above — a refused startup must not leak a timer.
-  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, stopHttpManifestPoll } =
+  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, stopHttpManifestPoll } =
     createConsortiumRouting({
       manifestProvider,
       manifestRootKeys,
@@ -597,7 +597,28 @@ async function startDaemonHoldingLock(
       // is only ever discovered at the NEXT agent start, not on the reconnect that actually
       // brings the agent back — this closes that gap. Fire-and-forget; autoRecoverForAgent
       // already catches its own per-relay errors internally.
-      onConnected: () => { void autoRecoverForAgent(agentName); },
+      onConnected: () => {
+        void autoRecoverForAgent(agentName);
+        // RE-REGISTER THE STANDING RECEIVER. The receiver's LIFETIME is tied to this daemon; its
+        // REGISTRATION is tied to this stream, and the stream turns over roughly every 70 seconds.
+        // ensureStandingReceiverForAgent ran only at agent start, so 46 of 48 reconnects in one hour
+        // left every agent unregistered — the directory then answers `targetStreamFound: false` and
+        // a session request fails with `target_offline`, while `cello status`, `agent.online` and the
+        // directory's own agent_presence all still report the agent healthy. Silent, and it does not
+        // self-heal: only a daemon restart recovered it (2026-07-31 incident).
+        //
+        // Guarded on onlineAgents because this fires on the FIRST connect too, and an agent that was
+        // never started must not acquire a receiver here. Re-entry at start is harmless —
+        // #ensureStandingReceiver returns immediately when one exists or is being created.
+        if (onlineAgents.has(agentName)) {
+          void sessionNodeManager.ensureStandingReceiverForAgent(agentName).catch((err: unknown) => {
+            logger.warn("session.standing_receiver.reregister.failed", {
+              agentName,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
     perAgentSignaling.set(agentName, entry);
@@ -2586,10 +2607,46 @@ async function startDaemonHoldingLock(
   });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
+  /**
+   * The directory-reachability block for `cello_status`, or undefined when every node resolves.
+   *
+   * Reports the LAST resolve sweep. An empty list is not proof of health — it also means no sweep
+   * has run yet — so the shape says which nodes failed and why rather than asserting "all good".
+   */
+  function unresolvedNodesForStatus(): { directory_endpoints_unresolved: unknown } | undefined {
+    const failures = getUnresolvedNodes();
+    if (failures.length === 0) return undefined;
+    return {
+      directory_endpoints_unresolved: {
+        nodes: failures.map((f) => ({ node: f.nodeId, endpoint: f.endpoint, reason: f.reason, detail: f.detail })),
+        guidance:
+          "This daemon cannot resolve these directory endpoints, so the consortium roster is short and " +
+          "threshold ceremonies will fail — sessions surface that as counterparty_offline, " +
+          "directory_below_threshold, or ceremony_exhausted, none of which name the real cause. " +
+          "Agents can still show 'online': signaling dials multiaddrs and does not need DNS. " +
+          "If reason is dns_error after a directory restart or wake, the resolver is holding a cached " +
+          "negative answer — flush it (macOS: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder). " +
+          "Verify with node -e 'require(\"dns\").lookup(host,console.log)', NOT dig: dig bypasses the " +
+          "cache this daemon is stuck behind, so it reports success while the daemon still fails.",
+      },
+    };
+  }
+
   handlers.set("cello_status", async (_params, connectionId) => {
     return {
       daemon: "running",
       directory_signaling: directorySignalingStatus(),
+      // CAN I ACTUALLY REACH THE DIRECTORY — not just "is my socket up?".
+      //
+      // These are different facts and they diverged for an hour on 2026-07-31. libp2p signaling
+      // dials multiaddrs from the bundled manifest, so it stayed connected and every agent reported
+      // online, while a cached NXDOMAIN meant nothing that needed the HTTP endpoint resolved. The
+      // roster came back empty, so every threshold ceremony failed — surfacing to the operator as
+      // counterparty_offline, then directory_below_threshold, then ceremony_exhausted. Three errors,
+      // none of them naming DNS, while the reason sat in the log 26 times per node.
+      //
+      // Omitted entirely when nothing is failing, so a healthy status stays quiet.
+      ...(unresolvedNodesForStatus() ?? {}),
       agents: getAgentsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.

@@ -29,6 +29,7 @@ import type { DirectoryEndpoint } from "./signaling-connect.js";
 import {
   resolveDirectoryUrl,
   manifestNodesToEndpoints,
+  type NodeResolveFailure,
   createRosterAwareEndpointResolver,
   type ConsortiumEndpoint,
 } from "./directory-bootstrap.js";
@@ -187,6 +188,15 @@ export interface ConsortiumRouting {
    * path, where there is no primary resolver to wrap.
    */
   failoverEndpointResolver: (() => Promise<DirectoryEndpoint | null>) | undefined;
+  /**
+   * Which consortium nodes this daemon currently cannot resolve, and why.
+   *
+   * Exists so `cello status` can answer "can I actually reach the directory?" rather than only
+   * "is my signaling socket up?". Those differ: libp2p signaling dials multiaddrs from the bundled
+   * manifest and stays connected, so every agent reports online while anything needing the HTTP
+   * endpoint — the roster, and therefore every threshold ceremony — fails.
+   */
+  getUnresolvedNodes: () => NodeResolveFailure[];
   /** Null-safe accessor for the ceremony/handler getDirectoryEndpoint sites. */
   getFailoverEndpoint: () => Promise<DirectoryEndpoint | null>;
   /** Stops the daemon-level HTTP manifest poll. Undefined when no poll was started. */
@@ -199,9 +209,23 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
     manifestPollScheduler, directoryHttpUrl, directoryEndpointResolver, logger, fetchFn,
   } = deps;
 
+  // LAST failure per node, not a running count — the operator needs the current state, and a node
+  // that has started resolving again must drop out rather than linger as a stale complaint. Cleared
+  // per sweep: every resolve attempt rebuilds this from what actually failed that time.
+  let unresolvedNodes: NodeResolveFailure[] = [];
+  const getUnresolvedNodes = (): NodeResolveFailure[] => [...unresolvedNodes];
+
   const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {
     const m = manifestProvider?.getCurrentManifest();
-    return m ? await manifestNodesToEndpoints(m.nodes, { logger, fetchFn }) : null;
+    if (!m) return null;
+    const failures: NodeResolveFailure[] = [];
+    const endpoints = await manifestNodesToEndpoints(m.nodes, {
+      logger,
+      fetchFn,
+      onNodeUnresolved: (f) => failures.push(f),
+    });
+    unresolvedNodes = failures;
+    return endpoints;
   };
 
   // DECLARED membership, straight off the verified manifest — no probe. Lets the resolver reject a
@@ -244,5 +268,5 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
     });
   }
 
-  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, stopHttpManifestPoll };
+  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, stopHttpManifestPoll };
 }
