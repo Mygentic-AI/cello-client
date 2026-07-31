@@ -800,28 +800,58 @@ export class AgentRelayClient {
 
   async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
+    // Snapshotted BEFORE the first attempt, and it is the whole safety of this loop.
+    //
+    // The first-message race is BY DEFINITION a session we have not recorded yet. A session we DID
+    // record and that the relay now reports missing is a DIFFERENT state: the relay destroys a
+    // session on seal (relay-node.ts `confirmSeal`) and on idle sweep, and its store keeps NO
+    // tombstone — `recordSession` re-creates any absent key fresh (`seq_counter: 0`, empty
+    // leaf_log, status "active"). So `getSession` answers `session_not_found`, NOT `session_sealed`.
+    // Re-presenting our still-valid directory-signed assignment there would silently RESURRECT a
+    // sealed session on the relay: a ghost with an empty log, an idle timer and a delivery path,
+    // created by a client submit retry. Two ctrl leaves on it would drive a second notarization
+    // over a 1-leaf log for an already-certified session.
+    //
+    // The 2 post-seal failures in this defect's own evidence table are exactly that shape — they
+    // reported `session_not_found`, indistinguishable at the wire from the race — which is why
+    // this must be discriminated on OUR state, not on the relay's reason string.
+    const recordedBefore = this.#sessions.get(sessionIdHex)?.recorded === true;
+
     let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
     for (
       let attempt = 1;
       attempt < AgentRelayClient.#SESSION_NOT_FOUND_ATTEMPTS
+        && !recordedBefore
         && !result.ok
-        && result.reason === "session_not_found"
+        && (result.reason === "session_not_found" || result.reason === "session_not_recorded")
         && !this.#closed;
       attempt++
     ) {
-      // Force the assignment to be re-presented: the session state we depend on does not exist
-      // on the relay, so whatever `recorded` says is stale. A session with no assignment to
-      // present (direct/legacy) re-submits without a record — still bounded, and it surfaces the
-      // same named failure rather than hanging.
+      // Force the assignment to be re-presented: we never recorded this session, so the relay
+      // genuinely does not hold it yet. A session with no assignment to present (direct/legacy)
+      // re-submits without a record — still bounded, and it surfaces the same named failure
+      // rather than hanging.
       const sess = this.#sessions.get(sessionIdHex);
       if (sess) sess.recorded = false;
       this.#logger.info("session.relay.submit.retry", {
         relayPeerId: this.#relayPeerId,
         sessionShort: sessionIdHex.slice(0, 16),
         attempt,
-        reason: "session_not_found",
+        reason: result.reason,
       });
       result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
+    }
+
+    // The relay lost a session we had successfully recorded — sealed, idle-swept, or restarted.
+    // Report THAT, rather than letting the caller read a bare `session_not_found` that reads like
+    // the first-message race. Never re-present here: recreating it is the resurrection above.
+    if (recordedBefore && !result.ok && result.reason === "session_not_found") {
+      this.#logger.warn("session.relay.session.gone", {
+        relayPeerId: this.#relayPeerId,
+        sessionShort: sessionIdHex.slice(0, 16),
+        guidance: "the relay no longer holds a session it had recorded (sealed, idle-swept, or restarted) — not re-presented, because that would recreate it with an empty leaf log",
+      });
+      return { ok: false, reason: "relay_session_gone" };
     }
     return result;
   }
@@ -835,7 +865,20 @@ export class AgentRelayClient {
     // the first hash_submit — the relay rejects a submit for an unknown session. Idempotent + no-op when
     // there is no assignment to present (direct/persisted sessions). Runs inline on the submit chain (no re-chaining
     // — #doSubmit is already a chain link), and may reset the stream on failure, so capture #stream after.
-    await this.#doRecord(node, sessionIdHex);
+    const recorded = await this.#doRecord(node, sessionIdHex);
+    const sess = this.#sessions.get(sessionIdHex);
+    if (!recorded && sess?.assignment) {
+      // DOD-FIRSTMSG-WITNESS-1 AC3: do NOT send a hash_submit for a session we know the relay does
+      // not hold. Previously this return value was discarded and the doomed frame went out anyway —
+      // the line this defect's producer→consumer trace names as THE gap. Two sub-states, kept apart:
+      //   - recordRejected  → TERMINAL (the relay refused the assignment as unverifiable). Retrying
+      //                       cannot help and would storm the shared stream.
+      //   - anything else   → the record is in flight or transiently failed. Retryable.
+      // A session with NO assignment to present (direct/legacy) is not covered here: #doRecord
+      // returns true for it, so it still submits exactly as before.
+      if (sess.recordRejected) return { ok: false, reason: "relay_assignment_rejected" };
+      return { ok: false, reason: "session_not_recorded" };
+    }
     const stream = this.#stream;
     if (!stream) return { ok: false, reason: "relay_unavailable" };
 

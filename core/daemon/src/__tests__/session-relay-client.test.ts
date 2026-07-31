@@ -380,71 +380,61 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     return client;
   };
 
-  it("re-presents the assignment and RETRIES the submit when the relay answers session_not_found", async () => {
+  it("RETRIES the submit when the relay answers session_not_found for a session it never recorded", async () => {
+    // This is the live shape of all 23 first-message failures: the SUBMITTING side had no
+    // assignment to present (the inbound path dropped `relay_directory_signature`, fixed
+    // separately), so it could not create the relay session itself and depended on the
+    // counterparty's record landing — which the log shows arriving 5 ms – 2.1 s LATER.
+    // The retry is what turns that lost race into a witnessed leaf.
     const client = await connectedClient();
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0x7a);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
-    await tick();
-    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
-    await tick();
-    relay.push({ type: "relay_auth_ok" });
-    await tick();
-    relay.push({ type: "assignment_ok" });
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1));
     await tick();
-    // The relay does not hold the session yet (it was recorded against another node / the record
-    // is still landing). This is the EXACT live failure.
-    relay.push({ type: "hash_submit_error", reason: "session_not_found" });
-    await tick();
-    // The client must re-present the assignment rather than give up...
-    relay.push({ type: "assignment_ok" });
-    await tick();
-    // ...and re-submit the SAME leaf, which the relay now witnesses.
-    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
-
-    const result = await submit;
-    // The leaf ends up WITNESSED. Today it returns { ok: false, reason: "session_not_found" }
-    // and the daemon appends it unwitnessed forever — the receipt defect.
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.sequence_number).toBe(1);
-
-    // Two hash_submits: the rejected one and the retry. The assignment was re-presented between them.
-    const kinds = relay.sentFrames.map((f) => f["type"]);
-    expect(kinds.filter((k) => k === "hash_submit").length).toBe(2);
-    const firstSubmit = kinds.indexOf("hash_submit");
-    const rerecord = kinds.indexOf("client_record_assignment", firstSubmit);
-    const retry = kinds.indexOf("hash_submit", firstSubmit + 1);
-    expect(rerecord).toBeGreaterThan(firstSubmit);
-    expect(retry).toBeGreaterThan(rerecord);
-    client.close();
-  });
-
-  it("retries session_not_found a BOUNDED number of times — a relay that never records fails loudly", async () => {
-    const client = await connectedClient();
-    const relay = makeFakeRelay();
-    const sid = new Uint8Array(16).fill(0x7b);
-
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
-    await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "assignment_ok" });
+    // The relay does not hold the session yet. This is the EXACT live failure.
+    relay.push({ type: "hash_submit_error", reason: "session_not_found" });
+    await tick();
+    // In the live window the counterparty's record lands here — the retry now succeeds.
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+
+    const result = await submit;
+    // The leaf ends up WITNESSED. Before the fix this returned
+    // { ok: false, reason: "session_not_found" } and the daemon appended it unwitnessed forever,
+    // leaving the record one ahead of the relay for the life of the session — the receipt defect.
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.sequence_number).toBe(1);
+    expect(relay.sentFrames.filter((f) => f["type"] === "hash_submit").length).toBe(2);
+    // Nothing to present, so nothing was recorded — the retry did not invent an assignment.
+    expect(relay.sentFrames.some((f) => f["type"] === "client_record_assignment")).toBe(false);
+    client.close();
+  });
+
+  it("retries session_not_found a BOUNDED number of times — a relay that never holds it fails loudly", async () => {
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7b);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
     await tick();
     // The relay refuses every time — an unbounded retry would hang the send path forever
     // (constraint 3: an inbox must stay readable).
     for (let i = 0; i < 6; i++) {
       relay.push({ type: "hash_submit_error", reason: "session_not_found" });
-      await tick();
-      relay.push({ type: "assignment_ok" });
       await tick();
     }
 
@@ -455,6 +445,70 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     const submits = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
     expect(submits).toBeGreaterThan(1);
     expect(submits).toBeLessThanOrEqual(3);
+    client.close();
+  });
+
+  it("a TERMINALLY rejected assignment never submits blind — it fails with its own reason", async () => {
+    // AC3: #doRecord's return value is no longer discarded. A relay that cleanly rejected the
+    // assignment (assignment_invalid) will reject it again, so submitting would be doomed traffic
+    // and retrying would storm the shared per-agent stream. Before the fix this sent the frame
+    // anyway and surfaced the relay's `session_not_found` — the wrong subsystem entirely.
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7e);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_invalid", reason: "directory_signature_invalid" });
+    await tick();
+
+    const result = await client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(5));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("relay_assignment_rejected");
+    // No doomed hash_submit went on the wire, and no re-present storm.
+    expect(relay.sentFrames.some((f) => f["type"] === "hash_submit")).toBe(false);
+    expect(relay.sentFrames.filter((f) => f["type"] === "client_record_assignment").length).toBe(1);
+    client.close();
+  });
+
+  it("NEVER re-presents for a session it already recorded — a sealed session must not be resurrected", async () => {
+    // The relay DESTROYS a session on seal (relay-node.ts confirmSeal) and on idle sweep, and keeps
+    // NO tombstone — its store re-creates any absent key fresh (seq_counter 0, empty leaf_log,
+    // status "active"). So a post-seal send gets `session_not_found`, byte-identical to the
+    // first-message race. Re-presenting the still-valid assignment there would RESURRECT the sealed
+    // session as a ghost with an empty log — and 2 of the 25 live failures are exactly that shape.
+    // The discriminator has to be OUR state (did we record it?), never the relay's reason string.
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7d);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_ok" });
+    await tick();
+    const recordsAfterRegister = relay.sentFrames.filter((f) => f["type"] === "client_record_assignment").length;
+    expect(recordsAfterRegister).toBe(1); // the session IS recorded
+
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(4));
+    await tick();
+    relay.push({ type: "hash_submit_error", reason: "session_not_found" });
+    await tick();
+
+    const result = await submit;
+    // Reported as what it actually is, not as the race.
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("relay_session_gone");
+    // THE assertion: no second assignment was presented, so nothing was recreated on the relay.
+    expect(relay.sentFrames.filter((f) => f["type"] === "client_record_assignment").length).toBe(1);
+    expect(relay.sentFrames.filter((f) => f["type"] === "hash_submit").length).toBe(1);
     client.close();
   });
 
@@ -474,8 +528,11 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(3));
     await tick();
-    // A sealed session is a TERMINAL answer — retrying it would be pointless traffic and would
-    // mask a real state (this is the shape of the 2 post-seal failures in the live log).
+    // `session_sealed` is a TERMINAL answer — retrying it would be pointless traffic masking a real
+    // state. NOTE: this is NOT the shape of the 2 post-seal failures in the live log; those reported
+    // `session_not_found`, because confirmSeal DESTROYS the relay's session entry rather than
+    // marking it sealed. `session_sealed` only fires in the narrow sealing/seal_rejected window.
+    // That case is covered by the "never re-presents for a session it already recorded" test above.
     relay.push({ type: "hash_submit_error", reason: "session_sealed" });
 
     const result = await submit;

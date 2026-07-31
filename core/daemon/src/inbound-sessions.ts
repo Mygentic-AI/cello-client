@@ -24,6 +24,7 @@ import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvel
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
+import type { RelayAssignmentCarry } from "./session-relay-client.js";
 
 /** How long an un-accepted inbound session request stays claimable. */
 export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
@@ -262,6 +263,84 @@ function toSignature64(v: unknown): Uint8Array | undefined {
   return bytes && bytes.length === 64 ? bytes : undefined;
 }
 
+/**
+ * DOD-FIRSTMSG-WITNESS-1: build the RESPONDER's `RelayAssignmentCarry` from a parsed inbound
+ * assignment, so it can present `client_record_assignment` and create its own relay session state.
+ *
+ * Before this the responder carried no assignment at all: `#doRecord` no-opped (returning TRUE —
+ * "nothing to present"), `#doSubmit` submitted blind, and the relay answered `session_not_found`
+ * unless the initiator's record had already landed. Same-machine loses that race because local
+ * delivery is instant while the initiator's record is a round trip.
+ *
+ * Mirrors `buildRelayConnectParams` (daemon.ts) on the initiator side. Returns undefined when the
+ * directory issued no signature, leaving direct/legacy sessions exactly as they were.
+ *
+ * The field mapping is load-bearing: the relay rebuilds the signed TBS from these values, so a
+ * swapped participant or a dropped peer id yields an assignment it rejects as FORGED — which sets
+ * `recordRejected` terminally and leaves the session permanently unwitnessed. That is a worse
+ * failure than the one this closes, which is why it is extracted and tested directly.
+ */
+/**
+ * M7 DOD-SPINE-6 / MSG-001-3b + DOD-FIRSTMSG-WITNESS-1: the responder's relay-witness params.
+ *
+ * Extracted from `acceptInboundAssignment` so the whole object handed to `acceptSession` — not just
+ * its parts — is directly assertable. The `assignment` field is the fix: without it the responder
+ * can never present `client_record_assignment`.
+ *
+ * Returns undefined when this agent has no key or the assignment carries no relay endpoint — the
+ * session then runs on the direct content path with no relay witness (degraded, never blocked).
+ */
+export async function buildResponderRelayParams(
+  parsed: NonNullable<ReturnType<typeof extractInboundSessionAssignment>>,
+  kp: KeyProvider | undefined,
+  logger: Logger,
+  agentName: string,
+): Promise<RelayConnectParams | undefined> {
+  if (!kp || !parsed.relayPeerId || parsed.relayAddrs.length === 0) return undefined;
+  // DOD-FIRSTMSG-WITNESS-1 (F4): mirror the initiator's loud warning (daemon.ts:457). We only reach
+  // here when the assignment carries a relay endpoint, so a missing signature is NOT the legitimate
+  // direct/legacy case — it means this session gets no relay witness of its own, which is exactly
+  // the pre-fix state. Unwitnessed is an allowed sovereign-redundancy state; it must not be
+  // INVISIBLE. Malformed is reported separately from absent: a wrong-length signature is a
+  // wire/version bug, not a legacy session.
+  if (!parsed.relayDirectorySignature) {
+    logger.warn("session.relay.assignment.signature.missing", {
+      agentName,
+      sessionId: parsed.sessionIdHex.slice(0, 16),
+      reason: parsed.relayDirectorySignatureMalformed
+        ? "relay_directory_signature_malformed"
+        : "relay_mode_assignment_without_directory_signature",
+    });
+  }
+  return {
+    relayPeerId: parsed.relayPeerId,
+    relayAddrs: parsed.relayAddrs,
+    keyProvider: kp,
+    senderPubkey: await kp.getPublicKey(),
+    sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
+    assignment: buildResponderRelayAssignment(parsed),
+  };
+}
+
+export function buildResponderRelayAssignment(parsed: {
+  participantAPubkeyHex: string;
+  participantBPubkeyHex: string;
+  sessionTimestamp: number;
+  initiatorPeerId: string;
+  counterpartySessionPeerId: string | null;
+  relayDirectorySignature: Uint8Array | undefined;
+}): RelayAssignmentCarry | undefined {
+  if (!parsed.relayDirectorySignature) return undefined;
+  return {
+    participantA: new Uint8Array(Buffer.from(parsed.participantAPubkeyHex, "hex")),
+    participantB: new Uint8Array(Buffer.from(parsed.participantBPubkeyHex, "hex")),
+    sessionTimestamp: parsed.sessionTimestamp,
+    initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
+    counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
+    assignmentSignature: parsed.relayDirectorySignature,
+  };
+}
+
 export function extractInboundSessionAssignment(frame: Record<string, unknown>):
   | {
       sessionIdHex: string;
@@ -285,6 +364,9 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
       // (direct/legacy/pre-Option-B); it must read as ABSENT, never as an empty signature,
       // because presenting an empty one would be rejected as forged.
       relayDirectorySignature: Uint8Array | undefined;
+      // True when the field was PRESENT but not a well-formed 64-byte signature — a wire/version
+      // bug, reported distinctly from "the directory issued none" (a legacy/direct session).
+      relayDirectorySignatureMalformed: boolean;
       // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
       // boundary — downstream code can never observe an invalid moniker. null when
       // absent (older client) or invalid; monikerRejected distinguishes the two so the
@@ -354,6 +436,8 @@ export function extractInboundSessionAssignment(frame: Record<string, unknown>):
     // has no client-presentable assignment" rather than producing a frame the relay rejects as
     // forged — which would mark the session recordRejected and terminally unwitnessed.
     relayDirectorySignature: toSignature64(a["relay_directory_signature"]),
+    relayDirectorySignatureMalformed:
+      a["relay_directory_signature"] !== undefined && toSignature64(a["relay_directory_signature"]) === undefined,
     offeredMoniker: monikerResult.offeredMoniker,
     monikerRejected: monikerResult.rejected,
     monikerRejectReason: monikerResult.reason ?? null,
@@ -564,34 +648,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       }
       // M7 DOD-SPINE-6 / MSG-001-3b: relay witness for the receiver. Build from the
       // inbound assignment's relay endpoint + this agent's K_local + the 16-byte session id.
-      const kp = getKeyProvider(agentName);
-      let relayParams: RelayConnectParams | undefined;
-      if (kp && parsed.relayPeerId && parsed.relayAddrs.length > 0) {
-        relayParams = {
-          relayPeerId: parsed.relayPeerId,
-          relayAddrs: parsed.relayAddrs,
-          keyProvider: kp,
-          senderPubkey: await kp.getPublicKey(),
-          sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
-          // DOD-FIRSTMSG-WITNESS-1: carry the directory-signed assignment so the RESPONDER can
-          // present `client_record_assignment` itself. Before this the responder had no assignment
-          // at all, so #doRecord no-opped (returning TRUE — "nothing to present"), #doSubmit
-          // submitted blind, and the relay answered `session_not_found` unless the initiator's
-          // record had already landed. Mirrors buildRelayConnectParams (daemon.ts) on the
-          // initiator side; undefined when the directory issued no signature, which leaves the
-          // previous behaviour exactly as it was for direct/legacy sessions.
-          assignment: parsed.relayDirectorySignature
-            ? {
-                participantA: new Uint8Array(Buffer.from(parsed.participantAPubkeyHex, "hex")),
-                participantB: new Uint8Array(Buffer.from(parsed.participantBPubkeyHex, "hex")),
-                sessionTimestamp: parsed.sessionTimestamp,
-                initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
-                counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
-                assignmentSignature: parsed.relayDirectorySignature,
-              }
-            : undefined,
-        };
-      }
+      const relayParams = await buildResponderRelayParams(parsed, getKeyProvider(agentName), logger, agentName);
       const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
         agentName,
