@@ -157,6 +157,9 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     // when nobody accepted the offer (directory-frames.ts encodes it only when non-empty), so
     // `null` here builds exactly that broken frame. Defaults to present — a complete assignment.
     counterpartyPeerId?: string | null;
+    /** DOD-FIRSTMSG-WITNESS-1: the relay endpoint + the directory's signature over the assignment. */
+    relayPeerId?: string;
+    relayDirectorySignature?: Uint8Array;
   }): Record<string, unknown> {
     const assignment: Record<string, unknown> = {
       session_id: opts.sessionId ?? SID_BYTES,
@@ -168,6 +171,12 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     if (opts.initiatorPeerId !== undefined) assignment["initiator_session_peer_id"] = opts.initiatorPeerId;
     const counterpartyPeerId = opts.counterpartyPeerId === undefined ? "bob-session-peer-id" : opts.counterpartyPeerId;
     if (counterpartyPeerId !== null) assignment["counterparty_session_peer_id"] = counterpartyPeerId;
+    if (opts.relayPeerId !== undefined) {
+      assignment["relay_endpoint"] = { peer_id: opts.relayPeerId, multiaddrs: ["/ip4/127.0.0.1/tcp/1/p2p/" + opts.relayPeerId] };
+    }
+    if (opts.relayDirectorySignature !== undefined) {
+      assignment["relay_directory_signature"] = opts.relayDirectorySignature;
+    }
     return { type: "session_assignment", assignment };
   }
 
@@ -523,4 +532,52 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     expect(malformed!.context["reason"]).toBe("missing_assignment_or_ids");
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
+
+  // ─── DOD-FIRSTMSG-WITNESS-1 · F1 ─────────────────────────────────────────────────────────────
+  // THE ONE LINE THAT IS THE FIX. `acceptInboundAssignment` builds the responder's relay params and
+  // hands them to `acceptSession` (inbound-sessions.ts:651). Everything else about this fix — the
+  // parser, the carry builder, the params builder — is unit-tested six ways, and ALL OF IT is dead
+  // if that one call site drops the `assignment` field. Reverting it to the pre-fix inline literal
+  // left the whole suite green, which is the exact shape the new test file's own header claimed to
+  // have closed. It pinned the builder; nothing pinned the caller.
+  //
+  // So this asserts on the REAL path: a directory-pushed frame goes in, and the signature the
+  // directory put on the wire has to come back out of the object `acceptSession` actually receives.
+  it("hands acceptSession the relay assignment carrying the directory's signature (DOD-FIRSTMSG-WITNESS-1)", async () => {
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const node = new FakeNode();
+    const captured: Record<string, unknown>[] = [];
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
+    await wait(50);
+
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    // Spy that CALLS THROUGH — the accept must still really happen, or this would pass against a
+    // path that never completes.
+    const seen: unknown[] = [];
+    const realAccept = snm.acceptSession.bind(snm);
+    (snm as any).acceptSession = (...args: unknown[]) => { seen.push(args[5]); return (realAccept as any)(...args); };
+
+    const DIR_SIG = Uint8Array.from(Array.from({ length: 64 }, (_, i) => (i * 7 + 3) & 0xff));
+    injectRef.inject!(assignmentFrame({
+      initiatorPubkeyHex: "cd".repeat(32),
+      counterpartyPubkeyHex: bobPubkey,
+      initiatorPeerId: "alice-session-peer-id",
+      relayPeerId: "relay-peer-id",
+      relayDirectorySignature: DIR_SIG,
+    }));
+    await wait(150);
+
+    expect(seen.length, "acceptSession was never reached — the test proves nothing").toBe(1);
+    const relayParams = seen[0] as { assignment?: { assignmentSignature?: Uint8Array } } | undefined;
+    expect(relayParams?.assignment, "the responder's relay params carry no assignment — the wiring at inbound-sessions.ts:651 is gone").toBeDefined();
+    expect(
+      Buffer.from(relayParams!.assignment!.assignmentSignature!).toString("hex"),
+      "the directory's signature did not survive the wire boundary into acceptSession",
+    ).toBe(Buffer.from(DIR_SIG).toString("hex"));
+  });
+
 });

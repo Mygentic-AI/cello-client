@@ -245,6 +245,13 @@ export class AgentRelayClient {
      * it, so a misconfigured relay can't trigger a reconnect/re-present storm across sibling sessions.
      */
     recordRejected: boolean;
+    /**
+     * The record TIMED OUT rather than failing fast. A distinct sub-state because it means the
+     * relay is unhealthy, not that the session is "not ready yet" — and the retry loop below is
+     * for the not-ready-yet case. Retrying a timeout burns HASH_SUBMIT_TIMEOUT_MS per attempt on
+     * the agent's SHARED submit chain, so a degraded relay would hold every session's sends.
+     */
+    recordTimedOut: boolean;
   }>();
 
   constructor(opts: AgentRelayClientOpts) {
@@ -281,6 +288,7 @@ export class AgentRelayClient {
       assignment: assignment ?? existing?.assignment,
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
+      recordTimedOut: existing?.recordTimedOut ?? false,
     });
     // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
     // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay
@@ -337,6 +345,7 @@ export class AgentRelayClient {
       const result = await Promise.race([ackPromise, timeout]);
       if (result === "ok") {
         sess.recorded = true;
+        sess.recordTimedOut = false;
         this.#logger.info("session.relay.assignment.recorded", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
         return true;
       }
@@ -344,6 +353,7 @@ export class AgentRelayClient {
         // ONLY here reset the stream: a late ack on this superseded stream would settle a LATER submit's
         // resolver (FIFO desync). recorded stays false ⇒ a transient timeout is retried on reconnect.
         this.#resetStream();
+        sess.recordTimedOut = true;
         this.#logger.warn("session.relay.assignment.record.timeout", { relayPeerId: this.#relayPeerId, sessionShort: sessionIdHex.slice(0, 16) });
         return false;
       }
@@ -877,6 +887,13 @@ export class AgentRelayClient {
       // A session with NO assignment to present (direct/legacy) is not covered here: #doRecord
       // returns true for it, so it still submits exactly as before.
       if (sess.recordRejected) return { ok: false, reason: "relay_assignment_rejected" };
+      // A TIMEOUT IS NOT "NOT READY YET". The retry below exists for a relay that has not finished
+      // registering the session — it answers in milliseconds. A record that timed out means the relay
+      // is not answering at all, and retrying spends HASH_SUBMIT_TIMEOUT_MS again per attempt on the
+      // chain SHARED by every session this agent holds on this relay. Classifying it as unreachable
+      // proceeds unwitnessed immediately, which is what AC2 asks for on an outage — the send is not
+      // lost, and one sick relay cannot hold an operator's other conversations for half a minute.
+      if (sess.recordTimedOut) return { ok: false, reason: "relay_unavailable" };
       return { ok: false, reason: "session_not_recorded" };
     }
     const stream = this.#stream;
