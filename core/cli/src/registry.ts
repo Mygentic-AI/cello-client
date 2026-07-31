@@ -894,7 +894,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "cannot read it), screened, minted \u2014 and then the SUBJECT must accept it before anyone else can\n" +
       "see it. They may refuse, and a refusal may carry their reasoning back to you.\n" +
       "\n" +
-      "The receiving direction \u2014 attestations others wrote about YOU \u2014 is 'cello consent'.\n" +
+      "The receiving direction \u2014 attestations others wrote about YOU \u2014 is 'cello attestation-consent'.\n" +
       "You cannot attest about yourself.\n" +
       "\n" +
       "Prose contains things that look like flags, so use -- to end flag parsing:\n" +
@@ -975,7 +975,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         const msg = positional.slice(2).join(" ");
         return attestationConsentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
       }
-      return { stdout: helpForSpec("consent"), stderr: "", exitCode: 1 };
+      return { stdout: helpForSpec("attestation-consent"), stderr: "", exitCode: 1 };
     },
   },
 

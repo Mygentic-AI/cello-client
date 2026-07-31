@@ -639,7 +639,7 @@ export async function sessions(
  *   issue <pubkey> <text…>  — attest to something you have seen them do
  *   issued                  — what happened to the ones you wrote
  *
- * The receiving direction — what others wrote about YOU — is `cello consent`.
+ * The receiving direction — what others wrote about YOU — is `cello attestation-consent`.
  */
 export async function attestations(
   celloDir: string,
@@ -726,11 +726,11 @@ export async function attestations(
       return {
         exitCode: 1,
         output:
-          "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>\n" +
+          "Usage: cello attestations issue <subject-pubkey> <what you are endorsing them for…>\n" +
           "\n" +
           "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
           "before it so it is read as text:\n" +
-          "  cello trust-signals issue <pubkey> -- cut p99 by -30ms on the auth path",
+          "  cello attestations issue <pubkey> -- cut p99 by -30ms on the auth path",
       };
     }
     try {
@@ -754,7 +754,7 @@ export async function attestations(
       "  cello attestations issue <pubkey> <text…>  — attest to something you have seen them do\n" +
       "  cello attestations issued                  — what happened to the ones you wrote\n" +
       "\n" +
-      "What others wrote about YOU is 'cello consent'.",
+      "What others wrote about YOU is 'cello attestation-consent'.",
   };
 }
 
@@ -838,7 +838,7 @@ export async function trustSignals(
       const header = `  ${"type".padEnd(22)}  hash          status        consent    co-own  include  issued`;
       const divider = "  " + "─".repeat(92);
       const consentLegend = anyAwaiting
-        ? `\n  consent: PENDING = someone issued this ABOUT you and it awaits your decision — it is NOT\n           shown to anyone until you accept.  Run 'cello consent list' to read and decide.\n           refused = you refused it; it stays inert.  ✗ = not presentable, whatever 'include' says.`
+        ? `\n  consent: PENDING = someone issued this ABOUT you and it awaits your decision — it is NOT\n           shown to anyone until you accept.  Run 'cello attestation-consent list' to read and decide.\n           refused = you refused it; it stays inert.  ✗ = not presentable, whatever 'include' says.`
         : "";
       // The co-own legend appears only when a co-owned signal is present: a line explaining a column
       // that reads "—" on every row is noise, and its APPEARANCE is what makes the operator look.
