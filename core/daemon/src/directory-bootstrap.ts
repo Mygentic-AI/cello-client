@@ -5,7 +5,7 @@
  * adapter, which sits ABOVE it as a thin IPC proxy.
  *
  * Mechanism:
- *   1. resolveDirectoryUrl(env): CELLO_DIRECTORY_URL or PRODUCTION_DIRECTORY_URL.
+ *   1. resolveDirectoryUrl(env): CELLO_DIRECTORY_URL or a random bundled endpoint.
  *   2. GET ${url}/bootstrap → { multiaddr } containing "/p2p/<peerId>".
  *   3. The peer ID is the segment after the final "/p2p/" in the multiaddr.
  *
