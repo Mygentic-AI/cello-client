@@ -557,6 +557,38 @@ describe("manifestNodesToEndpoints", () => {
     ]);
   });
 
+  it("REFUSES a node whose probe returns a peer id the signed manifest does not declare", async () => {
+    // The manifest declares peerId inside the SIGNED body. When the plaintext /bootstrap probe answers
+    // with a different one, the signed roster and the live response disagree about who this node is —
+    // which is what a redirected or substituted /bootstrap looks like. Before this the declared value
+    // was decorative: the client dialled whatever the probe returned.
+    const declared = [{ ...NODES[0], peerId: "PEER5001" }, { ...NODES[1], peerId: "SOMEONE-ELSE" }];
+    const errors: Array<{ event: string; detail: Record<string, unknown> }> = [];
+    const logger = {
+      ...silentLogger,
+      error: (event: string, detail?: Record<string, unknown>) => errors.push({ event, detail: detail ?? {} }),
+    };
+
+    const eps = await manifestNodesToEndpoints(declared as never, {
+      fetchFn: portKeyedFetch(),
+      logger: logger as never,
+    });
+
+    // The honest node still resolves — one bad entry must not strand the consortium.
+    expect(eps.map((e) => e.nodeId)).toEqual(["node-0"]);
+    const mismatch = errors.find((e) => e.event === "directory.consortium.node.peer_id_mismatch");
+    expect(mismatch, "the refusal must name its cause, not be a silent skip").toBeDefined();
+    expect(mismatch?.detail["declaredPeerId"]).toBe("SOMEONE-ELSE");
+    expect(mismatch?.detail["probePeerId"]).toBe("PEER5002");
+  });
+
+  it("tolerates a node that declares NO peer id — pre-field manifests must still resolve", async () => {
+    // Treating "not declared" as "mismatch" would strand every node in a manifest written before the
+    // field existed, turning a hardening measure into an outage.
+    const eps = await manifestNodesToEndpoints(NODES, { fetchFn: portKeyedFetch(), logger: silentLogger });
+    expect(eps).toHaveLength(3);
+  });
+
   it("is availability-aware: a node whose /bootstrap fails is SKIPPED, the rest still resolve", async () => {
     // Redundancy invariant (CLAUDE.md): one node down must not strand the others.
     const eps = await manifestNodesToEndpoints(NODES, { fetchFn: portKeyedFetch(["5002"]), logger: silentLogger });

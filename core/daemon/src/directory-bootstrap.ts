@@ -233,6 +233,26 @@ export async function manifestNodesToEndpoints(
         opts.logger.error("directory.consortium.node.no_peer_id", { nodeId: node.nodeId, multiaddr });
         return null;
       }
+      // The manifest DECLARES this node's peer id, and it is inside the signed body — so when the
+      // plaintext /bootstrap probe answers with a different one, the signed roster and the live
+      // response disagree about who this node is. Refuse rather than dial.
+      //
+      // Without this the declared value was decorative: the client dialled whatever the probe
+      // returned and the signature covered a field nobody read. Step-6 still authenticates the
+      // directory by challenge, so this is defence in depth at the DIAL layer — it declines to open a
+      // connection to the wrong peer at all, instead of opening one and rejecting it a round later.
+      //
+      // Absent `peerId` is tolerated: manifests written before the field existed carry none, and
+      // treating "not declared" as "mismatch" would strand every node in them.
+      const declaredPeerId = node.peerId;
+      if (declaredPeerId && declaredPeerId !== peerId) {
+        opts.logger.error("directory.consortium.node.peer_id_mismatch", {
+          nodeId: node.nodeId,
+          declaredPeerId,
+          probePeerId: peerId,
+        });
+        return null;
+      }
       return { nodeId: node.nodeId, pubkey: node.pubkey, peerId, multiaddr };
     }),
   );
