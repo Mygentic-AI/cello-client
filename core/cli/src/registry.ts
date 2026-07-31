@@ -943,7 +943,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "attestation-consent",
     group: "Attestations",
-    summary: "Decide on attestations OTHERS have written about you (accept or refuse).",
+    summary: "Accept or refuse attestations others have written about you.",
     help:
       "Usage:\n" +
       "  cello attestation-consent list                    — attestations others wrote about you, awaiting your decision\n" +
