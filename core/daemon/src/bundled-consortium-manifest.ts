@@ -21,13 +21,13 @@
  *     /bootstrap that would otherwise redirect the client to a rogue directory. THIS is the
  *     adversarial defense; it is enabled by default alongside the roster.
  *
- * nodeId MUST equal the directory's reported NODE_ID (its AWS region string); the step-6 verifier
+ * nodeId MUST equal the directory's reported NODE_ID (`<cloud>-<region>`, e.g. `gcp-use1`); the step-6 verifier
  * looks the node up by nodeId. pubkey MUST equal /cello/<env>/directory/manifest-signer-pubkey for
  * that region (derived from the directory's node-private-key). endpoint is the HTTP /bootstrap base.
  *
  * Regeneration: on directory node-key or officer-key rotation, re-sign with
- * infra/scripts/sign-consortium-manifest and update this constant + BUNDLED_CONSORTIUM_ROOT_KEYS.
- * The officer signing key lives in Secrets Manager (cello/<env>/consortium/officer-key-0); only its
+ * infra/scripts/sign-gcp-consortium-manifest and update this constant + BUNDLED_CONSORTIUM_ROOT_KEYS.
+ * The officer signing key lives in Secrets Manager (GCP Secret Manager `cello-consortium-officer-key-0`); only its
  * PUBLIC key is embedded here.
  *
  * Crypto reference: RFC 8032 (Ed25519 threshold signatures, verified by verifyManifest).
@@ -42,25 +42,34 @@ export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
   expires: "2030-01-01T00:00:00Z",
   nodes: [
     {
-      nodeId: "us-east-1",
-      pubkey: "167ca6b145bfdd3696af8f4befd883c3dc610f4a9c8d52a30f6a22f669dc27b5",
-      region: "us-east-1",
-      provider: "aws",
-      endpoint: "http://directory-us1.cello.mygentic.ai",
+      nodeId: "gcp-use1",
+      pubkey: "7969e22a7d95293ae343cb2667c2a4d7127aa8748478582fa637674c30e0113c",
+      region: "use1",
+      provider: "gcp",
+      endpoint: "http://34.75.172.108:9090",
+      peerId: "12D3KooWMH58hm8xpuwgwaNSvnvXBuc126jfuUMVbrGNcU2MeEAX",
+      multiaddr: "/ip4/34.75.172.108/tcp/8080/ws",
+      role: "validator",
     },
     {
-      nodeId: "eu-central-1",
-      pubkey: "8105b180b753d97b50039a7e94433fd2b419f43d61f9ad7caf2ac15ad5cd1b45",
-      region: "eu-central-1",
-      provider: "aws",
-      endpoint: "http://directory-eu1.cello.mygentic.ai",
+      nodeId: "gcp-usc1",
+      pubkey: "ef961384100bb087f36b68e3a270acb8f22fdf62c4cd5e517e423afb7f399002",
+      region: "usc1",
+      provider: "gcp",
+      endpoint: "http://34.136.176.190:9090",
+      peerId: "12D3KooWExQLMbvaioVqQCPkc1ZZgJ5kdoePymtMrg46ugMBs5zi",
+      multiaddr: "/ip4/34.136.176.190/tcp/8080/ws",
+      role: "validator",
     },
     {
-      nodeId: "ap-northeast-1",
-      pubkey: "9b4b673a16487ba47363e3eaff844bf68f19736d82967918fb896b813e39b984",
-      region: "ap-northeast-1",
-      provider: "aws",
-      endpoint: "http://directory-ap1.cello.mygentic.ai",
+      nodeId: "gcp-euw1",
+      pubkey: "9cb77b68a98f49056fef232f4d56eeb9b66b1a6646fe06b966ff570a82ca6c14",
+      region: "euw1",
+      provider: "gcp",
+      endpoint: "http://34.34.166.245:9090",
+      peerId: "12D3KooWP52VSVrakyRdPyt23kAuhgp3FV6tiVRByfdyVvHAaEeJ",
+      multiaddr: "/ip4/34.34.166.245/tcp/8080/ws",
+      role: "validator",
     },
   ],
   // M10B / DOD-END-INGRESS-1 — the PORTAL INTAKE KEY. A submitting daemon seals its trust-signal
@@ -74,7 +83,7 @@ export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
     {
       officerIndex: 0,
       signature:
-        "2e19962eab0a30dd6b740462baae42eadb583ffd835cc353a9deb1838bc4980ea3aef02ac2c11182fc1bfbc404b2249152e99966edff1c4d7391063715e6390a",
+        "d85802b8c9ea876ff3b2774e7c5feab8413b953d5a4f41291309a9bd38ea90ab53203c50fa41f8b74b2fc4370880098ad1f0c317081a898990afafffd5c49508",
     },
   ],
 };
@@ -84,7 +93,7 @@ export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
  * verifies BUNDLED_CONSORTIUM_MANIFEST's threshold signatures against this set. Public data.
  */
 export const BUNDLED_CONSORTIUM_ROOT_KEYS: readonly string[] = [
-  "8e9b99e5aa5505f2f50ec9f933f497a64956614575edce3427ec8a096c864199",
+  "e8300a2b9de7be6f6d629f778dc319715ad0010c0639f3a1564181d56d3eb104",
 ];
 
 /** Minimum number of distinct valid officer signatures required (dev: single officer, threshold 1). */

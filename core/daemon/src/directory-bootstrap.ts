@@ -19,8 +19,25 @@ import type { ConsortiumNode } from "@cello-protocol/protocol-types";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { Logger } from "./types.js";
 
-/** Production directory HTTP endpoint (ALB / Route53 — ALB terminates TLS, internal HTTP). */
-export const PRODUCTION_DIRECTORY_URL = "http://directory-us1.cello.mygentic.ai";
+/**
+ * Production directory HTTP endpoint — the cold-boot fallback when CELLO_DIRECTORY_URL is unset.
+ *
+ * THIS MUST BE ONE OF THE `endpoint` VALUES IN THE BUNDLED MANIFEST, byte for byte. `buildManifestDeps`
+ * loads the bundled roster only when the resolved directory URL matches a node in it, and otherwise
+ * falls through to the pre-roster path with NO step-6 directory authentication — so a value that
+ * merely reaches the same machine, such as a DNS name for the same host, silently disables the
+ * defense against a MITM redirecting /bootstrap to a rogue directory. It fails open and quietly,
+ * which is why the requirement is stated here rather than left to be rediscovered.
+ *
+ * Hence an address and not a name: the manifest carries addresses, and the manifest is signed. Those
+ * addresses are reserved (`google_compute_address`, held across instance replacement), so they are
+ * stable by construction rather than by luck. `directory-use1.cello.mygentic.ai` also resolves here
+ * and is fine for humans and curl — it just cannot be this constant until the manifest carries names.
+ *
+ * Port 9090 serves /bootstrap. 8080 speaks the libp2p WebSocket upgrade and answers plain HTTP with
+ * 400, which resolves as zero reachable nodes from a perfectly valid manifest.
+ */
+export const PRODUCTION_DIRECTORY_URL = "http://34.75.172.108:9090";
 
 /**
  * Resolve the directory URL from the environment, falling back to the production
