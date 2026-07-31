@@ -2205,8 +2205,18 @@ async function startDaemonHoldingLock(
         );
         const r = await fetchSubmissionResults({ signaling: visit.mgr, keyProvider: opener, logger });
         if (r.ok) for (const x of r.results) { if (!seen.has(x.submissionId)) seen.set(x.submissionId, mapResult(x)); }
-        else unreachable.push(node.nodeId);
-      } catch {
+        else {
+          // SAY WHY. `unreachable` is a list of node ids and nothing else, so a sweep that fails
+          // everywhere reports "all three unreachable" with the cause discarded at the exact point it
+          // was known — leaving the only evidence to be guessed at afterwards.
+          logger.warn("signal.results.node.unreachable", { nodeId: node.nodeId, reason: r.reason });
+          unreachable.push(node.nodeId);
+        }
+      } catch (err: unknown) {
+        logger.warn("signal.results.node.unreachable", {
+          nodeId: node.nodeId,
+          reason: err instanceof Error ? err.message : String(err),
+        });
         unreachable.push(node.nodeId);
       } finally {
         // ALWAYS torn down. A visiting connection left open holds a stream the directory will drain
