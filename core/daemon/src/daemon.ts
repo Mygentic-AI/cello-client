@@ -1996,7 +1996,11 @@ async function startDaemonHoldingLock(
       return {
         ok: false,
         reason: "no_current_agent",
-        guidance: "Select an agent first (cello_use_agent) — a consent decision belongs to the agent it is about.",
+        // NOT "a consent decision belongs to…" — this resolver is shared with the attestation verbs
+        // now, and `cello attestations issued` answered a plain "what happened to what I sent?" with
+        // an explanation about consent. Guidance that describes a different verb is worse than none:
+        // it sends the reader to fix something that was never wrong.
+        guidance: "Select an agent first (cello_use_agent) — these act AS a specific agent, and the wrong one would answer on another agent's behalf.",
       };
     }
     const rec = loadedAgents.find((a) => a.name === name);
@@ -2228,10 +2232,19 @@ async function startDaemonHoldingLock(
     if (seen.size === 0 && unreachable.length > 0 && unreachable.length >= roster.length) {
       // EVERY node we tried failed. Reporting an empty list here would be the exact lie this fan-out
       // exists to prevent.
+      //
+      // AN EMPTY ROSTER IS ITS OWN ANSWER. `resolveConsortiumRoster()` returns null when there is no
+      // current manifest, and `?? []` turns "I do not know of any other nodes" into "there are no
+      // other nodes" — so a daemon that cannot resolve the consortium at all reported "No directory
+      // node answered (home)", which reads as one bad node rather than as no map. Chasing that cost
+      // real time against a hibernated environment on 2026-07-31.
+      const noRoster = roster.length === 0;
       return {
         ok: false,
-        reason: "results_unreachable",
-        guidance: `No directory node answered (${unreachable.join(", ")}). Your outcomes are held until you collect them — nothing is lost. Retry when connectivity returns.`,
+        reason: noRoster ? "consortium_unresolved" : "results_unreachable",
+        guidance: noRoster
+          ? `This daemon cannot resolve any directory node right now, so there was nowhere to ask (${unreachable.join(", ")} also failed). Check that the directory is reachable — 'directory.consortium.node.unresolved' in the daemon log names each endpoint and why. Your outcomes are held until you collect them; nothing is lost.`
+          : `No directory node answered (${unreachable.join(", ")}). Your outcomes are held until you collect them — nothing is lost. Retry when connectivity returns.`,
       };
     }
     return {
