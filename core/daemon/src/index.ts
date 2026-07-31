@@ -55,7 +55,6 @@ export type {
 } from "./transport-selector.js";
 
 // Manifest loading, verification, and polling
-export { FileManifestProvider } from "./manifest-loader.js";
 export { RandomizedPollScheduler, ImmediatePollScheduler } from "./manifest-poll-scheduler.js";
 export { InMemoryManifestVersionStore } from "./manifest-version-store.js";
 export { DbManifestVersionStore } from "./manifest-version-store-db.js";

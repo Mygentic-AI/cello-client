@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer, type Server } from "node:http";
@@ -30,7 +30,6 @@ import {
 } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import { FileManifestProvider } from "../manifest-loader.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 import type { IManifestPollScheduler } from "@cello-protocol/transport";
@@ -76,69 +75,12 @@ function makeExpiredManifest(): ConsortiumManifest {
 
 // ─── FileManifestProvider tests ───────────────────────────────────────────────
 
-describe("AC-002: FileManifestProvider — manifest file loading", () => {
-  let tempDir: string;
-
-  beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), "cello-manifest-test-"));
-  });
-
-  afterEach(async () => {
-    await rm(tempDir, { recursive: true, force: true });
-  });
-
-  it("loads and verifies a valid manifest from a JSON file", async () => {
-    const manifest = makeValidManifest();
-    const manifestPath = join(tempDir, "consortium-manifest.json");
-    await writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
-
-    const provider = new FileManifestProvider(manifestPath);
-    const result = await provider.loadAndVerify(TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
-
-    expect(result.nodes[0].nodeId).toBe("test-node-us-east-1");
-    expect(result.version).toBe(1);
-  });
-
-  it("caches the manifest after loadAndVerify", async () => {
-    const manifest = makeValidManifest();
-    const manifestPath = join(tempDir, "consortium-manifest.json");
-    await writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
-
-    const provider = new FileManifestProvider(manifestPath);
-    const loaded = await provider.loadAndVerify(TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD);
-    expect(provider.getCurrentManifest()).toBeDefined();
-    expect(provider.getCurrentManifest()?.version).toBe(loaded.version);
-  });
-
-  it("AC-003: throws on signature verification failure", async () => {
-    const manifest = makeTestManifest([makeTestNode("node-1", "00".repeat(32))]);
-    const badRootKeys = ["00".repeat(32), "00".repeat(32), "00".repeat(32), "00".repeat(32), "00".repeat(32)];
-    const manifestPath = join(tempDir, "bad-manifest.json");
-    await writeFile(manifestPath, JSON.stringify(manifest), "utf-8");
-
-    const provider = new FileManifestProvider(manifestPath);
-    await expect(
-      provider.loadAndVerify(badRootKeys, 3)
-    ).rejects.toThrow(/manifest_signature_invalid/);
-  });
-
-  it("throws on missing file", async () => {
-    const provider = new FileManifestProvider(join(tempDir, "nonexistent.json"));
-    await expect(
-      provider.loadAndVerify(TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD)
-    ).rejects.toThrow(/manifest_file_unreadable/);
-  });
-
-  it("throws on invalid JSON", async () => {
-    const manifestPath = join(tempDir, "invalid.json");
-    await writeFile(manifestPath, "{not valid json}", "utf-8");
-
-    const provider = new FileManifestProvider(manifestPath);
-    await expect(
-      provider.loadAndVerify(TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD)
-    ).rejects.toThrow(/manifest_parse_failed/);
-  });
-});
+// AC-002 (FileManifestProvider — package-root manifest file loading) was REMOVED with the class it
+// tested. That provider read a `consortium-manifest.json` from the package root; no production code
+// imported it, the JSON was never published in the tarball, and a SECOND class of the same name in
+// file-manifest-provider.ts is the one the daemon actually uses. The test therefore proved a code
+// path no operator could reach, while making the repo look like it had two manifest providers.
+// AC-004 below covers startDaemon's real manifest loading and is untouched.
 
 // ─── Daemon startup with manifest loading ─────────────────────────────────────
 
