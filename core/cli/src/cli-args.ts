@@ -89,7 +89,7 @@ export type ArgsCheck =
  */
 export function checkArgs(command: string, args: string[]): ArgsCheck {
   // The help check MUST respect the `--` terminator too. It used to scan the whole argv, so
-  // `cello trust-signals issue <pubkey> -- she walked me through the -h flag` printed help instead
+  // `cello attestations issue <pubkey> -- she walked me through the -h flag` printed help instead
   // of issuing the signal — the terminator was honoured for unknown flags and ignored for help,
   // which is the surprising half. Commands that take free prose (issue, consent refuse, contact
   // set-away) are exactly the ones where a bare `-h` appears as ordinary text.

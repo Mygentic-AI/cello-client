@@ -25,6 +25,7 @@ import {
   sessions,
   type SessionFilter,
   telegramSetToken,
+  attestations,
   trustSignals,
   type CommandResult,
 } from "./commands.js";
@@ -105,7 +106,13 @@ export const GROUP_ORDER = [
   "Messaging",
   "Sessions & receipts",
   "Contacts",
-  "Trust & endorsements",
+  // TWO GROUPS, NOT ONE. On the wire an attestation is a trust signal, and they sat together for
+  // exactly that reason — which made the person-to-person primitive read as a wallet chore. What the
+  // NETWORK verifies about you and what a PERSON says about a person are different affordances, and
+  // the help is where an operator learns which is which. Attestations come first: it is the one that
+  // needs two people, and the one nothing else here can substitute for.
+  "Attestations",
+  "Trust signals",
   // The security and governance layer's own surfaces. Its own group because burying them under
   // "Other" is how an operator fails to find the one command that unblocks a misfiring guard —
   // and how an agent that hits that guard has nothing concrete to relay.
@@ -865,27 +872,60 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
 
-  // ═══ Trust & endorsements ═══════════════════════════════════════════════════════════════════
+  // ═══ Attestations — the person-to-person primitive ══════════════════════════════════════════
+  // ITS OWN GROUP, deliberately. An attestation is a PERSON vouching for a PERSON; a trust signal is
+  // the NETWORK verifying an attribute (GitHub age, phone, email). The wire format is the same, so it
+  // is tempting to file them together — but they are different affordances, and burying attestation
+  // under a wallet listing hides the one capability that makes collaboration possible.
+  {
+    name: "attestations",
+    group: "Attestations",
+    summary: "Vouch for another agent in your own words, and see what became of it.",
+    help:
+      "Usage:\n" +
+      "  cello attestations issue <pubkey> <text\u2026>\n" +
+      "                                        \u2014 attest to something you have seen them do\n" +
+      "  cello attestations issued             \u2014 what happened to the ones you wrote\n" +
+      "\n" +
+      "An attestation is YOUR words about ANOTHER agent \u2014 the person-to-person half of trust. The\n" +
+      "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +
+      "\n" +
+      "Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory\n" +
+      "cannot read it), screened, minted \u2014 and then the SUBJECT must accept it before anyone else can\n" +
+      "see it. They may refuse, and a refusal may carry their reasoning back to you.\n" +
+      "\n" +
+      "The receiving direction \u2014 attestations others wrote about YOU \u2014 is 'cello consent'.\n" +
+      "You cannot attest about yourself.\n" +
+      "\n" +
+      "Prose contains things that look like flags, so use -- to end flag parsing:\n" +
+      "  cello attestations issue b23c24dd\u2026 -- cut p99 by -30ms on the auth path",
+    async run(ctx, args) {
+      const [sub, ...rest] = args;
+      return legacy(await attestations(ctx.celloDir, sub ?? "", rest));
+    },
+  },
+
+  // ═══ Trust signals — what the network verifies about you ════════════════════════════════════
   {
     name: "trust-signals",
-    group: "Trust & endorsements",
+    group: "Trust signals",
     summary: "Inspect and manage the trust signals in your local wallet.",
     flags: [{ name: "--all" }],
     help:
       "Usage:\n" +
-      "  cello trust-signals issue <pubkey> <text…>\n" +
-      "                                        — vouch for a counterparty in your own words\n" +
-      "  cello trust-signals list              — show every signal (type, hash, status, default, issued)\n" +
-      "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
-      "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
-      "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +
-      "  cello trust-signals revoke <hash>     — tombstone at the directory AND delete locally\n" +
+      "  cello trust-signals list              \u2014 show every signal (type, hash, status, default, issued)\n" +
+      "  cello trust-signals view <hash>       \u2014 decode and display a signal's full payload\n" +
+      "  cello trust-signals enable <hash>     \u2014 include signal in the default presentation bundle\n" +
+      "  cello trust-signals disable <hash>    \u2014 exclude signal from the default bundle\n" +
+      "  cello trust-signals revoke <hash>     \u2014 tombstone at the directory AND delete locally\n" +
       "\n" +
       "Trust signals are verifiable claims about you (GitHub account age, phone, email, etc.) that your\n" +
       "agent presents to contacts during sessions. They are issued by the CELLO portal, notarized by\n" +
-      "the directory, and held in your local encrypted wallet.\n" +
+      "the directory, and held in your local encrypted wallet. To vouch for SOMEONE ELSE in your own\n" +
+      "words, that is 'cello attestations issue' \u2014 a different thing with a different name.\n" +
       "\n" +
-      "The 'def' column in 'list' shows whether a signal is in the default bundle (✓ = yes, – = no).\n" +
+      "'list' shows the whole wallet, including attestations others wrote about you once you accepted\n" +
+      "them. The 'def' column shows whether a signal is in the default bundle (\u2713 = yes, \u2013 = no).\n" +
       "Signals with _id suffix (github_id, etc.) start excluded by default. Use enable/disable to change.\n" +
       "\n" +
       "'revoke' deletes the signal locally AND sends a tombstone to the directory. This is the correct\n" +
@@ -902,8 +942,8 @@ export const COMMANDS: readonly CommandSpec[] = [
 
   {
     name: "consent",
-    group: "Trust & endorsements",
-    summary: "Decide on trust signals OTHERS have issued about you (accept or refuse).",
+    group: "Attestations",
+    summary: "Decide on attestations OTHERS have written about you (accept or refuse).",
     help:
       "Usage:\n" +
       "  cello consent list                    — signals others issued about you, awaiting your decision\n" +

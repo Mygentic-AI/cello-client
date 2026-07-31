@@ -627,6 +627,138 @@ export async function sessions(
  *  daemon-wide bot credentials (narrow, dedicated surface; NOT folded into the parked `cello
  *  config`, since a bot token has no sensible default and can't wait for M9-CFG-001). */
 /**
+ * `cello attestations` — YOUR words about ANOTHER agent, and what became of them.
+ *
+ * SEPARATE FROM `trust-signals` ON PURPOSE. On the wire an attestation IS a trust signal, so folding
+ * the two together is the obvious move — and it is the wrong one. A trust signal is the NETWORK
+ * verifying an attribute of yours; an attestation is a PERSON vouching for a PERSON. That second
+ * thing is the primitive collaboration rests on, and filing it as a subcommand of a wallet listing
+ * makes the most important capability the hardest one to find.
+ *
+ * Subcommands:
+ *   issue <pubkey> <text…>  — attest to something you have seen them do
+ *   issued                  — what happened to the ones you wrote
+ *
+ * The receiving direction — what others wrote about YOU — is `cello consent`.
+ */
+export async function attestations(
+  celloDir: string,
+  sub: string,
+  args: string[],
+): Promise<CommandResult> {
+  const lockFilePath = join(celloDir, "daemon.lock");
+  const lock = await readLock(lockFilePath);
+  if (!lock) {
+    return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
+  }
+
+  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
+  // rather than folded into `list`: listing what you hold must keep working when the directory is
+  // unreachable, and a remote failure must not break a local read.
+  if (sub === "issued") {
+    try {
+      // TWO CALLS. `wallet_list_issued` is the local record of what was submitted; `wallet_fetch_results`
+      // is the network sweep for outcomes. Showing only the second made a submission still awaiting the
+      // subject INVISIBLE — three in flight printed as "no outcomes waiting", which reads as "nothing
+      // was ever sent" rather than "nobody has answered yet".
+      const [issued, res] = (await withIpc(lock.socketPath, (client) =>
+        Promise.all([client.send("wallet_list_issued"), client.send("wallet_fetch_results")]),
+      )) as [
+        { ok: boolean; reason?: string; guidance?: string; issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }> },
+        {
+          ok: boolean;
+          reason?: string;
+          guidance?: string;
+          results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
+          unreachable_nodes?: string[];
+        },
+      ];
+      if (!issued.ok) {
+        return { exitCode: 1, output: `${issued.reason ?? "failed"}\n${issued.guidance ?? ""}`.trim() };
+      }
+      if (!res.ok) {
+        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
+      }
+      const byId = new Map((res.results ?? []).map((r) => [r.submission_id, r]));
+      const rows: Array<{ submission_id: string; outcome: string; reason: string | null; message: string | null }> =
+        (issued.issued ?? []).map((s) => ({
+          ...(byId.get(s.submission_id) ?? { outcome: "pending", reason: null, message: null }),
+          submission_id: s.submission_id,
+        }));
+      // Anything that came back for a submission this wallet has no local record of still gets shown —
+      // dropping it would hide a real outcome behind a local bookkeeping gap.
+      for (const r of res.results ?? []) if (!rows.some((x) => x.submission_id === r.submission_id)) rows.push(r);
+      // A node that did not answer is stated, never folded into the list — an incomplete sweep must not
+      // be readable as "nothing came back".
+      const partial = (res.unreachable_nodes ?? []).length > 0
+        ? `\n\n  ⚠ ${res.unreachable_nodes!.length} node(s) did not answer (${res.unreachable_nodes!.join(", ")}).\n    This list may be incomplete — an outcome recorded there is not shown yet.`
+        : "";
+      if (rows.length === 0) {
+        return { exitCode: 0, output: "You have submitted no endorsements. Results are held until you collect them, so nothing has been missed." + partial };
+      }
+      const lines = rows.map((r) => {
+        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
+        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
+        // operator's claim, and running it into the status columns would read as CELLO's verdict.
+        return r.message ? `${head}\n      they said: "${r.message}"` : head;
+      });
+      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
+      return {
+        exitCode: 0,
+        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
+          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
+          "  Re-submitting a corrected version is the intended next step.\n" +
+          "  'pending' means the subject has not answered yet — the submission is not lost." + partial,
+      };
+    } catch (err) {
+      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  if (sub === "issue") {
+    const [subject, ...rest] = args;
+    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
+    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
+    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
+    // convention every shell user already knows.
+    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
+    if (!subject || body.length === 0) {
+      return {
+        exitCode: 1,
+        output:
+          "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>\n" +
+          "\n" +
+          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
+          "before it so it is read as text:\n" +
+          "  cello trust-signals issue <pubkey> -- cut p99 by -30ms on the auth path",
+      };
+    }
+    try {
+      const result = (await withIpc(lock.socketPath, (client) =>
+        client.send("cello_attestations_issue", { subject_pubkey: subject, body }))) as {
+        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
+      };
+      if (!result.ok) {
+        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
+      }
+      return { exitCode: 0, output: result.guidance ?? "Submitted." };
+    } catch (err: unknown) {
+      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  }
+
+  return {
+    exitCode: 1,
+    output:
+      "Usage:\n" +
+      "  cello attestations issue <pubkey> <text…>  — attest to something you have seen them do\n" +
+      "  cello attestations issued                  — what happened to the ones you wrote\n" +
+      "\n" +
+      "What others wrote about YOU is 'cello consent'.",
+  };
+}
+
+/**
  * `cello trust-signals` — inspect and manage the operator's trust-signal wallet.
  *
  * Subcommands:
@@ -645,42 +777,6 @@ export async function trustSignals(
   const lock = await readLock(lockFilePath);
   if (!lock) {
     return { exitCode: 1, output: "No daemon running. Run 'cello login' first." };
-  }
-
-  // M10B / `M10B-D25r2` — "what happened to what I submitted?". A NETWORK call, so it is its own verb
-  // rather than folded into `list`: listing what you hold must keep working when the directory is
-  // unreachable, and a remote failure must not break a local read.
-  if (sub === "results") {
-    try {
-      const res = (await withIpc(lock.socketPath, (client) => client.send("wallet_fetch_results"))) as {
-        ok: boolean;
-        reason?: string;
-        guidance?: string;
-        results?: Array<{ submission_id: string; outcome: string; reason: string | null; signal_hash: string | null; message: string | null; created_at: string }>;
-      };
-      if (!res.ok) {
-        return { exitCode: 1, output: `${res.reason ?? "failed"}\n${res.guidance ?? ""}`.trim() };
-      }
-      const rows = res.results ?? [];
-      if (rows.length === 0) {
-        return { exitCode: 0, output: "No outcomes waiting. Results are held until you collect them, so nothing has been missed." };
-      }
-      const lines = rows.map((r) => {
-        const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
-        // THE MESSAGE ON ITS OWN LINE, quoted and attributed. It is the SUBJECT'S words about the
-        // operator's claim, and running it into the status columns would read as CELLO's verdict.
-        return r.message ? `${head}\n      they said: "${r.message}"` : head;
-      });
-      const header = `  ${"outcome".padEnd(10)}  submission    reason`;
-      return {
-        exitCode: 0,
-        output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
-          "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
-          "  Re-submitting a corrected version is the intended next step.",
-      };
-    } catch (err) {
-      return { exitCode: 1, output: `Could not reach the daemon: ${err instanceof Error ? err.message : String(err)}` };
-    }
   }
 
   if (sub === "list") {
@@ -757,38 +853,6 @@ export async function trustSignals(
       return { exitCode: 0, output: [header, divider, ...lines].join("\n") + legend + footer };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to list signals: ${err instanceof Error ? err.message : String(err)}` };
-    }
-  }
-
-  if (sub === "issue") {
-    const [subject, ...rest] = args;
-    // `--` ENDS FLAG PARSING. Free prose is the whole point of this verb, and prose contains things
-    // that look like flags: "cut p99 -30ms" is rejected as an unknown flag, and "-h" anywhere prints
-    // help instead of issuing. The operator needs a way to say "the rest is text", and `--` is the
-    // convention every shell user already knows.
-    const body = (rest[0] === "--" ? rest.slice(1) : rest).join(" ");
-    if (!subject || body.length === 0) {
-      return {
-        exitCode: 1,
-        output:
-          "Usage: cello trust-signals issue <subject-pubkey> <what you are vouching for…>\n" +
-          "\n" +
-          "If your text contains something that looks like a flag (a leading '-', or '-h'), put `--`\n" +
-          "before it so it is read as text:\n" +
-          "  cello trust-signals issue <pubkey> -- cut p99 by -30ms on the auth path",
-      };
-    }
-    try {
-      const result = (await withIpc(lock.socketPath, (client) =>
-        client.send("cello_trust_signals_issue", { subject_pubkey: subject, body }))) as {
-        ok: boolean; reason?: string; guidance?: string; submission_id?: string;
-      };
-      if (!result.ok) {
-        return { exitCode: 1, output: `${result.reason}\n${result.guidance ?? ""}`.trim() };
-      }
-      return { exitCode: 0, output: result.guidance ?? "Submitted." };
-    } catch (err: unknown) {
-      return { exitCode: 1, output: `Failed to issue signal: ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
@@ -912,7 +976,6 @@ export async function trustSignals(
     output:
       "Usage:\n" +
       "  cello trust-signals list [--all]      — show active signals (--all includes superseded)\n" +
-      "  cello trust-signals results           — what happened to endorsements you submitted\n" +
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
       "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +

@@ -71,8 +71,9 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_contact_set_moniker", cli: "cello contact <pubkey> set-moniker" },
   { mcp: "cello_contact_set_signal", cli: "cello contact <pubkey> set-signal" },
   // The wallet's own trust signals (M10B / DOD-END-SURFACE-1 — CLI-only until now)
-  { mcp: "cello_trust_signals_issue", cli: "cello trust-signals issue" },
   { mcp: "cello_trust_signals_list", cli: "cello trust-signals list" },
+  { mcp: "cello_attestations_issue", cli: "cello attestations issue" },
+  { mcp: "cello_attestations_issued", cli: "cello attestations issued" },
   { mcp: "cello_trust_signals_view", cli: "cello trust-signals view" },
   { mcp: "cello_trust_signals_enable", cli: "cello trust-signals enable" },
   { mcp: "cello_trust_signals_disable", cli: "cello trust-signals disable" },

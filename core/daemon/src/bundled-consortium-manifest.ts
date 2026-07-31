@@ -64,7 +64,7 @@ export const BUNDLED_CONSORTIUM_MANIFEST: ConsortiumManifestInput = {
     },
   ],
   // M10B / DOD-END-INGRESS-1 — the PORTAL INTAKE KEY. A submitting daemon seals its trust-signal
-  // submission to this key so the DIRECTORY cannot read it; without it `cello_trust_signals_issue`
+  // submission to this key so the DIRECTORY cannot read it; without it `cello_attestations_issue`
   // refuses with `intake_key_absent` rather than sending in the clear. It has to be in the BUNDLED
   // manifest and not only in the served one, because a cold-boot daemon that cannot yet reach a
   // directory falls back to this constant — and "your first submission fails until you have polled"

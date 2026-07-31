@@ -136,7 +136,7 @@ describe("DOD-ONBOARD-HELP-1 §5 — every *_guidance key is renderable, whateve
  * verbs DEAD on both surfaces for exactly that reason. These drive a real socket and assert on the
  * responses.
  */
-describe("DOD-END-SURFACE-1 — cello_trust_signals_issue, over a live daemon", () => {
+describe("DOD-END-SURFACE-1 — cello_attestations_issue, over a live daemon", () => {
   let handle: DaemonHandle | undefined;
   let tempDir: string | undefined;
   const clients: IpcClient[] = [];
@@ -170,7 +170,7 @@ describe("DOD-END-SURFACE-1 — cello_trust_signals_issue, over a live daemon", 
 
   it("is REGISTERED — the handler exists under the name both surfaces call", async () => {
     const c = await client();
-    const res = (await c.send("cello_trust_signals_issue", {})) as Record<string, unknown>;
+    const res = (await c.send("cello_attestations_issue", {})) as Record<string, unknown>;
     // An unregistered method would come back as an unknown-method error rather than the handler's
     // own verdict. Reaching `no_current_agent` proves the handler ran.
     expect(res.reason).toBe("no_current_agent");
@@ -180,7 +180,7 @@ describe("DOD-END-SURFACE-1 — cello_trust_signals_issue, over a live daemon", 
     const c = await client();
     // With no agent selected the selection guard fires first, so this cannot assert the subject
     // gate directly — but it CAN assert the handler does not reject the parameter shape itself.
-    const res = (await c.send("cello_trust_signals_issue", {
+    const res = (await c.send("cello_attestations_issue", {
       subject_pubkey: "ab".repeat(32), body: "worked with them on the migration",
     })) as Record<string, unknown>;
     expect(res.ok).toBe(false);

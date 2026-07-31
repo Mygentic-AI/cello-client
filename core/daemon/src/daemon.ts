@@ -2258,7 +2258,7 @@ async function startDaemonHoldingLock(
     };
   });
 
-  handlers.set("cello_trust_signals_issue", async (params, connectionId) => {
+  handlers.set("cello_attestations_issue", async (params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
     const subject = typeof params?.subject_pubkey === "string" ? params.subject_pubkey.toLowerCase() : "";
