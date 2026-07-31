@@ -350,6 +350,142 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
   });
 });
 
+describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FIRSTMSG-WITNESS-1)", () => {
+  // §7a: a session's FIRST message is submitted before the relay holds the session, is rejected
+  // `session_not_found`, and is NEVER resubmitted — so the relay's counter never counts it and the
+  // certificate (rebuilt EXCLUSIVELY from relay-witnessed leaves, §7d) omits the opening message.
+  //
+  // Proven from the live log (23 of 25 submit failures): in EVERY case the relay's
+  // `session.relay.assignment.recorded` lands 5 ms – 2.1 s AFTER the failed submit. The relay is
+  // reachable and answering — it just does not hold the session YET. That makes `session_not_found`
+  // a TRANSIENT state with a bounded, self-clearing cause, and it must be distinguished from
+  // `relay_unavailable` (a genuine outage, where proceeding unwitnessed is correct so the inbox
+  // stays readable).
+  const carry = () => ({
+    participantA: new Uint8Array(32).fill(0xa1),
+    participantB: new Uint8Array(32).fill(0xb2),
+    sessionTimestamp: 1_750_000_000_000,
+    assignmentSignature: new Uint8Array(64).fill(0xc3),
+  });
+
+  const connectedClient = async () => {
+    const kp = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      logger: noopLogger,
+    });
+    return client;
+  };
+
+  it("re-presents the assignment and RETRIES the submit when the relay answers session_not_found", async () => {
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7a);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_ok" });
+    await tick();
+
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1));
+    await tick();
+    // The relay does not hold the session yet (it was recorded against another node / the record
+    // is still landing). This is the EXACT live failure.
+    relay.push({ type: "hash_submit_error", reason: "session_not_found" });
+    await tick();
+    // The client must re-present the assignment rather than give up...
+    relay.push({ type: "assignment_ok" });
+    await tick();
+    // ...and re-submit the SAME leaf, which the relay now witnesses.
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+
+    const result = await submit;
+    // The leaf ends up WITNESSED. Today it returns { ok: false, reason: "session_not_found" }
+    // and the daemon appends it unwitnessed forever — the receipt defect.
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.sequence_number).toBe(1);
+
+    // Two hash_submits: the rejected one and the retry. The assignment was re-presented between them.
+    const kinds = relay.sentFrames.map((f) => f["type"]);
+    expect(kinds.filter((k) => k === "hash_submit").length).toBe(2);
+    const firstSubmit = kinds.indexOf("hash_submit");
+    const rerecord = kinds.indexOf("client_record_assignment", firstSubmit);
+    const retry = kinds.indexOf("hash_submit", firstSubmit + 1);
+    expect(rerecord).toBeGreaterThan(firstSubmit);
+    expect(retry).toBeGreaterThan(rerecord);
+    client.close();
+  });
+
+  it("retries session_not_found a BOUNDED number of times — a relay that never records fails loudly", async () => {
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7b);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_ok" });
+    await tick();
+
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
+    await tick();
+    // The relay refuses every time — an unbounded retry would hang the send path forever
+    // (constraint 3: an inbox must stay readable).
+    for (let i = 0; i < 6; i++) {
+      relay.push({ type: "hash_submit_error", reason: "session_not_found" });
+      await tick();
+      relay.push({ type: "assignment_ok" });
+      await tick();
+    }
+
+    const result = await submit;
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("session_not_found");
+    // Bounded: it gave up rather than retrying indefinitely.
+    const submits = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
+    expect(submits).toBeGreaterThan(1);
+    expect(submits).toBeLessThanOrEqual(3);
+    client.close();
+  });
+
+  it("does NOT retry a non-transient rejection — a different reason is returned as-is", async () => {
+    const client = await connectedClient();
+    const relay = makeFakeRelay();
+    const sid = new Uint8Array(16).fill(0x7c);
+
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, carry());
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "assignment_ok" });
+    await tick();
+
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(3));
+    await tick();
+    // A sealed session is a TERMINAL answer — retrying it would be pointless traffic and would
+    // mask a real state (this is the shape of the 2 post-seal failures in the live log).
+    relay.push({ type: "hash_submit_error", reason: "session_sealed" });
+
+    const result = await submit;
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("session_sealed");
+    expect(relay.sentFrames.filter((f) => f["type"] === "hash_submit").length).toBe(1);
+    client.close();
+  });
+});
+
 describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)", () => {
   // F1 blocking: the daemon capture path is the PRODUCER of the seal carry. These prove that
   // the sealLeafStore receives the correct data from both own-leaf acks and counterparty leaf_delivers.

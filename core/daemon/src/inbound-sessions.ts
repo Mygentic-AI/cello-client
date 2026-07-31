@@ -248,6 +248,119 @@ export function projectTrustSignals(
   };
 }
 
+// Pull the fields out of a pushed session_assignment frame. Returns null when the frame
+// carries no usable assignment object / is missing the essential ids (the handler then
+// ignores it rather than throwing). Field-level validity (peer id, signature type) is
+// checked in the handler so it can emit a distinct, diagnosable event per failure.
+/**
+ * Coerce a wire value to a 64-byte Ed25519 signature, or undefined. CBOR decodes byte strings as
+ * Uint8Array or Buffer depending on the decoder, so accept both; reject every other shape and any
+ * wrong length rather than passing a malformed signature downstream.
+ */
+function toSignature64(v: unknown): Uint8Array | undefined {
+  const bytes = v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v) : null;
+  return bytes && bytes.length === 64 ? bytes : undefined;
+}
+
+export function extractInboundSessionAssignment(frame: Record<string, unknown>):
+  | {
+      sessionIdHex: string;
+      participantAPubkeyHex: string;
+      participantBPubkeyHex: string;
+      initiatorPeerId: string;
+      // DOD-INBOUND-GUARD-1: the responder's accepted session endpoint. The directory omits
+      // this field when the offer was never accepted (offer-accept timeout → "empty defaults"),
+      // so null/"" here means NOBODY accepted — the initiator's F13 guard refuses the same
+      // assignment on its side, and the handler must refuse it here too. null when absent.
+      counterpartySessionPeerId: string | null;
+      sessionTimestamp: number;
+      signatureType: string | null;
+      signerPubkeyHex: string | null;
+      relayPeerId: string;
+      relayAddrs: string[];
+      // DOD-FIRSTMSG-WITNESS-1: the directory's per-node relay signature. WITHOUT it the
+      // responder cannot present `client_record_assignment`, so it can never create its own
+      // relay session state and its first message races the initiator's record — the live
+      // same-machine `session_not_found`. undefined = the directory issued none
+      // (direct/legacy/pre-Option-B); it must read as ABSENT, never as an empty signature,
+      // because presenting an empty one would be rejected as forged.
+      relayDirectorySignature: Uint8Array | undefined;
+      // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
+      // boundary — downstream code can never observe an invalid moniker. null when
+      // absent (older client) or invalid; monikerRejected distinguishes the two so the
+      // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
+      offeredMoniker: string | null;
+      monikerRejected: boolean;
+      monikerRejectReason: "not_string" | "length" | "charset" | null;
+      // DOD-PRESENT-1: trust signals that survived the directory's dumb check.
+      // undefined = absent (older directory or initiator presented nothing).
+      trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
+    }
+  | null {
+  const raw = frame["assignment"];
+  if (!raw || typeof raw !== "object") return null;
+  const a = raw as Record<string, unknown>;
+  const pa = a["participant_a"] as Record<string, unknown> | undefined;
+  const pb = a["participant_b"] as Record<string, unknown> | undefined;
+  const sessionIdHex = frameValueToHex(a["session_id"]);
+  const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
+  const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
+  if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
+  // M7 DOD-SPINE-6 / MSG-001-3b: relay endpoint so the receiver also connects to the
+  // relay witness (so the relay can deliver the initiator's witnessed leaves to it).
+  const relayEndpoint = a["relay_endpoint"] as Record<string, unknown> | undefined;
+  const relayPeerId =
+    relayEndpoint && typeof relayEndpoint["peer_id"] === "string" ? relayEndpoint["peer_id"] : "";
+  const relayAddrs =
+    relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
+      ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
+      : [];
+  // MONIKER-2 AC2: validate the offered name ONCE, at this wire boundary.
+  const monikerResult = extractOfferedMoniker(a);
+  // DOD-PRESENT-1: extract trust signals that survived the directory's dumb check.
+  let trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
+  const rawSignals = a["trust_signals"];
+  if (Array.isArray(rawSignals) && rawSignals.length > 0) {
+    const parsed: Array<{ hash: string; blob: Uint8Array }> = [];
+    for (const entry of rawSignals) {
+      if (entry && typeof entry === "object") {
+        const e = entry as Record<string, unknown>;
+        const hash = typeof e["hash"] === "string" ? e["hash"] : null;
+        const blob = e["blob"] instanceof Uint8Array ? e["blob"] : Buffer.isBuffer(e["blob"]) ? new Uint8Array(e["blob"] as Buffer) : null;
+        if (hash && blob) parsed.push({ hash, blob });
+      }
+    }
+    if (parsed.length > 0) trustSignals = parsed;
+  }
+  return {
+    sessionIdHex,
+    participantAPubkeyHex,
+    participantBPubkeyHex,
+    initiatorPeerId:
+      typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
+    counterpartySessionPeerId:
+      typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
+    sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
+    signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
+    // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
+    // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
+    // The responder stores it so it can verify the bilateral seal signature locally, not just
+    // accept it (session.ts: "embedded so the counterparty can verify").
+    signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
+    relayPeerId,
+    relayAddrs,
+    // DOD-FIRSTMSG-WITNESS-1. Accept only a well-formed 64-byte Ed25519 signature: anything else
+    // (wrong length, wrong type) reads as ABSENT, so a malformed field degrades to "this session
+    // has no client-presentable assignment" rather than producing a frame the relay rejects as
+    // forged — which would mark the session recordRejected and terminally unwitnessed.
+    relayDirectorySignature: toSignature64(a["relay_directory_signature"]),
+    offeredMoniker: monikerResult.offeredMoniker,
+    monikerRejected: monikerResult.rejected,
+    monikerRejectReason: monikerResult.reason ?? null,
+    trustSignals,
+  };
+}
+
 export function createInboundSessions(deps: InboundSessionDeps) {
   const {
     logger, sessionNodeManager, agents, getConnState, resolveCurrentAgent,
@@ -374,96 +487,6 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     inboundSessionQueues.set(agentName, live);
   }
 
-  // Pull the fields out of a pushed session_assignment frame. Returns null when the frame
-  // carries no usable assignment object / is missing the essential ids (the handler then
-  // ignores it rather than throwing). Field-level validity (peer id, signature type) is
-  // checked in the handler so it can emit a distinct, diagnosable event per failure.
-  function extractInboundSessionAssignment(frame: Record<string, unknown>):
-    | {
-        sessionIdHex: string;
-        participantAPubkeyHex: string;
-        participantBPubkeyHex: string;
-        initiatorPeerId: string;
-        // DOD-INBOUND-GUARD-1: the responder's accepted session endpoint. The directory omits
-        // this field when the offer was never accepted (offer-accept timeout → "empty defaults"),
-        // so null/"" here means NOBODY accepted — the initiator's F13 guard refuses the same
-        // assignment on its side, and the handler must refuse it here too. null when absent.
-        counterpartySessionPeerId: string | null;
-        sessionTimestamp: number;
-        signatureType: string | null;
-        signerPubkeyHex: string | null;
-        relayPeerId: string;
-        relayAddrs: string[];
-        // MONIKER-2 AC2: the initiator's offered name, validated ONCE here at the wire
-        // boundary — downstream code can never observe an invalid moniker. null when
-        // absent (older client) or invalid; monikerRejected distinguishes the two so the
-        // caller can log `moniker.rejected` (invalid) vs stay silent (absent).
-        offeredMoniker: string | null;
-        monikerRejected: boolean;
-        monikerRejectReason: "not_string" | "length" | "charset" | null;
-        // DOD-PRESENT-1: trust signals that survived the directory's dumb check.
-        // undefined = absent (older directory or initiator presented nothing).
-        trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
-      }
-    | null {
-    const raw = frame["assignment"];
-    if (!raw || typeof raw !== "object") return null;
-    const a = raw as Record<string, unknown>;
-    const pa = a["participant_a"] as Record<string, unknown> | undefined;
-    const pb = a["participant_b"] as Record<string, unknown> | undefined;
-    const sessionIdHex = frameValueToHex(a["session_id"]);
-    const participantAPubkeyHex = pa ? frameValueToHex(pa["pubkey"]) : null;
-    const participantBPubkeyHex = pb ? frameValueToHex(pb["pubkey"]) : null;
-    if (!sessionIdHex || !participantAPubkeyHex || !participantBPubkeyHex) return null;
-    // M7 DOD-SPINE-6 / MSG-001-3b: relay endpoint so the receiver also connects to the
-    // relay witness (so the relay can deliver the initiator's witnessed leaves to it).
-    const relayEndpoint = a["relay_endpoint"] as Record<string, unknown> | undefined;
-    const relayPeerId =
-      relayEndpoint && typeof relayEndpoint["peer_id"] === "string" ? relayEndpoint["peer_id"] : "";
-    const relayAddrs =
-      relayEndpoint && Array.isArray(relayEndpoint["multiaddrs"])
-        ? (relayEndpoint["multiaddrs"] as unknown[]).filter((m): m is string => typeof m === "string")
-        : [];
-    // MONIKER-2 AC2: validate the offered name ONCE, at this wire boundary.
-    const monikerResult = extractOfferedMoniker(a);
-    // DOD-PRESENT-1: extract trust signals that survived the directory's dumb check.
-    let trustSignals: Array<{ hash: string; blob: Uint8Array }> | undefined;
-    const rawSignals = a["trust_signals"];
-    if (Array.isArray(rawSignals) && rawSignals.length > 0) {
-      const parsed: Array<{ hash: string; blob: Uint8Array }> = [];
-      for (const entry of rawSignals) {
-        if (entry && typeof entry === "object") {
-          const e = entry as Record<string, unknown>;
-          const hash = typeof e["hash"] === "string" ? e["hash"] : null;
-          const blob = e["blob"] instanceof Uint8Array ? e["blob"] : Buffer.isBuffer(e["blob"]) ? new Uint8Array(e["blob"] as Buffer) : null;
-          if (hash && blob) parsed.push({ hash, blob });
-        }
-      }
-      if (parsed.length > 0) trustSignals = parsed;
-    }
-    return {
-      sessionIdHex,
-      participantAPubkeyHex,
-      participantBPubkeyHex,
-      initiatorPeerId:
-        typeof a["initiator_session_peer_id"] === "string" ? a["initiator_session_peer_id"] : "",
-      counterpartySessionPeerId:
-        typeof a["counterparty_session_peer_id"] === "string" ? a["counterparty_session_peer_id"] : null,
-      sessionTimestamp: typeof a["session_timestamp"] === "number" ? a["session_timestamp"] : 0,
-      signatureType: typeof a["signature_type"] === "string" ? a["signature_type"] : null,
-      // M7 legibility-TBS-binding (responder verify): the FROST-signed assignment embeds the
-      // initiator's primary (group) pubkey as `signer_pubkey` — the key that signs the seal.
-      // The responder stores it so it can verify the bilateral seal signature locally, not just
-      // accept it (session.ts: "embedded so the counterparty can verify").
-      signerPubkeyHex: a["signer_pubkey"] !== undefined ? frameValueToHex(a["signer_pubkey"]) : null,
-      relayPeerId,
-      relayAddrs,
-      offeredMoniker: monikerResult.offeredMoniker,
-      monikerRejected: monikerResult.rejected,
-      monikerRejectReason: monikerResult.reason ?? null,
-      trustSignals,
-    };
-  }
 
   // Wait (bounded) for THIS AGENT's standing receiver to be ready. acceptSession consumes the
   // agent's standing receiver and rebuilds a replacement asynchronously, so a burst of inbound
@@ -550,6 +573,23 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           keyProvider: kp,
           senderPubkey: await kp.getPublicKey(),
           sessionIdBytes: new Uint8Array(Buffer.from(parsed.sessionIdHex, "hex")),
+          // DOD-FIRSTMSG-WITNESS-1: carry the directory-signed assignment so the RESPONDER can
+          // present `client_record_assignment` itself. Before this the responder had no assignment
+          // at all, so #doRecord no-opped (returning TRUE — "nothing to present"), #doSubmit
+          // submitted blind, and the relay answered `session_not_found` unless the initiator's
+          // record had already landed. Mirrors buildRelayConnectParams (daemon.ts) on the
+          // initiator side; undefined when the directory issued no signature, which leaves the
+          // previous behaviour exactly as it was for direct/legacy sessions.
+          assignment: parsed.relayDirectorySignature
+            ? {
+                participantA: new Uint8Array(Buffer.from(parsed.participantAPubkeyHex, "hex")),
+                participantB: new Uint8Array(Buffer.from(parsed.participantBPubkeyHex, "hex")),
+                sessionTimestamp: parsed.sessionTimestamp,
+                initiatorSessionPeerId: parsed.initiatorPeerId || undefined,
+                counterpartySessionPeerId: parsed.counterpartySessionPeerId ?? undefined,
+                assignmentSignature: parsed.relayDirectorySignature,
+              }
+            : undefined,
         };
       }
       const result = await sessionNodeManager.acceptSession(

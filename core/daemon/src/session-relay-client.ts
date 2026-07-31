@@ -769,7 +769,64 @@ export class AgentRelayClient {
     return run;
   }
 
+  /**
+   * DOD-FIRSTMSG-WITNESS-1: `session_not_found` is TRANSIENT, not terminal.
+   *
+   * The relay answers it when it does not hold the session YET — the assignment record is still
+   * landing, or the counterparty recorded it and our own record raced ahead of the submit. Proven
+   * from the live log: in all 23 first-message failures the `assignment.recorded` event lands
+   * 5 ms – 2.1 s AFTER the rejected submit. The relay is reachable and answering; it is simply
+   * not ready.
+   *
+   * Before this, the rejection was returned to `sendContent`, which logged
+   * `session.relay.hash.submit.failed` and appended the leaf UNWITNESSED anyway. Nothing retried,
+   * so the relay's counter never counted that message and the local record stayed exactly one
+   * ahead for the life of the session. Because the bilateral certificate is rebuilt EXCLUSIVELY
+   * from relay-witnessed leaves, the sealed receipt omitted the conversation's opening message —
+   * and was issued regardless.
+   *
+   * Retrying re-presents the assignment first (idempotent — the relay answers `assignment_ok` on
+   * `session_already_exists`), which is also what supplies the wait: re-recording is a full
+   * round trip, so the retry cannot busy-spin against a relay that is still catching up.
+   *
+   * This does NOT collapse the two states the fix must tell apart:
+   *   - `session_not_found` — a reachable relay that does not hold the session yet → retry here.
+   *   - `relay_unavailable` / stream failures — a genuine outage → returned untouched, so
+   *     `sendContent` still degrades to an unwitnessed append and the inbox stays readable.
+   * Any other rejection (`session_sealed`, `not_a_participant`, signature failures) is terminal
+   * and returned as-is — retrying those would be pointless traffic masking a real state.
+   */
+  static readonly #SESSION_NOT_FOUND_ATTEMPTS = 3;
+
   async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
+    const sessionIdHex = Buffer.from(sessionId).toString("hex");
+    let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
+    for (
+      let attempt = 1;
+      attempt < AgentRelayClient.#SESSION_NOT_FOUND_ATTEMPTS
+        && !result.ok
+        && result.reason === "session_not_found"
+        && !this.#closed;
+      attempt++
+    ) {
+      // Force the assignment to be re-presented: the session state we depend on does not exist
+      // on the relay, so whatever `recorded` says is stale. A session with no assignment to
+      // present (direct/legacy) re-submits without a record — still bounded, and it surfaces the
+      // same named failure rather than hanging.
+      const sess = this.#sessions.get(sessionIdHex);
+      if (sess) sess.recorded = false;
+      this.#logger.info("session.relay.submit.retry", {
+        relayPeerId: this.#relayPeerId,
+        sessionShort: sessionIdHex.slice(0, 16),
+        attempt,
+        reason: "session_not_found",
+      });
+      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
+    }
+    return result;
+  }
+
+  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
 
