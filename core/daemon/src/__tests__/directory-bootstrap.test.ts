@@ -7,7 +7,6 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
-  PRODUCTION_DIRECTORY_URL,
   resolveDirectoryUrl,
   fetchBootstrapMultiaddr,
   fetchBootstrapResult,
