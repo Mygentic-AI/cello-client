@@ -263,7 +263,31 @@ export class IpcProxy {
       await this.#rawCall("ipc.connect", { clientType: this.#clientType }, HANDSHAKE_TIMEOUT_MS);
     }
     if (this.#currentAgent) {
-      await this.#rawCall("cello_use_agent", { name: this.#currentAgent }, HANDSHAKE_TIMEOUT_MS);
+      // THE REPLAY'S ANSWER IS LOAD-BEARING — it used to be discarded.
+      //
+      // Observed live 2026-08-01: a session was told "the daemon is back and you are acting as
+      // Miss_Chelly" while the daemon held no current agent for that connection at all
+      // (`cello_stop_using_agent` → released: null; `cello_agents` → selected:false, attendance:0).
+      // The replay had been REFUSED and nobody looked. `#currentAgent` is otherwise only cleared on
+      // an explicit de-selection, so the cache went on asserting an agent the daemon never
+      // attached — and `onReconnect` builds its announcement from that cache, so the claim was
+      // manufactured by the very component whose call had just failed.
+      //
+      // It fires precisely when it hurts: a daemon that has just restarted may not have the agent
+      // online yet, and cello_use_agent does NOT auto-start on this path (deliberately — a reconnect
+      // must never silently re-arm an agent the operator stopped).
+      //
+      // `agent_already_current` is SUCCESS: it means this connection already holds it. Anything
+      // else means the daemon did not give it back, so the cache must stop claiming it — a stale
+      // mirror is worse than an empty one, because the operator reads the mirror.
+      const replayed = (await this.#rawCall(
+        "cello_use_agent",
+        { name: this.#currentAgent },
+        HANDSHAKE_TIMEOUT_MS,
+      )) as { ok?: boolean; reason?: string } | null;
+      const restored = replayed !== null
+        && (replayed.ok === true || replayed.reason === "agent_already_current");
+      if (!restored) this.#currentAgent = null;
     }
   }
 
