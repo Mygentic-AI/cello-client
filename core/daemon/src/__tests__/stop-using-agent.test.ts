@@ -4,8 +4,8 @@
  * WHY THIS EXISTS
  *
  * `cello_use_agent` requires a name, so a connection could SWITCH agents but never LET GO of one.
- * The only thing that cleared a selection was `cello_set_agent_offline` (then named
- * `cello_stop_agent`) — which operates on a completely different axis:
+ * The only thing that cleared a selection was `cello_set_agent_offline`, which operates on a
+ * completely different axis:
  *
  *   lifecycle  — cello_start_agent / cello_set_agent_offline    (offline ⇄ online)
  *   attendance — cello_use_agent   / cello_stop_using_agent     (who this connection drives)

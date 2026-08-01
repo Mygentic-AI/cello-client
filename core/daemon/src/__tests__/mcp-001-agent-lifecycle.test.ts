@@ -168,7 +168,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
-    const result = await client.send("cello_stop_agent", { name: "alice" });
+    const result = await client.send("cello_set_agent_offline", { name: "alice" });
     expect(result).toEqual({ ok: true });
 
     // Verify agent is now registered
@@ -183,7 +183,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(offlineEvent!.context.reason).toBe("stopped");
 
     // Second call: idempotent — no second event
-    const result2 = await client.send("cello_stop_agent", { name: "alice" });
+    const result2 = await client.send("cello_set_agent_offline", { name: "alice" });
     expect(result2).toEqual({ ok: true });
     const offlineEventsAfter = logEvents.filter((e) => e.event === "agent.offline");
     expect(offlineEventsAfter).toHaveLength(1);
@@ -685,7 +685,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client2.send("cello_use_agent", { name: "alice" });
 
     // Stop alice from connection 1
-    await client1.send("cello_stop_agent", { name: "alice" });
+    await client1.send("cello_set_agent_offline", { name: "alice" });
 
     // Both connections should now see alice as registered, not current
     const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
@@ -713,7 +713,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
-    const result = await client.send("cello_stop_agent", { name: "nonexistent" }) as { ok: boolean; reason: string; guidance: string };
+    const result = await client.send("cello_set_agent_offline", { name: "nonexistent" }) as { ok: boolean; reason: string; guidance: string };
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("agent_not_found");
     expect(result.guidance).toBeDefined();

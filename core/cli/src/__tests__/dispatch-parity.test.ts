@@ -376,7 +376,7 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
     const expected: Record<string, string> = {
       cello_list_agents: "agents",
       cello_start_agent: "start-agent",
-      cello_stop_agent: "set-agent-offline",
+      cello_set_agent_offline: "set-agent-offline",
       cello_use_agent: "use-agent",
       cello_check_notifications: "inbox",
       cello_get_transcript: "transcript",

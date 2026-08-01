@@ -333,7 +333,7 @@ export class IpcProxy {
     if (cleared?.ok === true) {
       if (method === "cello_stop_using_agent") {
         this.#currentAgent = null;
-      } else if (method === "cello_stop_agent" && params?.["name"] === this.#currentAgent) {
+      } else if (method === "cello_set_agent_offline" && params?.["name"] === this.#currentAgent) {
         // Wire name — the TOOL is cello_set_agent_offline (see agent-handlers.ts on why they differ).
         this.#currentAgent = null;
       }

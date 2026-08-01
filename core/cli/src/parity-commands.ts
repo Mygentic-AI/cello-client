@@ -271,7 +271,7 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
 export const IPC_METHODS = {
   agents: "cello_list_agents",
   "start-agent": "cello_start_agent",
-  "set-agent-offline": "cello_stop_agent",
+  "set-agent-offline": "cello_set_agent_offline",
   "use-agent": "cello_use_agent",
   "stop-using-agent": "cello_stop_using_agent",
   inbox: "cello_check_notifications",

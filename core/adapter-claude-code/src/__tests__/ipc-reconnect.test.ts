@@ -196,8 +196,7 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     // cello_use_agent AUTO-STARTS an offline agent, so replaying it after a deliberate
     // set-agent-offline brings the agent back online and reachable with no signal — kill-switch
     // adjacent, and it contradicted parity-commands.ts's own claim that the MCP surface never does
-    // this. (Pre-existing; found by the same review as the release case and fixed with it. The wire
-    // method is still cello_stop_agent — the TOOL is cello_set_agent_offline.)
+    // this. (Pre-existing; found by the same review as the release case and fixed with it.)
     const { IpcProxy } = await import("../ipc-proxy.js");
     const socketPath = join(tempDir, "d.sock");
     daemon = await fakeDaemon(socketPath, []);
@@ -206,7 +205,7 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     await proxy.connect();
     await proxy.call("ipc.connect", { clientType: "mcp" });
     await proxy.call("cello_use_agent", { name: "Ms_Chelly" });
-    await proxy.call("cello_stop_agent", { name: "Ms_Chelly" });
+    await proxy.call("cello_set_agent_offline", { name: "Ms_Chelly" });
 
     await killDaemon(daemon, socketPath);
     const second: string[] = [];
@@ -228,7 +227,7 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     await proxy.connect();
     await proxy.call("ipc.connect", { clientType: "mcp" });
     await proxy.call("cello_use_agent", { name: "Ms_Chelly" });
-    await proxy.call("cello_stop_agent", { name: "SomeoneElse" });
+    await proxy.call("cello_set_agent_offline", { name: "SomeoneElse" });
 
     await killDaemon(daemon, socketPath);
     const second: string[] = [];

@@ -279,15 +279,18 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     return { ok: true, name, agentId, oneWay: true, directoryRevocation, guidance: baseLine + dirLine };
   });
 
-  // ─── MCP-001: the `cello_set_agent_offline` TOOL — wire method still `cello_stop_agent` ───
+  // ─── MCP-001: cello_set_agent_offline — renamed on BOTH the tool and the wire ───
   //
-  // THE WIRE NAME DELIBERATELY DID NOT MOVE WITH THE TOOL. connect and daemon ship as separate npm
-  // packages and connect has no daemon dependency, so a NEW daemon must keep serving an OLD shim.
-  // Renaming the IPC method would break that pairing silently — the operator's only symptom being a
-  // tool that stopped existing. This is the same tool↔wire divergence that
-  // dod-onboard-help-1-tool-parity.test.ts states and guards for cello_list_agents /
-  // cello_list_sessions / cello_set_moniker. Renaming the wire here was caught in review before it
-  // shipped; do not "tidy" it later.
+  // NO LEGACY WIRE ALIAS, and no second name for this anywhere. One operator, no install base:
+  // an alias is permanent debt bought for nobody, and a verb that exists under two names is how
+  // both humans and AI coders end up calling the wrong one. connect and daemon are promoted and
+  // reinstalled together, and the version gate an alias would have complemented does not even
+  // exist — cello-mcp.ts checks `ipc.connect` for a `version_mismatch` reason NOTHING here
+  // returns.
+  //
+  // A genuinely mismatched shim now fails loudly and correctly: `Unknown method:
+  // cello_set_agent_offline`, whose guidance already names the cause (shim/daemon version skew) and
+  // the fix (`cello logout && cello login`). Loud and fixable beats silent and permanent.
   //
   // The TOOL was renamed because the old name described the wrong axis and cost real confusion.
   // There are two independent things an operator does to an agent:
@@ -304,7 +307,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   // The deselect half genuinely did not exist: `cello_use_agent` requires a name, so a connection
   // could SWITCH agents but never LET GO of one. The only way to clear a selection was to shut the
   // agent down, which is why the two verbs collapsed into each other.
-  handlers.set("cello_stop_agent", async (params, _connectionId) => {
+  handlers.set("cello_set_agent_offline", async (params, _connectionId) => {
     const name = params?.name as string | undefined;
     if (!name) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to stop." };

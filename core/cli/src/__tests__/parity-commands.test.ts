@@ -276,7 +276,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
   describe("review fixes: the replay must not lie, misroute, or resurrect", () => {
     it("F1: `set-agent-offline` CLEARS the selection — a read-only command can never silently re-online it", async () => {
       // The defect: every agent-scoped command replays cello_use_agent, which AUTO-STARTS an offline
-      // agent. So `stop-agent alice` followed by `cello inbox` brought alice back online — reachable
+      // agent. So taking alice offline, then `cello inbox`, brought her back online — reachable
       // again — with no signal. Stopping an agent is kill-switch-adjacent; reading must never re-arm it.
       await createAgent(tempDir, "alice");
       await useAgent(tempDir, "alice", {});
@@ -330,7 +330,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       const lock = await readLock(join(tempDir, "daemon.lock"));
       const c = await connectToDaemon(lock!.socketPath);
       await c.send("ipc.connect", { clientType: "test" });
-      await c.send("cello_stop_agent", { name: "alice" });
+      await c.send("cello_set_agent_offline", { name: "alice" });
       c.close();
       expect(await readCurrentAgent(tempDir)).toBe("alice"); // selection still there, agent offline
 
@@ -511,7 +511,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
     // one up, the next command silently runs as that one.
     //
     // Observed before the fix, verbatim:
-    //   use-agent alice → stop-agent alice → `cello settings set away.default …`
+    //   use-agent alice → set-agent-offline alice → `cello settings set away.default …`
     //   → {"ok":true,"agent":"bob", …}, exit 0.
     // The operator selected alice; the write landed on BOB and reported success.
     it("no selection + several agents registered → REFUSE, never silently target whoever is online", async () => {
