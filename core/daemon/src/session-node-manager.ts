@@ -3522,6 +3522,14 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
+    /**
+     * DOD-FRONTIER-STRAND-1 AC1: the relay-assigned canonical position for THIS message, taken from
+     * the verified ordering record by the caller. Passed EXPLICITLY rather than recovered from
+     * `#witnessedSeq`, because that map is keyed by content hash — so two byte-identical messages
+     * collapse in it before dedup is ever consulted, which is the whole defect. Absent when the
+     * session has no relay witness (relay-degraded): see the announced fallback below.
+     */
+    canonicalSeqIn?: number,
   ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
@@ -3585,12 +3593,47 @@ export class SessionNodeManager {
     // is a replay — do NOT append a second leaf and do NOT double-count it. The recipient already
     // holds this message at its assigned sequence. (In the normal single-delivery case this find is
     // -1, so the live/recover append paths are unchanged.)
-    const existingIdx = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
+    // ─── DOD-FRONTIER-STRAND-1 AC1: the discriminator is the POSITION, not the content ───
+    //
+    // The old rule ("a content_hash satisfies AT MOST ONE Merkle leaf") is false whenever two
+    // genuinely distinct messages match byte-for-byte — and two instances of the same model,
+    // answering the same message with similar context, collide far more readily than humans do.
+    // That is what stranded session dbb93dfc... for a week: an away responder fired twice with
+    // identical text, the sender appended both, the receiver dropped the second as a "redelivery",
+    // and the two frontiers disagreed forever. No receipt was ever possible.
+    //
+    // The relay already assigns every submission a unique position: a REDELIVERY carries the same
+    // position, a genuinely new identical message carries a NEW one. So a duplicate is the same
+    // hash AT THE SAME POSITION -- never the same hash anywhere.
+    const tree = this.getSessionTree(agentName, sessionId);
+    let existingIdx: number;
+    if (canonicalSeqIn !== undefined && canonicalSeqIn >= 0) {
+      existingIdx = tree.hashAt(canonicalSeqIn) === contentHashHex ? canonicalSeqIn : -1;
+    } else {
+      // RELAY-DEGRADED: no witness, so no discriminator exists and the content-hash rule is all
+      // there is. Keeping it preserves today's protection against real redelivery and today's blind
+      // spot for identical messages -- the strand can still form on this path. Section 5a permits
+      // proceeding rather than refusing (losing content is worse than mis-ordering it), but only
+      // ANNOUNCED: a silent fallback is exactly how this went a week unnoticed. Fires only when the
+      // hash actually matches, so it marks a real decision rather than every unwitnessed message.
+      existingIdx = tree.indexOfHash(contentHashHex);
+      if (existingIdx >= 0) {
+        this.#logger.warn("session.content.dedup.unwitnessed", {
+          sessionId,
+          agentName,
+          contentHashHex,
+          sequenceNumber: existingIdx,
+          reason: "no_relay_position_deduped_on_content",
+          correlationId,
+        });
+      }
+    }
     if (existingIdx >= 0) {
       this.#logger.info("session.content.deduplicated", {
         sessionId,
         contentHashHex,
         sequenceNumber: existingIdx,
+        witnessed: canonicalSeqIn !== undefined,
         correlationId,
       });
       // appendedCount 0 — a dedup appends NO new leaf, so a recover that re-pulls an already-ingested
@@ -3714,12 +3757,22 @@ export class SessionNodeManager {
     // first to resume appends, and the second sees its leaf and dedups.
     //
     // Adding any further await between here and the append reopens the window.
-    const dedupAfterScreen = this.getSessionTree(agentName, sessionId).indexOfHash(contentHashHex);
+    // DOD-FRONTIER-STRAND-1 AC1: this re-check must use the SAME discriminator as the first one.
+    // Left keyed on the content hash it silently re-created the whole defect one branch later --
+    // the pre-screen check would correctly let a second identical-but-distinct message through, and
+    // then this one would drop it anyway. The race it exists to close is unaffected: two concurrent
+    // ingests of a true redelivery share a position, so the second still sees the first's leaf.
+    const treeAfterScreen = this.getSessionTree(agentName, sessionId);
+    const dedupAfterScreen = canonicalSeqIn !== undefined && canonicalSeqIn >= 0
+      ? (treeAfterScreen.hashAt(canonicalSeqIn) === contentHashHex ? canonicalSeqIn : -1)
+      : treeAfterScreen.indexOfHash(contentHashHex);
     if (dedupAfterScreen >= 0) {
       this.#logger.info("session.content.deduplicated", {
         sessionId,
         contentHashHex,
         sequenceNumber: dedupAfterScreen,
+        witnessed: canonicalSeqIn !== undefined,
+        phase: "post_screen",
         correlationId,
       });
       return { ok: true, leafIndex: dedupAfterScreen, sequenceNumber: dedupAfterScreen, appendedCount: 0, ...(terminalBlock ? { screenedOut: true } : {}) };
@@ -3769,7 +3822,13 @@ export class SessionNodeManager {
     // interleave. With NO witness for this hash (relay-degraded) B falls back to arrival-order
     // append — the pre-MSG-4 behavior (no ordering signal available).
     const key = this.#k(agentName, sessionId);
-    const canonicalSeq = this.#witnessedSeq.get(key)?.get(contentHashHex);
+    // Prefer the position the CALLER verified for this specific message over the hash-keyed map.
+    // The map cannot distinguish two identical messages (AC1) -- it holds one entry per hash, so the
+    // second firing overwrites the first's position. The explicit value is per-message and correct;
+    // the map remains the fallback for paths that have no ordering record.
+    const canonicalSeq = canonicalSeqIn !== undefined && canonicalSeqIn >= 0
+      ? canonicalSeqIn
+      : this.#witnessedSeq.get(key)?.get(contentHashHex);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
       let held = this.#heldContent.get(key);
@@ -4293,8 +4352,11 @@ export class SessionNodeManager {
     // #recordFrameOrdering — it answers a different question (WHERE this message sits in the
     // canonical sequence, per the relay) and is still best-effort: a bad record must not block a
     // message whose AUTHORSHIP we have now proven.
+    // DOD-FRONTIER-STRAND-1 AC1: keep the VERIFIED position and hand it to ingest, so dedup can
+    // tell a redelivery (same position) from a genuinely new identical message (new position).
+    let recoveredSeq: number | null = null;
     if (env.structure1Cbor && env.structure2Cbor) {
-      this.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId);
+      recoveredSeq = this.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId);
     }
 
     this.#logger.info("content.recover.verified", {
@@ -4304,7 +4366,7 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    return await this.ingestReceivedContent(agentName, sessionId, env.content, contentHash, correlationId);
+    return await this.ingestReceivedContent(agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined);
   }
 
   /**
@@ -4333,8 +4395,11 @@ export class SessionNodeManager {
     structure2Cbor: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): void {
-    this.#recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park");
+    // DOD-FRONTIER-STRAND-1 AC1: returns the verified canonical position (null when the record is
+    // absent, malformed, or not signed by this session's counterparty) so the park-recovery caller
+    // can key dedup on the position rather than on the content hash.
+  ): number | null {
+    return this.#recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park");
   }
 
   #recordFrameOrdering(
@@ -4345,7 +4410,12 @@ export class SessionNodeManager {
     contentHash: Uint8Array,
     correlationId?: string,
     source: string = "content_frame",
-  ): void {
+    // DOD-FRONTIER-STRAND-1 AC1: RETURNS the verified canonical position so the caller hands it
+    // straight to ingest. It was void, and the position was only stashed in the hash-keyed
+    // #witnessedSeq map — which cannot hold two positions for one hash, so two identical
+    // messages collapsed there before dedup ran. Returning it is what makes per-message dedup
+    // possible at all.
+  ): number | null {
     try {
       const s1 = decode(structure1Cbor) as unknown[];
       const s2 = decode(structure2Cbor) as unknown[];
@@ -4355,19 +4425,19 @@ export class SessionNodeManager {
       const s2Sig = s2?.[3];
       if (!(s1Hash instanceof Uint8Array) || !(s1Pubkey instanceof Uint8Array) || !(s2Sig instanceof Uint8Array) || seq < 1) {
         this.#logger.warn("session.content.ordering.malformed", { sessionId, correlationId });
-        return;
+        return null;
       }
       // The framed ordering record must bind to THIS content (its hash) — else it orders the wrong bytes.
       const contentHashHex = Buffer.from(contentHash).toString("hex");
       if (Buffer.from(s1Hash).toString("hex") !== contentHashHex) {
         this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
-        return;
+        return null;
       }
       // Verify the SENDER's Ed25519 signature over the exact signed bytes (structure1_cbor) — the same
       // check the relay performs. Proves the counterparty committed to this (content_hash @ sequence).
       if (!verify(s1Pubkey, structure1Cbor, s2Sig)) {
         this.#logger.warn("session.content.ordering.bad_signature", { sessionId, correlationId });
-        return;
+        return null;
       }
       // Sovereign-node cross-check: the signer MUST be THIS session's counterparty, not an unrelated
       // key. FAIL CLOSED (review L) — if the counterparty pubkey is unknown we cannot prove the signer,
@@ -4383,7 +4453,7 @@ export class SessionNodeManager {
           reason: counterparty ? "signer_not_counterparty" : "counterparty_unknown",
           correlationId,
         });
-        return;
+        return null;
       }
       // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
       this.recordWitnessedSequence(agentName, sessionId, contentHashHex, seq - 1);
@@ -4393,6 +4463,7 @@ export class SessionNodeManager {
         source,
         correlationId,
       });
+      return seq - 1;
     } catch (err: unknown) {
       this.#logger.warn("session.content.ordering.decode_failed", {
         sessionId,
@@ -4400,6 +4471,8 @@ export class SessionNodeManager {
         correlationId,
       });
     }
+    // No verified position — the caller falls back to the announced hash-dedup path.
+    return null;
   }
 
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
@@ -4436,12 +4509,13 @@ export class SessionNodeManager {
       // non-fatal: the content still ingests, ordered by the witness stream / arrival as before.
       const s1Cbor = frame["structure1_cbor"];
       const s2Cbor = frame["structure2_cbor"];
+      let framedSeq: number | null = null;
       if (s1Cbor instanceof Uint8Array && s2Cbor instanceof Uint8Array) {
-        this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
+        framedSeq = this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
       }
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
-      const ingest = await this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId);
+      const ingest = await this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId, framedSeq ?? undefined);
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
       // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF

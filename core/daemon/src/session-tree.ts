@@ -56,6 +56,19 @@ export class SessionTree {
     return this.#indexByHash.get(hashHex) ?? -1;
   }
 
+  /**
+   * The content-hash at a specific leaf index, or null if the tree is not that long.
+   *
+   * DOD-FRONTIER-STRAND-1 AC1: `indexOfHash` answers "is this content anywhere?", which is the
+   * question that stranded session dbb93dfc… — two byte-identical messages are two DIFFERENT
+   * messages, and treating the second as a redelivery dropped it while the counterparty kept it.
+   * The relay-assigned position is the discriminator, so dedup needs to ask "is this content at
+   * THIS position?" instead.
+   */
+  hashAt(index: number): string | null {
+    return this.#leaves[index]?.hashHex ?? null;
+  }
+
   /** Construct an empty tree. */
   static empty(): SessionTree {
     return new SessionTree([]);
