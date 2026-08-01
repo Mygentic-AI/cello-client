@@ -96,7 +96,10 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
         // FROST DKG must dial the directory's /cello/frost/1.0.0 — a dialable
         // multiaddr is required (DirectoryEndpoint.multiaddr is optional for the
         // already-connected signaling case, but registration needs to open streams).
-        return { ok: false, reason: "directory_unreachable", guidance: "Could not resolve a dialable directory bootstrap endpoint (GET /bootstrap). Check CELLO_DIRECTORY_URL and network connectivity, then retry." };
+        // The primary resolver uses staleFallback:false, so a transient /bootstrap blip returns null
+        // here. Registration is a rare manual operation — failing fast with a clear retry message is
+        // correct. (Signaling has richer failover because it runs continuously; registration runs once.)
+        return { ok: false, reason: "directory_unreachable", guidance: "Could not reach a directory node to start registration — this is often a transient network blip. Wait a few seconds and retry. If it persists, check your internet connection." };
       }
       const directoryEndpoint = { peer_id: ep.peerId, multiaddrs: [ep.multiaddr] };
 
