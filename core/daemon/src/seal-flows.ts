@@ -73,7 +73,10 @@ export function renderSealRejection(
   sessionId: string,
   frontier?: { responder: number; initiator: number; diverging: number },
 ): { guidance: string } & SealFailureDetail {
-  if (frontier) {
+  // Gated on the REASON as well as the presence of numbers (review L3). Only a
+  // leaf_count_mismatch means what this narrative says; if any other reason ever arrives carrying a
+  // frontier, rendering it here would explain the wrong thing confidently.
+  if (frontier && reason === "leaf_count_mismatch") {
     const { responder, initiator, diverging } = frontier;
     return {
       rejection_reason: reason,

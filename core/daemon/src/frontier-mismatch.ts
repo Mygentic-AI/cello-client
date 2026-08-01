@@ -39,6 +39,14 @@ export interface FrontierMismatch {
  */
 const MAX_TRACKED_SESSIONS = 256;
 
+/**
+ * Eviction is FIFO-BY-WRITE, not LRU (review L2). `record()` refreshes an entry's position;
+ * `get()` does not. Named accurately because the victim differs: a long-lived strand READ daily
+ * but never re-observed is evicted ahead of a fresher unread one. That is acceptable here — a
+ * mismatch is re-recorded on every close attempt, so anything actively being worked on is written,
+ * not merely read — but calling it LRU would set the wrong expectation for whoever tunes it next.
+ */
+
 export class FrontierMismatchStore {
   readonly #byKey = new Map<string, FrontierMismatch>();
 
