@@ -34,6 +34,14 @@ export interface SessionContentDeps {
   advanceConnectionCursor: (connectionId: string, sessionId: string, seq: number) => void;
   /** Never vaults the cursor past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
+  /**
+   * DOD-COATTEND-1 (review F1) — the DELIVERY bookmark, deliberately NOT the gate's cursor. The
+   * gate asks "has this connection seen every leaf?" and must stop at a gap; delivery asks "what
+   * have I already handed this connection?" and is destroyed by stopping. See daemon.ts for why
+   * reusing one for the other produced an unbounded redelivery loop.
+   */
+  getDeliveryBookmark: (connectionId: string, sessionId: string) => number;
+  advanceDeliveryBookmark: (connectionId: string, sessionId: string, seq: number) => void;
   /** M8C-TGDOOR-1: a read clears the doorbell's ring-once-until-read. */
   clearTelegramRung: (agentName: string, sessionId: string) => void;
   /** DOD-COATTEND-VISIBLE-1: how many connections attend this agent right now (reporting only). */
@@ -50,7 +58,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
   const {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
-    getConnectionCursor, advanceConnectionCursor, safeCursorAdvance, clearTelegramRung,
+    getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
+    getDeliveryBookmark, advanceDeliveryBookmark, clearTelegramRung,
     attendanceCount, contentTakes,
   } = deps;
 
@@ -480,11 +489,26 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       //
       // Ordering is safe: `#appendVerifiedContent` writes the transcript row (`:3996`) BEFORE it
       // pushes to the buffer (`:4003`), so the record can never lag the queue this replaces.
-      const cursorNow = getConnectionCursor(connectionId, sessionId);
+      //
+      // The bar is the DELIVERY BOOKMARK, not the gate's read cursor (review F1, BLOCKING). Using
+      // the cursor here pinned this connection below the first gap in its received-only view — and
+      // a sibling connection's SENT leaf is such a gap, as is a security-gateway block that leaves
+      // a permanent hole. The same message was then re-served on every call, forever. The gate's
+      // cursor stays exactly as it was; it simply is not the thing that answers this question.
+      const deliveredThrough = getDeliveryBookmark(connectionId, sessionId);
+      // Asked ~47x/second per blocked connection, so the predicate is in SQL and exactly one blob is
+      // decoded (review F5). The obvious `readTranscript().messages.find(...)` decoded the entire
+      // session on every tick and threw all of it away.
+      //
+      // Guarded on `record` (review F7 claimed this guard was dead — it is NOT, and the typecheck
+      // proved it): a TRANSCRIPT-ONLY session has received rows and no `sessions` row, and it does
+      // not return above, it falls through with `record === null`. Live delivery needs the
+      // counterparty pubkey, which only the record carries, so those sessions are read through the
+      // since_seq catch-up from the transcript alone — exactly as before this change. Dropping the
+      // guard is a null dereference on the one session shape that reaches here without a record.
       const nextRow = record
-        ? sessionNodeManager.readTranscript(agentName, sessionId).messages
-          .find((m) => m.direction === "received" && m.sequence > cursorNow)
-        : undefined;
+        ? sessionNodeManager.findNextReceivedAfter(agentName, sessionId, deliveredThrough)
+        : null;
       const entry = nextRow
         ? {
           contentHex: Buffer.from(nextRow.text, "utf8").toString("hex"),
@@ -501,9 +525,18 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // was read — safeCursorAdvance refuses to vault past a gap (e.g. an unread sent leaf from
         // another local connection) even though this specific sequence number is now known.
         safeCursorAdvance(connectionId, sessionId, new Set([entry.sequenceNumber]));
-        // DOD-COATTEND-VISIBLE-1: this is the destructive drain — the message has just been REMOVED
-        // from every co-attending session's view. Record which connection took it, at the one place
-        // it happens, so a sibling that finds an empty buffer can be told why.
+        // ...and separately, this connection has now BEEN HANDED this leaf. Monotonic, no gap walk:
+        // that is the whole distinction (review F1). Without this the read above re-finds the same
+        // row on the next call.
+        advanceDeliveryBookmark(connectionId, sessionId, entry.sequenceNumber);
+        // DOD-COATTEND-VISIBLE-1: the ledger of which connection was handed which leaf.
+        //
+        // It was written when this WAS a destructive drain, and the comment here used to say so —
+        // "the message has just been REMOVED from every co-attending session's view". That is no
+        // longer true and had become the most misleading sentence in the file (review F6): it
+        // asserted the very property this unit removed, at the one site a reader would come to
+        // check it. Delivery is non-destructive now; the ledger survives because the `taken_by_
+        // sibling_session` discriminator still reads it, and its deletion is its own unit.
         contentTakes.record(agentName, sessionId, connectionId, entry.sequenceNumber);
         logger.info("session.receive.delivered", {
           sessionId, agentName, connectionId, sequenceNumber: entry.sequenceNumber,
@@ -531,6 +564,28 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // 3) Out of time — non-blocking-equivalent empty answer.
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
+        // ─── DOD-COATTEND-1 (review F2): a LOCAL failure must not wear the counterparty's label ───
+        //
+        // Content arrived, was verified and leafed, and its plaintext failed to reach the
+        // transcript. Since Tier 1 the transcript IS the delivery path, so that message can never
+        // be handed to any session. Every word of the empty answer below is wrong for this case:
+        // waiting cannot help, the transcript does not hold it, and "do not resend your last
+        // message" is aimed at the one party who could still fix it. Answer with the actual fault,
+        // above the branch that would otherwise substitute for it.
+        const undeliverable = sessionNodeManager.getUndeliverableSeqs(agentName, sessionId);
+        if (undeliverable.length > 0) {
+          logger.error("session.receive.undeliverable", {
+            sessionId, agentName, connectionId, sequences: undeliverable,
+            attendance: attendanceCount(agentName), correlationId: receiveCorrelationId,
+          });
+          return {
+            ok: true,
+            content: null,
+            reason: "content_undeliverable",
+            undeliverable_sequences: [...undeliverable],
+            guidance: `${undeliverable.length} message(s) arrived but could not be written to the local transcript, so they cannot be delivered — this is a fault on THIS machine (check disk space and ~/.cello permissions; see transcript.message.record.failed in the daemon log), not a quiet counterparty. Do not wait: waiting cannot recover them. Ask the counterparty to resend once the local fault is fixed.`,
+          };
+        }
         const liveness = sessionNodeManager.getSessionLiveness(agentName, sessionId);
         const attendance = attendanceCount(agentName);
         // ─── DOD-COATTEND-VISIBLE-1 AC1: the loser of the race gets a DIFFERENT answer ───

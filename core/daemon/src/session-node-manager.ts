@@ -213,6 +213,13 @@ export class SessionNodeManager {
   readonly #logger: Logger;
   readonly #dbPath: string;
   #db: DaemonDatabase | null = null;
+  /**
+   * DOD-COATTEND-1 (review F2): sessions whose RECEIVED transcript row failed to write, and are
+   * therefore holding content that can never be delivered. Read by `cello_receive` so the timeout
+   * answer names the local failure instead of telling the operator to keep waiting on a
+   * counterparty who already sent. Keyed (agent, session) → the leaf sequences that were lost.
+   */
+  readonly #undeliverableSeqs = new Map<string, Set<number>>();
   /** RELAYSIG-1: shared immutable store of the relay's signed ordering-record receipts (keyed by agent). */
   #relayReceiptStore: RelayReceiptStore | null = null;
   /** FED-OPTIONB-SEAL-001: the per-session leaf log (both parties) carried at a unilateral seal. */
@@ -901,8 +908,12 @@ export class SessionNodeManager {
    * DOD-LOG-1 / PERSIST-002 (AC-010): append one readable message to the durable transcript, keyed
    * by the canonical leaf `sequence` so it joins to the committed hash chain. The blob is stored as
    * plaintext bytes: the whole DB is SQLCipher-encrypted at rest, so there is no per-column cipher.
-   * Idempotent on replay (INSERT OR IGNORE). Never throws into the caller's content path: a
-   * transcript-write failure is logged, not fatal.
+   * Idempotent on replay (INSERT OR IGNORE). Never throws into the caller's content path — but it
+   * REPORTS: returns false when the row did not land, so a caller for whom the row is a delivery
+   * precondition can fail instead of proceeding (review F2). Before Tier 1 the return value would
+   * have been pointless, because `cello_receive` served content from the in-memory buffer and the
+   * lost row only cost the unread count. Delivery reads the transcript now, so a swallowed received
+   * row is TOTAL content loss and the caller has to know.
    */
   recordTranscriptMessage(
     agentName: string,
@@ -911,8 +922,8 @@ export class SessionNodeManager {
     direction: "sent" | "received",
     plaintext: Uint8Array,
     correlationId?: string,
-  ): void {
-    if (!this.#db) return;
+  ): boolean {
+    if (!this.#db) return false;
     try {
       const agentId = this.#requireAgentId(agentName);
       const blob = Buffer.from(plaintext);
@@ -923,20 +934,27 @@ export class SessionNodeManager {
         )
         .run(agentId, sessionId, sequence, direction, blob, Date.now());
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
+      return true;
     } catch (err: unknown) {
       // M8C-INBOX-1 (reviewer F2): a RECEIVED-row write failure is not cosmetic — since INBOX-1 the
-      // transcript is the AUTHORITY for unread (getUnreadSummary). A swallowed received write means
-      // the message never shows as unread in cello_check_notifications AND is lost on restart, while
-      // cello_receive still delivers it live from the in-memory buffer (masking the loss). Surface it
-      // LOUDLY (error) so the reconcile-after-loss guarantee's dependency is visible. Sent-row
-      // failures stay a warning (they only affect the durable readable transcript, not unread).
+      // transcript is the AUTHORITY for unread (getUnreadSummary).
+      //
+      // UPDATED for DOD-COATTEND-1 (review F2). This comment used to end "...while cello_receive
+      // still delivers it live from the in-memory buffer (masking the loss)", and that mitigation
+      // was the whole reason a swallowed write was survivable. Tier 1 DELETED it: delivery reads
+      // the transcript now, so a lost received row is not an undercount, it is the message never
+      // reaching ANY session while the doorbell rings and the leaf sits in the hash chain. The
+      // sentence is corrected rather than kept, because as written it reassured a reader about a
+      // safety net that no longer exists. Sent-row failures stay a warning (they only affect the
+      // durable readable transcript, not delivery).
       const level = direction === "received" ? "error" : "warn";
       this.#logger[level]("transcript.message.record.failed", {
         sessionId, agentName, sequence, direction,
         reason: err instanceof Error ? err.message : String(err),
         correlationId,
-        ...(direction === "received" ? { impact: "unread_reconciliation_may_undercount" } : {}),
+        ...(direction === "received" ? { impact: "content_undeliverable_message_lost" } : {}),
       });
+      return false;
     }
   }
 
@@ -970,6 +988,38 @@ export class SessionNodeManager {
       });
     }
     return { messages, undecryptable: 0 };
+  }
+
+  /**
+   * DOD-COATTEND-1 (review F5) — the single next RECEIVED message after `afterSeq`, or null.
+   *
+   * The delivery path asks this question inside a 20 ms poll, so it is asked ~47 times a second per
+   * blocked connection — ~1,400 times over a default 30 s receive. Answering it with
+   * `readTranscript()` meant, every single time: SELECT every row of the session with no predicate
+   * and no limit, `TextDecoder().decode()` every blob in it, build the array, then `.find()` one
+   * row and discard the rest. On a 200-message session with three co-attending connections blocking
+   * — which is the M8D use case, not a worst case — that is tens of thousands of blob decodes per
+   * second on the daemon's single synchronous SQLCipher handle, contending with the write path.
+   *
+   * The predicate belongs in SQL. This is O(1) on the existing (agent_id, session_id, sequence)
+   * key and decodes exactly the one blob it returns.
+   */
+  findNextReceivedAfter(
+    agentName: string,
+    sessionId: string,
+    afterSeq: number,
+  ): { sequence: number; text: string } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare(
+        `SELECT sequence, blob FROM transcript
+         WHERE agent_id = ? AND session_id = ? AND direction = 'received' AND sequence > ?
+         ORDER BY sequence ASC LIMIT 1`,
+      )
+      .get(this.#requireAgentId(agentName), sessionId, afterSeq) as { sequence: number; blob: Uint8Array } | undefined;
+    if (!row) return null;
+    const blob = row.blob instanceof Uint8Array ? row.blob : new Uint8Array(row.blob);
+    return { sequence: row.sequence, text: new TextDecoder().decode(blob) };
   }
 
   // ─── M8C-INBOX-1 (N2/N3): read-watermark accessors ───────────────────────────
@@ -3929,6 +3979,19 @@ export class SessionNodeManager {
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
       : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
 
+    // DOD-COATTEND-1 (review F2): the plaintext failed to reach the transcript, and since Tier 1 the
+    // transcript IS the delivery path — so this message can never be handed to any session. Report
+    // the ingest as failed. Reporting `ok: true` here is what let a local SQLCipher failure surface,
+    // 30 seconds later and one subsystem away, as "no content arrived — keep waiting": the operator
+    // is sent to debug a counterparty who did nothing wrong.
+    //
+    // The leaf STAYS. It is genuinely committed to the hash chain, and unwinding a committed leaf to
+    // tidy up a reporting problem would corrupt the frontier the counterparty already co-signs
+    // against. The hole is now crossable by delivery (F1), so it costs a gap, not a stall.
+    if (!terminalBlock && this.getUndeliverableSeqs(agentName, sessionId).includes(leafIndex)) {
+      return { ok: false, reason: "transcript_write_failed" };
+    }
+
     // NO relay witness for this hash. We appended it anyway — refusing would make the relay a hard
     // precondition for reading mail, so a relay outage would render the inbox unreadable, and the
     // direct path and park backstop exist precisely to survive that. But this append is a WEAKER
@@ -3990,6 +4053,14 @@ export class SessionNodeManager {
    * live arrivals until its tree reaches this, because it has more to recover than it has appended);
    * NOT yet consumed by the gate. Also `recordWitnessedSequence` maintains it.
    */
+  /**
+   * DOD-COATTEND-1 (review F2): leaf sequences whose plaintext failed to reach the transcript and
+   * are therefore undeliverable. Empty is the overwhelmingly normal case.
+   */
+  getUndeliverableSeqs(agentName: string, sessionId: string): readonly number[] {
+    return [...(this.#undeliverableSeqs.get(this.#k(agentName, sessionId)) ?? [])];
+  }
+
   getHighWaterSeq(agentName: string, sessionId: string): number {
     return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
   }
@@ -4007,8 +4078,16 @@ export class SessionNodeManager {
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
     // relay/directory never see this plaintext, only the hash).
-    this.recordTranscriptMessage(agentName, sessionId, leafIndex, "received", content, correlationId);
+    const durable = this.recordTranscriptMessage(agentName, sessionId, leafIndex, "received", content, correlationId);
     const recvKey = this.#k(agentName, sessionId);
+    if (!durable) {
+      // The leaf is committed and the plaintext is not. Delivery reads the transcript, so this
+      // message is now unreachable by every session — record it so the receive path can SAY that
+      // rather than time out wearing the quiet-counterparty answer (review F2).
+      let lost = this.#undeliverableSeqs.get(recvKey);
+      if (!lost) { lost = new Set(); this.#undeliverableSeqs.set(recvKey, lost); }
+      lost.add(leafIndex);
+    }
     // Review finding #6: the witness for this hash has done its ordering job once the leaf is
     // appended — drop it so #witnessedSeq stays proportional to held/pending content, not the whole
     // transcript. A later replay of the same hash is still caught by the dedup leaf-scan, which is

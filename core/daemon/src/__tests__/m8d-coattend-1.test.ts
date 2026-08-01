@@ -63,6 +63,10 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     const connA = await fx.connectAs("alice");
     const connB = await fx.connectAs("alice");
 
+    // A SENT leaf first (review: this clause previously ran at cursor -1 against seq 0 — the one
+    // arrangement where a gap-safe walk happens to work, so it passed one leaf short of the defect
+    // it exists to guard). A conversation has both directions in it; that is what makes it one.
+    fx.seedSent("alice", SID, "something a sibling connection sent");
     await fx.ingestReceived("alice", SID, "first");
     expect(((await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("first");
 
@@ -94,6 +98,11 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     await fx.createSession(SID, "alice");
     const connA = await fx.connectAs("alice");
 
+    // "Mid-conversation" must MEAN mid-conversation (review): the first version of this clause
+    // seeded only received messages, so the late connection's cursor had no gap ahead of it and
+    // any gap-stopping implementation passed. A real conversation has this agent's own replies in
+    // it, and every one of them is a leaf the late connection never read.
+    fx.seedSent("alice", SID, "our earlier reply");
     await fx.ingestReceived("alice", SID, "before you joined");
     expect(((await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("before you joined");
 
@@ -102,6 +111,14 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     const late = await fx.connectAs("alice");
     const caught = (await late.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
     expect(caught.content, "a late session catches up from its own bookmark").toBe("before you joined");
+
+    // ...and KEEPS catching up. Stopping at the first message it finds is what made the original
+    // version of this clause hollow: a bookmark that never advances past the sent leaf at seq 0
+    // still returns "before you joined" here, so the assertion above passes on the broken build.
+    // Catching up means reaching the present, not receiving once.
+    await fx.ingestReceived("alice", SID, "and this came after");
+    const next = (await late.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect(next.content, "catching up means reaching the NEXT message too").toBe("and this came after");
   });
 
   it("T5 (AC3, CONTENT LOSS): a connection dying with the message unread loses NOTHING", async () => {
@@ -120,6 +137,68 @@ describe("DOD-COATTEND-1: two attached sessions BOTH receive the message", () =>
     const got = (await fresh.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
     expect(got.content, "content must survive the death of the connection that was going to read it").toBe("must survive");
   });
+
+  // ─── F1 (review, BLOCKING): the bookmark must not be the GATE's cursor ────────────────────────
+  //
+  // Tier 1 delivered against `safeCursorAdvance`, which by design refuses to walk past a gap. That
+  // is correct for the SEND GATE — "has this connection seen every leaf?" must never skip an unseen
+  // one. It is fatal for DELIVERY — "what have I already handed this connection?" — because the
+  // answer is pinned below the gap forever, so the same message is served on every call and the
+  // next one is never reached. One question needs gap-safety; the other is destroyed by it.
+  //
+  // The gap is produced by the most ordinary thing in the protocol: a message this agent SENT from
+  // another connection. Leaf indices are contiguous across both directions, so every sibling send
+  // is a hole in a co-attending connection's received-only view.
+
+  it("T7 (AC1/AC6, F1): a sibling's SENT leaf must not pin a co-attending session to one message", async () => {
+    await fx.createSession(SID, "alice");
+    fx.seedSent("alice", SID, "hello bob"); // leaf 0 — authored on some other connection
+    const connB = await fx.connectAs("alice"); // cursor -1, and leaf 0 is a gap it will never read
+
+    await fx.ingestReceived("alice", SID, "reply one");
+    const first = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect(first.content).toBe("reply one");
+
+    await fx.ingestReceived("alice", SID, "reply two");
+    const second = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    // Before the fix this was "reply one" again — and again, and again, unboundedly. Worse than the
+    // theft this milestone exists to fix: the session is not merely missing a message, it is stuck
+    // replying to the same one while the conversation moves on without it.
+    expect(second.content, "the NEXT message must be delivered, not the same one again").toBe("reply two");
+  });
+
+  it("T8 (AC1, F1 second shape): a screened-out leaf leaves a PERMANENT hole — delivery must cross it", async () => {
+    // The security gateway terminal-blocks an inbound message: the leaf is committed, no transcript
+    // row is ever written. That index can never be filled, so a gap-stopping bookmark stops there
+    // for the life of the session — one block would permanently break cello_receive for EVERY
+    // connection, which is a far larger blast radius than co-attendance.
+    await fx.createSession(SID, "alice");
+    fx.seedLeafWithoutTranscriptRow("alice", SID); // leaf 0 — no row, forever
+    const conn = await fx.connectAs("alice");
+
+    await fx.ingestReceived("alice", SID, "one");
+    expect(((await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>).content).toBe("one");
+    await fx.ingestReceived("alice", SID, "two");
+    const second = (await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    expect(second.content, "a permanent transcript hole must not stop delivery forever").toBe("two");
+  });
+
+  // WHY THERE IS NO "AND THE SEND IS STILL REFUSED" CLAUSE HERE.
+  //
+  // The fix's other half is that it must not WEAKEN the gate: M8C-CURSOR-1's read-before-write
+  // guarantee lives on the gate's cursor, and if the new bookmark were reused as the gate then
+  // delivering a received message would vault a connection past an unread SENT leaf and let it
+  // reply having never seen what its sibling said. So the fix adds a SEPARATE map and leaves
+  // safeCursorAdvance and every gate call site untouched.
+  //
+  // That half is not assertable through IPC today — measured, not assumed. Written as
+  // `expect(send.ok).toBe(false)` the clause failed with `ok: true` BEFORE the bookmark existed:
+  // the gate reads `connectionCursor >= currentSeq || unreadReceived === 0`, and the second
+  // authority passes as soon as ANY connection has read. That is DOD-COATTEND-SENDWINDOW-1's
+  // defect (journal Entry 17) and it is that line's to fix; the refusal becomes assertable there.
+  // A clause asserting it here would pin behavior this unit does not ship, and a clause asserting
+  // only what already passes would survive the revert test — which is the failure mode this
+  // milestone keeps hitting. So it is stated, not staged.
 
   it("T6 (AC2 + AC4): the doorbell STAYS multicast and carries no content", async () => {
     // AC2 is a do-not-change clause: the multicast wake-up is correct and only the queue was wrong.

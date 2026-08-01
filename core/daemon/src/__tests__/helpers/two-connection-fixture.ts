@@ -91,6 +91,10 @@ export interface TwoConnectionFixture {
   createSession(sessionId: string, agent: string, counterpartyPubkey?: string, peerId?: string): Promise<void>;
   /** Seed a RECEIVED message exactly as the inbound path does: tree leaf + transcript row. */
   seedReceived(agent: string, sessionId: string, text: string): number;
+  /** Append a leaf this agent SENT, with its transcript row — what a sibling connection's send produces. */
+  seedSent(agent: string, sessionId: string, text: string): number;
+  /** Append a leaf with NO transcript row — a security-gateway terminal block; a permanent sequence hole. */
+  seedLeafWithoutTranscriptRow(agent: string, sessionId: string): number;
   /** Drive the real inbound-content path, so the delivery buffer and the doorbell both fire. */
   ingestReceived(agent: string, sessionId: string, text: string, correlationId?: string): Promise<unknown>;
   eventsNamed(event: string): CapturedEvent[];
@@ -159,6 +163,19 @@ export async function startTwoConnectionFixture(
     },
     async createSession(sessionId, agent, counterpartyPubkey = "bobpubkeyhex", peerId = "bob-peer-id") {
       await handle.getSessionNodeManager().createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
+    },
+    seedSent(agent, sessionId, text) {
+      const snm = handle.getSessionNodeManager();
+      const { leafIndex } = snm.appendSessionLeaf(agent, sessionId, "msg", "bb".repeat(32), "seed");
+      snm.recordTranscriptMessage(agent, sessionId, leafIndex, "sent", new TextEncoder().encode(text), "seed");
+      return leafIndex;
+    },
+    seedLeafWithoutTranscriptRow(agent, sessionId) {
+      // A leaf with NO transcript row is what the security gateway produces when it terminal-blocks
+      // an inbound message: the leaf is committed to the hash chain, the plaintext never lands. It
+      // is therefore a PERMANENT hole in the transcript's sequence space, and any walk that stops
+      // at the first gap stops there for the lifetime of the session.
+      return handle.getSessionNodeManager().appendSessionLeaf(agent, sessionId, "msg", "cc".repeat(32), "seed").leafIndex;
     },
     seedReceived(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();
