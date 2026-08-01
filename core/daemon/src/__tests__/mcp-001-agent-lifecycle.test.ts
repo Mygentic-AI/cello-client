@@ -5,7 +5,7 @@
  * - AC-001: Adapter connects to daemon IPC, no crypto imports
  * - AC-002: cello_start_agent transitions Registered→Online (idempotent)
  * - AC-003: cello_use_agent sets current agent per-connection
- * - AC-004: cello_stop_agent transitions Online→Registered
+ * - AC-004: cello_set_agent_offline transitions Online→Registered
  * - AC-005: Multi-connection isolation (2 connections, different current agents)
  * - AC-006: Two connections can have same agent as current independently
  * - AC-007: no_current_agent guard on 5 session tools (separate test per tool)
@@ -159,8 +159,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(switchEvent!.context.connectionId).toBeDefined();
   });
 
-  // ─── AC-004: cello_stop_agent transitions Online→Registered (idempotent) ───
-  it("AC-004: cello_stop_agent transitions agent to registered and clears current", async () => {
+  // ─── AC-004: cello_set_agent_offline transitions Online→Registered (idempotent) ───
+  it("AC-004: cello_set_agent_offline transitions agent to registered and clears current", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
@@ -168,7 +168,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
-    const result = await client.send("cello_stop_agent", { name: "alice" });
+    const result = await client.send("cello_set_agent_offline", { name: "alice" });
     expect(result).toEqual({ ok: true });
 
     // Verify agent is now registered
@@ -183,7 +183,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(offlineEvent!.context.reason).toBe("stopped");
 
     // Second call: idempotent — no second event
-    const result2 = await client.send("cello_stop_agent", { name: "alice" });
+    const result2 = await client.send("cello_set_agent_offline", { name: "alice" });
     expect(result2).toEqual({ ok: true });
     const offlineEventsAfter = logEvents.filter((e) => e.event === "agent.offline");
     expect(offlineEventsAfter).toHaveLength(1);
@@ -672,8 +672,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(list1.agents.find((a) => a.name === "bob")?.state).toBe("online");
   });
 
-  // ─── cello_stop_agent clears current for affected connections ───
-  it("cello_stop_agent clears current agent for all connections using that agent", async () => {
+  // ─── cello_set_agent_offline clears current for affected connections ───
+  it("cello_set_agent_offline clears current agent for all connections using that agent", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
 
@@ -685,7 +685,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     await client2.send("cello_use_agent", { name: "alice" });
 
     // Stop alice from connection 1
-    await client1.send("cello_stop_agent", { name: "alice" });
+    await client1.send("cello_set_agent_offline", { name: "alice" });
 
     // Both connections should now see alice as registered, not current
     const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
@@ -707,13 +707,13 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(result.guidance).toBeDefined();
   });
 
-  // ─── cello_stop_agent with unknown agent ───
-  it("cello_stop_agent returns agent_not_found for unknown agent", async () => {
+  // ─── cello_set_agent_offline with unknown agent ───
+  it("cello_set_agent_offline returns agent_not_found for unknown agent", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
-    const result = await client.send("cello_stop_agent", { name: "nonexistent" }) as { ok: boolean; reason: string; guidance: string };
+    const result = await client.send("cello_set_agent_offline", { name: "nonexistent" }) as { ok: boolean; reason: string; guidance: string };
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("agent_not_found");
     expect(result.guidance).toBeDefined();

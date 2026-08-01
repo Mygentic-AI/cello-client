@@ -26,7 +26,7 @@ import {
   IPC_METHODS,
   listAgents,
   startAgent,
-  stopAgent,
+  setAgentOffline,
   useAgent,
   inbox,
   listSessions,
@@ -89,7 +89,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect((parsed.agents as Array<{ name: string }>).map((a) => a.name)).toContain("alice");
     });
 
-    it("`cello start-agent` / `stop-agent` reach the daemon handler and report its verdict", async () => {
+    it("`cello start-agent` / `set-agent-offline` reach the daemon handler and report its verdict", async () => {
       await createAgent(tempDir, "alice");
       const started = await startAgent(tempDir, "alice", {});
       // An unregistered agent may legitimately refuse to start — what must hold is that the CLI
@@ -99,7 +99,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect(started.exitCode).toBe(startBody.ok ? 0 : 1);
       if (!startBody.ok) expect(started.stdout).toBe(""); // failure never lands on stdout
 
-      const stopped = await stopAgent(tempDir, "alice", {});
+      const stopped = await setAgentOffline(tempDir, "alice", {});
       const stopBody = JSON.parse(stopped.exitCode === 0 ? stopped.stdout : stopped.stderr);
       expect(stopped.exitCode).toBe(stopBody.ok ? 0 : 1);
     });
@@ -273,7 +273,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
   // ─── Unit-review fixes (F1, F2, F4, T1) ──────────────────────────────────────────────────
 
   describe("review fixes: the replay must not lie, misroute, or resurrect", () => {
-    it("F1: `stop-agent` CLEARS the selection — a read-only command can never silently re-online it", async () => {
+    it("F1: `set-agent-offline` CLEARS the selection — a read-only command can never silently re-online it", async () => {
       // The defect: every agent-scoped command replays cello_use_agent, which AUTO-STARTS an offline
       // agent. So `stop-agent alice` followed by `cello inbox` brought alice back online — reachable
       // again — with no signal. Stopping an agent is kill-switch-adjacent; reading must never re-arm it.
@@ -281,13 +281,13 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await useAgent(tempDir, "alice", {});
       expect(await readCurrentAgent(tempDir)).toBe("alice");
 
-      await stopAgent(tempDir, "alice", {});
+      await setAgentOffline(tempDir, "alice", {});
       expect(await readCurrentAgent(tempDir)).toBeUndefined(); // the durable mirror follows the daemon
     });
 
     it("F1: an OFFLINE selected agent fails LOUD rather than being auto-started by a read", async () => {
       await createAgent(tempDir, "alice");
-      // Persist a selection, then take the agent offline WITHOUT going through stopAgent (so the
+      // Persist a selection, then take the agent offline WITHOUT going through setAgentOffline (so the
       // selection file survives — the exact state a crash or a direct MCP stop would leave).
       await useAgent(tempDir, "alice", {});
       // Take alice offline via the daemon's OWN handler, leaving the persisted selection in place —
@@ -296,7 +296,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       const lock = await readLock(join(tempDir, "daemon.lock"));
       const c = await connectToDaemon(lock!.socketPath);
       await c.send("ipc.connect", { clientType: "test" });
-      await c.send("cello_stop_agent", { name: "alice" });
+      await c.send("cello_set_agent_offline", { name: "alice" });
       c.close();
       expect(await readCurrentAgent(tempDir)).toBe("alice"); // selection still there, agent offline
 
@@ -471,7 +471,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
 
     // Found while fixing the above, and it is the more dangerous half.
     //
-    // `cello stop-agent <selected>` CLEARS the persisted selection (parity-commands stopAgent) — on
+    // `cello set-agent-offline <selected>` CLEARS the persisted selection (parity-commands setAgentOffline) — on
     // its own, reasonable. But the daemon's fallback for "no selection" is "the sole ONLINE agent",
     // and it only refuses when TWO OR MORE are online. So with several agents registered and exactly
     // one up, the next command silently runs as that one.
@@ -485,7 +485,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       await createAgent(tempDir, "bob");
       await startAgent(tempDir, "bob", {});
       await useAgent(tempDir, "alice", {});   // use-agent AUTO-STARTS alice (AUTOSTART-1)...
-      await stopAgent(tempDir, "alice", {});  // ...so stop her. This also clears the selection.
+      await setAgentOffline(tempDir, "alice", {});  // ...so stop her. This also clears the selection.
 
       const out = await settingsSet(tempDir, "away.default", "must not land on bob", {});
       expect(out.exitCode, "a write with no selection must not silently pick an agent").toBe(1);

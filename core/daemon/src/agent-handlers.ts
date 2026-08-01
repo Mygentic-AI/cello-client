@@ -279,8 +279,24 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     return { ok: true, name, agentId, oneWay: true, directoryRevocation, guidance: baseLine + dirLine };
   });
 
-  // ─── MCP-001: cello_stop_agent handler ───
-  handlers.set("cello_stop_agent", async (params, _connectionId) => {
+  // ─── MCP-001: cello_set_agent_offline handler (was cello_set_agent_offline) ───
+  //
+  // RENAMED because the old name described the wrong axis and cost real confusion. There are two
+  // independent things an operator does to an agent:
+  //
+  //   lifecycle  — cello_start_agent  / cello_set_agent_offline    (offline ⇄ online)
+  //   attendance — cello_use_agent    / cello_stop_using_agent  (who this connection drives)
+  //
+  // "stop_agent" reads as the opposite of "use_agent" — stop using it — but it is the opposite of
+  // "start_agent". An operator wanting to step away from an agent so its AWAY path could fire ran
+  // it and took the agent fully offline instead, at which point inbound sessions were refused with
+  // `counterparty_did_not_accept` and the away reply could never be produced. The two states look
+  // alike from outside (nobody is answering) and behave nothing alike.
+  //
+  // The deselect half genuinely did not exist: `cello_use_agent` requires a name, so a connection
+  // could SWITCH agents but never LET GO of one. The only way to clear a selection was to shut the
+  // agent down, which is why the two verbs collapsed into each other.
+  handlers.set("cello_set_agent_offline", async (params, _connectionId) => {
     const name = params?.name as string | undefined;
     if (!name) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to stop." };
@@ -316,6 +332,46 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       }
     }
     return { ok: true };
+  });
+
+  // ─── cello_stop_using_agent handler — the missing half of cello_use_agent ───
+  //
+  // `cello_use_agent` requires a name, so a connection could SWITCH agents but never LET GO of one.
+  // The only way to clear a selection was `cello_set_agent_offline`, which takes the agent OFFLINE —
+  // a different axis entirely, and the confusion that named this handler into existence.
+  //
+  // The gap was not cosmetic. An attended agent never sends its away reply (`isAttended` suppresses
+  // it), so an operator who wanted to step away had exactly two options: shut the agent down, which
+  // makes it unreachable and refuses inbound sessions outright, or select some OTHER agent — which
+  // is impossible if you only have one. A single-agent operator had no route to "away" at all.
+  //
+  // Releasing does NOT touch the agent's lifecycle: it stays online with its standing receiver, so
+  // it can still accept inbound sessions and answer them with its away message. That is the whole
+  // point — this is how an operator becomes reachable-but-absent rather than simply gone.
+  handlers.set("cello_stop_using_agent", async (_params, connectionId) => {
+    const connState = getConnState(connectionId);
+    if (!connState) {
+      return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
+    }
+    const fromAgent = connState.currentAgent;
+    if (!fromAgent) {
+      // Idempotent, and says so — releasing nothing is not an error worth failing a script over.
+      return { ok: true, released: null, guidance: "This connection was not attending any agent. Nothing to release." };
+    }
+    connState.currentAgent = null;
+    // DELIBERATELY NOT setting `clearedAgent`. That flag exists to refuse the sole-online fallback
+    // for a connection whose selection was TAKEN AWAY under it (the agent was shut down or removed)
+    // — "this connection had an intent, do not guess a replacement". A release is the opposite: the
+    // operator is choosing to hold nothing, and should be free to be handed the sole online agent
+    // again by the normal fallback rather than being locked out of it for the rest of the session.
+    getNotificationDispatcher().setCurrentAgent(connectionId, null);
+    getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, null);
+    logger.info("agent.current.released", { connectionId, fromAgent });
+    return {
+      ok: true,
+      released: fromAgent,
+      guidance: `No longer attending '${fromAgent}'. It stays ONLINE and reachable — inbound sessions will now get its away message instead of a live reply.`,
+    };
   });
 
   // ─── MCP-001: cello_use_agent handler ───

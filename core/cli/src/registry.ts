@@ -44,7 +44,8 @@ import {
   contactSetAway,
   listAgents,
   startAgent,
-  stopAgent,
+  setAgentOffline,
+  stopUsingAgent,
   useAgent,
   inbox,
   transcript,
@@ -352,15 +353,33 @@ export const COMMANDS: readonly CommandSpec[] = [
     },
   },
   {
-    name: "stop-agent",
+    name: "set-agent-offline",
     group: "Agents",
     summary: "Take an agent offline. It stops accepting anything until restarted.",
-    help: "Usage: cello stop-agent <name> [--pretty]  — take an agent offline.",
-    ipcMethod: IPC_METHODS["stop-agent"],
+    help:
+      "Usage: cello set-agent-offline <name> [--pretty]  — take an agent offline (reversible with start-agent).\n" +
+      "  The agent becomes UNREACHABLE: inbound sessions are refused and it cannot even send an away\n" +
+      "  message. To step away while staying reachable, use 'cello stop-using-agent' instead.",
+    ipcMethod: IPC_METHODS["set-agent-offline"],
     jsonOut: true,
     async run(ctx, args) {
       const { pretty, positional } = parityOpts(args);
-      return stopAgent(ctx.celloDir, positional[0] ?? "", { pretty });
+      return setAgentOffline(ctx.celloDir, positional[0] ?? "", { pretty });
+    },
+  },
+  {
+    name: "stop-using-agent",
+    group: "Agents",
+    summary: "Stop attending the current agent, leaving it online and reachable.",
+    help:
+      "Usage: cello stop-using-agent [--pretty]  — release the current agent without taking it offline.\n" +
+      "  The opposite of 'cello use-agent'. The agent stays ONLINE, so inbound sessions still open and\n" +
+      "  are answered with its away message instead of a live reply.",
+    ipcMethod: IPC_METHODS["stop-using-agent"],
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty } = parityOpts(args);
+      return stopUsingAgent(ctx.celloDir, { pretty });
     },
   },
   {

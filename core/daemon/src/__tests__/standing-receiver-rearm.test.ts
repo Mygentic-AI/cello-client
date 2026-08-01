@@ -17,7 +17,7 @@
  *  3. When every attempt fails for an agent that wants a receiver, a LOUD terminal event
  *     (`session.standing_receiver.dead`, error level) fires — distinct from the per-attempt
  *     `session.node.create.failed`.
- *  4. Regression (L1): cello_stop_agent during an in-flight ensure still tears down cleanly
+ *  4. Regression (L1): cello_set_agent_offline during an in-flight ensure still tears down cleanly
  *     (tombstone semantics preserved — the retry loop must also honor it).
  *
  * The daemon-level half (ensure-on-demand in the inbound accept path + per-agent

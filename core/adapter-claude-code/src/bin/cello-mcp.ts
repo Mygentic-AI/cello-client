@@ -138,17 +138,22 @@ server.tool("cello_start_agent", "Bring a registered CELLO agent online so it ca
   return jsonText(result);
 });
 
-server.tool("cello_stop_agent", "Take an online CELLO agent offline (back to registered state)", {
-  name: z.string().describe("Agent name to stop"),
+server.tool("cello_set_agent_offline", "TAKE AN AGENT OFFLINE — back to registered state, tearing down its standing receiver so it can no longer be reached at all. Reversible with cello_start_agent. This is the opposite of cello_start_agent, NOT of cello_use_agent: inbound sessions to an offline agent are REFUSED (counterparty_did_not_accept), and it cannot send an away message because nothing is listening. To step away while STAYING reachable, use cello_stop_using_agent instead.", {
+  name: z.string().describe("Agent name to take offline"),
 }, async ({ name }) => {
-  const result = await proxy.call("cello_stop_agent", { name });
+  const result = await proxy.call("cello_set_agent_offline", { name });
   return jsonText(result);
 });
 
-server.tool("cello_use_agent", "Set which online agent this connection routes tool calls to", {
+server.tool("cello_use_agent", "ATTEND an agent — set which online agent this connection routes tool calls to, and receive its doorbells here. Auto-starts the agent if it is offline. NOTE: attending an agent SUPPRESSES its away message — a counterparty gets your live reply instead, no matter how away.* is configured. Release it with cello_stop_using_agent.", {
   name: z.string().describe("Agent name to set as current for this connection"),
 }, async ({ name }) => {
   const result = await proxy.call("cello_use_agent", { name });
+  return jsonText(result);
+});
+
+server.tool("cello_stop_using_agent", "STOP ATTENDING the current agent, without shutting it down. The agent stays ONLINE and reachable — inbound sessions still open and are answered with its away message rather than a live reply. This is the opposite of cello_use_agent (use cello_set_agent_offline to take an agent offline instead). Call this to step away, to hand an agent to another session, or to stop receiving its doorbells. Idempotent when nothing is attended.", {}, async () => {
+  const result = await proxy.call("cello_stop_using_agent", {});
   return jsonText(result);
 });
 

@@ -43,7 +43,7 @@ describe("F1: usage string lists every command", () => {
         // Setup
         "login", "logout", "status", "create-agent", "register-agent", "remove-agent",
         // Agents
-        "agents", "start-agent", "use-agent", "stop-agent", "refresh",
+        "agents", "start-agent", "use-agent", "stop-using-agent", "set-agent-offline", "refresh",
         // Messaging
         "initiate-session", "await-session", "close-session", "name-session", "dismiss", "send", "receive", "inbox",
         // Sessions & receipts
@@ -61,7 +61,11 @@ describe("F1: usage string lists every command", () => {
   // DOD-ONBOARD-HELP-1 §2: the renames are CLEAN. No aliases — one user, no install base, so an
   // alias would be permanent debt bought for nobody.
   it("the OLD command names are gone from the dispatchable set", () => {
-    for (const old of ["install", "register", "close", "initiate", "receipts", "receive-session"]) {
+    // `stop-agent` joined this list when it became `set-agent-offline`: the name described the
+    // wrong axis (it reads as the opposite of `use-agent`, but it is the opposite of
+    // `start-agent`) and an operator wanting to step away took their agent fully offline
+    // instead — unreachable, and unable to send the away message they were trying to trigger.
+    for (const old of ["install", "register", "close", "initiate", "receipts", "receive-session", "stop-agent"]) {
       expect(KNOWN_COMMANDS.has(old), `'${old}' must be deleted, not aliased`).toBe(false);
     }
   });

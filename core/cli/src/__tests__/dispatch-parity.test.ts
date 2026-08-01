@@ -47,7 +47,7 @@ vi.mock("../parity-commands.js", async (importOriginal) => {
     ...actual,
     listAgents: stub(),
     startAgent: stub(),
-    stopAgent: stub(),
+    setAgentOffline: stub(),
     useAgent: stub(),
     inbox: stub(),
     listSessions: stub(),
@@ -223,8 +223,8 @@ describe("Phases 1-2: parity commands forward the MCP params exactly", () => {
     expect(parity.listAgents).toHaveBeenCalledWith(CELLO_DIR, { pretty: false });
     await run("start-agent", ["alice"]);
     expect(parity.startAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
-    await run("stop-agent", ["alice"]);
-    expect(parity.stopAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
+    await run("set-agent-offline", ["alice"]);
+    expect(parity.setAgentOffline).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
     await run("use-agent", ["alice"]);
     expect(parity.useAgent).toHaveBeenCalledWith(CELLO_DIR, "alice", { pretty: false });
   });
@@ -376,7 +376,7 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
     const expected: Record<string, string> = {
       cello_list_agents: "agents",
       cello_start_agent: "start-agent",
-      cello_stop_agent: "stop-agent",
+      cello_set_agent_offline: "set-agent-offline",
       cello_use_agent: "use-agent",
       cello_check_notifications: "inbox",
       cello_get_transcript: "transcript",

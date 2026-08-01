@@ -46,8 +46,9 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   // Agents
   { mcp: "cello_agents", cli: "cello agents" },
   { mcp: "cello_start_agent", cli: "cello start-agent" },
-  { mcp: "cello_stop_agent", cli: "cello stop-agent" },
+  { mcp: "cello_set_agent_offline", cli: "cello set-agent-offline" },
   { mcp: "cello_use_agent", cli: "cello use-agent" },
+  { mcp: "cello_stop_using_agent", cli: "cello stop-using-agent" },
   { mcp: "cello_status", cli: "cello status" },
   // Messaging
   { mcp: "cello_initiate_session", cli: "cello initiate-session" },

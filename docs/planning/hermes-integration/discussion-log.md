@@ -40,7 +40,7 @@ The recommended deliverables (tracked, not built here) are:
 - It connects to `${CELLO_DIR:-~/.cello}/daemon.sock`. If the socket is missing (`ENOENT` /
   `ECONNREFUSED`) it prints `daemon not running — run cello login` and exits 1.
 - Tools registered (stable surface today):
-  - Agent mgmt: `cello_start_agent`, `cello_stop_agent`, `cello_use_agent`, `cello_list_agents`
+  - Agent mgmt: `cello_start_agent`, `cello_set_agent_offline`, `cello_use_agent`, `cello_list_agents`
   - Sessions: `cello_initiate_session`, `cello_await_session`, `cello_send`, `cello_receive`,
     `cello_receive_session`, `cello_close_session`, `cello_list_sessions`
   - Status/receipts: `cello_status`, `cello_backup`, `cello_restore`, `cello_get_sealed_receipt`,

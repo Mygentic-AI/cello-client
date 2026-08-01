@@ -231,7 +231,7 @@ export class SessionNodeManager {
   #standingReceiverCreating = new Set<string>();
   // M8B F14: agents that SHOULD have a standing receiver — marked by
   // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
-  // unmarked by removeStandingReceiverForAgent (cello_stop_agent). Consulted by the
+  // unmarked by removeStandingReceiverForAgent (cello_set_agent_offline). Consulted by the
   // teardown re-arm so a session-node teardown never re-arms an offline agent.
   #agentsWantingReceiver = new Set<string>();
   // M8B F14: standing-receiver create retry schedule (see constructor opts).
@@ -244,7 +244,7 @@ export class SessionNodeManager {
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
-  // an agent that has since gone offline (cello_stop_agent race). A fresh ensure clears it.
+  // an agent that has since gone offline (cello_set_agent_offline race). A fresh ensure clears it.
   #standingReceiverRemoving = new Set<string>();
   // Set once gracefulShutdown begins. The standing-receiver replacement that
   // acceptSession kicks off runs un-awaited (AC-003), so it can be in flight when
@@ -4618,7 +4618,7 @@ export class SessionNodeManager {
    * Replace an agent's reservation-less standing receiver with one that reserves.
    *
    * Deliberately NOT removeStandingReceiverForAgent()+ensureStandingReceiverForAgent():
-   * the public remove CLEARS #agentsWantingReceiver, so a cello_stop_agent landing in
+   * the public remove CLEARS #agentsWantingReceiver, so a cello_set_agent_offline landing in
    * the window while node.stop() is awaited would find no map entry and no creating
    * marker, leave no tombstone, and the re-ensure would then RESURRECT a receiver for
    * an agent that asked to go dark — accepting inbound sessions for an offline agent.
@@ -4901,7 +4901,7 @@ export class SessionNodeManager {
       return { outcome: "aborted" };
     }
 
-    // L1: the agent may have gone offline (cello_stop_agent → removeStandingReceiverForAgent)
+    // L1: the agent may have gone offline (cello_set_agent_offline → removeStandingReceiverForAgent)
     // while this ensure was parked on start(). Removal found no map entry to delete, so the
     // tombstone is how we learn of it — tear the fresh node down rather than install an SR for
     // an offline agent.

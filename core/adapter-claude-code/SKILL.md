@@ -150,7 +150,8 @@ It is **private to you**: never sent to the counterparty, never to the relay or 
 cello_agents()                      — list your agents and whether each is online
 cello_start_agent({ name })         — bring an agent online
 cello_use_agent({ name })           — select the agent this connection acts as (auto-starts it)
-cello_stop_agent({ name })          — take an agent offline
+cello_set_agent_offline({ name })   — take an agent offline (UNREACHABLE: inbound sessions refused)
+cello_stop_using_agent()            — stop attending the current agent; it STAYS online and reachable
 cello_status()                      — daemon + agent state
 ```
 

@@ -66,7 +66,7 @@ export async function readCurrentAgent(celloDir: string): Promise<string | undef
 }
 
 /**
- * Forget the persisted selection. Called by `stop-agent`: the daemon clears an agent from every
+ * Forget the persisted selection. Called by `set-agent-offline`: the daemon clears an agent from every
  * connection's current-agent state when it is stopped, so the CLI's durable mirror of that state
  * must be cleared too.
  */
@@ -133,7 +133,7 @@ async function withDaemon(
       const selected = opts.agent ?? (await readCurrentAgent(celloDir));
       if (selected) {
         // The replay must not RESURRECT a stopped agent. cello_use_agent auto-starts an offline
-        // agent (AUTOSTART-1), so replaying it blindly would let `cello stop-agent alice` be
+        // agent (AUTOSTART-1), so replaying it blindly would let `cello set-agent-offline alice` be
         // silently undone by the very next read-only command (`cello inbox`), bringing alice back
         // online and reachable with no signal. Stopping an agent is kill-switch-adjacent; a command
         // that reads must never re-arm it. The MCP surface never does this — the daemon clears the
@@ -144,7 +144,7 @@ async function withDaemon(
         if (!(await isAgentOnline(client, selected))) {
           return emitTransportError(
             "selected_agent_offline",
-            `Agent '${selected}' is not online, so this command was not run as it. Bring it online with 'cello start-agent ${selected}' (or select another with 'cello use-agent <name>'). It is NOT auto-started here: that would silently undo a deliberate 'cello stop-agent'.`,
+            `Agent '${selected}' is not online, so this command was not run as it. Bring it online with 'cello start-agent ${selected}' (or select another with 'cello use-agent <name>'). It is NOT auto-started here: that would silently undo a deliberate 'cello set-agent-offline'.`,
             opts,
           );
         }
@@ -165,7 +165,7 @@ async function withDaemon(
       } else {
         // NO selection. The daemon's fallback is "the sole ONLINE agent", and it refuses only when
         // two or more are online — so with several agents known and exactly one up, it runs the
-        // command as that one. `cello stop-agent <selected>` clears the selection, which walks
+        // command as that one. `cello set-agent-offline <selected>` clears the selection, which walks
         // straight into it: the next command silently re-targets whoever else happens to be online.
         //
         // With ONE known agent the fallback is unambiguous and useful (a fresh operator who never ran
@@ -271,8 +271,9 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
 export const IPC_METHODS = {
   agents: "cello_list_agents",
   "start-agent": "cello_start_agent",
-  "stop-agent": "cello_stop_agent",
+  "set-agent-offline": "cello_set_agent_offline",
   "use-agent": "cello_use_agent",
+  "stop-using-agent": "cello_stop_using_agent",
   inbox: "cello_check_notifications",
   sessions: "cello_list_sessions",
   transcript: "cello_get_transcript",
@@ -312,17 +313,33 @@ export function startAgent(celloDir: string, name: string, opts: ParityOptions):
 }
 
 /**
- * `cello stop-agent <name>` → cello_stop_agent.
+ * `cello set-agent-offline <name>` → cello_set_agent_offline. (Was `set-agent-offline`, renamed because
+ * "stop" read as the opposite of `use-agent` when it is the opposite of `start-agent` — see the
+ * handler comment in agent-handlers.ts.)
  *
- * Also CLEARS the persisted selection when it names this agent (review F1). The daemon clears a
- * stopped agent from every connection's current-agent state; the CLI's durable mirror of that state
- * must follow, or the next command would try to act as an agent the operator just stopped.
+ * Also CLEARS the persisted selection when it names this agent (review F1). The daemon clears an
+ * offline agent from every connection's current-agent state; the CLI's durable mirror of that state
+ * must follow, or the next command would try to act as an agent the operator just took offline.
  */
-export async function stopAgent(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
-  const out = await ipcCommand(celloDir, IPC_METHODS["stop-agent"], { name }, opts, false);
+export async function setAgentOffline(celloDir: string, name: string, opts: ParityOptions): Promise<CliOutput> {
+  const out = await ipcCommand(celloDir, IPC_METHODS["set-agent-offline"], { name }, opts, false);
   if (out.exitCode === 0 && (await readCurrentAgent(celloDir)) === name) {
     await clearCurrentAgent(celloDir);
   }
+  return out;
+}
+
+/**
+ * `cello stop-using-agent` → cello_stop_using_agent. The opposite of `use-agent`.
+ *
+ * Clears the persisted selection unconditionally — the CLI's durable mirror IS the selection for a
+ * process that dies between invocations, so leaving the file behind would make the release a no-op
+ * from the next command's point of view: it would replay `cello_use_agent` and re-attend the agent
+ * the operator just released. Not agent-scoped (there is no agent to replay).
+ */
+export async function stopUsingAgent(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  const out = await ipcCommand(celloDir, IPC_METHODS["stop-using-agent"], {}, opts, false);
+  if (out.exitCode === 0) await clearCurrentAgent(celloDir);
   return out;
 }
 

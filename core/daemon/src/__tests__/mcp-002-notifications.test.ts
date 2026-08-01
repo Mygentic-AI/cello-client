@@ -3,7 +3,7 @@
  *
  * Specification understanding:
  * - AC-001: agent_state_changed broadcast to ALL connections on cello_start_agent
- * - AC-002: agent_state_changed broadcast to ALL connections on cello_stop_agent
+ * - AC-002: agent_state_changed broadcast to ALL connections on cello_set_agent_offline
  * - AC-003: agent_current_changed sent ONLY to triggering connection
  * - AC-004: session_state_changed sent to all connections where agent is current
  * - AC-005: session_state_changed NOT sent to connections with different current agent
@@ -136,8 +136,8 @@ describe("MCP-002: notification routing", () => {
     expect(stateB[0].data).toEqual(stateA[0].data);
   });
 
-  // ─── AC-002: agent_state_changed broadcast on cello_stop_agent ───
-  it("AC-002: both connections receive agent_state_changed on cello_stop_agent", async () => {
+  // ─── AC-002: agent_state_changed broadcast on cello_set_agent_offline ───
+  it("AC-002: both connections receive agent_state_changed on cello_set_agent_offline", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
 
@@ -152,7 +152,7 @@ describe("MCP-002: notification routing", () => {
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
 
-    await clientA.send("cello_stop_agent", { name: "alice" });
+    await clientA.send("cello_set_agent_offline", { name: "alice" });
     await waitForNotifications();
 
     const stateA = notifA.filter((n) => n.notification === "agent_state_changed");
@@ -500,7 +500,7 @@ describe("MCP-002: notification routing", () => {
     const client = await connect(config.socketPath);
 
     await client.send("cello_start_agent", { name: "alice" });
-    await client.send("cello_stop_agent", { name: "alice" });
+    await client.send("cello_set_agent_offline", { name: "alice" });
 
     const offlineEvent = logEvents.find((e) => e.event === "agent.offline");
     expect(offlineEvent).toBeDefined();
