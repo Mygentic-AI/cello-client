@@ -43,35 +43,6 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     await fx.cleanup();
   });
 
-  it("C1 (AC1): the session that lost the race is told a SIBLING took it — a machine-readable reason, not prose", async () => {
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-
-    await fx.ingestReceived("alice", SID, "from bob");
-
-    // A wins the race and DRAINS the shared buffer (today's behavior, unchanged by this line).
-    const won = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
-    expect(won.content).toBe("from bob");
-
-    // B polls an empty buffer and times out. Today it is told, verbatim, what a quiet counterparty
-    // produces. It must instead be told that a sibling connection consumed a message it never saw.
-    const lost = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(lost.ok).toBe(true);
-    expect(lost.content).toBeNull();
-
-    // THE DISCRIMINATOR. `reason` is the field this return already uses to discriminate its other
-    // branch (`counterparty_gone`), so a caller that switches on it needs no new shape.
-    expect(lost.reason).toBe("taken_by_sibling_session");
-    expect(lost.taken_by_sibling).toMatchObject({ count: 1, last_sequence: 0 });
-    expect((lost.taken_by_sibling as Record<string, unknown>).connections).toHaveLength(1);
-
-    // Prose is the PRESENTATION of the discriminator, so it must also differ — but the assertion
-    // above is what makes this a fix rather than a rewording.
-    expect(String(lost.guidance)).toMatch(/another|sibling|session/i);
-    expect(String(lost.guidance)).not.toMatch(/^No content arrived within timeout_ms/);
-  });
-
   it("C2 (AC1, the control): a genuinely quiet counterparty is UNCHANGED and stays distinguishable", async () => {
     await fx.createSession(SID, "alice");
     const connA = await fx.connectAs("alice");
@@ -84,42 +55,6 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     expect(quiet.reason).toBeUndefined();
     expect(quiet.taken_by_sibling).toBeUndefined();
     expect(String(quiet.guidance)).toMatch(/No content arrived within timeout_ms/);
-  });
-
-  it("C3 (AC3): the blocking receive logs on BOTH outcomes, and a theft is a WARN", async () => {
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-
-    await fx.ingestReceived("alice", SID, "from bob");
-    await connA.send("cello_receive", { session_id: SID, timeout_ms: 500 });
-    await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 });
-    // A third receive on a session with nothing outstanding — the plain empty outcome.
-    await connA.send("cello_receive", { session_id: SID, timeout_ms: 100 });
-
-    const delivered = fx.eventsNamed("session.receive.delivered");
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice", sequenceNumber: 0, attendance: 2 });
-    expect(delivered[0].ctx.connectionId).toBeTruthy();
-    expect(delivered[0].ctx.correlationId).toBeTruthy();
-
-    const stolen = fx.eventsNamed("session.receive.taken_by_sibling");
-    expect(stolen).toHaveLength(1);
-    // A theft is not routine bookkeeping — it must be findable at WARN, the level the operator greps.
-    expect(stolen[0].level).toBe("warn");
-    expect(stolen[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice", takenCount: 1, lastTakenSeq: 0, attendance: 2 });
-    // The taking connection is named, so the log ALONE reconstructs the race.
-    expect(Array.isArray(stolen[0].ctx.takenBy)).toBe(true);
-    expect((stolen[0].ctx.takenBy as string[])[0]).not.toBe(stolen[0].ctx.connectionId);
-
-    const empty = fx.eventsNamed("session.receive.empty");
-    expect(empty).toHaveLength(1);
-    expect(empty[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice", timeoutMs: 100 });
-
-    // INV-CONTENTFREE: none of the three carries the message or anything derived from it.
-    for (const e of [...delivered, ...stolen, ...empty]) {
-      expect(JSON.stringify(e.ctx)).not.toMatch(/from bob/);
-    }
   });
 
   it("C4 (AC2): the attendance count rides cello_use_agent, cello_status, and the arrival alert", async () => {
@@ -193,80 +128,42 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     expect(fx.eventsNamed("session.away.response.sent")).toHaveLength(0);
   });
 
-  it("C8 (review HIGH, the case C7 could not see): a FRESH connection after its predecessor died is told NOTHING ARRIVED — not that a sibling took it", async () => {
-    // C7 clears the discriminator from the SAME connection's point of view. It never asks what a
-    // NEW connection sees — and that is the `cello` CLI's only mode (a fresh process, therefore a
-    // fresh connection, per command) and every MCP reconnect's first mode.
-    //
-    // The take ledger is connection-scoped, and a fresh connection starts at cursor -1. Without
-    // pruning the ledger when a connection dies, every take the dead connection ever recorded sits
-    // above that bar and reads as a live sibling stealing mail: one operator, one window, a phantom
-    // thief, on every single command, forever. That is worse than the silence this line replaced —
-    // it teaches the operator to disbelieve the signal, so the REAL theft arrives wearing words
-    // they have learned to ignore.
+  // ─── SUPERSEDED BY DOD-COATTEND-1 (Tier 1), 2026-08-01 ────────────────────────────────────
+  //
+  // This file used to carry five clauses asserting that the loser of a race is TOLD a sibling took
+  // its message: the machine-readable discriminator, the WARN, the clearing behaviour, the
+  // fresh-connection case, and the both-true-with-counterparty-gone case.
+  //
+  // Tier 1 removed the theft. Delivery now reads a durable record against a per-connection
+  // bookmark, so both attached sessions receive the same message and nothing is taken from anyone.
+  // Those clauses asserted the VISIBILITY OF A DEFECT THAT NO LONGER OCCURS — keeping them would
+  // pin the defect, which is the opposite of what they were written for.
+  //
+  // What Tier 0 delivered and this file still guards: the attendance count on every surface, that
+  // attaching is never refused, that `isAttended`'s away decision did not move, and that a
+  // genuinely quiet counterparty still reads as quiet. The new behaviour is asserted on two real
+  // connections in m8d-coattend-1.test.ts.
+  //
+  // The `taken_by_sibling_session` discriminator itself is deliberately NOT deleted in this unit:
+  // deadness is proven by deletion plus a red build, never by "nothing reaches it today", and the
+  // drift and relay-degraded paths have not been re-examined against it. That is its own unit.
+  it("C10 (supersession): what WAS a theft is now a delivery — both sessions get the message", async () => {
     await fx.createSession(SID, "alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
 
-    const first = await fx.connectAs("alice");
     await fx.ingestReceived("alice", SID, "from bob");
-    const got = (await first.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
-    expect(got.content).toBe("from bob"); // it really did take it — the ledger has a real entry
-    first.close();
-    await new Promise((r) => setTimeout(r, 150)); // let the daemon observe the disconnect
 
-    const reconnected = await fx.connectAs("alice");
-    const answer = (await reconnected.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(answer.reason).toBeUndefined();
-    expect(answer.taken_by_sibling).toBeUndefined();
-    expect(String(answer.guidance)).toMatch(/No content arrived within timeout_ms/);
+    const a = (await connA.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+    const b = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 2_000 })) as Record<string, unknown>;
+
+    expect(a.content).toBe("from bob");
+    expect(b.content, "the second session is no longer robbed — that is Tier 1").toBe("from bob");
+    // ...and neither is told about a theft, because none happened.
+    expect(a.reason).toBeUndefined();
+    expect(b.reason).toBeUndefined();
     expect(fx.eventsNamed("session.receive.taken_by_sibling")).toHaveLength(0);
-  });
-
-  it("C9 (review MEDIUM): when a sibling took it AND the counterparty is gone, the TERMINAL condition names the reason", async () => {
-    // Both are true. `reason` is the machine-readable field, and a caller switching on it must
-    // still see `counterparty_gone` — it is the one that changes what the operator should DO
-    // (seal), whereas "read the transcript then reply" would send a reply to a connection that is
-    // dead. The theft is additive, so it survives as a field and in the guidance; nothing is lost.
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-
-    await fx.ingestReceived("alice", SID, "from bob");
-    await connA.send("cello_receive", { session_id: SID, timeout_ms: 500 });
-    fx.snm.markSessionLivenessForTest("alice", SID, "gone");
-
-    const answer = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(answer.reason).toBe("counterparty_gone");
-    expect(answer.liveness).toBe("gone");
-    // ...and the theft is still reported, in both machine-readable and human form.
-    expect(answer.taken_by_sibling).toMatchObject({ count: 1, last_sequence: 0 });
-    expect(String(answer.guidance)).toMatch(/already received 1 message/);
-    // Substance, not spelling: DOD-ONBOARD-HELP-1 renders the remedy per surface at the IPC
-    // boundary, so a CLI-shaped caller is told `cello close-session`. Both renderings are locked
-    // end-to-end in dod-onboard-help-1-vocabulary.test.ts; pinning one here would pin the wrong
-    // one for half the callers.
-    expect(String(answer.guidance)).toMatch(/close.?session/i);
-    expect(String(answer.guidance)).toMatch(/transcript/);
-    // The warn still fires — the theft must not stop being greppable because the peer also died.
-    expect(fx.eventsNamed("session.receive.taken_by_sibling")).toHaveLength(1);
-  });
-
-  it("C7: the discriminator reports UNSEEN content — it clears once the loser catches up", async () => {
-    await fx.createSession(SID, "alice");
-    const connA = await fx.connectAs("alice");
-    const connB = await fx.connectAs("alice");
-
-    await fx.ingestReceived("alice", SID, "from bob");
-    await connA.send("cello_receive", { session_id: SID, timeout_ms: 500 });
-
-    const lost = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(lost.reason).toBe("taken_by_sibling_session");
-
-    // B catches up through the documented door. The content is no longer unseen by B, so a second
-    // empty receive is now a genuinely quiet counterparty — and must say so.
-    await connB.send("cello_get_transcript", { session_id: SID });
-
-    const quietNow = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
-    expect(quietNow.reason).toBeUndefined();
-    expect(String(quietNow.guidance)).toMatch(/No content arrived within timeout_ms/);
+    // Tier 0's logging is what survives, and it still fires for both readers.
+    expect(fx.eventsNamed("session.receive.delivered").length).toBeGreaterThanOrEqual(2);
   });
 });

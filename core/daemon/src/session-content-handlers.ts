@@ -436,8 +436,62 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // over a handful of entries; there is nothing to save by caching it.
 
     for (;;) {
-      // 1) Deliverable content wins — drain one buffered message per call (FIFO).
-      const entry = sessionNodeManager.takeReceivedContent(agentName, sessionId);
+      // TERMINAL FIRST (DOD-COATTEND-1). Reading the DURABLE RECORD means a sealed session's rows
+      // are still present, so a content read would keep delivering on a session that has already
+      // terminated — and F1-b's `session_sealed` answer would never be reached. Under the old
+      // destructive queue this ordering did not matter, because the seal EVICTED the buffer and the
+      // read found nothing. It matters now, so the terminal answer is checked before the record.
+      //
+      // F1-b: the session sealed while we were (or before we started) waiting — return the
+      //    terminal answer instead of hanging to timeout. unread_count reports messages that
+      //    were evicted unread (still durable — recoverable via cello_get_transcript).
+      const terminal = sessionNodeManager.peekTerminalMarker(agentName, sessionId);
+      if (terminal) {
+        const sealedRoot = sessionNodeManager.getSealedRootHex(agentName, sessionId);
+        // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
+        // same silent handler, and leaving it silent would reproduce the defect one branch over.
+        logger.info("session.receive.sealed", {
+          sessionId, agentName, connectionId, attendance: attendanceCount(agentName),
+          unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
+        });
+        return {
+          ok: true,
+          type: "session_sealed",
+          session_id: sessionId,
+          ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
+          unread_count: terminal.unreadCount,
+          guidance: terminal.unreadCount > 0
+            ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
+            : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
+        };
+      }
+      // ─── DOD-COATTEND-1: read the DURABLE RECORD against THIS connection's bookmark ───
+      //
+      // This used to be `takeReceivedContent`, a `buf.shift()` on a buffer keyed
+      // (agentName, sessionId) and NOT by connection. The doorbell is multicast, so two attached
+      // sessions were both woken, both entered this loop, and whichever hit the next 20 ms tick
+      // first REMOVED the message from the other's view — which was then told, word for word, what
+      // a quiet counterparty produces.
+      //
+      // Now: the transcript is the source of truth and each connection has its own cursor, so
+      // reading is non-destructive by construction. Nothing one consumer does mutates state another
+      // consumer reads — which is exactly what `shift()` violated. The doorbell STAYS multicast
+      // (AC 2); the queue was the defect, not the wake-up.
+      //
+      // Ordering is safe: `#appendVerifiedContent` writes the transcript row (`:3996`) BEFORE it
+      // pushes to the buffer (`:4003`), so the record can never lag the queue this replaces.
+      const cursorNow = getConnectionCursor(connectionId, sessionId);
+      const nextRow = record
+        ? sessionNodeManager.readTranscript(agentName, sessionId).messages
+          .find((m) => m.direction === "received" && m.sequence > cursorNow)
+        : undefined;
+      const entry = nextRow
+        ? {
+          contentHex: Buffer.from(nextRow.text, "utf8").toString("hex"),
+          senderPubkey: record!.counterparty_pubkey,
+          sequenceNumber: nextRow.sequence,
+        }
+        : null;
       if (entry) {
         // M8C-INBOX-1 (N3): delivery marks read — advance the persisted read watermark so this
         // message no longer counts as unread in cello_check_notifications. Monotonic (never lowers).
@@ -472,29 +526,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           sequence_number: entry.sequenceNumber,
           senderPubkey: entry.senderPubkey,
           ...(signalGuidance !== undefined ? { guidance: signalGuidance } : {}),
-        };
-      }
-      // 2) F1-b: the session sealed while we were (or before we started) waiting — return the
-      //    terminal answer instead of hanging to timeout. unread_count reports messages that
-      //    were evicted unread (still durable — recoverable via cello_get_transcript).
-      const terminal = sessionNodeManager.peekTerminalMarker(agentName, sessionId);
-      if (terminal) {
-        const sealedRoot = sessionNodeManager.getSealedRootHex(agentName, sessionId);
-        // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
-        // same silent handler, and leaving it silent would reproduce the defect one branch over.
-        logger.info("session.receive.sealed", {
-          sessionId, agentName, connectionId, attendance: attendanceCount(agentName),
-          unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
-        });
-        return {
-          ok: true,
-          type: "session_sealed",
-          session_id: sessionId,
-          ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
-          unread_count: terminal.unreadCount,
-          guidance: terminal.unreadCount > 0
-            ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
-            : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
         };
       }
       // 3) Out of time — non-blocking-equivalent empty answer.

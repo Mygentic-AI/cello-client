@@ -146,7 +146,18 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     expect(msgs.map((m) => m.sequence)).toEqual([1, 2]); // seq > 0 (msg 0 excluded)
   });
 
-  it("S4: cello_receive WITHOUT since_seq is unchanged (drains live buffer / times out, no batch)", async () => {
+  // ─── S4, REWRITTEN BY DOD-COATTEND-1 (Tier 1), 2026-08-01 ───────────────────────────────────
+  //
+  // This clause used to assert that a plain receive must NOT return a transcript row that was never
+  // in the live buffer. That was true of the destructive queue, and Tier 1 deliberately changed it:
+  // delivery now reads the DURABLE RECORD against a per-connection bookmark, precisely so a message
+  // is not lost when the buffer is drained by a sibling session or dies with a connection.
+  //
+  // So the clause is inverted rather than deleted — the transcript row IS now deliverable — and
+  // what it still guards is the half that did not change: a plain receive returns ONE message in
+  // the single-message shape, never the `since_seq` batch shape. Conflating those would break every
+  // caller that switches on `messages` vs `content`.
+  it("S4 (Tier 1): a plain receive DOES deliver a durable row, and still never returns the batch shape", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
@@ -156,12 +167,14 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     insertSessionRow("alice", s, "cp");
     seed("alice", s, 0, "received", "in transcript but not in the live buffer");
 
-    // No since_seq → the classic drain-or-timeout path: nothing buffered → a null-content timeout,
-    // NOT the since_seq batch (the transcript row must NOT be returned by a plain receive).
     const res = (await client.send("cello_receive", { session_id: s, timeout_ms: 200 })) as R;
     expect(res["ok"]).toBe(true);
-    expect(res).not.toHaveProperty("messages"); // no batch shape
-    expect(res["content"]).toBeNull();
+    // The durable row is delivered — this is the Tier-1 change, and it is what stops a message
+    // being lost when a sibling drains the buffer or the reading connection dies.
+    expect(res["content"]).toBe("in transcript but not in the live buffer");
+    // ...in the SINGLE-message shape. The since_seq batch shape is a different contract and callers
+    // switch on it, so a plain receive must never return `messages`.
+    expect(res).not.toHaveProperty("messages");
   });
 
   // ─── DOD-UNREAD-1 D4b (M8C-PHANTOM-SESSION-FIX-PLAN §4, reader for legacy residue) ──────────
