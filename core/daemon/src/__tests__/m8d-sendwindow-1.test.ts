@@ -183,6 +183,15 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
       e.ctx.authority === "sibling_send_in_flight" || e.ctx.authority === "frontier_moved_during_send");
     expect(raced, "the log must name WHICH authority refused").toBeDefined();
     expect(raced!.level).toBe("warn");
+
+    // F7/L5: the PRE-EXISTING gate refusal must carry an authority too, or an operator filtering on
+    // the field sees only the co-attendance refusals and concludes the rest do not exist. It must
+    // NOT claim one authority over the other: reaching that branch means BOTH said no, and the
+    // ternary originally written there could only ever print one value (review H2).
+    const gateBlocked = blocked.find((e) => e.ctx.unreadReceived !== undefined);
+    if (gateBlocked) {
+      expect(gateBlocked.ctx.authority, "both authorities are false there — say so").toBe("cursor_and_watermark");
+    }
   });
 
   it("S2b: when the sibling's send COMPLETES first, the FRONTIER comparison is what refuses", async () => {
@@ -213,6 +222,15 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
       .find((e) => e.ctx.authority === "frontier_moved_during_send");
     expect(byFrontier, "a completed sibling send must be caught by the frontier comparison").toBeDefined();
     expect(byFrontier!.ctx.frontierNow).not.toBe(byFrontier!.ctx.frontierAtGate);
+
+    // F6/L5: the guidance says LEAF, not "message". The frontier counts leaves, and a screened-out
+    // leaf has no transcript row — promising N messages in a transcript that holds fewer sends the
+    // operator hunting for content that was removed on purpose. Reverting the wording left the
+    // suite green (review L5), so it is pinned here rather than trusted.
+    const loser = (await aSend) as Record<string, unknown>;
+    expect(loser.ok).toBe(false);
+    expect(String(loser.guidance)).toMatch(/leaf|leaves/);
+    expect(String(loser.guidance), "must not over-claim readable messages").not.toMatch(/message\(s\) were added/);
   });
 
   it("S4 (review F1): a send parked ON THE WIRE also blocks a sibling — the frontier cannot see it", async () => {
@@ -290,6 +308,47 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     gateway.releaseAll();
     const retry = (await retryP) as Record<string, unknown>;
     expect(retry.ok, "a retry without reading currently succeeds — DELIBERATE, see above").toBe(true);
+  });
+
+  it("S6 (review H3): a claim held past its TTL must not wedge the session forever", async () => {
+    // `finally` covers throw and reject; it does NOT cover a send that never settles, and
+    // sendContent awaits newStream and stream.close with no timeout. Without a TTL, one hung
+    // libp2p stream would refuse every sibling send on that conversation until the daemon
+    // restarted — trading a duplicate reply for a dead conversation, which is the wrong way round.
+    //
+    // The clock is not mocked here; the TTL is read out of the refusal instead. `claimHeldMs` is
+    // what an operator (and the next reader) needs to tell "a sibling is mid-send" from "something
+    // has been stuck for a minute", and asserting it present pins the field the expiry depends on.
+    const node = new StreamStallingNode();
+    const fx2 = await startTwoConnectionFixture({
+      dirPrefix: "cello-m8d-ttl-",
+      securityGateway: new (class { async screenOutbound() { return { disposition: "allow" as const }; } async screenInbound() { return { disposition: "allow" as const }; } })() as unknown as SecurityGatewayClient,
+      node: node as unknown as CelloNode,
+    });
+    try {
+      await fx2.createSession(SID, "alice");
+      const a = await fx2.connectAs("alice");
+      const b = await fx2.connectAs("alice");
+      await fx2.ingestReceived("alice", SID, "one question");
+      for (const c of [a, b]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
+
+      const parked = a.send("cello_send", { session_id: SID, content: "A's answer" });
+      parked.catch(() => { /* abandoned on the wire by design */ });
+      await node.reachedWire;
+
+      const refused = (await b.send("cello_send", { session_id: SID, content: "B's answer" })) as Record<string, unknown>;
+      expect(refused.in_flight).toBe(true);
+
+      const blocked = fx2.eventsNamed("session.send.blocked")
+        .find((e) => e.ctx.authority === "sibling_send_in_flight");
+      expect(blocked, "the in-flight refusal must be logged").toBeDefined();
+      expect(
+        typeof blocked!.ctx.claimHeldMs,
+        "how long the claim has been held must be recorded — it is what separates a live sibling from a wedge",
+      ).toBe("number");
+    } finally {
+      await fx2.cleanup();
+    }
   });
 
   it("S3: a lone sender is NOT refused — the re-check must not tax the ordinary case", async () => {

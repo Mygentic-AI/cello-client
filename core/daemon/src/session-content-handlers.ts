@@ -82,7 +82,22 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
    * Keyed (agent, session): the race is two connections replying into ONE conversation. Held in the
    * factory closure, which runs once per daemon, so it is exactly as long-lived as the handler set.
    */
-  const sendInFlight = new Set<string>();
+  const sendInFlight = new Map<string, number>();
+  /**
+   * How long a claim is honored before a sibling may proceed anyway (review H3).
+   *
+   * `finally` covers throw and reject. It does NOT cover a promise that NEVER SETTLES, and
+   * `sendContent` awaits `node.newStream` and `stream.close` with no timeout or abort signal —
+   * only the relay submit is bounded. Before the claim existed, a hung libp2p stream hung ONE
+   * call; with an unbounded claim it would refuse every sibling send on that conversation until
+   * the daemon restarted, behind guidance that says "wait a moment" forever. Trading a permanent
+   * outage for a small chance of the duplicate this line prevents is the wrong way round: the
+   * defect is a bad conversation, the wedge is a dead one.
+   *
+   * Generous relative to the honest worst case (~30 s of bounded relay retries plus an unbounded
+   * stream tail), so it expires hangs rather than races.
+   */
+  const SEND_CLAIM_TTL_MS = 60_000;
 
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
   handlers.set("cello_send", async (params, connectionId) => {
@@ -157,11 +172,15 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         unreadReceived,
         connectionId,
         agentName,
-        // AC2 asks the event to NAME the authority that refused. The two co-attendance refusals
-        // below carry one; without it here an operator filtering on `authority` would see only
-        // some of the refusals and conclude the rest do not exist (review F7). Both authorities
-        // must be false to reach this branch, so the label reports which bar is the binding one.
-        authority: connectionCursor >= currentSeq ? "connection_cursor" : "unread_watermark",
+        // AC2 asks the event to NAME the authority that refused (review F7). Reaching this branch
+        // means BOTH authorities said no — the gate passes if EITHER is satisfied — so there is no
+        // "binding one" to report and the ternary I first wrote here was dead: `connectionCursor <
+        // currentSeq` is always true at this point, so it could only ever print `unread_watermark`,
+        // and an operator filtering for `connection_cursor` would get zero hits forever and
+        // conclude cursor refusals do not exist. That is the defect F7 was raised to fix, rebuilt
+        // (review H2). The true statement is that both are false; `lastReadSeq` and
+        // `unreadReceived` above already carry which is how far off.
+        authority: "cursor_and_watermark",
       });
       return {
         ok: false,
@@ -301,19 +320,24 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // answer: "did the session move under me while I was gone?"
     const frontierNow = sessionNodeManager.getSessionTree(agentName, sessionId).size();
     const inFlightKey = `${agentName}\u0000${sessionId}`;
-    if (sendInFlight.has(inFlightKey)) {
+    const claimedAt = sendInFlight.get(inFlightKey);
+    if (claimedAt !== undefined && Date.now() - claimedAt < SEND_CLAIM_TTL_MS) {
       // A sibling is between its own frontier check and its append RIGHT NOW. Its leaf does not
       // exist yet, so the comparison below cannot see it — this is the half of the window a
       // frontier check structurally cannot cover, whatever it is compared against.
       logger.warn("session.send.blocked", {
         sessionId, agentName, connectionId, correlationId,
         authority: "sibling_send_in_flight",
+        claimHeldMs: Date.now() - claimedAt,
       });
       return {
         ok: false,
         reason: "session_moved_under_send",
         in_flight: true,
-        guidance: `Another session on this agent is sending a reply into this conversation right now, so nothing was sent. Wait a moment, then read what they said with cello_transcript ${sessionId} before deciding whether your reply still applies. Do not simply resend: they may have already answered.`,
+        // Says "may have sent" (review L4): the in-flight send can still fail and be queued for
+        // retry, in which case nothing was said and there is nothing to read. Promising the operator
+        // a reply that does not exist sends them to an unchanged transcript to look for it.
+        guidance: `Another session on this agent is sending into this conversation right now, so nothing was sent. Wait a moment, then check cello_transcript ${sessionId} — they may have already answered — before deciding whether your reply still applies. Do not simply resend.`,
       };
     }
     if (frontierNow !== frontierAtGate) {
@@ -343,7 +367,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // moved (append happened → its own frontier comparison catches it) or the send failed and
     // nothing was committed (→ it is free to try). `finally` rather than a plain call so a throw
     // cannot wedge the session into permanent refusal.
-    sendInFlight.add(inFlightKey);
+    sendInFlight.set(inFlightKey, Date.now());
     let sendResult: Awaited<ReturnType<typeof sessionNodeManager.sendContent>>;
     try {
       sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId);
@@ -510,16 +534,30 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         //     could read, reported as read. That is precisely what CATCHUP AC3 forbids of a
         //     catch-up path, on the door that was NOT chosen, which is why it survived this long.
         //
-        //     The walk is seeded at `sinceSeq`, NOT at the stored watermark, and that distinction is
-        //     the contract: `since_seq: N` is the CALLER ASSERTING it already holds through N, so
-        //     rows at or below N are the caller's claim and must not block the advance. Seeding at
-        //     the stored watermark instead makes an ordinary catch-up stop dead at the first row the
-        //     caller skipped — caught by M8C-SINCESEQ-1 S1/S2/S3, which is exactly what that clause
-        //     is for. What the walk still refuses is a hole INSIDE the delivered batch, which is
-        //     where the undecryptable row lives, and that is the whole of F8.
+        //     TWO THINGS THE WALK MUST GET RIGHT, and I got the second one wrong first (review H1).
+        //
+        //     (a) SEEDED AT `sinceSeq`, not at the stored watermark. `since_seq: N` is the CALLER
+        //         ASSERTING it already holds through N, so rows at or below N are its claim and must
+        //         not block the advance. Seeding at the watermark makes ordinary catch-up stop dead
+        //         at the first row the caller skipped — M8C-SINCESEQ-1 S1/S2/S3 caught that.
+        //
+        //     (b) CONTIGUOUS OVER **BOTH DIRECTIONS**, not over the received-only batch. Leaf
+        //         indices are contiguous across both directions, so a SENT leaf — this agent's own
+        //         reply, or a sibling connection's — is a hole in any received-only set. Walking
+        //         `received` therefore stopped on the most ordinary event in the protocol, and
+        //         reading everything no longer cleared unread: the badge could not be cleared, and
+        //         a stateless CLI caller was refused forever through the very door the guidance
+        //         points at. That is CATCHUP §3b's own defect — a rule satisfiable only through a
+        //         door the caller is not pointed at — reintroduced on the watermark.
+        //
+        //     The same received-only-view mistake as DOD-COATTEND-1 review F1, made a second time
+        //     one file over: `daemon.ts` already says "every sibling send is a hole" in as many
+        //     words. `cello_get_transcript` gets this right by walking both directions; so does this
+        //     now. What still stops the walk is a genuinely absent index — an undecryptable row or a
+        //     screened-out leaf, which have no transcript row at all and ARE unread.
         let frontier = sinceSeq;
-        const deliveredSeqs = new Set(received.map((m) => m.sequence));
-        while (deliveredSeqs.has(frontier + 1)) frontier += 1;
+        const presentSeqs = new Set(messages.map((m) => m.sequence));
+        while (presentSeqs.has(frontier + 1)) frontier += 1;
         sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, frontier); // MONOTONIC — takes MAX
         clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
       }

@@ -144,6 +144,39 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     ).toBeDefined();
   });
 
+  it("H1 (review): a SENT leaf in the range must NOT stop the watermark — reading everything clears unread", async () => {
+    // The regression the first H1 fix introduced, and the reason this clause exists rather than a
+    // comment. The walk was contiguous over the RECEIVED-only batch, and leaf indices are
+    // contiguous across BOTH directions — so this agent's own reply, or a sibling connection's, is
+    // a hole. Reading everything then left the session still reporting unread: the badge could not
+    // be cleared, and a stateless CLI caller (fresh connection per command, so the cursor authority
+    // can never help it) was refused forever through the very door the guidance points at.
+    //
+    // This is the M8D co-attendance shape: received, sibling's SENT, received.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "e".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    seed("alice", s, 0, "received", "theirs");
+    seed("alice", s, 1, "sent", "our reply from another window");
+    seed("alice", s, 2, "received", "theirs again");
+
+    const res = (await client.send("cello_receive", { session_id: s, since_seq: -1 })) as R;
+    expect(res["ok"]).toBe(true);
+    expect((res["messages"] as Array<{ sequence: number }>).map((m) => m.sequence)).toEqual([0, 2]);
+
+    // Everything readable has been read, so nothing may still be reported unread.
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    const agents = inbox["agents"] as Array<{ agent: string; unread: Array<{ session_id: string }> }> | undefined;
+    expect(
+      agents?.[0]?.unread.find((u) => u.session_id === s),
+      "a SENT leaf is not an unread message — it must not pin the watermark",
+    ).toBeUndefined();
+  });
+
   it("S1: since_seq at the latest sequence returns an empty batch (not an error)", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
