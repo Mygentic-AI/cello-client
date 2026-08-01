@@ -1060,6 +1060,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "Get or set how reachable an agent is (limits per trust tier, away messages).",
     help:
       "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]\n" +
+      "       cello settings clear <key> [--agent <name>]  — unset it; the built-in default applies again\n" +
       "  Per-agent reachability policy (DOD-SETTINGS-1). Keys: bounds.<tier>.max_sessions, bounds.<tier>.max_bytes\n" +
       "  (tier = unknown|known|whitelisted|vip; a finite positive integer), away.default, away.tier.<tier> (away text).\n" +
       "  An unset key uses the built-in default. Example:  cello settings set bounds.known.max_sessions 8 --agent alice",
@@ -1073,8 +1074,15 @@ export const COMMANDS: readonly CommandSpec[] = [
       if (sub === "set" && key && value !== undefined) {
         return settingsSet(ctx.celloDir, key, value, opts);
       }
+      // `clear` mirrors `cello moniker clear` — the established verb for putting a setting back to
+      // its built-in default. There is deliberately no second way to do this: `set <key> ""` stays
+      // refused, because an empty away text is a VALUE that wins the resolution walk and blanks the
+      // reply, which is not what "remove my away message" means.
+      if (sub === "clear" && key) {
+        return settingsSet(ctx.celloDir, key, null, opts);
+      }
       return {
-        stdout: "Usage: cello settings get [key] [--agent <name>] | cello settings set <key> <value> [--agent <name>]",
+        stdout: "Usage: cello settings get [key] | cello settings set <key> <value> | cello settings clear <key>  [--agent <name>]",
         stderr: "",
         exitCode: 1,
       };

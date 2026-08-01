@@ -283,12 +283,42 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
   handlers.set("cello_settings_set", async (params, connectionId) => {
     const key = typeof params?.key === "string" ? params.key : undefined;
     const rawValue = params?.value;
+    // NULL CLEARS THE SETTING, matching cello_contact_set_away, which has always taken
+    // `string | null`. This handler's own guidance told callers to "pass null to clear" while
+    // coercing null to undefined and rejecting it as missing_params — so there was NO way to unset a
+    // setting from either surface. A caller following that advice from the CLI stored the literal
+    // text "null", which for an away message meant the agent greeted every caller with "null".
+    const isClear = rawValue === null;
     const value = typeof rawValue === "string" ? rawValue : typeof rawValue === "number" ? String(rawValue) : undefined;
-    if (!key || value === undefined) {
-      return { ok: false, reason: "missing_params", guidance: `Provide 'key' and 'value' (string or number). Valid keys: ${allSettingKeys().join(", ")}` };
+    if (!key || (value === undefined && !isClear)) {
+      return { ok: false, reason: "missing_params", guidance: `Provide 'key' and 'value' (string or number), or value null to clear the setting. Valid keys: ${allSettingKeys().join(", ")}` };
     }
     if (!isValidSettingKey(key)) {
       return { ok: false, reason: "invalid_key", guidance: `Unknown setting key '${key}'. Valid keys: ${allSettingKeys().join(", ")}` };
+    }
+    if (isClear) {
+      // Reported honestly: `cleared` says whether a row actually went away, so clearing an already
+      // unset key reads as the no-op it is instead of implying something was removed.
+      const resolvedClear = resolveContactAgent(getConnState(connectionId), params);
+      if (!resolvedClear.ok) return resolvedClear;
+      const removed = sessionNodeManager.deleteSetting(resolvedClear.agent, key);
+      logger.info("setting.cleared", { agentName: resolvedClear.agent, key, removed });
+      return {
+        ok: true,
+        agent: resolvedClear.agent,
+        key,
+        value: null,
+        cleared: removed,
+        guidance: removed
+          ? `'${key}' is unset — the built-in default applies again.`
+          : `'${key}' was already unset; nothing to clear. The built-in default applies.`,
+      };
+    }
+    // Past the clear branch, so this is a real set. The guard above already rejected an undefined
+    // value on this path; re-check rather than assert, so a future edit to that guard cannot let an
+    // undefined reach setSetting behind a cast that silently agreed with it.
+    if (value === undefined) {
+      return { ok: false, reason: "missing_params", guidance: `Provide 'value' (string or number), or null to clear. Valid keys: ${allSettingKeys().join(", ")}` };
     }
     // DOD-TIER-BOUNDS-SETTINGS AC2: a bound value must be a finite positive integer (INV-TIER-BOUND —
     // a setting cannot REMOVE a bound). Away-text values are free-form.

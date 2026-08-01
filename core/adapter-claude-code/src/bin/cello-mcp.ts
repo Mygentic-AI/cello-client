@@ -355,9 +355,9 @@ server.tool("cello_settings_get", "Read a per-agent reachability-policy setting 
   return jsonText(result);
 });
 
-server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. A bound override (bounds.<tier>.max_sessions / max_bytes; tier = unknown|known|whitelisted|vip) must be a FINITE POSITIVE INTEGER — a higher value raises the bound, never removes it (Infinity/negative/0 are refused). An away text (away.default, away.tier.<tier>) is the message a sender at that tier gets when you're away. Unknown keys are refused. Defaults to the current agent.", {
+server.tool("cello_settings_set", "Set a per-agent reachability-policy setting. A bound override (bounds.<tier>.max_sessions / max_bytes; tier = unknown|known|whitelisted|vip) must be a FINITE POSITIVE INTEGER — a higher value raises the bound, never removes it (Infinity/negative/0 are refused). An away text (away.default, away.tier.<tier>) is the message a sender at that tier gets when you're away. Pass value null to CLEAR a setting (the built-in default applies again) — an empty string is refused, because a blank away text is a value that wins the resolution walk rather than an absence. Unknown keys are refused. Defaults to the current agent.", {
   key: z.string().describe("The setting key (see the list in cello_settings_get)"),
-  value: z.union([z.string(), z.number()]).describe("The value — an integer for a bound, a text for an away message"),
+  value: z.union([z.string(), z.number(), z.null()]).describe("The value — an integer for a bound, a text for an away message, or NULL to clear the setting so the built-in default applies again"),
   agent: z.string().optional().describe("Agent whose setting to write (defaults to the current agent)"),
 }, async ({ key, value, agent }) => {
   const result = await proxy.call("cello_settings_set", agent ? { key, value, agent } : { key, value });

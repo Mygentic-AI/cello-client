@@ -483,7 +483,11 @@ export function settingsGet(celloDir: string, key: string | undefined, opts: Par
 
 /** `cello settings set <key> <value>` → cello_settings_set. The DAEMON validates the key and, for
  *  bound keys, that the value is a finite positive integer; the CLI surfaces its verdict verbatim. */
-export function settingsSet(celloDir: string, key: string, value: string, opts: ParityOptions): Promise<CliOutput> {
+export function settingsSet(celloDir: string, key: string, value: string | null, opts: ParityOptions): Promise<CliOutput> {
+  // `value: null` CLEARS the setting (`cello settings clear <key>`), the same shape
+  // cello_contact_set_away has always taken. Sent explicitly rather than as an omitted field: the
+  // handler distinguishes "clear this" from "you forgot the value", and an absent key would read as
+  // the latter.
   return ipcCommand(celloDir, IPC_METHODS["settings-set"], { key, value }, opts);
 }
 

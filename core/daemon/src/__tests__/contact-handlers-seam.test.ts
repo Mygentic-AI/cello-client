@@ -43,6 +43,8 @@ function makeStubStore() {
     getSetting: vi.fn(() => null),
     getAllSettings: vi.fn(() => []),
     setSetting: vi.fn(),
+    // Returns true = "a row was removed", the shape the handler reports as `cleared`.
+    deleteSetting: vi.fn().mockReturnValue(true),
     setTelegramSettings: vi.fn(),
   };
 }
@@ -103,6 +105,9 @@ describe("the address book runs with NO daemon — the seam is real", () => {
     ["cello_contact_list", {}],
     ["cello_settings_get", {}],
     ["cello_settings_set", { key: "away.default", value: "back later" }],
+    // The CLEAR shape must survive the same seam: `value: null` is a real request, not a
+    // missing parameter, and it takes a different branch (deleteSetting) than the set path.
+    ["cello_settings_set", { key: "away.default", value: null }],
     ["cello_set_moniker", { moniker: "alice" }],
     ["cello_telegram_set_token", { bot_token: "123:abc", allowlisted_chat_id: "42" }],
   ];

@@ -1563,6 +1563,32 @@ export class SessionNodeManager {
     return row?.value ?? null;
   }
 
+  /**
+   * DOD-SETTINGS-1: DELETE a per-agent setting so the built-in default applies again.
+   *
+   * Deleting is NOT storing "". `getSetting` returns null for both, but the away-text resolver walks
+   * per-contact → per-tier → agent-default → system default, and an empty string is a VALUE that
+   * wins that walk and blanks the reply. Unsetting is the only way back to the default, and until
+   * this existed there was no way back at all: `cello_settings_set` accepted a string, refused an
+   * empty one, and told the caller to "pass null to clear" — a null it coerced to undefined and
+   * rejected as missing_params. Following that guidance from the CLI set the literal text "null",
+   * so an operator trying to remove their away message ended up broadcasting the word "null" to
+   * every caller.
+   *
+   * Returns whether a row was actually removed, so the handler can report what it did rather than
+   * claiming a clear it never performed.
+   */
+  deleteSetting(agentName: string, key: string): boolean {
+    if (!this.#db) throw new Error(`deleteSetting('${agentName}'): database not initialized`);
+    // Same dual-layer key check as setSetting — an unknown key here means a caller hand-typed one,
+    // and silently reporting "cleared" for a key that never existed would be the same class of lie.
+    if (!isValidSettingKey(key)) throw new Error(`invalid_key: '${key}' is not a known setting`);
+    const res = this.#db
+      .prepare("DELETE FROM agent_settings WHERE agent_id = ? AND key = ?")
+      .run(this.#requireAgentId(agentName), key);
+    return res.changes > 0;
+  }
+
   /** DOD-SETTINGS-1: write a per-agent setting (upsert). Key VALIDATION is the handler's boundary
    *  (isValidSettingKey); value validation for typed settings (finite bounds, etc.) belongs to the
    *  specific consumer. Throws on a missing DB — a write that silently no-ops would be a lie. */

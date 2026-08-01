@@ -110,4 +110,46 @@ describe("DOD-SETTINGS-1 — the per-agent store", () => {
   it("F2: setSetting has a store-level backstop — an unknown key can never be persisted", () => {
     expect(() => mgr.setSetting("alice", "bogus.key", "x")).toThrow(/invalid_key/);
   });
+
+  // ─── DOD-SETTINGS-CLEAR-1: a set setting can be UNSET ───
+  //
+  // Found by testing the away path live. `cello_settings_set` refused an empty away text with the
+  // guidance "omit the key or pass null to clear" — while coercing null to undefined and rejecting
+  // it as missing_params. So there was no way to unset a setting from any surface, and a caller
+  // following that guidance from the CLI stored the literal text "null": the agent then greeted
+  // every caller with "null" as its away message.
+
+  it("deleteSetting unsets the key so the built-in default applies again", () => {
+    mgr.setSetting("alice", AWAY_DEFAULT_KEY, "Back Monday.");
+    expect(mgr.getSetting("alice", AWAY_DEFAULT_KEY)).toBe("Back Monday.");
+
+    expect(mgr.deleteSetting("alice", AWAY_DEFAULT_KEY)).toBe(true);
+    expect(mgr.getSetting("alice", AWAY_DEFAULT_KEY)).toBeNull();
+  });
+
+  it("deleteSetting reports FALSE when there was nothing to clear", () => {
+    // The handler surfaces this as `cleared: false` — clearing an already-unset key must read as the
+    // no-op it is, not imply something was removed.
+    expect(mgr.deleteSetting("alice", AWAY_DEFAULT_KEY)).toBe(false);
+  });
+
+  it("clearing is NOT the same as storing an empty string", () => {
+    // The distinction the bug turned on. getSetting returns null for an absent row, but an empty
+    // string is a VALUE: it wins the per-contact → per-tier → agent-default → system-default walk
+    // and blanks the away reply entirely. Unsetting is the only route back to the default, which is
+    // why `set <key> ""` stays refused and `clear` exists instead.
+    mgr.setSetting("alice", AWAY_DEFAULT_KEY, "");
+    expect(mgr.getSetting("alice", AWAY_DEFAULT_KEY)).toBe(""); // a value, not an absence
+    mgr.deleteSetting("alice", AWAY_DEFAULT_KEY);
+    expect(mgr.getSetting("alice", AWAY_DEFAULT_KEY)).toBeNull(); // now genuinely absent
+  });
+
+  it("deleteSetting has the same store-level key backstop as setSetting", () => {
+    expect(() => mgr.deleteSetting("alice", "bogus.key")).toThrow(/invalid_key/);
+  });
+
+  it("deleteSetting fails closed on an uninitialized DB", () => {
+    const bare = new SessionNodeManager({ securityGateway: new PassthroughGatewayClient(), factory: new StubNodeFactory(), logger: silent, dbPath: "/nonexistent/unused.db" });
+    expect(() => bare.deleteSetting("alice", AWAY_DEFAULT_KEY)).toThrow(/not initialized/);
+  });
 });
