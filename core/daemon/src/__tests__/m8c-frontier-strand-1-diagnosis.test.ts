@@ -24,6 +24,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { createInboundSealRequestHandler } from "../inbound-seal-request.js";
+import { renderSealRejection } from "../seal-flows.js";
 
 const SID = "ef".repeat(32);
 
@@ -136,5 +137,46 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
     expect(rejection.responder_leaf_count).toBe(1);
     expect(rejection.initiator_leaf_count).toBe(4);
     expect(rejection.diverging_leaf_index).toBe(1); // min(1, 4) — the shorter side stops here
+  });
+
+  // ─── AC2's actual clause: the message the INITIATOR shows the operator ────────────────────
+  //
+  // F1/F2/F3 above cover the responder's FRAME. AC2 is worded about the initiator's MESSAGE, and
+  // that had no test at all (review) — reverting all of seal-flows.ts left everything green.
+  describe("the operator-visible rejection (AC2's literal clause)", () => {
+    const SID_HEX = "dbb93dfcf415b7cbfe13626f5b168a3f";
+
+    it("F4: with the frontier numbers, it names both counts, the diverging leaf, and the loopback case", () => {
+      const r = renderSealRejection("leaf_count_mismatch", SID_HEX, { responder: 2, initiator: 3, diverging: 2 });
+      expect(r).toMatchObject({ your_leaf_count: 3, their_leaf_count: 2, diverging_leaf_index: 2 });
+      expect(r.guidance).toMatch(/you hold 3/);
+      expect(r.guidance).toMatch(/they hold 2/);
+      expect(r.guidance).toMatch(/diverge at leaf 2/);
+      // The clause AC2 exists to retire: "ask the counterparty to check their end" is unfollowable
+      // when both agents are on ONE daemon, which is how dbb93dfc… stranded.
+      expect(r.guidance).toMatch(/If BOTH agents run on this machine/);
+      expect(r.guidance).not.toMatch(/ask the counterparty/i);
+    });
+
+    it("F5: a leaf_count_mismatch with NO numbers is the only case that blames an older daemon", () => {
+      const r = renderSealRejection("leaf_count_mismatch", SID_HEX);
+      expect(r.guidance).toMatch(/older daemon/);
+      expect(r.your_leaf_count).toBeUndefined(); // never invents a count it did not receive
+    });
+
+    it("F6 (review F3 — error substitution): OTHER refusals are reported verbatim, never diagnosed as a version", () => {
+      // The responder rejects for six reasons and only leaf_count_mismatch carries detail. Rendering
+      // the other five as "it is running an older daemon" asserts a cause the code never observed,
+      // and sends the operator to compare transcripts when the real problem is, say, a missing key.
+      for (const reason of [
+        "unknown_counterparty", "session_not_found", "session_not_interrupted",
+        "initiator_mismatch", "signing_key_unavailable",
+      ]) {
+        const r = renderSealRejection(reason, SID_HEX);
+        expect(r.guidance, `${reason} must not be blamed on a version`).not.toMatch(/older daemon/);
+        expect(r.guidance, `${reason} must survive into the message`).toContain(reason);
+        expect(r.rejection_reason).toBe(reason);
+      }
+    });
   });
 });

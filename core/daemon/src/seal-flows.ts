@@ -53,6 +53,47 @@ export interface SealFlowDeps {
   clearFrontierMismatch?: (agentName: string, sessionId: string) => void;
 }
 
+
+/**
+ * The operator-visible text for a counterparty's seal-interrupted rejection.
+ *
+ * Extracted from the flow so it can be TESTED. AC2 is worded about the message the INITIATOR shows
+ * — "reports the ACTUAL mismatch … instead of directing the operator to ask the counterparty" — and
+ * that message was previously built inline inside `handleSealInterruptedFlow`, reachable only by
+ * standing up two daemons and driving a real seal exchange. So the clause the AC is actually about
+ * had no test at all (review). A pure function is the honest seam.
+ */
+export function renderSealRejection(
+  reason: string,
+  sessionId: string,
+  frontier?: { responder: number; initiator: number; diverging: number },
+): { guidance: string } & SealFailureDetail {
+  if (frontier) {
+    const { responder, initiator, diverging } = frontier;
+    return {
+      rejection_reason: reason,
+      your_leaf_count: initiator,
+      their_leaf_count: responder,
+      diverging_leaf_index: diverging,
+      guidance:
+        `The two sides disagree on how many messages this session contains: you hold ${initiator}, ` +
+        `they hold ${responder}. They diverge at leaf ${diverging} — compare that message on both ` +
+        `transcripts with cello_transcript ${sessionId}. A leaf that only one side recorded cannot ` +
+        `be co-signed, so the session cannot seal until the records agree. If BOTH agents run on ` +
+        `this machine, read both sides here; there is no other end to check.`,
+    };
+  }
+  // Only a leaf_count_mismatch is EXPECTED to carry the numbers, so only there is their absence
+  // evidence of an older daemon. The responder rejects for five other reasons, and rendering those
+  // as a version problem asserts a cause the code never observed.
+  return {
+    rejection_reason: reason,
+    guidance: reason === "leaf_count_mismatch"
+      ? `The counterparty rejected the seal-interrupted request because the two sides disagree on how many messages this session holds, but it did not report its own count — it is running an older daemon. Compare the two transcripts with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other never recorded.`
+      : `The counterparty rejected the seal-interrupted request: ${reason}. That is its own reason, reported verbatim — nothing here diagnoses it further. Check the counterparty's daemon for that condition; cello_transcript ${sessionId} shows this side's record if you need it.`,
+  };
+}
+
 export function createSealFlows(deps: SealFlowDeps) {
   const { logger, sessionNodeManager, agents, getKeyProvider, signalingFor, sendOver, recordFrontierMismatch, clearFrontierMismatch } = deps;
   const keyProviders = { get: getKeyProvider } as { get: (a: string) => KeyProvider | undefined };
@@ -281,34 +322,11 @@ export function createSealFlows(deps: SealFlowDeps) {
         recordFrontierMismatch?.(record.agent_name, sessionId, {
           ours: initiator, theirs: responder, divergingLeafIndex: diverging,
         });
-        return {
-          ok: false,
-          reason: "seal_interrupted_rejected_by_counterparty",
-          rejection_reason: ackResult.reason,
-          your_leaf_count: initiator,
-          their_leaf_count: responder,
-          diverging_leaf_index: diverging,
-          guidance:
-            `The two sides disagree on how many messages this session contains: you hold ${initiator}, ` +
-            `they hold ${responder}. They diverge at leaf ${diverging} — compare that message on both ` +
-            `transcripts with cello_transcript ${sessionId}. A leaf that only one side recorded cannot ` +
-            `be co-signed, so the session cannot seal until the records agree. If BOTH agents run on ` +
-            `this machine, read both sides here; there is no other end to check.`,
-        };
       }
-      // review F3: only a leaf_count_mismatch is EXPECTED to carry frontier numbers, so only there
-      // is their absence evidence of an older daemon. The responder rejects for five other reasons
-      // (unknown_counterparty, session_not_found, session_not_interrupted, initiator_mismatch,
-      // signing_key_unavailable) and none of them attaches detail — rendering those as "it is
-      // running an older daemon" asserts a version cause the code never observed, and sends the
-      // operator to compare transcripts when the real problem is, say, a missing key provider.
       return {
         ok: false,
         reason: "seal_interrupted_rejected_by_counterparty",
-        rejection_reason: ackResult.reason,
-        guidance: ackResult.reason === "leaf_count_mismatch"
-          ? `The counterparty rejected the seal-interrupted request because the two sides disagree on how many messages this session holds, but it did not report its own count — it is running an older daemon. Compare the two transcripts with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other never recorded.`
-          : `The counterparty rejected the seal-interrupted request: ${ackResult.reason}. That is its own reason, reported verbatim — nothing here diagnoses it further. Check the counterparty's daemon for that condition; cello_transcript ${sessionId} shows this side's record if you need it.`,
+        ...renderSealRejection(ackResult.reason, sessionId, ackResult.frontier),
       };
     }
 
