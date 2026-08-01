@@ -13,21 +13,29 @@ Example: if your prompt is `[agent_name]`, line 1 must be `AGENT_NAME="[agent_na
 
 ```bash
 AGENT_NAME="[agent_name]"
-# Guard: an empty or unsubstituted name must FAIL LOUD. Without this, `cello use-agent` errors
-# silently and the loop polls whichever desk was already selected — announcing another agent's
-# callers as if they were this one's, with nothing to reveal the mix-up.
+# Guard: an empty or unsubstituted name must FAIL LOUD, ONCE. Without it the loop below polls with
+# --agent "", which cello refuses (missing_agent_value) every 10 seconds forever while never naming
+# the invocation as the problem.
 if [ -z "$AGENT_NAME" ] || [ "$AGENT_NAME" = "[agent_name]" ]; then
   echo "ERROR: no agent name supplied — cannot staff a desk. Invoke with the exact agent name." >&2
   exit 1
 fi
-if ! cello use-agent "$AGENT_NAME"; then
-  echo "ERROR: cello use-agent '$AGENT_NAME' failed — not staffing an unconfirmed desk." >&2
-  exit 1
-fi
+# DO NOT run `cello use-agent` here (DOD-RECEPTIONIST-AGENT-1). It writes ~/.cello/current-agent —
+# ONE machine-wide file that every `cello` process in every terminal shares — so two receptionists
+# staffing two desks fight over it: whichever ran it last owns it, and BOTH then report on that one
+# agent, announcing another agent's callers as if they were this one's. `--agent` below names the
+# desk on this process's own connection instead and touches no shared state, so any number of
+# receptionists can run side by side. It is also not a weaker check: the daemon refuses an offline
+# or unknown desk (selected_agent_offline) rather than quietly answering as somebody else.
+ERR_LOG=$(mktemp)
+trap 'rm -f "$ERR_LOG"' EXIT
 while true; do
-  RESULT=$(cello inbox --scope current 2>/dev/null)
+  RESULT=$(cello inbox --agent "$AGENT_NAME" --scope current 2>"$ERR_LOG")
   if [ -z "$RESULT" ]; then
-    echo "ERROR: cello inbox returned empty output" >&2
+    # Report the CAUSE, not the exit point. cello puts a refusal on stderr as structured JSON; the
+    # previous `2>/dev/null` threw that away and reported "empty output", which describes where the
+    # failure surfaced and sends the operator to the wrong subsystem.
+    echo "ERROR: cello inbox --agent \"$AGENT_NAME\" returned nothing. Reason: $(cat "$ERR_LOG")" >&2
     exit 1
   fi
   PENDING=$(echo "$RESULT" | jq '[.agents[] | select(.total_unread > 0 or (.pending_session_requests | length) > 0)] | length' 2>/dev/null)
