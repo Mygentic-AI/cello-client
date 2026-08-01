@@ -3607,8 +3607,46 @@ export class SessionNodeManager {
     // hash AT THE SAME POSITION -- never the same hash anywhere.
     const tree = this.getSessionTree(agentName, sessionId);
     let existingIdx: number;
-    if (canonicalSeqIn !== undefined && canonicalSeqIn >= 0) {
-      existingIdx = tree.hashAt(canonicalSeqIn) === contentHashHex ? canonicalSeqIn : -1;
+    if (canonicalSeqIn !== undefined && canonicalSeqIn >= 0 && tree.hashAt(canonicalSeqIn) === contentHashHex) {
+      // The relay position holds exactly this content: a redelivery.
+      existingIdx = canonicalSeqIn;
+    } else if (canonicalSeqIn !== undefined && canonicalSeqIn >= 0 && canonicalSeqIn >= tree.size()) {
+      // The position is at or beyond the frontier, so it cannot be a leaf we already hold. A
+      // genuinely new message — including one byte-identical to an earlier leaf, which is the whole
+      // point of AC1.
+      existingIdx = -1;
+    } else if (canonicalSeqIn !== undefined && canonicalSeqIn >= 0) {
+      // ─── POSITION DRIFT (review F2, a regression this fix introduced and this branch repairs) ───
+      //
+      // `canonicalSeqIn < tree.size()` yet that slot holds different content, so **leaf index is no
+      // longer the relay position** and the position cannot be used as an index into the tree. That
+      // is §7a's drift: a first message whose relay submit failed is appended locally and never
+      // counted by the relay, leaving the local record permanently one ahead.
+      //
+      // Using the position as an index here made a TRUE REDELIVERY append a second leaf — measured:
+      // tree size 3 where the pre-fix code correctly gave 2. That is the "too permissive" direction,
+      // and it inflates this side's tree against the counterparty's: the strand, from the other end.
+      //
+      // So under drift, fall back to the content-hash rule. It is weaker — it still cannot tell two
+      // identical messages apart — but it is CORRECT about redelivery, which is the failure actually
+      // reachable here, and it is exactly the pre-existing behavior, so this is not a regression in
+      // either direction. Loudly announced, because the ambiguity is real and the drift is the thing
+      // that should be fixed (DOD-FIRSTMSG-WITNESS-1 closes the producer).
+      existingIdx = tree.indexOfHash(contentHashHex);
+      // Announce only when the fallback actually DECIDED something (it found a duplicate). When it
+      // finds nothing the message simply appends, `session.content.sequence_behind_tree` already
+      // reports the drift itself, and a second warn on every message of a drifted session would
+      // bury the case that matters. A signal that fires on the normal case is not a signal.
+      if (existingIdx >= 0) this.#logger.warn("session.content.dedup.position_drifted", {
+        sessionId,
+        agentName,
+        contentHashHex,
+        canonicalSeq: canonicalSeqIn,
+        treeSize: tree.size(),
+        dedupedAt: existingIdx,
+        reason: "leaf_index_is_not_relay_position_fell_back_to_content_hash",
+        correlationId,
+      });
     } else {
       // RELAY-DEGRADED: no witness, so no discriminator exists and the content-hash rule is all
       // there is. Keeping it preserves today's protection against real redelivery and today's blind
@@ -3617,13 +3655,19 @@ export class SessionNodeManager {
       // ANNOUNCED: a silent fallback is exactly how this went a week unnoticed. Fires only when the
       // hash actually matches, so it marks a real decision rather than every unwitnessed message.
       existingIdx = tree.indexOfHash(contentHashHex);
-      if (existingIdx >= 0) {
+      // Gated exactly as its sibling `session.content.unwitnessed` is (see :3933): a session with NO
+      // RELAY ATTACHED has no witness BY DESIGN, so warning there would fire on every message of a
+      // normal no-relay session and bury the case that means something. A signal that fires on the
+      // normal case is not a signal. The reason distinguishes the two shapes rather than asserting
+      // the relay is absent — the position can also be missing because this particular frame carried
+      // no ordering record while the relay is perfectly healthy.
+      if (existingIdx >= 0 && this.#activeNodes.get(this.#k(agentName, sessionId))?.relayClient) {
         this.#logger.warn("session.content.dedup.unwitnessed", {
           sessionId,
           agentName,
           contentHashHex,
           sequenceNumber: existingIdx,
-          reason: "no_relay_position_deduped_on_content",
+          reason: "no_ordering_record_deduped_on_content_hash",
           correlationId,
         });
       }

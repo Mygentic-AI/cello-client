@@ -66,12 +66,15 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
       // CONN-001: send the rejection over the LOCAL responder agent's own stream (the agent whose
       // pubkey is counterpartyPubkey — the stream this request arrived on). If unresolved, sendOver
       // reports a send failure rather than throwing.
+      // review F5: detail is spread FIRST so the fixed fields always win. Spread last, a future
+      // caller passing `{ reason: 1 }` would silently overwrite the machine-readable discriminator
+      // every consumer switches on — a footgun with no error, only a wrong answer.
       const sent = await sendOver(agents.find((a) => a.pubkey === counterpartyPubkey)?.name ?? "", {
+        ...(detail ?? {}),
         type: "seal_interrupted_rejection",
         sessionId,
         initiatorPubkey,
         reason,
-        ...(detail ?? {}),
       });
       // fallback-finder LOW: don't log the rejection as delivered when the send failed (e.g. no local
       // agent for counterpartyPubkey, or a transient send error) — the counterparty would otherwise

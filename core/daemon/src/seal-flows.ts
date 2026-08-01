@@ -296,17 +296,19 @@ export function createSealFlows(deps: SealFlowDeps) {
             `this machine, read both sides here; there is no other end to check.`,
         };
       }
+      // review F3: only a leaf_count_mismatch is EXPECTED to carry frontier numbers, so only there
+      // is their absence evidence of an older daemon. The responder rejects for five other reasons
+      // (unknown_counterparty, session_not_found, session_not_interrupted, initiator_mismatch,
+      // signing_key_unavailable) and none of them attaches detail — rendering those as "it is
+      // running an older daemon" asserts a version cause the code never observed, and sends the
+      // operator to compare transcripts when the real problem is, say, a missing key provider.
       return {
         ok: false,
         reason: "seal_interrupted_rejected_by_counterparty",
         rejection_reason: ackResult.reason,
-        // No detail on the wire (an older counterparty). Say that, rather than implying the reason
-        // is unknowable — the operator can still read both transcripts.
-        guidance:
-          `The counterparty rejected the seal-interrupted request (${ackResult.reason}), and did not ` +
-          `report its own message count — it is running an older daemon. Compare the two transcripts ` +
-          `with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other ` +
-          `never recorded.`,
+        guidance: ackResult.reason === "leaf_count_mismatch"
+          ? `The counterparty rejected the seal-interrupted request because the two sides disagree on how many messages this session holds, but it did not report its own count — it is running an older daemon. Compare the two transcripts with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other never recorded.`
+          : `The counterparty rejected the seal-interrupted request: ${ackResult.reason}. That is its own reason, reported verbatim — nothing here diagnoses it further. Check the counterparty's daemon for that condition; cello_transcript ${sessionId} shows this side's record if you need it.`,
       };
     }
 

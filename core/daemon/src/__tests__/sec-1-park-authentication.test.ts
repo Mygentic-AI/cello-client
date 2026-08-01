@@ -34,7 +34,10 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { buildParkContentTbs } from "@cello-protocol/protocol-types";
+import { buildParkContentTbs, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
+// NOT protocol-types' encodeStructure1 — that one takes an object. This is the positional wire
+// helper the relay client itself uses, which is what msg-001-strict-in-order builds records with.
+import { encodeStructure1 } from "../session-relay-client.js";
 import { encodeParkEnvelope, sealParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
@@ -138,6 +141,62 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       ),
     );
   }
+
+
+  // ─── DOD-FRONTIER-STRAND-1 AC1 (review F1) — the PRODUCTION threading hop ──────────────────
+  //
+  // The AC1 clauses in m8c-frontier-strand-1-dedup.test.ts call `ingestReceivedContent` DIRECTLY
+  // with a literal position. That pins the callee and nothing else: replacing the position with
+  // `undefined` at both production call sites left the entire 1285-test daemon suite green while
+  // the defect was fully restored. The fix is only real if the position actually reaches ingest
+  // from the verified ordering record, so this drives the REAL park-recovery entry point —
+  // signature gate included — and lets the daemon derive the position itself.
+  it("AC1/F1: two byte-identical parked messages at DIFFERENT relay positions both land, through the real recover path", async () => {
+    const mgr = await makeSession("ac1-threading");
+    // The away-autoresponder text that stranded dbb93dfc…, identical on both firings.
+    const away = new TextEncoder().encode("I'm away right now — leave a message and I'll get back to you.");
+    const hash = msgLeafHash(away);
+
+    // Two ordering records for the SAME bytes at relay sequences 1 and 2 (1-based on the wire).
+    const mkRecord = async (seq: number) => {
+      const pubkey = await counterparty.getPublicKey();
+      const structure1Cbor = encodeStructure1(hash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+      const sig = await counterparty.sign(structure1Cbor);
+      const built = buildStructure2(seq, pubkey, hash, sig, new Uint8Array(32));
+      if (!built.ok) throw new Error("buildStructure2 failed");
+      return { structure1Cbor, structure2Cbor: encodeStructure2(built.structure2) };
+    };
+    const parkSig = await signPark(counterparty, { contentHash: hash });
+
+    const deliver = async (seq: number) => {
+      const rec = await mkRecord(seq);
+      return mgr.recoverParkedEntry(AGENT, sid, victimPub, encodeParkEnvelope({
+        content: away,
+        structure1Cbor: rec.structure1Cbor,
+        structure2Cbor: rec.structure2Cbor,
+        senderPubkey: counterpartyPub,
+        parkSig,
+      }), hash);
+    };
+
+    const first = await deliver(1);
+    expect(first.ok, "first identical message must land").toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+
+    // THE STRAND: same bytes, its own relay position. Under the content-hash rule this was dropped
+    // while the counterparty kept it, and the two frontiers disagreed forever.
+    const second = await deliver(2);
+    expect(second.ok, "the second identical message must land too").toBe(true);
+    expect(
+      mgr.getSessionTree(AGENT, sid).size(),
+      "two distinct messages are two leaves — proven through the real recover path, not a direct ingest call",
+    ).toBe(2);
+
+    // ...and a REDELIVERY of position 2 still dedups, so this is not "append everything".
+    const redelivered = await deliver(2);
+    expect(redelivered.ok).toBe(true);
+    expect(mgr.getSessionTree(AGENT, sid).size(), "a redelivery must not inflate the tree").toBe(2);
+  });
 
   // ─── AC3 — THE SEC-1 REGRESSION TEST ────────────────────────────────────────────────────────
   // An adversary holding ONLY the victim's PUBLIC key and a live session_id (both of which the

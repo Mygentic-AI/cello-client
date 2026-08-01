@@ -101,21 +101,73 @@ describe("DOD-FRONTIER-STRAND-1 AC1: identical messages at different relay posit
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(2);
   });
 
-  it("D4 (relay-degraded): with NO position, hash-dedup still applies — and says so", async () => {
-    // A session with no relay witness has no discriminator, so the pre-existing content-hash rule
-    // is the only thing left. That is a DEGRADED path, not the happy one: it keeps today's
-    // protection against redelivery and keeps today's blind spot for identical messages. §5a allows
-    // proceeding rather than refusing (losing content is worse), but only if the degradation is
-    // ANNOUNCED — a silent fallback here is how the strand went a week unnoticed.
-    await fx.createSession(SID, "alice");
+  it("D4 (relay-degraded): with NO position, hash-dedup still applies — and does NOT cry wolf", async () => {
+    // A session with no relay witness has no discriminator, so the pre-existing content-hash rule is
+    // all there is. It keeps today's protection against real redelivery and today's blind spot for
+    // identical messages — the strand can still form on this path. §5a permits proceeding rather
+    // than refusing (losing content is worse than mis-ordering it).
+    //
+    // But it must NOT warn here. A session with NO RELAY ATTACHED has no witness BY DESIGN, so a
+    // warn would fire on every deduped message of a perfectly normal no-relay session and bury the
+    // case that means something — the same rule its sibling `session.content.unwitnessed` already
+    // follows. A signal that fires on the normal case is not a signal. (Review F4: the first version
+    // of this clause asserted the opposite, and was wrong.)
+    await fx.createSession(SID, "alice"); // createSessionNode attaches NO relay client
 
     await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-x");
     const second = await fx.snm.ingestReceivedContent("alice", SID, AWAY, msgLeafHash(AWAY), "corr-y");
     expect(second).toMatchObject({ ok: true, appendedCount: 0 });
     expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
 
-    const degraded = fx.eventsNamed("session.content.dedup.unwitnessed");
-    expect(degraded.length, "the degraded dedup path must announce itself").toBeGreaterThan(0);
-    expect(degraded[0].ctx).toMatchObject({ sessionId: SID, agentName: "alice" });
+    expect(
+      fx.eventsNamed("session.content.dedup.unwitnessed"),
+      "a no-relay session must not warn about a witness it was never going to get",
+    ).toHaveLength(0);
+  });
+
+  // NOT COVERED HERE, deliberately, and for the same reason m8c-cursor-1 records for
+  // `session.content.unwitnessed`: the case the warn EXISTS for is a session with a relay ATTACHED
+  // whose content frame carried no ordering record. Reaching it means attaching a live relay client
+  // (`#activeNodes` is private, and a seam added purely for the test would test the seam). It
+  // belongs in the live spine, against a real relay.
+
+  it("D5 (review F2 — the regression this fix first INTRODUCED): under position DRIFT a true redelivery still dedups", async () => {
+    // Drift is a documented live condition (§7a): a first message whose relay submit failed is
+    // appended locally and never counted by the relay, so the local tree runs permanently one ahead
+    // and LEAF INDEX IS NO LONGER THE RELAY POSITION.
+    //
+    // The first version of AC1 used the position as an index into the tree, which under drift made a
+    // TRUE REDELIVERY append a second leaf — measured at tree size 3 where the pre-fix code gave 2.
+    // That is the "too permissive" direction: it inflates this side's tree against the
+    // counterparty's, which is the strand from the other end. Both directions destroy a receipt, so
+    // both get a clause.
+    await fx.createSession(SID, "alice");
+
+    // Leaf 0: an UNWITNESSED message (its relay submit failed) — the drift producer.
+    const first = new TextEncoder().encode("first message, relay submit failed");
+    await fx.snm.ingestReceivedContent("alice", SID, first, msgLeafHash(first), "corr-d1");
+    expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
+
+    // Leaf 1: a WITNESSED message which the relay numbered 0 — the tree is now one ahead.
+    const second = new TextEncoder().encode("second message, witnessed at relay position 0");
+    await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d2", 0);
+    expect(fx.snm.getSessionTree("alice", SID).size()).toBe(2);
+
+    // ...and now the SAME message is redelivered (direct delivery plus the park backstop both
+    // landing is a designed path). It carries the same relay position, 0.
+    const redelivered = await fx.snm.ingestReceivedContent("alice", SID, second, msgLeafHash(second), "corr-d3", 0);
+    expect(redelivered).toMatchObject({ ok: true, appendedCount: 0 });
+    expect(
+      fx.snm.getSessionTree("alice", SID).size(),
+      "a redelivery must not append a second leaf just because the tree has drifted",
+    ).toBe(2);
+
+    // The ambiguity is ANNOUNCED — under drift the position is unusable as an index, so dedup falls
+    // back to the weaker content-hash rule and says so rather than pretending it is still exact.
+    // Exactly ONE — it fires where the fallback DECIDED (the redelivery), not on the earlier
+    // message that merely appended under drift. sequence_behind_tree already reports that.
+    const drifted = fx.eventsNamed("session.content.dedup.position_drifted");
+    expect(drifted).toHaveLength(1);
+    expect(drifted[0].ctx).toMatchObject({ sessionId: SID, canonicalSeq: 0, treeSize: 2, dedupedAt: 1 });
   });
 });
