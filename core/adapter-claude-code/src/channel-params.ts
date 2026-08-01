@@ -56,9 +56,16 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       // operator's agent actually reads, and the whole point of this line is that a session which
       // gets nothing back from cello_receive should already know why. Still content-free: a count of
       // attending sessions is routing metadata and says nothing about what arrived.
-      const attending = Number(data["attendance"]);
-      const shared = Number.isFinite(attending) && attending > 1
-        ? ` ${attending} sessions are attending this agent, so the other one may read it first — if cello_receive returns nothing, run cello_transcript.`
+      //
+      // An OLDER daemon sends no `attendance` at all, and versions skew by design (CLAUDE.md
+      // forbids pinning, so shim-newer-than-daemon is the expected state, not the exception).
+      // `Number(undefined)` is NaN, so the guard is explicit: absent means "this daemon cannot
+      // tell me", which is not "you are alone" — say nothing rather than assert solitude.
+      const raw = data["attendance"];
+      const attending = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
+      const shared = attending !== null && attending > 1
+        // Correct for any N: with 3 sessions "the other one" names a session that does not exist.
+        ? ` ${attending} sessions are attending this agent, so another one may read it first — if cello_receive returns nothing, run cello_transcript.`
         : "";
       return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.${shared}`;
     }

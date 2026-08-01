@@ -475,7 +475,8 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // Says what is true and what to do about it, in that order — and does NOT tell the operator
       // to go away, because co-attending is allowed. What they need to know is that a message can
       // be delivered to the OTHER session, and where it will still be readable when it is.
-      result["co_attendance"] = true;
+      // No separate `co_attendance: true` flag — `attendance > 1` already IS that boolean, and a
+      // second field carrying the same fact is one more thing that can drift out of agreement.
       result["co_attendance_guidance"] =
         `${attendance} sessions are attending '${name}' (including this one). That is allowed — but an ` +
         `arriving message is delivered to whichever session reads it first, so cello_receive here may ` +

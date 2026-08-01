@@ -20,6 +20,11 @@
  * - C6 (AC2): isAttended's decision is untouched — counting is additive.
  * - C7: the discriminator clears once the loser has caught up. It reports UNSEEN content, not "a
  *   sibling exists" — a flag that never clears is a flag nobody reads.
+ * - C8 (review HIGH): a FRESH connection whose predecessor died is told nothing arrived. C7 only
+ *   ever asked what the SAME connection sees; this asks what a NEW one sees, which is the `cello`
+ *   CLI's only mode and every reconnect's first mode.
+ * - C9 (review MEDIUM): a theft AND a dead counterparty are both true — `reason` names the
+ *   terminal, actionable condition and the theft rides as a field.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -186,6 +191,63 @@ describe("DOD-COATTEND-VISIBLE-1: two sessions on one agent — the loser is tol
     await new Promise((r) => setTimeout(r, 150));
 
     expect(fx.eventsNamed("session.away.response.sent")).toHaveLength(0);
+  });
+
+  it("C8 (review HIGH, the case C7 could not see): a FRESH connection after its predecessor died is told NOTHING ARRIVED — not that a sibling took it", async () => {
+    // C7 clears the discriminator from the SAME connection's point of view. It never asks what a
+    // NEW connection sees — and that is the `cello` CLI's only mode (a fresh process, therefore a
+    // fresh connection, per command) and every MCP reconnect's first mode.
+    //
+    // The take ledger is connection-scoped, and a fresh connection starts at cursor -1. Without
+    // pruning the ledger when a connection dies, every take the dead connection ever recorded sits
+    // above that bar and reads as a live sibling stealing mail: one operator, one window, a phantom
+    // thief, on every single command, forever. That is worse than the silence this line replaced —
+    // it teaches the operator to disbelieve the signal, so the REAL theft arrives wearing words
+    // they have learned to ignore.
+    await fx.createSession(SID, "alice");
+
+    const first = await fx.connectAs("alice");
+    await fx.ingestReceived("alice", SID, "from bob");
+    const got = (await first.send("cello_receive", { session_id: SID, timeout_ms: 500 })) as Record<string, unknown>;
+    expect(got.content).toBe("from bob"); // it really did take it — the ledger has a real entry
+    first.close();
+    await new Promise((r) => setTimeout(r, 150)); // let the daemon observe the disconnect
+
+    const reconnected = await fx.connectAs("alice");
+    const answer = (await reconnected.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
+    expect(answer.reason).toBeUndefined();
+    expect(answer.taken_by_sibling).toBeUndefined();
+    expect(String(answer.guidance)).toMatch(/No content arrived within timeout_ms/);
+    expect(fx.eventsNamed("session.receive.taken_by_sibling")).toHaveLength(0);
+  });
+
+  it("C9 (review MEDIUM): when a sibling took it AND the counterparty is gone, the TERMINAL condition names the reason", async () => {
+    // Both are true. `reason` is the machine-readable field, and a caller switching on it must
+    // still see `counterparty_gone` — it is the one that changes what the operator should DO
+    // (seal), whereas "read the transcript then reply" would send a reply to a connection that is
+    // dead. The theft is additive, so it survives as a field and in the guidance; nothing is lost.
+    await fx.createSession(SID, "alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
+
+    await fx.ingestReceived("alice", SID, "from bob");
+    await connA.send("cello_receive", { session_id: SID, timeout_ms: 500 });
+    fx.snm.markSessionLivenessForTest("alice", SID, "gone");
+
+    const answer = (await connB.send("cello_receive", { session_id: SID, timeout_ms: 100 })) as Record<string, unknown>;
+    expect(answer.reason).toBe("counterparty_gone");
+    expect(answer.liveness).toBe("gone");
+    // ...and the theft is still reported, in both machine-readable and human form.
+    expect(answer.taken_by_sibling).toMatchObject({ count: 1, last_sequence: 0 });
+    expect(String(answer.guidance)).toMatch(/already received 1 message/);
+    // Substance, not spelling: DOD-ONBOARD-HELP-1 renders the remedy per surface at the IPC
+    // boundary, so a CLI-shaped caller is told `cello close-session`. Both renderings are locked
+    // end-to-end in dod-onboard-help-1-vocabulary.test.ts; pinning one here would pin the wrong
+    // one for half the callers.
+    expect(String(answer.guidance)).toMatch(/close.?session/i);
+    expect(String(answer.guidance)).toMatch(/transcript/);
+    // The warn still fires — the theft must not stop being greppable because the peer also died.
+    expect(fx.eventsNamed("session.receive.taken_by_sibling")).toHaveLength(1);
   });
 
   it("C7: the discriminator reports UNSEEN content — it clears once the loser catches up", async () => {

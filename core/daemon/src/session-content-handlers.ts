@@ -429,7 +429,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // the operator in the moment or for anyone reading the log afterwards. One correlationId threads
     // every exit below.
     const receiveCorrelationId = randomUUID();
-    const attendance = attendanceCount(agentName);
+    // Recomputed at EVERY exit, never snapshotted here (review MEDIUM): the loop below blocks for
+    // up to timeout_ms — 30 s by default — and sessions attach and detach inside that window. A
+    // count captured before the wait is stale exactly when it matters, and it is the number the
+    // operator reads and the number interpolated into the guidance. It is an O(connections) walk
+    // over a handful of entries; there is nothing to save by caching it.
 
     for (;;) {
       // 1) Deliverable content wins — drain one buffered message per call (FIFO).
@@ -449,7 +453,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         contentTakes.record(agentName, sessionId, connectionId, entry.sequenceNumber);
         logger.info("session.receive.delivered", {
           sessionId, agentName, connectionId, sequenceNumber: entry.sequenceNumber,
-          attendance, correlationId: receiveCorrelationId,
+          attendance: attendanceCount(agentName), correlationId: receiveCorrelationId,
         });
         const contentText = Buffer.from(entry.contentHex, "hex").toString("utf8");
         const trimmed = contentText.trimEnd();
@@ -479,7 +483,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
         // same silent handler, and leaving it silent would reproduce the defect one branch over.
         logger.info("session.receive.sealed", {
-          sessionId, agentName, connectionId, attendance,
+          sessionId, agentName, connectionId, attendance: attendanceCount(agentName),
           unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
         });
         return {
@@ -497,6 +501,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         const liveness = sessionNodeManager.getSessionLiveness(agentName, sessionId);
+        const attendance = attendanceCount(agentName);
         // ─── DOD-COATTEND-VISIBLE-1 AC1: the loser of the race gets a DIFFERENT answer ───
         //
         // The buffer is keyed (agentName, sessionId) and drained with `buf.shift()`, so when the
@@ -513,24 +518,51 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           agentName, sessionId, connectionId, getConnectionCursor(connectionId, sessionId),
         );
         if (missed) {
+          // The message a sibling took is described WITHOUT claiming that sibling still attends
+          // this agent (review MEDIUM). A connection may operate on the sole online agent through
+          // `resolveCurrentAgent` WITHOUT attending it, and it drains the same buffer — so a real
+          // thief need not be counted in `attendance`. The old wording produced sentences that
+          // contradicted themselves ("another session attending alice — 1 sessions are attending").
+          // `attendance` stays as its own field, meaning what it says: how many sessions SELECTED
+          // this agent.
+          const takenDetail = {
+            count: missed.count,
+            last_sequence: missed.lastSequence,
+            connections: missed.connections,
+            // `count` is a floor once the per-session cap has discarded older takes.
+            ...(missed.truncated ? { truncated: true } : {}),
+          };
           logger.warn("session.receive.taken_by_sibling", {
-            sessionId, agentName, connectionId, timeoutMs, attendance,
+            sessionId, agentName, connectionId, timeoutMs, attendance, liveness,
             takenCount: missed.count, lastTakenSeq: missed.lastSequence, takenBy: missed.connections,
-            correlationId: receiveCorrelationId,
+            truncated: missed.truncated, correlationId: receiveCorrelationId,
           });
+          const missedText = `Another session on this daemon already received ${missed.count} message(s) on this session that you have not read (up to sequence ${missed.lastSequence}). Nothing was lost: read what you missed with cello_transcript ${sessionId}.`;
+          // BOTH conditions can be true, and `counterparty_gone` WINS the `reason` field when they
+          // are (review MEDIUM). `reason` is the machine-readable discriminator, and a caller
+          // switching on it must still see the TERMINAL, actionable condition: telling an operator
+          // to "read what you missed, then reply" to a counterparty whose connection is dead sends
+          // them to the wrong subsystem and the reply goes nowhere. The theft is additive
+          // information, so it rides as a field and as the first half of the guidance — nothing is
+          // hidden, but the answer names the condition that changes what the operator should DO.
+          if (liveness === "gone") {
+            return {
+              ok: true,
+              content: null,
+              reason: "counterparty_gone",
+              liveness: "gone",
+              taken_by_sibling: takenDetail,
+              attendance,
+              guidance: `${missedText} Note the counterparty's session connection has ALSO dropped (liveness: gone), so no more content will arrive and a reply cannot reach them — call cello_close_session to seal the session once you have read the history. If the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.`,
+            };
+          }
           return {
             ok: true,
             content: null,
             reason: "taken_by_sibling_session",
-            taken_by_sibling: {
-              count: missed.count,
-              last_sequence: missed.lastSequence,
-              connections: missed.connections,
-            },
+            taken_by_sibling: takenDetail,
             attendance,
-            // A dead counterparty and a sibling theft are both true here; neither is hidden.
-            ...(liveness === "gone" ? { liveness } : {}),
-            guidance: `Another session attending '${agentName}' already received ${missed.count} message(s) on this session that you have not read (up to sequence ${missed.lastSequence}) — ${attendance} sessions are attending this agent right now. Nothing was lost: read what you missed with cello_transcript ${sessionId}, then reply. Do not resend your last message.`,
+            guidance: `${missedText} Then reply — do not resend your last message.`,
           };
         }
         // M8B F16: a dead session must not return the SAME null timeout as a

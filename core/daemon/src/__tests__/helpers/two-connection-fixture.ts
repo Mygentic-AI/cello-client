@@ -20,8 +20,7 @@
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { FileKeyProvider, msgLeafHash } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../../daemon.js";
 import { connectToDaemon, type IpcClient } from "../../ipc-client.js";
@@ -98,10 +97,15 @@ export interface TwoConnectionFixture {
   cleanup(): Promise<void>;
 }
 
-/** The msg-leaf hash the content path binds: sha256(0x00 || content). */
-export function msgLeafHash(content: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
-}
+/**
+ * The msg-leaf hash the content path binds.
+ *
+ * Re-exported from `@cello-protocol/crypto` rather than re-derived from `createHash` (review LOW).
+ * The inline copy was carried over from `m8c-cursor-1`, and promoting it into a SHARED fixture
+ * would have made the duplication load-bearing: if the production leaf rule ever changed, every
+ * test built on this fixture would keep passing against the old one.
+ */
+export { msgLeafHash };
 
 export async function startTwoConnectionFixture(
   opts: TwoConnectionFixtureOpts = {},

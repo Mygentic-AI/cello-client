@@ -60,6 +60,12 @@ export interface SiblingTakes {
   readonly lastSequence: number;
   /** The connections that took it — so the daemon log alone reconstructs the race. */
   readonly connections: readonly string[];
+  /**
+   * The per-session cap discarded older takes, so `count` is a FLOOR, not the total. Stated on the
+   * answer rather than only in a constant: an unstated cap is a silent truncation, and a caller
+   * reading `count: 64` deserves to know the real number may be larger.
+   */
+  readonly truncated: boolean;
 }
 
 /**
@@ -74,6 +80,8 @@ const MAX_TRACKED_SESSIONS = 512;
 export class ContentTakeLedger {
   /** `(agentName, sessionId)` → recent takes, oldest first. Insertion order doubles as the LRU. */
   readonly #takes = new Map<string, ContentTake[]>();
+  /** Sessions whose per-session cap has discarded at least one take. */
+  readonly #truncated = new Set<string>();
 
   static #key(agentName: string, sessionId: string): string {
     // NUL cannot appear in either component, so the join is unambiguous.
@@ -86,7 +94,10 @@ export class ContentTakeLedger {
     const existing = this.#takes.get(key);
     const takes = existing ?? [];
     takes.push({ connectionId, sequenceNumber });
-    if (takes.length > MAX_TAKES_PER_SESSION) takes.splice(0, takes.length - MAX_TAKES_PER_SESSION);
+    if (takes.length > MAX_TAKES_PER_SESSION) {
+      takes.splice(0, takes.length - MAX_TAKES_PER_SESSION);
+      this.#truncated.add(key);
+    }
     // Re-insert so this session moves to the young end of the eviction order.
     if (existing !== undefined) this.#takes.delete(key);
     this.#takes.set(key, takes);
@@ -94,6 +105,33 @@ export class ContentTakeLedger {
       const oldest = this.#takes.keys().next();
       if (oldest.done === true) break;
       this.#takes.delete(oldest.value);
+      this.#truncated.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Drop everything `connectionId` took. Called from the daemon's `onDisconnect`, beside
+   * `connectionCursors.delete` — this state is connection-scoped for the same reason and must have
+   * the same lifetime.
+   *
+   * WHY IT IS NOT OPTIONAL (review HIGH). A fresh connection presents cursor -1, so without this
+   * every take a dead connection ever recorded sits above the bar and reads as a live sibling
+   * stealing mail. The `cello` CLI opens a fresh connection PER COMMAND, so that fired on ordinary
+   * single-operator use and never cleared — the catch-up dead end in mirror image. Once a
+   * connection is gone its takes are history, and history is not "another session took it".
+   *
+   * Bounded by construction: at most MAX_TRACKED_SESSIONS × MAX_TAKES_PER_SESSION entries.
+   */
+  forget(connectionId: string): void {
+    for (const [key, takes] of this.#takes) {
+      const kept = takes.filter((t) => t.connectionId !== connectionId);
+      if (kept.length === takes.length) continue;
+      if (kept.length === 0) {
+        this.#takes.delete(key);
+        this.#truncated.delete(key);
+      } else {
+        this.#takes.set(key, kept);
+      }
     }
   }
 
@@ -101,14 +139,21 @@ export class ContentTakeLedger {
    * Content another connection consumed that `connectionId` has not read, or `null` when there is
    * none.
    *
-   * The bar is the caller's own read cursor, NOT a wall-clock window. A time window would have to
-   * guess how long ago the theft counts for, and would miss the ordinary case where the sibling's
-   * take lands microseconds before this caller's handler even starts. A cursor is exact: it reports
-   * content this connection genuinely has not seen, and it CLEARS by itself the moment the caller
-   * catches up. A discriminator that never clears is one nobody reads.
+   * TWO conditions, and both are load-bearing.
+   *
+   * 1. The take is above the caller's own read cursor — NOT inside a wall-clock window. A window
+   *    would have to guess how long ago a theft still counts for, and would miss the ordinary case
+   *    where the sibling's take lands microseconds before this caller's handler even starts. A
+   *    cursor is exact: it reports content this connection genuinely has not seen, and it CLEARS by
+   *    itself once the caller catches up. A discriminator that never clears is one nobody reads.
+   *
+   * 2. The taking connection is STILL ALIVE — guaranteed by `forget()` on disconnect, which is why
+   *    that call is not housekeeping. A take by a connection that has since died is history, and
+   *    reporting history as a live theft is what made this fire on every CLI command.
    */
   missedBy(agentName: string, sessionId: string, connectionId: string, cursor: number): SiblingTakes | null {
-    const takes = this.#takes.get(ContentTakeLedger.#key(agentName, sessionId));
+    const key = ContentTakeLedger.#key(agentName, sessionId);
+    const takes = this.#takes.get(key);
     if (takes === undefined) return null;
     const missed = takes.filter((t) => t.connectionId !== connectionId && t.sequenceNumber > cursor);
     if (missed.length === 0) return null;
@@ -116,6 +161,7 @@ export class ContentTakeLedger {
       count: missed.length,
       lastSequence: missed.reduce((max, t) => (t.sequenceNumber > max ? t.sequenceNumber : max), missed[0].sequenceNumber),
       connections: [...new Set(missed.map((t) => t.connectionId))],
+      truncated: this.#truncated.has(key),
     };
   }
 }
