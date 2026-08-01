@@ -176,19 +176,10 @@ export interface ActiveSessionInfo {
   liveness: "alive" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
-  /**
-   * DOD-FRONTIER-STRAND-1 AC3: present ONLY when a seal exchange has proved the two sides disagree
-   * on how many messages this session holds. Its presence means the session is STRANDED — it cannot
-   * co-sign and will never seal — as distinct from an ordinary interrupted session that is merely
-   * waiting for both parties to be online. Absent is the healthy case; there is no "false" to read.
-   */
-  frontierMismatch?: {
-    ours: number;
-    theirs: number;
-    divergingLeafIndex: number;
-    observedAt: string;
-    guidance: string;
-  };
+  /** DOD-FRONTIER-STRAND-1 AC3 — see SessionListEntry.frontierMismatch. Declared here because
+   *  buildInterruptedSessions returns THIS type; it typechecked only because TS exempts spread
+   *  properties from excess-property checking, so a renderer typed as this could not read it. */
+  frontierMismatch?: SessionListEntry["frontierMismatch"];
 }
 
 // --- Daemon configuration ---
@@ -450,6 +441,20 @@ export interface SessionListEntry {
   status: SessionStatus;
   /** Operator-facing bucket derived from status + messageCount: open | closed | failed. */
   category: "open" | "closed" | "failed";
+  /**
+   * DOD-FRONTIER-STRAND-1 AC3: present ONLY when a seal exchange has proved the two sides disagree
+   * on how many messages this session holds. Its presence means the session is STRANDED — it cannot
+   * co-sign and will never seal — as distinct from an ordinary interrupted session that is merely
+   * waiting for both parties to be online. Absent is the healthy case; there is no "false" to read.
+   */
+  frontierMismatch?: {
+    ours: number;
+    theirs: number;
+    divergingLeafIndex: number;
+    observedAt: string;
+    guidance: string;
+  };
+
   messageCount: number;
   createdAt: string;
   updatedAt: string;

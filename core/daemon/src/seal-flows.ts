@@ -47,10 +47,15 @@ export interface SealFlowDeps {
   /** This agent's directory signaling stream, or undefined if it has none. */
   signalingFor: (agentName: string) => SignalingManager | undefined;
   sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
-  /** DOD-FRONTIER-STRAND-1 AC3: retain an observed mismatch so the session list can show it. */
-  recordFrontierMismatch?: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
+  /**
+   * DOD-FRONTIER-STRAND-1 AC3: retain an observed mismatch so the session list can show it.
+   * REQUIRED, not optional (review M4) — there is exactly one composition root, so optionality
+   * buys nothing and costs the compiler's ability to catch a wiring that was never done. That is
+   * precisely how the responder's missing `clearFrontierMismatch` stayed invisible.
+   */
+  recordFrontierMismatch: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
   /** AC3: a seal that SUCCEEDS proves the frontiers agree — a stale flag would be the same defect inverted. */
-  clearFrontierMismatch?: (agentName: string, sessionId: string) => void;
+  clearFrontierMismatch: (agentName: string, sessionId: string) => void;
 }
 
 
@@ -319,8 +324,20 @@ export function createSealFlows(deps: SealFlowDeps) {
         // AC3: the INITIATOR learns the two numbers here and must keep them too — otherwise only the
         // responder's session list shows the strand and the side that attempted the close sees
         // nothing afterwards.
-        recordFrontierMismatch?.(record.agent_name, sessionId, {
+        recordFrontierMismatch(record.agent_name, sessionId, {
           ours: initiator, theirs: responder, divergingLeafIndex: diverging,
+        });
+        // AC3 asks for a LOG EVENT, and only the responder emitted one (review M6). On a
+        // two-machine strand an operator grepping the INITIATING daemon — the side that ran the
+        // close and saw the failure — found nothing at all.
+        logger.warn("session.frontier.mismatch", {
+          sessionId,
+          agentName: record.agent_name,
+          role: "initiator",
+          ourLeafCount: initiator,
+          theirLeafCount: responder,
+          divergingLeafIndex: diverging,
+          correlationId,
         });
       }
       return {
@@ -406,7 +423,7 @@ export function createSealFlows(deps: SealFlowDeps) {
       // AC3: the frontiers evidently agree now — drop any recorded mismatch. A flag that outlives
       // the condition is the same defect inverted: an operator told a healthy session is stranded
       // stops believing the flag, and the next real strand reads as noise.
-      clearFrontierMismatch?.(record.agent_name, sessionId);
+      clearFrontierMismatch(record.agent_name, sessionId);
       return { ok: true, sessionId, status: "seal_interrupted_pending" };
     }
   }
@@ -609,7 +626,7 @@ export function createSealFlows(deps: SealFlowDeps) {
     // AC3: the frontiers evidently agree now — drop any recorded mismatch. A flag that outlives
     // the condition is the same defect inverted: an operator told a healthy session is stranded
     // stops believing the flag, and the next real strand reads as noise.
-    clearFrontierMismatch?.(record.agent_name, sessionId);
+    clearFrontierMismatch(record.agent_name, sessionId);
     return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
   }
   return { awaitSealAck, handleSealInterruptedFlow, handleActiveSealFlow };

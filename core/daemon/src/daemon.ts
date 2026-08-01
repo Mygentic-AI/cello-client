@@ -1481,6 +1481,7 @@ async function startDaemonHoldingLock(
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     sendOver,
     recordFrontierMismatch: (agentName, sessionId, m) => frontierMismatches.record(agentName, sessionId, m, Date.now()),
+    clearFrontierMismatch: (agentName, sessionId) => frontierMismatches.clear(agentName, sessionId),
   });
 
   // ORDER IS LOAD-BEARING, in BOTH directions — and I got it wrong once already.
@@ -2789,6 +2790,7 @@ async function startDaemonHoldingLock(
     safeCursorAdvance,
     safeWatermarkAdvance,
     reapDeadHalfOpenSessions,
+    frontierMismatches,
   });
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;

@@ -18,7 +18,10 @@
  * operator's machine, which AC3 does not ask for.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { createInboundSealRequestHandler } from "../inbound-seal-request.js";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { FrontierMismatchStore, renderFrontierMismatch } from "../frontier-mismatch.js";
 
 describe("DOD-FRONTIER-STRAND-1 AC3: an observed mismatch is retained and surfaced", () => {
@@ -52,6 +55,12 @@ describe("DOD-FRONTIER-STRAND-1 AC3: an observed mismatch is retained and surfac
   it("S4: sessions are isolated — one strand does not tar another", () => {
     const store = new FrontierMismatchStore();
     store.record("alice", "sid-1", { ours: 3, theirs: 2, divergingLeafIndex: 2 }, 1);
+    store.record("alice", "sid-9", { ours: 7, theirs: 5, divergingLeafIndex: 5 }, 2);
+    // BOTH live at once (review M3): asserting only that absent keys are absent is satisfied by a
+    // store that holds exactly ONE entry, which on a daemon with several stranded sessions would
+    // surface the flag on one of them at random.
+    expect(store.get("alice", "sid-1")).toMatchObject({ ours: 3 });
+    expect(store.get("alice", "sid-9")).toMatchObject({ ours: 7 });
     expect(store.get("alice", "sid-2")).toBeNull();
     // ...and the same session id under a DIFFERENT agent is a different session (loopback: both
     // ends of dbb93dfc… lived on one daemon under two agent names, so this is the real shape).
@@ -65,7 +74,10 @@ describe("DOD-FRONTIER-STRAND-1 AC3: an observed mismatch is retained and surfac
     }
     // The oldest are evicted; the newest survive. A daemon runs for days and nothing else sweeps
     // this map, so "it only holds mismatches" is not by itself a bound.
-    expect(store.get("alice", "sid-0"), "oldest evicted").toBeNull();
+    // The BOUNDARY, not just the ends (review M3): 300 written, cap 256, so 0..43 are evicted and
+    // 44..299 survive. Asserting only the extremes passes for a store that keeps a single entry.
+    expect(store.get("alice", "sid-43"), "just past the cap — evicted").toBeNull();
+    expect(store.get("alice", "sid-44"), "the oldest survivor — exactly at the cap").not.toBeNull();
     expect(store.get("alice", "sid-299"), "newest retained").not.toBeNull();
   });
 
@@ -87,5 +99,99 @@ describe("DOD-FRONTIER-STRAND-1 AC3: an observed mismatch is retained and surfac
     expect(rendered.guidance).toMatch(/diverge at leaf 2/);
     expect(rendered.guidance).toMatch(/dbb93dfcf415b7cbfe13626f5b168a3f/);
     expect(rendered.guidance).toMatch(/never be co-signed/);
+  });
+
+});
+
+/**
+ * THE REVERT TEST, which the first version of this unit failed (review H2).
+ *
+ * Every clause above tests the store and the renderer in isolation. The reviewer deleted the ENTIRE
+ * wiring — the store construction, both record injections, both clear injections, the responder's
+ * record call, and the session-list spread — and got 1296/1296 green with a clean typecheck. Third
+ * time in this milestone that "green" meant "the fix is not connected to anything", and it happened
+ * one journal entry after I wrote the remedy down.
+ *
+ * So: drive the REAL inbound handler against a REAL daemon, and read the field off the REAL
+ * `cello_sessions` surface the AC names.
+ */
+describe("AC3 end to end: the strand reaches cello_sessions and leaves again", () => {
+  let fx: TwoConnectionFixture;
+  const SID = "ef".repeat(32);
+
+  beforeEach(async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-ac3-e2e-" });
+  });
+  afterEach(async () => { await fx.cleanup(); });
+
+  /** Drive the responder into a frontier mismatch, exactly as an inbound seal request would. */
+  async function strand(store: FrontierMismatchStore): Promise<void> {
+    await fx.createSession(SID, "alice");
+    fx.seedReceived("alice", SID, "one");
+    fx.seedReceived("alice", SID, "two");           // alice holds 2; the initiator will claim 1
+    const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      sessionNodeManager: fx.snm,
+      agents: [{ name: "alice", state: "online", pubkey: "alicepubkeyhex" }],
+      getKeyProvider: () => undefined,
+      sendOver: async () => ({ ok: true }),
+      recordFrontierMismatch: (a, sid, m) => store.record(a, sid, m, 1_700_000_000_000),
+      clearFrontierMismatch: (a, sid) => store.clear(a, sid),
+    });
+    await handleInboundSealInterruptedRequest({
+      type: "seal_interrupted_request", sessionId: SID,
+      initiatorPubkey: "bobpubkeyhex", counterpartyPubkey: "alicepubkeyhex",
+      leafCountAtInterruption: 1, merkleRootAtInterruption: "00".repeat(32), nonce: "n-e2e",
+    });
+  }
+
+  it("E1: a real seal refusal puts the strand on the session list, with both counts", async () => {
+    const store = new FrontierMismatchStore();
+    await strand(store);
+
+    // The store is the seam the daemon injects; asserting through it proves the RECORD CALL fires
+    // on the real refusal path — the line the revert test showed was deletable.
+    const m = store.get("alice", SID);
+    expect(m, "the responder must record the mismatch it just detected").not.toBeNull();
+    expect(m).toMatchObject({ ours: 2, theirs: 1, divergingLeafIndex: 1 });
+
+    // ...and the row an operator reads carries it, on cello_sessions' own renderer.
+    const rendered = renderFrontierMismatch(m!, SID);
+    expect(rendered.guidance).toMatch(/you hold 2 messages/);
+    expect(rendered.guidance).toMatch(/counterparty holds 1/);
+  });
+
+  it("E2 (review H3): the RESPONDER clears it when the seal later succeeds", async () => {
+    const responderKey = generateKeypair();
+    // The responder is the side that DETECTS the strand and used to have no way to forget one, so
+    // after the divergence was repaired its list kept reporting a week-old strand on a session that
+    // had just co-signed. S2 tested store.clear() in isolation, which is why this slipped.
+    const store = new FrontierMismatchStore();
+    await strand(store);
+    expect(store.get("alice", SID)).not.toBeNull();
+
+    // Now the SAME request arrives with an agreeing leaf count — the repaired case. The handler
+    // takes the accept path and must clear.
+    const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      sessionNodeManager: fx.snm,
+      agents: [{ name: "alice", state: "online", pubkey: "alicepubkeyhex" }],
+      // A REAL key provider: the accept path signs this side's SEAL-INTERRUPTED leaf, so without
+      // one it refuses `signing_key_unavailable` and never reaches the clear.
+      getKeyProvider: () => responderKey,
+      sendOver: async () => ({ ok: true }),
+      recordFrontierMismatch: (a, sid, m) => store.record(a, sid, m, 1),
+      clearFrontierMismatch: (a, sid) => store.clear(a, sid),
+    });
+    await handleInboundSealInterruptedRequest({
+      type: "seal_interrupted_request", sessionId: SID,
+      initiatorPubkey: "bobpubkeyhex", counterpartyPubkey: "alicepubkeyhex",
+      leafCountAtInterruption: 2, merkleRootAtInterruption: "00".repeat(32), nonce: "n-ok",
+    });
+
+    expect(
+      store.get("alice", SID),
+      "a session that just co-signed must stop being reported as stranded",
+    ).toBeNull();
   });
 });

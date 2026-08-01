@@ -19,11 +19,20 @@ export interface InboundSealRequestDeps {
   getKeyProvider: (agentName: string) => KeyProvider | undefined;
   sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
   /** DOD-FRONTIER-STRAND-1 AC3: retain an observed mismatch so the session list can show it. */
-  recordFrontierMismatch?: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
+  recordFrontierMismatch: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
+  /**
+   * AC3 (review H3): the RESPONDER must be able to clear it too. It is the side that DETECTS the
+   * mismatch, and it used to have no way to forget one — so after the divergence was repaired and
+   * the seal succeeded, the responder's session list kept reporting a week-old strand on a session
+   * that had just co-signed. That is precisely the defect S2 pins ("a flag that outlives its
+   * condition is the same defect inverted"), shipped on the detecting side. REQUIRED, not optional:
+   * optionality is what hid the missing wiring from the compiler in the first place.
+   */
+  clearFrontierMismatch: (agentName: string, sessionId: string) => void;
 }
 
 export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
-  const { logger, sessionNodeManager, agents, getKeyProvider, sendOver, recordFrontierMismatch } = deps;
+  const { logger, sessionNodeManager, agents, getKeyProvider, sendOver, recordFrontierMismatch, clearFrontierMismatch } = deps;
 
   // ─── M7-SESSION-001 (H-1): seal-interrupted bilateral RESPONDER ────────────
   //
@@ -136,7 +145,7 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
       });
       // AC3: keep it. Without this the refusal is a transient string in one command's output, and
       // the session goes back to looking exactly like a healthy paused one.
-      recordFrontierMismatch?.(localAgent.name, sessionId, {
+      recordFrontierMismatch(localAgent.name, sessionId, {
         ours: ownLeafCount, theirs: leafCountReq, divergingLeafIndex: diverging,
       });
       await reject("leaf_count_mismatch", {
@@ -190,6 +199,8 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
       });
       return;
     }
+    // AC3: this exchange SUCCEEDED, so whatever mismatch this side recorded is no longer true.
+    clearFrontierMismatch(localAgent.name, sessionId);
     logger.info("session.interrupted.responder.acked", {
       sessionId,
       agentName: localAgent.name,

@@ -16,8 +16,11 @@ import type { SessionRecord, SessionListEntry, SessionListResponse, Logger } fro
 import type { ConnState } from "./contact-handlers.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { validateSessionName } from "./session-name.js";
+import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-mismatch.js";
 
 export interface SessionReadDeps {
+  /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
+  frontierMismatches: FrontierMismatchStore;
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
@@ -38,7 +41,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     handlers, logger, sessionNodeManager, loadedAgents, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance,
     reapDeadHalfOpenSessions,
-  } = deps;
+      frontierMismatches,
+} = deps;
 
   // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
   // The cert-read surface: returns the receipt-not-assent certificate for a sealed session —
@@ -222,6 +226,16 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // interrupted_at is the canonical ISO interruption stamp; null for any
       // session that was never interrupted (active/sealed).
       interruptedAt: row.interrupted_at ?? null,
+      // DOD-FRONTIER-STRAND-1 AC3 — THE SURFACE THE AC NAMES (review H1). The first version put
+      // this only on `cello_status.interrupted_sessions`, which is a health SNAPSHOT: capped at 10
+      // resumable rows, by its own comment "not a session archive". A session stranded for a week
+      // is precisely the one that has fallen off that cap, so the operator would query
+      // `cello_sessions` — the archive — and see a plain `interrupted` row, which is the original
+      // defect unchanged. This list covers every status and is not capped by resumability.
+      ...(() => {
+        const m = frontierMismatches.get(row.agent_name, row.session_id);
+        return m ? { frontierMismatch: renderFrontierMismatch(m, row.session_id) } : {};
+      })(),
     }));
     return { ok: true, filter, limit, totalMatched: matched.length, sessions };
   }
