@@ -58,6 +58,10 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
         sent.push(frame);
         return { ok: true };
       },
+      // AC3's deps are REQUIRED, so every construction must name them. This file is about the
+      // rejection FRAME, not retention, so they are explicit no-ops rather than silently absent.
+      recordFrontierMismatch: () => {},
+      clearFrontierMismatch: () => {},
     });
     await handleInboundSealInterruptedRequest({
       type: "seal_interrupted_request",
@@ -93,7 +97,9 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       agents: [{ name: "alice", state: "online", pubkey: "alicepubkeyhex" }],
       getKeyProvider: () => undefined,
       sendOver: async () => ({ ok: true }),
-    } as never);
+      recordFrontierMismatch: () => {},
+      clearFrontierMismatch: () => {},
+    });
     const warns: Array<{ event: string; ctx: Record<string, unknown> }> = [];
 
     await handleInboundSealInterruptedRequest({
@@ -125,7 +131,9 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       agents: [{ name: "alice", state: "online", pubkey: "alicepubkeyhex" }],
       getKeyProvider: () => undefined,
       sendOver: async (_a: string, frame: Record<string, unknown>) => { sent.push(frame); return { ok: true }; },
-    } as never);
+      recordFrontierMismatch: () => {},
+      clearFrontierMismatch: () => {},
+    });
 
     await handleInboundSealInterruptedRequest({
       type: "seal_interrupted_request", sessionId: SID,
