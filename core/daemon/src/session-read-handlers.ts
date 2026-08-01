@@ -69,7 +69,28 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // hold the id, so the name is free context. It is display only: nothing in the certificate,
       // the sealed root, or the legibility object is derived from it.
       const sessionName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-      return { ok: true, session_id: sessionId, session_name: sessionName, sealed_root: cert.sealed_root, legibility: cert.legibility };
+      // DOD-FIRSTMSG-WITNESS-1 AC8: say HOW MUCH the certificate covers.
+      //
+      // §7a's defect was a certificate issued over a record short one message — the conversation's
+      // opening message, dropped because its relay submit was rejected and never retried. It was
+      // invisible precisely because the receipt reported no size: seal RATE was unaffected (75% vs
+      // 72%), so every surface said "sealed" while the notarized record was incomplete. Rate was
+      // never the measure; coverage is, and coverage was not reported anywhere.
+      //
+      // Both counts, because they answer different questions. `leaf_count` is the whole sealed tree
+      // (content AND the control leaves the seal itself appends). `content_leaf_count` is the
+      // messages, and it is the one comparable to a transcript length — conflating them would make
+      // the check drift by the number of ctrl leaves and read as a defect when nothing is wrong.
+      const leaves = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
+      return {
+        ok: true,
+        session_id: sessionId,
+        session_name: sessionName,
+        sealed_root: cert.sealed_root,
+        leaf_count: leaves.length,
+        content_leaf_count: leaves.filter((l) => l.kind === "msg").length,
+        legibility: cert.legibility,
+      };
     }
     // M8C-INBOX-1 (F4): the single `sealed_receipt_not_found` conflated four distinct causes, so a
     // caller could not tell a typo from a not-sealed-yet session from a wrong-agent selection.
