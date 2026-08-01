@@ -27,19 +27,60 @@ fi
 # desk on this process's own connection instead and touches no shared state, so any number of
 # receptionists can run side by side. It is also not a weaker check: the daemon refuses an offline
 # or unknown desk (selected_agent_offline) rather than quietly answering as somebody else.
-ERR_LOG=$(mktemp)
+#
+# ONE LIFECYCLE CHANGE CAME WITH THAT, ON PURPOSE: `use-agent` auto-started an offline agent, and
+# this poll does not. The desk must ALREADY BE ONLINE — a read must never re-arm something the
+# operator deliberately stopped. Dispatched directly against an offline desk, this now exits 1
+# naming the remedy instead of silently bringing the agent back up and reachable.
+command -v jq >/dev/null 2>&1 || {
+  echo "ERROR: jq is required to read the inbox but is not on PATH. Install jq, then respawn." >&2
+  exit 1
+}
+ERR_LOG=$(mktemp) || {
+  echo "ERROR: mktemp failed — cannot capture cello's stderr, and staffing a desk while blind to" \
+       "its errors is how a receptionist sleeps through every caller. Refusing to poll." >&2
+  exit 1
+}
 trap 'rm -f "$ERR_LOG"' EXIT
 while true; do
-  RESULT=$(cello inbox --agent "$AGENT_NAME" --scope current 2>"$ERR_LOG")
-  if [ -z "$RESULT" ]; then
-    # Report the CAUSE, not the exit point. cello puts a refusal on stderr as structured JSON; the
-    # previous `2>/dev/null` threw that away and reported "empty output", which describes where the
-    # failure surfaced and sends the operator to the wrong subsystem.
-    echo "ERROR: cello inbox --agent \"$AGENT_NAME\" returned nothing. Reason: $(cat "$ERR_LOG")" >&2
+  # BRANCH ON THE EXIT CODE, not on empty output. Empty stdout is a PROXY for failure and several
+  # real paths defeat it: an unknown flag or an unknown command prints help/USAGE to STDOUT and
+  # exits 1, which would sail past an `-z` check, fail the jq parse below, and leave this loop
+  # sleeping forever — an answering service that says it is monitoring and announces nobody, with
+  # nothing on any stream. That is the worst failure this script has, because it is silent.
+  if ! RESULT=$(cello inbox --agent "$AGENT_NAME" --scope current 2>"$ERR_LOG"); then
+    # Report the CAUSE, not the exit point. cello puts a refusal on stderr as structured JSON; a
+    # `2>/dev/null` here would throw that away and leave only "empty output", which describes where
+    # the failure surfaced and sends the operator to the wrong subsystem.
+    REASON=$(cat "$ERR_LOG")
+    [ -n "$REASON" ] || REASON="(exited non-zero with no stderr — killed by a signal?)"
+    echo "ERROR: cello inbox --agent \"$AGENT_NAME\" failed. Reason: $REASON" >&2
     exit 1
   fi
-  PENDING=$(echo "$RESULT" | jq '[.agents[] | select(.total_unread > 0 or (.pending_session_requests | length) > 0)] | length' 2>/dev/null)
-  if [ "$PENDING" -gt 0 ] 2>/dev/null; then
+  if [ -z "$RESULT" ]; then
+    echo "ERROR: cello inbox --agent \"$AGENT_NAME\" exited 0 but printed nothing. Reason: $(cat "$ERR_LOG")" >&2
+    exit 1
+  fi
+  # Every way a caller can be waiting, not just the two obvious ones. `total_unread` counts ACTIVE
+  # sessions only, so someone who left a message and sealed — the answering-machine case — shows up
+  # in `sealed_unread` and contributes zero here; polling on total_unread alone slept through them
+  # indefinitely. `// []` because the daemon omits sealed_unread entirely when it is empty.
+  PENDING=$(echo "$RESULT" | jq '[.agents[] | select(
+      .total_unread > 0
+      or ((.pending_session_requests // []) | length) > 0
+      or ((.sealed_unread // []) | length) > 0
+      or ((.expired_session_requests // []) | length) > 0
+    )] | length')
+  # A non-numeric PENDING means jq could not read the response — a real failure, not "nobody called".
+  # The old `2>/dev/null` on this test turned that into a silent false and slept on it forever.
+  case "$PENDING" in
+    ''|*[!0-9]*)
+      echo "ERROR: could not read the inbox response for \"$AGENT_NAME\" — jq produced '$PENDING'." \
+           "Refusing to report an all-clear that was never confirmed." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$PENDING" -gt 0 ]; then
     echo "$RESULT"
     exit 0
   fi
