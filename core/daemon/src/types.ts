@@ -176,6 +176,19 @@ export interface ActiveSessionInfo {
   liveness: "alive" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
+  /**
+   * DOD-FRONTIER-STRAND-1 AC3: present ONLY when a seal exchange has proved the two sides disagree
+   * on how many messages this session holds. Its presence means the session is STRANDED — it cannot
+   * co-sign and will never seal — as distinct from an ordinary interrupted session that is merely
+   * waiting for both parties to be online. Absent is the healthy case; there is no "false" to read.
+   */
+  frontierMismatch?: {
+    ours: number;
+    theirs: number;
+    divergingLeafIndex: number;
+    observedAt: string;
+    guidance: string;
+  };
 }
 
 // --- Daemon configuration ---

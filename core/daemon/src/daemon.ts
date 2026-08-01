@@ -101,6 +101,7 @@ import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
+import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 
 
@@ -419,6 +420,12 @@ async function startDaemonHoldingLock(
   // The two seal-initiation flows cello_close_session dispatches into (seal-flows.ts): the
   // counterparty is gone (seal-interrupted) or live (bilateral). Neither can notarize on its own —
   // the daemon holds no threshold signer, which IS the sovereign-node invariant.
+  // DOD-FRONTIER-STRAND-1 AC3: mismatches observed during a seal exchange, retained so the session
+  // list can show them. Detection is inherently at close time (the frontiers can only be compared
+  // when the two sides talk); what was missing is that the answer was discarded the moment it was
+  // produced, so the only way to see it again was to attempt another close.
+  const frontierMismatches = new FrontierMismatchStore();
+
   const { handleSealInterruptedFlow, handleActiveSealFlow } = createSealFlows({
     logger,
     sessionNodeManager,
@@ -426,6 +433,8 @@ async function startDaemonHoldingLock(
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     signalingFor,
     sendOver,
+    recordFrontierMismatch: (agentName, sessionId, m) => frontierMismatches.record(agentName, sessionId, m, Date.now()),
+    clearFrontierMismatch: (agentName, sessionId) => frontierMismatches.clear(agentName, sessionId),
   });
 
   // M7 DOD-SPINE-6 / MSG-001-3b: assemble the relay-witness connect params for a
@@ -1471,6 +1480,7 @@ async function startDaemonHoldingLock(
     agents,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     sendOver,
+    recordFrontierMismatch: (agentName, sessionId, m) => frontierMismatches.record(agentName, sessionId, m, Date.now()),
   });
 
   // ORDER IS LOAD-BEARING, in BOTH directions — and I got it wrong once already.
@@ -1580,6 +1590,14 @@ async function startDaemonHoldingLock(
         // DOD-SESSION-NAME-1 (AC-A11): an interrupted session is one you may want to resume or seal
         // — the name is how you tell which one it was.
         sessionName: row.session_name ?? null,
+        // DOD-FRONTIER-STRAND-1 AC3: if a seal exchange has already proved the two sides disagree on
+        // how many messages this session holds, SAY SO HERE. Otherwise a stranded session is listed
+        // exactly like a healthy paused one, and the only way to learn it can never seal is to
+        // attempt another close and read the error — which is how dbb93dfc… sat unnoticed a week.
+        ...(() => {
+          const m = frontierMismatches.get(row.agent_name, row.session_id);
+          return m ? { frontierMismatch: renderFrontierMismatch(m, row.session_id) } : {};
+        })(),
       }));
   }
 

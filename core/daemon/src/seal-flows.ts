@@ -47,10 +47,14 @@ export interface SealFlowDeps {
   /** This agent's directory signaling stream, or undefined if it has none. */
   signalingFor: (agentName: string) => SignalingManager | undefined;
   sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
+  /** DOD-FRONTIER-STRAND-1 AC3: retain an observed mismatch so the session list can show it. */
+  recordFrontierMismatch?: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
+  /** AC3: a seal that SUCCEEDS proves the frontiers agree — a stale flag would be the same defect inverted. */
+  clearFrontierMismatch?: (agentName: string, sessionId: string) => void;
 }
 
 export function createSealFlows(deps: SealFlowDeps) {
-  const { logger, sessionNodeManager, agents, getKeyProvider, signalingFor, sendOver } = deps;
+  const { logger, sessionNodeManager, agents, getKeyProvider, signalingFor, sendOver, recordFrontierMismatch, clearFrontierMismatch } = deps;
   const keyProviders = { get: getKeyProvider } as { get: (a: string) => KeyProvider | undefined };
 
   // Seal-interrupted bilateral INITIATOR flow.
@@ -271,6 +275,12 @@ export function createSealFlows(deps: SealFlowDeps) {
       // exist while withholding the two numbers that identify the problem.
       if (ackResult.frontier) {
         const { responder, initiator, diverging } = ackResult.frontier;
+        // AC3: the INITIATOR learns the two numbers here and must keep them too — otherwise only the
+        // responder's session list shows the strand and the side that attempted the close sees
+        // nothing afterwards.
+        recordFrontierMismatch?.(record.agent_name, sessionId, {
+          ours: initiator, theirs: responder, divergingLeafIndex: diverging,
+        });
         return {
           ok: false,
           reason: "seal_interrupted_rejected_by_counterparty",
@@ -373,6 +383,10 @@ export function createSealFlows(deps: SealFlowDeps) {
         leafCount: ownLeafCount,
         correlationId,
       });
+      // AC3: the frontiers evidently agree now — drop any recorded mismatch. A flag that outlives
+      // the condition is the same defect inverted: an operator told a healthy session is stranded
+      // stops believing the flag, and the next real strand reads as noise.
+      clearFrontierMismatch?.(record.agent_name, sessionId);
       return { ok: true, sessionId, status: "seal_interrupted_pending" };
     }
   }
@@ -572,6 +586,10 @@ export function createSealFlows(deps: SealFlowDeps) {
     // active close. retireSessionNode stops the node WITHOUT changing the DB status.
     await sessionNodeManager.retireSessionNode(record.agent_name, sessionId);
 
+    // AC3: the frontiers evidently agree now — drop any recorded mismatch. A flag that outlives
+    // the condition is the same defect inverted: an operator told a healthy session is stranded
+    // stops believing the flag, and the next real strand reads as noise.
+    clearFrontierMismatch?.(record.agent_name, sessionId);
     return { ok: true, sessionId, status: "seal_interrupted_pending", rootHex: ownRootHex };
   }
   return { awaitSealAck, handleSealInterruptedFlow, handleActiveSealFlow };

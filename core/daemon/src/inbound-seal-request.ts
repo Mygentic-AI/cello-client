@@ -18,10 +18,12 @@ export interface InboundSealRequestDeps {
   agents: AgentInfo[];
   getKeyProvider: (agentName: string) => KeyProvider | undefined;
   sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
+  /** DOD-FRONTIER-STRAND-1 AC3: retain an observed mismatch so the session list can show it. */
+  recordFrontierMismatch?: (agentName: string, sessionId: string, m: { ours: number; theirs: number; divergingLeafIndex: number }) => void;
 }
 
 export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
-  const { logger, sessionNodeManager, agents, getKeyProvider, sendOver } = deps;
+  const { logger, sessionNodeManager, agents, getKeyProvider, sendOver, recordFrontierMismatch } = deps;
 
   // ─── M7-SESSION-001 (H-1): seal-interrupted bilateral RESPONDER ────────────
   //
@@ -128,6 +130,11 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
         initiatorLeafCount: leafCountReq,
         divergingLeafIndex: diverging,
         correlationId,
+      });
+      // AC3: keep it. Without this the refusal is a transient string in one command's output, and
+      // the session goes back to looking exactly like a healthy paused one.
+      recordFrontierMismatch?.(localAgent.name, sessionId, {
+        ours: ownLeafCount, theirs: leafCountReq, divergingLeafIndex: diverging,
       });
       await reject("leaf_count_mismatch", {
         responder_leaf_count: ownLeafCount,
