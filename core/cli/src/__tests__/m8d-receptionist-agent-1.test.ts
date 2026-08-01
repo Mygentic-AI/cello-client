@@ -50,7 +50,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, access } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile, access, mkdir, chmod } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDaemon, type DaemonHandle, type DaemonConfig, type Logger } from "@cello-protocol/daemon";
@@ -300,6 +301,99 @@ describe("DOD-RECEPTIONIST-AGENT-1: two desks, two receptionists, no shared file
       expect(String(err.guidance)).toMatch(/alice/);
       expect(String(err.guidance)).toMatch(/start-agent/);
     });
+
+    // ─── R5 (AC4, literally): RUN the shipped bash. Two receptionists, one CELLO_DIR. ──────────
+    //
+    // Every clause above either matches a regex against the markdown or calls a TypeScript
+    // function. Neither executes the thing that ships. That gap is not academic: all three HIGH
+    // findings on this unit were execution semantics — an exit code read as empty stdout, a
+    // swallowed `jq` failure, a jq filter that could not see a sealed message — and not one of
+    // them is visible to a regex unless you already know to look for it.
+    //
+    // So this runs the real bash, through the real `cello` binary, against a real daemon, with
+    // BOTH receptionists sharing ONE CELLO_DIR — which is the whole point, because the shared
+    // `current-agent` file inside it is what they used to fight over.
+    it("R5 (AC4): two receptionist loops, one CELLO_DIR, each announces only its OWN desk", async () => {
+      await twoOnlineDesks();
+
+      // Give each desk a waiting caller, so the first poll of each loop exits immediately rather
+      // than sleeping 10 s. Seeded exactly as the inbound path does: tree leaf + transcript row.
+      const snm = handle!.getSessionNodeManager();
+      for (const [agent, sid, text] of [
+        ["alice", "a1".repeat(32), "caller for alice"],
+        ["bob", "b2".repeat(32), "caller for bob"],
+      ] as const) {
+        await snm.createSessionNode(sid, agent, "cppubkeyhex", `${agent}-peer`, "r5");
+        const { leafIndex } = snm.appendSessionLeaf(agent, sid, "msg", "aa".repeat(32), "r5");
+        snm.recordTranscriptMessage(agent, sid, leafIndex, "received", new TextEncoder().encode(text), "r5");
+      }
+
+      // A `cello` on PATH that is this repo's BUILT binary — the artifact the operator runs.
+      const binDir = join(tempDir, "bin");
+      await mkdir(binDir, { recursive: true });
+      const realCli = join(import.meta.dirname, "..", "..", "dist", "bin", "cello.js");
+      await writeFile(join(binDir, "cello"), `#!/bin/sh\nexec "${process.execPath}" "${realCli}" "$@"\n`, "utf8");
+      await chmod(join(binDir, "cello"), 0o755);
+
+      const script = await readFile(RECEPTIONIST_MD, "utf8");
+      const bash = /```bash\n([\s\S]*?)```/.exec(script)![1];
+
+      const runReceptionist = (agent: string) => new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+        const child = spawn("bash", ["-c", bash.replace('AGENT_NAME="[agent_name]"', `AGENT_NAME="${agent}"`)], {
+          env: { ...process.env, CELLO_DIR: tempDir, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "", err = "";
+        child.stdout.on("data", (c: Buffer) => { out += c.toString("utf8"); });
+        child.stderr.on("data", (c: Buffer) => { err += c.toString("utf8"); });
+        child.on("close", (code) => resolve({ code, out, err }));
+      });
+
+      // CONCURRENTLY, sharing one CELLO_DIR — the collision, staged for real.
+      const [a, b] = await Promise.all([runReceptionist("alice"), runReceptionist("bob")]);
+
+      expect(a.code, `alice receptionist failed: ${a.err}`).toBe(0);
+      expect(b.code, `bob receptionist failed: ${b.err}`).toBe(0);
+      // Each announced its OWN caller. Under the old mechanism both would have reported whichever
+      // desk ran `use-agent` last.
+      expect((JSON.parse(a.out).agents as Array<{ agent: string }>).map((x) => x.agent)).toEqual(["alice"]);
+      expect((JSON.parse(b.out).agents as Array<{ agent: string }>).map((x) => x.agent)).toEqual(["bob"]);
+      // And neither of them re-pointed the machine-wide file on its way through.
+      expect(await readCurrentAgent(tempDir)).toBeUndefined();
+    }, 60_000);
+
+    it("R5b (AC4): the loop refuses LOUDLY when its desk is offline — it does not poll on in silence", async () => {
+      // The execution-level counterpart to R4a, and the clause that would have caught HIGH-1 by
+      // running rather than by reading: a failure must terminate the loop with a named cause, not
+      // leave a receptionist that reports nothing forever.
+      await createAgent(tempDir, "alice"); // created, never started
+
+      const binDir = join(tempDir, "bin");
+      await mkdir(binDir, { recursive: true });
+      const realCli = join(import.meta.dirname, "..", "..", "dist", "bin", "cello.js");
+      await writeFile(join(binDir, "cello"), `#!/bin/sh\nexec "${process.execPath}" "${realCli}" "$@"\n`, "utf8");
+      await chmod(join(binDir, "cello"), 0o755);
+
+      const script = await readFile(RECEPTIONIST_MD, "utf8");
+      const bash = /```bash\n([\s\S]*?)```/.exec(script)![1];
+
+      const result = await new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+        const child = spawn("bash", ["-c", bash.replace('AGENT_NAME="[agent_name]"', 'AGENT_NAME="alice"')], {
+          env: { ...process.env, CELLO_DIR: tempDir, PATH: `${binDir}:${process.env["PATH"] ?? ""}` },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "", err = "";
+        child.stdout.on("data", (c: Buffer) => { out += c.toString("utf8"); });
+        child.stderr.on("data", (c: Buffer) => { err += c.toString("utf8"); });
+        child.on("close", (code) => resolve({ code, out, err }));
+      });
+
+      expect(result.code).toBe(1);
+      expect(result.out).toBe("");
+      // The daemon's real reason survives all the way out to the operator, not "empty output".
+      expect(result.err).toMatch(/selected_agent_offline/);
+      expect(result.err).toMatch(/start-agent alice/);
+    }, 60_000);
 
     it("R4a: a poll for an UNKNOWN desk does not silently answer as somebody else", async () => {
       await twoOnlineDesks();
