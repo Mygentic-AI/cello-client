@@ -200,6 +200,14 @@ type CreateSessionResult =
 
 // ─── SessionNodeManager ───────────────────────────────────────────────────────
 
+/**
+ * DOD-COATTEND-1: how much of the arrival buffer is kept. Delivery reads the durable transcript
+ * now, so this buffer is only a recency hint (`peekLatestReceivedContentHex` for M8C-AWAY-1's
+ * [[WRAP]] check). Small, and stated: an unstated cap is a silent truncation, and no cap at all is
+ * the leak the old destructive read was accidentally preventing.
+ */
+const RECEIVED_BUFFER_CAP = 32;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -2317,7 +2325,11 @@ export class SessionNodeManager {
     // retireSessionNode and is not blocking on receive.
     if (reason === "sealed") {
       const tkey = this.#k(agentName, sessionId);
-      const unreadCount = this.#receivedContent.get(tkey)?.length ?? 0;
+      // DOD-COATTEND-1: counted from the DURABLE read watermark, not the buffer's length.
+      // Delivery no longer drains that buffer (it reads the transcript against a per-connection
+      // bookmark), so its length is now "everything that ever arrived", not "what nobody read" —
+      // reporting it would tell the operator every message of a healthy conversation went unread.
+      const unreadCount = this.getUnreadReceivedCount(agentName, sessionId);
       this.#sessionTerminal.set(tkey, { type: "sealed", unreadCount });
     }
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
@@ -2421,7 +2433,9 @@ export class SessionNodeManager {
     // F1-c: dropping a NON-empty received-content buffer means deliverable plaintext the app
     // never read live is being discarded (still durable in the transcript). Make that silent
     // drop diagnosable — it fires on both the destroy (sealed) and retire (sealing) paths.
-    const unreadCount = this.#receivedContent.get(key)?.length ?? 0;
+    // DOD-COATTEND-1: same correction as the terminal marker above — the buffer is no longer
+    // drained by delivery, so its length no longer means "unread". The watermark does.
+    const unreadCount = this.getUnreadReceivedCount(agentName, sessionId);
     if (unreadCount > 0) {
       this.#logger.info("session.receive.buffer.evicted", { sessionId, agentName, unreadCount });
     }
@@ -4003,6 +4017,11 @@ export class SessionNodeManager {
     let buf = this.#receivedContent.get(recvKey);
     if (!buf) { buf = []; this.#receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
+    // DOD-COATTEND-1: BOUNDED, because delivery no longer drains this. Its remaining job is
+    // `peekLatestReceivedContentHex` (M8C-AWAY-1 reads the TAIL to spot a [[WRAP]]), so only the
+    // recent tail is load-bearing — but an unbounded array holding every message of every live
+    // session, in memory, for the life of the daemon, is a leak the old destructive read hid.
+    if (buf.length > RECEIVED_BUFFER_CAP) buf.splice(0, buf.length - RECEIVED_BUFFER_CAP);
     this.#logger.info("session.content.received", {
       sessionId,
       senderPubkey,
