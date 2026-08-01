@@ -61,7 +61,14 @@ describe("DOD-COATTEND-CATCHUP-1: a session behind a SIBLING'S SEND has a door, 
   });
   afterEach(async () => { await fx.cleanup(); });
 
-  it("K1 (AC2/AC4, THE LINE): cello_transcript clears a cursor stuck behind a sibling's sent leaf", async () => {
+  // NOTE ON ALL THREE CLAUSES (review F5): these are CHARACTERIZATION tests. This line shipped no
+  // production change — the door already existed — so none of them goes red when the unit's only
+  // code change is reverted, and AC4's "red before green" was not and could not be satisfied. They
+  // pin a door that already worked so a later edit cannot quietly remove it. Said here, in the
+  // names, rather than only in the commit body: a clause called "THE LINE" that cannot fail reads
+  // as proof of a change to anyone skimming.
+
+  it("K1 (AC2/AC4, CHARACTERIZATION): cello_transcript clears the bar for a session behind a sibling's send", async () => {
     await fx.createSession(SID, "alice");
     const connB = await fx.connectAs("alice"); // attended BEFORE any arrival — no away auto-reply
     fx.seedSent("alice", SID, "A's reply, which B never saw");   // leaf 0 — the sibling's send
@@ -79,17 +86,25 @@ describe("DOD-COATTEND-CATCHUP-1: a session behind a SIBLING'S SEND has a door, 
 
     // Force one more refusal to read the cursor again. If the door worked, B's cursor now sits at
     // the sibling's send AND the counterparty message — past the gap that receive could not cross.
-    await fx.ingestReceived("alice", SID, "another one"); // leaf 2, unread → the gate bites again
-    const refusedAgain = (await connB.send("cello_send", { session_id: SID, content: "B's reply" })) as Record<string, unknown>;
-    expect(refusedAgain.ok).toBe(false);
-    expect(lastBlockedCursor(fx), "the transcript door moved the cursor ACROSS the sibling's sent leaf").toBe(1);
+    // AC4 says the door must let B CLEAR THE BAR — so assert the SEND, not a number scraped off a
+    // refusal (review F4). The first version asserted `lastBlockedCursor === 1`, which is a field
+    // of a refusal: it proved B was still refused and merely inspected how. Any implementation that
+    // advanced the cursor and kept refusing would have passed it unchanged.
+    const after = (await connB.send("cello_send", { session_id: SID, content: "B's reply" })) as Record<string, unknown>;
+    expect(after.ok, "after walking through the door, the send must go through").toBe(true);
   });
 
-  it("K2 (§3b): cello_receive alone does NOT clear it — the dead end this line exists to name", async () => {
-    // The contrast that makes K1 mean something. Same setup, same bar, the OTHER door — and the
-    // cursor does not move, because receive delivers only `direction === "received"` and
-    // safeCursorAdvance stops at the sibling's sent leaf at 0. Without this clause, K1 would pass on
-    // a build where BOTH paths worked and would prove nothing about the choice.
+  it("K2 (§3b, CHARACTERIZATION): cello_receive cannot move the CURSOR past a sibling's sent leaf", async () => {
+    // The contrast that makes K1 mean something: the cursor does not move, because receive delivers
+    // only `direction === "received"` and safeCursorAdvance stops at the sibling's sent leaf at 0.
+    // It would go red if `cello_receive` were widened to both directions, which is the design this
+    // line rejected.
+    //
+    // SCOPED PRECISELY (review F2 on CATCHUP): this is about the CURSOR, not the GATE. Receive does
+    // clear the *gate*, because it advances the agent-scoped watermark and the second authority
+    // then passes. So there is no dead end at the gate today — the DoD's own correction says the
+    // requirement stands in weakened form, and this clause is the weakened form, not the original
+    // "stuck forever" claim. Asserting a gate dead end here would assert something untrue.
     await fx.createSession(SID, "alice");
     const connB = await fx.connectAs("alice");
     fx.seedSent("alice", SID, "A's reply, which B never saw");   // leaf 0
@@ -109,7 +124,7 @@ describe("DOD-COATTEND-CATCHUP-1: a session behind a SIBLING'S SEND has a door, 
     ).toBe(-1);
   });
 
-  it("K3 (AC3): the door still refuses to skip an unread leaf — catch-up is not a bypass", async () => {
+  it("K3 (AC3, CHARACTERIZATION): the door still refuses to skip an unread leaf — catch-up is not a bypass", async () => {
     // safeCursorAdvance's gap-safety is the read-before-write guarantee itself. If the transcript
     // door vaulted the cursor to the newest leaf it happened to see, catch-up would become a way to
     // clear the bar WITHOUT reading — the exact thing the gate exists to prevent, reachable by

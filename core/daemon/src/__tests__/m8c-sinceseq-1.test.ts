@@ -111,6 +111,39 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     expect(agents[0].unread.find((u) => u.session_id === s)).toBeUndefined();
   });
 
+  it("F8 (review): a HOLE INSIDE the delivered batch stops the watermark — a row nobody could read is not 'read'", async () => {
+    // This path used to vault the watermark straight to the highest received sequence it delivered,
+    // jumping anything in between. The leaf it jumps can be a transcript row that failed to
+    // decrypt: readTranscript drops such a row from `messages`, but getUnreadReceivedCount still
+    // counts it. So a message nobody could read was silently marked read, stopped counting as
+    // unread, and cleared the send gate's second authority — the agent could then reply to a
+    // conversation containing content it had never seen and could not see.
+    //
+    // Seq 2 is absent here, which is what a dropped/undecryptable row looks like to this code.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "d".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    for (const i of [0, 1, 3]) seed("alice", s, i, "received", `m${i}`);
+
+    const res = (await client.send("cello_receive", { session_id: s, since_seq: 0 })) as R;
+    expect(res["ok"]).toBe(true);
+    // Delivery is unchanged — the caller still RECEIVES everything readable. Only the claim about
+    // what has been read is held back.
+    expect((res["messages"] as Array<{ sequence: number }>).map((m) => m.sequence)).toEqual([1, 3]);
+
+    // The watermark stopped at 1, so seq 3 is still outstanding and the session still reports unread.
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    const agents = inbox["agents"] as Array<{ agent: string; unread: Array<{ session_id: string }> }>;
+    expect(
+      agents[0]?.unread.find((u) => u.session_id === s),
+      "a gap below a delivered row must leave the session unread — not vaulted past",
+    ).toBeDefined();
+  });
+
   it("S1: since_seq at the latest sequence returns an empty batch (not an error)", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);

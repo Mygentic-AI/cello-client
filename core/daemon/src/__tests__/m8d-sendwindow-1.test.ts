@@ -28,32 +28,36 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { Stream } from "@libp2p/interface";
+import type { CelloNode } from "@cello-protocol/transport";
 import type { SecurityGatewayClient } from "../types.js";
 
 const SID = "9a".repeat(32);
 
 /**
- * A gateway that HOLDS the first screening until released. The passthrough resolves in the same
- * microtask, which closes the window faster than any test can aim at — so the race would be
- * unobservable and a test built on it would pass against the broken build.
+ * A gateway that holds EVERY entrant until `waitFor(n)` has seen n of them.
+ *
+ * The first version held only the first caller (`if (!this.#release)`, with `#release` assigned
+ * synchronously inside the Promise executor), so the second send ran to completion — append
+ * included — before the first resumed. That is the SEQUENTIAL race, and AC5 asks for the
+ * concurrent one: "two connections BOTH pass the gate, BOTH proceed through a stalled screening
+ * await". Caught by review; the distinction matters because the sequential case is the one the
+ * frontier comparison already covers, so the clause was passing on the easier half.
  */
 class StallingGateway implements Partial<SecurityGatewayClient> {
-  #release: (() => void) | null = null;
-  readonly entered: Promise<void>;
-  #announceEntered!: () => void;
-
-  constructor() {
-    this.entered = new Promise<void>((r) => { this.#announceEntered = r; });
-  }
+  #held: Array<() => void> = [];
+  #entrants = 0;
+  #waiters: Array<{ n: number; resolve: () => void }> = [];
 
   async screenOutbound(content: Uint8Array): Promise<{ disposition: "allow"; content?: Uint8Array }> {
-    if (!this.#release) {
-      const held = new Promise<void>((r) => { this.#release = r; });
-      this.#announceEntered();
-      await held;
-    }
     void content;
+    await new Promise<void>((release) => {
+      this.#held.push(release);
+      this.#entrants += 1;
+      for (const w of this.#waiters.filter((w) => w.n <= this.#entrants)) w.resolve();
+      this.#waiters = this.#waiters.filter((w) => w.n > this.#entrants);
+    });
     return { disposition: "allow" };
   }
 
@@ -61,7 +65,41 @@ class StallingGateway implements Partial<SecurityGatewayClient> {
     return { disposition: "allow" };
   }
 
-  release(): void { this.#release?.(); }
+  /** Resolve once `n` callers are simultaneously inside screening. */
+  waitFor(n: number): Promise<void> {
+    if (this.#entrants >= n) return Promise.resolve();
+    return new Promise<void>((resolve) => { this.#waiters.push({ n, resolve }); });
+  }
+
+  /** Release the EARLIEST entrant only, so it can run to completion while others stay parked. */
+  releaseOne(): void {
+    this.#held.shift()?.();
+  }
+
+  releaseAll(): void {
+    const held = this.#held;
+    this.#held = [];
+    for (const r of held) r();
+  }
+}
+
+/** A node whose first `newStream` never settles — parks a send INSIDE `sendContent`. */
+class StreamStallingNode extends FakeNode {
+  #firstHeld = false;
+  readonly reachedWire: Promise<void>;
+  #announce!: () => void;
+  constructor() {
+    super();
+    this.reachedWire = new Promise<void>((r) => { this.#announce = r; });
+  }
+  override async newStream(peer: string, proto: string): Promise<Stream> {
+    if (!this.#firstHeld) {
+      this.#firstHeld = true;
+      this.#announce();
+      await new Promise<void>(() => { /* never settles — the send stays on the wire */ });
+    }
+    return await super.newStream(peer, proto);
+  }
 }
 
 describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one message", () => {
@@ -93,12 +131,10 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
 
     // A enters screening and is HELD there, inside the window.
     const aSend = connA.send("cello_send", { session_id: SID, content: "A's answer" });
-    await gateway.entered;
-
-    // B now sends. Under the passthrough this is a coin flip; held open, it is deterministic.
     const bSend = connB.send("cello_send", { session_id: SID, content: "B's answer" });
-    await new Promise((r) => setTimeout(r, 100));
-    gateway.release();
+    // BOTH inside screening at once — AC5's literal wording, not two sends that merely overlap.
+    await gateway.waitFor(2);
+    gateway.releaseAll();
 
     const [a, b] = (await Promise.all([aSend, bSend])) as Array<Record<string, unknown>>;
     const committed = [a, b].filter((r) => r.ok === true);
@@ -117,10 +153,9 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
     const aSend = connA.send("cello_send", { session_id: SID, content: "A's answer" });
-    await gateway.entered;
     const bSend = connB.send("cello_send", { session_id: SID, content: "B's answer" });
-    await new Promise((r) => setTimeout(r, 100));
-    gateway.release();
+    await gateway.waitFor(2);
+    gateway.releaseAll();
 
     const results = (await Promise.all([aSend, bSend])) as Array<Record<string, unknown>>;
     const loser = results.find((r) => r.ok === false);
@@ -139,9 +174,122 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     // ...and it is on the record, naming both frontiers so the next reader can see WHAT moved.
     const blocked = fx.eventsNamed("session.send.blocked");
     expect(blocked.length, "the refusal must be logged, not just returned").toBeGreaterThanOrEqual(1);
-    const raced = blocked.find((e) => e.ctx.authority === "frontier_moved_during_send");
+    // EITHER authority is correct here, and which one fires depends on how the race lands — that is
+    // the point of having two. Released together, both sends clear the frontier comparison (no leaf
+    // exists yet) and the loser is caught by the in-flight claim. Let the sibling FINISH first
+    // (S2b) and the frontier comparison catches it instead. Pinning one name here would make the
+    // clause fail on a correct build for the wrong reason.
+    const raced = blocked.find((e) =>
+      e.ctx.authority === "sibling_send_in_flight" || e.ctx.authority === "frontier_moved_during_send");
     expect(raced, "the log must name WHICH authority refused").toBeDefined();
     expect(raced!.level).toBe("warn");
+  });
+
+  it("S2b: when the sibling's send COMPLETES first, the FRONTIER comparison is what refuses", async () => {
+    // The sequential half of the race, kept as its own clause so each authority is pinned to the
+    // shape it exists for. Here A's leaf lands while B is still screened, so B's frontier snapshot
+    // is stale and the comparison catches it — the in-flight claim is already released.
+    await fx.createSession(SID, "alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
+    await fx.ingestReceived("alice", SID, "one question");
+    for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
+
+    const bSend = connB.send("cello_send", { session_id: SID, content: "B's answer" });
+    await gateway.waitFor(1);          // B is parked in screening
+    const aSend = connA.send("cello_send", { session_id: SID, content: "A's answer" });
+    await gateway.waitFor(2);          // A parked too
+
+    // Let B run to COMPLETION — append included — while A is still parked. That is what makes this
+    // the sequential shape: by the time A resumes, the leaf exists and the claim is long released,
+    // so the frontier comparison is the only thing that can catch it.
+    gateway.releaseOne();
+    expect(((await bSend) as Record<string, unknown>).ok, "the first send must succeed").toBe(true);
+
+    gateway.releaseAll();
+    await aSend;
+
+    const byFrontier = fx.eventsNamed("session.send.blocked")
+      .find((e) => e.ctx.authority === "frontier_moved_during_send");
+    expect(byFrontier, "a completed sibling send must be caught by the frontier comparison").toBeDefined();
+    expect(byFrontier!.ctx.frontierNow).not.toBe(byFrontier!.ctx.frontierAtGate);
+  });
+
+  it("S4 (review F1): a send parked ON THE WIRE also blocks a sibling — the frontier cannot see it", async () => {
+    // THE FINDING. `sendContent` is the LAST await and the wider one — relay submit, stream open,
+    // stream close, a network round trip in production. A sibling's leaf does not exist yet while
+    // that is in flight, so no frontier comparison can see it, whatever it compares against.
+    // Reviewer reproduced two `ok:true`, two frames on the wire and two leaves here. The claim is
+    // what closes it, and it refuses BEFORE the loser's own wire call, so nothing is stranded.
+    const node = new StreamStallingNode();
+    const fx2 = await startTwoConnectionFixture({
+      dirPrefix: "cello-m8d-wire-",
+      securityGateway: new (class { async screenOutbound() { return { disposition: "allow" as const }; } async screenInbound() { return { disposition: "allow" as const }; } })() as unknown as SecurityGatewayClient,
+      node: node as unknown as CelloNode,
+    });
+    try {
+      await fx2.createSession(SID, "alice");
+      const a = await fx2.connectAs("alice");
+      const b = await fx2.connectAs("alice");
+      await fx2.ingestReceived("alice", SID, "one question");
+      for (const c of [a, b]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
+
+      const leavesBefore = fx2.snm.getSessionTree("alice", SID).size();
+      // Parks inside sendContent and NEVER settles (the stalled newStream is the point), so the
+      // rejection at teardown must be swallowed here — otherwise cleanup closing the socket raises
+      // an unhandled "Connection closed" that fails the whole run while every test passes.
+      const parked = a.send("cello_send", { session_id: SID, content: "A's answer" });
+      parked.catch(() => { /* expected: this send is abandoned on the wire by design */ });
+      await node.reachedWire;
+
+      const bResult = (await b.send("cello_send", { session_id: SID, content: "B's answer" })) as Record<string, unknown>;
+      expect(bResult.ok, "a sibling mid-wire must block this send").toBe(false);
+      expect(bResult.in_flight).toBe(true);
+      expect(fx2.snm.getSessionTree("alice", SID).size(), "and B must append NOTHING").toBe(leavesBefore);
+    } finally {
+      await fx2.cleanup();
+    }
+  });
+
+  it("S5 (review F3): the refusal is ADVISORY — a loser that retries without reading DOES get through", async () => {
+    // Stated, not hidden. Review proved the refusal has nothing behind it: the next cello_send takes
+    // a fresh frontier snapshot, and the gate itself passes because a SIBLING'S SENT LEAF IS NOT
+    // UNREAD COUNTERPARTY CONTENT — which is deliberate and load-bearing (the gate's own comment:
+    // "two attended windows on one agent do not gate each other… do not 'fix' it"). So a
+    // retry-on-failure agent produces the duplicate reply one round trip later.
+    //
+    // That is the CHOSEN behavior, not an oversight: the principal is the agent, and the daemon
+    // cannot referee which of an operator's windows a human is looking at. What this line owes is
+    // the race — two replies from ONE counterparty message with neither session informed — and that
+    // is closed. A second reply sent by an agent that was TOLD another session answered and chose to
+    // proceed is the operator's call.
+    //
+    // The clause exists so that if someone later decides retry should be blocked, they change a
+    // test that says so out loud rather than discovering this by accident in production.
+    await fx.createSession(SID, "alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
+    await fx.ingestReceived("alice", SID, "one question");
+    for (const c of [connA, connB]) await c.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
+
+    const bSend = connB.send("cello_send", { session_id: SID, content: "B's answer" });
+    await gateway.waitFor(1);
+    const aSend = connA.send("cello_send", { session_id: SID, content: "A's answer" });
+    await gateway.waitFor(2);
+    gateway.releaseOne();
+    await bSend;
+    gateway.releaseAll();
+    const refused = (await aSend) as Record<string, unknown>;
+    expect(refused.ok, "the loser is refused once").toBe(false);
+
+    // ...and is then free to insist, having been told. (The retry parks in screening like any other
+    // send, so it needs releasing too — `releaseAll` only frees the entrants held at the moment it
+    // is called.)
+    const retryP = connA.send("cello_send", { session_id: SID, content: "A's answer, again" });
+    await gateway.waitFor(3);
+    gateway.releaseAll();
+    const retry = (await retryP) as Record<string, unknown>;
+    expect(retry.ok, "a retry without reading currently succeeds — DELIBERATE, see above").toBe(true);
   });
 
   it("S3: a lone sender is NOT refused — the re-check must not tax the ordinary case", async () => {
@@ -154,8 +302,8 @@ describe("DOD-COATTEND-SENDWINDOW-1: two sessions cannot both reply to one messa
     await conn.send("cello_receive", { session_id: SID, timeout_ms: 2_000 });
 
     const send = conn.send("cello_send", { session_id: SID, content: "the only answer" });
-    await gateway.entered;
-    gateway.release();
+    await gateway.waitFor(1);
+    gateway.releaseAll();
     const r = (await send) as Record<string, unknown>;
     expect(r.ok, "an uncontended send must pass").toBe(true);
   });
