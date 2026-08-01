@@ -271,7 +271,7 @@ function defined(params: Record<string, unknown>): Record<string, unknown> {
 export const IPC_METHODS = {
   agents: "cello_list_agents",
   "start-agent": "cello_start_agent",
-  "set-agent-offline": "cello_set_agent_offline",
+  "set-agent-offline": "cello_stop_agent",
   "use-agent": "cello_use_agent",
   "stop-using-agent": "cello_stop_using_agent",
   inbox: "cello_check_notifications",
@@ -330,17 +330,45 @@ export async function setAgentOffline(celloDir: string, name: string, opts: Pari
 }
 
 /**
- * `cello stop-using-agent` → cello_stop_using_agent. The opposite of `use-agent`.
+ * `cello stop-using-agent` — forget the CLI's persisted selection.
  *
- * Clears the persisted selection unconditionally — the CLI's durable mirror IS the selection for a
- * process that dies between invocations, so leaving the file behind would make the release a no-op
- * from the next command's point of view: it would replay `cello_use_agent` and re-attend the agent
- * the operator just released. Not agent-scoped (there is no agent to replay).
+ * IT DOES NOT RELEASE A LIVE MCP SESSION, AND MUST NOT CLAIM TO. Attendance is PER-CONNECTION. The
+ * MCP shim holds one long-lived socket, which is what `isAttended()` sees; every CLI invocation is a
+ * fresh ephemeral connection that starts with `currentAgent: null` and dies microseconds later. So
+ * calling the daemon handler from here would always take its idempotent branch and answer "this
+ * connection was not attending any agent" — true of the socket, and worthless to the operator, whose
+ * agent is attended somewhere else entirely.
+ *
+ * That is exactly the gesture to expect: attended in Claude Code, step over to a terminal, run
+ * `cello stop-using-agent`. Passing the daemon's reply through would print "nothing to release",
+ * exit 0, delete the persisted selection, and leave the agent attended with its away message still
+ * suppressed — a success message for the opposite of what happened, which is the same class of
+ * defect as the name that started all this (review finding 2).
+ *
+ * So the CLI reports ITS OWN effect and names the half it cannot reach. The daemon call is skipped
+ * rather than made-and-ignored: an IPC round-trip whose answer we would discard is not honesty, it
+ * is theatre.
  */
 export async function stopUsingAgent(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
-  const out = await ipcCommand(celloDir, IPC_METHODS["stop-using-agent"], {}, opts, false);
-  if (out.exitCode === 0) await clearCurrentAgent(celloDir);
-  return out;
+  const previous = await readCurrentAgent(celloDir);
+  await clearCurrentAgent(celloDir);
+  return emitIpcResult(
+    previous
+      ? {
+          ok: true,
+          cleared: previous,
+          guidance:
+            `Forgot the persisted CLI selection '${previous}'. A live MCP session attending this agent is ` +
+            `NOT released — do that in the session itself with cello_stop_using_agent. To make the agent ` +
+            `stop answering everywhere, use 'cello set-agent-offline ${previous}'.`,
+        }
+      : {
+          ok: true,
+          cleared: null,
+          guidance: "No CLI agent selection was persisted, so there was nothing to forget.",
+        },
+    opts,
+  );
 }
 
 /**

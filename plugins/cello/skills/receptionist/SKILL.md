@@ -151,3 +151,21 @@ After the receptionist reports an arrival, the operator typically:
 | **Role** | Resolves agent, checks inbox, announces arrivals | Conducts a full two-way exchange |
 | **Signal tokens** | N/A | `over` / `standby` / `wrap` required on every send |
 | **When to use** | Staffing an agent's front desk | Active conversation between two agents |
+
+## Ending the shift
+
+Staffing a desk is not free: while you hold it, that agent is **attended**, so its away
+autoresponder never fires and anyone who calls gets your live reply instead of "they're away."
+When you stop staffing, hand the desk back:
+
+```
+cello_stop_using_agent()
+```
+
+The agent stays **online and reachable** — it simply starts answering with its own away message
+again. Do NOT use `cello_set_agent_offline` for this: that takes the agent off the air entirely,
+inbound sessions are refused with `counterparty_did_not_accept`, and no away message can be sent
+because nothing is listening.
+
+If you walk away still holding the desk, the agent's answering machine stays silent — the same
+failure this skill asks you to avoid by not guessing which desk to staff.

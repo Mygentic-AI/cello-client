@@ -131,7 +131,7 @@ const server = new McpServer(
 
 // ─── Agent management tools ─────────────────────────────────────────────────
 
-server.tool("cello_start_agent", "Bring a registered CELLO agent online so it can participate in sessions", {
+server.tool("cello_start_agent", "BRING AN AGENT ONLINE so it can participate in sessions — the lifecycle axis (reverse: cello_set_agent_offline). This does NOT make the agent yours to drive: it stays unattended, so it answers inbound sessions with its away message. Use cello_use_agent to attend it.", {
   name: z.string().describe("Agent name to start"),
 }, async ({ name }) => {
   const result = await proxy.call("cello_start_agent", { name });
@@ -141,7 +141,7 @@ server.tool("cello_start_agent", "Bring a registered CELLO agent online so it ca
 server.tool("cello_set_agent_offline", "TAKE AN AGENT OFFLINE — back to registered state, tearing down its standing receiver so it can no longer be reached at all. Reversible with cello_start_agent. This is the opposite of cello_start_agent, NOT of cello_use_agent: inbound sessions to an offline agent are REFUSED (counterparty_did_not_accept), and it cannot send an away message because nothing is listening. To step away while STAYING reachable, use cello_stop_using_agent instead.", {
   name: z.string().describe("Agent name to take offline"),
 }, async ({ name }) => {
-  const result = await proxy.call("cello_set_agent_offline", { name });
+  const result = await proxy.call("cello_stop_agent", { name });
   return jsonText(result);
 });
 

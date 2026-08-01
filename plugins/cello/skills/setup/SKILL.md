@@ -117,6 +117,16 @@ cello contact set-away <pubkey> "Back Monday."     # what ONE specific peer hear
 `cello_use_agent` marks it attended and silences its autoresponder — which is why the `receptionist`
 skill refuses to guess which desk to staff.
 
+To actually go away, **release the agent** — do not take it offline:
+
+```
+cello_stop_using_agent()          # attendance ends; agent stays ONLINE and answers with its away text
+cello_set_agent_offline({ name }) # WRONG for this — the agent goes deaf and inbound sessions are REFUSED
+```
+
+The second one looks like the way to step away and is not: an offline agent cannot send an away
+message, because nothing is listening to receive the session in the first place.
+
 ### Security guards
 
 ```bash

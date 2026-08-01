@@ -376,7 +376,7 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
     const expected: Record<string, string> = {
       cello_list_agents: "agents",
       cello_start_agent: "start-agent",
-      cello_set_agent_offline: "set-agent-offline",
+      cello_stop_agent: "set-agent-offline",
       cello_use_agent: "use-agent",
       cello_check_notifications: "inbox",
       cello_get_transcript: "transcript",
@@ -389,6 +389,14 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
       // `cello receipts`. It is not: `receipts` calls cello_get_relay_receipts, a DIFFERENT handler.
       // The notarized bilateral seal receipt had no CLI surface; this is it.
       cello_get_sealed_receipt: "sealed-receipt",
+      // cello_stop_using_agent is DELIBERATELY ABSENT, and this is the one exemption that is about
+      // semantics rather than an unimplemented stub. Attendance is PER-CONNECTION: the MCP shim's
+      // long-lived socket is what isAttended() sees, while every CLI invocation is a fresh ephemeral
+      // connection that starts with currentAgent: null. A CLI pass-through would therefore ALWAYS
+      // take the handler's idempotent branch and print "nothing to release" — a success message for
+      // the opposite of what the operator asked for. So `cello stop-using-agent` exists but clears
+      // the CLI's own persisted selection and says exactly that; it does not proxy the handler.
+      // See stopUsingAgent() in parity-commands.ts. Do not "restore parity" by wiring it through.
     };
     for (const [tool, cliName] of Object.entries(expected)) {
       const spec = findCommand(cliName);

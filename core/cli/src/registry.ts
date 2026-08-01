@@ -370,12 +370,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "stop-using-agent",
     group: "Agents",
-    summary: "Stop attending the current agent, leaving it online and reachable.",
+    summary: "Forget the CLI's persisted agent selection (does NOT release a live MCP session).",
     help:
-      "Usage: cello stop-using-agent [--pretty]  — release the current agent without taking it offline.\n" +
-      "  The opposite of 'cello use-agent'. The agent stays ONLINE, so inbound sessions still open and\n" +
-      "  are answered with its away message instead of a live reply.",
-    ipcMethod: IPC_METHODS["stop-using-agent"],
+      "Usage: cello stop-using-agent [--pretty]  — forget the selection made by 'cello use-agent'.\n" +
+      "  Attendance is PER-CONNECTION: this clears the CLI's own durable selection only. An agent being\n" +
+      "  attended by a live MCP session stays attended — release it THERE (cello_stop_using_agent) if you\n" +
+      "  want its away message to start firing. To stop it answering everywhere: 'cello set-agent-offline'.",
     jsonOut: true,
     async run(ctx, args) {
       const { pretty } = parityOpts(args);

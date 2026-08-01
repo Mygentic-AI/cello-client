@@ -315,6 +315,29 @@ export class IpcProxy {
         this.#currentAgent = params["name"] as string;
       }
     }
+
+    // EVERY DE-SELECTION MUST CLEAR THE CACHE, or #replayHandshake silently undoes it.
+    //
+    // The cache had a set path and no clear path, and #replayHandshake replays `cello_use_agent`
+    // after every reconnect — a handler that AUTO-STARTS the agent. So:
+    //
+    //   • release to go away → socket drops (daemon restart, `cello logout/login`, /mcp reconnect)
+    //     → the shim re-attends → isAttended() is true again → the away message stops firing, with
+    //     nothing in any log saying the release was reverted. The bug this tool exists to fix, back
+    //     on a timer.
+    //   • take an agent offline → reconnect → replay AUTO-STARTS it. An agent the operator
+    //     deliberately took offline comes back online and reachable, silently. That is
+    //     kill-switch-adjacent, and it contradicted parity-commands.ts's own claim that "the MCP
+    //     surface never does this". Pre-existing; found by the same review, fixed here with it.
+    const cleared = result as { ok?: boolean } | null;
+    if (cleared?.ok === true) {
+      if (method === "cello_stop_using_agent") {
+        this.#currentAgent = null;
+      } else if (method === "cello_stop_agent" && params?.["name"] === this.#currentAgent) {
+        // Wire name — the TOOL is cello_set_agent_offline (see agent-handlers.ts on why they differ).
+        this.#currentAgent = null;
+      }
+    }
     return result;
   }
 

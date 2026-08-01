@@ -31,7 +31,7 @@ import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
 
-interface AgentList { agents: Array<{ name: string; state: string; selected?: boolean }> }
+interface AgentList { agents: Array<{ name: string; state: string; selected?: boolean; standing_receiver_ready?: boolean }> }
 
 describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
   let tempDir: string;
@@ -100,18 +100,38 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
   });
 
   // THE LOAD-BEARING ONE. A release that took the agent offline would reproduce the exact bug this
-  // tool was built to fix, and every other assertion here would still pass.
-  it("LEAVES THE AGENT ONLINE — this is the whole difference from set_agent_offline", async () => {
+  // tool was built to fix, and every other assertion in this file would still pass.
+  //
+  // `state: "online"` ALONE IS NOT ENOUGH, and the first version of this test made that mistake.
+  // `state` is derived purely from the `onlineAgents` Set, and `agent.offline` is logged only inside
+  // the set-offline handler — so this implementation passed both:
+  //
+  //     connState.currentAgent = null;
+  //     await sessionNodeManager.removeStandingReceiverForAgent(fromAgent);  // ← agent is now deaf
+  //
+  // onlineAgents still holds alice, so `state` reads "online"; no `agent.offline` fires. The agent
+  // is unreachable and every assertion is green — and it is WORSE than being offline, because
+  // cello_use_agent sees `onlineAgents.has(name)`, skips the autostart, and never re-arms the
+  // receiver. So assert REACHABILITY, which is the property the operator actually has.
+  it("LEAVES THE AGENT ONLINE AND REACHABLE — the whole difference from set_agent_offline", async () => {
     const config = await setupWithAgents("alice");
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
     await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
+
+    const before = await client.send("cello_list_agents") as AgentList;
+    expect(before.agents.find((a) => a.name === "alice")?.standing_receiver_ready).toBe(true);
+
     await client.send("cello_stop_using_agent", {});
 
-    const list = await client.send("cello_list_agents") as AgentList;
-    expect(list.agents.find((a) => a.name === "alice")?.state).toBe("online");
+    const after = await client.send("cello_list_agents") as AgentList;
+    const alice = after.agents.find((a) => a.name === "alice");
+    expect(alice?.state).toBe("online");
+    // The assertion that kills the bypass: the standing receiver is what accepts inbound sessions
+    // and produces the away reply. Tear it down and the agent is deaf while still reading "online".
+    expect(alice?.standing_receiver_ready).toBe(true);
 
     // And no lifecycle transition was logged — releasing is not a state change for the agent.
     expect(logEvents.filter((e) => e.event === "agent.offline")).toHaveLength(0);
@@ -172,8 +192,11 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
 
     // With alice the sole online agent and no explicit selection, an agent-scoped call must still
     // resolve to her. If the release had set clearedAgent, this would refuse with no_current_agent.
-    const contacts = await client.send("cello_contact_list", {}) as { ok?: boolean; reason?: string };
-    expect(contacts.reason).not.toBe("no_current_agent");
+    // Asserted POSITIVELY. `expect(reason).not.toBe("no_current_agent")` was satisfiable by any
+    // unrelated failure shape — a test that passes when the call breaks for a different reason.
+    const contacts = await client.send("cello_contact_list", {}) as { ok?: boolean; agent?: string; reason?: string };
+    expect(contacts.ok).toBe(true);
+    expect(contacts.agent).toBe("alice");
   });
 
   // Attendance is PER-CONNECTION: one session releasing must not yank the agent out from under

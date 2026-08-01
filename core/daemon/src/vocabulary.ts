@@ -146,6 +146,11 @@ export const DEAD_CLI_VERBS: readonly string[] = [
   // No replacement to point at: this was an alias of `cello receive` (same daemon handler) whose
   // help claimed an accept/join step CELLO does not have. Listed so no string can offer it again.
   "cello receive-session",
+  // Renamed to `cello set-agent-offline` (DOD-RELEASE-1). It was added to the CLI DISPATCH guard
+  // in cli-args.test.ts — "can you type it" — but that guard is blind to the thing this list
+  // exists for: a daemon STRING offering the verb to an operator. Same gap that leaked
+  // `cello register`.
+  "cello stop-agent",
 ];
 
 /**

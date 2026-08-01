@@ -27,6 +27,7 @@ import {
   listAgents,
   startAgent,
   setAgentOffline,
+  stopUsingAgent,
   useAgent,
   inbox,
   listSessions,
@@ -285,6 +286,39 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       expect(await readCurrentAgent(tempDir)).toBeUndefined(); // the durable mirror follows the daemon
     });
 
+    // ─── DOD-RELEASE-1: `cello stop-using-agent` must report ITS OWN effect ───
+
+    it("stop-using-agent forgets the persisted selection and NAMES the agent it forgot", async () => {
+      // The version this replaces passed the daemon's reply straight through. Attendance is
+      // per-connection and every CLI invocation is a fresh ephemeral connection starting with
+      // currentAgent: null, so the handler ALWAYS took its idempotent branch: the operator saw
+      // "This connection was not attending any agent. Nothing to release." exit 0 — while the
+      // persisted selection was in fact deleted. A success message for the opposite of what
+      // happened, which is the same class of defect as the name that started all of this.
+      await createAgent(tempDir, "alice");
+      await useAgent(tempDir, "alice", {});
+      expect(await readCurrentAgent(tempDir)).toBe("alice");
+
+      const out = await stopUsingAgent(tempDir, {});
+      expect(out.exitCode).toBe(0);
+      const body = JSON.parse(out.stdout) as { ok: boolean; cleared: string | null; guidance: string };
+      expect(body.ok).toBe(true);
+      expect(body.cleared).toBe("alice");
+      expect(await readCurrentAgent(tempDir)).toBeUndefined();
+
+      // It must NOT claim the away-message effect it cannot deliver from here: a live MCP session
+      // attending this agent keeps attending it, and its away message stays suppressed.
+      expect(body.guidance).toContain("NOT released");
+    });
+
+    it("stop-using-agent says nothing was persisted rather than inventing a release", async () => {
+      const out = await stopUsingAgent(tempDir, {});
+      expect(out.exitCode).toBe(0);
+      const body = JSON.parse(out.stdout) as { ok: boolean; cleared: string | null };
+      expect(body.ok).toBe(true);
+      expect(body.cleared).toBeNull();
+    });
+
     it("F1: an OFFLINE selected agent fails LOUD rather than being auto-started by a read", async () => {
       await createAgent(tempDir, "alice");
       // Persist a selection, then take the agent offline WITHOUT going through setAgentOffline (so the
@@ -296,7 +330,7 @@ describe("DOD-CLI-PARITY-1: Group A + Group B against a REAL daemon", () => {
       const lock = await readLock(join(tempDir, "daemon.lock"));
       const c = await connectToDaemon(lock!.socketPath);
       await c.send("ipc.connect", { clientType: "test" });
-      await c.send("cello_set_agent_offline", { name: "alice" });
+      await c.send("cello_stop_agent", { name: "alice" });
       c.close();
       expect(await readCurrentAgent(tempDir)).toBe("alice"); // selection still there, agent offline
 

@@ -152,7 +152,7 @@ describe("MCP-002: notification routing", () => {
     const notifA = collectNotifications(clientA);
     const notifB = collectNotifications(clientB);
 
-    await clientA.send("cello_set_agent_offline", { name: "alice" });
+    await clientA.send("cello_stop_agent", { name: "alice" });
     await waitForNotifications();
 
     const stateA = notifA.filter((n) => n.notification === "agent_state_changed");
@@ -500,7 +500,7 @@ describe("MCP-002: notification routing", () => {
     const client = await connect(config.socketPath);
 
     await client.send("cello_start_agent", { name: "alice" });
-    await client.send("cello_set_agent_offline", { name: "alice" });
+    await client.send("cello_stop_agent", { name: "alice" });
 
     const offlineEvent = logEvents.find((e) => e.event === "agent.offline");
     expect(offlineEvent).toBeDefined();

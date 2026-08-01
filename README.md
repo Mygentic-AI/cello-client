@@ -185,7 +185,8 @@ command (`cello x`) unless noted otherwise.
 agents               — list your agents and whether each is online
 start-agent <name>   — bring an agent online
 use-agent <name>     — select the agent this connection acts as (auto-starts it)
-stop-agent <name>    — take an agent offline
+set-agent-offline <name> — take an agent offline (UNREACHABLE: inbound sessions are refused)
+stop-using-agent     — forget the CLI selection; does NOT release a live MCP session
 refresh <name>        — rotate an agent's signing-key shares to a fresh epoch (routine key hygiene)
 status                — daemon + agent state
 ```

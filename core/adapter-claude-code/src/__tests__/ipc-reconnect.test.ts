@@ -163,6 +163,82 @@ describe("RECONNECT-001: IpcProxy auto-reconnects after a daemon restart", () =>
     proxy.close();
   }, 20_000);
 
+  // ─── DOD-RELEASE-1: the replay must not resurrect a de-selection ───
+  //
+  // The cache above had a SET path and no CLEAR path, so every de-selection verb was silently undone
+  // by the next reconnect. These are the two ways that hurt, and neither was covered.
+
+  it("a released agent is NOT re-attended on reconnect", async () => {
+    // Release to go away → socket drops → the shim replays cello_use_agent → isAttended() is true
+    // again → the away message stops firing, with nothing in any log saying so. The exact bug
+    // cello_stop_using_agent exists to fix, resurrected on a timer.
+    const { IpcProxy } = await import("../ipc-proxy.js");
+    const socketPath = join(tempDir, "d.sock");
+    daemon = await fakeDaemon(socketPath, []);
+
+    const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    await proxy.connect();
+    await proxy.call("ipc.connect", { clientType: "mcp" });
+    await proxy.call("cello_use_agent", { name: "Ms_Chelly" });
+    await proxy.call("cello_stop_using_agent", {});
+
+    await killDaemon(daemon, socketPath);
+    const second: string[] = [];
+    daemon = await fakeDaemon(socketPath, second);
+    await proxy.call("cello_status");
+
+    expect(second).not.toContain("cello_use_agent");
+    expect(second).toContain("ipc.connect");
+    proxy.close();
+  }, 20_000);
+
+  it("an agent taken OFFLINE is not silently auto-started by the reconnect replay", async () => {
+    // cello_use_agent AUTO-STARTS an offline agent, so replaying it after a deliberate
+    // set-agent-offline brings the agent back online and reachable with no signal — kill-switch
+    // adjacent, and it contradicted parity-commands.ts's own claim that the MCP surface never does
+    // this. (Pre-existing; found by the same review as the release case and fixed with it. The wire
+    // method is still cello_stop_agent — the TOOL is cello_set_agent_offline.)
+    const { IpcProxy } = await import("../ipc-proxy.js");
+    const socketPath = join(tempDir, "d.sock");
+    daemon = await fakeDaemon(socketPath, []);
+
+    const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    await proxy.connect();
+    await proxy.call("ipc.connect", { clientType: "mcp" });
+    await proxy.call("cello_use_agent", { name: "Ms_Chelly" });
+    await proxy.call("cello_stop_agent", { name: "Ms_Chelly" });
+
+    await killDaemon(daemon, socketPath);
+    const second: string[] = [];
+    daemon = await fakeDaemon(socketPath, second);
+    await proxy.call("cello_status");
+
+    expect(second).not.toContain("cello_use_agent");
+    proxy.close();
+  }, 20_000);
+
+  it("taking a DIFFERENT agent offline leaves the current selection replayed", async () => {
+    // The clear is conditional on the name matching. Without that guard, taking any unrelated agent
+    // offline would drop routing for the agent this connection is actually driving.
+    const { IpcProxy } = await import("../ipc-proxy.js");
+    const socketPath = join(tempDir, "d.sock");
+    daemon = await fakeDaemon(socketPath, []);
+
+    const proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    await proxy.connect();
+    await proxy.call("ipc.connect", { clientType: "mcp" });
+    await proxy.call("cello_use_agent", { name: "Ms_Chelly" });
+    await proxy.call("cello_stop_agent", { name: "SomeoneElse" });
+
+    await killDaemon(daemon, socketPath);
+    const second: string[] = [];
+    daemon = await fakeDaemon(socketPath, second);
+    await proxy.call("cello_status");
+
+    expect(second).toContain("cello_use_agent");
+    proxy.close();
+  }, 20_000);
+
   it("never replays an in-flight request (cello_send must not double-send)", async () => {
     const { IpcProxy } = await import("../ipc-proxy.js");
     const socketPath = join(tempDir, "d.sock");

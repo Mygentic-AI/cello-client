@@ -279,10 +279,18 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     return { ok: true, name, agentId, oneWay: true, directoryRevocation, guidance: baseLine + dirLine };
   });
 
-  // ─── MCP-001: cello_set_agent_offline handler (was cello_set_agent_offline) ───
+  // ─── MCP-001: the `cello_set_agent_offline` TOOL — wire method still `cello_stop_agent` ───
   //
-  // RENAMED because the old name described the wrong axis and cost real confusion. There are two
-  // independent things an operator does to an agent:
+  // THE WIRE NAME DELIBERATELY DID NOT MOVE WITH THE TOOL. connect and daemon ship as separate npm
+  // packages and connect has no daemon dependency, so a NEW daemon must keep serving an OLD shim.
+  // Renaming the IPC method would break that pairing silently — the operator's only symptom being a
+  // tool that stopped existing. This is the same tool↔wire divergence that
+  // dod-onboard-help-1-tool-parity.test.ts states and guards for cello_list_agents /
+  // cello_list_sessions / cello_set_moniker. Renaming the wire here was caught in review before it
+  // shipped; do not "tidy" it later.
+  //
+  // The TOOL was renamed because the old name described the wrong axis and cost real confusion.
+  // There are two independent things an operator does to an agent:
   //
   //   lifecycle  — cello_start_agent  / cello_set_agent_offline    (offline ⇄ online)
   //   attendance — cello_use_agent    / cello_stop_using_agent  (who this connection drives)
@@ -296,7 +304,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   // The deselect half genuinely did not exist: `cello_use_agent` requires a name, so a connection
   // could SWITCH agents but never LET GO of one. The only way to clear a selection was to shut the
   // agent down, which is why the two verbs collapsed into each other.
-  handlers.set("cello_set_agent_offline", async (params, _connectionId) => {
+  handlers.set("cello_stop_agent", async (params, _connectionId) => {
     const name = params?.name as string | undefined;
     if (!name) {
       return { ok: false, reason: "missing_params", guidance: "Provide 'name' parameter with the agent name to stop." };
@@ -354,23 +362,37 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       return { ok: false, reason: "connection_not_registered", guidance: "Send ipc.connect frame before calling agent tools." };
     }
     const fromAgent = connState.currentAgent;
+
+    // CLEARED ON BOTH BRANCHES, including the one that releases nothing. `clearedAgent` means "this
+    // connection's choice was taken away from it, do not guess a replacement" — it is set when an
+    // agent is taken offline or removed UNDERNEATH a connection. A release is the opposite: the
+    // operator is deliberately choosing to hold nothing. Leaving the flag set would mean the one
+    // gesture that explicitly says "I hold nothing, on purpose" left the connection locked out of
+    // the sole-online fallback for the rest of the session, which only cello_use_agent could undo.
+    // (Review finding 6 — the original code cleared it on neither branch while its own comment
+    // argued it should.)
+    delete connState.clearedAgent;
+
     if (!fromAgent) {
       // Idempotent, and says so — releasing nothing is not an error worth failing a script over.
       return { ok: true, released: null, guidance: "This connection was not attending any agent. Nothing to release." };
     }
     connState.currentAgent = null;
-    // DELIBERATELY NOT setting `clearedAgent`. That flag exists to refuse the sole-online fallback
-    // for a connection whose selection was TAKEN AWAY under it (the agent was shut down or removed)
-    // — "this connection had an intent, do not guess a replacement". A release is the opposite: the
-    // operator is choosing to hold nothing, and should be free to be handed the sole online agent
-    // again by the normal fallback rather than being locked out of it for the rest of the session.
     getNotificationDispatcher().setCurrentAgent(connectionId, null);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, null);
     logger.info("agent.current.released", { connectionId, fromAgent });
     return {
       ok: true,
       released: fromAgent,
-      guidance: `No longer attending '${fromAgent}'. It stays ONLINE and reachable — inbound sessions will now get its away message instead of a live reply.`,
+      // The fallback caveat is stated because omitting it is how this tool would mislead the very
+      // operator it was built for. "Step away" reads as "nothing I do now acts as that agent" — but
+      // if it is the ONLY agent online, agent-scoped calls with no explicit `agent` still resolve to
+      // it via the sole-online fallback, and cello_send would happily send as them, ok:true.
+      guidance:
+        `No longer attending '${fromAgent}'. It stays ONLINE and reachable — inbound sessions now get ` +
+        `its away message instead of a live reply. NOTE: if it is the only agent online, agent-scoped ` +
+        `calls without an explicit 'agent' still resolve to it; pass 'agent' explicitly, or take it ` +
+        `offline with cello_set_agent_offline if you want those calls to refuse.`,
     };
   });
 
