@@ -24,6 +24,7 @@ import type { SignalingManager, CelloNode } from "@cello-protocol/transport";
 import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto";
 
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { countAttendance } from "./co-attendance.js";
 
 export interface AgentHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -455,10 +456,32 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     getNotificationDispatcher().setCurrentAgent(connectionId, name);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, name);
     logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name });
+    // ─── DOD-COATTEND-VISIBLE-1 AC4: you find out at ATTACH time that you are not alone ───
+    //
+    // Attach is NOT refused, and must never become refusable: exclusivity is rejected permanently
+    // (spec §3 — connections die constantly, so a refusal only relocates the hard part into a
+    // takeover protocol; it buys no cryptographic property; and it forecloses listener mode). The
+    // count is set AFTER the assignment above, so it includes this connection: joining a lone
+    // session reads 2, which is the number the operator can act on.
+    const attendance = countAttendance(perConnectionState, name);
+    if (attendance > 1) {
+      logger.info("agent.attend.coattended", { connectionId, agentName: name, attendance });
+    }
     // M8C-AUTOSTART-1 (A3, D12): not_registered is a NON-BLOCKING warning — the agent is selected
     // and usable locally, but it cannot establish directory sessions until registered. Surface the
     // next step (ONBOARD-NEXTSTEP style) without stranding the selection. One-row read.
-    const result: Record<string, unknown> = { ok: true };
+    const result: Record<string, unknown> = { ok: true, attendance };
+    if (attendance > 1) {
+      // Says what is true and what to do about it, in that order — and does NOT tell the operator
+      // to go away, because co-attending is allowed. What they need to know is that a message can
+      // be delivered to the OTHER session, and where it will still be readable when it is.
+      result["co_attendance"] = true;
+      result["co_attendance_guidance"] =
+        `${attendance} sessions are attending '${name}' (including this one). That is allowed — but an ` +
+        `arriving message is delivered to whichever session reads it first, so cello_receive here may ` +
+        `return nothing while the other session gets it. Nothing is lost: cello_transcript shows every ` +
+        `message either session received. Use cello_stop_using_agent if you did not intend to share it.`;
+    }
     try {
       const reg = await new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName: name, logger }).loadRegistrationState();
       if (!reg || reg.status !== "active") {

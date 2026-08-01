@@ -100,6 +100,7 @@ import { DbRegistryVersionStore } from "./registry-version-store-db.js";
 import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 
 
@@ -867,6 +868,18 @@ async function startDaemonHoldingLock(
     for (const s of perConnectionState.values()) if (s.currentAgent === agentName) return true;
     return false;
   }
+  // DOD-COATTEND-VISIBLE-1: the COUNT, deliberately kept separate from the boolean above. Several
+  // sessions attending one agent is legitimate and permanent (co-attendance, not exclusivity — spec
+  // §3); what was missing is that nobody was ever TOLD. `isAttended` is left byte-identical because
+  // M8C-AWAY-1's auto-ack suppression hangs off its early return, and both read the same
+  // `currentAgent` map the doorbell routes on, so the count can never disagree with who gets woken.
+  function attendanceCount(agentName: string): number {
+    return countAttendance(perConnectionState, agentName);
+  }
+  // Which connection consumed which leaf, so the session that finds an empty buffer can be told
+  // whether its counterparty is quiet or its sibling was faster. Written at the destructive drain in
+  // session-content-handlers; read at that handler's timeout. Delivery itself is unchanged.
+  const contentTakes = new ContentTakeLedger();
   // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
   // the call site so it names the specific away agent.
   // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
@@ -1535,6 +1548,10 @@ async function startDaemonHoldingLock(
           // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
           standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+          // DOD-COATTEND-VISIBLE-1 AC2: how many sessions are driving this agent, including this
+          // one. Live, not a high-water mark — it drops when a session disconnects. `selected` says
+          // whether YOU hold it; this says whether anyone else does too.
+          attendance: countAttendance(perConnectionState, a.name),
         };
       });
   }
@@ -2949,6 +2966,8 @@ async function startDaemonHoldingLock(
     advanceConnectionCursor,
     safeCursorAdvance,
     clearTelegramRung,
+    attendanceCount,
+    contentTakes,
   });
 
   // cello_check_notifications (notification-handlers.ts): the push-loss reconciler. Notifications are

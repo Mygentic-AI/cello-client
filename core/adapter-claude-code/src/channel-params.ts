@@ -50,8 +50,18 @@ function renderWho(data: Record<string, unknown>): string {
  *  meta attributes, where tools read them). */
 function doorbellText(type: string, data: Record<string, unknown>): string {
   switch (type) {
-    case "cello_message":
-      return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.`;
+    case "cello_message": {
+      // DOD-COATTEND-VISIBLE-1 AC2: when more than one session attends this agent, the doorbell says
+      // so IN THE BODY. The count already rides as a `meta` attribute, but the body is what the
+      // operator's agent actually reads, and the whole point of this line is that a session which
+      // gets nothing back from cello_receive should already know why. Still content-free: a count of
+      // attending sessions is routing metadata and says nothing about what arrived.
+      const attending = Number(data["attendance"]);
+      const shared = Number.isFinite(attending) && attending > 1
+        ? ` ${attending} sessions are attending this agent, so the other one may read it first — if cello_receive returns nothing, run cello_transcript.`
+        : "";
+      return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.${shared}`;
+    }
     case "cello_session_request":
       return `📞 CELLO — ${renderWho(data)} wants to connect. Run cello_await_session to accept.`;
     case "session_state_changed": {

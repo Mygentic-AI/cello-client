@@ -18,6 +18,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
+import type { ContentTakeLedger } from "./co-attendance.js";
 
 export interface SessionContentDeps {
   handlers: Map<string, IpcHandler>;
@@ -35,6 +36,14 @@ export interface SessionContentDeps {
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   /** M8C-TGDOOR-1: a read clears the doorbell's ring-once-until-read. */
   clearTelegramRung: (agentName: string, sessionId: string) => void;
+  /** DOD-COATTEND-VISIBLE-1: how many connections attend this agent right now (reporting only). */
+  attendanceCount: (agentName: string) => number;
+  /**
+   * DOD-COATTEND-VISIBLE-1: which connection consumed which leaf. Written here, at the one place
+   * the destructive drain happens, and read at the timeout to tell a robbed caller apart from a
+   * quiet counterparty. It does not change delivery — the drain stays `buf.shift()`.
+   */
+  contentTakes: ContentTakeLedger;
 }
 
 export function registerSessionContentHandlers(deps: SessionContentDeps): void {
@@ -42,6 +51,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     handlers, logger, sessionNodeManager, securityGateway, retryQueue,
     getConnState, resolveCurrentAgent, NO_CURRENT_AGENT_RESPONSE,
     getConnectionCursor, advanceConnectionCursor, safeCursorAdvance, clearTelegramRung,
+    attendanceCount, contentTakes,
   } = deps;
 
   // ─── CELLO-M7-DAEMON-004: cello_send (live send + daemon-owned tree append) ──
@@ -413,6 +423,13 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       ? rawTimeout
       : RECEIVE_DEFAULT_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
+    // DOD-COATTEND-VISIBLE-1 AC3: before this line the plain blocking receive wrote NOTHING to the
+    // log on ANY outcome — the only event in the path was `session.receive.since_seq`, which is the
+    // OTHER branch — so a session having its message taken by a sibling left no trace anywhere, for
+    // the operator in the moment or for anyone reading the log afterwards. One correlationId threads
+    // every exit below.
+    const receiveCorrelationId = randomUUID();
+    const attendance = attendanceCount(agentName);
 
     for (;;) {
       // 1) Deliverable content wins — drain one buffered message per call (FIFO).
@@ -426,6 +443,14 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // was read — safeCursorAdvance refuses to vault past a gap (e.g. an unread sent leaf from
         // another local connection) even though this specific sequence number is now known.
         safeCursorAdvance(connectionId, sessionId, new Set([entry.sequenceNumber]));
+        // DOD-COATTEND-VISIBLE-1: this is the destructive drain — the message has just been REMOVED
+        // from every co-attending session's view. Record which connection took it, at the one place
+        // it happens, so a sibling that finds an empty buffer can be told why.
+        contentTakes.record(agentName, sessionId, connectionId, entry.sequenceNumber);
+        logger.info("session.receive.delivered", {
+          sessionId, agentName, connectionId, sequenceNumber: entry.sequenceNumber,
+          attendance, correlationId: receiveCorrelationId,
+        });
         const contentText = Buffer.from(entry.contentHex, "hex").toString("utf8");
         const trimmed = contentText.trimEnd();
         const signalGuidance =
@@ -451,6 +476,12 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       const terminal = sessionNodeManager.peekTerminalMarker(agentName, sessionId);
       if (terminal) {
         const sealedRoot = sessionNodeManager.getSealedRootHex(agentName, sessionId);
+        // AC3 covers "both outcomes" — got something / got nothing. This is the third exit from the
+        // same silent handler, and leaving it silent would reproduce the defect one branch over.
+        logger.info("session.receive.sealed", {
+          sessionId, agentName, connectionId, attendance,
+          unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
+        });
         return {
           ok: true,
           type: "session_sealed",
@@ -465,10 +496,51 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // 3) Out of time — non-blocking-equivalent empty answer.
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
+        const liveness = sessionNodeManager.getSessionLiveness(agentName, sessionId);
+        // ─── DOD-COATTEND-VISIBLE-1 AC1: the loser of the race gets a DIFFERENT answer ───
+        //
+        // The buffer is keyed (agentName, sessionId) and drained with `buf.shift()`, so when the
+        // multicast doorbell wakes two attending sessions the faster one REMOVES the message. Until
+        // this branch existed the slower one was told, word for word, what a quiet counterparty
+        // produces — and nothing was logged either, so the theft left no trace anywhere.
+        //
+        // The bar is this connection's own read cursor, not a time window: it reports content this
+        // connection genuinely has not seen, and it CLEARS itself once the caller catches up. The
+        // discriminator is `reason` — the field this very return already uses for its other branch —
+        // so a caller switching on it needs no new shape. `taken_by_sibling` carries the machine-
+        // readable detail; the prose below is the presentation of that, never a substitute for it.
+        const missed = contentTakes.missedBy(
+          agentName, sessionId, connectionId, getConnectionCursor(connectionId, sessionId),
+        );
+        if (missed) {
+          logger.warn("session.receive.taken_by_sibling", {
+            sessionId, agentName, connectionId, timeoutMs, attendance,
+            takenCount: missed.count, lastTakenSeq: missed.lastSequence, takenBy: missed.connections,
+            correlationId: receiveCorrelationId,
+          });
+          return {
+            ok: true,
+            content: null,
+            reason: "taken_by_sibling_session",
+            taken_by_sibling: {
+              count: missed.count,
+              last_sequence: missed.lastSequence,
+              connections: missed.connections,
+            },
+            attendance,
+            // A dead counterparty and a sibling theft are both true here; neither is hidden.
+            ...(liveness === "gone" ? { liveness } : {}),
+            guidance: `Another session attending '${agentName}' already received ${missed.count} message(s) on this session that you have not read (up to sequence ${missed.lastSequence}) — ${attendance} sessions are attending this agent right now. Nothing was lost: read what you missed with cello_transcript ${sessionId}, then reply. Do not resend your last message.`,
+          };
+        }
         // M8B F16: a dead session must not return the SAME null timeout as a
         // quiet-but-healthy one. The liveness signal (session.liveness.changed → gone,
         // tracked per session by the node manager) finally reaches the MCP surface here.
-        if (sessionNodeManager.getSessionLiveness(agentName, sessionId) === "gone") {
+        if (liveness === "gone") {
+          logger.info("session.receive.empty", {
+            sessionId, agentName, connectionId, timeoutMs, attendance,
+            liveness, correlationId: receiveCorrelationId,
+          });
           return {
             ok: true,
             content: null,
@@ -477,6 +549,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
           };
         }
+        logger.info("session.receive.empty", {
+          sessionId, agentName, connectionId, timeoutMs, attendance,
+          liveness, correlationId: receiveCorrelationId,
+        });
         return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history." };
       }
       await new Promise((r) => setTimeout(r, Math.min(20, remaining)));

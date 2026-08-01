@@ -1,6 +1,12 @@
 /**
  * CELLO-M8C-CURSOR-1 — per-connection, per-session read cursor (read-before-write gating)
  *
+ * M8D-D1: the daemon + two-connections-on-one-agent scaffolding this file used to define inline
+ * (FakeNode, FixedFactory, start, connectAs, seedReceived, msgLeafHash) now lives in
+ * `helpers/two-connection-fixture.ts`. It was EXTRACTED from here unchanged, because this was the
+ * only harness in the repo that could attend one agent from two connections and M8D needs exactly
+ * that. Every clause below keeps its original assertions; only the plumbing moved.
+ *
  * Clause coverage (M8C-BUILD-JOURNAL design note):
  * - C1: a fresh connection with unread history is refused cello_send with session_not_current +
  *   current_seq + last_read_seq + guidance, BEFORE any transmission attempt.
@@ -24,108 +30,32 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
-import { FileKeyProvider } from "@cello-protocol/crypto";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { startDaemon } from "../daemon.js";
-import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import type { Logger, DaemonConfig } from "../types.js";
-import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
-import type { CelloNode } from "@cello-protocol/transport";
-import type { Stream } from "@libp2p/interface";
-
-class FakeNode implements Partial<CelloNode> {
-  sent: Uint8Array[] = [];
-  readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getPeerId(): string { return this.#peerId; }
-  listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
-  async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, _h: unknown): Promise<void> {}
-  getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
-  onPeerConnect(_h: (p: string) => void): void {}
-  onPeerDisconnect(_h: (p: string) => void): void {}
-  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
-  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
-  async newStream(_peer: string, _proto: string): Promise<Stream> {
-    const sink = this.sent;
-    return { send(d: Uint8Array) { sink.push(d); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;
-  }
-}
-
-class FixedFactory implements ISessionNodeFactory {
-  constructor(private node: CelloNode) {}
-  async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return this.node; }
-}
+import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
 describe("M8C-CURSOR-1: per-connection read cursor", () => {
-  let tempDir: string;
-  let handle: Awaited<ReturnType<typeof startDaemon>> | null;
-  let clients: IpcClient[];
+  let fx: TwoConnectionFixture;
 
   beforeEach(async () => {
-    tempDir = await mkdtemp(join(tmpdir(), "cello-cursor-"));
-    handle = null;
-    clients = [];
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-cursor-" });
   });
 
   afterEach(async () => {
-    for (const c of clients) { try { c.close(); } catch { /* closed */ } }
-    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* stopped */ } }
-    await rm(tempDir, { recursive: true, force: true });
+    await fx.cleanup();
   });
-
-  async function makeAgentDir(name: string): Promise<void> {
-    const dir = join(tempDir, "agents", name);
-    await mkdir(dir, { recursive: true });
-    await FileKeyProvider.load(join(dir, "key"));
-  }
-
-  async function start(logger: Logger, node: CelloNode): Promise<Awaited<ReturnType<typeof startDaemon>>> {
-    const config: DaemonConfig = {
-    securityGateway: new PassthroughGatewayClient(),
-      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
-      maxConnections: 16, version: "0.0.1-test", logger, sessionNodeFactory: new FixedFactory(node),
-    };
-    const h = await startDaemon(config);
-    handle = h;
-    return h;
-  }
-
-  async function connectAs(agent: string): Promise<IpcClient> {
-    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
-    clients.push(client);
-    await client.send("ipc.connect", { clientType: "test" });
-    await client.send("cello_use_agent", { name: agent });
-    return client;
-  }
-
-  const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
   /** Seed a RECEIVED message the same way the real inbound-content path does: append the tree
    *  leaf (bumps message_count) AND the readable transcript row, so record.message_count reflects
    *  it exactly like production. */
-  function seedReceived(agent: string, sessionId: string, text: string): number {
-    const snm = handle!.getSessionNodeManager();
-    const { leafIndex } = snm.appendSessionLeaf(agent, sessionId, "msg", "aa".repeat(32), "seed");
-    snm.recordTranscriptMessage(agent, sessionId, leafIndex, "received", new TextEncoder().encode(text), "seed");
-    return leafIndex;
-  }
+  const seedReceived = (agent: string, sessionId: string, text: string): number =>
+    fx.seedReceived(agent, sessionId, text);
 
   const SID = "cd".repeat(32);
 
   it("C1: a fresh connection with unread history is refused session_not_current with current_seq/last_read_seq/guidance", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
     seedReceived("alice", SID, "hello from bob"); // message_count → 1, currentSeq → 0
 
-    const client = await connectAs("alice");
+    const client = await fx.connectAs("alice");
     const res = (await client.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
     expect(res).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
     // DOD-ONBOARD-HELP-1 §5: assert the SUBSTANCE, not the spelling. The daemon now renders the
@@ -137,12 +67,10 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   });
 
   it("C2: cello_get_transcript advances the cursor and unblocks the send", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
     seedReceived("alice", SID, "hello from bob");
 
-    const client = await connectAs("alice");
+    const client = await fx.connectAs("alice");
     const blocked = (await client.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
     expect(blocked.reason).toBe("session_not_current");
 
@@ -154,12 +82,10 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   });
 
   it("C3: sending auto-advances the sender's OWN cursor (no self-block on the next send)", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
     // Brand-new empty session: current_seq starts at -1, so the FIRST send needs no catch-up.
 
-    const client = await connectAs("alice");
+    const client = await fx.connectAs("alice");
     const first = (await client.send("cello_send", { session_id: SID, content: "hi" })) as Record<string, unknown>;
     expect(first.ok).toBe(true);
 
@@ -192,12 +118,10 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   // The clauses below are rewritten to lock the NEW boundary — including, explicitly, that the
   // counterparty half did NOT weaken.
   it("C4/C5 (rewritten, DOD-CURSOR-DURABLE-1): a second connection on the same agent is NO LONGER blocked by the first connection's own SENT message — but IS still blocked by unread COUNTERPARTY content", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
 
-    const connA = await connectAs("alice");
-    const connB = await connectAs("alice"); // second attended connection, SAME agent
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice"); // second attended connection, SAME agent
 
     const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
     expect(sendA.ok).toBe(true); // A's own send is never blocked
@@ -208,8 +132,7 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     expect(bNowAllowed.ok).toBe(true);
 
     // THE HALF THAT DID NOT WEAKEN: now the COUNTERPARTY speaks. Nobody on alice's side has read it.
-    const inbound = new TextEncoder().encode("from bob");
-    await h.getSessionNodeManager().ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-in");
+    await fx.ingestReceived("alice", SID, "from bob", "corr-in");
 
     const refused = (await connB.send("cello_send", { session_id: SID, content: "blind reply" })) as Record<string, unknown>;
     expect(refused).toMatchObject({ ok: false, reason: "session_not_current" });
@@ -222,42 +145,32 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   });
 
   it("C6 (rewritten, DOD-CURSOR-DURABLE-1): a fresh connection is no longer blocked by the agent's OWN prior send — this is the stateless-CLI path (a new process per command)", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
 
-    const conn1 = await connectAs("alice");
+    const conn1 = await fx.connectAs("alice");
     const sent = (await conn1.send("cello_send", { session_id: SID, content: "hi" })) as Record<string, unknown>;
     expect(sent.ok).toBe(true);
     conn1.close();
 
     // Exactly what `cello send` does twice in a row: a brand-new connectionId, cursor -1, on a
     // session that already has history. The only unread leaf is this agent's OWN message.
-    const conn2 = await connectAs("alice");
+    const conn2 = await fx.connectAs("alice");
     const res = (await conn2.send("cello_send", { session_id: SID, content: "again" })) as Record<string, unknown>;
     expect(res.ok).toBe(true);
   });
 
-  function msgLeafHash(content: Uint8Array): Uint8Array {
-    return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
-  }
-
   it("C7 (reviewer HIGH fix, live reproduction of the reported bypass): draining ONLY a later counterparty-received message must not silently unblock a send that skips an unread local-sent leaf", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
 
-    const connA = await connectAs("alice");
-    const connB = await connectAs("alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
 
     // leaf 0: connA sends (a LOCAL sent message connB has not read).
     const sendA = (await connA.send("cello_send", { session_id: SID, content: "from A" })) as Record<string, unknown>;
     expect(sendA.ok).toBe(true);
 
     // leaf 1: counterparty content arrives (received), buffered for delivery.
-    const inbound = new TextEncoder().encode("from counterparty");
-    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
+    await fx.ingestReceived("alice", SID, "from counterparty", "corr-inbound");
 
     // connB drains ONLY the buffered received content (leaf 1) via live cello_receive — it has
     // still never read leaf 0 (connA's sent message).
@@ -281,80 +194,73 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   // ─── DOD-CURSOR-DURABLE-1 — the new durable clauses ────────────────────────────────────────
   describe("DOD-CURSOR-DURABLE-1: read-before-write survives the connection", () => {
     it("D1 (the fix): a FRESH connection may send once the AGENT has read the counterparty — the stateless-CLI case", async () => {
-      await makeAgentDir("alice");
-      const h = await start(noopLogger, new FakeNode());
-      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      await fx.createSession(SID, "alice");
       seedReceived("alice", SID, "hello from bob");
 
       // Connection 1 = `cello receive`. It reads, advancing the PERSISTED watermark, then exits.
-      const reader = await connectAs("alice");
+      const reader = await fx.connectAs("alice");
       const got = (await reader.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
       expect(got.count).toBe(1);
       reader.close();
 
       // Connection 2 = `cello send`, a brand-new process. Its cursor is -1 and always will be.
       // Before this fix it was refused forever; now the agent's durable read unblocks it.
-      const sender = await connectAs("alice");
+      const sender = await fx.connectAs("alice");
       const res = (await sender.send("cello_send", { session_id: SID, content: "reply from bash" })) as Record<string, unknown>;
       expect(res.ok).toBe(true);
     });
 
     it("D2 (the guarantee HOLDS): unread counterparty content still refuses a fresh connection — the fix is not a bypass", async () => {
-      await makeAgentDir("alice");
-      const h = await start(noopLogger, new FakeNode());
-      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      await fx.createSession(SID, "alice");
       seedReceived("alice", SID, "hello from bob"); // NOBODY reads it
 
-      const sender = await connectAs("alice");
+      const sender = await fx.connectAs("alice");
       const res = (await sender.send("cello_send", { session_id: SID, content: "blind reply" })) as Record<string, unknown>;
       expect(res).toMatchObject({ ok: false, reason: "session_not_current", unread_received: 1 });
 
       // ...and it stays refused across a reconnect. The block is durable, not an artifact of one socket.
       sender.close();
-      const sender2 = await connectAs("alice");
+      const sender2 = await fx.connectAs("alice");
       const again = (await sender2.send("cello_send", { session_id: SID, content: "still blind" })) as Record<string, unknown>;
       expect(again).toMatchObject({ ok: false, reason: "session_not_current" });
     });
 
     it("D3 (AC3 + hole safety): cello_get_transcript advances the PERSISTED watermark, and a gap in the transcript keeps later messages unread", async () => {
-      await makeAgentDir("alice");
-      const h = await start(noopLogger, new FakeNode());
-      const snm = h.getSessionNodeManager();
-      await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      await fx.createSession(SID, "alice");
 
       // Attend FIRST (as C8 does): seeding while unattended trips M8C-AWAY-1's auto-ack, which
       // appends its own SENT leaf and muddies the exact sequence numbers this clause is about.
-      const attendant = await connectAs("alice");
+      const attendant = await fx.connectAs("alice");
 
       seedReceived("alice", SID, "bob 1"); // received leaf 0
-      expect(snm.getLastDeliveredSeq("alice", SID)).toBe(-1); // nothing read yet
+      expect(fx.snm.getLastDeliveredSeq("alice", SID)).toBe(-1); // nothing read yet
 
       // A fresh connection reads the TRANSCRIPT (not cello_receive) — the remedy the gate's guidance
       // names. Before AC3 this advanced only the dying connection cursor, so the next process was
       // still blocked and the documented remedy was a dead end for any stateless client.
-      const reader = await connectAs("alice");
+      const reader = await fx.connectAs("alice");
       await reader.send("cello_get_transcript", { session_id: SID });
       reader.close();
-      expect(snm.getLastDeliveredSeq("alice", SID)).toBe(0); // PERSISTED — survives the socket
-      expect(snm.getUnreadReceivedCount("alice", SID)).toBe(0);
+      expect(fx.snm.getLastDeliveredSeq("alice", SID)).toBe(0); // PERSISTED — survives the socket
+      expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBe(0);
 
-      const sender = await connectAs("alice");
+      const sender = await fx.connectAs("alice");
       const res = (await sender.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
       expect(res.ok).toBe(true); // sent leaf (seq 2 after the reply)
 
       // Hole safety: append a leaf with NO transcript row (the shape an undecryptable/failed write
       // leaves), then a real received message BEYOND it. The contiguous walk must stop at the gap,
       // so the later counterparty message can never be silently marked read.
-      snm.appendSessionLeaf("alice", SID, "msg", "bb".repeat(32), "hole"); // no transcript row
+      fx.snm.appendSessionLeaf("alice", SID, "msg", "bb".repeat(32), "hole"); // no transcript row
       const bob2Seq = seedReceived("alice", SID, "bob 2 (beyond the hole)");
 
-      const reader2 = await connectAs("alice");
+      const reader2 = await fx.connectAs("alice");
       await reader2.send("cello_get_transcript", { session_id: SID });
       // The walk may advance THROUGH rows it actually saw (the reply it sent), but it must STOP at
       // the hole — so the watermark never reaches bob 2, and bob 2 stays unread. That is the whole
       // point: a message the agent has not seen cannot be marked read by a gap.
-      expect(snm.getLastDeliveredSeq("alice", SID)).toBeLessThan(bob2Seq);
-      expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0); // "bob 2" still unread
+      expect(fx.snm.getLastDeliveredSeq("alice", SID)).toBeLessThan(bob2Seq);
+      expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0); // "bob 2" still unread
 
       // ...and because it is still unread, the gate still refuses the send. Hole safety is not
       // cosmetic — it is what stops the fix becoming a bypass.
@@ -364,14 +270,12 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
     });
 
     it("D4 (the safety property): the long-lived single-connection path is UNCHANGED — read-then-send behaves exactly as before", async () => {
-      await makeAgentDir("alice");
-      const h = await start(noopLogger, new FakeNode());
-      await h.getSessionNodeManager().createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      await fx.createSession(SID, "alice");
       seedReceived("alice", SID, "hello from bob");
 
       // This is the MCP shim's shape: ONE socket for the whole session. It is refused before reading
       // and allowed after — identical to pre-fix behavior, satisfied by the connection-cursor clause.
-      const mcp = await connectAs("alice");
+      const mcp = await fx.connectAs("alice");
       const blocked = (await mcp.send("cello_send", { session_id: SID, content: "reply" })) as Record<string, unknown>;
       expect(blocked).toMatchObject({ ok: false, reason: "session_not_current", current_seq: 0, last_read_seq: -1 });
 
@@ -382,23 +286,18 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   });
 
   it("C8 (reviewer finding, per-session isolation): one connection attending two different sessions — advancing one's cursor must not unblock the other", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    const snm = h.getSessionNodeManager();
     const SID_A = "aa".repeat(32);
     const SID_B = "bb".repeat(32);
-    await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id-a", "corr-a");
-    await snm.createSessionNode(SID_B, "alice", "carolpubkeyhex", "carol-peer-id-b", "corr-b");
+    await fx.createSession(SID_A, "alice", "bobpubkeyhex", "bob-peer-id-a");
+    await fx.createSession(SID_B, "alice", "carolpubkeyhex", "carol-peer-id-b");
 
     // Attend FIRST (M8C-AWAY-1 is now live in this daemon too — seeding while unattended would
     // trigger its own auto-ack, adding an extra leaf this CURSOR-only test isn't about).
-    const client = await connectAs("alice");
+    const client = await fx.connectAs("alice");
 
     // Seed unread history on BOTH sessions.
-    const msgA = new TextEncoder().encode("on A");
-    const msgB = new TextEncoder().encode("on B");
-    await snm.ingestReceivedContent("alice", SID_A, msgA, msgLeafHash(msgA), "corr-a");
-    await snm.ingestReceivedContent("alice", SID_B, msgB, msgLeafHash(msgB), "corr-b");
+    await fx.ingestReceived("alice", SID_A, "on A", "corr-a");
+    await fx.ingestReceived("alice", SID_B, "on B", "corr-b");
 
     // Catch up ONLY on session A.
     await client.send("cello_get_transcript", { session_id: SID_A });
@@ -426,20 +325,16 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   // gate documented as FAILS CLOSED is a defect whether or not today's SQL spares us), but this test
   // does NOT cover it: revert that line and this still passes. It guards the branch beside it.
   it("a closed DB refuses the send — the gate never guesses 'caught up' (reachable branch only)", async () => {
-    await makeAgentDir("alice");
-    const h = await start(noopLogger, new FakeNode());
-    const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
 
-    const inbound = new TextEncoder().encode("unread counterparty content");
-    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound), "corr-inbound");
-    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+    await fx.ingestReceived("alice", SID, "unread counterparty content", "corr-inbound");
+    expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
 
     // Tear the DB out from under the gate. It can no longer count anything.
-    await snm.gracefulShutdown();
+    await fx.snm.gracefulShutdown();
 
     // It must STILL refuse — "I don't know" is not "you're caught up".
-    expect(snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
+    expect(fx.snm.getUnreadReceivedCount("alice", SID)).toBeGreaterThan(0);
   });
 
   // An unwitnessed append is announced ONLY when a witness was expected.
@@ -456,25 +351,15 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   // message of a normal no-relay session and bury the one case that means something. A signal that
   // fires on the normal case is not a signal.
   it("a no-relay session does NOT warn — the signal must not fire on a designed benign state", async () => {
-    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
-    const spyLogger: Logger = {
-      debug() {}, info() {}, error() {},
-      warn(event: string, ctx?: Record<string, unknown>) { events.push({ event, ctx: ctx ?? {} }); },
-    };
-
-    await makeAgentDir("alice");
-    const h = await start(spyLogger, new FakeNode());
-    const snm = h.getSessionNodeManager();
     // createSessionNode attaches NO relay client — the no-relay session, exactly as designed.
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    await fx.createSession(SID, "alice");
 
-    const content = new TextEncoder().encode("no relay on this session");
-    const res = await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-norelay");
+    const res = await fx.ingestReceived("alice", SID, "no relay on this session", "corr-norelay") as { ok: boolean };
     expect(res.ok).toBe(true); // ingested, not refused — availability is preserved
 
     // Teeth: drop the "was a witness expected?" guard and this fires, once per message, forever.
     expect(
-      events.filter((e) => e.event === "session.content.unwitnessed"),
+      fx.eventsNamed("session.content.unwitnessed").filter((e) => e.level === "warn"),
       "a session with no relay must not warn about a witness it was never going to get",
     ).toHaveLength(0);
   });
@@ -485,3 +370,4 @@ describe("M8C-CURSOR-1: per-connection read cursor", () => {
   // to fake one would test the seam). It belongs in the live spine, against a real relay.
 
 });
+

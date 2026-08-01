@@ -158,6 +158,16 @@ export class NotificationDispatcher {
     // MONIKER-4 AC2: same additive label contract as dispatchSessionStateChanged; `from` anchors.
     who?: { who: string; whoKnown: boolean },
   ): void {
+    // DOD-COATTEND-VISIBLE-1 AC2: the arrival alert carries the attendance count. Counted from the
+    // SAME map the loop below routes on, so the number is exactly "how many sessions this doorbell
+    // is about to wake" — it cannot drift from reality the way a separately-maintained counter could.
+    //
+    // INV-CONTENTFREE holds: a count of attending sessions is ROUTING metadata. It says nothing
+    // about what arrived, who sent it, or how big it is. Anything that identified the content would
+    // not be permitted here no matter how useful.
+    let attendance = 0;
+    for (const current of this.#currentAgentMap.values()) if (current === agentName) attendance += 1;
+
     const notification: IpcNotification = {
       notification: "cello_message",
       data: {
@@ -165,6 +175,7 @@ export class NotificationDispatcher {
         type: "cello_message",
         from,
         session_id: sessionId,
+        attendance,
         ...(who !== undefined ? { who: who.who, whoKnown: who.whoKnown } : {}),
       },
     };
