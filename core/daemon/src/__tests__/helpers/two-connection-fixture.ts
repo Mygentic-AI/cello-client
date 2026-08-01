@@ -26,6 +26,7 @@ import { startDaemon } from "../../daemon.js";
 import { connectToDaemon, type IpcClient } from "../../ipc-client.js";
 import type { Logger, DaemonConfig } from "../../types.js";
 import type { SessionNodeManager, ISessionNodeFactory, SessionNodeConfig } from "../../session-node-manager.js";
+import type { SecurityGatewayClient } from "../../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 
@@ -76,6 +77,14 @@ export interface TwoConnectionFixtureOpts {
   node?: CelloNode;
   /** Temp-dir prefix, so a failing run is identifiable. Default `"cello-m8d-"`. */
   dirPrefix?: string;
+  /**
+   * Replace the outbound/inbound screening client. Default: `PassthroughGatewayClient`.
+   *
+   * DOD-COATTEND-SENDWINDOW-1 needs to HOLD a send inside `screenOutbound` while a second
+   * connection races it — the gateway round trip is the wide half of the window the race lives in,
+   * and with a passthrough it closes faster than any test can aim at.
+   */
+  securityGateway?: SecurityGatewayClient;
 }
 
 export interface TwoConnectionFixture {
@@ -131,7 +140,7 @@ export async function startTwoConnectionFixture(
 
   const socketPath = join(tempDir, "daemon.sock");
   const config: DaemonConfig = {
-    securityGateway: new PassthroughGatewayClient(),
+    securityGateway: opts.securityGateway ?? new PassthroughGatewayClient(),
     celloDir: tempDir,
     socketPath,
     lockFilePath: join(tempDir, "daemon.lock"),

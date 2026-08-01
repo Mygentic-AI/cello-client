@@ -118,6 +118,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // principal is the agent, not the socket, and the daemon cannot referee which of an operator's
     // own windows a human is looking at. This is deliberate; do not "fix" it.
     const currentSeq = record.message_count - 1;
+    // DOD-COATTEND-SENDWINDOW-1: the frontier AS THIS SEND SAW IT. Re-read immediately before the
+    // wire, below — anything that moved it in between is a leaf this send was never checked
+    // against.
+    const frontierAtGate = sessionNodeManager.getSessionTree(agentName, sessionId).size();
     const connectionCursor = getConnectionCursor(connectionId, sessionId);
     const unreadReceived = sessionNodeManager.getUnreadReceivedCount(agentName, sessionId);
     const caughtUp = connectionCursor >= currentSeq || unreadReceived === 0;
@@ -245,6 +249,45 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(sendBytes).digest();
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
+    // ─── DOD-COATTEND-SENDWINDOW-1 (§4): re-check the gate, in the same synchronous window as the
+    //     act that makes this message irreversible ───────────────────────────────────────────────
+    //
+    // NO AWAIT MAY BE INTRODUCED BETWEEN THIS CHECK AND `sendContent` BELOW. The check is only
+    // worth anything because nothing can interleave between it and the wire; adding an await here
+    // reopens exactly the window it closes, silently, while leaving code that still looks correct.
+    //
+    // WHY HERE AND NOT AT `appendSessionLeaf`, WHICH IS WHAT AC1 ASKS FOR. AC1 copies the inbound
+    // pattern (`session-node-manager.ts:3682-3695`), where the append IS the commit point.
+    // Outbound it is not: `sendContent` puts the message ON THE WIRE and runs BEFORE the append, so
+    // by the append the counterparty already holds it. Refusing there would leave them holding
+    // content this side never leafed — the two frontiers disagree, neither will co-sign, and the
+    // session is unsealable except by forfeiting the receipt. That is DOD-FRONTIER-STRAND-1, the
+    // defect that left `dbb93dfc…` stranded for a week, manufactured on purpose to satisfy the
+    // letter of an AC. The purpose of AC1 is "re-check where it still matters"; outbound, that is
+    // the wire.
+    //
+    // WHY A FRONTIER COMPARISON RATHER THAN RE-RUNNING `caughtUp`. AC3: the gate's second authority
+    // is the PERSISTED read watermark, which is AGENT-scoped — so the moment ANY connection reads,
+    // `unreadReceived === 0` for every one of them, and re-running the gate would pass a racing
+    // sibling exactly as it passed the first time. That agent-scoping is DOD-CURSOR-DURABLE-1
+    // behaving as its own §6 predicted: right for stateless clients, wrong for this. So the tighten
+    // is stated AGAINST it rather than around it — this asks a question the watermark cannot
+    // answer: "did the session move under me while I was gone?"
+    const frontierNow = sessionNodeManager.getSessionTree(agentName, sessionId).size();
+    if (frontierNow !== frontierAtGate) {
+      logger.warn("session.send.blocked", {
+        sessionId, agentName, connectionId, correlationId,
+        authority: "frontier_moved_during_send",
+        frontierAtGate, frontierNow,
+      });
+      return {
+        ok: false,
+        reason: "session_moved_under_send",
+        frontier_at_gate: frontierAtGate,
+        frontier_now: frontierNow,
+        guidance: `The conversation moved while this message was being screened — ${frontierNow - frontierAtGate} message(s) were added by another session on this agent or by the counterparty, so nothing was sent. Read them first with cello_transcript ${sessionId}, then decide whether your reply still applies. Do not simply resend: another session may have already answered.`,
+      };
+    }
     const sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId);
     if (!sendResult.ok) {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
