@@ -17,9 +17,23 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 
+/**
+ * DOD-FRONTIER-STRAND-1 AC2: a failure may carry the numbers that caused it. `reason` stays the
+ * machine-readable discriminator every caller already switches on; these are additive detail so an
+ * operator is told WHAT disagreed rather than being sent to a counterparty that may be this same
+ * daemon. All optional — a rejection from an older counterparty carries none of them.
+ */
+export interface SealFailureDetail {
+  /** The counterparty's own refusal reason, distinct from OUR terminal `reason`. */
+  rejection_reason?: string;
+  your_leaf_count?: number;
+  their_leaf_count?: number;
+  diverging_leaf_index?: number;
+}
+
 export type SealFlowResult =
   | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
-  | { ok: false; reason: string; guidance: string };
+  | ({ ok: false; reason: string; guidance: string } & SealFailureDetail);
 
 export type ActiveSealResult =
   | { ok: true; sessionId: string; status: "seal_interrupted_pending"; rootHex: string }
@@ -73,7 +87,11 @@ export function createSealFlows(deps: SealFlowDeps) {
   const SEAL_INTERRUPTED_TIMEOUT_MS = 30_000;
   type SealAckResult =
     | { type: "seal_interrupted_ack"; sealInterruptedLeaf: Record<string, unknown>; nonce: string | null }
-    | { type: "seal_interrupted_rejection"; reason: string }
+    // DOD-FRONTIER-STRAND-1 AC2: the responder's frontier numbers ride the rejection so the
+    // initiator can name the mismatch instead of guessing at it. Optional — an older counterparty
+    // sends the bare reason, and the renderer must degrade to the old wording rather than print
+    // "undefined vs undefined".
+    | { type: "seal_interrupted_rejection"; reason: string; frontier?: { responder: number; initiator: number; diverging: number } }
     | { type: "timeout" };
 
   function awaitSealAck(sessionId: string, mgr: SignalingManager | undefined): Promise<SealAckResult> {
@@ -101,9 +119,18 @@ export function createSealFlows(deps: SealFlowDeps) {
             nonce: typeof frame.nonce === "string" ? frame.nonce : null,
           });
         } else {
+          // Only treat the frontier detail as present when BOTH numbers are real. A half-populated
+          // frame must render as "no detail", never as a mismatch with one side invented.
+          const responder = frame["responder_leaf_count"];
+          const initiator = frame["initiator_leaf_count"];
+          const diverging = frame["diverging_leaf_index"];
+          const hasFrontier = typeof responder === "number" && typeof initiator === "number";
           resolve({
             type: "seal_interrupted_rejection",
             reason: typeof frame.reason === "string" ? frame.reason : "unknown",
+            ...(hasFrontier
+              ? { frontier: { responder, initiator, diverging: typeof diverging === "number" ? diverging : Math.min(responder, initiator) } }
+              : {}),
           });
         }
       });
@@ -229,12 +256,47 @@ export function createSealFlows(deps: SealFlowDeps) {
         agentName: record.agent_name,
         reason: "seal_interrupted_rejected_by_counterparty",
         error: ackResult.reason,
+        ...(ackResult.frontier
+          ? {
+            responderLeafCount: ackResult.frontier.responder,
+            initiatorLeafCount: ackResult.frontier.initiator,
+            divergingLeafIndex: ackResult.frontier.diverging,
+          }
+          : {}),
         correlationId,
       });
+      // DOD-FRONTIER-STRAND-1 AC2: name the mismatch. The old text said "ask the counterparty to
+      // check their interrupted sessions on their end" — which, when both agents run on ONE daemon
+      // (the case that stranded session dbb93dfc… for a week), points at a machine that does not
+      // exist while withholding the two numbers that identify the problem.
+      if (ackResult.frontier) {
+        const { responder, initiator, diverging } = ackResult.frontier;
+        return {
+          ok: false,
+          reason: "seal_interrupted_rejected_by_counterparty",
+          rejection_reason: ackResult.reason,
+          your_leaf_count: initiator,
+          their_leaf_count: responder,
+          diverging_leaf_index: diverging,
+          guidance:
+            `The two sides disagree on how many messages this session contains: you hold ${initiator}, ` +
+            `they hold ${responder}. They diverge at leaf ${diverging} — compare that message on both ` +
+            `transcripts with cello_transcript ${sessionId}. A leaf that only one side recorded cannot ` +
+            `be co-signed, so the session cannot seal until the records agree. If BOTH agents run on ` +
+            `this machine, read both sides here; there is no other end to check.`,
+        };
+      }
       return {
         ok: false,
         reason: "seal_interrupted_rejected_by_counterparty",
-        guidance: "The counterparty rejected the seal-interrupted request. This may indicate their session state is inconsistent. Ask the counterparty to check their interrupted sessions via cello status on their end.",
+        rejection_reason: ackResult.reason,
+        // No detail on the wire (an older counterparty). Say that, rather than implying the reason
+        // is unknowable — the operator can still read both transcripts.
+        guidance:
+          `The counterparty rejected the seal-interrupted request (${ackResult.reason}), and did not ` +
+          `report its own message count — it is running an older daemon. Compare the two transcripts ` +
+          `with cello_transcript ${sessionId}; a session strands when one side holds a leaf the other ` +
+          `never recorded.`,
       };
     }
 

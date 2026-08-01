@@ -14,6 +14,8 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { InboundSessionEvent, ExpiredSessionRequest } from "./inbound-sessions.js";
+import { resolveNamedAgent } from "./resolve-named-agent.js";
+import type { AgentInfo } from "./types.js";
 
 export interface NotificationHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -22,6 +24,8 @@ export interface NotificationHandlerDeps {
   getConnState: (connectionId: string) => ConnState | undefined;
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string }>;
+  /** DOD-INBOX-AGENT-1: every agent INCLUDING load_failed ones — 'exists but broken' is not 'not found'. */
+  agents: ReadonlyArray<AgentInfo>;
   reapExpiredInboundSessions: (agentName: string) => void;
   inboundSessionQueues: Map<string, InboundSessionEvent[]>;
   expiredSessionRequests: Map<string, ExpiredSessionRequest[]>;
@@ -30,7 +34,7 @@ export interface NotificationHandlerDeps {
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
-    loadedAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests,
+    loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests,
   } = deps;
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
@@ -49,36 +53,24 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
     // desk, no signal. That is the receptionist's shared-file collision one layer up, with an MCP
     // socket standing in for `~/.cello/current-agent`: two skills in one Claude Code session share
     // one socket, so a sibling's cello_use_agent re-points this caller mid-flight.
-    const rawAgent = params?.agent;
-    const explicitAgent = typeof rawAgent === "string" ? rawAgent : undefined;
-    // An EMPTY name must never read as "no name given". `{ agent: someUnsetVar }` yields "", which
-    // is not nullish but IS falsy — it would slip past resolveCurrentAgent's truthiness check and
-    // run as the connection's selection instead, which is exactly the misroute being closed here.
-    if (explicitAgent !== undefined && explicitAgent.trim() === "") {
-      return {
-        ok: false,
-        reason: "missing_agent_value",
-        guidance: "The 'agent' parameter was empty. Name an agent explicitly, or omit it to use this connection's current agent.",
-      };
+    // The named-agent guard runs BEFORE the scope branch, not inside it (review MEDIUM). Inside, the
+    // same parameter was refused when empty and silently ignored when unknown, depending only on
+    // whether scope was 'current' or 'all' — accept-and-ignore is the exact shape this line removes,
+    // so it must not survive on one branch of it.
+    const named = resolveNamedAgent(params?.agent, allAgents);
+    if (!named.ok) {
+      logger.warn("inbox.agent.rejected", { connectionId, scope, reason: named.reason });
+      return named;
     }
+    const explicitAgent = named.agent ?? undefined;
 
     let agentNames: string[];
     if (scope === "all") {
       // 'all' means every loaded agent, so a named agent is not applicable — narrowing it here would
-      // make scope:'all' silently mean scope:'current'.
+      // make scope:'all' silently mean scope:'current'. It is still VALIDATED above, so a caller who
+      // passes a bad name is told, rather than having it quietly discarded.
       agentNames = loadedAgents.map((a) => a.name);
     } else {
-      // A named agent that does not exist REFUSES. Falling through to the connection's selection
-      // would answer a question about carol with alice's inbox, under ok:true — the silent misroute
-      // this line exists to remove, so the guard has to run BEFORE the resolve, not after it.
-      if (explicitAgent !== undefined && !loadedAgents.some((a) => a.name === explicitAgent)) {
-        logger.warn("inbox.agent.not_found", { connectionId, agentName: explicitAgent, scope });
-        return {
-          ok: false,
-          reason: "agent_not_found",
-          guidance: `Agent '${explicitAgent}' does not exist on this machine, so no inbox was read. Check the name with cello_agents, or omit 'agent' to use this connection's current agent.`,
-        };
-      }
       // F18: an explicit current agent, else the sole-online agent; ambiguous → no_current_agent.
       const current = resolveCurrentAgent(connState, explicitAgent);
       if (!current) {

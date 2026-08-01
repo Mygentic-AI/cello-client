@@ -25,6 +25,9 @@ import {
   AWAY_MESSAGE_MAX_LEN,
 } from "./agent-settings-keys.js";
 
+import { resolveNamedAgent } from "./resolve-named-agent.js";
+import type { AgentInfo } from "./types.js";
+
 /** The per-connection agent selection, as the address book needs to read it. */
 export interface ConnState {
   currentAgent: string | null;
@@ -42,6 +45,8 @@ export interface ContactHandlerDeps {
   getConnState: (connectionId: string) => ConnState | undefined;
   /** The daemon's single agent-selection rule. Injected, never re-implemented here. */
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
+  /** DOD-INBOX-AGENT-1: every agent, so an explicitly NAMED one can be validated before we WRITE. */
+  agents: ReadonlyArray<AgentInfo>;
   /**
    * Set (or clear, with null) an agent's outbound-name override. False when no such agent exists.
    *
@@ -85,7 +90,7 @@ export function invalidPubkey(pubkey: string | undefined): Refusal | null {
 
 export function registerContactHandlers(deps: ContactHandlerDeps): void {
   const {
-    handlers, sessionNodeManager, getConnState, resolveCurrentAgent,
+    handlers, sessionNodeManager, getConnState, resolveCurrentAgent, agents,
     setAgentMoniker, logger, startTelegramPollerIfConfigured,
   } = deps;
 
@@ -96,8 +101,15 @@ export function registerContactHandlers(deps: ContactHandlerDeps): void {
     connState: ConnState | undefined,
     params?: Record<string, unknown>,
   ): { ok: true; agent: string } | Refusal {
-    const explicit = typeof params?.agent === "string" ? params.agent : undefined;
-    if (explicit) return { ok: true, agent: explicit };
+    // DOD-INBOX-AGENT-1 (review PE1): this carried BOTH holes the inbox handler just closed, and
+    // here they are worse, because these handlers WRITE. `{ agent: "" }` is falsy but not nullish,
+    // so a bare truthiness test filed the contact under whatever desk the connection happened to
+    // hold; `{ agent: "carol" }` with no carol wrote a row keyed to an agent that does not exist
+    // (addContact does not validate the name). Both returned ok:true. One shared guard now, so the
+    // third copy of this never gets written.
+    const named = resolveNamedAgent(params?.agent, agents);
+    if (!named.ok) return named;
+    if (named.agent !== null) return { ok: true, agent: named.agent };
     const current = resolveCurrentAgent(connState);
     if (!current) {
       return {

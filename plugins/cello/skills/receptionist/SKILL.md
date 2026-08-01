@@ -70,9 +70,8 @@ cello_inbox({ agent: "<exact name>", scope: "current" })
 
 Use `scope: "current"` — not `"all"` — since you are asking about one desk.
 
-**Name the agent explicitly, exactly as step 1 told you to.** This step used to pass only
-`scope: "current"` and lean on the selection made in step 2, which contradicted step 1's own
-instruction. Skills and subagents in one Claude Code session **share one MCP connection**, so
+**Name the agent explicitly, exactly as step 1 told you to.** Skills and subagents in one Claude
+Code session **share one MCP connection**, so
 another one calling `cello_use_agent` re-points yours mid-loop — and the answer comes back for
 *their* desk, under `ok: true`, with nothing to reveal the swap. Naming the agent makes this call
 independent of whatever the connection currently holds. An unknown name is refused
@@ -84,8 +83,9 @@ If there are pending session requests, unread messages, or sealed unread session
 
 1. **Calculate age:** compute how long ago the message arrived using `createdAt` (ms epoch) vs the current time. Express it as "X minutes ago", "X hours ago", etc.
 2. **Read the content:**
-   - For `unread` items: call `cello_transcript({ cello_session_id })`.
-   - For `sealed_unread` items: call `cello_transcript({ cello_session_id })`. **Calling `cello_transcript` clears the item from `sealed_unread` automatically** — no further action needed. If the operator wants to dismiss without reading, use `cello_dismiss({ cello_session_id })` instead (clears from inbox, does not mark messages as read).
+   - For `unread` items: call `cello_transcript({ agent: "<exact name>", cello_session_id })`.
+   - For `sealed_unread` items: call `cello_transcript({ agent: "<exact name>", cello_session_id })`. **Calling `cello_transcript` clears the item from `sealed_unread` automatically** — no further action needed. If the operator wants to dismiss without reading, use `cello_dismiss({ agent: "<exact name>", cello_session_id })` instead (clears from inbox, does not mark messages as read).
+   - Name the agent on these too. Step 1 says *every* call, and it means it: these read and clear real state, so a re-pointed connection would clear the wrong desk's inbox.
 3. **Report to the operator** in this format:
 
 ```
@@ -142,7 +142,7 @@ Awaiting your instructions.
 - Do not call `cello_receive` on the inbound session. This is the receptionist role — you announce, you don't converse. To conduct the conversation, use the `cello` skill in this plugin.
 - Do not respond to messages unless you have standing instructions to do so.
 - Do not close or seal sessions without operator approval (except on `[[WRAP]]` — that's unconditional).
-- Do not use `scope: "all"` on inbox — always scope to the current agent.
+- Do not use `scope: "all"` on inbox — pass `agent` explicitly with `scope: "current"`.
 
 ---
 

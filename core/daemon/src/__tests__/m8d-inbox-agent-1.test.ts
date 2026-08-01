@@ -27,6 +27,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { resolveNamedAgent } from "../resolve-named-agent.js";
 
 describe("DOD-INBOX-AGENT-1: cello_check_notifications honours an explicit agent", () => {
   let fx: TwoConnectionFixture;
@@ -79,6 +80,44 @@ describe("DOD-INBOX-AGENT-1: cello_check_notifications honours an explicit agent
     expect(res.agents).toBeUndefined();
   });
 
+  it("I6 (review HIGH): an EMPTY name is refused — it must never read as 'no name given'", async () => {
+    const conn = await fx.connectAs("alice");
+    const res = (await conn.send("cello_check_notifications", { agent: "", scope: "current" })) as Record<string, unknown>;
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("missing_agent_value");
+    expect(res.agents).toBeUndefined();
+  });
+
+  it("I7 (review HIGH): a NON-STRING name is refused, not silently dropped", async () => {
+    // MCP callers are shielded by zod; direct-IPC callers are not, and §5a is explicit that
+    // unreachability is a property of today's call graph rather than of the code.
+    const conn = await fx.connectAs("alice");
+    for (const bad of [123, ["bob"], { name: "bob" }, true]) {
+      const res = (await conn.send("cello_check_notifications", { agent: bad as never, scope: "current" })) as Record<string, unknown>;
+      expect(res.ok, `agent: ${JSON.stringify(bad)} must be refused`).toBe(false);
+      expect(res.reason).toBe("invalid_agent_value");
+      expect(res.agents).toBeUndefined();
+    }
+  });
+
+  it("I8 (review MEDIUM): scope 'all' VALIDATES the name too — one parameter, one answer", async () => {
+    // The guard used to sit inside the `current` branch, so the same parameter was refused when
+    // empty and silently ignored when unknown, depending only on scope. Accept-and-ignore on one
+    // branch of the fix is still accept-and-ignore.
+    const conn = await fx.connectAs("alice");
+    const res = (await conn.send("cello_check_notifications", { agent: "carol", scope: "all" })) as Record<string, unknown>;
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("agent_not_found");
+  });
+
+  it("I10 (observability): a refusal is logged, so a misrouted poll is findable after the fact", async () => {
+    const conn = await fx.connectAs("alice");
+    await conn.send("cello_check_notifications", { agent: "carol", scope: "current" });
+    const rejected = fx.eventsNamed("inbox.agent.rejected");
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].ctx).toMatchObject({ reason: "agent_not_found", scope: "current" });
+  });
+
   it("I4 (unchanged): with no explicit agent, the connection's selection still answers", async () => {
     // The regression guard. Every existing caller passes no agent and must behave exactly as before.
     const conn = await fx.connectAs("alice");
@@ -95,5 +134,51 @@ describe("DOD-INBOX-AGENT-1: cello_check_notifications honours an explicit agent
     expect(res.ok).toBe(true);
     const names = (res.agents as Array<{ agent: string }>).map((a) => a.agent).sort();
     expect(names).toEqual(["alice", "bob"]);
+  });
+});
+
+/**
+ * The guard itself, unit-tested directly.
+ *
+ * SCOPE, stated so this is not mistaken for end-to-end coverage: driving a load_failed agent
+ * through a real daemon means inserting a corrupt K_local seed into the encrypted store, since
+ * agents load from the DB and fail when InMemoryKeyProvider rejects the seed — a fixture seam that
+ * would exist only for this test. The helper is pure, so it is tested as one. The DAEMON's use of
+ * it is covered by I3/I6/I7/I8 above.
+ */
+describe("resolveNamedAgent: the shared guard", () => {
+  const known = [
+    { name: "alice", state: "online" },
+    { name: "broken", state: "load_failed", error: "bad seed length" },
+  ];
+
+  it("names nothing → the caller falls back to its own resolution", () => {
+    expect(resolveNamedAgent(undefined, known)).toEqual({ ok: true, agent: null });
+    expect(resolveNamedAgent(null, known)).toEqual({ ok: true, agent: null });
+  });
+
+  it("names a real agent → that agent", () => {
+    expect(resolveNamedAgent("alice", known)).toEqual({ ok: true, agent: "alice" });
+  });
+
+  it("a LOAD-FAILED agent is reported as itself, never as missing", () => {
+    // "does not exist — check cello_agents" would be an exit-point label standing in for the cause:
+    // cello_agents FILTERS load_failed agents out, so the operator sees nothing there and confirms
+    // the wrong diagnosis, never reaching cello_status, which shows the real error.
+    const res = resolveNamedAgent("broken", known);
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toBe("agent_load_failed");
+    const guidance = (res as { guidance: string }).guidance;
+    expect(guidance).toMatch(/cello_status/);
+    expect(guidance).toMatch(/bad seed length/);      // the real cause travels with it
+    expect(guidance).toMatch(/omits agents in this state/); // and why cello_agents will mislead
+  });
+
+  it("a caller-supplied name is capped before it is echoed back", () => {
+    const res = resolveNamedAgent("z".repeat(500), known);
+    expect((res as { reason: string }).reason).toBe("agent_not_found");
+    // The name is echoed into guidance an LLM reads back; an unbounded caller string does not belong
+    // in it, even from a same-privilege caller.
+    expect((res as { guidance: string }).guidance.length).toBeLessThan(400);
   });
 });

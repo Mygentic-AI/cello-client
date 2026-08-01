@@ -30,6 +30,10 @@ const SESSION_TOOLS: Array<[tool: string, method: string]> = [
   ["cello_sessions", "cello_list_sessions"],
   ["cello_sealed_receipt", "cello_get_sealed_receipt"],
   ["cello_transcript", "cello_get_transcript"],
+  // DOD-INBOX-AGENT-1: cello_inbox was never in this list, which is exactly WHY the defect it fixes
+  // survived DOD-AGENT-PARAM-1 and had to be found by a human a milestone later. Omitting an entry
+  // from a hand-maintained enumerator makes the loop shorter, never red.
+  ["cello_inbox", "cello_check_notifications"],
 ];
 
 /** The text from `server.tool("<name>"` up to the start of the next tool registration. */
@@ -57,6 +61,40 @@ describe("DOD-AGENT-PARAM-1 AC-B2: `agent` on the session tools", () => {
     // params?.agent → undefined, and the call would silently act as the sole online agent instead.
     // That is the exact defect this file exists to catch, so the assertion has to see the key.
     expect(call, `${tool} declares \`agent\` but never sends it under that key`).toMatch(/[{,]\s*agent\s*[,}]/);
+  });
+
+  // ─── The blind-enumerator guard (DOD-INBOX-AGENT-1, review HIGH) ─────────────────────────────
+  //
+  // Everything above iterates a list a human maintains, so it can only ever check what somebody
+  // remembered to add — the failure mode that produced this very unit. This one is DERIVED from the
+  // source: whatever declares the parameter must also forward it, whether or not anyone listed it.
+  // A new tool that declares `agent` and drops it goes red the day it is written.
+  it("EVERY tool that declares `agent` also forwards it — no hand-maintained list involved", () => {
+    const declaring = [...source.matchAll(/server\.tool\("([a-z_]+)"/g)]
+      .map((m) => m[1])
+      .filter((tool) => /agent:\s*z\.string\(\)\.optional\(\)/.test(blockFor(tool)));
+
+    // Sanity: if this ever finds nothing, the regex has drifted and the guard is vacuous.
+    expect(declaring.length, "no tool declares an `agent` param — the scan has drifted").toBeGreaterThan(5);
+
+    for (const tool of declaring) {
+      const block = blockFor(tool);
+      const callAt = block.indexOf("proxy.call(");
+      expect(callAt, `${tool} declares \`agent\` but makes no proxy.call`).toBeGreaterThan(-1);
+      // Two shapes forward it: a spread/shorthand `{ agent }`, and the builder form
+      // `params.agent = agent`. Both are legitimate; matching only the first would have called the
+      // contact tools broken. What is NOT legitimate is declaring it and never sending it.
+      const call = block.slice(callAt);
+      const forwards = /[{,]\s*agent\s*[,}]/.test(call) || /\.agent\s*=\s*agent\b/.test(block);
+      expect(forwards, `${tool} declares \`agent\` but never sends it under that key — the operator's agent is told it works`).toBe(true);
+      // ...and it must not DROP an empty name on the way. `z.string().optional()` accepts "", so a
+      // truthiness test sends the daemon "no agent given" and the call runs as whatever desk the
+      // connection holds, ok:true — the misroute the parameter exists to prevent, reintroduced by
+      // the code that forwards it. This fired on four tools, two of which WRITE.
+      expect(block, `${tool} drops an empty \`agent\` instead of letting the daemon refuse it`)
+        .not.toMatch(/if \(agent\) |\(agent \? \{ agent \}/);
+      expect(block, `${tool}'s \`agent\` description must use the shared vocabulary`).toContain("defaults to the current agent");
+    }
   });
 
   it("no tool sends the dead `name` spelling as a selector", () => {

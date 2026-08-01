@@ -2980,6 +2980,7 @@ async function startDaemonHoldingLock(
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     loadedAgents,
+    agents,
     reapExpiredInboundSessions,
     inboundSessionQueues,
     expiredSessionRequests,
@@ -2994,6 +2995,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
+    agents,
     // cello_set_moniker was the one address-book handler reaching past the store for the raw SQLite
     // handle. Same construction, same behavior — the daemon owns the DB, so the daemon builds it.
     setAgentMoniker: (agentName, moniker) =>

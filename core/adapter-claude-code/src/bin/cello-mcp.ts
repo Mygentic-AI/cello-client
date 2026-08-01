@@ -184,7 +184,11 @@ server.tool("cello_contact_add", "Add a peer (by hex public key) to an agent's a
 }, async ({ pubkey, moniker, agent }) => {
   const params: Record<string, unknown> = { pubkey };
   if (moniker !== undefined) params.moniker = moniker;
-  if (agent) params.agent = agent;
+  // `!== undefined`, not truthiness: z.string().optional() accepts "", and dropping it here
+  // would send the daemon "no agent given" — answered as whatever desk this connection holds,
+  // ok:true. The daemon owns the refusal (missing_agent_value); the shim must not swallow the
+  // value before it gets there. DOD-INBOX-AGENT-1.
+  if (agent !== undefined) params.agent = agent;
   const result = await proxy.call("cello_contact_add", params);
   return jsonText(result);
 });
@@ -350,7 +354,11 @@ server.tool("cello_settings_get", "Read a per-agent reachability-policy setting 
 }, async ({ key, agent }) => {
   const params: Record<string, unknown> = {};
   if (key !== undefined) params.key = key;
-  if (agent) params.agent = agent;
+  // `!== undefined`, not truthiness: z.string().optional() accepts "", and dropping it here
+  // would send the daemon "no agent given" — answered as whatever desk this connection holds,
+  // ok:true. The daemon owns the refusal (missing_agent_value); the shim must not swallow the
+  // value before it gets there. DOD-INBOX-AGENT-1.
+  if (agent !== undefined) params.agent = agent;
   const result = await proxy.call("cello_settings_get", params);
   return jsonText(result);
 });
@@ -494,7 +502,8 @@ server.tool("cello_send", "Send a message in an active session. REQUIRED: every 
     session_id,
     content: contentWithToken,
     ...(governance_decisions !== undefined ? { governance_decisions } : {}),
-    ...(agent ? { agent } : {}),
+    // See DOD-INBOX-AGENT-1: `!== undefined`, not truthiness — "" must reach the daemon's guard.
+    ...(agent !== undefined ? { agent } : {}),
   });
   return jsonText(result);
 });
@@ -523,7 +532,8 @@ server.tool("cello_close_session", "Close a session. Normally triggers the bilat
     // `session_name` is forwarded whenever the key is PRESENT, including an explicit null — the
     // truthiness shortcut used for `force`/`agent` would silently drop it.
     ...(session_name !== undefined ? { session_name } : {}),
-    ...(agent ? { agent } : {}),
+    // See DOD-INBOX-AGENT-1: `!== undefined`, not truthiness — "" must reach the daemon's guard.
+    ...(agent !== undefined ? { agent } : {}),
   });
   return jsonText(result);
 });
@@ -566,11 +576,17 @@ server.tool("cello_inbox", "Check for pending inbound session requests and unrea
   // DOD-INBOX-AGENT-1: the door the receptionist skill's own instructions assumed existed. Without
   // it, "pass the agent explicitly on every call" was advice this tool could not honour, and two
   // skills sharing one MCP socket re-pointed each other silently.
-  agent: z.string().optional().describe("Name the agent explicitly, instead of using this connection's current selection"),
+  agent: z.string().optional().describe("Name the agent explicitly (defaults to the current agent), instead of relying on this connection's selection"),
 }, async ({ scope, agent }) => {
   const result = await proxy.call("cello_check_notifications", {
     ...(scope ? { scope } : {}),
-    ...(agent ? { agent } : {}),
+    // `agent !== undefined`, NOT a truthiness test. `z.string().optional()` accepts "", and a
+    // truthy spread would drop it here — so an unsubstituted placeholder or an unset variable
+    // would reach the daemon as "no agent given" and be answered for whatever desk this
+    // connection holds, ok:true. That is the exact misroute this parameter exists to prevent, and
+    // it would have made the daemon's empty-name guard unreachable from the only surface that
+    // matters. The daemon owns the refusal; the shim's job is to not swallow the value first.
+    ...(agent !== undefined ? { agent } : {}),
   });
   return jsonText(result);
 });

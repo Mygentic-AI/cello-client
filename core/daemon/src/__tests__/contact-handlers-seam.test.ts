@@ -49,7 +49,7 @@ function makeStubStore() {
   };
 }
 
-function harness(opts: { connState?: ConnState } = {}) {
+function harness(opts: { connState?: ConnState; agents?: ReadonlyArray<{ name: string; state?: string }> } = {}) {
   const handlers = new Map<string, IpcHandler>();
   const store = makeStubStore();
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -63,6 +63,14 @@ function harness(opts: { connState?: ConnState } = {}) {
     getConnState: () => connState,
     // The daemon's real rule, in miniature: explicit wins, else the connection's selection.
     resolveCurrentAgent: (cs, explicit) => explicit ?? cs?.currentAgent ?? null,
+    // DOD-INBOX-AGENT-1 (review PE1): the address book WRITES, so a named agent is validated before
+    // it does. Previously any string was honoured — `{ agent: "carol" }` filed a contact row keyed
+    // to an agent that does not exist, ok:true — and `{ agent: "" }` fell through to whatever desk
+    // the connection held. The harness now declares who exists, as the daemon does.
+    agents: opts.agents ?? [
+      { name: "alice", state: "online" as const },
+      { name: "bob", state: "online" as const },
+    ],
     setAgentMoniker,
     logger,
     startTelegramPollerIfConfigured,
@@ -142,6 +150,30 @@ describe("the address book runs with NO daemon — the seam is real", () => {
 
     expect(store.addContact).toHaveBeenCalledWith("bob", PUBKEY, undefined, null, 2);
     expect(store.setSetting).toHaveBeenCalledWith("bob", "away.default", "back later");
+  });
+
+  it("PE1: a named agent that does not exist is REFUSED — the address book never writes to a ghost desk", async () => {
+    const { store, call } = harness({ connState: { currentAgent: "alice" } });
+
+    const res = await call("cello_contact_add", { pubkey: PUBKEY, agent: "carol" }) as { ok: boolean; reason: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("agent_not_found");
+    // The point is not the error — it is that nothing was WRITTEN. addContact does not validate the
+    // agent name, so the old path persisted a contact row under an agent that does not exist.
+    expect(store.addContact).not.toHaveBeenCalled();
+  });
+
+  it("PE1: an EMPTY agent is REFUSED — it must not silently write to the connection's desk", async () => {
+    const { store, call } = harness({ connState: { currentAgent: "alice" } });
+
+    // `{ agent: someUnsetVar }` yields "": falsy but not nullish, so a truthiness test read it as
+    // "no agent given" and filed the contact under alice — the operator's write, silently redirected.
+    const res = await call("cello_contact_add", { pubkey: PUBKEY, agent: "" }) as { ok: boolean; reason: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("missing_agent_value");
+    expect(store.addContact).not.toHaveBeenCalled();
   });
 
   it("an UNKNOWN settings key is REFUSED, never persisted — a typo'd key would be a setting that silently never takes effect", async () => {

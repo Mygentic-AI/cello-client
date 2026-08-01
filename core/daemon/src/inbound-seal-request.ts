@@ -51,7 +51,16 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
       return;
     }
 
-    const reject = async (reason: string): Promise<void> => {
+    // DOD-FRONTIER-STRAND-1 AC2: a rejection may carry the numbers that caused it.
+    //
+    // The RESPONDER is the only party that ever sees both frontiers — it holds its own tree and
+    // receives the initiator's claimed count in the request. It used to compare them and then throw
+    // the comparison away, sending the bare word "leaf_count_mismatch". The initiator, which knows
+    // only its own side, then told the operator to go ask the counterparty. When both agents live on
+    // ONE daemon (the loopback case that produced session dbb93dfc…, stranded for a week) there is
+    // no counterparty to ask and no second machine to check: the advice was unfollowable and the one
+    // fact that would have solved it in a minute was discarded here.
+    const reject = async (reason: string, detail?: Record<string, number>): Promise<void> => {
       // CONN-001: send the rejection over the LOCAL responder agent's own stream (the agent whose
       // pubkey is counterpartyPubkey — the stream this request arrived on). If unresolved, sendOver
       // reports a send failure rather than throwing.
@@ -60,6 +69,7 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
         sessionId,
         initiatorPubkey,
         reason,
+        ...(detail ?? {}),
       });
       // fallback-finder LOW: don't log the rejection as delivered when the send failed (e.g. no local
       // agent for counterpartyPubkey, or a transient send error) — the counterparty would otherwise
@@ -105,7 +115,27 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
     const ownRoot = useOwnTree ? sessionNodeManager.getSessionTreeRootHex(localAgent.name, sessionId) : merkleRootReq;
 
     // SI-002/AC-008: leaf-count agreement against our own state.
-    if (ownLeafCount !== leafCountReq) { await reject("leaf_count_mismatch"); return; }
+    if (ownLeafCount !== leafCountReq) {
+      // AC2: carry BOTH frontiers and the first index where they can differ. The diverging index is
+      // the lower count — leaf indices are contiguous from 0, so the shorter side simply stops
+      // there, and that leaf is the one an operator should read on both transcripts. (Which side is
+      // longer is not assumed: either can be, depending on which one failed to record.)
+      const diverging = Math.min(ownLeafCount, leafCountReq);
+      logger.warn("session.frontier.mismatch", {
+        sessionId,
+        agentName: localAgent.name,
+        responderLeafCount: ownLeafCount,
+        initiatorLeafCount: leafCountReq,
+        divergingLeafIndex: diverging,
+        correlationId,
+      });
+      await reject("leaf_count_mismatch", {
+        responder_leaf_count: ownLeafCount,
+        initiator_leaf_count: leafCountReq,
+        diverging_leaf_index: diverging,
+      });
+      return;
+    }
 
     const kp = getKeyProvider(localAgent.name);
     if (!kp) { await reject("signing_key_unavailable"); return; }
