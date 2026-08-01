@@ -561,10 +561,17 @@ server.tool("cello_status", "Get daemon and agent status", {}, async () => {
   return jsonText(result);
 });
 
-server.tool("cello_inbox", "Check for pending inbound session requests and unread messages (the push-loss reconciler — discovers anything missed while this session was away). scope 'current' (default) checks the current agent; 'all' checks every loaded agent.", {
+server.tool("cello_inbox", "Check for pending inbound session requests and unread messages (the push-loss reconciler — discovers anything missed while this session was away). scope 'current' (default) checks the current agent; 'all' checks every loaded agent. Pass 'agent' to name the desk explicitly — safer than relying on the current selection, which another skill or subagent sharing this MCP connection can change underneath you.", {
   scope: z.enum(["current", "all"]).optional().describe("'current' (default) = current agent only; 'all' = every loaded agent, labelled"),
-}, async ({ scope }) => {
-  const result = await proxy.call("cello_check_notifications", scope ? { scope } : {});
+  // DOD-INBOX-AGENT-1: the door the receptionist skill's own instructions assumed existed. Without
+  // it, "pass the agent explicitly on every call" was advice this tool could not honour, and two
+  // skills sharing one MCP socket re-pointed each other silently.
+  agent: z.string().optional().describe("Name the agent explicitly, instead of using this connection's current selection"),
+}, async ({ scope, agent }) => {
+  const result = await proxy.call("cello_check_notifications", {
+    ...(scope ? { scope } : {}),
+    ...(agent ? { agent } : {}),
+  });
   return jsonText(result);
 });
 

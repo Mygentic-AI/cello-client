@@ -65,10 +65,18 @@ Verify `state: "online"`, `directory_signaling: "connected"`, and `standing_rece
 ### 3 — Check the inbox for this agent specifically
 
 ```
-cello_inbox({ scope: "current" })
+cello_inbox({ agent: "<exact name>", scope: "current" })
 ```
 
-Use `scope: "current"` — not `"all"` — since you have already selected the correct agent.
+Use `scope: "current"` — not `"all"` — since you are asking about one desk.
+
+**Name the agent explicitly, exactly as step 1 told you to.** This step used to pass only
+`scope: "current"` and lean on the selection made in step 2, which contradicted step 1's own
+instruction. Skills and subagents in one Claude Code session **share one MCP connection**, so
+another one calling `cello_use_agent` re-points yours mid-loop — and the answer comes back for
+*their* desk, under `ok: true`, with nothing to reveal the swap. Naming the agent makes this call
+independent of whatever the connection currently holds. An unknown name is refused
+(`agent_not_found`) rather than quietly answered as somebody else.
 
 ### 4 — Handle anything already waiting
 
