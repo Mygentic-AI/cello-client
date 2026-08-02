@@ -82,6 +82,21 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
    * Keyed (agent, session): the race is two connections replying into ONE conversation. Held in the
    * factory closure, which runs once per daemon, so it is exactly as long-lived as the handler set.
    */
+  /**
+   * DOD-COATTEND-VISIBLE-1 AC6 (review F2) — attendance as reported ON A RESPONSE.
+   *
+   * `attendanceCount` walks the connections that explicitly called `cello_use_agent`. A connection
+   * can reach these handlers WITHOUT having done so, through `resolveCurrentAgent`'s sole-online
+   * fallback — which is not exotic: it is every `cello` CLI invocation with no persisted selection,
+   * and any MCP client that skipped the call. Such a reader was not counted, INCLUDING ITSELF, and
+   * was handed `attendance: 0` — told that zero sessions attend the agent it is reading.
+   *
+   * That is worse than the missing field this AC set out to fix: not absent, but a definite
+   * negative that is false. The caller is holding the response, so at least one session is on this
+   * agent by construction. A response can never honestly say 0.
+   */
+  const attendingNow = (agentName: string): number => Math.max(1, attendanceCount(agentName));
+
   const sendInFlight = new Map<string, number>();
   /**
    * How long a claim is honored before a sibling may proceed anyway (review H3).
@@ -570,6 +585,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         ok: true,
         since_seq: sinceSeq,
         count: received.length,
+        // AC6 (review F1): the catch-up batch is THE stateless-client door — `cello receive <id>
+        // --since-seq -1` is a fresh connection every time, so it never saw a doorbell, and the
+        // `session_not_live` refusal below points callers here BY NAME. Shipping attendance on the
+        // live exits and not this one left the defect alive in the exact shape the AC exists for.
+        attendance: attendingNow(agentName),
         messages: received.map((m) => ({ sequence: m.sequence, content: m.text, from })),
       };
     }
@@ -582,6 +602,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       return {
         ok: false,
         reason: "session_not_live",
+        attendance: attendingNow(agentName),
         guidance: "This session exists only as a durable transcript (no live session — it was never established or predates this daemon). Read it with cello_receive { since_seq } (e.g. since_seq: -1 for everything) or cello_transcript.",
       };
     }
@@ -628,6 +649,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           session_id: sessionId,
           ...(sealedRoot ? { sealed_root: sealedRoot } : {}),
           unread_count: terminal.unreadCount,
+          attendance: attendingNow(agentName),
           guidance: terminal.unreadCount > 0
             ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
             : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
@@ -718,7 +740,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // this; the read surfaces did not, so a session that never saw a doorbell — a fresh MCP
           // connection, EVERY `cello` CLI invocation, anything that attached after the last
           // arrival — had no way to learn it was co-attended. Live finding, journal Entry 33.
-          attendance: attendanceCount(agentName),
+          attendance: attendingNow(agentName),
           sessionId,
           sequence_number: entry.sequenceNumber,
           senderPubkey: entry.senderPubkey,
@@ -746,6 +768,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             ok: true,
             content: null,
             reason: "content_undeliverable",
+            attendance: attendingNow(agentName),
             undeliverable_sequences: [...undeliverable],
             guidance: `${undeliverable.length} message(s) arrived but could not be written to the local transcript, so they cannot be delivered — this is a fault on THIS machine (check disk space and ~/.cello permissions; see transcript.message.record.failed in the daemon log), not a quiet counterparty. Do not wait: waiting cannot recover them. Ask the counterparty to resend once the local fault is fixed.`,
           };
@@ -826,7 +849,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           return {
             ok: true,
             content: null,
-            attendance: attendanceCount(agentName),
+            attendance: attendingNow(agentName),
             reason: "counterparty_gone",
             liveness: "gone",
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
@@ -842,7 +865,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         return {
           ok: true,
           content: null,
-          attendance: attendanceCount(agentName),
+          attendance: attendingNow(agentName),
           guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history.",
         };
       }

@@ -178,7 +178,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
     // DOD-SESSION-NAME-1 (AC-A12): the name rides along so a transcript dump says what it is of.
     const transcriptName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable, attendance: attendanceCount(agentName) };
+    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable, attendance: Math.max(1, attendanceCount(agentName)) };
   });
 
   // cello_list_sessions: the discovery surface — every persisted session for the

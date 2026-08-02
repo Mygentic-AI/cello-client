@@ -30,7 +30,7 @@ describe("DOD-COATTEND-VISIBLE-1 AC6: the READ surfaces say whether this session
   let fx: TwoConnectionFixture;
 
   beforeEach(async () => {
-    fx = await startTwoConnectionFixture({ dirPrefix: "cello-m8d-ac6-" });
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-m8d-ac6-", agents: ["alice", "bob"] });
   });
   afterEach(async () => { await fx.cleanup(); });
 
@@ -103,5 +103,74 @@ describe("DOD-COATTEND-VISIBLE-1 AC6: the READ surfaces say whether this session
       ((await connA.send("cello_receive", { session_id: SID, timeout_ms: 200 })) as Record<string, unknown>).attendance,
       "after the sibling goes, this session is alone again and must be told so",
     ).toBe(1);
+  });
+
+  it("V6 (review F1): the since_seq CATCH-UP exit carries it — the stateless door the AC exists for", async () => {
+    // `cello receive <id> --since-seq -1` is the away-then-return door, and it is a FRESH
+    // connection every time, so it never saw a doorbell. The `session_not_live` refusal points
+    // callers here BY NAME. Shipping attendance on the live exits and not this one leaves the
+    // defect alive in the exact shape the unit's own rationale invokes.
+    await fx.createSession(SID, "alice");
+    const connA = await fx.connectAs("alice");
+    const connB = await fx.connectAs("alice");
+    fx.seedReceived("alice", SID, "history");
+
+    const batch = (await connA.send("cello_receive", { session_id: SID, since_seq: -1 })) as Record<string, unknown>;
+    expect(batch.ok).toBe(true);
+    expect(batch.attendance, "the catch-up batch must say whether you are alone").toBe(2);
+    void connB;
+  });
+
+  it("V8 (review F3): the count is AGENT-SCOPED — a window on a DIFFERENT agent is not co-attendance", async () => {
+    // THE HOLLOWNESS THE REVIEW PROVED. Replace the predicate in countAttendance with "count every
+    // connection" and V1-V5 stay green, as does the whole daemon package — nothing anywhere pinned
+    // the field's actual semantic. On the first-wedge setup (one window per agent, which is how
+    // this product is used daily) that implementation tells BOTH windows they are co-attended by a
+    // session that is attending something else entirely.
+    await fx.createSession(SID, "alice");
+    const onAlice = await fx.connectAs("alice");
+    const onBob = await fx.connectAs("bob"); // a sibling window on a DIFFERENT agent
+
+    const r = (await onAlice.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
+    expect(r.attendance, "a window attending bob does not make alice co-attended").toBe(1);
+    void onBob;
+  });
+});
+
+/**
+ * V7 needs its own fixture: the sole-online fallback only fires when there IS exactly one online
+ * agent, so a two-agent fixture cannot reach the path under test — it returns "no current agent"
+ * instead, which is a different (and correct) refusal.
+ */
+describe("AC6 review F2: a reader that never selected the agent", () => {
+  let fx: TwoConnectionFixture;
+  beforeEach(async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-m8d-ac6-solo-" });
+  });
+  afterEach(async () => { await fx.cleanup(); });
+
+  it("V7 (review F2): a connection that never selected the agent still reads a TRUTHFUL count, never 0", async () => {
+    // `resolveCurrentAgent` falls back to the sole online agent, so a connection can read an
+    // agent's data with `currentAgent === null` — every `cello` CLI invocation with no persisted
+    // selection, and any MCP client that skipped cello_use_agent. The count walked only explicitly
+    // attending connections, so such a reader was told ZERO sessions attend the agent it is
+    // reading. That is worse than the absent field this unit set out to fix: not missing, but a
+    // definite negative that is false. A response the caller is holding can never honestly say 0.
+    await fx.createSession(SID, "alice");
+
+    // Bring alice ONLINE and then leave with nobody attending — the daemon keeps an agent running
+    // after the connection that started it goes away. That is the CLI's ordinary state: the daemon
+    // starts persisted agents at boot and every `cello` command is a fresh connection that never
+    // attends. So the agent is online with an attendance of ZERO.
+    const starter = await fx.connectAs("alice");
+    starter.close();
+    await new Promise((r) => setTimeout(r, 200));
+
+    // A fresh connection reads. `resolveCurrentAgent` falls back to the sole online agent, so this
+    // succeeds — and the count walked only explicitly attending connections, so it answered 0.
+    const unattached = await fx.connect(); // NO cello_use_agent
+    const quiet = (await unattached.send("cello_receive", { session_id: SID, timeout_ms: 300 })) as Record<string, unknown>;
+    expect(quiet.ok, "the sole-online fallback lets this read succeed").toBe(true);
+    expect(quiet.attendance, "the reader itself attends — 0 is never a truthful answer here").toBe(1);
   });
 });
