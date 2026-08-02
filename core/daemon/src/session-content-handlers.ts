@@ -714,6 +714,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         return {
           ok: true,
           content: contentText,
+          // AC6: every READ answer says whether this session is alone. The push already carried
+          // this; the read surfaces did not, so a session that never saw a doorbell — a fresh MCP
+          // connection, EVERY `cello` CLI invocation, anything that attached after the last
+          // arrival — had no way to learn it was co-attended. Live finding, journal Entry 33.
+          attendance: attendanceCount(agentName),
           sessionId,
           sequence_number: entry.sequenceNumber,
           senderPubkey: entry.senderPubkey,
@@ -821,6 +826,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           return {
             ok: true,
             content: null,
+            attendance: attendanceCount(agentName),
             reason: "counterparty_gone",
             liveness: "gone",
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
@@ -830,7 +836,15 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           sessionId, agentName, connectionId, timeoutMs, attendance,
           liveness, correlationId: receiveCorrelationId,
         });
-        return { ok: true, content: null, guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history." };
+        // AC6: the QUIET answer carries it too. This is the exit a session with no doorbell to
+        // learn from is most likely to reach — it attached, found nothing waiting, and would
+        // otherwise have no way to know another window holds the same agent.
+        return {
+          ok: true,
+          content: null,
+          attendance: attendanceCount(agentName),
+          guidance: "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history.",
+        };
       }
       await new Promise((r) => setTimeout(r, Math.min(20, remaining)));
     }

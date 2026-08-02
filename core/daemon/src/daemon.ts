@@ -2828,6 +2828,7 @@ async function startDaemonHoldingLock(
     safeWatermarkAdvance,
     reapDeadHalfOpenSessions,
     frontierMismatches,
+    attendanceCount,
   });
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;

@@ -33,13 +33,20 @@ export interface SessionReadDeps {
   /** Never vaults a cursor/watermark past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   safeWatermarkAdvance: (agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
+  /**
+   * DOD-COATTEND-VISIBLE-1 AC6: how many connections are attending this agent right now.
+   *
+   * The transcript is where a session that has already caught up looks, and where a session with no
+   * doorbell to learn from looks FIRST — so it is exactly the surface the live journey found silent.
+   */
+  attendanceCount: (agentName: string) => number;
   reapDeadHalfOpenSessions: (agentName?: string) => void;
 }
 
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
   const {
     handlers, logger, sessionNodeManager, loadedAgents, getConnState, resolveCurrentAgent,
-    NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance,
+    NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance, attendanceCount,
     reapDeadHalfOpenSessions,
       frontierMismatches,
 } = deps;
@@ -171,7 +178,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     safeWatermarkAdvance(agentName, sessionId, deliveredSeqs);
     // DOD-SESSION-NAME-1 (AC-A12): the name rides along so a transcript dump says what it is of.
     const transcriptName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
-    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable };
+    return { ok: true, session_id: sessionId, session_name: transcriptName, messages, undecryptable, attendance: attendanceCount(agentName) };
   });
 
   // cello_list_sessions: the discovery surface — every persisted session for the
