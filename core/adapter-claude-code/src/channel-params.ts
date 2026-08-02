@@ -65,7 +65,21 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
       const attending = typeof raw === "number" && Number.isFinite(raw) ? raw : null;
       const shared = attending !== null && attending > 1
         // Correct for any N: with 3 sessions "the other one" names a session that does not exist.
-        ? ` ${attending} sessions are attending this agent, so another one may read it first — if cello_receive returns nothing, run cello_transcript.`
+        //
+        // REWRITTEN after the live two-session journey (2026-08-02). The old text said "another one
+        // may read it first — if cello_receive returns nothing, run cello_transcript", which was
+        // true in the Tier-0 world and is now FALSE: DOD-COATTEND-1 made delivery non-destructive,
+        // so a sibling reading first takes nothing away and `cello_receive` cannot come back empty
+        // for that reason. Left alone it would teach every operator to expect a theft that has been
+        // fixed — a warning that outlives its cause is not harmless, it trains distrust of a surface
+        // that is now correct.
+        //
+        // `cello_transcript` still belongs here, for the reason the journey actually demonstrated:
+        // a SIBLING'S REPLIES never appear in cello_receive — that path returns only the
+        // counterparty's messages — so the transcript is the one place a session sees what its
+        // co-attendee said. That is DOD-COATTEND-CATCHUP-1's door, named at the moment it becomes
+        // relevant rather than in a doc nobody reads.
+        ? ` ${attending} sessions are attending this agent — you will each receive this message, and reading it does not take it from the others. Their replies will NOT appear in cello_receive; run cello_transcript to see what they said.`
         : "";
       return `📩 CELLO — ${renderWho(data)} sent a message. Run cello_receive to read it.${shared}`;
     }
