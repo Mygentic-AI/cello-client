@@ -37,7 +37,15 @@ export function ctrlLeafHash(data: Uint8Array): Uint8Array {
   return sha256(prefixed(CTRL_LEAF, data));
 }
 
-/** Document-operation leaf (DOD-DOC-LEAF-1): SHA-256(0x04 || data). RFC 6962 §2.1 domain separation. */
+/**
+ * Document-operation leaf (DOD-DOC-LEAF-1): SHA-256(0x04 || data). RFC 6962 §2.1 domain separation.
+ *
+ * PREIMAGE CONTRACT: `data` MUST be re-encoded canonical state, NEVER the bytes received from a
+ * peer. The Yjs v1 update encoding is malleable — trailing bytes past the decoder's cursor are
+ * ignored, so unlimited distinct byte strings decode to identical document state (measured,
+ * DOD-DOC-FUZZ-1). Hashing received bytes would let a peer change a leaf hash without changing
+ * the document, and two honest peers holding identical state would produce different leaves.
+ */
 export function docLeafHash(data: Uint8Array): Uint8Array {
   return sha256(prefixed(DOC_LEAF, data));
 }
