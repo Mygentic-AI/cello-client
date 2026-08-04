@@ -35,6 +35,7 @@
   },
   "dependencies": {
     "@cello-protocol/crypto": "workspace:*",
+    "yjs": "^13.6.32",
     "@cello-protocol/gateway": "workspace:*",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
