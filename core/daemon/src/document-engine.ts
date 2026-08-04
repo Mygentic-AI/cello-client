@@ -33,14 +33,14 @@ export type DocumentUpdateFailure =
   | "document_update_too_large"
   | "document_update_too_small"
   | "document_update_malformed"
-  | "document_update_unresolved_dependencies";
+  | "document_update_unresolved_dependencies"
+  | "document_snapshot_malformed"
+  | "document_envelope_purged";
 
-export interface DocumentUpdateResult {
-  ok: boolean;
-  reason?: DocumentUpdateFailure;
-  /** The underlying cause, when there is one — never the reason itself. */
-  detail?: string;
-}
+export type DocumentUpdateResult =
+  | { ok: true }
+  /** `detail` is the underlying cause — never the reason itself. */
+  | { ok: false; reason: DocumentUpdateFailure; detail?: string };
 
 /** Thrown by the *OrThrow variants and by `replay`, where returning a verdict would let a caller
  *  persist a state that was never fully applied. */
@@ -94,11 +94,19 @@ export class DocumentEngine {
     return doc;
   }
 
-  readText(doc: Y.Doc): string {
+  /**
+   * Read the single text root a text-typed document uses.
+   *
+   * Named for the root it reads, not for "the document's content". `DocumentRow.documentType`
+   * admits markdown, json and xml; on the latter two the data does not live in this root, and an
+   * unnamed `readText` would return "" — indistinguishable from an empty document. Structured
+   * types get their own accessors when a unit needs them.
+   */
+  readTextRoot(doc: Y.Doc): string {
     return doc.getText(TEXT_ROOT).toString();
   }
 
-  insertText(doc: Y.Doc, index: number, text: string): void {
+  insertIntoTextRoot(doc: Y.Doc, index: number, text: string): void {
     doc.getText(TEXT_ROOT).insert(index, text);
   }
 
@@ -123,7 +131,27 @@ export class DocumentEngine {
    */
   restore(binary: Uint8Array): Y.Doc {
     const doc = new Y.Doc();
-    Y.applyUpdate(doc, binary);
+    try {
+      Y.applyUpdate(doc, binary);
+    } catch (err: unknown) {
+      // This is the one method that reads bytes off disk, and it used to be a bare applyUpdate —
+      // so a corrupt `document_snapshots` row surfaced as "Unexpected end of array", the exact
+      // lib0 string this module says must never be a reason. It named Yjs internals and pointed
+      // an operator at the wrong subsystem.
+      const detail = err instanceof Error ? err.message : String(err);
+      this.#logger.error("document.snapshot.malformed", { detail });
+      throw new DocumentUpdateError("document_snapshot_malformed", detail);
+    }
+    if (doc.store.pendingStructs !== null) {
+      // A snapshot that decodes but is incomplete would otherwise restore SHORT and silent.
+      this.#logger.error("document.snapshot.incomplete", {
+        missing: doc.store.pendingStructs.missing.size,
+      });
+      throw new DocumentUpdateError(
+        "document_update_unresolved_dependencies",
+        `snapshot is missing operations from ${doc.store.pendingStructs.missing.size} client(s)`,
+      );
+    }
     return doc;
   }
 
@@ -135,73 +163,113 @@ export class DocumentEngine {
    * answer is no.
    */
   applyUpdate(doc: Y.Doc, update: Uint8Array): DocumentUpdateResult {
+    return this.#applyChecked(doc, new Y.Doc(), update);
+  }
+
+  /**
+   * The guarded apply. `shadow` is a scratch document the caller may reuse across a batch — the
+   * trial costs a full encode/decode of `doc`, so allocating one per update makes a fold over an
+   * N-envelope log quadratic in document size. Reusing it is safe because the shadow is reset to
+   * `doc`'s state at the top of every call.
+   */
+  #applyChecked(doc: Y.Doc, shadow: Y.Doc, update: Uint8Array): DocumentUpdateResult {
     if (update.length > MAX_UPDATE_BYTES) {
-      return { ok: false, reason: "document_update_too_large" };
+      return this.#refuse("document_update_too_large", `${update.length} bytes exceeds the ${MAX_UPDATE_BYTES}-byte cap`, update);
     }
     if (update.length < MIN_UPDATE_BYTES) {
-      return { ok: false, reason: "document_update_too_small" };
+      return this.#refuse("document_update_too_small", `${update.length} bytes is below the ${MIN_UPDATE_BYTES}-byte minimum for a Yjs update`, update);
     }
 
-    // Try it on a copy first. Yjs has no "apply atomically" mode, and an update that resolves
-    // partially would otherwise leave the real document in a state no one chose.
-    const shadow = new Y.Doc();
+    // Trial it on scratch state first. Yjs has no atomic-apply mode, and an update that resolves
+    // only partially would otherwise leave the caller's document in a state nobody chose.
     try {
       Y.applyUpdate(shadow, Y.encodeStateAsUpdate(doc));
       Y.applyUpdate(shadow, update);
     } catch (err: unknown) {
-      return {
-        ok: false,
-        reason: "document_update_malformed",
-        detail: err instanceof Error ? err.message : String(err),
-      };
+      return this.#refuse("document_update_malformed", err instanceof Error ? err.message : String(err), update);
     }
 
-    // THE ACCEPT CLASS. Yjs returned success — that is not evidence the update integrated.
-    // A non-empty pending set means it is waiting on structs that never arrived, and admitting
-    // it would retain them indefinitely while contributing nothing.
+    // THE ACCEPT CLASS. Yjs returned success — that is not evidence the update integrated. A
+    // non-empty pending set means it is waiting on structs that never arrived; admitting it would
+    // retain them indefinitely while contributing nothing (measured, DOD-DOC-FUZZ-1).
+    //
+    // PRECONDITION THIS IMPLIES: a sender's envelopes must be delivered in chain order. Yjs would
+    // otherwise BUFFER an out-of-order update and resolve it on the next state-vector exchange;
+    // this refuses instead. That is right for replay, where a gap means a corrupt log — a live
+    // receive path wanting buffer-and-re-request semantics needs its own entry point, not this one.
     if (shadow.store.pendingStructs !== null) {
-      return {
-        ok: false,
-        reason: "document_update_unresolved_dependencies",
-        detail: `update depends on ${shadow.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
-      };
+      return this.#refuse(
+        "document_update_unresolved_dependencies",
+        `depends on ${shadow.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
+        update,
+      );
     }
 
     Y.applyUpdate(doc, update);
     return { ok: true };
   }
 
+  /** Every refusal is logged, not merely returned — a return value nobody reads is not observable. */
+  #refuse(reason: DocumentUpdateFailure, detail: string, update: Uint8Array): DocumentUpdateResult {
+    this.#logger.warn("document.update.refused", { reason, detail, bytes: update.length });
+    return { ok: false, reason, detail };
+  }
+
   /** `applyUpdate` for callers that want the failure to be unmissable. */
   applyUpdateOrThrow(doc: Y.Doc, update: Uint8Array): void {
     const res = this.applyUpdate(doc, update);
-    if (!res.ok) throw new DocumentUpdateError(res.reason!, res.detail);
+    if (!res.ok) throw new DocumentUpdateError(res.reason, res.detail);
   }
 
   /**
    * Fold an ordered envelope log into a materialized state — the `ReplayFn` the store injects.
    *
-   * Receives the WHOLE log, withdrawal and rejection rows included. Those carry no payload, and
-   * excluding the update a withdrawal references is precisely the judgement the store declines to
-   * make on the engine's behalf.
+   * **A WITHDRAWAL EXCLUDES NOTHING.** §16.4 is explicit: withdrawing rolls the change back with
+   * a *Yjs undo* and writes a record "beside the original envelope — marked withdrawn, never
+   * deleted, so the log stays intact". Rejection resolves the same way, by supersession —
+   * "inverses, not erasure" (§3.2). So the undo is itself an ordinary update in the log, and
+   * replay simply applies every payload in order.
+   *
+   * An earlier version of this method excluded the referenced envelope instead, which is
+   * unsound in a CRDT log and was measured to be so: Yjs operations are causally chained, so
+   * dropping any but the LAST envelope leaves every later one depending on structs that never
+   * arrive — the document rebuilds until the next daemon restart and is permanently unopenable
+   * after it. It also let ANY sender suppress ANY other sender's content by appending a
+   * payload-free row, since nothing upstream checks authorship of a reference. Both problems
+   * dissolve when the log is simply replayed, which is what the spec said to do.
    *
    * REFUSES rather than skipping. A payload that will not apply means the log is corrupt, and
    * folding the rest would produce a document that reads as complete while missing operations —
    * the silent divergence the whole two-layer design exists to prevent.
    */
   replay(envelopes: readonly DocumentEnvelopeRow[]): { binary: Uint8Array; stateVector: Uint8Array } {
-    const withdrawn = new Set<string>();
-    for (const e of envelopes) {
-      if ((e.kind === "withdrawal" || e.kind === "rejection") && e.referencesEnvelopeHash) {
-        withdrawn.add(e.referencesEnvelopeHash);
-      }
-    }
-
     const doc = new Y.Doc();
+    const shadow = new Y.Doc(); // reused across the fold — see #applyChecked
     let applied = 0;
+
     for (const e of envelopes) {
-      if (e.payload === null) continue; // withdrawal/rejection records, and purged envelopes
-      if (withdrawn.has(e.envelopeHash)) continue;
-      const res = this.applyUpdate(doc, e.payload);
+      if (e.payload === null) {
+        // A withdrawal or rejection RECORD legitimately carries no payload — it is audit, not
+        // content. An `update` row with no payload is different: it is a PURGED operation whose
+        // bytes are gone (§16.7-12), and folding around it would produce a document that reads
+        // as complete while missing an operation. Purge is V2, so this cannot happen yet — which
+        // is exactly why it must refuse now rather than become a silent skip later.
+        if (e.kind === "update") {
+          this.#logger.error("document.replay.failed", {
+            documentId: e.documentId,
+            envelopeHash: e.envelopeHash,
+            reason: "document_envelope_purged",
+          });
+          throw new DocumentUpdateError(
+            "document_envelope_purged",
+            `envelope ${e.envelopeHash.slice(0, 16)}… is an update whose payload has been purged — ` +
+              `the document cannot be rebuilt without it`,
+          );
+        }
+        continue;
+      }
+
+      const res = this.#applyChecked(doc, shadow, e.payload);
       if (!res.ok) {
         this.#logger.error("document.replay.failed", {
           documentId: e.documentId,
@@ -209,7 +277,10 @@ export class DocumentEngine {
           reason: res.reason,
           detail: res.detail,
         });
-        throw new DocumentUpdateError(res.reason!, `envelope ${e.envelopeHash.slice(0, 16)}…: ${res.detail ?? ""}`);
+        throw new DocumentUpdateError(
+          res.reason,
+          `envelope ${e.envelopeHash.slice(0, 16)}…: ${res.detail ?? ""}`,
+        );
       }
       applied++;
     }

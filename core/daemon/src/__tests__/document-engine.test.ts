@@ -60,7 +60,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
   it("creates a document from starting content", () => {
     const engine = new DocumentEngine(NOOP_LOGGER);
     const doc = engine.createDocument("# Title\n\nbody text");
-    expect(engine.readText(doc)).toBe("# Title\n\nbody text");
+    expect(engine.readTextRoot(doc)).toBe("# Title\n\nbody text");
   });
 
   it("applies an update and reads the merged result", () => {
@@ -71,7 +71,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
 
     const res = engine.applyUpdate(b, update);
     expect(res.ok).toBe(true);
-    expect(engine.readText(b)).toBe("hello");
+    expect(engine.readTextRoot(b)).toBe("hello");
   });
 
   it("computes an update against a peer state vector — only the delta the peer lacks", () => {
@@ -81,7 +81,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
     engine.applyUpdate(theirs, engine.encodeState(mine));
 
     // Now diverge: I add more.
-    engine.insertText(mine, engine.readText(mine).length, " plus mine");
+    engine.insertIntoTextRoot(mine, engine.readTextRoot(mine).length, " plus mine");
 
     const theirVector = engine.encodeStateVector(theirs);
     const delta = engine.encodeState(mine, theirVector);
@@ -90,7 +90,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
     expect(delta.length).toBeLessThan(full.length);
 
     engine.applyUpdate(theirs, delta);
-    expect(engine.readText(theirs)).toBe("shared base plus mine");
+    expect(engine.readTextRoot(theirs)).toBe("shared base plus mine");
   });
 
   it("snapshots and restores through binary + state vector", () => {
@@ -99,7 +99,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
     const snap = engine.snapshot(doc);
 
     const restored = engine.restore(snap.binary);
-    expect(engine.readText(restored)).toBe("persist me");
+    expect(engine.readTextRoot(restored)).toBe("persist me");
     expect(Buffer.from(engine.encodeStateVector(restored))).toEqual(Buffer.from(snap.stateVector));
   });
 
@@ -110,8 +110,8 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
 
     const a = engine.restore(baseState);
     const b = engine.restore(baseState);
-    engine.insertText(a, engine.readText(a).length, " A");
-    engine.insertText(b, 0, "B ");
+    engine.insertIntoTextRoot(a, engine.readTextRoot(a).length, " A");
+    engine.insertIntoTextRoot(b, 0, "B ");
     const updateA = engine.encodeState(a);
     const updateB = engine.encodeState(b);
 
@@ -124,7 +124,7 @@ describe("DocumentEngine — Y.Doc lifecycle", () => {
     engine.applyUpdate(second, updateB);
     engine.applyUpdate(second, updateA);
 
-    expect(engine.readText(first)).toBe(engine.readText(second));
+    expect(engine.readTextRoot(first)).toBe(engine.readTextRoot(second));
   });
 });
 
@@ -145,7 +145,7 @@ describe("DocumentEngine — the clientID rule (§14)", () => {
     // the honest client's update is accepted-and-dropped, and the document becomes a splice of
     // two authors with an empty pending set and no error anywhere.
     expect(restored.clientID).not.toBe(original.clientID);
-    expect(engine.readText(restored)).toBe("content");
+    expect(engine.readTextRoot(restored)).toBe("content");
   });
 });
 
@@ -189,7 +189,7 @@ describe("DocumentEngine — hostile input (guards measured by DOD-DOC-FUZZ-1)",
     const source = engine.createDocument("");
     const updates: Uint8Array[] = [];
     source.on("update", (u: Uint8Array) => updates.push(u));
-    for (let i = 0; i < 5; i++) engine.insertText(source, 0, `chunk${i} `);
+    for (let i = 0; i < 5; i++) engine.insertIntoTextRoot(source, 0, `chunk${i} `);
 
     const target = engine.createDocument("");
     // Skip the first, so every later update depends on a struct the target never sees. Yjs
@@ -198,7 +198,7 @@ describe("DocumentEngine — hostile input (guards measured by DOD-DOC-FUZZ-1)",
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("document_update_unresolved_dependencies");
     // And the document is left untouched, not half-integrated.
-    expect(engine.readText(target)).toBe("");
+    expect(engine.readTextRoot(target)).toBe("");
   });
 
   it("a bad update never crashes and never mutates the document", () => {
@@ -207,7 +207,7 @@ describe("DocumentEngine — hostile input (guards measured by DOD-DOC-FUZZ-1)",
     for (const bad of [new Uint8Array([0xff, 0xff]), new Uint8Array([0x01, 0x02, 0x03])]) {
       expect(() => engine.applyUpdate(doc, bad)).not.toThrow();
     }
-    expect(engine.readText(doc)).toBe("original");
+    expect(engine.readTextRoot(doc)).toBe("original");
   });
 
   it("applyUpdateOrThrow raises a typed error for callers that want one", () => {
@@ -226,9 +226,9 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
     const live = engine.createDocument("");
     const captured: Uint8Array[] = [];
     live.on("update", (u: Uint8Array) => captured.push(u));
-    engine.insertText(live, 0, "first ");
-    engine.insertText(live, engine.readText(live).length, "second ");
-    engine.insertText(live, engine.readText(live).length, "third");
+    engine.insertIntoTextRoot(live, 0, "first ");
+    engine.insertIntoTextRoot(live, engine.readTextRoot(live).length, "second ");
+    engine.insertIntoTextRoot(live, engine.readTextRoot(live).length, "third");
 
     let prev: string | null = null;
     for (const payload of captured) {
@@ -242,20 +242,26 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
 
     // The property a concatenation stand-in cannot test: Yjs merge is neither associative nor
     // order-only, so this is where "the log is sufficient input" becomes "the fold is correct".
+    // BYTE-identical, which is what the AC says — a state vector is only clientID→clock, so
+    // structurally different state with the same clocks would pass that alone.
+    expect(Buffer.from(rebuilt.binary)).toEqual(Buffer.from(expected.binary));
     expect(Buffer.from(rebuilt.stateVector)).toEqual(Buffer.from(expected.stateVector));
     const restored = engine.restore(rebuilt.binary);
-    expect(engine.readText(restored)).toBe("first second third");
+    expect(engine.readTextRoot(restored)).toBe("first second third");
   });
 
-  it("(ii) a WITHDRAWN update is excluded from the fold", () => {
+  it("(ii) a withdrawal record excludes NOTHING — the undo is an inverse update (§16.4)", () => {
     const engine = new DocumentEngine(NOOP_LOGGER);
     const store = newStore();
 
     const live = engine.createDocument("");
     const captured: Uint8Array[] = [];
     live.on("update", (u: Uint8Array) => captured.push(u));
-    engine.insertText(live, 0, "keep ");
-    engine.insertText(live, engine.readText(live).length, "WITHDRAWN");
+    engine.insertIntoTextRoot(live, 0, "keep ");
+    engine.insertIntoTextRoot(live, engine.readTextRoot(live).length, "WITHDRAWN");
+    // The withdrawal's ACTUAL mechanism: a Yjs undo, which is itself an ordinary update.
+    const withdrawnLength = "WITHDRAWN".length;
+    live.getText("content").delete(engine.readTextRoot(live).length - withdrawnLength, withdrawnLength);
 
     let prev: string | null = null;
     const hashes: string[] = [];
@@ -265,14 +271,84 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
       hashes.push(e.envelopeHash);
       prev = e.envelopeHash;
     }
-    // A withdrawal row referencing the second update. It carries NO payload — which is exactly
-    // why the store hands the engine whole rows rather than payload bytes.
+    // The audit record sits BESIDE the original — "marked withdrawn, never deleted, so the log
+    // stays intact" (§16.4). It carries no payload and changes no content.
     store.appendEnvelope(AGENT, envelopeFor(null, prev, "withdrawal", hashes[1]));
 
     const rebuilt = store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows));
     const restored = engine.restore(rebuilt.binary);
-    expect(engine.readText(restored)).toBe("keep ");
-    expect(engine.readText(restored)).not.toContain("WITHDRAWN");
+    expect(engine.readTextRoot(restored)).toBe("keep ");
+    expect(engine.readTextRoot(restored)).not.toContain("WITHDRAWN");
+  });
+
+  // The case the previous implementation broke, and the previous test could not see because it
+  // withdrew the LAST envelope — the one shape exclusion happened to survive.
+  it("(ii) a withdrawal of a NON-LEAF envelope still rebuilds — exclusion would have broken it", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const store = newStore();
+
+    const live = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    live.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(live, 0, "one ");
+    engine.insertIntoTextRoot(live, engine.readTextRoot(live).length, "two ");
+    engine.insertIntoTextRoot(live, engine.readTextRoot(live).length, "three");
+
+    let prev: string | null = null;
+    const hashes: string[] = [];
+    for (const payload of captured) {
+      const e = envelopeFor(payload, prev);
+      store.appendEnvelope(AGENT, e);
+      hashes.push(e.envelopeHash);
+      prev = e.envelopeHash;
+    }
+    // Reference the FIRST envelope — Yjs operations are causally chained, so excluding it would
+    // strand every later one on structs that never arrive.
+    store.appendEnvelope(AGENT, envelopeFor(null, prev, "withdrawal", hashes[0]));
+
+    const rebuilt = store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows));
+    expect(engine.readTextRoot(engine.restore(rebuilt.binary))).toBe("one two three");
+  });
+
+  it("(ii) a withdrawal referencing ANOTHER sender's envelope cannot erase it", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const store = newStore();
+
+    const live = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    live.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(live, 0, "mine");
+
+    const mine = envelopeFor(captured[0]!, null);
+    store.appendEnvelope(AGENT, mine);
+    // A hostile peer appends a payload-free withdrawal naming MY envelope. Nothing upstream
+    // validates authorship of a reference, so if replay honoured it, a counterparty could erase
+    // my contribution with a log that still verifies.
+    store.appendEnvelope(AGENT, {
+      ...envelopeFor(null, null, "withdrawal", mine.envelopeHash),
+      senderAgentId: PEER,
+    });
+
+    const rebuilt = store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows));
+    expect(engine.readTextRoot(engine.restore(rebuilt.binary))).toBe("mine");
+  });
+
+  it("a PURGED update row REFUSES — a short document is never reported as a clean rebuild", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const store = newStore();
+    const live = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    live.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(live, 0, "content");
+
+    const first = envelopeFor(captured[0]!, null);
+    store.appendEnvelope(AGENT, first);
+    // kind "update" with no payload is a PURGED operation (V2), not an audit record. Folding
+    // around it would silently drop an operation that was part of the document.
+    store.appendEnvelope(AGENT, envelopeFor(null, first.envelopeHash, "update"));
+
+    expect(() => store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows)))
+      .toThrow(/document_envelope_purged/);
   });
 
   it("(iii) rebuilding through the store REFUSES over a chain that does not verify", () => {
@@ -281,7 +357,7 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
     const live = engine.createDocument("");
     const captured: Uint8Array[] = [];
     live.on("update", (u: Uint8Array) => captured.push(u));
-    engine.insertText(live, 0, "content");
+    engine.insertIntoTextRoot(live, 0, "content");
 
     const first = envelopeFor(captured[0]!, null);
     store.appendEnvelope(AGENT, first);
@@ -297,7 +373,7 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
     const live = engine.createDocument("");
     const captured: Uint8Array[] = [];
     live.on("update", (u: Uint8Array) => captured.push(u));
-    engine.insertText(live, 0, "content");
+    engine.insertIntoTextRoot(live, 0, "content");
 
     const good = envelopeFor(captured[0]!, null);
     store.appendEnvelope(AGENT, good);
@@ -305,5 +381,34 @@ describe("DocumentEngine — rebuild from the log (the ACs inherited from STORE-
 
     expect(() => store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows)))
       .toThrow(DocumentUpdateError);
+  });
+});
+
+describe("DocumentEngine — restore is guarded like every other read", () => {
+  it("a corrupt snapshot binary raises a TYPED reason, not a lib0 decoder string", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    let thrown: unknown;
+    try {
+      engine.restore(new Uint8Array([0xff, 0xff, 0xff, 0xff]));
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(DocumentUpdateError);
+    const e = thrown as DocumentUpdateError;
+    expect(e.reason).toBe("document_snapshot_malformed");
+    // The decoder string survives as DETAIL — it is useful, it is just not the reason.
+    expect(e.detail).toBeTruthy();
+  });
+
+  it("a snapshot that decodes but is INCOMPLETE refuses rather than restoring short", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const source = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    source.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(source, 0, "first ");
+    engine.insertIntoTextRoot(source, engine.readTextRoot(source).length, "second");
+
+    // Only the SECOND update — decodable, but depending on structs that are absent.
+    expect(() => engine.restore(captured[1]!)).toThrow(DocumentUpdateError);
   });
 });
