@@ -22,7 +22,33 @@
 
 import { buildMerkleTree, merkleRoot, type LeafInput } from "@cello-protocol/crypto";
 
-export type SessionTreeLeafKind = "msg" | "ctrl";
+/**
+ * The leaf domains a session tree can carry. "doc" (0x04) and "reject" (0x05) are the
+ * document-collaboration kinds (DOD-DOC-LEAF-1); the stored hash already encodes the prefix,
+ * so the kind here is the domain label that must survive persistence intact.
+ */
+export type SessionTreeLeafKind = "msg" | "ctrl" | "doc" | "reject";
+
+const SESSION_TREE_LEAF_KINDS: readonly SessionTreeLeafKind[] = ["msg", "ctrl", "doc", "reject"];
+
+/**
+ * Map a `session_tree_leaves.leaf_kind` value read back from the database to its domain.
+ *
+ * REFUSES an unrecognized value rather than defaulting. A default would relabel a leaf whose
+ * kind this build does not know — silently changing the domain the tree replays under, which
+ * diverges the root from the counterparty's without any error surfacing. An unknown value here
+ * means own-database corruption or a downgrade below the writing build; both must be loud.
+ */
+export function sessionTreeLeafKindFromDb(value: string): SessionTreeLeafKind {
+  const found = SESSION_TREE_LEAF_KINDS.find((k) => k === value);
+  if (!found) {
+    throw new Error(
+      `session_tree_leaves.leaf_kind holds an unrecognized domain ${JSON.stringify(value)} — ` +
+        `expected one of ${SESSION_TREE_LEAF_KINDS.join(", ")}`,
+    );
+  }
+  return found;
+}
 
 export interface SessionTreeLeaf {
   /** Domain of the leaf — metadata only; the stored hash already encodes the prefix. */

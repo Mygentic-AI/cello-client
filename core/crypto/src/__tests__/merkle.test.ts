@@ -18,7 +18,7 @@ import {
   it,
   expect,
 } from "@claude-flow/testing";
-import { msgLeafHash, ctrlLeafHash } from "../hashing.js";
+import { msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "../hashing.js";
 import {
   buildMerkleTree,
   merkleRoot,
@@ -408,5 +408,83 @@ describe("'hash' leaf-kind variant (DAEMON-004 SessionTree)", () => {
     const pre = new Uint8Array(32).fill(0x7e);
     const tree = buildMerkleTree([{ kind: "hash", data: pre }]);
     expect(toHex(merkleRoot(tree))).toBe(toHex(pre));
+  });
+});
+
+// ── DOD-DOC-LEAF-1: "doc" (0x04) and "reject" (0x05) leaf kinds ─────────────
+describe("'doc' and 'reject' leaf kinds (DOD-DOC-LEAF-1)", () => {
+  it("a 'doc' leaf hashes as docLeafHash — same root as the pre-hashed equivalent", () => {
+    const data = new TextEncoder().encode("yjs update bytes");
+    const docTree = buildMerkleTree([{ kind: "doc", data }]);
+    const hashTree = buildMerkleTree([{ kind: "hash", data: docLeafHash(data) }]);
+    expect(toHex(merkleRoot(docTree))).toBe(toHex(merkleRoot(hashTree)));
+  });
+
+  it("a 'reject' leaf hashes as rejectLeafHash — same root as the pre-hashed equivalent", () => {
+    const data = new TextEncoder().encode("rejection record");
+    const rejTree = buildMerkleTree([{ kind: "reject", data }]);
+    const hashTree = buildMerkleTree([{ kind: "hash", data: rejectLeafHash(data) }]);
+    expect(toHex(merkleRoot(rejTree))).toBe(toHex(merkleRoot(hashTree)));
+  });
+
+  it("relabeling a doc leaf as msg changes the root — cross-type substitution is detected", () => {
+    const data = new TextEncoder().encode("same payload");
+    const asDoc = toHex(merkleRoot(buildMerkleTree([{ kind: "doc", data }])));
+    const asMsg = toHex(merkleRoot(buildMerkleTree([msgLeaf(data)])));
+    const asReject = toHex(merkleRoot(buildMerkleTree([{ kind: "reject", data }])));
+    expect(asDoc).not.toBe(asMsg);
+    expect(asDoc).not.toBe(asReject);
+  });
+
+  it("mixed-kind tree (msg + ctrl + doc + reject) builds deterministically and proofs verify", () => {
+    const leaves: LeafInput[] = [
+      msgLeaf(new Uint8Array([0x01])),
+      { kind: "doc", data: new Uint8Array([0x02]) },
+      { kind: "reject", data: new Uint8Array([0x03]) },
+      ctrlLeaf(new Uint8Array([0x04])),
+    ];
+    const tree = buildMerkleTree(leaves);
+    const root = merkleRoot(tree);
+    expect(toHex(root)).toBe(toHex(merkleRoot(buildMerkleTree(leaves))));
+    // Inclusion proof for the doc leaf verifies against the mixed root.
+    const proof = inclusionProof(tree, 1);
+    expect(verifyInclusion(docLeafHash(new Uint8Array([0x02])), 1, 4, proof, root)).toBe(true);
+  });
+});
+
+// ── DOD-DOC-LEAF-1 (§16.7-10): opaque kind — verifier tolerance ─────────────
+// A verifier walking a tree that contains a leaf kind it does not recognize must
+// hash it as opaque bytes (prefix || data) rather than erroring, so future kinds
+// never break old verifiers' root recomputation.
+describe("'opaque' leaf kind (DOD-DOC-LEAF-1 verifier tolerance)", () => {
+  it("an opaque leaf with an unrecognized prefix builds and roots deterministically", () => {
+    const data = fromHex("deadbeef");
+    const tree = buildMerkleTree([{ kind: "opaque", prefix: 0x06, data }]);
+    const expected = createHash("sha256")
+      .update(Buffer.concat([Buffer.from([0x06]), Buffer.from(data)]))
+      .digest("hex");
+    expect(toHex(merkleRoot(tree))).toBe(expected);
+  });
+
+  it("opaque with a KNOWN prefix reproduces the named-kind root exactly", () => {
+    const data = new TextEncoder().encode("payload");
+    const named = toHex(merkleRoot(buildMerkleTree([{ kind: "doc", data }])));
+    const opaque = toHex(merkleRoot(buildMerkleTree([{ kind: "opaque", prefix: 0x04, data }])));
+    expect(opaque).toBe(named);
+  });
+
+  it("a mixed tree with one unrecognized-kind leaf still verifies known-leaf inclusion", () => {
+    const leaves: LeafInput[] = [
+      msgLeaf(new Uint8Array([0xaa])),
+      { kind: "opaque", prefix: 0x07, data: new Uint8Array([0xbb]) },
+      ctrlLeaf(new Uint8Array([0xcc])),
+    ];
+    const tree = buildMerkleTree(leaves);
+    const root = merkleRoot(tree);
+    const proof = inclusionProof(tree, 0);
+    expect(verifyInclusion(msgLeafHash(new Uint8Array([0xaa])), 0, 3, proof, root)).toBe(true);
+    // And the opaque leaf itself proves inclusion via opaqueLeafHash.
+    const proofOpaque = inclusionProof(tree, 1);
+    expect(verifyInclusion(opaqueLeafHash(0x07, new Uint8Array([0xbb])), 1, 3, proofOpaque, root)).toBe(true);
   });
 });

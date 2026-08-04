@@ -21,7 +21,7 @@
 
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
-import { SessionTree } from "../session-tree.js";
+import { SessionTree, sessionTreeLeafKindFromDb } from "../session-tree.js";
 
 function msgLeafHashHex(content: Uint8Array): string {
   return createHash("sha256").update(new Uint8Array([0x00])).update(content).digest("hex");
@@ -99,5 +99,40 @@ describe("DAEMON-004: SessionTree", () => {
   it("appendLeafHash rejects a non-32-byte hex hash", () => {
     const tree = SessionTree.empty();
     expect(() => tree.appendLeafHash("msg", "deadbeef")).toThrow(/64 lowercase hex/);
+  });
+});
+
+// ─── DOD-DOC-LEAF-1: "doc" and "reject" leaf kinds ──────────────────────────
+describe("DOD-DOC-LEAF-1: document leaf kinds in SessionTree", () => {
+  const h = (b: number) => createHash("sha256").update(new Uint8Array([b])).digest("hex");
+
+  it("appendLeafHash accepts 'doc' and 'reject' kinds and preserves them in leaves()", () => {
+    const tree = SessionTree.empty();
+    tree.appendLeafHash("msg", h(1));
+    tree.appendLeafHash("doc", h(2));
+    tree.appendLeafHash("reject", h(3));
+    tree.appendLeafHash("ctrl", h(4));
+    expect(tree.leaves().map((l) => l.kind)).toEqual(["msg", "doc", "reject", "ctrl"]);
+  });
+
+  it("fromLeaves round-trips doc/reject kinds with identical root", () => {
+    const original = SessionTree.empty();
+    original.appendLeafHash("doc", h(5));
+    original.appendLeafHash("reject", h(6));
+    const reloaded = SessionTree.fromLeaves(original.leaves());
+    expect(reloaded.leaves().map((l) => l.kind)).toEqual(["doc", "reject"]);
+    expect(reloaded.rootHex()).toBe(original.rootHex());
+  });
+
+  it("sessionTreeLeafKindFromDb maps all four stored kinds verbatim", () => {
+    expect(sessionTreeLeafKindFromDb("msg")).toBe("msg");
+    expect(sessionTreeLeafKindFromDb("ctrl")).toBe("ctrl");
+    expect(sessionTreeLeafKindFromDb("doc")).toBe("doc");
+    expect(sessionTreeLeafKindFromDb("reject")).toBe("reject");
+  });
+
+  it("sessionTreeLeafKindFromDb REFUSES an unknown stored kind, naming the value — never a silent 'msg' relabel", () => {
+    expect(() => sessionTreeLeafKindFromDb("future-kind")).toThrow(/future-kind/);
+    expect(() => sessionTreeLeafKindFromDb("")).toThrow(/leaf_kind/);
   });
 });

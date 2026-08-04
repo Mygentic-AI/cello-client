@@ -73,4 +73,15 @@ describe("SessionSealLeafStore (DOD-OPTIONB-SEAL-1)", () => {
     store.store(agent, "ab".repeat(16), own(1, 0), 1);
     expect(store.getCarry(agent, sess).length).toBe(1);
   });
+
+  // DOD-DOC-LEAF-1 (C7): the INTEGER leaf_kind column round-trips the document kinds
+  // 0x04 (doc-op) and 0x05 (rejection) unaltered — no coercion anywhere in the store.
+  it("round-trips leaf kinds 0x04 and 0x05 verbatim", () => {
+    const store = new SessionSealLeafStore(new DatabaseSync(":memory:"), NOOP_LOGGER);
+    store.store(agent, sess, own(1, 0x04), 1);
+    store.store(agent, sess, received(2, 0x05), 1);
+    store.store(agent, sess, own(3, 0x02), 1);
+    const carry = store.getCarry(agent, sess);
+    expect(carry.map((l) => l.leafKind)).toEqual([0x04, 0x05, 0x02]);
+  });
 });

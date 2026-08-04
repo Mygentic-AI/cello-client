@@ -39,7 +39,7 @@ import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
-import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
+import { SessionTree, sessionTreeLeafKindFromDb, type SessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
@@ -4373,7 +4373,7 @@ export class SessionNodeManager {
       )
       .all(this.#requireAgentId(agentName), sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
     return SessionTree.fromLeaves(
-      rows.map((r) => ({ kind: r.leaf_kind === "ctrl" ? "ctrl" : "msg", hashHex: r.leaf_hash_hex })),
+      rows.map((r) => ({ kind: sessionTreeLeafKindFromDb(r.leaf_kind), hashHex: r.leaf_hash_hex })),
     );
   }
 

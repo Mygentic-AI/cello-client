@@ -11,12 +11,16 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { generateKeypair, verify, buildRelayAckTbs } from "@cello-protocol/crypto";
+import { generateKeypair, verify, buildRelayAckTbs, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
 import {
   AgentRelayClient,
   buildRelayAuthPayload,
   encodeStructure1,
   RELAY_AUTH_DOMAIN,
+  LEAF_KIND_MSG,
+  LEAF_KIND_CTRL,
+  LEAF_KIND_DOC,
+  LEAF_KIND_REJECT,
 } from "../session-relay-client.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
@@ -736,5 +740,37 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     expect(atSeq1[0].relayId).toBe(relayIdHex);
     expect(atSeq1[0].relaySignatureHex).toBe(Buffer.from(relaySig).toString("hex"));
     client.close();
+  });
+});
+
+// ─── DOD-DOC-LEAF-1: the wire leaf-kind bytes ARE the crypto domain prefixes ──
+//
+// The wire byte and the hash prefix are one agreement: the relay receives the byte
+// and computes the leaf hash from it, while the client computes the same hash from
+// its domain function. If the two ever disagree the roots diverge silently, which is
+// exactly the failure a domain-separated leaf type exists to prevent. These tests are
+// the serialization pin for the new constants (M14-PROCEDURE §5 no-consumer exception —
+// the submitting consumer arrives with the document envelope in P2).
+describe("DOD-DOC-LEAF-1: leaf-kind wire bytes", () => {
+  it("the four wire bytes are 0x00/0x02/0x04/0x05 and are mutually distinct", () => {
+    expect(LEAF_KIND_MSG).toBe(0x00);
+    expect(LEAF_KIND_CTRL).toBe(0x02);
+    expect(LEAF_KIND_DOC).toBe(0x04);
+    expect(LEAF_KIND_REJECT).toBe(0x05);
+    expect(new Set([LEAF_KIND_MSG, LEAF_KIND_CTRL, LEAF_KIND_DOC, LEAF_KIND_REJECT]).size).toBe(4);
+  });
+
+  it("each wire byte reproduces its domain's leaf hash exactly", () => {
+    const data = new TextEncoder().encode("leaf payload");
+    const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+    expect(hex(opaqueLeafHash(LEAF_KIND_MSG, data))).toBe(hex(msgLeafHash(data)));
+    expect(hex(opaqueLeafHash(LEAF_KIND_CTRL, data))).toBe(hex(ctrlLeafHash(data)));
+    expect(hex(opaqueLeafHash(LEAF_KIND_DOC, data))).toBe(hex(docLeafHash(data)));
+    expect(hex(opaqueLeafHash(LEAF_KIND_REJECT, data))).toBe(hex(rejectLeafHash(data)));
+  });
+
+  it("no document byte collides with the RFC 6962 internal-node prefix 0x01", () => {
+    expect(LEAF_KIND_DOC).not.toBe(0x01);
+    expect(LEAF_KIND_REJECT).not.toBe(0x01);
   });
 });
