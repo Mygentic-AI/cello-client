@@ -83,25 +83,53 @@ export interface DocumentEnvelopeRow {
   /** For a withdrawal or rejection: the envelope it concerns. */
   referencesEnvelopeHash?: string | null;
   createdAtMs: number;
+  /** Position in this document's log. Assigned on append; absent until then. */
+  logIndex?: number;
 }
 
 export interface DocumentSnapshot {
   binary: Uint8Array;
   stateVector: Uint8Array;
   /**
-   * Position in the envelope log this snapshot reflects. §14 is explicit about why this is
+   * The `log_index` of the last envelope this snapshot reflects. §14 is explicit about why it is
    * stored rather than derived: with it, "where does the snapshot sit relative to the log" is a
-   * lookup; without it, every rebuild and verification works it out from scratch.
+   * lookup; without it, every rebuild works it out from scratch.
+   *
+   * **-1 means nothing has been applied.** The resume point is ALWAYS `lastAppliedIndex + 1`,
+   * so an empty log yields 0 and `getEnvelopesSince(0)` reads the whole log — the sentinel and
+   * the convention are chosen to agree.
    */
   lastAppliedIndex: number;
+}
+
+/** Thrown when a read path refuses to materialize over a chain that does not verify. */
+export class DocumentChainError extends Error {
+  readonly reason: string;
+  readonly detail: string;
+  constructor(reason: string, detail: string) {
+    super(`${reason}: ${detail}`);
+    this.name = "DocumentChainError";
+    this.reason = reason;
+    this.detail = detail;
+  }
 }
 
 export type ChainVerdict =
   | { ok: true }
   | { ok: false; reason: "document_chain_broken" | "document_chain_forked"; detail: string };
 
-/** Injected by the engine: fold an ordered payload list into a materialized state. */
-export type ReplayFn = (payloads: Uint8Array[]) => { binary: Uint8Array; stateVector: Uint8Array };
+/**
+ * Injected by the engine: fold an ordered envelope list into a materialized state.
+ *
+ * Takes ROWS, not bare payloads. The engine has to distinguish an update from a withdrawal or a
+ * rejection to fold correctly — a withdrawn envelope's payload must not be applied — and it
+ * cannot do that from `Uint8Array[]`. The store supplies every envelope that HAS a payload, in
+ * log order; deciding which of them count is the engine's call, not the store's.
+ */
+export type ReplayFn = (envelopes: DocumentEnvelopeRow[]) => {
+  binary: Uint8Array;
+  stateVector: Uint8Array;
+};
 
 const CREATE_DOCUMENTS_SQL = `
   CREATE TABLE IF NOT EXISTS documents (
@@ -110,7 +138,7 @@ const CREATE_DOCUMENTS_SQL = `
     peer_agent_id   TEXT    NOT NULL,
     document_type   TEXT    NOT NULL,
     properties      TEXT    NOT NULL,
-    status          TEXT    NOT NULL,
+    status          TEXT    NOT NULL CHECK (status IN ('active', 'closed', 'killed', 'stalled')),
     created_at      INTEGER NOT NULL,
     PRIMARY KEY (owner_agent_id, document_id)
   );
@@ -127,11 +155,19 @@ const CREATE_ENVELOPES_SQL = `
     signature       BLOB    NOT NULL,
     state_vector    BLOB    NOT NULL,
     payload         BLOB,
-    kind            TEXT    NOT NULL,
+    kind            TEXT    NOT NULL CHECK (kind IN ('update', 'withdrawal', 'rejection')),
     references_hash TEXT,
     created_at      INTEGER NOT NULL,
     log_index       INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id, envelope_hash)
+    PRIMARY KEY (owner_agent_id, document_id, envelope_hash),
+    -- A duplicate index would make ORDER BY log_index non-deterministic, and this log's entire
+    -- value is deterministic replay. Two daemons on one DB file (the orphan-process case this
+    -- repo has been bitten by) would otherwise each compute the same next index and both insert.
+    UNIQUE (owner_agent_id, document_id, log_index),
+    -- Rows cannot exist for a document that was never created. The reference store makes the
+    -- same call in writing: an unscoped row must be impossible to write, not merely discouraged
+    -- by a query convention every future caller has to remember.
+    FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
   );
 `;
 
@@ -142,7 +178,8 @@ const CREATE_SNAPSHOTS_SQL = `
     binary              BLOB    NOT NULL,
     state_vector        BLOB    NOT NULL,
     last_applied_index  INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id)
+    PRIMARY KEY (owner_agent_id, document_id),
+    FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
   );
 `;
 
@@ -213,13 +250,19 @@ export class DocumentStore {
    * from a duplicate rather than inferring it.
    */
   appendEnvelope(ownerAgentId: string, envelope: DocumentEnvelopeRow): boolean {
-    const nextIndex = this.#nextLogIndex(ownerAgentId, envelope.documentId);
+    // The log index is computed INSIDE the insert, not read first and passed in. A read-then-write
+    // is safe within one process (this API is synchronous throughout), but two daemons on one DB
+    // file — the orphan-process case this repo has hit before — would each read the same MAX and
+    // each insert it. A duplicate index makes ORDER BY log_index non-deterministic, and
+    // deterministic replay is this log's entire purpose. The UNIQUE constraint is the backstop.
     const info = this.#db
       .prepare(
         `INSERT OR IGNORE INTO document_envelopes
            (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash, epoch_id,
             signature, state_vector, payload, kind, references_hash, created_at, log_index)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                COALESCE((SELECT MAX(log_index) + 1 FROM document_envelopes
+                           WHERE owner_agent_id = ? AND document_id = ?), 0)`,
       )
       .run(
         ownerAgentId,
@@ -234,9 +277,26 @@ export class DocumentStore {
         envelope.kind,
         envelope.referencesEnvelopeHash ?? null,
         envelope.createdAtMs,
-        nextIndex,
+        ownerAgentId,
+        envelope.documentId,
       );
     return Number(info.changes) > 0;
+  }
+
+  /**
+   * Envelopes at or after `fromIndex`, in log order. This is what makes `lastAppliedIndex` the
+   * lookup §14 asks for: resume an incremental rebuild at `lastAppliedIndex + 1` without reading
+   * the whole log.
+   */
+  getEnvelopesSince(ownerAgentId: string, documentId: string, fromIndex: number): DocumentEnvelopeRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND log_index >= ?
+          ORDER BY log_index ASC`,
+      )
+      .all(ownerAgentId, documentId, fromIndex) as Array<Record<string, unknown>>;
+    return rows.map(toEnvelopeRow);
   }
 
   getEnvelopeLog(ownerAgentId: string, documentId: string): DocumentEnvelopeRow[] {
@@ -259,8 +319,12 @@ export class DocumentStore {
    * A break REFUSES and names the sender and the missing predecessor. Skipping the leaf and
    * carrying on would leave a document that reads as complete while missing operations, which is
    * the silent-divergence failure the chain exists to prevent.
+   *
+   * LINKAGE ONLY — the name says so deliberately. This verifies no signature and does not check
+   * that `envelope_hash` hashes the content; neither is possible here (no key, no encoder). A
+   * caller must not read `ok: true` as authenticity — that belongs to the engine.
    */
-  verifyChain(ownerAgentId: string, documentId: string): ChainVerdict {
+  verifyChainLinkage(ownerAgentId: string, documentId: string): ChainVerdict {
     const log = this.getEnvelopeLog(ownerAgentId, documentId);
     const bySender = new Map<string, DocumentEnvelopeRow[]>();
     for (const e of log) {
@@ -272,7 +336,9 @@ export class DocumentStore {
     for (const [sender, envelopes] of bySender) {
       const present = new Set(envelopes.map((e) => e.envelopeHash));
       const genesis = envelopes.filter((e) => e.docPrevHash === null);
-      if (genesis.length > 1) {
+      // EXACTLY one, not at-most-one. Zero genesis means the links form a detached cycle
+      // (A→B, B→A): every predecessor is present, nothing is missing, and it is not a chain.
+      if (genesis.length !== 1) {
         return {
           ok: false,
           reason: "document_chain_forked",
@@ -280,6 +346,21 @@ export class DocumentStore {
             `sender ${sender.slice(0, 16)}… has ${genesis.length} genesis envelopes for document ` +
             `${documentId.slice(0, 16)}… — a chain has exactly one`,
         };
+      }
+      // Two envelopes claiming the same predecessor is a fork, even though both links resolve.
+      const claimed = new Set<string>();
+      for (const e of envelopes) {
+        if (e.docPrevHash === null) continue;
+        if (claimed.has(e.docPrevHash)) {
+          return {
+            ok: false,
+            reason: "document_chain_forked",
+            detail:
+              `sender ${sender.slice(0, 16)}… has two envelopes claiming predecessor ` +
+              `${e.docPrevHash.slice(0, 16)}… — a chain branches nowhere`,
+          };
+        }
+        claimed.add(e.docPrevHash);
       }
       for (const e of envelopes) {
         if (e.docPrevHash !== null && !present.has(e.docPrevHash)) {
@@ -341,31 +422,37 @@ export class DocumentStore {
    * incremental rebuild would start behind them and replay them forever.
    */
   rebuildSnapshot(ownerAgentId: string, documentId: string, replay: ReplayFn): DocumentSnapshot {
-    const log = this.getEnvelopeLog(ownerAgentId, documentId);
-    const payloads: Uint8Array[] = [];
-    for (const e of log) {
-      if (e.payload !== null) payloads.push(e.payload);
+    // VERIFY BEFORE REPLAY. Rebuilding over an unverified chain is the exact silent divergence
+    // the chain exists to prevent: a log with a missing predecessor folds into a state that is
+    // quietly short of operations, and putSnapshot would then persist it as authoritative.
+    // Refusing is loud; a short document is not.
+    const verdict = this.verifyChainLinkage(ownerAgentId, documentId);
+    if (!verdict.ok) {
+      this.#logger.warn("document.chain.broken", {
+        documentId,
+        reason: verdict.reason,
+        detail: verdict.detail,
+      });
+      throw new DocumentChainError(verdict.reason, verdict.detail);
     }
-    const { binary, stateVector } = replay(payloads);
+
+    const log = this.getEnvelopeLog(ownerAgentId, documentId);
+    // Every envelope that HAS a payload, in log order. Which of them count — an update versus a
+    // withdrawn one — is the engine's call, which is why it receives rows rather than bytes.
+    const replayable = log.filter((e) => e.payload !== null);
+    const { binary, stateVector } = replay(replayable);
     this.#logger.info("document.snapshot.rebuilt", {
       documentId,
       envelopes: log.length,
-      replayed: payloads.length,
+      replayed: replayable.length,
     });
-    return { binary, stateVector, lastAppliedIndex: log.length - 1 };
+    // The LAST ROW'S log_index, not the array length. They coincide only while indices are dense,
+    // which is an accident of how they are assigned rather than a guarantee.
+    return { binary, stateVector, lastAppliedIndex: log.at(-1)?.logIndex ?? -1 };
   }
 
   // ─── internals ────────────────────────────────────────────────────────────
 
-  #nextLogIndex(ownerAgentId: string, documentId: string): number {
-    const r = this.#db
-      .prepare(
-        "SELECT MAX(log_index) AS max_index FROM document_envelopes WHERE owner_agent_id = ? AND document_id = ?",
-      )
-      .get(ownerAgentId, documentId) as { max_index: number | null } | undefined;
-    const current = r?.max_index;
-    return current === null || current === undefined ? 0 : current + 1;
-  }
 }
 
 function toDocumentRow(r: Record<string, unknown>): DocumentRow {
@@ -394,13 +481,24 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     kind: r["kind"] as DocumentEnvelopeKind,
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
+    logIndex: r["log_index"] as number,
   };
 }
 
-/** Normalize a SQLite BLOB (Buffer / Uint8Array / ArrayBuffer) to a Uint8Array. */
+/**
+ * Normalize a SQLite BLOB (Buffer / Uint8Array / ArrayBuffer) to a Uint8Array.
+ *
+ * REFUSES anything else rather than substituting an empty array. This is the read path for
+ * `signature`, `state_vector` and `payload`: returning `new Uint8Array()` for an unexpected type
+ * would hand back a ZERO-LENGTH SIGNATURE as if it were the stored one, and the failure would
+ * surface downstream as "signature invalid" — sending an operator to the crypto layer for what
+ * is a storage-read defect. Nothing legitimate reaches this branch; `null` is handled by callers.
+ */
 function toU8(v: unknown): Uint8Array {
   if (v instanceof Uint8Array) return v;
   if (Buffer.isBuffer(v)) return new Uint8Array(v);
   if (v instanceof ArrayBuffer) return new Uint8Array(v);
-  return new Uint8Array();
+  throw new Error(
+    `document_store_blob_decode_failed: expected a BLOB, got ${v === null ? "null" : typeof v}`,
+  );
 }

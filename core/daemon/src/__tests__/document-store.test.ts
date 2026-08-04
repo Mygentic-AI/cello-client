@@ -14,7 +14,7 @@
 import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
+import { DocumentStore, DocumentChainError, type DocumentEnvelopeRow } from "../document-store.js";
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
 
@@ -22,10 +22,21 @@ const AGENT = "aa".repeat(32);
 const PEER = "bb".repeat(32);
 const DOC = "cc".repeat(32);
 
-function newStore(): DocumentStore {
+function newStore(opts: { withDocument?: boolean } = { withDocument: true }): DocumentStore {
   // node:sqlite only as an in-memory TEST handle — production opens SQLCipher (see
   // sqlcipher-db.ts). The store itself never imports node:sqlite.
-  return new DocumentStore(new DatabaseSync(":memory:"), NOOP_LOGGER);
+  const db = new DatabaseSync(":memory:");
+  // Production sets this at open (sqlcipher-db.ts) and verifies it took effect. Without it here
+  // the foreign keys would be decorative and the FK tests would pass vacuously.
+  db.exec("PRAGMA foreign_keys = ON");
+  const store = new DocumentStore(db, NOOP_LOGGER);
+  if (opts.withDocument !== false) {
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+  }
+  return store;
 }
 
 /** Chain-linked envelope: doc_prev_hash points at the sender's previous envelope. */
@@ -64,7 +75,7 @@ function chain(sender: string, n: number, from = 0): DocumentEnvelopeRow[] {
 
 describe("DocumentStore — documents table (DOD-DOC-STORE-1)", () => {
   it("round-trips a document keyed on document_id and peer agent_id", () => {
-    const store = newStore();
+    const store = newStore({ withDocument: false });
     store.createDocument({
       documentId: DOC,
       ownerAgentId: AGENT,
@@ -89,10 +100,6 @@ describe("DocumentStore — documents table (DOD-DOC-STORE-1)", () => {
 
   it("scopes by owner agent_id — another agent on the same daemon sees nothing", () => {
     const store = newStore();
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
     expect(store.getDocument("dd".repeat(32), DOC)).toBeNull();
     expect(store.listDocuments("dd".repeat(32))).toHaveLength(0);
     expect(store.listDocuments(AGENT)).toHaveLength(1);
@@ -100,10 +107,6 @@ describe("DocumentStore — documents table (DOD-DOC-STORE-1)", () => {
 
   it("status is mutable; identity is not", () => {
     const store = newStore();
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
     store.setDocumentStatus(AGENT, DOC, "stalled");
     expect(store.getDocument(AGENT, DOC)!.status).toBe("stalled");
   });
@@ -177,7 +180,7 @@ describe("DocumentStore — per-sender chain verification on read", () => {
   it("verifies a well-formed chain from a single sender", () => {
     const store = newStore();
     for (const e of chain(AGENT, 4)) store.appendEnvelope(AGENT, e);
-    expect(store.verifyChain(AGENT, DOC)).toEqual({ ok: true });
+    expect(store.verifyChainLinkage(AGENT, DOC)).toEqual({ ok: true });
   });
 
   it("verifies TWO senders' chains independently — they interleave in the log", () => {
@@ -189,7 +192,7 @@ describe("DocumentStore — per-sender chain verification on read", () => {
       store.appendEnvelope(AGENT, mine[i]!);
       store.appendEnvelope(AGENT, theirs[i]!);
     }
-    expect(store.verifyChain(AGENT, DOC)).toEqual({ ok: true });
+    expect(store.verifyChainLinkage(AGENT, DOC)).toEqual({ ok: true });
   });
 
   it("REFUSES a broken link, naming the sender and the gap — never a silent skip", () => {
@@ -199,7 +202,7 @@ describe("DocumentStore — per-sender chain verification on read", () => {
     // Third envelope points at a predecessor that was never stored.
     store.appendEnvelope(AGENT, { ...good[2]!, docPrevHash: "de".repeat(32) });
 
-    const res = store.verifyChain(AGENT, DOC);
+    const res = store.verifyChainLinkage(AGENT, DOC);
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.reason).toBe("document_chain_broken");
@@ -213,7 +216,7 @@ describe("DocumentStore — per-sender chain verification on read", () => {
     store.appendEnvelope(AGENT, envelope(0, AGENT, null, new Uint8Array([0])));
     store.appendEnvelope(AGENT, envelope(1, AGENT, null, new Uint8Array([1])));
 
-    const res = store.verifyChain(AGENT, DOC);
+    const res = store.verifyChainLinkage(AGENT, DOC);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toBe("document_chain_forked");
   });
@@ -228,7 +231,8 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
     // A replay function stands in for the engine: the store owns WHAT to replay and in what
     // order; the engine owns HOW to apply. Here, concatenating payloads is a faithful stand-in
     // for "fold the log into a state" without importing yjs into a P0 store.
-    const replay = (payloads: Uint8Array[]): { binary: Uint8Array; stateVector: Uint8Array } => {
+    const replay = (rows: DocumentEnvelopeRow[]): { binary: Uint8Array; stateVector: Uint8Array } => {
+      const payloads = rows.map((r) => r.payload!);
       const binary = new Uint8Array(payloads.reduce((n, p) => n + p.length, 0));
       let at = 0;
       for (const p of payloads) { binary.set(p, at); at += p.length; }
@@ -241,6 +245,10 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
     const original = store.getSnapshot(AGENT, DOC);
     expect(original).not.toBeNull();
     expect(original!.lastAppliedIndex).toBe(envelopes.length - 1);
+    // CONTENT and ORDER pinned, not just self-consistency. Comparing rebuild-A to rebuild-B
+    // passes for an implementation that never reads a payload at all — both would be empty and
+    // equal. This is the assertion that makes the log demonstrably the INPUT to the rebuild.
+    expect(Buffer.from(original!.binary)).toEqual(Buffer.from(Uint8Array.from([0, 1, 2, 3, 4])));
 
     // Throw it away.
     store.deleteSnapshot(AGENT, DOC);
@@ -265,8 +273,8 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
     store.appendEnvelope(AGENT, envelopes[2]!);
 
     const seen: number[] = [];
-    const replay = (payloads: Uint8Array[]) => {
-      for (const p of payloads) seen.push(p[0]!);
+    const replay = (rows: DocumentEnvelopeRow[]) => {
+      for (const r of rows) seen.push(r.payload![0]!);
       return { binary: new Uint8Array(seen), stateVector: new Uint8Array([seen.length]) };
     };
 
@@ -299,6 +307,7 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
 describe("DocumentStore — schema discipline", () => {
   it("constructing twice over the same database is idempotent", () => {
     const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
     const a = new DocumentStore(db, NOOP_LOGGER);
     a.createDocument({
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
@@ -308,14 +317,97 @@ describe("DocumentStore — schema discipline", () => {
     expect(b.getDocument(AGENT, DOC)).not.toBeNull();
   });
 
-  it("no table carries an agent_name column — join on the stable key only", () => {
+  it("NO table this store creates carries an agent_name column — schema-driven, not a list", () => {
     const db = new DatabaseSync(":memory:");
     new DocumentStore(db, NOOP_LOGGER);
-    for (const table of ["documents", "document_envelopes", "document_snapshots"]) {
+    // Enumerated from the schema so a table added later is covered automatically. A hand-kept
+    // list gets shorter than the schema and silently stops checking the new one.
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((t) => t.name)
+      .filter((n) => !n.startsWith("sqlite_"));
+    expect(tables).toEqual(expect.arrayContaining(["documents", "document_envelopes", "document_snapshots"]));
+    for (const table of tables) {
       const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
       expect(cols.length, `${table} must exist`).toBeGreaterThan(0);
       expect(cols.map((c) => c.name), `${table} must not key on a mutable attribute`)
         .not.toContain("agent_name");
     }
+  });
+});
+
+// ─── Review-pass additions: the refusals that were unwired or unreachable ────
+describe("DocumentStore — refusals that must be reachable, not merely available", () => {
+  it("rebuildSnapshot REFUSES over a broken chain — it never materializes a short document", () => {
+    const store = newStore();
+    const good = chain(AGENT, 3);
+    store.appendEnvelope(AGENT, good[0]!);
+    store.appendEnvelope(AGENT, { ...good[2]!, docPrevHash: "de".repeat(32) });
+
+    // Verification is ON READ. Without this, a log with a missing predecessor folds into a state
+    // quietly short of operations and putSnapshot persists it as authoritative.
+    expect(() => store.rebuildSnapshot(AGENT, DOC, () => ({
+      binary: new Uint8Array(), stateVector: new Uint8Array(),
+    }))).toThrow(DocumentChainError);
+    expect(store.getSnapshot(AGENT, DOC)).toBeNull();
+  });
+
+  it("REFUSES a detached cycle — every link resolves, and it is still not a chain", () => {
+    const store = newStore();
+    const a = envelope(0, AGENT, null, new Uint8Array([0]));
+    const b = envelope(1, AGENT, a.envelopeHash, new Uint8Array([1]));
+    // Close the loop: a points at b, b points at a. Zero genesis, nothing missing.
+    store.appendEnvelope(AGENT, { ...a, docPrevHash: b.envelopeHash });
+    store.appendEnvelope(AGENT, b);
+
+    const res = store.verifyChainLinkage(AGENT, DOC);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe("document_chain_forked");
+  });
+
+  it("REFUSES a mid-chain fork — two envelopes claiming the same predecessor", () => {
+    const store = newStore();
+    const root = envelope(0, AGENT, null, new Uint8Array([0]));
+    store.appendEnvelope(AGENT, root);
+    store.appendEnvelope(AGENT, envelope(1, AGENT, root.envelopeHash, new Uint8Array([1])));
+    store.appendEnvelope(AGENT, envelope(2, AGENT, root.envelopeHash, new Uint8Array([2])));
+
+    const res = store.verifyChainLinkage(AGENT, DOC);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe("document_chain_forked");
+      expect(res.detail).toContain("claiming predecessor");
+    }
+  });
+
+  it("an envelope for a document that was never created is REFUSED by the database", () => {
+    const store = newStore();
+    const orphan = { ...envelope(0, AGENT, null, new Uint8Array([0])), documentId: "ff".repeat(32) };
+    // The foreign key makes an unscoped row impossible to write, rather than discouraged by a
+    // convention every future caller has to remember.
+    expect(() => store.appendEnvelope(AGENT, orphan)).toThrow();
+  });
+
+  it("an empty log rebuilds to lastAppliedIndex -1, and the resume point is 0", () => {
+    const store = newStore();
+    const built = store.rebuildSnapshot(AGENT, DOC, () => ({
+      binary: new Uint8Array(), stateVector: new Uint8Array(),
+    }));
+    expect(built.lastAppliedIndex).toBe(-1);
+    // The sentinel and the resume convention are chosen to agree: `slice(-1 + 1)` is the whole log.
+    expect(store.getEnvelopesSince(AGENT, DOC, built.lastAppliedIndex + 1)).toHaveLength(0);
+  });
+
+  it("getEnvelopesSince resumes at lastAppliedIndex + 1 — the lookup §14 asks for", () => {
+    const store = newStore();
+    for (const e of chain(AGENT, 5)) store.appendEnvelope(AGENT, e);
+    const snapshotAt = 2;
+    const tail = store.getEnvelopesSince(AGENT, DOC, snapshotAt + 1);
+    expect(tail.map((e) => e.logIndex)).toEqual([3, 4]);
+  });
+
+  it("a status outside the lifecycle set is refused by the schema, not silently stored", () => {
+    const store = newStore();
+    expect(() => store.setDocumentStatus(AGENT, DOC, "nonsense" as never)).toThrow();
+    expect(store.getDocument(AGENT, DOC)!.status).toBe("active");
   });
 });
