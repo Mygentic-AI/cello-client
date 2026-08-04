@@ -5,6 +5,11 @@
  */
 
 export { createNode, isValidMultiaddr, buildConfiguredHosts } from "./node.js";
+// DOD-RELAY-KEEPALIVE-1: the connection-monitor policy. WAN_PING_TIMEOUT_FLOOR_MS doubles as the
+// capability marker a consumer can test for — the relay refuses to start on a transport that
+// predates the policy, because there the connectionMonitor option is silently ignored.
+export { resolveConnectionMonitorConfig, WAN_PING_TIMEOUT_FLOOR_MS } from "./node.js";
+export type { ResolvedConnectionMonitorConfig } from "./node.js";
 export type { CelloNode, CreateNodeOptions, CelloStreamHandler } from "./types.js";
 export type {
   CelloTransportError,

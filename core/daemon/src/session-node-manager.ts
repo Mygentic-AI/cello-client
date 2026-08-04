@@ -2091,7 +2091,7 @@ export class SessionNodeManager {
     await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
     // liveness. The session connection IS the authority for a direct session.
-    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId);
+    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, counterpartyPeerId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
     // Structure-2 witness (non-fatal — direct content still works without it).
@@ -2263,13 +2263,27 @@ export class SessionNodeManager {
 
   /**
    * M7-SESSION-003 AC-004: wire a session node's peer-connect / peer-disconnect
-   * events to per-session direct-path liveness. onPeerConnect → 'alive'; the
-   * session node's gater restricts connections to the designated counterparty, so
-   * a connect/disconnect on this node is the counterparty's session-path liveness.
-   * onPeerDisconnect → 'gone' (the hook the client did not act on before),
-   * emitting session.liveness.changed at WARN. Combined with the transport
-   * keepalive (AC-005), a peer that vanished without a clean close still surfaces
-   * a disconnect and drives 'gone'.
+   * events to per-session direct-path liveness. onPeerConnect → 'alive',
+   * onPeerDisconnect → 'gone', emitting session.liveness.changed at WARN. Combined
+   * with the transport keepalive (AC-005), a peer that vanished without a clean
+   * close still surfaces a disconnect and drives 'gone'.
+   *
+   * THE EVENT MUST BE FILTERED BY PEER (DOD-RELAY-KEEPALIVE-1 review, F2). The
+   * original wiring acted on EVERY peer event this node saw, justified by "the
+   * session node's gater restricts connections to the designated counterparty".
+   * That stopped being true: the session node also dials the RELAY as its
+   * Structure-2 witness (#connectSessionRelay), and the gater allows those peers
+   * outbound. So a relay link dropping declared the counterparty dead — at WARN,
+   * feeding the unilateral-seal gate — while the counterparty was sitting there
+   * perfectly alive. During the 2026-08-04 incident, when the relay link churned
+   * every 60-90 seconds, that fired continuously.
+   *
+   * `counterpartySessionPeerId` is the authority when known. When it is not (the
+   * peer id can be absent on a session whose assignment has not landed yet),
+   * every peer is honoured EXCEPT ones known to be relays for this session —
+   * degrading to the old over-eager behaviour minus its one known false positive,
+   * rather than to silence, because a liveness detector that never fires is worse
+   * than one that fires too often.
    */
   #wireSessionLiveness(
     agentName: string,
@@ -2277,9 +2291,16 @@ export class SessionNodeManager {
     node: CelloNode,
     counterpartyPubkey: string,
     correlationId: string,
+    counterpartySessionPeerId?: string,
   ): void {
     const key = this.#k(agentName, sessionId);
-    node.onPeerConnect(() => {
+    const isCounterparty = (peerId: string): boolean => {
+      if (counterpartySessionPeerId) return peerId === counterpartySessionPeerId;
+      const entry = this.#activeNodes.get(key);
+      return entry?.relayPeerId !== peerId;
+    };
+    node.onPeerConnect((peerId: string) => {
+      if (!isCounterparty(peerId)) return;
       const prior = this.#sessionLiveness.get(key);
       this.#sessionLiveness.set(key, "alive");
       if (prior !== "alive") {
@@ -2293,7 +2314,18 @@ export class SessionNodeManager {
         });
       }
     });
-    node.onPeerDisconnect(() => {
+    node.onPeerDisconnect((peerId: string) => {
+      if (!isCounterparty(peerId)) {
+        // Not silence: a relay link dropping is a real event, it is simply not a
+        // statement about the counterparty. It has its own signal
+        // (session.standing_receiver.reservation.lost / session.relay.reader.ended).
+        this.#logger.debug("session.liveness.unrelated_peer_disconnect", {
+          sessionId,
+          peerId,
+          correlationId,
+        });
+        return;
+      }
       const prior = this.#sessionLiveness.get(key);
       this.#sessionLiveness.set(key, "gone");
       if (prior !== "gone") {
@@ -2430,7 +2462,7 @@ export class SessionNodeManager {
     // DAEMON-004: register the content stream handler for the inbound session.
     await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
-    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId);
+    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, initiatorPeerId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
     // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
@@ -5083,10 +5115,17 @@ export class SessionNodeManager {
       const stillAdvertising = sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"));
       if (stillConnected && stillAdvertising) continue;
 
+      // DOD-RELAY-KEEPALIVE-1 (review F4): carry the CAUSE, not just the exit point.
+      // `relay_connection_gone` says where this was noticed — a poll of getConnections() — by which
+      // time the abort reason that actually killed the link is long discarded. The relay client for
+      // this (agent, relay) pair kept the error that ended its reader; that is the nearest thing to
+      // an upstream cause available here, and its absence is how 2,061 of these went untraced.
+      const upstreamReason = this.#relayClients.get(`${agentName}::${sr.relayPeerId}`)?.getLastReaderError();
       this.#logger.warn("session.standing_receiver.reservation.lost", {
         agentName,
         relayPeerId: sr.relayPeerId,
         reason: stillConnected ? "circuit_address_vanished" : "relay_connection_gone",
+        ...(upstreamReason ? { upstreamReason } : {}),
       });
       void this.#rebuildStandingReceiver(agentName);
     }

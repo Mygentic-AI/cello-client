@@ -16,6 +16,7 @@
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ConnectionGater, Stream } from "@libp2p/interface";
 import type { Dialability, Unsubscribe } from "./autonat.js";
+import type { ResolvedConnectionMonitorConfig as ConnectionMonitorPolicy } from "./node.js";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -115,10 +116,18 @@ export interface CreateNodeOptions {
    * every node and, by default, ABORTS a whole connection after one ping that misses an
    * AdaptiveTimeout whose floor is 5 seconds.
    *
-   * That is what killed the client↔relay link every 60-90 seconds on 2026-08-04: the link was
-   * healthy, the ping was merely slow (a WAN hop, a busy event loop, or a relayed stream), and
-   * the monitor severed it — producing "The operation was aborted due to timeout", the string
-   * behind 2,061 untraced relay reader errors.
+   * That is the prime suspect for the client↔relay link dying every 60-90 seconds on 2026-08-04:
+   * the link was healthy, the ping merely slow (a WAN hop, a busy event loop, a relayed stream),
+   * and the monitor severs on one miss.
+   *
+   * ATTRIBUTION IS NOT SETTLED, and this comment must not read as though it were. The incident's
+   * error text — "The operation was aborted due to timeout" — is Node's generic message for ANY
+   * timed-out AbortSignal, and this dependency tree has at least ten on the relay path (libp2p's
+   * registrar, upgrader, connection negotiation and close, dial-queue, connection-pruner, plus
+   * circuit-relay-v2's listen/reservation/hop timeouts). The observed symptom is *consistent
+   * with* the connection monitor; which timeout actually fired is unresolved until
+   * DEBUG=libp2p:connection-monitor* runs against the live relay. The policy below is worth
+   * having either way — no timeout on a healthy link should cost the whole connection.
    *
    * Defaults live in resolveConnectionMonitorConfig. Override per node when one link needs a
    * different policy from the rest: the relay's client links must never be severed on a slow
@@ -229,6 +238,16 @@ export interface CelloNode {
    * '/p2p-circuit'; a direct one does not.
    */
   hasDirectConnectionTo(peerId: string): boolean;
+
+  /**
+   * DOD-RELAY-KEEPALIVE-1: the connection-monitor policy this node is actually running.
+   *
+   * Answerable at runtime on purpose. The policy decides whether a slow ping costs the whole
+   * connection, and getting it wrong is invisible from the outside — the node looks healthy right
+   * up until it severs a link it should have kept. An operator (or a test) must be able to ask the
+   * node rather than infer it from the call site that built it.
+   */
+  getConnectionMonitorPolicy(): ConnectionMonitorPolicy;
 
   /**
    * Subscribe to peer connect/disconnect events for observability logging.

@@ -199,6 +199,17 @@ async function nextWithTimeout(
  * single-in-flight on the stream; `leaf_deliver` is routed by session_id.
  */
 export class AgentRelayClient {
+  /**
+   * DOD-RELAY-KEEPALIVE-1 (review F4): the last error that ended this relay's reader.
+   * The reservation watchdog reports `relay_connection_gone` — an exit-point label derived from a
+   * poll, with the real abort reason already discarded. This carries the cause across to it.
+   */
+  #lastReaderError: string | null = null;
+  /** The cause of the most recent reader end, or null if it has not ended. */
+  getLastReaderError(): string | null {
+    return this.#lastReaderError;
+  }
+
   readonly #relayPeerId: string;
   readonly #relayAddrs: string[];
   readonly #keyProvider: KeyProvider;
@@ -733,7 +744,12 @@ export class AgentRelayClient {
           this.#dispatch(frame);
         }
       } catch (err: unknown) {
-        this.#logger.debug?.("session.relay.reader.ended", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
+        // WARN, not debug (DOD-RELAY-KEEPALIVE-1 review F4). This is the ONLY place the cause of a
+        // dead relay link survives: the watchdog that notices later reports `relay_connection_gone`,
+        // which names where it noticed, not why. At debug, 2,061 of these went untraced through a
+        // launch — the reader ending is not routine, it means in-flight submits just failed.
+        this.#logger.warn("session.relay.reader.ended", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
+        this.#lastReaderError = extractErrorMessage(err);
       } finally {
         // Stream gone — clear it so the next submit re-dials, and fail any in-flight submit.
         if (this.#stream === stream) this.#stream = null;

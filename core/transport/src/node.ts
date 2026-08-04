@@ -169,6 +169,7 @@ function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>
 
 class CelloNodeImpl implements CelloNode {
   readonly #libp2p: Libp2p;
+  #connectionMonitorPolicy: ResolvedConnectionMonitorConfig = { abortConnectionOnPingFailure: true };
   readonly keyProvider: KeyProvider;
   // Dialability observable, updated on each AutoNAT probe cycle (surfaced by
   // libp2p as a 'self:peer:update' event).
@@ -371,6 +372,16 @@ class CelloNodeImpl implements CelloNode {
     }));
   }
 
+  /** DOD-RELAY-KEEPALIVE-1: the connection-monitor policy this node was built with. */
+  getConnectionMonitorPolicy(): ResolvedConnectionMonitorConfig {
+    return this.#connectionMonitorPolicy;
+  }
+
+  /** Set once by createNode, from resolveConnectionMonitorConfig — the same object libp2p got. */
+  setConnectionMonitorPolicy(policy: ResolvedConnectionMonitorConfig): void {
+    this.#connectionMonitorPolicy = policy;
+  }
+
   hasDirectConnectionTo(peerIdStr: string): boolean {
     let peerId;
     try {
@@ -500,15 +511,31 @@ function mapStreamError(
  * that is working perfectly. Missing it once destroys the connection, because
  * `abortConnectionOnPingFailure` defaults to true.
  *
- * 30 seconds keeps the mechanism honest — a peer that is genuinely gone is detected within
- * roughly one ping interval plus this — while giving a slow-but-alive link six times the
- * headroom it had when the client↔relay link was dying every 60-90 seconds.
+ * 30 seconds keeps the mechanism honest — a peer that is genuinely gone is still detected — while
+ * giving a slow-but-alive link six times the headroom it had when the client↔relay link was dying
+ * every 60-90 seconds.
+ *
+ * THE COST, stated because it is a trade and not free (review F5): a counterparty that vanishes
+ * WITHOUT a FIN is now detected in at most pingInterval + 30s ≈ 40s, up from ≈15s. That detection
+ * is the only thing that drives `counterparty_liveness` to 'gone' for a silently-dead peer, and
+ * the unilateral-seal gate reads it — so the gate must tolerate a ~40s window. If it ever cannot,
+ * lower the ping INTERVAL rather than this floor: the floor is what a slow WAN round trip needs,
+ * the interval is how often we ask.
+ *
+ * Note the floor is the effective deadline in practice, not just a lower bound: no CELLO node
+ * registers a ping responder, so every ping ends in UnsupportedProtocolError — which libp2p counts
+ * as alive and which returns fast — so the AdaptiveTimeout's moving average never rises.
  */
 export const WAN_PING_TIMEOUT_FLOOR_MS = 30_000;
 
-/** The libp2p `connectionMonitor` init this node's options resolve to. */
+/**
+ * The libp2p `connectionMonitor` init this node's options resolve to.
+ *
+ * There is deliberately NO `enabled` field. libp2p reads `enabled: false` to switch the monitor
+ * off, and this policy never does — the pings are the keepalive. A field we never produce would
+ * be a knob suggesting otherwise; its absence from this type is the statement.
+ */
 export interface ResolvedConnectionMonitorConfig {
-  enabled?: boolean;
   pingInterval?: number;
   pingTimeout?: { minTimeout: number };
   abortConnectionOnPingFailure?: boolean;
@@ -562,6 +589,10 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // invariant that matters: the non-circuit (TCP) listeners must have materialised,
   // else start() throws loudly — NO_FATAL must not mask a real EADDRINUSE.
   const hasCircuitListen = opts.listenAddresses.some((a) => a.includes("/p2p-circuit"));
+
+  // Resolved ONCE and shared: what libp2p is configured with is what the node reports, by
+  // construction rather than by two call sites agreeing.
+  const connectionMonitorPolicy = resolveConnectionMonitorConfig(opts);
 
   const libp2p = await createLibp2p({
     start: false,
@@ -618,7 +649,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     // DOD-RELAY-KEEPALIVE-1: the monitor's policy is ours now, not libp2p's defaults.
     // Keepalive pings still detect a peer that vanished without a clean close, but the deadline
     // a ping must meet is a WAN deadline rather than 5 seconds.
-    connectionMonitor: resolveConnectionMonitorConfig(opts),
+    connectionMonitor: connectionMonitorPolicy,
   });
 
   // Record the hosts this node was configured to listen on / announce.
@@ -629,5 +660,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // Return node in STOPPED state — caller must call start()
   const expectsDirectListener =
     hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
-  return new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder);
+  const node = new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder);
+  node.setConnectionMonitorPolicy(connectionMonitorPolicy);
+  return node;
 }
