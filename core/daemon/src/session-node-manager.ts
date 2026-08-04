@@ -273,6 +273,7 @@ export class SessionNodeManager {
   #parkedDrainLastBackstopAt = 0;
   /** DOD-PARK-DRAIN-1: the composition root's parked-mailbox drain — see setParkedDrainHook. */
   #parkedDrainHook: ((agentName: string, reason: ParkedDrainReason) => void) | null = null;
+  #parkedDrainHookAbsenceLogged = false;
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -530,10 +531,41 @@ export class SessionNodeManager {
     this.#parkedDrainHook = fn;
   }
 
+  /**
+   * DOD-PARK-DRAIN-1 (review F6): why there is no standing-receiver node to dial from — named
+   * precisely, because `standing_receiver_unavailable` is the exit-point label that stood in for
+   * four different causes and misnamed this very incident 102 times.
+   *
+   * Only meaningful once `getStandingReceiverNode()` has returned null, which means NO agent on
+   * this daemon has a ready receiver — the dial node is not agent-scoped.
+   */
+  standingReceiverAbsenceReason(
+    agentName: string,
+  ): "daemon_shutting_down" | "standing_receiver_creating" | "agent_offline" | "no_standing_receiver" {
+    if (this.#shuttingDown) return "daemon_shutting_down";
+    if (this.#standingReceiverCreating.has(agentName)) return "standing_receiver_creating";
+    if (!this.#agentsWantingReceiver.has(agentName)) return "agent_offline";
+    return "no_standing_receiver";
+  }
+
   /** Ask for a drain. Never throws — a broken drain must never cost the caller its receiver. */
   #fireParkedDrain(agentName: string, reason: ParkedDrainReason): void {
     const hook = this.#parkedDrainHook;
-    if (!hook || this.#shuttingDown) return;
+    if (this.#shuttingDown) return;
+    if (!hook) {
+      // DOD-PARK-DRAIN-1 (review F4): an unwired hook silently reverts this entire unit, and the
+      // defect it fixes was itself a trigger that silently was not there. Say so — once, because
+      // the fire points are on a timer grid. Not an error: a SessionNodeManager built by a test
+      // that does not exercise the drain is legitimate.
+      if (!this.#parkedDrainHookAbsenceLogged) {
+        this.#parkedDrainHookAbsenceLogged = true;
+        this.#logger.warn("content.recover.drain.hook.absent", { agentName, reason });
+      }
+      return;
+    }
+    // The success-side trail. Without it, a live run cannot say WHICH trigger delivered the
+    // content — which is exactly the claim the outstanding acceptance clause has to evidence.
+    this.#logger.info("content.recover.drain.triggered", { agentName, reason });
     try {
       hook(agentName, reason);
     } catch (err: unknown) {

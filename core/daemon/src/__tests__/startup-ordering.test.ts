@@ -90,6 +90,30 @@ describe("startDaemon ordering — constraints the type system cannot express", 
     expect(registerPark, "content-park handlers register after the map exists").toBeGreaterThan(map);
   });
 
+  it("DOD-PARK-DRAIN-1: onConnected DELEGATES to the reconnect drain — it does not re-inline two voids", () => {
+    const construct = lineOf("= createReconnectDrain({");
+    const delegate = lineOf("onSignalingConnected(agentName)");
+    const hook = lineOf("sessionNodeManager.setParkedDrainHook(");
+
+    expect(construct, "createReconnectDrain() must be constructed in the composition root").toBeGreaterThan(-1);
+    expect(hook, "the parked-drain hook must be wired — an unwired hook reverts the whole unit").toBeGreaterThan(-1);
+
+    // THE ASSERTION. The ensure→drain ORDER is the contract, and it lives in reconnect-drain.ts
+    // precisely so a refactor of this 3,000-line file cannot quietly turn it back into two
+    // concurrent `void`s — which is what it was when the drain lost the race 102 times in one log
+    // (2026-08-04). If onConnected stops delegating, the module still passes its own unit tests
+    // and production silently regresses. This is the line that notices.
+    expect(
+      delegate,
+      "getAgentSignaling's onConnected must call onSignalingConnected(agentName) — the ensure→drain " +
+      "ordering contract lives in reconnect-drain.ts, not inline here.",
+    ).toBeGreaterThan(-1);
+    expect(
+      construct,
+      "createReconnectDrain() must be constructed before getAgentSignaling can call it.",
+    ).toBeLessThan(delegate);
+  });
+
   it("the content park is CONSTRUCTED before its boot-time callers (autoRecoverForAgent)", () => {
     const construct = lineOf("= createContentPark({");
     const sealCoordinator = lineOf("= createSealCoordinator({");

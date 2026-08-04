@@ -1,12 +1,20 @@
 /**
  * DOD-PARK-DRAIN-1 — what an agent does when its directory signaling reconnects.
  *
- * Two things, IN ORDER: re-register the standing receiver on the fresh stream, then drain the
- * agent's parked mailbox. They used to be two concurrent `void`s, and the drain needs the node the
- * ensure builds (`content-park.ts` → `getStandingReceiverNode`). When the drain won that race it
- * failed `standing_receiver_unavailable` — 102 times in the 2026-08-04 incident log, against 84
- * relay failures and drains reporting `recovered: 0, failedRelays: 1`. The agent-start path already
- * chained ensure→drain correctly; this is the reconnect path catching up.
+ * Two things, and the ORDER is the contract: re-register the standing receiver on the fresh
+ * stream, then drain the agent's parked mailbox. They used to be two concurrent `void`s, and the
+ * drain needs the node the ensure builds (`content-park.ts` → `getStandingReceiverNode`). When the
+ * drain won that race it failed `standing_receiver_unavailable` — 102 times in the 2026-08-04
+ * incident log, against 84 relay failures and drains reporting `recovered: 0, failedRelays: 1`.
+ * The agent-start path already chained ensure→drain correctly; this is the reconnect path
+ * catching up.
+ *
+ * THE DRAIN IS UNCONDITIONAL; only the ENSURE is gated on the agent being online. That asymmetry
+ * is deliberate: production opens a directory connection for every LOADED agent at startup,
+ * started or not, and each of those connects drained that agent's mailbox before this module
+ * existed. The pull is keyed by the agent's pubkey and dials from ANY ready standing receiver, so
+ * it works for an agent that has none of its own — whereas giving a receiver to an agent nobody
+ * started would accept inbound sessions on its behalf.
  *
  * Lives in its own module because the ordering IS the contract, and a contract that only exists
  * inside a 3,000-line composition root is one refactor away from being two `void`s again.
@@ -29,22 +37,30 @@ export interface ReconnectDrainDeps {
  */
 export function createReconnectDrain(deps: ReconnectDrainDeps): (agentName: string) => void {
   const { logger, isAgentOnline, ensureStandingReceiver, drainParked } = deps;
+
+  const drain = (agentName: string): Promise<void> =>
+    drainParked(agentName).catch((err: unknown) => {
+      logger.warn("content.recover.auto.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
+    });
+
   return (agentName: string): void => {
-    // Fires on the FIRST connect too, and an agent that was never started must not acquire a
-    // receiver here. Re-entry at start is harmless — the ensure returns immediately when a receiver
-    // exists or is being created.
-    if (!isAgentOnline(agentName)) return;
-    void ensureStandingReceiver(agentName)
-      .then(
-        () => drainParked(agentName).catch((err: unknown) => {
-          logger.warn("content.recover.auto.failed", { agentName, error: extractErrorMessage(err) });
-        }),
-        (err: unknown) => {
-          // The ensure failed, so there is no node for a pull to originate from. Report the
-          // receiver failure — a drain attempted here would only add a second, misleading
-          // `standing_receiver_unavailable` on top of the real cause.
-          logger.warn("session.standing_receiver.reregister.failed", { agentName, error: extractErrorMessage(err) });
-        },
-      );
+    // The ensure fires on the FIRST connect too, and an agent that was never started must not
+    // acquire a receiver here. Re-entry at start is harmless — the ensure returns immediately when
+    // a receiver exists or is being created.
+    if (!isAgentOnline(agentName)) {
+      void drain(agentName);
+      return;
+    }
+    void ensureStandingReceiver(agentName).then(
+      () => drain(agentName),
+      (err: unknown) => {
+        logger.warn("session.standing_receiver.reregister.failed", { agentName, error: extractErrorMessage(err) });
+        // Drain anyway. A failed ensure does not mean the pull has nowhere to run from: the
+        // content park dials from ANY ready standing receiver — two agents on one daemon is a
+        // supported configuration (DOD-LOOP-1) — and the mailbox is keyed by this agent's pubkey.
+        // Skipping here would strand content for a reason that only holds on a single-agent daemon.
+        return drain(agentName);
+      },
+    );
   };
 }

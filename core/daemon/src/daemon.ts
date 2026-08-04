@@ -394,18 +394,19 @@ async function startDaemonHoldingLock(
     agents,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
   });
-  const autoRecoverForAgent = (agentName: string): Promise<void> => contentPark.autoRecoverForAgent(agentName);
+  const autoRecoverForAgent = (agentName: string, trigger?: string): Promise<void> =>
+    contentPark.autoRecoverForAgent(agentName, trigger);
 
   // DOD-PARK-DRAIN-1: drain where the parking actually happens. Content parks when the RELAY link
   // drops; the manager tells us the moment this agent has a receiver again (first ensure, watchdog
   // rebuild, auth_ok rebuild) and on its slow backstop sweep. Before this, a message that hit a
   // relay churn gap sat parked until a human restarted the receiving daemon.
   sessionNodeManager.setParkedDrainHook((agentName: string, reason: string) => {
-    void autoRecoverForAgent(agentName).catch((err: unknown) => {
+    void autoRecoverForAgent(agentName, reason).catch((err: unknown) => {
       // autoRecoverForAgent catches per-relay errors internally; this is the backstop, and it uses
       // extractErrorMessage because the transport rejects with structured plain objects that
       // String() renders as "[object Object]" — the reason 100+ real failures were undiagnosable.
-      logger.warn("content.recover.auto.failed", { agentName, trigger: reason, error: extractErrorMessage(err) });
+      logger.warn("content.recover.auto.failed", { agentName, trigger: reason, stage: "drain_hook", error: extractErrorMessage(err) });
     });
   });
 
@@ -417,7 +418,7 @@ async function startDaemonHoldingLock(
     logger,
     isAgentOnline: (agentName: string) => onlineAgents.has(agentName),
     ensureStandingReceiver: (agentName: string) => sessionNodeManager.ensureStandingReceiverForAgent(agentName),
-    drainParked: (agentName: string) => autoRecoverForAgent(agentName),
+    drainParked: (agentName: string) => autoRecoverForAgent(agentName, "signaling_reconnect"),
   });
 
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
@@ -440,7 +441,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     getPersistence,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
-    recoverContent: (agentName: string) => autoRecoverForAgent(agentName),
+    recoverContent: (agentName: string) => autoRecoverForAgent(agentName, "seal_upgrade_gate"),
   });
 
   // The two seal-initiation flows cello_close_session dispatches into (seal-flows.ts): the
@@ -1805,9 +1806,9 @@ async function startDaemonHoldingLock(
       // has sessions on (symmetric to the sender re-park). Its own stage so a failure is labelled
       // correctly (review #4), not as a standing-receiver error. autoRecoverForAgent catches per-relay
       // errors internally, so this .catch is a backstop only.
-      .then(() => autoRecoverForAgent(name))
+      .then(() => autoRecoverForAgent(name, "agent_start"))
       .catch((err: unknown) => {
-        logger.warn("content.recover.auto.failed", { agentName: name, reason: extractErrorMessage(err) });
+        logger.warn("content.recover.auto.failed", { agentName: name, stage: "agent_start", error: extractErrorMessage(err) });
       });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections

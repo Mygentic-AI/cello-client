@@ -68,7 +68,10 @@ export function createContentPark(deps: ContentParkDeps) {
     if (!kp) return { ok: false, reason: "signing_key_unavailable" };
     if (!kp.openContentSeal) return { ok: false, reason: "cannot_unseal" };
     const node = sessionNodeManager.getStandingReceiverNode();
-    if (!node) return { ok: false, reason: "standing_receiver_unavailable" };
+    // Name the CAUSE, not the exit point (review F6): one label stood for "still building",
+    // "agent never came online", "shutting down" and "none exists", and it is the label that
+    // misdescribed this incident 102 times.
+    if (!node) return { ok: false, reason: sessionNodeManager.standingReceiverAbsenceReason(recipientAgent.name) };
     const recipientPubkey = recipientAgent.pubkey ?? "";
     const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
@@ -147,7 +150,46 @@ export function createContentPark(deps: ContentParkDeps) {
   // every relay it has sessions on — symmetric to the SENDER's flushAwaitingContent. Without this,
   // nothing in production pulls a recipient's store-and-forward mailbox and parked content is never
   // delivered. Best-effort; a relay miss is retried on the next agent-online.
-  async function autoRecoverForAgent(agentName: string): Promise<void> {
+
+  /**
+   * DOD-PARK-DRAIN-1 (review F1): one drain per agent at a time, and at most one re-run queued.
+   *
+   * The drain used to have two triggers; it now has five (agent start, receiver install, every
+   * watchdog rebuild, signaling reconnect, the periodic backstop), and under the relay churn this
+   * unit exists to survive, rebuilds arrive faster than a drain completes. Concurrent drains are
+   * NOT safe by dedup alone: ingestReceivedContent decides "already present" synchronously from
+   * the in-memory tree and then AWAITS the security gateway before appending, so two drains that
+   * pull the same parked entry can both pass that check and both append — a duplicate leaf, the
+   * frontier divergence the recovery path exists to avoid.
+   *
+   * Coalesced, not queued: a trigger that arrives mid-drain asks for exactly ONE more pass when
+   * the current one finishes. Ten rebuilds during one slow pull cost one re-run, not ten.
+   */
+  const draining = new Set<string>();
+  /** agentName → the trigger of the coalesced re-run owed to it (absent = none owed). */
+  const drainRerunRequested = new Map<string, string>();
+
+  async function autoRecoverForAgent(agentName: string, trigger = "unspecified"): Promise<void> {
+    if (draining.has(agentName)) {
+      drainRerunRequested.set(agentName, trigger);
+      logger.debug("content.recover.auto.coalesced", { agentName, trigger });
+      return;
+    }
+    draining.add(agentName);
+    try {
+      let pass = trigger;
+      do {
+        drainRerunRequested.delete(agentName);
+        await drainOnce(agentName, pass);
+        pass = drainRerunRequested.get(agentName) ?? pass;
+      } while (drainRerunRequested.has(agentName));
+    } finally {
+      draining.delete(agentName);
+      drainRerunRequested.delete(agentName);
+    }
+  }
+
+  async function drainOnce(agentName: string, trigger: string): Promise<void> {
     const agent = agents.find((a) => a.name === agentName);
     if (!agent?.pubkey) return;
     const relays = sessionNodeManager.getAgentRelayEndpoints(agentName);
@@ -160,23 +202,23 @@ export function createContentPark(deps: ContentParkDeps) {
         if (res.ok) {
           total += res.recovered;
         } else {
-          // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal /
-          // standing_receiver_unavailable) was previously silent — log the reason so a run where
-          // every relay failed is distinguishable from "nothing was parked".
+          // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal / the precise
+          // no-receiver cause) was previously silent — log the reason so a run where every relay
+          // failed is distinguishable from "nothing was parked".
           failed++;
-          logger.warn("content.recover.auto.relay_failed", { agentName, relayPeerId: r.relayPeerId, reason: res.reason });
+          logger.warn("content.recover.auto.relay_failed", { agentName, trigger, relayPeerId: r.relayPeerId, reason: res.reason });
         }
       } catch (err: unknown) {
         failed++;
         // extractErrorMessage, NOT String(err): libp2p and the transport reject with structured
         // plain objects, and String() renders every one of them "[object Object]". 102 of these
         // fired during the 2026-08-04 incident and not one was diagnosable from the log.
-        logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: extractErrorMessage(err) });
+        logger.warn("content.recover.auto.failed", { agentName, trigger, stage: "relay", relayPeerId: r.relayPeerId, error: extractErrorMessage(err) });
       }
     }
     // Emit the completion event UNCONDITIONALLY — not only when total > 0 — so a clean "nothing
     // parked" run is observable, and distinct from an all-failed run.
-    logger.info("content.recover.auto.completed", { agentName, recovered: total, relayCount: relays.length, failedRelays: failed });
+    logger.info("content.recover.auto.completed", { agentName, trigger, recovered: total, relayCount: relays.length, failedRelays: failed });
   }
 
 
@@ -236,9 +278,17 @@ export function createContentPark(deps: ContentParkDeps) {
         const guidanceByReason: Record<string, string> = {
           signing_key_unavailable: `Signing key for '${recipientAgent.name}' is not loaded.`,
           cannot_unseal: `Agent '${recipientAgent.name}' key provider cannot open content seals.`,
-          standing_receiver_unavailable: "The daemon's standing receiver is not ready yet; retry after startup.",
+          standing_receiver_creating: "The daemon's standing receiver is still being built; retry in a few seconds.",
+          agent_offline: `Agent '${recipientAgent.name}' is not online, so this daemon has no node to pull from. Start it with cello_start_agent.`,
+          no_standing_receiver: "No agent on this daemon has a standing receiver; start an agent first.",
+          daemon_shutting_down: "The daemon is shutting down.",
         };
-        return { ok: false, reason: res.reason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
+        // The WIRE reason stays the documented contract string for every no-receiver cause
+        // (types.ts STANDING_RECEIVER_UNAVAILABLE); the precise cause rides in the guidance,
+        // where it helps the operator without breaking a consumer that branches on the reason.
+        const noReceiver = new Set(["standing_receiver_creating", "agent_offline", "no_standing_receiver", "daemon_shutting_down"]);
+        const wireReason = noReceiver.has(res.reason) ? "standing_receiver_unavailable" : res.reason;
+        return { ok: false, reason: wireReason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
       }
       return { ok: true, recovered: res.recovered, pulled: res.pulled };
     });

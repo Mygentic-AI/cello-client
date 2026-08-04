@@ -25,7 +25,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { createNode } from "@cello-protocol/transport";
@@ -33,6 +33,10 @@ import type { CelloNode } from "@cello-protocol/transport";
 import { SessionNodeManager } from "../session-node-manager.js";
 import { ProductionSessionNodeFactory, startDaemon, type DaemonHandle } from "../daemon.js";
 import { createReconnectDrain } from "../reconnect-drain.js";
+import { createContentPark } from "../content-park.js";
+import { ContentParkClient } from "../content-park-client.js";
+import { sealParkEnvelope } from "../park-envelope.js";
+import { startParkRelay } from "./helpers/park-relay.js";
 import type { DaemonConfig, Logger } from "../types.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
@@ -176,6 +180,21 @@ describe("A: the parked-content drain rides the standing receiver's life-cycle",
     }
   }, 20_000);
 
+  it("A6: the backstop clock is armed when watching STARTS — no redundant sweep on top of the install drain", async () => {
+    // backstop >> watchdog, so a sweep in the first ticks could only come from an unarmed clock
+    // (lastBackstopAt = 0 → "it has been 57 years since the last sweep" on tick one).
+    const { manager, drains } = await makeManager({ watchdogMs: 100, backstopMs: 60_000 });
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      await wait(600); // ~6 watchdog ticks
+      expect(drains.filter((d) => d.reason === "periodic_backstop")).toEqual([]);
+      expect(drains.filter((d) => d.reason === "standing_receiver_ready").length).toBe(1);
+    } finally {
+      await manager.gracefulShutdown();
+    }
+  }, 20_000);
+
   it("A5: a THROWING drain hook costs the drain, never the standing receiver", async () => {
     const { logger, events } = makeLogger();
     const dbPath = join(tempDir, `sessions-throw-${Date.now()}.db`);
@@ -228,7 +247,7 @@ describe("B: the signaling-reconnect drain chains ensure→drain instead of raci
     expect(order).toEqual(["ensure:start:alice", "ensure:done:alice", "drain:alice"]);
   });
 
-  it("B2: an ensure that rejects names its cause and does not run a drain that cannot work", async () => {
+  it("B2: an ensure that rejects names its cause AND still drains — the pull runs from any receiver", async () => {
     const { logger, events } = makeLogger();
     let drained = false;
     const onConnected = createReconnectDrain({
@@ -246,10 +265,14 @@ describe("B: the signaling-reconnect drain chains ensure→drain instead of raci
     expect(failed).toBeDefined();
     expect(String(failed!.context["error"])).toBe("EADDRINUSE 41000");
     expect(String(failed!.context["error"])).not.toContain("[object Object]");
-    expect(drained).toBe(false);
+    // A failed ensure does NOT mean the drain has nowhere to run from: the content park dials from
+    // any ready standing receiver and the mailbox is keyed by this agent's pubkey. Skipping the
+    // drain here would strand content on a two-agent daemon (DOD-LOOP-1).
+    await waitUntil(() => drained, 2_000);
+    expect(drained).toBe(true);
   });
 
-  it("B3: an agent that is not online gets neither a receiver nor a drain", async () => {
+  it("B3: an agent that is not online gets NO receiver, but its parked mailbox is still drained", async () => {
     const { logger } = makeLogger();
     let ensured = false;
     let drained = false;
@@ -260,9 +283,13 @@ describe("B: the signaling-reconnect drain chains ensure→drain instead of raci
       drainParked: async () => { drained = true; },
     });
     onConnected("alice");
-    await wait(50);
-    expect(ensured).toBe(false);
-    expect(drained).toBe(false);
+    await waitUntil(() => drained, 2_000);
+    // Production connects directory signaling for every LOADED agent at startup, started or not,
+    // and each of those connects drained that agent's mailbox before the ensure→drain chaining
+    // existed. Giving an unstarted agent a RECEIVER would accept inbound sessions on its behalf;
+    // draining its mailbox does not.
+    expect(ensured, "an agent nobody started must not acquire a receiver").toBe(false);
+    expect(drained, "its parked content must still be recovered — that behaviour predates this unit").toBe(true);
   });
 
   it("B4: a drain that rejects is logged with its cause, never swallowed and never '[object Object]'", async () => {
@@ -339,14 +366,251 @@ describe("C: the daemon composition root wires the drain to the standing receive
     );
     expect(drainedOnce, "the daemon must wire the standing-receiver drain hook — no consumer, no ship").toBe(true);
 
+    // The completed event says WHICH trigger delivered — the outstanding live clause has to be
+    // evidenced from logs, and "a drain ran" is not the same claim as "the rebuild drained".
+    const completed = logEvents.find((e) => e.event === "content.recover.auto.completed" && e.context["agentName"] === "alice");
+    expect(completed!.context["trigger"]).toBe("standing_receiver_ready");
+    expect(
+      logEvents.some((e) => e.event === "content.recover.drain.triggered" && e.context["reason"] === "standing_receiver_ready"),
+    ).toBe(true);
+
     // The relay is a bare libp2p node: it does not speak /cello/content-park, so the pull fails.
-    // That failure is the one that logged "[object Object]" for 102 occurrences in the incident log.
+    // That failure is the one that logged "[object Object]" for 102 occurrences in the incident
+    // log. UNCONDITIONAL: a review found this assertion hiding behind `if (failure)`, where a run
+    // that logged no failure at all would have passed it silently.
     const failure = logEvents.find(
       (e) => e.event === "content.recover.auto.failed" || e.event === "content.recover.auto.relay_failed",
     );
-    if (failure) {
-      const rendered = JSON.stringify(failure.context);
-      expect(rendered, "a drain failure must name its cause").not.toContain("[object Object]");
+    expect(failure, "the pull against a non-park relay must fail loudly, not silently").toBeDefined();
+    expect(JSON.stringify(failure!.context), "a drain failure must name its cause").not.toContain("[object Object]");
+  }, 60_000);
+});
+
+describe("D: the drain's own failure modes are diagnosable and non-overlapping", () => {
+  /**
+   * A SessionNodeManager stand-in. The drain only asks it three things, and every one of them is
+   * a place a real rejection comes from — including the plain-object rejections that String()
+   * flattens to "[object Object]".
+   */
+  function makeFakeManager(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      getAgentRelayEndpoints: () => [{ relayPeerId: "RELAY", relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/RELAY"] }],
+      getStandingReceiverNode: () => null,
+      standingReceiverAbsenceReason: () => "no_standing_receiver",
+      recoverParkedEntry: async () => ({ ok: true }),
+      ...overrides,
+    } as unknown as Parameters<typeof createContentPark>[0]["sessionNodeManager"];
+  }
+
+  const kp = { openContentSeal: async () => new Uint8Array([1]) } as unknown as ReturnType<
+    NonNullable<Parameters<typeof createContentPark>[0]["getKeyProvider"]>
+  >;
+
+  it("D1: a PLAIN-OBJECT rejection from the drain names its cause — never '[object Object]'", async () => {
+    const { logger, events } = makeLogger();
+    const park = createContentPark({
+      logger,
+      // The transport rejects with { reason, message } shapes, which is the whole point.
+      sessionNodeManager: makeFakeManager({
+        getStandingReceiverNode: () => { throw { reason: "node_stopped", message: "the node is not started" }; },
+      }),
+      agents: [{ name: "alice", pubkey: "aa".repeat(32) }] as Parameters<typeof createContentPark>[0]["agents"],
+      getKeyProvider: () => kp,
+    });
+
+    await park.autoRecoverForAgent("alice", "unit_test");
+    const failed = events.find((e) => e.event === "content.recover.auto.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.context["error"]).toBe("the node is not started");
+    expect(JSON.stringify(failed!.context)).not.toContain("[object Object]");
+    expect(failed!.context["trigger"]).toBe("unit_test");
+  });
+
+  it("D2: no-receiver reports WHICH no-receiver — not the label that misnamed this incident", async () => {
+    const { logger, events } = makeLogger();
+    const park = createContentPark({
+      logger,
+      sessionNodeManager: makeFakeManager({ standingReceiverAbsenceReason: () => "standing_receiver_creating" }),
+      agents: [{ name: "alice", pubkey: "aa".repeat(32) }] as Parameters<typeof createContentPark>[0]["agents"],
+      getKeyProvider: () => kp,
+    });
+
+    await park.autoRecoverForAgent("alice", "unit_test");
+    const failed = events.find((e) => e.event === "content.recover.auto.relay_failed");
+    expect(failed).toBeDefined();
+    expect(failed!.context["reason"]).toBe("standing_receiver_creating");
+  });
+
+  it("D3: concurrent drains for one agent do not overlap — the second coalesces into ONE re-run", async () => {
+    const { logger, events } = makeLogger();
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    let passes = 0;
+    const park = createContentPark({
+      logger,
+      sessionNodeManager: makeFakeManager({
+        getStandingReceiverNode: () => {
+          // Counted at the point the pull would start, which is what must never interleave: two
+          // drains past this line can both pass the dedup check and append the same leaf twice.
+          passes++;
+          inFlight++;
+          maxConcurrent = Math.max(maxConcurrent, inFlight);
+          throw { reason: "stop_here", message: "counted" };
+        },
+      }),
+      agents: [{ name: "alice", pubkey: "aa".repeat(32) }] as Parameters<typeof createContentPark>[0]["agents"],
+      getKeyProvider: () => kp,
+    });
+    // The throw above unwinds synchronously, so decrement where the drain's pass ends.
+    const originalWarn = logger.warn.bind(logger);
+    logger.warn = (event, context) => { if (event === "content.recover.auto.failed") inFlight--; originalWarn(event, context); };
+
+    // Five triggers at once — the relay-churn shape: install, rebuild, rebuild, reconnect, backstop.
+    await Promise.all([
+      park.autoRecoverForAgent("alice", "standing_receiver_ready"),
+      park.autoRecoverForAgent("alice", "standing_receiver_ready"),
+      park.autoRecoverForAgent("alice", "periodic_backstop"),
+      park.autoRecoverForAgent("alice", "signaling_reconnect"),
+      park.autoRecoverForAgent("alice", "standing_receiver_ready"),
+    ]);
+
+    expect(maxConcurrent, "two drains for one agent must never be in flight together").toBe(1);
+    // One pass for the winner, exactly one coalesced re-run for the four that arrived during it —
+    // not four queued passes.
+    expect(passes).toBe(2);
+    expect(events.filter((e) => e.event === "content.recover.auto.coalesced").length).toBe(4);
+  });
+
+  it("D4: a manager with NO drain hook wired says so — the fix must not be silently absent", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "cello-park-drain-nohook-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+    const { logger, events } = makeLogger();
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath: join(tempDir, "sessions.db"),
+      standingReceiverRetryDelaysMs: [],
+    });
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      await manager.ensureStandingReceiverForAgent("alice"); // no setParkedDrainHook call
+      const absent = events.filter((e) => e.event === "content.recover.drain.hook.absent");
+      expect(absent.length, "an unwired drain hook reverts the whole unit — it must not be silent").toBe(1);
+    } finally {
+      await manager.gracefulShutdown();
+      delete process.env["CELLO_LISTEN_ADDR"];
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
+describe("E: the claim itself — a message parked mid-run reaches a RUNNING daemon, no restart", () => {
+  let tempDir = "";
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "cello-park-drain-e2e-"));
+    process.env["CELLO_LISTEN_ADDR"] = "/ip4/127.0.0.1/tcp/0";
+  });
+  afterEach(async () => {
+    delete process.env["CELLO_LISTEN_ADDR"];
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const msgLeafHash = (content: Uint8Array): Uint8Array =>
+    new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
+
+  it("E1: content deposited while the daemon runs is decrypted, ingested and confirm-deleted — restart never happens", async () => {
+    const relay = await startParkRelay();
+    const recipient = generateKeypair();          // "alice" — the receiving agent
+    const counterparty = generateKeypair();       // the honest sender
+    const recipientPub = await recipient.getPublicKey();
+    const counterpartyPub = await counterparty.getPublicKey();
+    const counterpartyHex = Buffer.from(counterpartyPub).toString("hex");
+    const sid = "e".repeat(64);
+
+    const { logger, events } = makeLogger();
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath: join(tempDir, "sessions.db"),
+      standingReceiverRetryDelaysMs: [],
+      standingReceiverReservationTimeoutMs: 2_000,
+      standingReceiverWatchdogIntervalMs: 200,
+      parkedDrainBackstopMs: 400,
+    });
+    await manager.initialize();
+
+    // The session as production leaves it after a failed live send: interrupted, counterparty
+    // known, and the relay it was witnessed by recorded — which is where its mail waits.
+    const ids = await seedAgents(manager.getDb(), ["alice"]);
+    const now = Date.now();
+    manager.getDb().prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, relay_peer_id, relay_addrs)
+       VALUES (?, ?, ?, 'interrupted', ?, ?, 0, ?, ?)`,
+    ).run(sid, ids.get("alice")!, counterpartyHex, now, now, relay.peerId, JSON.stringify([relay.addr]));
+
+    // The composition root's wiring, reproduced: the park drains, the manager says when.
+    const park = createContentPark({
+      logger,
+      sessionNodeManager: manager,
+      agents: [{ name: "alice", pubkey: Buffer.from(recipientPub).toString("hex") }] as Parameters<typeof createContentPark>[0]["agents"],
+      getKeyProvider: () => recipient,
+    });
+    manager.setParkedDrainHook((agentName, reason) => {
+      void park.autoRecoverForAgent(agentName, reason);
+    });
+
+    const sender = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+    await sender.start();
+
+    try {
+      // The daemon is UP and idle first — this is the running-daemon precondition, not a restart.
+      await manager.ensureStandingReceiverForAgent("alice");
+      await waitUntil(() => events.some((e) => e.event === "content.recover.auto.completed"), 10_000);
+      expect(manager.getSessionTree("alice", sid).size()).toBe(0);
+
+      // NOW the message is parked — mid-conversation, exactly as the sender's
+      // `session.relay.hash.submit.failed → content.park.deposited` path leaves it.
+      const content = new TextEncoder().encode("the message that used to need a daemon restart");
+      const hash = msgLeafHash(content);
+      const ciphertext = await sealParkEnvelope({
+        signer: counterparty,
+        sessionIdHex: sid,
+        recipientPubkey: recipientPub,
+        contentHash: hash,
+        content,
+      });
+      const deposit = await new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger }).deposit(
+        sender,
+        {
+          recipientPubkey: recipientPub,
+          contentHash: hash,
+          sessionId: Buffer.from(sid, "hex"),
+          ciphertext,
+        },
+      );
+      expect(deposit.ok, "the fixture relay must accept the deposit").toBe(true);
+      expect(relay.mailbox.size).toBe(1);
+
+      // No restart. No reconnect. Nothing but the daemon continuing to run.
+      const delivered = await waitUntil(() => manager.getSessionTree("alice", sid).size() === 1, 15_000);
+      expect(delivered, "a running daemon must recover parked content on its own").toBe(true);
+
+      // …and the content actually decrypted and passed the SEC-1 signature gate to become a leaf.
+      const recovered = events.find((e) => e.event === "content.recovered");
+      expect(recovered).toBeDefined();
+      expect(recovered!.context["contentHash"]).toBe(Buffer.from(hash).toString("hex"));
+
+      // Delete-on-confirm ran, so the next drain does not re-pull the whole history.
+      const drained = await waitUntil(() => relay.mailbox.size === 0, 10_000);
+      expect(drained, "an ingested entry must be confirm-deleted from the relay mailbox").toBe(true);
+      expect(relay.pullCount()).toBeGreaterThanOrEqual(2);
+    } finally {
+      await manager.gracefulShutdown();
+      await sender.stop();
+      await relay.stop();
     }
   }, 60_000);
 });
