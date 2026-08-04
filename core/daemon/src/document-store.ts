@@ -104,9 +104,9 @@ export interface DocumentSnapshot {
 
 /** Thrown when a read path refuses to materialize over a chain that does not verify. */
 export class DocumentChainError extends Error {
-  readonly reason: string;
+  readonly reason: "document_chain_broken" | "document_chain_forked";
   readonly detail: string;
-  constructor(reason: string, detail: string) {
+  constructor(reason: "document_chain_broken" | "document_chain_forked", detail: string) {
     super(`${reason}: ${detail}`);
     this.name = "DocumentChainError";
     this.reason = reason;
@@ -123,8 +123,9 @@ export type ChainVerdict =
  *
  * Takes ROWS, not bare payloads. The engine has to distinguish an update from a withdrawal or a
  * rejection to fold correctly — a withdrawn envelope's payload must not be applied — and it
- * cannot do that from `Uint8Array[]`. The store supplies every envelope that HAS a payload, in
- * log order; deciding which of them count is the engine's call, not the store's.
+ * cannot do that from `Uint8Array[]`. The store supplies the WHOLE log in order — withdrawal and
+ * rejection records included, payload-free though they are; deciding what counts is the engine's
+ * call, not the store's.
  */
 export type ReplayFn = (envelopes: DocumentEnvelopeRow[]) => {
   binary: Uint8Array;
@@ -204,9 +205,13 @@ export class DocumentStore {
   createDocument(row: DocumentRow): void {
     this.#db
       .prepare(
-        `INSERT OR IGNORE INTO documents
+        // Scoped to the identity conflict only — a bare OR IGNORE would also swallow the status
+        // CHECK, leaving the caller believing a document exists that was never stored, and the
+        // failure would surface later as a foreign-key error on the first append.
+        `INSERT INTO documents
            (owner_agent_id, document_id, peer_agent_id, document_type, properties, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id) DO NOTHING`,
       )
       .run(
         row.ownerAgentId,
@@ -244,10 +249,16 @@ export class DocumentStore {
   /**
    * Append an envelope at the next log position.
    *
-   * IMMUTABLE AT A HASH: `INSERT OR IGNORE` keeps the FIRST record for an envelope hash, so a
+   * IMMUTABLE AT A HASH: the conflict clause is scoped to the envelope hash ALONE, so a
    * re-delivery — or a peer replaying the same hash with different bytes — cannot overwrite what
    * was recorded. Returns whether a new row was written, so the caller can tell a genuine append
    * from a duplicate rather than inferring it.
+   *
+   * Scoped deliberately, not written as a bare `OR IGNORE`: that form suppresses CHECK, UNIQUE
+   * and NOT NULL as well, which on an append-only log means a malformed `kind` or a colliding
+   * `log_index` would be DROPPED and reported to the caller as an already-seen duplicate. Every
+   * constraint except the hash conflict must throw, or `false` means three different things the
+   * caller cannot tell apart.
    */
   appendEnvelope(ownerAgentId: string, envelope: DocumentEnvelopeRow): boolean {
     // The log index is computed INSIDE the insert, not read first and passed in. A read-then-write
@@ -255,14 +266,17 @@ export class DocumentStore {
     // file — the orphan-process case this repo has hit before — would each read the same MAX and
     // each insert it. A duplicate index makes ORDER BY log_index non-deterministic, and
     // deterministic replay is this log's entire purpose. The UNIQUE constraint is the backstop.
-    const info = this.#db
+    let info;
+    try {
+      info = this.#db
       .prepare(
-        `INSERT OR IGNORE INTO document_envelopes
+        `INSERT INTO document_envelopes
            (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash, epoch_id,
             signature, state_vector, payload, kind, references_hash, created_at, log_index)
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE((SELECT MAX(log_index) + 1 FROM document_envelopes
-                           WHERE owner_agent_id = ? AND document_id = ?), 0)`,
+                           WHERE owner_agent_id = ? AND document_id = ?), 0)
+         ON CONFLICT (owner_agent_id, document_id, envelope_hash) DO NOTHING`,
       )
       .run(
         ownerAgentId,
@@ -280,6 +294,19 @@ export class DocumentStore {
         ownerAgentId,
         envelope.documentId,
       );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      // SQLite says "FOREIGN KEY constraint failed" and nothing else — not which document, not
+      // which owner, not that a `documents` row is missing. That is the message an operator meets
+      // when an envelope arrives before its document exists, so it has to name its own cause.
+      if (message.includes("FOREIGN KEY")) {
+        throw new Error(
+          `document_envelope_unscoped: no document ${envelope.documentId.slice(0, 16)}… exists for ` +
+            `owner ${ownerAgentId.slice(0, 16)}… — create the document before appending to its log`,
+        );
+      }
+      throw err;
+    }
     return Number(info.changes) > 0;
   }
 
@@ -336,8 +363,6 @@ export class DocumentStore {
     for (const [sender, envelopes] of bySender) {
       const present = new Set(envelopes.map((e) => e.envelopeHash));
       const genesis = envelopes.filter((e) => e.docPrevHash === null);
-      // EXACTLY one, not at-most-one. Zero genesis means the links form a detached cycle
-      // (A→B, B→A): every predecessor is present, nothing is missing, and it is not a chain.
       if (genesis.length !== 1) {
         return {
           ok: false,
@@ -347,21 +372,8 @@ export class DocumentStore {
             `${documentId.slice(0, 16)}… — a chain has exactly one`,
         };
       }
-      // Two envelopes claiming the same predecessor is a fork, even though both links resolve.
-      const claimed = new Set<string>();
-      for (const e of envelopes) {
-        if (e.docPrevHash === null) continue;
-        if (claimed.has(e.docPrevHash)) {
-          return {
-            ok: false,
-            reason: "document_chain_forked",
-            detail:
-              `sender ${sender.slice(0, 16)}… has two envelopes claiming predecessor ` +
-              `${e.docPrevHash.slice(0, 16)}… — a chain branches nowhere`,
-          };
-        }
-        claimed.add(e.docPrevHash);
-      }
+      // Every link must resolve. Checked first so a missing predecessor reports as BROKEN rather
+      // than as the unreachability it would also cause.
       for (const e of envelopes) {
         if (e.docPrevHash !== null && !present.has(e.docPrevHash)) {
           return {
@@ -372,6 +384,48 @@ export class DocumentStore {
               `${e.docPrevHash.slice(0, 16)}…, which is absent from the log`,
           };
         }
+      }
+
+      // REACHABILITY, not structural heuristics. Walk forward from the one genesis and require
+      // the walk to cover every envelope this sender authored. That single check subsumes the
+      // duplicate-genesis case, the duplicate-predecessor fork, AND every cycle shape — including
+      // a disjoint cycle sitting alongside a perfectly good genesis chain, which counting roots
+      // and predecessors cannot see. `doc_prev_hash` is peer-controlled, so this is a hostile
+      // input path and the verifier is the only thing between a crafted log and a persisted
+      // snapshot.
+      const childOf = new Map<string, DocumentEnvelopeRow[]>();
+      for (const e of envelopes) {
+        if (e.docPrevHash === null) continue;
+        const siblings = childOf.get(e.docPrevHash);
+        if (siblings) siblings.push(e);
+        else childOf.set(e.docPrevHash, [e]);
+      }
+      const reached = new Set<string>();
+      let cursor: DocumentEnvelopeRow | undefined = genesis[0]!;
+      while (cursor) {
+        if (reached.has(cursor.envelopeHash)) break; // defensive; a cycle cannot include genesis
+        reached.add(cursor.envelopeHash);
+        const children: DocumentEnvelopeRow[] = childOf.get(cursor.envelopeHash) ?? [];
+        if (children.length > 1) {
+          return {
+            ok: false,
+            reason: "document_chain_forked",
+            detail:
+              `sender ${sender.slice(0, 16)}… has ${children.length} envelopes claiming predecessor ` +
+              `${cursor.envelopeHash.slice(0, 16)}… — a chain branches nowhere`,
+          };
+        }
+        cursor = children[0];
+      }
+      if (reached.size !== envelopes.length) {
+        return {
+          ok: false,
+          reason: "document_chain_forked",
+          detail:
+            `sender ${sender.slice(0, 16)}… has ${envelopes.length - reached.size} envelopes ` +
+            `unreachable from its genesis for document ${documentId.slice(0, 16)}… — a detached ` +
+            `cycle or branch, not a chain`,
+        };
       }
     }
     return { ok: true };
@@ -437,14 +491,15 @@ export class DocumentStore {
     }
 
     const log = this.getEnvelopeLog(ownerAgentId, documentId);
-    // Every envelope that HAS a payload, in log order. Which of them count — an update versus a
-    // withdrawn one — is the engine's call, which is why it receives rows rather than bytes.
-    const replayable = log.filter((e) => e.payload !== null);
-    const { binary, stateVector } = replay(replayable);
+    // The WHOLE log, in order — including withdrawal and rejection records, which carry no
+    // payload. Filtering to payload-bearing rows here would strip exactly the records the engine
+    // needs in order to exclude a withdrawn update, making the row-shaped signature pointless.
+    // The store decides ORDER; the engine decides WHAT COUNTS.
+    const { binary, stateVector } = replay(log);
     this.#logger.info("document.snapshot.rebuilt", {
       documentId,
       envelopes: log.length,
-      replayed: replayable.length,
+      withPayload: log.filter((e) => e.payload !== null).length,
     });
     // The LAST ROW'S log_index, not the array length. They coincide only while indices are dense,
     // which is an accident of how they are assigned rather than a guarantee.

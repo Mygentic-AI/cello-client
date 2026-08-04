@@ -232,7 +232,9 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
     // order; the engine owns HOW to apply. Here, concatenating payloads is a faithful stand-in
     // for "fold the log into a state" without importing yjs into a P0 store.
     const replay = (rows: DocumentEnvelopeRow[]): { binary: Uint8Array; stateVector: Uint8Array } => {
-      const payloads = rows.map((r) => r.payload!);
+      // The engine decides what counts — it receives withdrawal/rejection rows too, which carry
+      // no payload, and that is exactly why the signature is row-shaped.
+      const payloads = rows.filter((r) => r.payload !== null).map((r) => r.payload!);
       const binary = new Uint8Array(payloads.reduce((n, p) => n + p.length, 0));
       let at = 0;
       for (const p of payloads) { binary.set(p, at); at += p.length; }
@@ -274,7 +276,7 @@ describe("DocumentStore — the snapshot is DISPOSABLE (the unit's headline prop
 
     const seen: number[] = [];
     const replay = (rows: DocumentEnvelopeRow[]) => {
-      for (const r of rows) seen.push(r.payload![0]!);
+      for (const r of rows) if (r.payload !== null) seen.push(r.payload[0]!);
       return { binary: new Uint8Array(seen), stateVector: new Uint8Array([seen.length]) };
     };
 
@@ -409,5 +411,113 @@ describe("DocumentStore — refusals that must be reachable, not merely availabl
     const store = newStore();
     expect(() => store.setDocumentStatus(AGENT, DOC, "nonsense" as never)).toThrow();
     expect(store.getDocument(AGENT, DOC)!.status).toBe("active");
+  });
+});
+
+// ─── Pass-two additions: constraints must REFUSE, not be swallowed ───────────
+//
+// `INSERT OR IGNORE` suppresses CHECK, UNIQUE and NOT NULL as well as the conflict it is aimed
+// at. On an append-only log that turns a malformed row into a SILENT DROP reported to the caller
+// as an already-seen duplicate — the exact failure this store exists to make impossible. The
+// conflict clause is scoped to the envelope hash alone so everything else throws.
+describe("DocumentStore — constraint violations refuse loudly", () => {
+  it("a malformed envelope kind THROWS — it is never dropped and reported as a duplicate", () => {
+    const store = newStore();
+    const bad = { ...envelope(0, AGENT, null, new Uint8Array([0])), kind: "nonsense" as never };
+    expect(() => store.appendEnvelope(AGENT, bad)).toThrow();
+    // And nothing was written — the caller's `false` can only ever mean "same hash already here".
+    expect(store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
+
+  it("createDocument THROWS on an out-of-set status instead of discarding the document", () => {
+    const store = newStore({ withDocument: false });
+    expect(() => store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "nonsense" as never, createdAtMs: 1,
+    })).toThrow();
+    // The silent version left the caller believing the document existed, and the failure then
+    // surfaced as a foreign-key error on the first append — pointing at the wrong statement.
+    expect(store.getDocument(AGENT, DOC)).toBeNull();
+  });
+
+  it("re-appending the same hash still returns false — the ONE thing false may mean", () => {
+    const store = newStore();
+    const [first] = chain(AGENT, 1);
+    expect(store.appendEnvelope(AGENT, first!)).toBe(true);
+    expect(store.appendEnvelope(AGENT, first!)).toBe(false);
+    expect(store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("the FK refusal names the document and the owner, not just 'FOREIGN KEY constraint failed'", () => {
+    const store = newStore();
+    const orphan = { ...envelope(0, AGENT, null, new Uint8Array([0])), documentId: "ff".repeat(32) };
+    expect(() => store.appendEnvelope(AGENT, orphan)).toThrow(/document_envelope_unscoped/);
+    expect(() => store.appendEnvelope(AGENT, orphan)).toThrow(/create the document before appending/);
+  });
+});
+
+describe("DocumentStore — chain reachability (not just link presence)", () => {
+  it("REFUSES a detached cycle sitting BESIDE a valid genesis chain", () => {
+    const store = newStore();
+    // A genuine root, plus two envelopes pointing only at each other. One genesis, every link
+    // resolves, no duplicate predecessor — structural counting cannot see this.
+    const g = envelope(0, AGENT, null, new Uint8Array([0]));
+    const c = envelope(1, AGENT, null, new Uint8Array([1]));
+    const d = envelope(2, AGENT, null, new Uint8Array([2]));
+    store.appendEnvelope(AGENT, g);
+    store.appendEnvelope(AGENT, { ...c, docPrevHash: d.envelopeHash });
+    store.appendEnvelope(AGENT, { ...d, docPrevHash: c.envelopeHash });
+
+    const res = store.verifyChainLinkage(AGENT, DOC);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.reason).toBe("document_chain_forked");
+      expect(res.detail).toContain("unreachable from its genesis");
+    }
+  });
+
+  it("and rebuildSnapshot refuses it too — the verifier guards the read path", () => {
+    const store = newStore();
+    const g = envelope(0, AGENT, null, new Uint8Array([0]));
+    const c = envelope(1, AGENT, null, new Uint8Array([1]));
+    const d = envelope(2, AGENT, null, new Uint8Array([2]));
+    store.appendEnvelope(AGENT, g);
+    store.appendEnvelope(AGENT, { ...c, docPrevHash: d.envelopeHash });
+    store.appendEnvelope(AGENT, { ...d, docPrevHash: c.envelopeHash });
+
+    expect(() => store.rebuildSnapshot(AGENT, DOC, () => ({
+      binary: new Uint8Array(), stateVector: new Uint8Array(),
+    }))).toThrow(DocumentChainError);
+  });
+});
+
+describe("DocumentStore — lastAppliedIndex is the log_index, not the row count", () => {
+  it("survives a SPARSE log — the two coincide only while indices are dense", () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const store = new DocumentStore(db, NOOP_LOGGER);
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    for (const e of chain(AGENT, 5)) store.appendEnvelope(AGENT, e);
+
+    // Make the INDEX sparse while leaving the CHAIN intact — deleting a row would break the
+    // chain and be refused for that reason instead, which would prove nothing about the index.
+    // Any future compaction or repair that renumbers produces exactly this shape.
+    db.prepare("UPDATE document_envelopes SET log_index = 14 WHERE log_index = 4").run();
+
+    const log = store.getEnvelopeLog(AGENT, DOC);
+    expect(log).toHaveLength(5);
+    expect(log.at(-1)!.logIndex).toBe(14); // the real maximum, not the row count - 1
+
+    const built = store.rebuildSnapshot(AGENT, DOC, (rows) => ({
+      binary: new Uint8Array(rows.filter((r) => r.payload !== null).length),
+      stateVector: new Uint8Array(1),
+    }));
+    // The count-based version would say 4 here, and the next incremental rebuild would start at
+    // 5 and replay the envelope at index 14 forever.
+    expect(built.lastAppliedIndex).toBe(14);
+    expect(store.getEnvelopesSince(AGENT, DOC, built.lastAppliedIndex + 1)).toHaveLength(0);
   });
 });
