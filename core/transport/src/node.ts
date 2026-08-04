@@ -491,6 +491,55 @@ function mapStreamError(
  *     is set. Client nodes (session / standing_receiver) no longer advertise
  *     themselves as relays for strangers.
  */
+/**
+ * DOD-RELAY-KEEPALIVE-1: how long a keepalive ping may take before the peer is judged dead.
+ *
+ * libp2p's AdaptiveTimeout floors at 5 seconds (@libp2p/utils DEFAULT_MIN_TIMEOUT), which is a
+ * LAN number. The ping opens a stream — a multistream-select negotiation, and on a relayed
+ * connection every frame of it crosses two WAN hops — so 5 seconds is routinely missed by a link
+ * that is working perfectly. Missing it once destroys the connection, because
+ * `abortConnectionOnPingFailure` defaults to true.
+ *
+ * 30 seconds keeps the mechanism honest — a peer that is genuinely gone is detected within
+ * roughly one ping interval plus this — while giving a slow-but-alive link six times the
+ * headroom it had when the client↔relay link was dying every 60-90 seconds.
+ */
+export const WAN_PING_TIMEOUT_FLOOR_MS = 30_000;
+
+/** The libp2p `connectionMonitor` init this node's options resolve to. */
+export interface ResolvedConnectionMonitorConfig {
+  enabled?: boolean;
+  pingInterval?: number;
+  pingTimeout?: { minTimeout: number };
+  abortConnectionOnPingFailure?: boolean;
+}
+
+/**
+ * DOD-RELAY-KEEPALIVE-1: resolve the connection-monitor policy for a node.
+ *
+ * The monitor is NEVER disabled. Its pings are the only keepalive traffic on an otherwise idle
+ * relay link, and that traffic is what keeps network-level reapers (enterprise firewalls, NAT
+ * conntrack) from collecting the connection. What changes is the verdict the monitor is allowed
+ * to reach: a WAN-length deadline instead of a LAN one, and — where the caller asks for it — no
+ * authority to abort the connection at all.
+ *
+ * The abort stays ON by default. It is what surfaces a counterparty that vanished without a FIN
+ * (`peer:disconnect` → `counterparty_liveness` → 'gone'), and that detection is load-bearing for
+ * the unilateral-seal gate. Only a node with no liveness duty toward its peers — the relay,
+ * whose client liveness is the reservation TTL's job — should turn it off.
+ */
+export function resolveConnectionMonitorConfig(opts: {
+  keepAliveIntervalMs?: number;
+  connectionMonitor?: { abortConnectionOnPingFailure?: boolean; pingTimeoutMinMs?: number };
+}): ResolvedConnectionMonitorConfig {
+  const override = opts.connectionMonitor;
+  return {
+    ...(opts.keepAliveIntervalMs !== undefined ? { pingInterval: opts.keepAliveIntervalMs } : {}),
+    pingTimeout: { minTimeout: override?.pingTimeoutMinMs ?? WAN_PING_TIMEOUT_FLOOR_MS },
+    abortConnectionOnPingFailure: override?.abortConnectionOnPingFailure ?? true,
+  };
+}
+
 export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // HOP relay: service nodes keep it (deployed-relay compatibility); client node
   // types must opt in explicitly via relayServer.
@@ -566,13 +615,10 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       dcutr: dcutr(),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
-    // Keepalive ping interval, so a peer that vanished without a clean close is
-    // detected within a bounded window. A failed
-    // ping aborts the connection (abortConnectionOnPingFailure default true),
-    // firing peer:disconnect → counterparty_liveness drives to 'gone'.
-    ...(opts.keepAliveIntervalMs !== undefined
-      ? { connectionMonitor: { pingInterval: opts.keepAliveIntervalMs } }
-      : {}),
+    // DOD-RELAY-KEEPALIVE-1: the monitor's policy is ours now, not libp2p's defaults.
+    // Keepalive pings still detect a peer that vanished without a clean close, but the deadline
+    // a ping must meet is a WAN deadline rather than 5 seconds.
+    connectionMonitor: resolveConnectionMonitorConfig(opts),
   });
 
   // Record the hosts this node was configured to listen on / announce.

@@ -110,6 +110,34 @@ export interface CreateNodeOptions {
    * default connectionMonitor interval applies.
    */
   keepAliveIntervalMs?: number;
+  /**
+   * DOD-RELAY-KEEPALIVE-1: policy for libp2p's connection monitor, which is on by default on
+   * every node and, by default, ABORTS a whole connection after one ping that misses an
+   * AdaptiveTimeout whose floor is 5 seconds.
+   *
+   * That is what killed the client↔relay link every 60-90 seconds on 2026-08-04: the link was
+   * healthy, the ping was merely slow (a WAN hop, a busy event loop, or a relayed stream), and
+   * the monitor severed it — producing "The operation was aborted due to timeout", the string
+   * behind 2,061 untraced relay reader errors.
+   *
+   * Defaults live in resolveConnectionMonitorConfig. Override per node when one link needs a
+   * different policy from the rest: the relay's client links must never be severed on a slow
+   * ping (liveness there is the reservation TTL's job), while a session node keeps the abort so
+   * counterparty_liveness still reaches 'gone' when a peer vanishes without a FIN.
+   */
+  connectionMonitor?: {
+    /**
+     * false → a failed ping is logged and the connection is left alone. Pinging CONTINUES: the
+     * traffic doubles as a keepalive against network-level reapers (enterprise firewalls, NAT
+     * conntrack). Default true — do not turn this off on a node whose peer liveness matters.
+     */
+    abortConnectionOnPingFailure?: boolean;
+    /**
+     * Floor for the adaptive ping deadline, replacing libp2p's 5s. Raise it for links whose
+     * round trip is genuinely slow before concluding the peer is dead.
+     */
+    pingTimeoutMinMs?: number;
+  };
 }
 
 // ─── StreamHandler ──────────────────────────────────────────────────────────
