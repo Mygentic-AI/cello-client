@@ -104,6 +104,18 @@ export interface RelayConnectParams {
   assignment?: RelayAssignmentCarry;
 }
 
+/**
+ * DOD-PARK-DRAIN-1: why the parked-mailbox drain is being asked to run.
+ *
+ * `standing_receiver_ready` — a receiver was just installed, first time or rebuilt. The rebuild is
+ * the case that matters: content parks precisely because the relay link died, and the watchdog
+ * rebuild is that same event seen from the client side.
+ * `periodic_backstop` — nothing happened; this is the slow sweep that keeps a missed trigger from
+ * stranding content until someone restarts the daemon. Drains are deduped and delete-on-confirm,
+ * so an extra one costs a pull.
+ */
+export type ParkedDrainReason = "standing_receiver_ready" | "periodic_backstop";
+
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
 /**
@@ -256,6 +268,11 @@ export class SessionNodeManager {
   /** DOD-NAT-REACHABILITY-1: watchdog for a SILENTLY lost reservation. */
   #srWatchdogIntervalMs: number;
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
+  /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
+  #parkedDrainBackstopMs: number;
+  #parkedDrainLastBackstopAt = 0;
+  /** DOD-PARK-DRAIN-1: the composition root's parked-mailbox drain — see setParkedDrainHook. */
+  #parkedDrainHook: ((agentName: string, reason: ParkedDrainReason) => void) | null = null;
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -424,6 +441,14 @@ export class SessionNodeManager {
      */
     standingReceiverWatchdogIntervalMs?: number;
     /**
+     * DOD-PARK-DRAIN-1: how often the parked-mailbox BACKSTOP drain runs for an agent with a
+     * healthy standing receiver. Rides the reservation watchdog's grid, so the effective period is
+     * this value rounded up to a watchdog interval. Default 5 minutes: the trigger-driven drains do
+     * the real work, and this only exists so a future missed trigger degrades to "late", never to
+     * "stranded until a human restarts the daemon".
+     */
+    parkedDrainBackstopMs?: number;
+    /**
      * M9-CORE-001: the inbound security-screening seam. When absent, a
      * REQUIRED — there is no always-allow default (INV-9). A caller that does not screen must
      * say so by passing PassthroughGatewayClient from `@cello-protocol/gateway/testing`.
@@ -440,6 +465,7 @@ export class SessionNodeManager {
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
+    this.#parkedDrainBackstopMs = opts.parkedDrainBackstopMs ?? 300_000;
     // REQUIRED, no fallback (INV-9, audit finding). This line used to read
     // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
     // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
@@ -488,6 +514,35 @@ export class SessionNodeManager {
     fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
   ): void {
     this.#contentParkHook = fn;
+  }
+
+  /**
+   * DOD-PARK-DRAIN-1: inject the parked-mailbox drain (daemon.ts → contentPark.autoRecoverForAgent).
+   *
+   * The manager owns the two events that mean "content may be waiting for this agent on a relay":
+   * a standing receiver was (re)built, and the slow backstop sweep. It does not own the drain
+   * itself — that needs the agent's key provider and the inbound ingest funnel. So it calls out.
+   *
+   * Injected by the composition root, not passed to the constructor: the manager is built long
+   * before the content park exists (content-park.ts documents why that ordering is load-bearing).
+   */
+  setParkedDrainHook(fn: (agentName: string, reason: ParkedDrainReason) => void): void {
+    this.#parkedDrainHook = fn;
+  }
+
+  /** Ask for a drain. Never throws — a broken drain must never cost the caller its receiver. */
+  #fireParkedDrain(agentName: string, reason: ParkedDrainReason): void {
+    const hook = this.#parkedDrainHook;
+    if (!hook || this.#shuttingDown) return;
+    try {
+      hook(agentName, reason);
+    } catch (err: unknown) {
+      this.#logger.warn("content.recover.drain.hook.failed", {
+        agentName,
+        reason,
+        error: extractErrorMessage(err),
+      });
+    }
   }
 
   /**
@@ -5005,12 +5060,37 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-PARK-DRAIN-1: the backstop sweep — every agent holding a standing receiver gets a drain
+   * every #parkedDrainBackstopMs, whether or not anything happened.
+   *
+   * The trigger-driven drains (agent start, receiver rebuild, signaling reconnect) are what
+   * actually deliver. This exists because the incident was a MISSING trigger, and a missing
+   * trigger is invisible: the daemon looked healthy, the content was intact on the relay, and the
+   * only thing that ever moved it was a human restarting the daemon. With the sweep, the worst a
+   * future gap in trigger coverage can cost is one interval of latency. Safe by construction —
+   * ingest is deduped and the relay is delete-on-confirm, so a redundant drain pulls nothing.
+   */
+  #parkedDrainBackstopTick(now: number): void {
+    if (this.#parkedDrainHook === null) return;
+    if (now - this.#parkedDrainLastBackstopAt < this.#parkedDrainBackstopMs) return;
+    this.#parkedDrainLastBackstopAt = now;
+    for (const agentName of this.#standingReceivers.keys()) {
+      if (!this.#agentsWantingReceiver.has(agentName)) continue; // agent went offline
+      this.#fireParkedDrain(agentName, "periodic_backstop");
+    }
+  }
+
   /** Start the reservation watchdog (idempotent). Stopped by gracefulShutdown. */
   #startReservationWatchdog(): void {
     if (this.#reservationWatchdog !== null) return;
+    // Arm the backstop clock from the START of watching, not from the epoch — otherwise the first
+    // tick always fires a sweep on top of the install drain that just ran.
+    this.#parkedDrainLastBackstopAt = Date.now();
     this.#reservationWatchdog = setInterval(() => {
       try {
         this.#reservationWatchdogTick();
+        this.#parkedDrainBackstopTick(Date.now());
       } catch (err: unknown) {
         this.#logger.warn("session.standing_receiver.watchdog.failed", { error: extractErrorMessage(err) });
       }
@@ -5213,6 +5293,13 @@ export class SessionNodeManager {
         correlationId,
       });
     }
+
+    // DOD-PARK-DRAIN-1: this agent has a receiver again — drain whatever parked while it did not.
+    // Fired from the ONE place every path converges on (first ensure, the watchdog rebuild after a
+    // lost reservation, and the auth_ok rebuild), because the defect this closes was a trigger
+    // hooked to the wrong connection: content parks when the RELAY link dies, and the drain was
+    // waiting on DIRECTORY SIGNALING to reconnect — which it never had to, having never dropped.
+    this.#fireParkedDrain(agentName, "standing_receiver_ready");
     return { outcome: "installed" };
   }
 

@@ -67,7 +67,9 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
+import { extractErrorMessage } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
+import { createReconnectDrain } from "./reconnect-drain.js";
 import {
   resolveCelloEnv,
   createTransportSelector,
@@ -394,6 +396,30 @@ async function startDaemonHoldingLock(
   });
   const autoRecoverForAgent = (agentName: string): Promise<void> => contentPark.autoRecoverForAgent(agentName);
 
+  // DOD-PARK-DRAIN-1: drain where the parking actually happens. Content parks when the RELAY link
+  // drops; the manager tells us the moment this agent has a receiver again (first ensure, watchdog
+  // rebuild, auth_ok rebuild) and on its slow backstop sweep. Before this, a message that hit a
+  // relay churn gap sat parked until a human restarted the receiving daemon.
+  sessionNodeManager.setParkedDrainHook((agentName: string, reason: string) => {
+    void autoRecoverForAgent(agentName).catch((err: unknown) => {
+      // autoRecoverForAgent catches per-relay errors internally; this is the backstop, and it uses
+      // extractErrorMessage because the transport rejects with structured plain objects that
+      // String() renders as "[object Object]" — the reason 100+ real failures were undiagnosable.
+      logger.warn("content.recover.auto.failed", { agentName, trigger: reason, error: extractErrorMessage(err) });
+    });
+  });
+
+  // DOD-PARK-DRAIN-1: what an agent's signaling reconnect does — ensure THEN drain, never both at
+  // once. Constructed here, beside the content park it drains; `onlineAgents` is read inside the
+  // callback (at connect time), never during this construction, so its later declaration is not a
+  // temporal-dead-zone hazard.
+  const onSignalingConnected = createReconnectDrain({
+    logger,
+    isAgentOnline: (agentName: string) => onlineAgents.has(agentName),
+    ensureStandingReceiver: (agentName: string) => sessionNodeManager.ensureStandingReceiverForAgent(agentName),
+    drainParked: (agentName: string) => autoRecoverForAgent(agentName),
+  });
+
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
   // are wired into every signaling manager below — and the originals were FUNCTION DECLARATIONS,
   // so hoisting silently let them be CALLED 1,900 lines before they were DEFINED. A const in their
@@ -600,34 +626,24 @@ async function startDaemonHoldingLock(
       logger,
       maxReconnectAttempts: Number.MAX_SAFE_INTEGER,
       maxBackoffMs: 30_000,
-      // M8C-RELAYWAKE-1: "check relay on wakeup" — every time this agent's directory signaling
-      // reaches 'connected' (the first connect AND every reconnect after a drop), re-drain its
-      // parked mailbox from every relay it has session history with. Without this, a message
-      // parked while signaling was down (network blip, directory node restart, daemon offline)
-      // is only ever discovered at the NEXT agent start, not on the reconnect that actually
-      // brings the agent back — this closes that gap. Fire-and-forget; autoRecoverForAgent
-      // already catches its own per-relay errors internally.
+      // Two things happen when this agent's directory signaling reaches 'connected' (the first
+      // connect AND every reconnect after a drop), and the ORDER is the contract — see
+      // reconnect-drain.ts.
+      //
+      // RE-REGISTER THE STANDING RECEIVER (2026-07-31 incident). The receiver's LIFETIME is tied to
+      // this daemon; its REGISTRATION is tied to this stream, and the stream turns over roughly
+      // every 70 seconds. ensureStandingReceiverForAgent ran only at agent start, so 46 of 48
+      // reconnects in one hour left every agent unregistered — the directory then answers
+      // `targetStreamFound: false` and a session request fails with `target_offline`, while
+      // `cello status`, `agent.online` and the directory's own agent_presence all still report the
+      // agent healthy. Only a daemon restart recovered it.
+      //
+      // THEN DRAIN (M8C-RELAYWAKE-1, "check relay on wakeup"): re-pull this agent's parked mailbox
+      // from every relay it has session history with, so a message parked while signaling was down
+      // is not left until the next agent start. The drain needs the node the ensure builds, which
+      // is why it no longer runs beside it.
       onConnected: () => {
-        void autoRecoverForAgent(agentName);
-        // RE-REGISTER THE STANDING RECEIVER. The receiver's LIFETIME is tied to this daemon; its
-        // REGISTRATION is tied to this stream, and the stream turns over roughly every 70 seconds.
-        // ensureStandingReceiverForAgent ran only at agent start, so 46 of 48 reconnects in one hour
-        // left every agent unregistered — the directory then answers `targetStreamFound: false` and
-        // a session request fails with `target_offline`, while `cello status`, `agent.online` and the
-        // directory's own agent_presence all still report the agent healthy. Silent, and it does not
-        // self-heal: only a daemon restart recovered it (2026-07-31 incident).
-        //
-        // Guarded on onlineAgents because this fires on the FIRST connect too, and an agent that was
-        // never started must not acquire a receiver here. Re-entry at start is harmless —
-        // #ensureStandingReceiver returns immediately when one exists or is being created.
-        if (onlineAgents.has(agentName)) {
-          void sessionNodeManager.ensureStandingReceiverForAgent(agentName).catch((err: unknown) => {
-            logger.warn("session.standing_receiver.reregister.failed", {
-              agentName,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
+        onSignalingConnected(agentName);
       },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
@@ -1783,7 +1799,7 @@ async function startDaemonHoldingLock(
     void sessionNodeManager.ensureStandingReceiverForAgent(name)
       .then(() => flushAwaitingContent(name))
       .catch((err: unknown) => {
-        logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+        logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: extractErrorMessage(err) });
       })
       // DOD-MSG-4 (auto-recover-on-reconnect): RECEIVER drains its parked mailbox from every relay it
       // has sessions on (symmetric to the sender re-park). Its own stage so a failure is labelled
@@ -1791,7 +1807,7 @@ async function startDaemonHoldingLock(
       // errors internally, so this .catch is a backstop only.
       .then(() => autoRecoverForAgent(name))
       .catch((err: unknown) => {
-        logger.warn("content.recover.auto.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+        logger.warn("content.recover.auto.failed", { agentName: name, reason: extractErrorMessage(err) });
       });
     logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
     // MCP-002: Broadcast agent_state_changed to ALL connections

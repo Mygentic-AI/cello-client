@@ -22,6 +22,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { ContentParkClient } from "./content-park-client.js";
+import { extractErrorMessage } from "./session-relay-client.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -114,7 +115,7 @@ export function createContentPark(deps: ContentParkDeps) {
         try {
           await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
         } catch (err: unknown) {
-          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
+          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
         }
       } else if (ingest.ok) {
         // DOD-MSG-4 (review #3): count leaves ACTUALLY written — the directly-ingested leaf PLUS any
@@ -129,7 +130,7 @@ export function createContentPark(deps: ContentParkDeps) {
         try {
           await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
         } catch (err: unknown) {
-          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: err instanceof Error ? err.message : String(err) });
+          logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
         }
       } else {
         // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
@@ -167,7 +168,10 @@ export function createContentPark(deps: ContentParkDeps) {
         }
       } catch (err: unknown) {
         failed++;
-        logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: err instanceof Error ? err.message : String(err) });
+        // extractErrorMessage, NOT String(err): libp2p and the transport reject with structured
+        // plain objects, and String() renders every one of them "[object Object]". 102 of these
+        // fired during the 2026-08-04 incident and not one was diagnosable from the log.
+        logger.warn("content.recover.auto.failed", { agentName, relayPeerId: r.relayPeerId, error: extractErrorMessage(err) });
       }
     }
     // Emit the completion event UNCONDITIONALLY — not only when total > 0 — so a clean "nothing
