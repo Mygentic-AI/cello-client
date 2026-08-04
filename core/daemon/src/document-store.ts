@@ -165,6 +165,11 @@ const CREATE_ENVELOPES_SQL = `
     -- value is deterministic replay. Two daemons on one DB file (the orphan-process case this
     -- repo has been bitten by) would otherwise each compute the same next index and both insert.
     UNIQUE (owner_agent_id, document_id, log_index),
+    -- An audit record carries no content, and replay SKIPS payload-free non-update rows on that
+    -- basis. Enforce it here rather than relying on the convention: if a withdrawal ever carried
+    -- a payload and were later purged, replay would skip it and rebuild SHORT — the exact
+    -- divergence the purged-update refusal exists to prevent.
+    CHECK (kind = 'update' OR payload IS NULL),
     -- Rows cannot exist for a document that was never created. The reference store makes the
     -- same call in writing: an unscoped row must be impossible to write, not merely discouraged
     -- by a query convention every future caller has to remember.
@@ -492,9 +497,9 @@ export class DocumentStore {
 
     const log = this.getEnvelopeLog(ownerAgentId, documentId);
     // The WHOLE log, in order — including withdrawal and rejection records, which carry no
-    // payload. Filtering to payload-bearing rows here would strip exactly the records the engine
-    // needs in order to exclude a withdrawn update, making the row-shaped signature pointless.
-    // The store decides ORDER; the engine decides WHAT COUNTS.
+    // payload. The engine needs those rows to tell an expected payload-free AUDIT record from a
+    // PURGED update whose bytes are gone; filtering here would hide that distinction and make the
+    // row-shaped signature pointless. The store decides ORDER; the engine decides WHAT COUNTS.
     const { binary, stateVector } = replay(log);
     this.#logger.info("document.snapshot.rebuilt", {
       documentId,

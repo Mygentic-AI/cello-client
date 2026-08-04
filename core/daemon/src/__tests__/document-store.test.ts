@@ -521,3 +521,27 @@ describe("DocumentStore — lastAppliedIndex is the log_index, not the row count
     expect(store.getEnvelopesSince(AGENT, DOC, built.lastAppliedIndex + 1)).toHaveLength(0);
   });
 });
+
+describe("DocumentStore — an audit record may not carry content", () => {
+  it("a withdrawal or rejection WITH a payload is refused by the schema", () => {
+    const store = newStore();
+    const [first] = chain(AGENT, 1);
+    store.appendEnvelope(AGENT, first!);
+    for (const kind of ["withdrawal", "rejection"] as const) {
+      expect(() => store.appendEnvelope(AGENT, {
+        ...envelope(50, AGENT, first!.envelopeHash, new Uint8Array([1])),
+        kind,
+        referencesEnvelopeHash: first!.envelopeHash,
+      })).toThrow();
+    }
+    // Replay skips payload-free non-update rows; this makes that provably safe rather than
+    // conventionally safe. A withdrawal that carried content and was later purged would be
+    // skipped and the document would rebuild short.
+    expect(store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("an update WITH a payload is of course still accepted", () => {
+    const store = newStore();
+    expect(store.appendEnvelope(AGENT, chain(AGENT, 1)[0]!)).toBe(true);
+  });
+});

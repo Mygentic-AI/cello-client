@@ -18,6 +18,17 @@ import { DocumentEngine, DocumentUpdateError } from "../document-engine.js";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
+
+/** A logger that records what was emitted, so "it is logged" can be asserted rather than assumed. */
+function recordingLogger(): { logger: never; events: Array<{ level: string; event: string; fields: Record<string, unknown> }> } {
+  const events: Array<{ level: string; event: string; fields: Record<string, unknown> }> = [];
+  const capture = (level: string) => (event: string, fields: Record<string, unknown> = {}) =>
+    void events.push({ level, event, fields });
+  return {
+    logger: { debug: capture("debug"), info: capture("info"), warn: capture("warn"), error: capture("error") } as never,
+    events,
+  };
+}
 const AGENT = "aa".repeat(32);
 const PEER = "bb".repeat(32);
 const DOC = "cc".repeat(32);
@@ -410,5 +421,87 @@ describe("DocumentEngine — restore is guarded like every other read", () => {
 
     // Only the SECOND update — decodable, but depending on structs that are absent.
     expect(() => engine.restore(captured[1]!)).toThrow(DocumentUpdateError);
+  });
+});
+
+// ─── Pass-two: the refusal LOGGING itself, which had no coverage ─────────────
+//
+// "A return value nobody reads is not observable" was the reason for logging refusals — and the
+// fix was itself unobservable, because every test used a no-op logger. Deleting the log calls
+// left all 2567 tests green.
+describe("DocumentEngine — refusals are observable, not merely returned", () => {
+  it("logs document.update.refused with the reason for EVERY refusal class", () => {
+    const { logger, events } = recordingLogger();
+    const engine = new DocumentEngine(logger);
+    const doc = engine.createDocument("");
+
+    engine.applyUpdate(doc, new Uint8Array(engine.maxUpdateBytes + 1));
+    engine.applyUpdate(doc, new Uint8Array(0));
+    engine.applyUpdate(doc, new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff]));
+
+    const refusals = events.filter((e) => e.event === "document.update.refused");
+    expect(refusals).toHaveLength(3);
+    expect(refusals.map((r) => r.fields.reason)).toEqual([
+      "document_update_too_large",
+      "document_update_too_small",
+      "document_update_malformed",
+    ]);
+    // Every refusal carries its size, so a peer refused in a loop is diagnosable from logs alone.
+    expect(refusals.every((r) => typeof r.fields.bytes === "number")).toBe(true);
+    expect(refusals.every((r) => r.level === "warn")).toBe(true);
+  });
+
+  it("logs a corrupt snapshot and an incomplete one under DISTINCT events", () => {
+    const { logger, events } = recordingLogger();
+    const engine = new DocumentEngine(logger);
+
+    expect(() => engine.restore(new Uint8Array([0xff, 0xff, 0xff, 0xff]))).toThrow();
+    expect(events.some((e) => e.event === "document.snapshot.malformed")).toBe(true);
+
+    const source = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    source.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(source, 0, "first ");
+    engine.insertIntoTextRoot(source, engine.readTextRoot(source).length, "second");
+    expect(() => engine.restore(captured[1]!)).toThrow();
+    expect(events.some((e) => e.event === "document.snapshot.incomplete")).toBe(true);
+  });
+
+  it("an incomplete snapshot has its OWN reason — not an update's", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const source = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    source.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(source, 0, "first ");
+    engine.insertIntoTextRoot(source, engine.readTextRoot(source).length, "second");
+
+    let thrown: unknown;
+    try { engine.restore(captured[1]!); } catch (e) { thrown = e; }
+    // Same symptom as an out-of-order update, different fault: one reason per class.
+    expect((thrown as DocumentUpdateError).reason).toBe("document_snapshot_incomplete");
+  });
+});
+
+// The residue hazard that made the reused shadow unsound, pinned so it cannot come back.
+describe("DocumentEngine — the trial document must never carry residue", () => {
+  it("a refused update leaves the caller's document untouched, repeatedly", () => {
+    const engine = new DocumentEngine(NOOP_LOGGER);
+    const doc = engine.createDocument("original");
+
+    const other = engine.createDocument("");
+    const captured: Uint8Array[] = [];
+    other.on("update", (u: Uint8Array) => captured.push(u));
+    engine.insertIntoTextRoot(other, 0, "alpha ");
+    engine.insertIntoTextRoot(other, engine.readTextRoot(other).length, "beta");
+
+    // Refuse the same out-of-order update twice. With a REUSED trial doc the second call sees the
+    // first attempt's residue, reports an empty pending set, and ACCEPTS — the accept-class guard
+    // going green on exactly the input it exists to refuse.
+    for (let i = 0; i < 2; i++) {
+      const res = engine.applyUpdate(doc, captured[1]!);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe("document_update_unresolved_dependencies");
+    }
+    expect(engine.readTextRoot(doc)).toBe("original");
   });
 });

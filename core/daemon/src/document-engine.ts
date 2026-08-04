@@ -2,9 +2,11 @@
  * DOD-DOC-ENGINE-1 — the daemon's Y.Doc lifecycle.
  *
  * The engine owns HOW to apply; the store (DOD-DOC-STORE-1) owns what to replay and in what
- * order. That split is why `replay` here takes whole envelope rows rather than payload bytes:
- * a withdrawal record carries no payload, so an engine handed only payloads could never exclude
- * the update it withdraws.
+ * order. `replay` takes whole envelope rows rather than payload bytes so it can tell a
+ * payload-free AUDIT record (a withdrawal or rejection, which is expected and skipped) from a
+ * payload-free PURGED update (an operation whose bytes are gone, which must refuse). That is the
+ * only thing `kind` is read for — `referencesEnvelopeHash` is pure audit at replay time, never
+ * read, because a withdrawal excludes nothing (§16.4; see `replay`).
  *
  * EVERY GUARD BELOW IS A RESPONSE TO A MEASUREMENT, not to a guess. DOD-DOC-FUZZ-1 fuzzed
  * `Y.applyUpdate` and found:
@@ -35,6 +37,7 @@ export type DocumentUpdateFailure =
   | "document_update_malformed"
   | "document_update_unresolved_dependencies"
   | "document_snapshot_malformed"
+  | "document_snapshot_incomplete"
   | "document_envelope_purged";
 
 export type DocumentUpdateResult =
@@ -147,8 +150,10 @@ export class DocumentEngine {
       this.#logger.error("document.snapshot.incomplete", {
         missing: doc.store.pendingStructs.missing.size,
       });
+      // Its OWN class. An incomplete snapshot is not "an incoming update depends on absent
+      // structs" — same symptom, different fault, and one reason per class is this module's rule.
       throw new DocumentUpdateError(
-        "document_update_unresolved_dependencies",
+        "document_snapshot_incomplete",
         `snapshot is missing operations from ${doc.store.pendingStructs.missing.size} client(s)`,
       );
     }
@@ -162,16 +167,20 @@ export class DocumentEngine {
    * resolved is applied to a THROWAWAY doc first, so the caller's document is untouched when the
    * answer is no.
    */
+  /**
+   * Apply one update to a caller's live document, leaving it untouched if the answer is no.
+   *
+   * The trial runs on a FRESH scratch document every time. Reusing one across calls is unsound:
+   * `Y.applyUpdate` MERGES, it does not reset, so a scratch doc seeded from an empty document
+   * still holds the previous trial's operations — and with that residue present, an update whose
+   * dependencies the target lacks reports an EMPTY pending set. The one guard that catches the
+   * accept class would go green on exactly the input it exists to refuse. (Measured, not
+   * reasoned: a shadow holding "AAA" re-seeded from an empty doc still reads "AAA".)
+   */
   applyUpdate(doc: Y.Doc, update: Uint8Array): DocumentUpdateResult {
     return this.#applyChecked(doc, new Y.Doc(), update);
   }
 
-  /**
-   * The guarded apply. `shadow` is a scratch document the caller may reuse across a batch — the
-   * trial costs a full encode/decode of `doc`, so allocating one per update makes a fold over an
-   * N-envelope log quadratic in document size. Reusing it is safe because the shadow is reset to
-   * `doc`'s state at the top of every call.
-   */
   #applyChecked(doc: Y.Doc, shadow: Y.Doc, update: Uint8Array): DocumentUpdateResult {
     if (update.length > MAX_UPDATE_BYTES) {
       return this.#refuse("document_update_too_large", `${update.length} bytes exceeds the ${MAX_UPDATE_BYTES}-byte cap`, update);
@@ -206,6 +215,36 @@ export class DocumentEngine {
     }
 
     Y.applyUpdate(doc, update);
+    return { ok: true };
+  }
+
+  /**
+   * Apply straight to `doc`, checking the pending set afterwards.
+   *
+   * No trial copy, because atomicity buys nothing here: `replay` throws on the first failure and
+   * the half-built document is discarded whole. Trialling each envelope would cost a full
+   * encode/decode of a growing document per envelope — the fold is O(n·|doc|) either way, but
+   * this halves the constant and removes the aliasing hazard entirely.
+   */
+  #applyDirect(doc: Y.Doc, update: Uint8Array): DocumentUpdateResult {
+    if (update.length > MAX_UPDATE_BYTES) {
+      return this.#refuse("document_update_too_large", `${update.length} bytes exceeds the ${MAX_UPDATE_BYTES}-byte cap`, update);
+    }
+    if (update.length < MIN_UPDATE_BYTES) {
+      return this.#refuse("document_update_too_small", `${update.length} bytes is below the ${MIN_UPDATE_BYTES}-byte minimum for a Yjs update`, update);
+    }
+    try {
+      Y.applyUpdate(doc, update);
+    } catch (err: unknown) {
+      return this.#refuse("document_update_malformed", err instanceof Error ? err.message : String(err), update);
+    }
+    if (doc.store.pendingStructs !== null) {
+      return this.#refuse(
+        "document_update_unresolved_dependencies",
+        `depends on ${doc.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
+        update,
+      );
+    }
     return { ok: true };
   }
 
@@ -244,7 +283,6 @@ export class DocumentEngine {
    */
   replay(envelopes: readonly DocumentEnvelopeRow[]): { binary: Uint8Array; stateVector: Uint8Array } {
     const doc = new Y.Doc();
-    const shadow = new Y.Doc(); // reused across the fold — see #applyChecked
     let applied = 0;
 
     for (const e of envelopes) {
@@ -269,7 +307,7 @@ export class DocumentEngine {
         continue;
       }
 
-      const res = this.#applyChecked(doc, shadow, e.payload);
+      const res = this.#applyDirect(doc, e.payload);
       if (!res.ok) {
         this.#logger.error("document.replay.failed", {
           documentId: e.documentId,
