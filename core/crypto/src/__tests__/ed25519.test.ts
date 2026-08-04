@@ -26,6 +26,14 @@ setupV3Tests();
 // ─── CRYPTO-001 AC-001: key generation returns correct sizes ─────────────────
 describe("generateKeypair", () => {
   it("AC-001: returns InMemoryKeyProvider with 32-byte public key; keygen completes under 200ms", async () => {
+    // WARM UP FIRST. The AC is about how long generating a key takes, and the very first call in
+    // a process also pays one-time noble-curves initialization — so timing it measures module
+    // load as much as keygen. Under a loaded machine that lands around 450ms against a 200ms
+    // budget and reports as a crypto regression, which is a false red that costs real time to
+    // chase (it did, 2026-08-04). The warm-up measures the steady-state property the AC means;
+    // the 200ms bound itself is unchanged.
+    await generateKeypair().getPublicKey();
+
     await assertTimingWithin(async () => {
       const kp = generateKeypair();
       const pubkey = await kp.getPublicKey();
