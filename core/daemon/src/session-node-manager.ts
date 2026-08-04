@@ -39,7 +39,7 @@ import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
-import { SessionTree, type SessionTreeLeafKind } from "./session-tree.js";
+import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify } from "@cello-protocol/crypto";
@@ -3083,7 +3083,7 @@ export class SessionNodeManager {
   appendSessionLeaf(
     agentName: string,
     sessionId: string,
-    kind: SessionTreeLeafKind,
+    kind: WritableSessionTreeLeafKind,
     leafHashHex: string,
     correlationId?: string,
   ): { leafIndex: number; newRootHex: string } {
@@ -4373,7 +4373,21 @@ export class SessionNodeManager {
       )
       .all(this.#requireAgentId(agentName), sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
     return SessionTree.fromLeaves(
-      rows.map((r) => ({ kind: r.leaf_kind === "ctrl" ? "ctrl" : "msg", hashHex: r.leaf_hash_hex })),
+      rows.map((r, leafIndex) => {
+        const kind = sessionTreeLeafKindFromDb(r.leaf_kind);
+        if (kind === "unknown") {
+          // A leaf kind written by a newer build. The tree stays intact and sealable (the
+          // stored hash carries its own domain), but an operator must be able to see that
+          // this daemon is behind the one that wrote the row.
+          this.#logger.error("session.tree.leaf_kind.unrecognized", {
+            agentName,
+            sessionId,
+            leafIndex,
+            value: r.leaf_kind,
+          });
+        }
+        return { kind, hashHex: r.leaf_hash_hex };
+      }),
     );
   }
 

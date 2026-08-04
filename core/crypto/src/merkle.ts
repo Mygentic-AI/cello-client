@@ -69,7 +69,7 @@
  *   because nodeHash uses 0x01 prefix on the already-hashed children, not the raw data.
  */
 
-import { msgLeafHash, ctrlLeafHash, nodeHash, hash } from "./hashing.js";
+import { msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash, nodeHash, hash } from "./hashing.js";
 
 /**
  * Internal representation of a built Merkle tree.
@@ -92,13 +92,20 @@ export interface MerkleTree {
 
 /**
  * A leaf input with an explicit kind for domain separation.
- * - "msg":  hashed as SHA-256(0x00 || data) — message leaves
- * - "ctrl": hashed as SHA-256(0x02 || data) — control leaves (SEAL, etc.)
- * - "hash": data is already a 32-byte leaf hash; used directly (no prefix applied)
+ * - "msg":    hashed as SHA-256(0x00 || data) — message leaves
+ * - "ctrl":   hashed as SHA-256(0x02 || data) — control leaves (SEAL, etc.)
+ * - "doc":    hashed as SHA-256(0x04 || data) — document-operation leaves (DOD-DOC-LEAF-1)
+ * - "reject": hashed as SHA-256(0x05 || data) — rejection leaves (DOD-DOC-LEAF-1)
+ * - "opaque": hashed as SHA-256(prefix || data) — a kind byte this verifier does not
+ *             recognize (§16.7-10 tolerance); prefix must be 0–255
+ * - "hash":   data is already a 32-byte leaf hash; used directly (no prefix applied)
  */
 export type LeafInput =
   | { kind: "msg"; data: Uint8Array }
   | { kind: "ctrl"; data: Uint8Array }
+  | { kind: "doc"; data: Uint8Array }
+  | { kind: "reject"; data: Uint8Array }
+  | { kind: "opaque"; prefix: number; data: Uint8Array }
   | { kind: "hash"; data: Uint8Array };
 
 /**
@@ -121,10 +128,26 @@ export function buildMerkleTree(leaves: LeafInput[]): MerkleTree {
   }
 
   const levels: Uint8Array[][] = [];
-  let current: Uint8Array[] = leaves.map((l) => {
-    if (l.kind === "ctrl") return ctrlLeafHash(l.data);
-    if (l.kind === "hash") return l.data;
-    return msgLeafHash(l.data);
+  let current: Uint8Array[] = leaves.map((l, i) => {
+    switch (l.kind) {
+      case "msg": return msgLeafHash(l.data);
+      case "ctrl": return ctrlLeafHash(l.data);
+      case "doc": return docLeafHash(l.data);
+      case "reject": return rejectLeafHash(l.data);
+      case "opaque": return opaqueLeafHash(l.prefix, l.data);
+      case "hash": return l.data;
+      default: {
+        // Exhaustiveness over LeafInput is a COMPILE-time guarantee. Callers that map a kind
+        // off decoded wire or persisted state can still reach this at runtime, and an
+        // unhandled kind would put `undefined` into hash math — surfacing inside nodeHash,
+        // naming nothing.
+        const unknown: never = l;
+        throw new TypeError(
+          `buildMerkleTree: unrecognized leaf kind ${JSON.stringify((unknown as { kind?: unknown }).kind)} ` +
+            `at index ${i} — use { kind: "opaque", prefix } for a leaf-kind byte this build does not know`,
+        );
+      }
+    }
   });
   levels.push(current);
 

@@ -1,5 +1,5 @@
 {
-  "description": "CELLO domain-separated SHA-256 test vectors. Computed with Node.js native crypto (FIPS 180-4 compliant). NIST CAVP plain SHA-256 vectors also included — the cross-implementation contract the future Rust port must match.",
+  "description": "CELLO domain-separated SHA-256 test vectors. Computed with Node.js native crypto (FIPS 180-4 compliant). NIST CAVP plain SHA-256 vectors also included \u2014 the cross-implementation contract the future Rust port must match.",
   "nist_sha256": {
     "source": "NIST FIPS 180-4 CAVP SHA-256 ShortMsg / FIPS 180-4 Appendix B",
     "note": "Plain SHA-256, no domain prefix. Verified against Node.js native crypto (FIPS 180-4 compliant).",
@@ -38,45 +38,93 @@
   },
   "message_leaf": [
     {
-      "label": "(a) empty input — AC-005(a)",
+      "label": "(a) empty input \u2014 AC-005(a)",
       "input_hex": "",
       "output_hex": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
     },
     {
-      "label": "(b) single byte 0x42 — AC-005(b); paired with control_leaf[1] to prove domain separation",
+      "label": "(b) single byte 0x42 \u2014 AC-005(b); paired with control_leaf[1] to prove domain separation",
       "input_hex": "42",
       "output_hex": "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e"
     },
     {
-      "label": "(c) 64-byte all-zeros — AC-005(c)",
+      "label": "(c) 64-byte all-zeros \u2014 AC-005(c)",
       "input_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "output_hex": "98ce42deef51d40269d542f5314bef2c7468d401ad5d85168bfab4c0108f75f7"
     }
   ],
   "internal_node": [
     {
-      "label": "(d) two all-zero 32-byte child hashes — AC-005(d)",
+      "label": "(d) two all-zero 32-byte child hashes \u2014 AC-005(d)",
       "left_hex": "0000000000000000000000000000000000000000000000000000000000000000",
       "right_hex": "0000000000000000000000000000000000000000000000000000000000000000",
       "output_hex": "ae0798d0ecaed2b778eddebf18f071a561c53658c05e76cedecc27cafbdbc577"
     },
     {
-      "label": "(e) two distinct child hashes: msgLeaf(empty) and msgLeaf(0x42) — AC-005(e)",
+      "label": "(e) two distinct child hashes: msgLeaf(empty) and msgLeaf(0x42) \u2014 AC-005(e)",
       "left_hex": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
       "right_hex": "87afe6086fe4571e37657e76281301f189c75ebae1d2eaafb56d578067a1d95e",
       "output_hex": "1728c4a4bace3881cd6dd3c46ecd457e93c6ce4b2e67bc181d6da43c1db69b73"
     }
   ],
+  "doc_leaf": [
+    {
+      "label": "empty input (SHA-256(0x04))",
+      "input_hex": "",
+      "output_hex": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "caf1a2b56b4401819c2db0a961942c0008aedef8cef3c5d288c22e118ab62140"
+    }
+  ],
+  "reject_leaf": [
+    {
+      "label": "empty input (SHA-256(0x05))",
+      "input_hex": "",
+      "output_hex": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "efd50c92e51a4984f74d3976354fa6ba8c83476dee9dea8cb443f0136097a450"
+    }
+  ],
   "control_leaf": [
     {
-      "label": "(f) empty input — AC-005(f)",
+      "label": "(f) empty input \u2014 AC-005(f)",
       "input_hex": "",
       "output_hex": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"
     },
     {
-      "label": "(g) single byte 0x42 — AC-005(g); distinct from message_leaf[1] proving cross-domain second-preimage protection",
+      "label": "(g) single byte 0x42 \u2014 AC-005(g); distinct from message_leaf[1] proving cross-domain second-preimage protection",
       "input_hex": "42",
       "output_hex": "ba14365b34c02cc7fc1ee35c5c7ec4170a031fe6a374a3592cc08d3622674de4"
+    }
+  ],
+  "doc_leaf": [
+    {
+      "label": "empty input (SHA-256(0x04))",
+      "input_hex": "",
+      "output_hex": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "caf1a2b56b4401819c2db0a961942c0008aedef8cef3c5d288c22e118ab62140"
+    }
+  ],
+  "reject_leaf": [
+    {
+      "label": "empty input (SHA-256(0x05))",
+      "input_hex": "",
+      "output_hex": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "efd50c92e51a4984f74d3976354fa6ba8c83476dee9dea8cb443f0136097a450"
     }
   ]
 }

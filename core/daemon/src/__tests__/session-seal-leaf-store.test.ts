@@ -73,4 +73,17 @@ describe("SessionSealLeafStore (DOD-OPTIONB-SEAL-1)", () => {
     store.store(agent, "ab".repeat(16), own(1, 0), 1);
     expect(store.getCarry(agent, sess).length).toBe(1);
   });
+
+  // DOD-DOC-LEAF-1 (C7): a CHARACTERIZATION test — it constrains behavior that already held
+  // rather than proving a fix. The INTEGER leaf_kind column never coerced, so nothing changed
+  // here; the pin exists because P2 will write 0x04/0x05 through this store and a later
+  // "normalize the kind" edit would otherwise pass unnoticed.
+  it("(characterization) leaf_kind INTEGER already round-trips 0x04/0x05 — no coercion to add", () => {
+    const store = new SessionSealLeafStore(new DatabaseSync(":memory:"), NOOP_LOGGER);
+    store.store(agent, sess, own(1, 0x04), 1);
+    store.store(agent, sess, received(2, 0x05), 1);
+    store.store(agent, sess, own(3, 0x02), 1);
+    const carry = store.getCarry(agent, sess);
+    expect(carry.map((l) => l.leafKind)).toEqual([0x04, 0x05, 0x02]);
+  });
 });

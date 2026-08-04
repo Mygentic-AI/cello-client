@@ -45,6 +45,10 @@ export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
 export const LEAF_KIND_MSG = 0x00;
 /** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
 export const LEAF_KIND_CTRL = 0x02;
+/** Document-operation leaf (DOD-DOC-LEAF-1): a CRDT update riding the session tree. */
+export const LEAF_KIND_DOC = 0x04;
+/** Rejection leaf (DOD-DOC-LEAF-1): references the rejected update envelope's hash. */
+export const LEAF_KIND_REJECT = 0x05;
 
 const RELAY_AUTH_TIMEOUT_MS = 5_000;
 const HASH_SUBMIT_TIMEOUT_MS = 10_000;

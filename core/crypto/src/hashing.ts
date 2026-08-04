@@ -4,6 +4,8 @@ import { sha256 } from "@noble/hashes/sha2.js";
 const MSG_LEAF = 0x00;
 const INTERNAL_NODE = 0x01;
 const CTRL_LEAF = 0x02;
+const DOC_LEAF = 0x04;
+const REJECT_LEAF = 0x05;
 
 function prefixed(prefix: number, data: Uint8Array): Uint8Array {
   const buf = new Uint8Array(1 + data.length);
@@ -33,6 +35,36 @@ export function nodeHash(left: Uint8Array, right: Uint8Array): Uint8Array {
 
 export function ctrlLeafHash(data: Uint8Array): Uint8Array {
   return sha256(prefixed(CTRL_LEAF, data));
+}
+
+/** Document-operation leaf (DOD-DOC-LEAF-1): SHA-256(0x04 || data). RFC 6962 §2.1 domain separation. */
+export function docLeafHash(data: Uint8Array): Uint8Array {
+  return sha256(prefixed(DOC_LEAF, data));
+}
+
+/** Rejection leaf (DOD-DOC-LEAF-1): SHA-256(0x05 || data), referencing a rejected update envelope. */
+export function rejectLeafHash(data: Uint8Array): Uint8Array {
+  return sha256(prefixed(REJECT_LEAF, data));
+}
+
+/**
+ * Opaque leaf hash for a kind byte the caller does not recognize (§16.7-10 verifier
+ * tolerance): SHA-256(prefix || data). A verifier rebuilding a tree that contains a
+ * future leaf kind hashes it with this instead of erroring, so root recomputation
+ * survives protocol additions. The prefix must be a single byte — anything else
+ * would silently alias a different domain.
+ */
+export function opaqueLeafHash(prefix: number, data: Uint8Array): Uint8Array {
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 255) {
+    throw new RangeError(`opaqueLeafHash: prefix must be an integer 0–255, got ${prefix}`);
+  }
+  if (prefix === INTERNAL_NODE) {
+    throw new RangeError(
+      `opaqueLeafHash: prefix 0x01 is the RFC 6962 internal-node domain and can never be a leaf kind — ` +
+        `a 64-byte leaf hashed under it is byte-identical to nodeHash(left, right), which forges tree shape (§2.1.3)`,
+    );
+  }
+  return sha256(prefixed(prefix, data));
 }
 
 /**

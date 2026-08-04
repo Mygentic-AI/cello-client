@@ -43,7 +43,7 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider, generateKeypair, verify as ed25519Verify } from "@cello-protocol/crypto";
+import { FileKeyProvider, generateKeypair, verify as ed25519Verify, docLeafHash, rejectLeafHash } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
@@ -518,6 +518,37 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const art = snm2.getSealInterruptedArtifacts("alice", SID);
     expect(art).not.toBeNull();
     expect(art!.merkleRoot).toBe(rootBeforeCrash);
+  });
+
+  // DOD-DOC-LEAF-1 (review): the reload path itself, not just the mapper function. Before this
+  // unit, #loadTreeFromDb read `leaf_kind === "ctrl" ? "ctrl" : "msg"` — a stored document leaf
+  // came back labeled "msg" after any restart, which inflates the content-leaf count that the
+  // sealed receipt reports. This test is red under that coercion.
+  it("DOD-DOC-LEAF-1: doc and reject leaf kinds survive a restart reload — never relabeled 'msg'", async () => {
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const cpKp = generateKeypair();
+    const cpPubkeyHex = Buffer.from(await cpKp.getPublicKey()).toString("hex");
+
+    const h1 = await start({ logger, node: new FakeNode() });
+    const snm1 = h1.getSessionNodeManager();
+    await snm1.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    snm1.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
+    snm1.appendSessionLeaf("alice", SID, "doc", Buffer.from(docLeafHash(new TextEncoder().encode("update"))).toString("hex"));
+    snm1.appendSessionLeaf("alice", SID, "reject", Buffer.from(rejectLeafHash(new TextEncoder().encode("rejected"))).toString("hex"));
+    const rootBefore = snm1.getSessionTreeRootHex("alice", SID);
+    await h1.stop("simulated_sigkill");
+    handle = null;
+
+    const h2 = await start({ logger, node: new FakeNode(), signalingConnect: makeRespondingSignaling([], cpKp, cpPubkeyHex) });
+    await new Promise((r) => setTimeout(r, 50));
+    const reloaded = h2.getSessionNodeManager().getSessionTree("alice", SID);
+
+    expect(reloaded.leaves().map((l) => l.kind)).toEqual(["msg", "doc", "reject"]);
+    // The root is identical either way — the stored hash carries its own domain — so the kind
+    // label is what the content count depends on, and exactly one leaf is content.
+    expect(reloaded.rootHex()).toBe(rootBefore);
+    expect(reloaded.leaves().filter((l) => l.kind === "msg").length).toBe(1);
   });
 
   it("finding #4: two concurrent active cello_close_session calls — only one initiates a seal; the other is rejected seal_interrupted_in_progress", async () => {

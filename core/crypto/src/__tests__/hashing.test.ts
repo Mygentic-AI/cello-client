@@ -8,7 +8,7 @@ import {
   it,
   expect,
 } from "@claude-flow/testing";
-import { hash, msgLeafHash, nodeHash, ctrlLeafHash, buildRelayAckTbs } from "../hashing.js";
+import { hash, msgLeafHash, nodeHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash, buildRelayAckTbs } from "../hashing.js";
 import { generateKeypair, verify } from "../ed25519.js";
 
 setupV3Tests();
@@ -62,7 +62,90 @@ describe("ctrlLeafHash (AC-003)", () => {
   }
 });
 
-// ─── CRYPTO-002 AC-004: domain separation — all three domains differ ─────────
+// ─── DOD-DOC-LEAF-1: document operation leaf hash (0x04) ─────────────────────
+describe("docLeafHash (DOD-DOC-LEAF-1)", () => {
+  it("returns 32 bytes", () => {
+    expect(docLeafHash(new Uint8Array(0)).length).toBe(32);
+  });
+
+  it("empty input == SHA-256(0x04) — verified independently of the fixture", () => {
+    const expected = createHash("sha256").update(new Uint8Array([0x04])).digest("hex");
+    expect(toHex(docLeafHash(new Uint8Array(0)))).toBe(expected);
+    expect(expected).toBe(vectors.doc_leaf[0].output_hex);
+  });
+
+  for (const v of vectors.doc_leaf) {
+    it(`fixture: ${v.label}`, () => {
+      expect(toHex(docLeafHash(fromHex(v.input_hex)))).toBe(v.output_hex);
+    });
+  }
+});
+
+// ─── DOD-DOC-LEAF-1: rejection leaf hash (0x05) ──────────────────────────────
+describe("rejectLeafHash (DOD-DOC-LEAF-1)", () => {
+  it("returns 32 bytes", () => {
+    expect(rejectLeafHash(new Uint8Array(0)).length).toBe(32);
+  });
+
+  it("empty input == SHA-256(0x05) — verified independently of the fixture", () => {
+    const expected = createHash("sha256").update(new Uint8Array([0x05])).digest("hex");
+    expect(toHex(rejectLeafHash(new Uint8Array(0)))).toBe(expected);
+    expect(expected).toBe(vectors.reject_leaf[0].output_hex);
+  });
+
+  for (const v of vectors.reject_leaf) {
+    it(`fixture: ${v.label}`, () => {
+      expect(toHex(rejectLeafHash(fromHex(v.input_hex)))).toBe(v.output_hex);
+    });
+  }
+});
+
+// ─── DOD-DOC-LEAF-1 (§16.7-10): opaque leaf hash for unrecognized kinds ──────
+describe("opaqueLeafHash (DOD-DOC-LEAF-1 verifier tolerance)", () => {
+  it("hashes SHA-256(prefix || data) for an arbitrary kind byte", () => {
+    const data = fromHex("deadbeef");
+    const expected = createHash("sha256")
+      .update(Buffer.concat([Buffer.from([0x06]), Buffer.from(data)]))
+      .digest("hex");
+    expect(toHex(opaqueLeafHash(0x06, data))).toBe(expected);
+  });
+
+  it("reproduces every named domain exactly (msg/ctrl/doc/reject are opaque with known prefixes)", () => {
+    const data = new TextEncoder().encode("cross-check");
+    expect(toHex(opaqueLeafHash(0x00, data))).toBe(toHex(msgLeafHash(data)));
+    expect(toHex(opaqueLeafHash(0x02, data))).toBe(toHex(ctrlLeafHash(data)));
+    expect(toHex(opaqueLeafHash(0x04, data))).toBe(toHex(docLeafHash(data)));
+    expect(toHex(opaqueLeafHash(0x05, data))).toBe(toHex(rejectLeafHash(data)));
+  });
+
+  it("refuses a prefix outside 0–255 — a truncated byte would silently alias another domain", () => {
+    expect(() => opaqueLeafHash(256, new Uint8Array(0))).toThrow();
+    expect(() => opaqueLeafHash(-1, new Uint8Array(0))).toThrow();
+    expect(() => opaqueLeafHash(1.5, new Uint8Array(0))).toThrow();
+  });
+
+  // RFC 6962 §2.1.3: leaf and internal-node hashing MUST occupy different domains, or a
+  // tree of one shape can be forged to root-match a tree of another. Tolerance for unknown
+  // leaf kinds accepts an attacker-chosen prefix byte, so 0x01 has to be refused HERE — a
+  // 0–255 range check at any wire boundary does not exclude it.
+  it("refuses prefix 0x01 — the internal-node domain — because a 64-byte leaf would alias a node hash", () => {
+    const left = new Uint8Array(32).fill(0xaa);
+    const right = new Uint8Array(32).fill(0xbb);
+    const forged = new Uint8Array(64);
+    forged.set(left, 0);
+    forged.set(right, 32);
+
+    // The teeth: without the guard, this leaf hash IS the internal-node hash, byte for byte.
+    const wouldAlias = createHash("sha256")
+      .update(Buffer.concat([Buffer.from([0x01]), Buffer.from(forged)]))
+      .digest("hex");
+    expect(wouldAlias).toBe(toHex(nodeHash(left, right)));
+
+    expect(() => opaqueLeafHash(0x01, forged)).toThrow(/internal-node/);
+  });
+});
+
+// ─── CRYPTO-002 AC-004: domain separation — all domains differ ───────────────
 describe("domain separation (AC-004)", () => {
   it("AC-004: msgLeaf, ctrlLeaf, and plain hash all produce different outputs for same input", () => {
     const data = new TextEncoder().encode("same input");
@@ -72,6 +155,18 @@ describe("domain separation (AC-004)", () => {
     expect(msg).not.toBe(ctrl);
     expect(msg).not.toBe(plain);
     expect(ctrl).not.toBe(plain);
+  });
+
+  it("DOD-DOC-LEAF-1: doc and reject leaves differ from every other domain for same input", () => {
+    const data = new TextEncoder().encode("same input");
+    const all = [
+      toHex(msgLeafHash(data)),
+      toHex(ctrlLeafHash(data)),
+      toHex(docLeafHash(data)),
+      toHex(rejectLeafHash(data)),
+      toHex(hash(data)),
+    ];
+    expect(new Set(all).size).toBe(all.length);
   });
 });
 
@@ -201,6 +296,8 @@ describe("NIST CAVP SHA-256 vectors (AC-005)", () => {
     expect(vectors.message_leaf.length).toBe(3);
     expect(vectors.internal_node.length).toBe(2);
     expect(vectors.control_leaf.length).toBe(2);
+    expect(vectors.doc_leaf.length).toBe(2);
+    expect(vectors.reject_leaf.length).toBe(2);
   });
 
   for (const v of vectors.nist_sha256.vectors) {
