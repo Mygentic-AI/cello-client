@@ -129,6 +129,9 @@ importers:
       it-length-prefixed:
         specifier: ^10.0.1
         version: 10.0.2
+      yjs:
+        specifier: ^13.6.32
+        version: 13.6.32
     devDependencies:
       '@types/node':
         specifier: ^25.6.2
@@ -136,9 +139,6 @@ importers:
       tsx:
         specifier: ^4.22.4
         version: 4.22.4
-      yjs:
-        specifier: ^13.6.32
-        version: 13.6.32
 
   core/gateway:
     dependencies:
