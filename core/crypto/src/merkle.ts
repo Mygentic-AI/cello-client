@@ -128,7 +128,7 @@ export function buildMerkleTree(leaves: LeafInput[]): MerkleTree {
   }
 
   const levels: Uint8Array[][] = [];
-  let current: Uint8Array[] = leaves.map((l) => {
+  let current: Uint8Array[] = leaves.map((l, i) => {
     switch (l.kind) {
       case "msg": return msgLeafHash(l.data);
       case "ctrl": return ctrlLeafHash(l.data);
@@ -136,6 +136,17 @@ export function buildMerkleTree(leaves: LeafInput[]): MerkleTree {
       case "reject": return rejectLeafHash(l.data);
       case "opaque": return opaqueLeafHash(l.prefix, l.data);
       case "hash": return l.data;
+      default: {
+        // Exhaustiveness over LeafInput is a COMPILE-time guarantee. Callers that map a kind
+        // off decoded wire or persisted state can still reach this at runtime, and an
+        // unhandled kind would put `undefined` into hash math — surfacing inside nodeHash,
+        // naming nothing.
+        const unknown: never = l;
+        throw new TypeError(
+          `buildMerkleTree: unrecognized leaf kind ${JSON.stringify((unknown as { kind?: unknown }).kind)} ` +
+            `at index ${i} — use { kind: "opaque", prefix } for a leaf-kind byte this build does not know`,
+        );
+      }
     }
   });
   levels.push(current);

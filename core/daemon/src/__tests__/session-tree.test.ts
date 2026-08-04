@@ -131,8 +131,25 @@ describe("DOD-DOC-LEAF-1: document leaf kinds in SessionTree", () => {
     expect(sessionTreeLeafKindFromDb("reject")).toBe("reject");
   });
 
-  it("sessionTreeLeafKindFromDb REFUSES an unknown stored kind, naming the value — never a silent 'msg' relabel", () => {
-    expect(() => sessionTreeLeafKindFromDb("future-kind")).toThrow(/future-kind/);
-    expect(() => sessionTreeLeafKindFromDb("")).toThrow(/leaf_kind/);
+  // A kind this build does not know means a downgrade below the build that wrote it. The leaf
+  // must survive: the stored hash already encodes its domain, so the root is unaffected — but
+  // relabeling it "msg" would inflate the content count, and refusing would make the session
+  // unsendable and UNSEALABLE over a display counter. Neither. It reloads as "unknown".
+  it("sessionTreeLeafKindFromDb maps an unrecognized stored kind to 'unknown' — never 'msg', never a throw", () => {
+    expect(sessionTreeLeafKindFromDb("future-kind")).toBe("unknown");
+    expect(sessionTreeLeafKindFromDb("")).toBe("unknown");
+  });
+
+  it("an 'unknown' leaf does not change the root — the stored hash carries its own domain", () => {
+    const withKnown = SessionTree.fromLeaves([
+      { kind: "msg", hashHex: h(1) },
+      { kind: "doc", hashHex: h(2) },
+    ]);
+    const withUnknown = SessionTree.fromLeaves([
+      { kind: "msg", hashHex: h(1) },
+      { kind: "unknown", hashHex: h(2) },
+    ]);
+    expect(withUnknown.rootHex()).toBe(withKnown.rootHex());
+    expect(withUnknown.size()).toBe(2);
   });
 });

@@ -67,6 +67,30 @@
       "output_hex": "1728c4a4bace3881cd6dd3c46ecd457e93c6ce4b2e67bc181d6da43c1db69b73"
     }
   ],
+  "doc_leaf": [
+    {
+      "label": "empty input (SHA-256(0x04))",
+      "input_hex": "",
+      "output_hex": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "caf1a2b56b4401819c2db0a961942c0008aedef8cef3c5d288c22e118ab62140"
+    }
+  ],
+  "reject_leaf": [
+    {
+      "label": "empty input (SHA-256(0x05))",
+      "input_hex": "",
+      "output_hex": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db"
+    },
+    {
+      "label": "single byte 0x42",
+      "input_hex": "42",
+      "output_hex": "efd50c92e51a4984f74d3976354fa6ba8c83476dee9dea8cb443f0136097a450"
+    }
+  ],
   "control_leaf": [
     {
       "label": "(f) empty input \u2014 AC-005(f)",

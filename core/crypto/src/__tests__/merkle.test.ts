@@ -473,6 +473,11 @@ describe("'opaque' leaf kind (DOD-DOC-LEAF-1 verifier tolerance)", () => {
     expect(opaque).toBe(named);
   });
 
+  it("refuses the internal-node prefix 0x01 — tree-shape forgery, RFC 6962 §2.1.3", () => {
+    const forged = new Uint8Array(64).fill(0xcd);
+    expect(() => buildMerkleTree([{ kind: "opaque", prefix: 0x01, data: forged }])).toThrow(/internal-node/);
+  });
+
   it("a mixed tree with one unrecognized-kind leaf still verifies known-leaf inclusion", () => {
     const leaves: LeafInput[] = [
       msgLeaf(new Uint8Array([0xaa])),
@@ -486,5 +491,23 @@ describe("'opaque' leaf kind (DOD-DOC-LEAF-1 verifier tolerance)", () => {
     // And the opaque leaf itself proves inclusion via opaqueLeafHash.
     const proofOpaque = inclusionProof(tree, 1);
     expect(verifyInclusion(opaqueLeafHash(0x07, new Uint8Array([0xbb])), 1, 3, proofOpaque, root)).toBe(true);
+  });
+});
+
+// ── DOD-DOC-LEAF-1 (review F3): out-of-union kind at a decode boundary ──────
+// buildMerkleTree's kind dispatch is exhaustive over the declared union, which is a
+// COMPILE-time guarantee only. The consumers in trustless-cello map `l.kind` off decoded
+// wire/persisted state, so an invalid value can reach this at runtime. It must name the
+// leaf kind and index rather than propagating `undefined` into hash math, where the error
+// would surface inside nodeHash and point at the wrong subsystem.
+describe("buildMerkleTree: unrecognized kind at runtime (DOD-DOC-LEAF-1)", () => {
+  it("throws naming the kind, the index, and the remedy — never undefined into hash math", () => {
+    const bad = [
+      { kind: "msg", data: new Uint8Array([0x01]) },
+      { kind: "amend", data: new Uint8Array([0x02]) },
+    ] as unknown as LeafInput[];
+    expect(() => buildMerkleTree(bad)).toThrow(/"amend"/);
+    expect(() => buildMerkleTree(bad)).toThrow(/index 1/);
+    expect(() => buildMerkleTree(bad)).toThrow(/opaque/);
   });
 });

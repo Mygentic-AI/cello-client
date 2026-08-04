@@ -123,6 +123,26 @@ describe("opaqueLeafHash (DOD-DOC-LEAF-1 verifier tolerance)", () => {
     expect(() => opaqueLeafHash(-1, new Uint8Array(0))).toThrow();
     expect(() => opaqueLeafHash(1.5, new Uint8Array(0))).toThrow();
   });
+
+  // RFC 6962 §2.1.3: leaf and internal-node hashing MUST occupy different domains, or a
+  // tree of one shape can be forged to root-match a tree of another. Tolerance for unknown
+  // leaf kinds accepts an attacker-chosen prefix byte, so 0x01 has to be refused HERE — a
+  // 0–255 range check at any wire boundary does not exclude it.
+  it("refuses prefix 0x01 — the internal-node domain — because a 64-byte leaf would alias a node hash", () => {
+    const left = new Uint8Array(32).fill(0xaa);
+    const right = new Uint8Array(32).fill(0xbb);
+    const forged = new Uint8Array(64);
+    forged.set(left, 0);
+    forged.set(right, 32);
+
+    // The teeth: without the guard, this leaf hash IS the internal-node hash, byte for byte.
+    const wouldAlias = createHash("sha256")
+      .update(Buffer.concat([Buffer.from([0x01]), Buffer.from(forged)]))
+      .digest("hex");
+    expect(wouldAlias).toBe(toHex(nodeHash(left, right)));
+
+    expect(() => opaqueLeafHash(0x01, forged)).toThrow(/internal-node/);
+  });
 });
 
 // ─── CRYPTO-002 AC-004: domain separation — all domains differ ───────────────

@@ -26,28 +26,40 @@ import { buildMerkleTree, merkleRoot, type LeafInput } from "@cello-protocol/cry
  * The leaf domains a session tree can carry. "doc" (0x04) and "reject" (0x05) are the
  * document-collaboration kinds (DOD-DOC-LEAF-1); the stored hash already encodes the prefix,
  * so the kind here is the domain label that must survive persistence intact.
+ *
+ * "unknown" is READ-ONLY — it is never written and never appended. It labels a leaf reloaded
+ * from a database written by a NEWER build, so the label survives without claiming a domain
+ * this build cannot name.
  */
-export type SessionTreeLeafKind = "msg" | "ctrl" | "doc" | "reject";
+export type SessionTreeLeafKind = "msg" | "ctrl" | "doc" | "reject" | "unknown";
 
-const SESSION_TREE_LEAF_KINDS: readonly SessionTreeLeafKind[] = ["msg", "ctrl", "doc", "reject"];
+/**
+ * The kinds this build can AUTHOR. "unknown" is deliberately absent: it labels what was read,
+ * so accepting it on an append would let a reloaded label be written back as data.
+ */
+export type WritableSessionTreeLeafKind = Exclude<SessionTreeLeafKind, "unknown">;
+
+const WRITABLE_LEAF_KINDS: readonly WritableSessionTreeLeafKind[] = ["msg", "ctrl", "doc", "reject"];
 
 /**
  * Map a `session_tree_leaves.leaf_kind` value read back from the database to its domain.
  *
- * REFUSES an unrecognized value rather than defaulting. A default would relabel a leaf whose
- * kind this build does not know — silently changing the domain the tree replays under, which
- * diverges the root from the counterparty's without any error surfacing. An unknown value here
- * means own-database corruption or a downgrade below the writing build; both must be loud.
+ * An unrecognized value means a downgrade below the build that wrote the row. Three options
+ * exist and only one is defensible:
+ *
+ *   - Relabel it "msg" (the shape before DOD-DOC-LEAF-1): inflates the content-leaf count a
+ *     sealed receipt reports, silently.
+ *   - Throw: the caller (`#loadTreeFromDb`) is reached through `getSessionTree`, which gates
+ *     send, receive, append and SEAL. One stale row would make the session permanently
+ *     unusable and unsealable, with no repair path — to protect a display counter.
+ *   - Carry it as "unknown": the root is unaffected either way, because the stored 32-byte
+ *     hash already encodes its own domain and `rootHex()` rehashes nothing. The leaf keeps its
+ *     place, the content count excludes it, and the session stays sealable.
+ *
+ * The caller logs the anomaly — this returning quietly is not the same as it passing unnoticed.
  */
 export function sessionTreeLeafKindFromDb(value: string): SessionTreeLeafKind {
-  const found = SESSION_TREE_LEAF_KINDS.find((k) => k === value);
-  if (!found) {
-    throw new Error(
-      `session_tree_leaves.leaf_kind holds an unrecognized domain ${JSON.stringify(value)} — ` +
-        `expected one of ${SESSION_TREE_LEAF_KINDS.join(", ")}`,
-    );
-  }
-  return found;
+  return WRITABLE_LEAF_KINDS.find((k) => k === value) ?? "unknown";
 }
 
 export interface SessionTreeLeaf {
@@ -119,7 +131,7 @@ export class SessionTree {
    * Append a leaf (by its pre-computed 32-byte leaf-hash hex) and advance the root.
    * @returns the new leaf's index and the recomputed root hex.
    */
-  appendLeafHash(kind: SessionTreeLeafKind, hashHex: string): { leafIndex: number; newRootHex: string } {
+  appendLeafHash(kind: WritableSessionTreeLeafKind, hashHex: string): { leafIndex: number; newRootHex: string } {
     if (!/^[0-9a-f]{64}$/.test(hashHex)) {
       throw new Error(`SessionTree.appendLeafHash: hashHex must be 64 lowercase hex chars (32 bytes), got length ${hashHex.length}`);
     }

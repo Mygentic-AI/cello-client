@@ -58,6 +58,12 @@ export function opaqueLeafHash(prefix: number, data: Uint8Array): Uint8Array {
   if (!Number.isInteger(prefix) || prefix < 0 || prefix > 255) {
     throw new RangeError(`opaqueLeafHash: prefix must be an integer 0–255, got ${prefix}`);
   }
+  if (prefix === INTERNAL_NODE) {
+    throw new RangeError(
+      `opaqueLeafHash: prefix 0x01 is the RFC 6962 internal-node domain and can never be a leaf kind — ` +
+        `a 64-byte leaf hashed under it is byte-identical to nodeHash(left, right), which forges tree shape (§2.1.3)`,
+    );
+  }
   return sha256(prefixed(prefix, data));
 }
 
