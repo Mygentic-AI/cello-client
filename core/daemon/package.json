@@ -38,6 +38,7 @@
     "@cello-protocol/gateway": "workspace:*",
     "@cello-protocol/protocol-types": "workspace:*",
     "@cello-protocol/transport": "workspace:*",
+    "yjs": "^13.6.32",
     "@libp2p/interface": "^3.0.0",
     "@signalapp/sqlcipher": "^3.3.5",
     "cbor-x": "^1.6.0",
@@ -45,7 +46,6 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.2",
-    "tsx": "^4.22.4",
-    "yjs": "^13.6.32"
+    "tsx": "^4.22.4"
   }
 }
