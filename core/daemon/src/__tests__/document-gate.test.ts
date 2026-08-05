@@ -599,3 +599,122 @@ describe("DocumentGate — a quarantined update is HELD, not merely named", () =
     }
   });
 });
+
+// ─── Pass-two: the input classes the NEW rules still got wrong ───────────────
+
+describe("DocumentGate — (f) depth cannot be escaped by shape or by scale", () => {
+  it("QUARANTINES deep nesting in an ARRAY-shaped root", () => {
+    const { gate } = newGate({ maxNestingDepth: 5 });
+    const accepted = acceptedDoc("");
+    const peer = new Y.Doc();
+    peer.clientID = 500;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(accepted));
+
+    // Instantiating roots via getMap MIGRATED an array root to an empty map, reporting depth 0 —
+    // the same bypass as before, reached with a different type.
+    let array = peer.getArray("log");
+    for (let i = 0; i < 30; i++) {
+      const child = new Y.Array();
+      array.insert(0, [child]);
+      array = child;
+    }
+    const update = Y.encodeStateAsUpdate(peer, Y.encodeStateVector(accepted));
+
+    const verdict = gate.validate(accepted, update, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_nesting_too_deep");
+  });
+
+  it("QUARANTINES nesting far PAST the recursion ceiling — deeper must never mean safer", () => {
+    const { gate } = newGate({ maxNestingDepth: 64 });
+    const accepted = acceptedDoc("");
+    const peer = new Y.Doc();
+    peer.clientID = 500;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(accepted));
+
+    // A recursive walk threw RangeError past ~1000 levels and a catch turned that into depth 0,
+    // so 30 levels were refused and 5,000 admitted. The rule was inverted by its own guard.
+    let map = peer.getMap("elsewhere");
+    for (let i = 0; i < 3000; i++) {
+      const child = new Y.Map();
+      map.set("child", child);
+      map = child;
+    }
+    const update = Y.encodeStateAsUpdate(peer, Y.encodeStateVector(accepted));
+
+    const verdict = gate.validate(accepted, update, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_nesting_too_deep");
+  });
+});
+
+describe("DocumentGate — (i) append_only holds for ANY root, and admits a real append", () => {
+  it("QUARANTINES a deletion in a root the gate was never told about", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    accepted.getArray("log").insert(0, ["one", "two", "three"]);
+    const update = peerUpdate(accepted, 500, (d) => d.getArray("log").delete(0, 2));
+
+    // Checking `content` and `data` protected two names; a peer chooses its own.
+    const verdict = gate.validate(accepted, update, { ...context, appendOnly: true });
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_append_only_violation");
+  });
+
+  it("ADMITS growth INSIDE a nested entry — the append the feature is named for", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    const entry = new Y.Map();
+    accepted.getMap("data").set("entry1", entry);
+    entry.set("f1", 1);
+
+    // Comparing top-level keys with JSON.stringify called this a REMOVAL and refused it, telling
+    // the operator content was removed when nothing was.
+    const update = peerUpdate(accepted, 500, (d) =>
+      (d.getMap("data").get("entry1") as Y.Map<unknown>).set("f2", 2),
+    );
+
+    const verdict = gate.validate(accepted, update, { ...context, appendOnly: true });
+    expect(verdict.admit).toBe(true);
+  });
+
+  it("ADMITS appending to an array root, and QUARANTINES rewriting a key", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    accepted.getArray("log").insert(0, ["first"]);
+    accepted.getMap("data").set("k", "before");
+
+    expect(
+      gate.validate(accepted, peerUpdate(accepted, 500, (d) => d.getArray("log").insert(1, ["second"])), {
+        ...context,
+        appendOnly: true,
+      }).admit,
+    ).toBe(true);
+
+    // §16.7-1 is "deletes OR EDITS": a rewrite deletes the old item, so it falls out.
+    expect(
+      gate.validate(accepted, peerUpdate(accepted, 500, (d) => d.getMap("data").set("k", "after")), {
+        ...context,
+        appendOnly: true,
+      }).admit,
+    ).toBe(false);
+  });
+});
+
+describe("DocumentGate — the quarantined bytes are OWNED, not aliased", () => {
+  it("survives the caller reusing its buffer", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc();
+    const buffer = new Uint8Array([0xff, 0xff, 0xff, 0xff]);
+
+    const verdict = gate.validate(accepted, buffer, context);
+    // A pooled network read buffer is reused under us; REJECT-1 would otherwise hash bytes that
+    // are no longer the ones refused — into a 0x05 leaf, silently.
+    buffer.fill(0);
+
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) {
+      expect(Buffer.from(verdict.quarantined)).toEqual(Buffer.from([0xff, 0xff, 0xff, 0xff]));
+    }
+  });
+});

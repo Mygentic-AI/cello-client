@@ -244,6 +244,11 @@ export class DocumentGate {
 
     window.push(now);
     this.#recent.set(context.senderAgentId, window);
+    // Prune senders whose window has emptied, so the map does not accumulate one entry per peer
+    // for the life of the process.
+    for (const [sender, times] of this.#recent) {
+      if (times.length > 0 && now - times[times.length - 1]! > 60_000) this.#recent.delete(sender);
+    }
 
     // ── Shadow apply, on state rebuilt from ACCEPTED — never long-lived ─────
     const shadow = new Y.Doc();
@@ -299,7 +304,18 @@ export class DocumentGate {
     // `Y.diffUpdate` against an empty state vector re-encodes the update's own content and drops
     // slack. `Y.mergeUpdates([padded])` does NOT — it preserves the padding — so it is not a
     // usable detector here.
-    const canonicalUpdate = Y.diffUpdate(update, Y.encodeStateVector(new Y.Doc()));
+    let canonicalUpdate: Uint8Array;
+    try {
+      canonicalUpdate = Y.diffUpdate(update, Y.encodeStateVector(new Y.Doc()));
+    } catch (err: unknown) {
+      // A throw here is a malformed update, not an internal rule failure — labelling it
+      // document_gate_rule_failed would name this gate's exit point rather than the peer's fault.
+      return this.#quarantine(context, update, {
+        admit: false,
+        reason: "document_update_malformed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
     const reEncoded = Y.encodeStateAsUpdate(shadow);
     if (update.length > canonicalUpdate.length) {
       return this.#quarantine(context, update, {
@@ -324,7 +340,7 @@ export class DocumentGate {
         (k) => JSON.stringify(beforeKeys.get(k)) !== JSON.stringify(afterKeys.get(k)),
       ),
       resultingBytes: reEncoded.length,
-      maxDepth: deepestRoot(shadow),
+      maxDepth: deepestRoot(shadow, this.#limits.maxNestingDepth),
     };
 
     // ── Structural limits, on the projected result ──────────────────────────
@@ -350,16 +366,23 @@ export class DocumentGate {
     // made append_only a COMPLETE NO-OP for json documents, whose content lives in the map: an
     // 8-byte update emptied `data` with deletedChars = 0 and was admitted.
     if (context.appendOnly === true) {
-      const removedKeys = [...beforeKeys.keys()].filter(
-        (k) => !afterKeys.has(k) || JSON.stringify(afterKeys.get(k)) !== JSON.stringify(beforeKeys.get(k)),
-      );
-      if (diff.deletedChars > 0 || removedKeys.length > 0) {
+      // The UPDATE'S OWN DELETE SET, not a projection diff. Measured, it is exactly the right
+      // question and the projection was not:
+      //   - it is root- and type-agnostic, so an append-only document is protected whatever roots
+      //     a peer chooses — the previous version protected `content` and `data` and nothing else,
+      //     which is no protection at all when the peer names the roots;
+      //   - a map key REWRITE deletes the old item, so §16.7-1's "deletes OR EDITS" falls out;
+      //   - and growing a NESTED entry deletes nothing, so it is admitted. The projection diff
+      //     compared top-level keys with JSON.stringify and called that a removal, refusing the
+      //     very append the feature is named for and telling the operator content was removed
+      //     when nothing was.
+      const deletions = countDeletions(update);
+      if (deletions > 0) {
         return this.#quarantine(context, update, {
           admit: false,
           reason: "document_append_only_violation",
-          detail: diff.deletedChars > 0
-            ? `the projected diff removes ${diff.deletedChars} character(s) of existing content`
-            : `the projected diff removes or rewrites existing key(s): ${removedKeys.join(", ")}`,
+          detail: `the update deletes or rewrites ${deletions} existing range(s); this document ` +
+            `accepts appends only`,
         });
       }
     }
@@ -392,8 +415,15 @@ export class DocumentGate {
    * after integration sidesteps Yjs's own "Changed the client-id" guard; a hand-rolled encoder
    * needs no trick at all.
    *
-   * Advancement is the right question because a peer never legitimately advances another client's
-   * clock — that is what authorship MEANS in Yjs.
+   * Advancement is the right question for INSERTIONS: a peer never legitimately advances another
+   * client's clock. Reusing a clock position below the owner's is deduped by Yjs, and one above
+   * leaves a gap that rule (a) catches.
+   *
+   * IT DOES NOT COVER DELETIONS. A Yjs delete set carries no clientID and advances no clock, so a
+   * BOUND peer can delete the owner's content and this rule sees nothing — which is legitimate
+   * CRDT behaviour for an authorized writer, not a forgery, but it means `append_only` is the only
+   * thing standing between a bound peer and erasure, and it defaults off. Recorded rather than
+   * left for a reader to infer, and carried as an AC on DOD-DOC-REJECT-1.
    */
   #checkAuthorship(
     accepted: Y.Doc,
@@ -414,8 +444,9 @@ export class DocumentGate {
         admit: false,
         reason: "document_update_unbound_client",
         detail: `clientID(s) ${unbound.join(", ")} advanced but are not bound to sender ` +
-          `${context.senderAgentId.slice(0, 16)}… — authorship in Yjs IS the clientID, so an ` +
-          `unbound one silently outranks the honest client`,
+          `${context.senderAgentId.slice(0, 16)}… — either an update authored under another ` +
+          `party's identity, or relayed third-party operations, which V1 does not support ` +
+          `(hub-and-spoke is deferred, §11.1)`,
       };
     }
     return null;
@@ -432,7 +463,10 @@ export class DocumentGate {
       limit: verdict.limit,
       rule: verdict.rule,
     });
-    return { ...verdict, quarantined: update };
+    // COPY. Storing the caller's reference would let a pooled network read buffer be reused
+    // underneath us, so DOD-DOC-REJECT-1 would hash bytes that are no longer the ones refused —
+    // into a 0x05 leaf, silently.
+    return { ...verdict, quarantined: new Uint8Array(update) };
   }
 }
 
@@ -460,30 +494,81 @@ function deletedCount(before: string, after: string): number {
 }
 
 /**
- * The deepest nesting across EVERY root, not just the ones this gate knows by name.
+ * The deepest nesting across EVERY root, whatever shape that root is.
  *
- * `doc.toJSON()` is not enough: it returns each root's key, but does NOT recurse into a root that
- * was never instantiated as a concrete type — measured, a 30-level map under an unnamed root
- * reported depth 1. Instantiating each root by name is what exposes it. Measuring only `data` let
- * 5,000 levels through under any other root, comfortably under both size caps.
+ * Two things this must not do, both measured going wrong:
+ *
+ * 1. **It must not recurse.** `YMap.toJSON()` and a recursive depth walk are mutually recursive,
+ *    and past roughly a thousand levels they throw `RangeError: Maximum call stack size exceeded`.
+ *    A `catch` around that returned 0, which INVERTED the rule — 30 levels were caught and 5,000
+ *    sailed through, so the deeper the attack the more certain it passed. Worse, it converted the
+ *    gate's own fail-safe catch-all into an admission. This walk is iterative and bails the moment
+ *    it passes the limit it is enforcing, so it never goes deeper than it has to.
+ * 2. **It must not instantiate roots by a guessed type.** `doc.getMap(name)` MIGRATES an
+ *    uninstantiated root to a map in place, so an Array- or Text-shaped root became an empty map
+ *    and reported depth 0 — the same bypass, reached with a different type. Walking Yjs's own item
+ *    graph is shape-agnostic: a nested type is a nested type whether it hangs off `_map` or the
+ *    `_start` list.
  */
-function deepestRoot(doc: Y.Doc): number {
+function deepestRoot(doc: Y.Doc, bailAt: number): number {
   let deepest = 0;
-  for (const name of doc.share.keys()) {
-    try {
-      deepest = Math.max(deepest, maxDepth(doc.getMap(name).toJSON()));
-    } catch {
-      // A root that is not map-shaped contributes no nesting of this kind.
+  const stack: Array<{ type: Y.AbstractType<unknown>; depth: number }> = [];
+  for (const root of doc.share.values()) {
+    stack.push({ type: root as Y.AbstractType<unknown>, depth: 0 });
+  }
+
+  while (stack.length > 0) {
+    const { type, depth } = stack.pop()!;
+    if (depth > deepest) deepest = depth;
+    // Never walk deeper than the limit under enforcement — the answer cannot change.
+    if (deepest > bailAt) return deepest;
+
+    const internals = type as unknown as {
+      _map?: Map<string, { content?: unknown }>;
+      _start?: { content?: unknown; right?: unknown } | null;
+    };
+    if (internals._map) {
+      for (const item of internals._map.values()) {
+        const nested = nestedType(item);
+        if (nested) stack.push({ type: nested, depth: depth + 1 });
+      }
+    }
+    let item = internals._start;
+    while (item) {
+      const nested = nestedType(item);
+      if (nested) stack.push({ type: nested, depth: depth + 1 });
+      item = item.right as typeof item;
     }
   }
   return deepest;
 }
 
-function maxDepth(value: unknown, depth = 0): number {
-  if (value === null || typeof value !== "object") return depth;
-  let deepest = depth;
-  for (const child of Object.values(value as Record<string, unknown>)) {
-    deepest = Math.max(deepest, maxDepth(child, depth + 1));
+/** The type nested inside an item, or null when the item holds a plain value. */
+function nestedType(item: { content?: unknown } | null | undefined): Y.AbstractType<unknown> | null {
+  const content = item?.content;
+  if (content instanceof Y.ContentType) {
+    return content.type as Y.AbstractType<unknown>;
   }
-  return deepest;
+  return null;
+}
+
+/**
+ * How many ranges this update deletes — the basis for `append_only`.
+ *
+ * The update's own delete set, rather than a diff of the projected document. Measured, that is
+ * the right question and a projection diff was not: this is root- and type-agnostic (so a peer
+ * cannot escape by naming its own roots), a map-key rewrite deletes the old item so §16.7-1's
+ * "deletes OR EDITS" falls out, and growing a nested entry deletes nothing so it is admitted.
+ */
+function countDeletions(update: Uint8Array): number {
+  try {
+    const { ds } = Y.decodeUpdate(update);
+    let total = 0;
+    for (const ranges of ds.clients.values()) total += ranges.length;
+    return total;
+  } catch {
+    // Undecodable here means the malformed check upstream already refused it. Inventing an
+    // append_only violation from a decode failure would name the wrong cause.
+    return 0;
+  }
 }
