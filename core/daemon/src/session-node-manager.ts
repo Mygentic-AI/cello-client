@@ -18,6 +18,7 @@
 // The daemon DB is SQLCipher (whole-file AES-256 at rest), never `node:sqlite`. `DaemonDatabase` is
 // the thin varargs surface; `openEncryptedDatabase` opens with a PRAGMA key and `resolveDbKey`
 // manages the single plaintext key file.
+import { wireContentHash } from "./wire-content-hash.js";
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -3780,7 +3781,7 @@ export class SessionNodeManager {
       return { ok: false, reason: "session_committed" };
     }
 
-    const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
+    const computed = wireContentHash(content);
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     if (Buffer.from(computed).toString("hex") !== contentHashHex) {
       this.#logger.warn("session.content.cross_check.failed", {

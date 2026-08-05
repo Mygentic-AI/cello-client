@@ -34,8 +34,8 @@
  * as delivered, leaves it unacked, and asks again on the capped backoff.
  */
 
-import { createHash } from "node:crypto";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
+import { wireContentHash } from "./wire-content-hash.js";
 import type { DocumentEnvelopeRow } from "./document-store.js";
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
@@ -142,7 +142,12 @@ export function createDocumentDeliveryTransport(
       const session = await acquireSession(peerAgentId, sessionHint, correlationId);
       if (!session.ok) return session;
 
-      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      // THE WIRE HASH, domain-separated. This was `sha256(bytes)`, and the receiver recomputes
+      // `sha256(0x00 || bytes)` for every frame — so the send reported success, `parked: false`,
+      // and the peer discarded it at the authenticity check before the document layer was ever
+      // consulted. Found by two real daemons; no in-process test could see it, because both sides
+      // of those compute the hash with the same function.
+      const hash = wireContentHash(bytes);
       const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId);
       if (!sent.ok) {
         // Sealed even on a send failure, for the same reason as below: a session this daemon opened

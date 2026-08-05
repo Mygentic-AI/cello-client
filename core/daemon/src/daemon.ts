@@ -27,7 +27,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type {
   DaemonConfig,
@@ -89,6 +89,7 @@ import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { registerDocumentHandlers } from "./document-handlers.js";
 import { createDocumentControlNotifier } from "./document-control-notifier.js";
+import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { DocumentDelivery } from "./document-delivery.js";
@@ -1013,7 +1014,7 @@ async function startDaemonHoldingLock(
           // is anchored on (a counterparty daemon's end-anchored detector must see this close).
           const rejectText = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
           const rejectBytes = new TextEncoder().encode(rejectText);
-          const rejectHash = createHash("sha256").update(new Uint8Array([0x00])).update(rejectBytes).digest();
+          const rejectHash = wireContentHash(rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
           const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
           if (sendResult.ok) {
@@ -1173,7 +1174,7 @@ async function startDaemonHoldingLock(
       const contentBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
         ? new Uint8Array(awayVerdict.content)
         : draftBytes;
-      const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
+      const contentHash = wireContentHash(contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
@@ -3364,7 +3365,9 @@ async function startDaemonHoldingLock(
             update: envelope.payload ?? new Uint8Array(0),
             signature: envelope.signature,
           });
-          return { bytes, hash: new Uint8Array(createHash("sha256").update(bytes).digest()) };
+          // Same defect as `sendBytes` had, on the UPDATE path: the receiver recomputes with the
+          // `0x00` domain prefix, so a bare hash is discarded at the authenticity check.
+          return { bytes, hash: wireContentHash(bytes) };
         },
     });
     documentTransports.set(agentName, transport);

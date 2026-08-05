@@ -9,7 +9,8 @@
  * appends to the daemon-owned tree; cello_receive advances the per-connection cursor and the durable
  * watermark. Splitting them would put the cursor's writer and its reader in different modules.
  */
-import { randomUUID, createHash } from "node:crypto";
+import { wireContentHash } from "./wire-content-hash.js";
+import { randomUUID } from "node:crypto";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -306,7 +307,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // hash binds — the transcript records what was actually sent, not the pre-redaction draft.
     const modified = outboundVerdict.disposition === "redact" && outboundVerdict.content !== undefined;
     const sendBytes = modified ? new Uint8Array(outboundVerdict.content as Uint8Array) : contentBytes;
-    const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(sendBytes).digest();
+    const contentHash = wireContentHash(sendBytes);
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
     // ─── DOD-COATTEND-SENDWINDOW-1 (§4): re-check the gate, in the same synchronous window as the
