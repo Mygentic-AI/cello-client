@@ -263,3 +263,14 @@ export {
   decodeDocumentAck,
 } from "./document-ack.js";
 export type { DocumentAck } from "./document-ack.js";
+export {
+  DOCUMENT_REJECTION_DOMAIN,
+  DOCUMENT_REJECTION_VERSION,
+  MAX_REJECTION_DETAIL_LENGTH,
+  buildDocumentRejectionTbs,
+  documentRejectionHash,
+  assertDocumentRejectionConsistent,
+  encodeDocumentRejection,
+  decodeDocumentRejection,
+} from "./document-rejection-envelope.js";
+export type { DocumentRejectionEnvelope } from "./document-rejection-envelope.js";
