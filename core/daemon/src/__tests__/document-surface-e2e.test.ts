@@ -288,3 +288,62 @@ describe("two parties converge through the operator surface", () => {
     });
   });
 });
+
+describe("concurrent writes MERGE — they do not concatenate the two documents", () => {
+  /**
+   * MEASURED, not assumed. `delete(0,len); insert(0,content)` can only delete the items this side
+   * has seen, so a peer's concurrently-inserted items survive the delete and splice into the new
+   * text. Both sides full-replacing "original" converged on "AAABBB" — two whole documents
+   * concatenated, signed and published by both parties.
+   *
+   * That is the same class of permanent, silently-converged corruption the whole-text contract was
+   * chosen to PREVENT. The fix is line hunks: touch only what changed.
+   */
+  it("a peer's edit to an untouched line SURVIVES our write of a different line", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "line one\nline two\nline three\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Both edit the SAME document at the SAME time, each sending back the complete text they saw —
+    // exactly what the API's contract asks for, and exactly what a whole-text replace destroys.
+    await a.call("cello_doc_write", { document_id: documentId, content: "line one EDITED BY A\nline two\nline three\n" });
+    await b.call("cello_doc_write", { document_id: documentId, content: "line one\nline two\nline three EDITED BY B\n" });
+
+    await a.sweep();
+    await b.sweep();
+
+    await vi.waitFor(() => {
+      const text = a.text(documentId);
+      // BOTH edits present, each on its own line, and the untouched middle line intact and single.
+      expect(text).toContain("line one EDITED BY A");
+      expect(text).toContain("line three EDITED BY B");
+      expect(text.match(/line two/g)).toHaveLength(1);
+    });
+    // And both sides agree, which is the property that makes any of it worth having.
+    expect(b.text(documentId)).toBe(a.text(documentId));
+  });
+
+  it("an untouched document is not rewritten by a write that changes one line", async () => {
+    const a = await makeParty("alice");
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: "cc".repeat(32),
+      starting_content: "keep\nchange me\nkeep too\n",
+    })).documentId as string;
+
+    await a.call("cello_doc_write", { document_id: documentId, content: "keep\nCHANGED\nkeep too\n" });
+    expect(a.text(documentId)).toBe("keep\nCHANGED\nkeep too\n");
+    // The published update carries the hunk, not the whole document. A whole-document update on
+    // every keystroke-batch is what makes a peer's concurrent edit collide with an unchanged line.
+    const row = a.layer.store.getEnvelopeLog(a.owner, documentId).at(-1)!;
+    expect(row.payload!.length).toBeLessThan(200);
+  });
+});

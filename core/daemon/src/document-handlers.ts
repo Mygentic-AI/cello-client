@@ -41,6 +41,7 @@ import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
+import { lineHunks } from "./document-write-path.js";
 
 /** Document types the notification/diff path understands. Anything else is stored, not diffed. */
 const DEFAULT_DOCUMENT_TYPE = "markdown";
@@ -386,16 +387,33 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (before === content) {
       return { ok: true, documentId, changed: false, published: false };
     }
-    // ONE TRANSACTION, so the delete and the insert are a single Yjs update rather than two — a
-    // peer applying them separately would briefly converge on an empty document, and if the second
-    // never arrived, permanently.
+    // LINE HUNKS, never a whole-text replace — and this is not a preference, it is measured.
+    //
+    // `delete(0, len); insert(0, content)` can only delete the items THIS side has seen. A peer's
+    // concurrently-inserted items survive the delete and are spliced into the new text as orphan
+    // fragments. Against yjs at this version:
+    //
+    //   both sides full-replace "original" with "AAA" / "BBB"  →  "AAABBB" on BOTH sides
+    //   "Hello world", peer inserts " dear", we replace w/ "Goodbye"  →  " dearGoodbye"
+    //
+    // The first is the ORDINARY case for an API whose contract is "send back the complete text",
+    // and it converges two whole documents concatenated — signed and published by both parties. It
+    // is exactly the "a wrong offset in a CRDT is a permanent corruption both sides converge on"
+    // outcome the full-content contract was chosen to avoid; the mechanism moved and the failure
+    // did not.
+    //
+    // `lineHunks` touches only the lines that actually changed, so untouched regions keep their
+    // items and a peer's concurrent edit to them merges. Same function `DocumentWritePath.#foldText`
+    // uses, whose header records the same hazard for the file path — one folding rule, not two.
+    const hunks = lineHunks(before, content);
+    // ONE TRANSACTION, so the whole edit is a single Yjs update rather than several — a peer
+    // applying them separately would pass through states no operator ever wrote.
     doc.transact(() => {
-      // Whole-text replace. Yjs's own diff would preserve more concurrent structure, and the honest
-      // note is that this does not: a peer editing the same region concurrently loses their edit to
-      // last-writer-wins on the overlap rather than merging. Correct for the hub-and-spoke seam V1
-      // ships (§16.3 TOPOLOGY_V1), and it must be revisited before that seam widens.
-      text.delete(0, text.length);
-      text.insert(0, content);
+      // Back to front, so earlier offsets stay valid as later ones are rewritten.
+      for (const hunk of [...hunks].reverse()) {
+        if (hunk.to > hunk.from) text.delete(hunk.from, hunk.to - hunk.from);
+        if (hunk.insert.length > 0) text.insert(hunk.from, hunk.insert);
+      }
     });
 
     const result = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());

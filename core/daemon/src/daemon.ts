@@ -40,7 +40,7 @@ import type {
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
-import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
+import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -3109,17 +3109,31 @@ async function startDaemonHoldingLock(
   //
   // Wrapping the handler map is the ONE choke point that has both the response and the connection's
   // clientType. Doing it per-handler would mean 60+ call sites, and the 61st would forget.
-  const renderedHandlers = new Map<string, IpcHandler>();
-  for (const [method, handler] of handlers) {
-    renderedHandlers.set(method, async (params, connectionId) => {
-      const result = await handler(params, connectionId);
-      // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and the
-      // CLI verb is the safe answer — it is at least a real command an operator can run, whereas an
-      // MCP tool name is useless in a terminal.
-      const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
-      return renderForSurface(result, surface);
-    });
-  }
+  //
+  // RESOLVED AT DISPATCH, not copied at construction. This was a `for…of` that snapshotted
+  // `handlers` into a second map, which made the ORDER of registration load-bearing in a file
+  // 3,500 lines long: anything registered after this line was written into a map nothing
+  // dispatched from. The document surface landed 245 lines below it and every `cello_doc_*` verb
+  // answered `method_not_found` — whose guidance blames version skew between the shim and the
+  // daemon, so an operator would re-pin, reinstall and restart, and find both sides matching.
+  //
+  // A comment saying "register above this line" would have been one more rule to remember. Late
+  // binding makes the ordering unrepresentable instead: the map below reads `handlers` when a
+  // request arrives, so a handler registered at any point before the first request is dispatchable.
+  const renderedHandlers: HandlerLookup = {
+    get(method: string): IpcHandler | undefined {
+      const handler = handlers.get(method);
+      if (!handler) return undefined;
+      return async (params, connectionId) => {
+        const result = await handler(params, connectionId);
+        // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
+        // the CLI verb is the safe answer — it is at least a real command an operator can run,
+        // whereas an MCP tool name is useless in a terminal.
+        const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
+        return renderForSurface(result, surface);
+      };
+    },
+  };
 
   // Create and start IPC server
   const ipcServer: IpcServer = createIpcServer(

@@ -173,6 +173,11 @@ export function createDocumentDeliveryTransport(
       const { bytes, hash } = deps.encodeEnvelope(envelope);
       const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId);
       if (!sent.ok) {
+        // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it
+        // had just dialled — a live node the operator never started, with no sealed record, which
+        // is precisely what the rule twenty lines below says the seal exists to prevent. A failed
+        // send is when it is most likely to happen, not least.
+        if (sessionOpened) await deps.sealSession(deps.agentName, sessionId, correlationId);
         return { ok: false, reason: sent.reason, detail: sent.error };
       }
 
