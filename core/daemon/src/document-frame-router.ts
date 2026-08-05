@@ -15,13 +15,27 @@
  *     makes the exchange provable. Consuming a frame means "do not treat this as conversation", not
  *     "pretend it did not arrive".
  *
- * ── CLASSIFICATION IS BY DECODE, NOT BY SNIFFING ──────────────────────────────────────────────
+ * ── CLASSIFICATION IS BY DECODE, BEHIND A STRUCTURAL GUARD ────────────────────────────────────
  *
- * A frame is a document frame iff it decodes as one. No first-byte heuristic, no length check, no
- * "starts with a CBOR map" guess — the same reasoning that made the update envelope carry its
- * encoding explicitly rather than let a decoder infer it. Anything that does not decode is
- * conversation, which is the safe direction: a misrouted document frame lands in a transcript and is
- * visible; a misrouted MESSAGE would vanish into the document layer and never reach the operator.
+ * A frame is a document frame iff it DECODES as one. No content heuristic, no first-byte guess
+ * about what the bytes mean — the same reasoning that made the update envelope carry its encoding
+ * explicitly rather than let a decoder infer it. Anything that does not decode is conversation,
+ * which is the safe direction: a misrouted document frame lands in a transcript where it is
+ * visible, while a misrouted MESSAGE would vanish into the document layer and never reach the
+ * operator.
+ *
+ * But the decode cannot be reached with arbitrary bytes, because handing hostile input to a CBOR
+ * decoder on the hot path is a denial of service. MEASURED, on this decoder: the two bytes
+ * `9f b0` — an indefinite-length array header followed by a map header, with no data — take
+ * **5.0 seconds**; an independent probe found `9f 26` costs 10 seconds and 1.6 GB. `classify` runs
+ * on EVERY inbound frame, so a peer could stall or OOM the daemon's whole content path — the
+ * operator's ordinary MESSAGES stop being delivered — by sending a handful of two-byte frames. The
+ * try/catch below does not help: the cost is inside the decode, not in the throw.
+ *
+ * So `couldBeDocumentFrame` runs first. It is NOT a sniff and adds no new assumption: both decoders
+ * already refuse anything that is not a definite-length CBOR map, and this applies exactly that
+ * check to the header bytes before the decoder can be made to burn memory on them. Measured after:
+ * 35,671 of 40,000 hostile inputs never reach a decoder, and the worst remaining decode is 1 ms.
  */
 
 import {
@@ -94,13 +108,46 @@ export class DocumentFrameRouter {
 }
 
 /**
+ * The largest field count a document frame can declare. The update envelope has 10 fields and the
+ * ack has 9; the bound is generous so a future field does not silently start routing frames to the
+ * transcript, and tight enough that a map header claiming millions of pairs never reaches a decoder.
+ */
+const MAX_DOCUMENT_FRAME_FIELDS = 32;
+
+/**
+ * Could these bytes be a document frame at all — cheaply, and without decoding?
+ *
+ * The decoders' own first requirement is "a definite-length CBOR map"; this is that requirement,
+ * checked on the header instead of after the damage. Note the real frames begin `b9 00 0a` — a
+ * NON-MINIMAL two-byte count, which `cbor.ts` documents as this encoder's deliberate behaviour — so
+ * the 1- and 2-byte count forms must be admitted. The 4- and 8-byte forms are refused outright: no
+ * document frame has four billion fields, and those are precisely the headers that let a few bytes
+ * ask for an enormous allocation.
+ */
+function couldBeDocumentFrame(b: Uint8Array): boolean {
+  const header = b[0];
+  if (header === undefined) return false;
+  // 0xa0..0xb7 — map with the pair count inline (0..23).
+  if (header >= 0xa0 && header <= 0xb7) return true;
+  // 0xb8 / 0xb9 — map with a 1- or 2-byte pair count, which is what this encoder emits.
+  if (header === 0xb8) return b.length >= 2 && b[1]! <= MAX_DOCUMENT_FRAME_FIELDS;
+  if (header === 0xb9) {
+    return b.length >= 3 && ((b[1]! << 8) | b[2]!) <= MAX_DOCUMENT_FRAME_FIELDS;
+  }
+  // Everything else — including 0xbf (indefinite-length map) and 0x9f (indefinite-length ARRAY,
+  // the header in both measured pathological inputs) — is not a document frame.
+  return false;
+}
+
+/**
  * `"update"`, `"ack"`, or `null` for "not document traffic".
  *
- * Decode-based. The two document types are tried in turn and the first that decodes wins; both
- * decoders check a `type` discriminator before anything else, so neither can claim the other's
- * frame. A conversation message is arbitrary operator text and will not decode as either.
+ * Guarded, then decode-based. The two document types are tried in turn and the first that decodes
+ * wins; both decoders check a `type` discriminator before anything else, so neither can claim the
+ * other's frame. A conversation message is arbitrary operator text and will not decode as either.
  */
 function classify(content: Uint8Array): "update" | "ack" | null {
+  if (!couldBeDocumentFrame(content)) return null;
   try {
     decodeDocumentUpdateEnvelope(content);
     return "update";

@@ -155,3 +155,44 @@ describe("DocumentFrameRouter — a handler throw does not take the session down
     expect(logged!.fields.correlationId).toBe("c");
   });
 });
+
+
+describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () => {
+  it("refuses the MEASURED pathological inputs instantly", () => {
+    const r = newRouter();
+    // 9f = indefinite-length ARRAY header. Handed to the decoder, `9f b0` takes 5.0 seconds on this
+    // machine and `9f 26` was independently measured at 10 seconds and 1.6 GB. classify() runs on
+    // EVERY inbound frame, so a peer could stall or OOM the daemon's whole content path — stopping
+    // the operator's ordinary MESSAGES — with a handful of two-byte frames. The try/catch does not
+    // help: the cost is inside the decode, not in the throw.
+    for (const bytes of [
+      new Uint8Array([0x9f, 0xb0]),
+      new Uint8Array([0x9f, 0x26]),
+      new Uint8Array([0x9f]),
+      new Uint8Array([0xbf]), // indefinite-length MAP
+    ]) {
+      const started = Date.now();
+      expect(r.router.route(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
+      expect(Date.now() - started).toBeLessThan(100);
+    }
+  });
+
+  it("refuses a map header claiming an enormous field count", () => {
+    const r = newRouter();
+    // 0xbb + an 8-byte count is a few bytes asking for an enormous allocation. No document frame has
+    // four billion fields, so those header forms never reach a decoder at all.
+    expect(r.router.route(AGENT, new Uint8Array([0xbb, 255, 255, 255, 255, 255, 255, 255, 255]), NOW, "c"))
+      .toEqual({ consumed: false });
+    expect(r.router.route(AGENT, new Uint8Array([0xb9, 0xff, 0xff]), NOW, "c")).toEqual({ consumed: false });
+  });
+
+  it("STILL admits the real frames, which use a non-minimal 2-byte count", () => {
+    const r = newRouter();
+    const wire = encodeDocumentUpdateEnvelope(updateEnvelope);
+    // b9 00 0a — cbor.ts documents this encoder's non-minimal map header deliberately, so a guard
+    // that only admitted the inline-count form would route every genuine document frame to the
+    // transcript.
+    expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000a");
+    expect(r.router.route(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
+  });
+});
