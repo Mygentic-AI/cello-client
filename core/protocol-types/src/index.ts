@@ -228,3 +228,14 @@ export {
 
 // MONIKER-0 — the single home of the agent-name / moniker charset rule (wire contract).
 export { MONIKER_RE, validateMoniker } from "./moniker.js";
+export {
+  DOCUMENT_UPDATE_DOMAIN,
+  DOCUMENT_UPDATE_ENCODING_V1,
+  DOCUMENT_EPOCH_V1,
+  buildDocumentUpdateTbs,
+  encodeDocumentUpdateEnvelope,
+  decodeDocumentUpdateEnvelope,
+  documentEnvelopeHash,
+  verifyDocumentChainLink,
+} from "./document-envelope.js";
+export type { DocumentUpdateEnvelope } from "./document-envelope.js";
