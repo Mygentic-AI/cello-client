@@ -195,6 +195,7 @@ describe("document update TBS — the three bindings are INSIDE the signature", 
   });
 
   it("the chain link, the epoch, the sender and the update bytes are all covered too", () => {
+    expect(tbsOf({ epoch_id: 1 })).not.toBe(tbsOf());
     expect(tbsOf({ doc_prev_hash: "dd".repeat(32) })).not.toBe(tbsOf());
     expect(tbsOf({ doc_prev_hash: null })).not.toBe(tbsOf());
     expect(tbsOf({ sender_agent_id: "agent-b" })).not.toBe(tbsOf());
@@ -225,12 +226,14 @@ describe("document update TBS — the three bindings are INSIDE the signature", 
     expect(buildDocumentUpdateTbs(b)).toEqual(buildDocumentUpdateTbs(a));
   });
 
-  it("distinct envelopes cannot collide by shifting bytes between adjacent fields", () => {
-    // The classic concatenation forgery: if fields were joined without length framing, moving a
-    // byte from the end of one to the start of the next yields the same preimage. CBOR arrays are
-    // self-delimiting, so this must hold.
-    const one = tbsOf({ sender_agent_id: "ab", document_id: DOC });
-    const two = tbsOf({ sender_agent_id: "a", document_id: DOC });
+  it("distinct envelopes cannot collide by shifting a byte across an ADJACENT field boundary", () => {
+    // The classic concatenation forgery: joined without length framing, moving a byte from the end
+    // of one field to the start of the next yields an identical preimage. state_vector and update
+    // are adjacent and both raw bytes, which is the only pair where this is even expressible — an
+    // earlier version compared two values of ONE non-adjacent field and a naive concatenation
+    // would have passed it unchanged.
+    const one = tbsOf({ state_vector: new Uint8Array([1, 2, 3]), update: new Uint8Array([4]) });
+    const two = tbsOf({ state_vector: new Uint8Array([1, 2]), update: new Uint8Array([3, 4]) });
     expect(one).not.toBe(two);
   });
 });
@@ -254,6 +257,39 @@ describe("documentEnvelopeHash", () => {
       .update(buildDocumentUpdateTbs(a, { preHash: false }))
       .digest("hex");
     expect(documentEnvelopeHash(a)).toBe(expected);
+  });
+});
+
+describe("document update TBS — the FROZEN vector", () => {
+  /**
+   * The conformance artifact. Every other TBS test asserts only "these two differ", which leaves
+   * the field ORDER completely unpinned: swap two slots or insert one mid-array and the whole
+   * suite stays green while every signature this module will ever produce changes. §14 names
+   * canonicalization drift as the worst failure mode for trust in the mechanism, because it
+   * surfaces as a false divergence alarm at quiescence rather than as an error.
+   *
+   * This one assertion pins the order, the arity, the domain string and the encoding at once, and
+   * it is what a second implementation conforms against. If it fails, the wire changed — decide
+   * that deliberately and reissue the vector; never edit it to match new output.
+   */
+  const FROZEN: DocumentUpdateEnvelope = {
+    type: "document_update",
+    document_id: "00".repeat(31) + "01",
+    epoch_id: 0,
+    doc_prev_hash: "00".repeat(31) + "02",
+    sender_agent_id: "vector-agent",
+    sender_client_id: 4_294_967_290,
+    update_encoding: "yjs-v1",
+    state_vector: new Uint8Array([0, 1, 2, 3]),
+    update: new Uint8Array([4, 5, 6, 7]),
+    signature: new Uint8Array(64).fill(0xab),
+  };
+
+  it("the preimage and the hash are byte-for-byte what they were the day they were frozen", () => {
+    expect(Buffer.from(buildDocumentUpdateTbs(FROZEN, { preHash: false })).toString("hex")).toBe(
+      "89781843454c4c4f2d444f43554d454e542d5550444154452d7631784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303031007840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d6167656e741afffffffa66796a732d763144000102034404050607",
+    );
+    expect(documentEnvelopeHash(FROZEN)).toBe("07911cf71294a91003cf94fee2b1fc165cf10fe167fc3885ca92b4fcb691002f");
   });
 });
 
@@ -284,10 +320,25 @@ describe("verifyDocumentChainLink — the receive-time check names the gap", () 
     }
     // "Naming the gap" is the AC: an operator must be able to see WHICH link was expected and
     // which arrived, or the error is just a label on the exit point.
-    expect(caught).toMatch(/document_chain_gap/);
+    expect(caught).toMatch(/document_chain_broken/);
     expect(caught).toContain(wrong);
     expect(caught).toContain(PREV);
     expect(caught).toContain("agent-a");
+  });
+
+  it("a REDELIVERED envelope is benign, not a chain gap", () => {
+    const env = envelope({ doc_prev_hash: PREV });
+    // Delivery derives pending from the log and retries across restarts, so a peer re-sending an
+    // envelope whose ack was lost is designed behaviour. Compared naively its doc_prev_hash is the
+    // PREDECESSOR while the head is its own hash, so it reported a chain gap — an operator sent to
+    // hunt a missing envelope or a hostile fork when the fact is "we already have this one".
+    expect(verifyDocumentChainLink(env, documentEnvelopeHash(env))).toEqual({ duplicate: true });
+  });
+
+  it("reports a first delivery as NOT a duplicate", () => {
+    expect(verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), PREV)).toEqual({
+      duplicate: false,
+    });
   });
 
   it("refuses a non-genesis envelope when the sender has no chain yet", () => {
@@ -299,7 +350,7 @@ describe("verifyDocumentChainLink — the receive-time check names the gap", () 
     }
     // The sender's first envelope is missing — accepting this would replay a suffix of a chain
     // whose head we never saw.
-    expect(caught).toMatch(/document_chain_gap/);
+    expect(caught).toMatch(/document_chain_broken/);
     expect(caught).toContain(PREV);
   });
 });

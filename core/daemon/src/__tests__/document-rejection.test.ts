@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import { DocumentEngine } from "../document-engine.js";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
-import { DocumentRejections, REJECTION_RETRY_LIMIT } from "../document-rejection.js";
+import { DocumentRejections, MAX_REJECTED_ROUNDS } from "../document-rejection.js";
 
 const AGENT = "aa".repeat(32);
 const PEER = "bb".repeat(32);
@@ -55,7 +55,34 @@ function crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: stri
     signature: new Uint8Array(64).fill(7),
     stateVector: new Uint8Array([1, 0]),
     nonce: `n${nonceCounter}`,
+    // The refused envelope's own chain link. Required, so the bridge can never fabricate a
+    // genesis for a refused envelope it does not actually know the predecessor of.
+    rejectedDocPrevHash: null as string | null,
   };
+}
+
+/** A real Yjs base update, so a rebuild has something to materialize. clientID pinned per the rule. */
+function baseUpdate(): Uint8Array {
+  const d = new Y.Doc();
+  d.clientID = 1000;
+  d.getText("content").insert(0, "agreed base. ");
+  return Y.encodeStateAsUpdate(d);
+}
+
+/** The bytes the gate refuses — never written to the log, only quarantined. */
+function refusedUpdate(): Uint8Array {
+  const d = new Y.Doc();
+  d.clientID = 1001;
+  d.getText("content").insert(0, "REFUSED CONTENT. ");
+  return Y.encodeStateAsUpdate(d);
+}
+
+/** A clean supersession, causally independent of the refused bytes for fixture purposes. */
+function cleanSupersession(): Uint8Array {
+  const d = new Y.Doc();
+  d.clientID = 1002;
+  d.getText("content").insert(0, "clean text. ");
+  return Y.encodeStateAsUpdate(d);
 }
 
 let seq = 0;
@@ -76,31 +103,42 @@ function envelope(payload: Uint8Array | null, prev: string | null): DocumentEnve
 }
 
 describe("DocumentRejections — a rejection is a record, not a discard", () => {
-  it("persists the quarantined bytes as a 0x05-kind row REFERENCING the rejected envelope", () => {
-    const { store, rejections } = newFixture();
-    const rejected = envelope(new Uint8Array([1, 2, 3]), null);
-    store.appendEnvelope(AGENT, rejected);
+  it("writes a 0x05 row REFERENCING the refused envelope, and never the refused payload", () => {
+    const { store, engine, rejections } = newFixture();
+    const base = envelope(baseUpdate(), null);
+    store.appendEnvelope(AGENT, base);
+    const refusedHash = "ab".repeat(32);
 
     rejections.reject(AGENT, DOC, {
-      rejectedEnvelopeHash: rejected.envelopeHash,
-      quarantined: new Uint8Array([1, 2, 3]),
+      rejectedEnvelopeHash: refusedHash,
+      quarantined: refusedUpdate(),
       reason: "document_append_only_violation",
       detail: "removes existing content",
       senderAgentId: PEER,
       ...crypto(),
+      // The refused envelope chains onto the base, as the peer authored it. The bridge needs this:
+      // the log will never hold the refused envelope, so this is the only record of where it sat.
+      rejectedDocPrevHash: base.envelopeHash,
     });
 
     const log = store.getEnvelopeLog(AGENT, DOC);
     const record = log.find((e) => e.kind === "rejection");
     expect(record).toBeDefined();
-    // §9: the 0x05 leaf references the rejected update's envelope hash — that reference is what
-    // makes the record self-describing for replay ("an update leaf is effective iff no rejection
-    // leaf references it").
-    expect(record!.referencesEnvelopeHash).toBe(rejected.envelopeHash);
-    // And the ORIGINAL is untouched: a rejection is a new row, never an edit.
-    expect(log.find((e) => e.envelopeHash === rejected.envelopeHash)!.payload).toEqual(
-      new Uint8Array([1, 2, 3]),
-    );
+    expect(record!.referencesEnvelopeHash).toBe(refusedHash);
+
+    // THE REFUSAL HAS TO SURVIVE A REBUILD, which is the assertion the previous version of this
+    // test stopped one line short of. §9 phrases effectiveness as a replay-time set property
+    // ("effective iff no rejection leaf references it"), but implemented literally that is unsound
+    // — a supersession is causally stacked on the refused operations, so skipping them at replay
+    // leaves everything later permanently pending and the document silently loses the legitimate
+    // work. What makes the refusal real is that the payload is NEVER WRITTEN: there is nothing to
+    // subtract because nothing was added.
+    expect(log.some((e) => e.envelopeHash === refusedHash)).toBe(false);
+    const rebuilt = store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows));
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, rebuilt.binary);
+    expect(doc.getText("content").toString()).toBe("agreed base. ");
+    expect(doc.getText("content").toString()).not.toContain("REFUSED");
   });
 
   it("HOLDS the quarantined bytes — never admitted, never discarded", () => {
@@ -232,7 +270,6 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
     expect(reject().stalled).toBe(false); // the original rejection
     expect(reject().stalled).toBe(false); // the superseding update rejected — one more round
     expect(reject().stalled).toBe(true); // and that is the limit
-    expect(REJECTION_RETRY_LIMIT).toBe(1);
 
     expect(store.getDocument(AGENT, DOC)!.status).toBe("stalled");
   });
@@ -305,7 +342,7 @@ describe("DocumentRejections — mutual concurrent rejections are independent", 
 });
 
 describe("DocumentRejections — erasure by a BOUND peer (the question GATE-1 handed over)", () => {
-  it("a bound peer's deletion is REJECTABLE, because the gate cannot see it", () => {
+  it("records the DECISION that erasure is rejectable — detection is owed to the gate", () => {
     const { rejections } = newFixture();
     // GATE-1's rule (h) binds insertions only: a Yjs delete set carries no clientID and advances
     // no clock, so a bound peer deleting the owner's content passes the gate silently. That is
@@ -383,14 +420,22 @@ describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
 describe("DocumentRejections — rejections do not fork the chain", () => {
   it("three rejections leave the chain VERIFIABLE and the document rebuildable", () => {
     const { store, engine, rejections } = newFixture();
+    // Three SUCCESSIVE envelopes from the peer, each refused. This is the protocol's own shape:
+    // the original, its supersession, and that supersession's — a chain, not three roots. An
+    // earlier version of this test rejected the same hash three times, which collapsed to one row
+    // and hid the fork it was written to catch.
+    let prev: string | null = null;
     for (let i = 0; i < 3; i++) {
+      const hash = `${i}`.padStart(64, "b");
       rejections.reject(AGENT, DOC, {
-        rejectedEnvelopeHash: `${i}`.padStart(64, "b"),
+        rejectedEnvelopeHash: hash,
         quarantined: new Uint8Array([i]),
         reason: "document_append_only_violation",
         senderAgentId: PEER,
         ...crypto(),
+        rejectedDocPrevHash: prev,
       });
+      prev = hash;
     }
 
     // Writing docPrevHash: null made every rejection a second GENESIS row, so two rejections
@@ -439,6 +484,7 @@ describe("DocumentRejections — a duplicate rejection does not advance the roun
       signature: new Uint8Array(64).fill(7),
       stateVector: new Uint8Array([1, 0]),
       nonce: "same",
+      rejectedDocPrevHash: null,
     };
     expect(rejections.reject(AGENT, DOC, input).round).toBe(1);
     // A duplicate must not advance the counter, or a document reaches `stalled` with fewer
@@ -452,6 +498,7 @@ describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)",
   it("the sender's side records a rejection ARRIVING, with the reason intact", () => {
     const { rejections, events } = newFixture();
     rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: "f1".repeat(32),
       rejectedEnvelopeHash: "ab".repeat(32),
       reason: "document_append_only_violation",
       detail: "the update deletes 12 existing range(s)",
@@ -477,6 +524,7 @@ describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)",
       ...crypto(),
     });
     rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: "f2".repeat(32),
       rejectedEnvelopeHash: "22".repeat(32),
       reason: "document_update_malformed",
       fromAgentId: PEER,
@@ -484,5 +532,209 @@ describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)",
 
     expect(events.filter((e) => e.event === "document.rejection.sent")).toHaveLength(1);
     expect(events.filter((e) => e.event === "document.rejection.received")).toHaveLength(1);
+  });
+});
+
+
+describe("DocumentRejections — the chain BRIDGES a refused envelope (§3.2 + §16.7-5)", () => {
+  it("the peer's supersession still links, even though the refused envelope is not in the log", () => {
+    const { store, engine, rejections } = newFixture();
+    const base = envelope(baseUpdate(), null);
+    store.appendEnvelope(AGENT, base);
+    const refusedHash = "ab".repeat(32);
+
+    rejections.reject(AGENT, DOC, {
+      rejectedEnvelopeHash: refusedHash,
+      quarantined: refusedUpdate(),
+      reason: "document_append_only_violation",
+      senderAgentId: PEER,
+      ...crypto(),
+      rejectedDocPrevHash: base.envelopeHash,
+    });
+
+    // The peer does not know its envelope was refused when it authors the supersession, so the
+    // supersession chains onto the REFUSED envelope — a hash our log deliberately never holds.
+    // Without the bridge this reads as document_chain_broken and the document refuses to rebuild,
+    // sending an operator to debug the chain layer for a rejection-protocol event.
+    const supersession = envelope(cleanSupersession(), refusedHash);
+    store.appendEnvelope(AGENT, supersession);
+
+    expect(store.verifyChainLinkage(AGENT, DOC)).toEqual({ ok: true });
+    const rebuilt = store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows));
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, rebuilt.binary);
+    expect(doc.getText("content").toString()).toContain("clean text");
+    expect(doc.getText("content").toString()).not.toContain("REFUSED");
+  });
+
+  it("a link to something that is NEITHER logged nor refused still refuses, and says which", () => {
+    const { store } = newFixture();
+    store.appendEnvelope(AGENT, envelope(baseUpdate(), null));
+    store.appendEnvelope(AGENT, envelope(new Uint8Array([0]), "de".repeat(32)));
+
+    const verdict = store.verifyChainLinkage(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    // The operator has to be able to tell a rejection from a genuine gap. Saying only "absent from
+    // the log" describes both, and one of them is not a chain problem at all.
+    expect((verdict as { detail: string }).detail).toContain("not among this document's refused");
+  });
+});
+
+describe("DocumentRejections — a refused envelope re-refused keeps EVERY round's facts", () => {
+  it("three rounds on one envelope hold three sets of bytes, reasons, rules and limits", () => {
+    const { rejections } = newFixture();
+    const refusedHash = "ab".repeat(32);
+    for (const [i, reason] of ["reason_ONE", "reason_TWO", "reason_THREE"].entries()) {
+      rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: refusedHash,
+        quarantined: new Uint8Array([i]),
+        reason,
+        rule: `rule_${i}`,
+        limit: { name: "bytes", limit: 100, actual: 100 + i },
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+    }
+
+    // Keyed on the REFUSED envelope, ON CONFLICT DO NOTHING dropped rounds two and three with no
+    // log line — and the stall message then said "the most recent reason was" and printed the
+    // OLDEST. "Held, never discarded" (§3.2) has to hold for every round, not just the first.
+    const held = rejections.quarantined(AGENT, DOC);
+    expect(held.map((h) => h.reason)).toEqual(["reason_ONE", "reason_TWO", "reason_THREE"]);
+    expect(held.map((h) => h.rule)).toEqual(["rule_0", "rule_1", "rule_2"]);
+    expect(held.map((h) => h.limitActual)).toEqual([100, 101, 102]);
+    expect(held.map((h) => Array.from(h.quarantined))).toEqual([[0], [1], [2]]);
+  });
+
+  it("the stall detail names the LATEST reason, not the first", () => {
+    const { rejections } = newFixture();
+    for (const reason of ["reason_ONE", "reason_TWO", "reason_THREE"]) {
+      rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: "ab".repeat(32),
+        quarantined: new Uint8Array([1]),
+        reason,
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+    }
+    const verdict = rejections.acceptsUpdates(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { detail: string }).detail).toContain("reason_THREE");
+    expect((verdict as { detail: string }).detail).not.toContain("reason_ONE");
+  });
+});
+
+describe("DocumentRejections — TWO PEERS, one document, two independent counters", () => {
+  it("each side reaches its own stall, and neither advances the other's round", () => {
+    // Two stores, because two peers are two daemons. The previous version of this test used two
+    // DOCUMENTS owned by one agent, which any implementation passes — it asserted that a composite
+    // primary key distinguishes two different keys.
+    const a = newFixture();
+    const b = newFixture();
+
+    for (let i = 0; i < 2; i++) {
+      a.rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: `${i}`.padStart(64, "b"),
+        quarantined: new Uint8Array([i]),
+        reason: "a_refuses_b",
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+      b.rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: `${i}`.padStart(64, "c"),
+        quarantined: new Uint8Array([i]),
+        reason: "b_refuses_a",
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+    }
+
+    // Two rounds each, not four. Counting rejection rows across senders conflated the directions,
+    // so the moment both peers refused something the document stalled at half the intended rounds.
+    expect(a.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true);
+    expect(b.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true);
+
+    const third = (f: typeof a, reason: string, fill: string): boolean =>
+      f.rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: "9".padStart(64, fill),
+        quarantined: new Uint8Array([9]),
+        reason,
+        senderAgentId: PEER,
+        ...crypto(),
+      }).stalled;
+
+    expect(third(a, "a_refuses_b", "b")).toBe(true);
+    expect(b.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true); // A stalling did not stall B
+  });
+});
+
+describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2 both sides)", () => {
+  const incoming = (n: number) => ({
+    rejectionEnvelopeHash: `${n}`.padStart(64, "f"),
+    rejectedEnvelopeHash: `${n}`.padStart(64, "e"),
+    reason: "document_append_only_violation",
+    fromAgentId: PEER,
+  });
+
+  it("counts the rejections RECEIVED, not the ones this agent authored", () => {
+    const { rejections } = newFixture();
+    // On a pure publisher the authored count is zero forever, so the round read 0 for the first,
+    // second and third rejection alike — the one number an operator uses to see how close the
+    // document is to stalling.
+    expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(1)).round).toBe(1);
+    expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(2)).round).toBe(2);
+  });
+
+  it("stalls the PUBLISHER on the same threshold the receiver stops accepting on", () => {
+    const { rejections } = newFixture();
+    rejections.recordIncomingRejection(AGENT, DOC, incoming(1));
+    rejections.recordIncomingRejection(AGENT, DOC, incoming(2));
+    const third = rejections.recordIncomingRejection(AGENT, DOC, incoming(3));
+
+    // Without this the receiver freezes and the sender keeps superseding into a document that will
+    // never take it — the hot loop the retry bound exists to stop, on the only side that loops.
+    expect(third.stalled).toBe(true);
+    expect(rejections.acceptsUpdates(AGENT, DOC).ok).toBe(false);
+    expect(MAX_REJECTED_ROUNDS).toBe(3);
+  });
+
+  it("SURVIVES a restart — the publisher's operator still knows why and how many", () => {
+    const f = newFixture();
+    f.rejections.recordIncomingRejection(AGENT, DOC, incoming(1));
+    f.rejections.recordIncomingRejection(AGENT, DOC, incoming(2));
+
+    const restarted = new DocumentRejections(f.store, f.logger);
+    expect(restarted.recordIncomingRejection(AGENT, DOC, incoming(3)).round).toBe(3);
+  });
+
+  it("a REDELIVERED rejection does not advance the round", () => {
+    const { rejections, events } = newFixture();
+    expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(1)).round).toBe(1);
+    expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(1)).round).toBe(1);
+    expect(events.filter((e) => e.event === "document.rejection.received")).toHaveLength(1);
+  });
+});
+
+describe("DocumentRejections — clearQuarantine only announces a real admission", () => {
+  it("stays silent for a hash that was never quarantined", () => {
+    const { rejections, events } = newFixture();
+    rejections.clearQuarantine(AGENT, DOC, "ff".repeat(32));
+    // An event that fires on a no-op is a signal on the wrong case: an operator watching for
+    // supersessions would see one that never happened.
+    expect(events.filter((e) => e.event === "document.supersession.admitted")).toHaveLength(0);
+  });
+
+  it("announces once when the entry existed", () => {
+    const { rejections, events } = newFixture();
+    rejections.reject(AGENT, DOC, {
+      rejectedEnvelopeHash: "ab".repeat(32),
+      quarantined: new Uint8Array([1]),
+      reason: "document_update_malformed",
+      senderAgentId: PEER,
+      ...crypto(),
+    });
+    rejections.clearQuarantine(AGENT, DOC, "ab".repeat(32));
+    rejections.clearQuarantine(AGENT, DOC, "ab".repeat(32));
+    expect(events.filter((e) => e.event === "document.supersession.admitted")).toHaveLength(1);
   });
 });

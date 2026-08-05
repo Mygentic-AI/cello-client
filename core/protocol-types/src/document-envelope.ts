@@ -252,6 +252,12 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
 /**
  * The receive-time chain check: does this envelope link to what we already hold from this sender?
  *
+ * The two refusal reasons are deliberately the SAME STRINGS the daemon's whole-log verifier uses
+ * (`DocumentStore.verifyChainLinkage`): `document_chain_forked` and `document_chain_broken`. Two
+ * vocabularies for one fact means a policy-log query or an operator keyed on one silently misses
+ * the other. The division of labour is real — this checks a single link on arrival, that one walks
+ * the whole log for reachability — but they are the same two failures.
+ *
  * `lastKnownHash` is the `documentEnvelopeHash` of the sender's most recent envelope for this
  * document, or `null` if we hold none. Replay is set-based per §16.7-5 — there is one chain PER
  * SENDER and no total order across senders — so this is the only ordering constraint there is, and
@@ -260,25 +266,34 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
 export function verifyDocumentChainLink(
   env: DocumentUpdateEnvelope,
   lastKnownHash: string | null,
-): void {
+): { duplicate: boolean } {
+  // A REDELIVERY IS NOT A FORK. Delivery derives what is pending from the log and retries across
+  // restarts, so a peer re-sending an envelope whose ack was lost is designed, expected behaviour.
+  // Its `doc_prev_hash` is the PREDECESSOR, while the head is now this envelope's own hash, so a
+  // naive comparison reports a chain gap — sending an operator to hunt a missing envelope or a
+  // hostile fork when the fact is "we already have this one". §16.7-5's replay is SET-based, and
+  // the store's append is already `ON CONFLICT DO NOTHING`; this agrees with both.
+  if (documentEnvelopeHash(env) === lastKnownHash) return { duplicate: true };
+
   if (env.doc_prev_hash === null) {
     if (lastKnownHash !== null) {
       // Two roots for one sender. DOD-DOC-REJECT-1 measured what this costs: the chain no longer
       // verifies, so the document rebuilds until the next daemon restart and is permanently
       // unopenable after it. The log is append-only; there is no repair.
       throw new Error(
-        `document_chain_fork: ${env.sender_agent_id} sent a genesis envelope for document ` +
+        `document_chain_forked: ${env.sender_agent_id} sent a genesis envelope for document ` +
           `${env.document_id}, but we already hold their chain at ${lastKnownHash}`,
       );
     }
-    return;
+    return { duplicate: false };
   }
 
   if (env.doc_prev_hash !== lastKnownHash) {
     throw new Error(
-      `document_chain_gap: ${env.sender_agent_id} chained to ${env.doc_prev_hash} for document ` +
+      `document_chain_broken: ${env.sender_agent_id} chained to ${env.doc_prev_hash} for document ` +
         `${env.document_id}, but their last envelope we hold is ${lastKnownHash ?? "none (no " +
           "envelope from this sender yet)"}`,
     );
   }
+  return { duplicate: false };
 }

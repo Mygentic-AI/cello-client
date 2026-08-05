@@ -89,7 +89,12 @@ export interface DocumentEnvelopeRow {
 
 export interface QuarantineRow {
   documentId: string;
+  /** The 0x05 leaf this row belongs to — the PK. One leaf, one row; see the table comment. */
+  rejectionEnvelopeHash: string;
   rejectedEnvelopeHash: string;
+  /** The refused envelope's own author and chain link, so the chain verifier can bridge it. */
+  rejectedSenderAgentId: string;
+  rejectedDocPrevHash: string | null;
   payload: Uint8Array;
   reason: string;
   detail?: string;
@@ -207,6 +212,17 @@ const CREATE_QUARANTINE_SQL = `
     owner_agent_id        TEXT    NOT NULL,
     document_id           TEXT    NOT NULL,
     rejected_envelope_hash TEXT   NOT NULL,
+    -- The 0x05 leaf THIS row belongs to. It is the PK because one refused envelope can be refused
+    -- MORE THAN ONCE, for different reasons, across retry rounds — the rejection protocol's normal
+    -- path. Keyed on the REFUSED envelope instead, the second round's bytes, reason, rule and limit
+    -- were dropped by ON CONFLICT DO NOTHING with no log line, and the stall message then told the
+    -- operator "the most recent reason was" and printed the OLDEST. One 0x05 leaf, one row.
+    rejection_envelope_hash TEXT  NOT NULL,
+    -- The refused envelope's OWN chain link and author, so verifyChainLinkage can bridge across
+    -- it. The refused payload is deliberately never written to the log (see the header), which
+    -- would otherwise leave the peer's supersession chaining onto a hash that is nowhere.
+    rejected_sender_agent_id TEXT NOT NULL,
+    rejected_doc_prev_hash TEXT,
     payload               BLOB    NOT NULL,
     reason                TEXT    NOT NULL,
     detail                TEXT,
@@ -215,7 +231,32 @@ const CREATE_QUARANTINE_SQL = `
     limit_value           INTEGER,
     limit_actual          INTEGER,
     created_at            INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id, rejected_envelope_hash),
+    PRIMARY KEY (owner_agent_id, document_id, rejection_envelope_hash),
+    FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
+  );
+`;
+
+/**
+ * Rejections we RECEIVED (§3.2 "both sides"). A separate table from `document_quarantine` because
+ * the two hold different facts: quarantine holds bytes WE refused, this holds the peer's refusal of
+ * bytes we authored — we hold no payload of theirs to quarantine.
+ *
+ * It is durable rather than a log line because everything an operator needs on the publishing side
+ * depends on it surviving a restart: why their work was refused, and how many rounds remain before
+ * the document stalls. Without a row, the sending side counted its OWN rejections — which on a pure
+ * publisher is zero forever — so the retry bound existed only on the side that never loops.
+ */
+const CREATE_REJECTIONS_RECEIVED_SQL = `
+  CREATE TABLE IF NOT EXISTS document_rejections_received (
+    owner_agent_id         TEXT    NOT NULL,
+    document_id            TEXT    NOT NULL,
+    rejection_envelope_hash TEXT   NOT NULL,
+    rejected_envelope_hash TEXT    NOT NULL,
+    from_agent_id          TEXT    NOT NULL,
+    reason                 TEXT    NOT NULL,
+    detail                 TEXT,
+    created_at             INTEGER NOT NULL,
+    PRIMARY KEY (owner_agent_id, document_id, rejection_envelope_hash),
     FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
   );
 `;
@@ -242,6 +283,7 @@ export class DocumentStore {
     this.#db.exec(CREATE_DOCUMENTS_SQL);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
+    this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
@@ -402,7 +444,39 @@ export class DocumentStore {
    */
   verifyChainLinkage(ownerAgentId: string, documentId: string): ChainVerdict {
     const log = this.getEnvelopeLog(ownerAgentId, documentId);
+
+    // BRIDGE THE REFUSED ENVELOPES. A refused update's payload is never written to the log — that
+    // is what makes the refusal real across a restart — but the peer does not know it was refused
+    // when it authors the next envelope, so its supersession chains onto a hash the log does not
+    // contain. Without the bridge that reads as `document_chain_broken`, the document refuses to
+    // rebuild, and the operator is sent to debug the chain layer for a rejection-protocol event.
+    //
+    // These stubs exist ONLY for verification. They carry no payload and are never returned by
+    // `getEnvelopeLog`, so replay cannot see them and the refused content cannot come back.
+    const stubs: DocumentEnvelopeRow[] = this.listQuarantined(ownerAgentId, documentId).map((q) => ({
+      envelopeHash: q.rejectedEnvelopeHash,
+      documentId: q.documentId,
+      senderAgentId: q.rejectedSenderAgentId,
+      docPrevHash: q.rejectedDocPrevHash,
+      epochId: 0,
+      signature: new Uint8Array(0),
+      stateVector: new Uint8Array(0),
+      payload: null,
+      kind: "rejection",
+      referencesEnvelopeHash: null,
+      createdAtMs: q.createdAtMs,
+    }));
+    // One refused envelope can carry several quarantine rows (one per retry round), and the chain
+    // has exactly one node for it.
+    const seenStub = new Set<string>();
     const bySender = new Map<string, DocumentEnvelopeRow[]>();
+    for (const stub of stubs) {
+      if (seenStub.has(stub.envelopeHash)) continue;
+      seenStub.add(stub.envelopeHash);
+      const list = bySender.get(stub.senderAgentId);
+      if (list) list.push(stub);
+      else bySender.set(stub.senderAgentId, [stub]);
+    }
     for (const e of log) {
       const list = bySender.get(e.senderAgentId);
       if (list) list.push(e);
@@ -430,7 +504,9 @@ export class DocumentStore {
             reason: "document_chain_broken",
             detail:
               `sender ${sender.slice(0, 16)}… envelope ${e.envelopeHash.slice(0, 16)}… links to ` +
-              `${e.docPrevHash.slice(0, 16)}…, which is absent from the log`,
+              `${e.docPrevHash.slice(0, 16)}…, which is absent from the log and is not among this ` +
+              `document's refused envelopes either — so this is a gap in the chain itself, not a ` +
+              `rejection`,
           };
         }
       }
@@ -482,20 +558,31 @@ export class DocumentStore {
 
   // ─── quarantine (held, never discarded) ───────────────────────────────────
 
-  /** Hold a refused update's bytes. Idempotent per rejected envelope. */
-  holdQuarantined(ownerAgentId: string, row: QuarantineRow): void {
-    this.#db
+  /**
+   * Hold a refused update's bytes. Idempotent per REJECTION (per 0x05 leaf), not per refused
+   * envelope — one envelope may be refused across several retry rounds and each round's reason,
+   * rule and limit are distinct facts an operator needs.
+   *
+   * Returns whether a row was written, so a caller never has to infer it. The previous signature
+   * returned void and the conflict clause silently dropped every round after the first.
+   */
+  holdQuarantined(ownerAgentId: string, row: QuarantineRow): boolean {
+    const info = this.#db
       .prepare(
         `INSERT INTO document_quarantine
-           (owner_agent_id, document_id, rejected_envelope_hash, payload, reason, detail,
+           (owner_agent_id, document_id, rejection_envelope_hash, rejected_envelope_hash,
+            rejected_sender_agent_id, rejected_doc_prev_hash, payload, reason, detail,
             rule, limit_name, limit_value, limit_actual, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (owner_agent_id, document_id, rejected_envelope_hash) DO NOTHING`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id, rejection_envelope_hash) DO NOTHING`,
       )
       .run(
         ownerAgentId,
         row.documentId,
+        row.rejectionEnvelopeHash,
         row.rejectedEnvelopeHash,
+        row.rejectedSenderAgentId,
+        row.rejectedDocPrevHash,
         Buffer.from(row.payload),
         row.reason,
         row.detail ?? null,
@@ -505,18 +592,26 @@ export class DocumentStore {
         row.limitActual ?? null,
         row.createdAtMs,
       );
+    return Number(info.changes) > 0;
   }
 
   listQuarantined(ownerAgentId: string, documentId: string): QuarantineRow[] {
     const rows = this.#db
       .prepare(
+        // rowid breaks the tie. Several rounds can land inside one millisecond, and `created_at`
+        // alone then leaves the order to SQLite — which is what an operator is shown as "the most
+        // recent reason". Insertion order is the real answer and rowid is it.
         `SELECT * FROM document_quarantine
-          WHERE owner_agent_id = ? AND document_id = ? ORDER BY created_at ASC`,
+          WHERE owner_agent_id = ? AND document_id = ?
+          ORDER BY created_at ASC, rowid ASC`,
       )
       .all(ownerAgentId, documentId) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       documentId: r["document_id"] as string,
+      rejectionEnvelopeHash: r["rejection_envelope_hash"] as string,
       rejectedEnvelopeHash: r["rejected_envelope_hash"] as string,
+      rejectedSenderAgentId: r["rejected_sender_agent_id"] as string,
+      rejectedDocPrevHash: (r["rejected_doc_prev_hash"] as string | null) ?? null,
       payload: toU8(r["payload"]),
       reason: r["reason"] as string,
       detail: (r["detail"] as string | null) ?? undefined,
@@ -528,7 +623,11 @@ export class DocumentStore {
     }));
   }
 
-  /** Release one entry once its superseding update has been admitted. Returns whether it existed. */
+  /**
+   * Release every entry for a refused envelope once its superseding update has been admitted.
+   * Returns whether anything was released. Keyed by the REFUSED envelope rather than the rejection
+   * leaf, because admitting the supersession resolves all of that envelope's rounds at once.
+   */
   releaseQuarantined(ownerAgentId: string, documentId: string, rejectedEnvelopeHash: string): boolean {
     const info = this.#db
       .prepare(
@@ -551,14 +650,85 @@ export class DocumentStore {
     return r?.envelope_hash ?? null;
   }
 
-  /** How many rejection records this document carries — the retry round, derived not remembered. */
-  countRejections(ownerAgentId: string, documentId: string): number {
+  /** Record a rejection the PEER sent us. Returns whether a row was written (idempotent by leaf). */
+  recordRejectionReceived(
+    ownerAgentId: string,
+    row: {
+      documentId: string;
+      rejectionEnvelopeHash: string;
+      rejectedEnvelopeHash: string;
+      fromAgentId: string;
+      reason: string;
+      detail?: string;
+      createdAtMs: number;
+    },
+  ): boolean {
+    const info = this.#db
+      .prepare(
+        `INSERT INTO document_rejections_received
+           (owner_agent_id, document_id, rejection_envelope_hash, rejected_envelope_hash,
+            from_agent_id, reason, detail, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id, rejection_envelope_hash) DO NOTHING`,
+      )
+      .run(
+        ownerAgentId,
+        row.documentId,
+        row.rejectionEnvelopeHash,
+        row.rejectedEnvelopeHash,
+        row.fromAgentId,
+        row.reason,
+        row.detail ?? null,
+        row.createdAtMs,
+      );
+    return Number(info.changes) > 0;
+  }
+
+  /** How many rejections this document has RECEIVED — the publishing side's retry round. */
+  countRejectionsReceived(ownerAgentId: string, documentId: string): number {
+    const r = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ?`,
+      )
+      .get(ownerAgentId, documentId) as { n?: number } | undefined;
+    return r?.n ?? 0;
+  }
+
+  /** The most recently received rejection, for the reason an operator is shown on a stall. */
+  latestRejectionReceived(
+    ownerAgentId: string,
+    documentId: string,
+  ): { reason: string; detail?: string; fromAgentId: string } | null {
+    const r = this.#db
+      .prepare(
+        `SELECT reason, detail, from_agent_id FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      reason: r["reason"] as string,
+      detail: (r["detail"] as string | null) ?? undefined,
+      fromAgentId: r["from_agent_id"] as string,
+    };
+  }
+
+  /**
+   * How many rejection records this document carries, PER REJECTING AGENT — the retry round.
+   *
+   * Scoped by author, because a mutual exchange puts both directions' 0x05 leaves in one document
+   * log. Counting across senders conflated them, so two peers each rejecting once read as round 2
+   * and the document stalled at half the intended rounds.
+   */
+  countRejections(ownerAgentId: string, documentId: string, rejectingAgentId: string): number {
     const r = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM document_envelopes
-          WHERE owner_agent_id = ? AND document_id = ? AND kind = 'rejection'`,
+          WHERE owner_agent_id = ? AND document_id = ? AND kind = 'rejection'
+            AND sender_agent_id = ?`,
       )
-      .get(ownerAgentId, documentId) as { n?: number } | undefined;
+      .get(ownerAgentId, documentId, rejectingAgentId) as { n?: number } | undefined;
     return r?.n ?? 0;
   }
 

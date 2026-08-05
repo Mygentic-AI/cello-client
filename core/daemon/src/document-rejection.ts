@@ -35,18 +35,31 @@ import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
 /**
- * One more round after the first rejection, then the document stalls (§16.7-2).
+ * The document stalls on the THIRD rejected round: the original refusal, one superseding attempt,
+ * and no more (§16.7-2 "one retry, then freeze").
  *
- * Bounded because an unbounded retry loop between two daemons that disagree is not convergence,
- * it is a hot loop neither operator can see. Stalling is the visible failure.
+ * Counted in rounds rather than retries because the previous spelling — a `REJECTION_RETRY_LIMIT`
+ * of 1 compared as `round > LIMIT + 1` — permitted two retries under a name that said one, which
+ * is the kind of thing the next edit gets wrong.
+ *
+ * Bounded at all because an unbounded retry loop between two daemons that disagree is not
+ * convergence, it is a hot loop neither operator can see. Stalling is the visible failure.
  */
-export const REJECTION_RETRY_LIMIT = 1;
+export const MAX_REJECTED_ROUNDS = 3;
 
 export interface RejectionInput {
   /** The envelope being rejected — the `0x05` leaf references this hash (§9). */
   rejectedEnvelopeHash: string;
   /** The bytes, held rather than discarded (§3.2). Supplied by the gate's quarantine verdict. */
   quarantined: Uint8Array;
+  /**
+   * The refused envelope's OWN chain link — `null` only when the refused envelope was genuinely
+   * that sender's first. REQUIRED rather than optional: the refused envelope is deliberately never
+   * written to the log, so this is the only thing keeping the peer's next link resolvable, and an
+   * omitted value would default every refused envelope to a genesis stub — manufacturing exactly
+   * the fork the bridge exists to prevent. The caller decoded the envelope; it knows.
+   */
+  rejectedDocPrevHash: string | null;
   reason: string;
   detail?: string;
   senderAgentId: string;
@@ -80,12 +93,25 @@ export interface QuarantineEntry {
   quarantined: Uint8Array;
   reason: string;
   detail?: string;
+  /** Which rule refused, and the number it refused on. Surfaced, not just stored. */
+  rule?: string;
+  limitName?: string;
+  limitValue?: number;
+  limitActual?: number;
 }
 
 /** A handle over the sender's local edits, so a rejection can be rolled back as inverses. */
 export interface TrackedEdits {
   readonly doc: Y.Doc;
   readonly undoManager: Y.UndoManager;
+  /**
+   * Release the tracker. Required, not optional hygiene: the depth guard in `rollback` admits
+   * exactly one stacked edit, so the only workable pattern is a FRESH tracker per publish — which
+   * means one live UndoManager per publish on a long-lived Y.Doc, each holding `afterTransaction`
+   * observers and accumulating undo items that retain deleted structs. Call it once the rejection
+   * is resolved, either way.
+   */
+  dispose(): void;
   /** Stack depth when tracking began, so `rollback` can prove it is undoing the right item. */
   readonly depthAtTracking: number;
 }
@@ -103,9 +129,33 @@ export class DocumentRejections {
    * Record a rejection: a `0x05` row referencing the rejected envelope, the quarantined bytes
    * held, and a policy record carrying the reason.
    *
-   * The envelope log is append-only, so this is a NEW ROW — the rejected envelope is never edited
-   * or removed. §9 makes the record self-describing for replay: an update leaf is effective iff
-   * no rejection leaf references it.
+   * The envelope log is append-only, so this is a NEW ROW — nothing is edited or removed.
+   *
+   * ── HOW A REFUSAL IS ACTUALLY REALIZED, AND WHY NOT THE WAY §9 SAYS ─────────────────────────
+   *
+   * §9 phrases effectiveness as a replay-time set property: "an update leaf is effective iff no
+   * rejection leaf references it". Implemented literally that is unsound, and it was measured
+   * rather than argued. Sender publishes a base, then a refused update, then rolls back and
+   * supersedes. Replaying the log while SKIPPING the refused leaf gives:
+   *
+   *     text "agreed base. "   pendingStructs PRESENT   pendingDs PRESENT
+   *
+   * The supersession is causally stacked on the refused operations — the rollback is a DELETION of
+   * those structs and the new work is positioned after them — so dropping them leaves everything
+   * later permanently pending. The document reads as complete and is silently missing the
+   * legitimate work. §16.7-5 already retired §9's "document-log order" phrasing; this retires its
+   * effectiveness phrasing on the same grounds.
+   *
+   * What is sound: the receiver NEVER WRITES the refused payload to its log. There is nothing to
+   * subtract at replay because it was never added, and the peer's supersession — computed against
+   * the RECEIVER's state vector per §3.2 step 3 — is self-contained. Measured on the same fixture:
+   *
+   *     text "agreed base. clean text. "   pendingStructs null   pendingDs null   converged true
+   *
+   * The refused bytes do travel again inside that supersession, carrying their own inverses, which
+   * is precisely "inverses, not erasure" (§3.2) — the content nets to zero and survives only as
+   * tombstones. The bytes we refused live in `document_quarantine`, and the chain bridges across
+   * the refused envelope so the peer's next link still resolves (see `verifyChainLinkage`).
    */
   reject(agentId: string, documentId: string, input: RejectionInput): RejectionOutcome {
 
@@ -115,8 +165,9 @@ export class DocumentRejections {
     // document survives a restart, the document rebuilt until the next daemon start and was
     // permanently unopenable after it. Measured. A rejection is this agent's own authored act, so
     // it belongs in this agent's own chain.
+    const rejectionEnvelopeHash = rejectionHash(input.rejectedEnvelopeHash, input.reason, input.nonce);
     const appended = this.#store.appendEnvelope(agentId, {
-      envelopeHash: rejectionHash(input.rejectedEnvelopeHash, input.reason, input.nonce),
+      envelopeHash: rejectionEnvelopeHash,
       documentId,
       senderAgentId: agentId, // WE authored the rejection, whoever authored the update
       docPrevHash: this.#store.lastEnvelopeHashBySender(agentId, documentId, agentId),
@@ -142,9 +193,14 @@ export class DocumentRejections {
 
     // PERSISTED, not remembered. The 0x05 leaf references these bytes; holding them in a Map
     // meant the reference outlived the thing it referenced across a restart.
-    this.#store.holdQuarantined(agentId, {
+    const held = this.#store.holdQuarantined(agentId, {
       documentId,
+      rejectionEnvelopeHash,
       rejectedEnvelopeHash: input.rejectedEnvelopeHash,
+      // The refused envelope's own author and chain link, so `verifyChainLinkage` can bridge it —
+      // the peer chains its supersession onto an envelope our log deliberately never holds.
+      rejectedSenderAgentId: input.senderAgentId,
+      rejectedDocPrevHash: input.rejectedDocPrevHash,
       // COPY: the caller's buffer may be a pooled network read, and a 0x05 leaf must reference
       // the bytes that were actually refused.
       payload: new Uint8Array(input.quarantined),
@@ -158,6 +214,16 @@ export class DocumentRejections {
       limitActual: input.limit?.actual,
       createdAtMs: Date.now(),
     });
+    if (!held) {
+      // Cannot happen while the leaf hash is unique per rejection, which the append above already
+      // established. Logged rather than assumed: the previous key silently dropped every round
+      // after the first, and the way that stayed invisible was precisely that nothing said so.
+      this.#logger.error("document.rejection.quarantine_not_written", {
+        documentId,
+        rejectionEnvelopeHash,
+        rejectedEnvelopeHash: input.rejectedEnvelopeHash,
+      });
+    }
 
     const round = this.#round(agentId, documentId);
 
@@ -168,11 +234,16 @@ export class DocumentRejections {
       senderAgentId: input.senderAgentId,
       reason: input.reason,
       detail: input.detail,
+      // Carried, not merely stored: an operator asking "why was this refused" needs the rule and
+      // the number, and a column no surface reads is a column that is not there.
+      rule: input.rule,
+      limitName: input.limit?.name,
+      limitValue: input.limit?.limit,
+      limitActual: input.limit?.actual,
       round,
     });
 
-    // One retry, then stalled: the original rejection, one superseding attempt, and no more.
-    const stalled = round > REJECTION_RETRY_LIMIT + 1;
+    const stalled = round >= MAX_REJECTED_ROUNDS;
     const alreadyStalled = this.#store.getDocument(agentId, documentId)?.status === "stalled";
     if (stalled && !alreadyStalled) {
       this.#store.setDocumentStatus(agentId, documentId, "stalled");
@@ -210,16 +281,64 @@ export class DocumentRejections {
   recordIncomingRejection(
     agentId: string,
     documentId: string,
-    input: { rejectedEnvelopeHash: string; reason: string; detail?: string; fromAgentId: string },
-  ): void {
+    input: {
+      /** The peer's 0x05 leaf hash — the row's identity, so a redelivery does not advance a round. */
+      rejectionEnvelopeHash: string;
+      rejectedEnvelopeHash: string;
+      reason: string;
+      detail?: string;
+      fromAgentId: string;
+    },
+  ): { stalled: boolean; round: number } {
+    // DURABLE, not a log line. Everything the PUBLISHING operator needs depends on this surviving
+    // a restart: why their work was refused, and how many rounds remain before the document
+    // stalls. It also has to exist for the retry bound to bind at all — the round was counted from
+    // rejections this agent AUTHORED, which on a pure publisher is zero forever, so the loop the
+    // limit exists to stop was the one side that had no limit.
+    const written = this.#store.recordRejectionReceived(agentId, {
+      documentId,
+      rejectionEnvelopeHash: input.rejectionEnvelopeHash,
+      rejectedEnvelopeHash: input.rejectedEnvelopeHash,
+      fromAgentId: input.fromAgentId,
+      reason: input.reason,
+      detail: input.detail,
+      createdAtMs: Date.now(),
+    });
+    const round = this.#store.countRejectionsReceived(agentId, documentId);
+
+    if (!written) {
+      this.#logger.warn("document.rejection.received_duplicate", {
+        documentId,
+        rejectionEnvelopeHash: input.rejectionEnvelopeHash,
+        round,
+      });
+      return { stalled: this.#isStalled(agentId, documentId), round };
+    }
+
     this.#logger.warn("document.rejection.received", {
       documentId,
       fromAgentId: input.fromAgentId,
       rejectedEnvelopeHash: input.rejectedEnvelopeHash,
       reason: input.reason,
       detail: input.detail,
-      round: this.#round(agentId, documentId),
+      round,
     });
+
+    // The publisher stops superseding on the same threshold the receiver stops accepting on. Two
+    // sides of one bound: without this, the receiver freezes and the sender keeps retrying into a
+    // document that will never take it.
+    const stalled = round >= MAX_REJECTED_ROUNDS;
+    if (stalled && !this.#isStalled(agentId, documentId)) {
+      this.#store.setDocumentStatus(agentId, documentId, "stalled");
+      this.#logger.error("document.stalled", {
+        documentId,
+        reason: input.reason,
+        detail: input.detail,
+        rounds: round,
+        side: "publisher",
+      });
+    }
+    return { stalled, round };
   }
 
   /** Entries held for this document — never admitted, never discarded (§3.2). From the store. */
@@ -229,6 +348,10 @@ export class DocumentRejections {
       quarantined: r.payload,
       reason: r.reason,
       detail: r.detail,
+      rule: r.rule,
+      limitName: r.limitName,
+      limitValue: r.limitValue,
+      limitActual: r.limitActual,
     }));
   }
 
@@ -291,7 +414,12 @@ export class DocumentRejections {
     const undoManager = new Y.UndoManager([doc.getText("content"), doc.getMap("data")], {
       captureTimeout: 0,
     });
-    return { doc, undoManager, depthAtTracking: undoManager.undoStack.length };
+    return {
+      doc,
+      undoManager,
+      depthAtTracking: undoManager.undoStack.length,
+      dispose: () => undoManager.destroy(),
+    };
   }
 
   /**
@@ -334,7 +462,10 @@ export class DocumentRejections {
 
   /** Derived from the log, not remembered — so it survives a restart. */
   #round(agentId: string, documentId: string): number {
-    return this.#store.countRejections(agentId, documentId);
+    // Scoped to the rejections THIS agent authored. A mutual exchange puts both directions' 0x05
+    // leaves in one document log, so an unscoped count conflated them and a document stalled at
+    // half the intended rounds the moment the peer also rejected something.
+    return this.#store.countRejections(agentId, documentId, agentId);
   }
 
   #isStalled(agentId: string, documentId: string): boolean {
@@ -346,7 +477,7 @@ export class DocumentRejections {
 function rejectionHash(rejectedEnvelopeHash: string, reason: string, nonce: string): string {
   // The nonce is what stops two rejections of the same envelope for the same reason collapsing
   // into one row — which would let a document reach `stalled` with fewer leaves than rounds.
-  // ENVELOPE-1 replaces this with a real content hash over the signed envelope.
+  // DELIBERATELY a different construction from ENVELOPE-1's update hash (a CBOR-array digest), though both land in the envelope_hash column and the same per-sender chain. The preimage shapes cannot collide, and unifying them would mean signing a rejection as a document update.
   return createHash("sha256")
     .update(`rejection:${rejectedEnvelopeHash}:${reason}:${nonce}`, "utf8")
     .digest("hex");
