@@ -445,3 +445,84 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
     expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(true);
   });
 });
+
+describe("cello_doc_diff — reviewing what arrived before building on it", () => {
+  it("shows the peer's change against what THIS agent last read", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "one\ntwo\nthree\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Alice looks. THIS is the bookmark — not the accept, not an arriving update.
+    await a.call("cello_doc_read", { document_id: documentId });
+
+    await b.call("cello_doc_write", { document_id: documentId, content: "one\ntwo CHANGED BY BOB\nthree\n" });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.text(documentId)).toContain("CHANGED BY BOB"));
+
+    const diff = await a.call("cello_doc_diff", { document_id: documentId });
+    expect(diff).toMatchObject({ ok: true, unchanged: false });
+    expect(String(diff.diff)).toContain("CHANGED BY BOB");
+    expect(diff.stats).toMatchObject({ linesAdded: 1, linesRemoved: 1 });
+  });
+
+  it("REFUSES rather than diffing against nothing when the document was never read", async () => {
+    const a = await makeParty("alice");
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: "cc".repeat(32),
+      starting_content: "a long document\nwith several lines\n",
+    })).documentId as string;
+
+    const diff = await a.call("cello_doc_diff", { document_id: documentId });
+    // Diffing against "" would render a FIRST look at a long document as an enormous change, which
+    // an agent then treats as "what just arrived" and acts on. Never-read is a different fact from
+    // nothing-changed and is said as one.
+    expect(diff).toMatchObject({ ok: false, reason: "document_never_read" });
+  });
+
+  it("reports UNCHANGED when nothing moved since the read", async () => {
+    const a = await makeParty("alice");
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: "cc".repeat(32),
+      starting_content: "steady\n",
+    })).documentId as string;
+    await a.call("cello_doc_read", { document_id: documentId });
+
+    expect(await a.call("cello_doc_diff", { document_id: documentId })).toMatchObject({
+      ok: true,
+      unchanged: true,
+    });
+  });
+
+  it("a second READ moves the bookmark, so the same change is not shown twice", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "base\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+    await a.call("cello_doc_read", { document_id: documentId });
+
+    await b.call("cello_doc_write", { document_id: documentId, content: "base\nbob was here\n" });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.text(documentId)).toContain("bob was here"));
+
+    expect(await a.call("cello_doc_diff", { document_id: documentId })).toMatchObject({ unchanged: false });
+    await a.call("cello_doc_read", { document_id: documentId });
+    // An agent that re-reviews the same change on every turn will keep re-reacting to it.
+    expect(await a.call("cello_doc_diff", { document_id: documentId })).toMatchObject({ unchanged: true });
+  });
+});

@@ -47,6 +47,29 @@ const CREATE_NOTICES_SQL = `
   );
 `;
 
+/**
+ * WHAT THE OPERATOR LAST SAW, so `diff` can answer "what changed since I looked".
+ *
+ * The text itself, not a state vector. A state vector says which OPERATIONS this side has seen,
+ * which is a fact about the CRDT — and the question an agent is asking before it builds on a shared
+ * document is a fact about the TEXT: what words are different from the ones I read. Reconstructing
+ * the old text from a vector means replaying the log to a point, which is both expensive and a
+ * second answer to a question this column answers directly.
+ *
+ * Written by READ, never by write or by an arriving update. It marks what a human or an agent
+ * actually looked at; moving it on an inbound update would erase the very change the diff exists to
+ * show, silently, at the moment it arrived.
+ */
+const CREATE_READ_MARKS_SQL = `
+  CREATE TABLE IF NOT EXISTS document_read_marks (
+    agent_id     TEXT    NOT NULL,
+    document_id  TEXT    NOT NULL,
+    seen_text    TEXT    NOT NULL,
+    seen_at      INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, document_id)
+  );
+`;
+
 /** Types `diff` can render. Decided in-unit; see the header for why the list is closed. */
 export const DIFFABLE_DOCUMENT_TYPES = ["markdown", "text", "json"] as const;
 export type DiffableDocumentType = (typeof DIFFABLE_DOCUMENT_TYPES)[number];
@@ -98,6 +121,39 @@ export class DocumentNotifications {
     this.#store = store;
     this.#logger = logger;
     this.#store.rawDb.exec(CREATE_NOTICES_SQL);
+    this.#store.rawDb.exec(CREATE_READ_MARKS_SQL);
+  }
+
+  /**
+   * Record what this agent last SAW, so a later diff has a "before".
+   *
+   * REPLACES. A read mark is a bookmark, not a history — keeping every read would make the table
+   * grow with attention rather than with content, and no caller wants the second-most-recent read.
+   */
+  markRead(agentId: string, documentId: string, text: string, nowMs: number): void {
+    this.#store.rawDb
+      .prepare(
+        `INSERT INTO document_read_marks (agent_id, document_id, seen_text, seen_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (agent_id, document_id) DO UPDATE SET seen_text = excluded.seen_text, seen_at = excluded.seen_at`,
+      )
+      .run(agentId, documentId, text, nowMs);
+  }
+
+  /**
+   * The text this agent last saw, or null if it has never read this document.
+   *
+   * NULL IS NOT THE EMPTY STRING, and callers must not conflate them. Never-read means the whole
+   * document is new to this agent; last-saw-empty means they read it when it was empty and
+   * everything since is a change they can be shown against that. Returning "" for both would render
+   * a first read of a long document as an enormous diff the agent then treats as "what just
+   * changed".
+   */
+  lastSeen(agentId: string, documentId: string): string | null {
+    const row = this.#store.rawDb
+      .prepare("SELECT seen_text FROM document_read_marks WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { seen_text: string } | undefined;
+    return row === undefined ? null : row.seen_text;
   }
 
   /**

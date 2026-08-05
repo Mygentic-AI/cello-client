@@ -44,6 +44,7 @@ import {
   docRefuse,
   docList,
   docRead,
+  docDiff,
   docWrite,
   attestationConsentList,
   attestationConsentAccept,
@@ -1023,6 +1024,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  cello doc refuse <document-id> [why…]             — refuse one\n" +
       "  cello doc list                                    — your documents and their state\n" +
       "  cello doc read <document-id>                      — the current text\n" +
+      "  cello doc diff <document-id>                      — what changed since you last read it\n" +
       "  cello doc write <document-id> <text…>             — replace the text and publish the change\n" +
       "\n" +
       "A document is a STANDING AGREEMENT to apply a counterparty's signed operations to your local\n" +
@@ -1064,6 +1066,7 @@ export const COMMANDS: readonly CommandSpec[] = [
         return docRefuse(ctx.celloDir, target, why.length > 0 ? why : null, o);
       }
       if (sub === "read" && target) return docRead(ctx.celloDir, target, o);
+      if (sub === "diff" && target) return docDiff(ctx.celloDir, target, o);
       if (sub === "write" && target) {
         // Joined, not positional[2] alone: the whole point is the COMPLETE text, and a shell splits
         // it on spaces. Taking only the first word would publish a one-word document and report

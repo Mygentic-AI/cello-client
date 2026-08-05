@@ -301,6 +301,7 @@ export const IPC_METHODS = {
   "doc-refuse": "cello_doc_refuse",
   "doc-list": "cello_doc_list",
   "doc-read": "cello_doc_read",
+  "doc-diff": "cello_doc_diff",
   "doc-write": "cello_doc_write",
   "attestation-consent-list": "cello_attestation_consent_list",
   "attestation-consent-accept": "cello_attestation_consent_accept",
@@ -832,6 +833,11 @@ export function docList(celloDir: string, opts: ParityOptions): Promise<CliOutpu
 /** `cello doc read <document-id>` → cello_doc_read. */
 export function docRead(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["doc-read"], { document_id: documentId }, opts);
+}
+
+/** `cello doc diff <document-id>` → cello_doc_diff. What changed since you last read it. */
+export function docDiff(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-diff"], { document_id: documentId }, opts);
 }
 
 /** `cello doc write <document-id> <content…>` → cello_doc_write.

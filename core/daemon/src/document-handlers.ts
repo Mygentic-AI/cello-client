@@ -420,13 +420,71 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // THROWS rather than returning empty when the log cannot be rebuilt — see LiveDocuments.get. An
     // empty document handed to an agent here would be written back over the peer's real content.
     const doc = layer.live.get(who.ownerAgentId, documentId);
+    const content = doc.getText("content").toString();
+    // THE READ IS THE BOOKMARK. `cello_doc_diff` answers "what changed since I looked", and looking
+    // is this call. Marking on an arriving update instead would erase the very change the diff
+    // exists to show, silently, at the moment it arrived.
+    layer.notifications.markRead(who.ownerAgentId, documentId, content, deps.now());
+    // And the unread notice is cleared, because it has now been read. Leaving it would keep an
+    // inbox entry for something the agent is holding in its hands.
+    layer.notifications.clear(who.ownerAgentId, documentId);
     return {
       ok: true,
       documentId,
       documentType: document.documentType,
       peerAgentId: document.peerAgentId,
       status: document.status,
-      content: doc.getText("content").toString(),
+      content,
+    };
+  });
+
+  handlers.set("cello_doc_diff", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    const document = layer.store.getDocument(who.ownerAgentId, documentId);
+    if (!document) {
+      return {
+        ok: false,
+        reason: "document_unknown",
+        guidance: `No document ${documentId.slice(0, 16)}… for this agent. See cello_doc_list.`,
+      };
+    }
+
+    const after = layer.live.get(who.ownerAgentId, documentId).getText("content").toString();
+    const before = layer.notifications.lastSeen(who.ownerAgentId, documentId);
+    if (before === null) {
+      // NEVER READ is not "nothing changed", and it is not an empty before either. Diffing against
+      // "" would render a first look at a long document as an enormous change the agent then treats
+      // as "what just arrived" — and act on. Said plainly instead.
+      return {
+        ok: false,
+        reason: "document_never_read",
+        guidance:
+          `You have not read ${documentId.slice(0, 16)}… yet, so there is nothing to compare against. ` +
+          `Call cello_doc_read first; the diff answers "what changed since I looked".`,
+      };
+    }
+
+    const rendered = layer.notifications.diff(document.documentType, before, after, documentId);
+    // The STATS come from the same pair of texts, so an agent branching on `overlap` is branching on
+    // the same comparison it is being shown.
+    const stats = layer.notifications.diffStats(documentId, before, after, null, document.documentType);
+    if (!rendered.ok) {
+      // The stats still stand — they are structural and type-independent — so a document type this
+      // build cannot render is not a document an agent has to read blind.
+      return { ok: true, documentId, unchanged: before === after, diff: null, reason: rendered.reason, stats };
+    }
+    return {
+      ok: true,
+      documentId,
+      unchanged: before === after,
+      diff: rendered.diff,
+      ...(rendered.fallback !== undefined ? { fallback: rendered.fallback } : {}),
+      stats,
     };
   });
 
@@ -514,6 +572,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   });
 
   logger.debug("document.handlers.registered", {
-    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "write"],
+    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write"],
   });
 }
