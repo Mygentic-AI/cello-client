@@ -165,7 +165,7 @@ export function createSealFlows(deps: SealFlowDeps) {
     // initiator can name the mismatch instead of guessing at it. Optional — an older counterparty
     // sends the bare reason, and the renderer must degrade to the old wording rather than print
     // "undefined vs undefined".
-    | { type: "seal_interrupted_rejection"; reason: string; frontier?: { responder: number; initiator: number; diverging: number } }
+    | { type: "seal_interrupted_rejection"; reason: string; pendingCeremony?: string; frontier?: { responder: number; initiator: number; diverging: number } }
     | { type: "timeout" };
 
   function awaitSealAck(sessionId: string, mgr: SignalingManager | undefined): Promise<SealAckResult> {
@@ -195,6 +195,9 @@ export function createSealFlows(deps: SealFlowDeps) {
         } else {
           // Only treat the frontier detail as present when BOTH numbers are real. A half-populated
           // frame must render as "no detail", never as a mismatch with one side invented.
+          // M12-P15: which ceremony the peer is actually on. ONE status covers two that need
+          // opposite actions, so the initiator must never infer it — absent means do not act.
+          const ceremony = typeof frame["pending_ceremony"] === "string" ? frame["pending_ceremony"] : undefined;
           const responder = frame["responder_leaf_count"];
           const initiator = frame["initiator_leaf_count"];
           const diverging = frame["diverging_leaf_index"];
@@ -202,6 +205,7 @@ export function createSealFlows(deps: SealFlowDeps) {
           resolve({
             type: "seal_interrupted_rejection",
             reason: typeof frame.reason === "string" ? frame.reason : "unknown",
+            ...(ceremony !== undefined ? { pendingCeremony: ceremony } : {}),
             ...(hasFrontier
               ? { frontier: { responder, initiator, diverging: typeof diverging === "number" ? diverging : Math.min(responder, initiator) } }
               : {}),
@@ -363,6 +367,33 @@ export function createSealFlows(deps: SealFlowDeps) {
           divergingLeafIndex: diverging,
           correlationId,
         });
+      }
+      // M12-P15: the counterparty just told us which ceremony IT is on. Act on that rather than
+      // dead-ending — the dead end is what left force:true (no receipt) as the only exit.
+      //
+      // ONLY `relay_bilateral`. A peer on the seal-interrupted ceremony has no relay SEAL ctrl leaf
+      // and never will, so our leaf would be one leaf into a log that can never hold a second
+      // distinct sender: the seal never completes and we would have reported ok. An ABSENT field
+      // (older peer) is not a hint — it is unknown, and unknown means do not sign.
+      if (ackResult.reason === "session_seal_already_pending" && ackResult.pendingCeremony === "relay_bilateral") {
+        logger.info("session.seal.ceremony.realigned", {
+          sessionId, agentName: record.agent_name,
+          from: "seal_interrupted", to: "bilateral_cosign", because: ackResult.reason, correlationId,
+        });
+        const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
+        // `responder_seal_already_submitted` means our half is ALREADY in the relay log. The active
+        // seal path treats it as success for exactly that reason; treating it as failure here told
+        // the operator to retry forever (every retry re-hits the synchronous idempotency mark) while
+        // forbidding the only real exit.
+        if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
+          return { ok: true, sessionId, status: "seal_interrupted_pending" };
+        }
+        return {
+          ok: false,
+          reason: "seal_cosign_failed",
+          rejection_reason: ackResult.reason,
+          guidance: `The counterparty is running the relay bilateral seal and was waiting for our half, so we submitted it instead of re-requesting an interrupted seal — but the submit failed (${submitted.reason}). The session is NOT terminal: retry cello_close_session ${sessionId} once that cause is cleared.`,
+        };
       }
       return {
         ok: false,

@@ -71,7 +71,7 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
     // ONE daemon (the loopback case that produced session dbb93dfc…, stranded for a week) there is
     // no counterparty to ask and no second machine to check: the advice was unfollowable and the one
     // fact that would have solved it in a minute was discarded here.
-    const reject = async (reason: string, detail?: Record<string, number>): Promise<void> => {
+    const reject = async (reason: string, detail?: Record<string, number | string>): Promise<void> => {
       // CONN-001: send the rejection over the LOCAL responder agent's own stream (the agent whose
       // pubkey is counterpartyPubkey — the stream this request arrived on). If unresolved, sendOver
       // reports a send failure rather than throwing.
@@ -118,9 +118,34 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
         sealed: "session_already_sealed",
         seal_interrupted_pending: "session_seal_already_pending",
       };
+      // M12-P15: `seal_interrupted_pending` is reached by TWO different ceremonies that need
+      // OPPOSITE things from the initiator, and the status alone cannot tell them apart:
+      //   relay_bilateral  — we submitted a relay SEAL ctrl leaf and need the initiator's half
+      //   seal_interrupted — we persisted a seal-interrupted commitment; there is no relay ctrl
+      //                      leaf and never will be, so an initiator leaf could never complete it
+      // Naming it is what lets the initiator act instead of dead-ending. Both discriminators are
+      // DURABLE (the relay leaf log and the artifacts row), so this survives a restart — which is
+      // the case that matters, since a restart is what marked the session interrupted.
+      let pendingCeremony: string | undefined;
+      if (localRecord.status === "seal_interrupted_pending") {
+        const ownCtrlLeaf = sessionNodeManager
+          .getSealCarry(counterpartyPubkey, sessionId)
+          .some((l) => l.leafKind === 0x02 && l.senderPubkeyHex === counterpartyPubkey);
+        if (ownCtrlLeaf) {
+          pendingCeremony = "relay_bilateral";
+        } else if (sessionNodeManager.getSealInterruptedArtifacts(localAgent.name, sessionId)) {
+          pendingCeremony = "seal_interrupted";
+        }
+        // Neither → leave it ABSENT. The initiator treats unknown as "do not sign", which is the
+        // only safe default: guessing wrong either strands the session or mints a leaf that can
+        // never be joined.
+      }
       // Own-property lookup (review MEDIUM-5): `??` does not protect against inherited keys, and a
       // status that happened to name one would rename the refusal to a function.
-      await reject(Object.hasOwn(named, localRecord.status) ? named[localRecord.status] : "session_not_interrupted");
+      await reject(
+        Object.hasOwn(named, localRecord.status) ? named[localRecord.status] : "session_not_interrupted",
+        pendingCeremony !== undefined ? { pending_ceremony: pendingCeremony } : undefined,
+      );
       return;
     }
     // From our perspective the initiator is our counterparty.

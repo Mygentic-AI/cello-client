@@ -243,6 +243,36 @@ describe("M12-P14: a terminal session is refused by its actual status, not a cat
     return sentReason;
   }
 
+  it("M12-P15: a seal_interrupted_pending refusal NAMES the ceremony, or the initiator cannot act", async () => {
+    // The initiator routes ONLY on `relay_bilateral` and treats an absent field as "do not sign".
+    // So if the responder never sends it, the routing is unreachable and M12-P15 is unfixed — this
+    // is the test that keeps the two halves connected.
+    await fx.createSession(SID, "alice");
+    fx.snm.getDb()!.prepare("UPDATE sessions SET status = 'seal_interrupted_pending' WHERE session_id = ?").run(SID);
+
+    let frame: Record<string, unknown> | undefined;
+    const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      sessionNodeManager: fx.snm,
+      agents: [{ name: "alice", state: "online", pubkey: "alicepubkeyhex" }],
+      getKeyProvider: () => undefined,
+      sendOver: async (_p: unknown, f: unknown) => { frame = f as Record<string, unknown>; return { ok: true }; },
+      recordFrontierMismatch: () => {},
+      clearFrontierMismatch: () => {},
+    });
+    await handleInboundSealInterruptedRequest({
+      type: "seal_interrupted_request", sessionId: SID,
+      initiatorPubkey: "bobpubkeyhex", counterpartyPubkey: "alicepubkeyhex",
+      leafCountAtInterruption: 0, merkleRootAtInterruption: "00".repeat(32), nonce: "n-ceremony",
+    });
+
+    expect(frame?.reason).toBe("session_seal_already_pending");
+    // No relay ctrl leaf and no artifacts row in this fixture, so the ceremony is genuinely UNKNOWN
+    // and must be omitted rather than guessed — the initiator then declines to sign, which is the
+    // safe default. Sending a wrong value is worse than sending none.
+    expect(frame?.pending_ceremony, "unknown must be absent, never guessed").toBeUndefined();
+  });
+
   it("an ABANDONED session is refused as session_abandoned — the state we put it in, named", async () => {
     expect(await rejectionFor("abandoned")).toBe("session_abandoned");
   });
