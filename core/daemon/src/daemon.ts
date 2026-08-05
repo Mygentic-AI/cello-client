@@ -2916,6 +2916,24 @@ async function startDaemonHoldingLock(
   // CELLO-M7-MSG-001 (AC-004/AC-005): the send path records un-acked content here when
   // its TTF timer fires, so a crash before the relay park confirms is recoverable at the
   // next startup flush. Stored in the SAME retry_queue table (awaiting_ack = 1).
+  // M12-P12 verification surface. REFUSES unless the daemon was started with
+  // CELLO_FAULT_INJECTION=1 — the gate is here rather than at the call site so a normal daemon
+  // cannot be talked into dropping messages by anything that can reach the socket, and the refusal
+  // names why rather than silently no-opping.
+  handlers.set("debug_inject_park_fault", async (params) => {
+    if (process.env.CELLO_FAULT_INJECTION !== "1") {
+      return {
+        error: "fault_injection_disabled",
+        guidance: "Start the daemon with CELLO_FAULT_INJECTION=1 to enable. This is a verification surface for M12-P12 and is inert in a normal daemon.",
+      };
+    }
+    const count = typeof params?.count === "number" ? params.count : 1;
+    const cause = typeof params?.cause === "string" ? params.cause : undefined;
+    const armed = sessionNodeManager.injectParkFault(count, cause);
+    logger.warn("content.park.fault.armed", { count: armed, cause: cause ?? "standing_receiver_creating" });
+    return { armed };
+  });
+
   handlers.set("enqueue_awaiting_content", async (params, connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const contentHashHex = params?.contentHash as string | undefined;

@@ -401,6 +401,28 @@ export class SessionNodeManager {
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
+  // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
+  // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
+  // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
+  // no CLI lever reaches that window: set-agent-offline leaves an open session's node serving, and
+  // the CLI refuses a send from an offline agent. Without this the fix ships unwatched.
+  // INERT unless the daemon is started with CELLO_FAULT_INJECTION=1; the IPC handler that sets it
+  // refuses outright otherwise, so a normal daemon cannot be talked into dropping messages.
+  #parkFaultRemaining = 0;
+  #parkFaultCause = "standing_receiver_creating";
+
+  /** Arm the park-deposit fault. Returns the count now armed. */
+  injectParkFault(count: number, cause?: string): number {
+    this.#parkFaultRemaining = Math.max(0, count);
+    if (cause) this.#parkFaultCause = cause;
+    return this.#parkFaultRemaining;
+  }
+
+  /** Remaining armed park faults — so a test can assert the fault was actually consumed. */
+  getParkFaultRemaining(): number {
+    return this.#parkFaultRemaining;
+  }
+
   // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
   // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
   // the wrong cause is how this path stayed invisible.
@@ -602,6 +624,19 @@ export class SessionNodeManager {
    * result — the deposit itself and its logging are unchanged either way.
    */
   async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<ParkAttempt> {
+    // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
+    // the live hook refuses (before any deposit), with the same event and the same `cause`.
+    if (this.#parkFaultRemaining > 0) {
+      this.#parkFaultRemaining -= 1;
+      this.#logger.warn("content.park.deposit.failed", {
+        sessionId,
+        contentHash: contentHashHex,
+        reason: "standing_receiver_unavailable",
+        cause: this.#parkFaultCause,
+        injected: true,
+      });
+      return "refused";
+    }
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     // M12-P12 (review F6): "no park target configured" is NOT a refused deposit. Content in a

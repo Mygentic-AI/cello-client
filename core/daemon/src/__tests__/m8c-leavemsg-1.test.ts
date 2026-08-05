@@ -295,6 +295,51 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
   // DOD-PARK-DRAIN-1 requires anyway — watch for `content.park.flush.completed` under a
   // `standing_receiver_ready` trigger. Recorded here so the gap is visible at the point of absence.
 
+  it("M12-P12 verification: an INJECTED park refusal takes the durable path, and the gate refuses without the env var", async () => {
+    // The fault exists so the failure can be produced on demand — it is a race in production and no
+    // CLI lever reaches it. This test pins two things: the injected refusal is indistinguishable
+    // from a real one (same durable outcome), and the IPC gate is closed by default so a normal
+    // daemon cannot be told to drop messages.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    // A park hook that would SUCCEED — so anything durable here came from the injected fault, not
+    // from a hook that happened to fail.
+    let hookCalls = 0;
+    snm.setContentParkHook(async () => { hookCalls++; return { ok: true }; });
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    expect(snm.injectParkFault(1)).toBe(1);
+    const content = new TextEncoder().encode("injected refusal");
+    const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+
+    expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
+    expect(hookCalls, "the fault must short-circuit BEFORE the deposit, like a real refusal").toBe(0);
+    expect(snm.getParkFaultRemaining(), "the armed fault must be consumed, not left latched").toBe(0);
+
+    const row = snm.getDb()!
+      .prepare("SELECT agent_id, awaiting_ack FROM retry_queue WHERE session_id = ? AND content_hash_hex = ?")
+      .get(SID, hashHex) as { agent_id: string; awaiting_ack: number } | undefined;
+    expect(row, "an injected refusal must leave the same durable row a real one does").toBeDefined();
+    expect(row!.awaiting_ack).toBe(1);
+    expect(row!.agent_id).toBe(snm.resolveAgentId("alice"));
+
+    // The gate: closed unless the daemon was started with the env var.
+    delete process.env.CELLO_FAULT_INJECTION;
+    const client = await connectAs("alice");
+    const denied = await client.send("debug_inject_park_fault", { count: 3 });
+    expect(denied).toMatchObject({ error: "fault_injection_disabled" });
+  });
+
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
