@@ -24,6 +24,7 @@ function ack(over: Partial<DocumentAck> = {}): DocumentAck {
     type: "document_ack",
     document_id: DOC,
     envelope_hash: ENV,
+    ack_version: 1,
     acker_agent_id: "agent-b",
     admitted: true,
     acked_at_ms: 1_700_000_000_000,
@@ -136,12 +137,25 @@ describe("document ack — the signature covers the whole claim", () => {
     expect(tbs({ acked_at_ms: 1 })).not.toBe(tbs());
   });
 
-  it("distinguishes a rejection reason from NO reason", () => {
-    const withReason = Buffer.from(buildDocumentAckTbs(rejection("a"))).toString("hex");
-    const otherReason = Buffer.from(buildDocumentAckTbs(rejection("b"))).toString("hex");
-    // Encoded as explicit null when absent rather than omitted: omitting shortens the array, which
-    // is a shape change the next field silently absorbs.
-    expect(withReason).not.toBe(otherReason);
+  it("distinguishes one rejection reason from another", () => {
+    expect(Buffer.from(buildDocumentAckTbs(rejection("a"))).toString("hex")).not.toBe(
+      Buffer.from(buildDocumentAckTbs(rejection("b"))).toString("hex"),
+    );
+  });
+
+  it("keeps the reason SLOT occupied whether or not there is a reason", () => {
+    // The earlier version of this test was named for this rule and compared two rejections that
+    // BOTH carried a reason — so it never exercised the absent case at all, and a builder that
+    // omitted the slot would have kept it green.
+    const admission = decodeCbor(
+      buildDocumentAckTbs(ack(), { preHash: false }),
+    ) as unknown[];
+    const refusal = decodeCbor(
+      buildDocumentAckTbs(rejection("x"), { preHash: false }),
+    ) as unknown[];
+    expect(admission).toHaveLength(refusal.length);
+    expect(admission[6]).toBeNull();
+    expect(refusal[6]).toBe("x");
   });
 
   it("does NOT cover its own signature", () => {
@@ -157,6 +171,7 @@ describe("document ack — the signature covers the whole claim", () => {
       acker_agent_id: a.acker_agent_id,
       envelope_hash: a.envelope_hash,
       document_id: a.document_id,
+      ack_version: a.ack_version,
       type: a.type,
     };
     // A map preimage would make the signature depend on the order the acker built the object in,
@@ -168,5 +183,124 @@ describe("document ack — the signature covers the whole claim", () => {
     const arr = decodeCbor(buildDocumentAckTbs(ack(), { preHash: false })) as unknown[];
     expect(arr[0]).not.toBe("CELLO-DOCUMENT-UPDATE-v1");
     expect(arr[0]).not.toBe("CELLO-DOCUMENT-PROPOSAL-v1");
+  });
+});
+
+
+describe("document ack — the FROZEN vector", () => {
+  /**
+   * The conformance artifact, matching the convention both sibling envelopes already follow. Every
+   * other TBS test here is DIFFERENTIAL — "these two differ" — which structurally cannot catch a
+   * reordering: swap two slots, or change the domain string, and the whole suite stays green while
+   * every ack any deployed peer ever signed becomes unverifiable, surfacing as "bad signature" on a
+   * frame that is fine.
+   *
+   * If this fails, the wire changed. Decide that deliberately and reissue the vector; never edit it
+   * to match new output.
+   */
+  const FROZEN_ADMISSION: DocumentAck = {
+    type: "document_ack",
+    ack_version: 1,
+    document_id: "00".repeat(31) + "01",
+    envelope_hash: "00".repeat(31) + "02",
+    acker_agent_id: "vector-acker",
+    admitted: true,
+    acked_at_ms: 1_700_000_000_000,
+    signature: new Uint8Array(64).fill(0xef),
+  };
+  const FROZEN_REJECTION: DocumentAck = {
+    ...FROZEN_ADMISSION,
+    admitted: false,
+    rejection_reason: "document_append_only_violation",
+  };
+
+  it("an ADMISSION preimage is byte-for-byte what it was the day it was frozen", () => {
+    expect(Buffer.from(buildDocumentAckTbs(FROZEN_ADMISSION, { preHash: false })).toString("hex")).toBe(
+      "887543454c4c4f2d444f43554d454e542d41434b2d7631017840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030317840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d61636b6572f5f61b0000018bcfe56800",
+    );
+  });
+
+  it("a REJECTION preimage is byte-for-byte what it was the day it was frozen", () => {
+    expect(Buffer.from(buildDocumentAckTbs(FROZEN_REJECTION, { preHash: false })).toString("hex")).toBe(
+      "887543454c4c4f2d444f43554d454e542d41434b2d7631017840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030317840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d61636b6572f4781e646f63756d656e745f617070656e645f6f6e6c795f76696f6c6174696f6e1b0000018bcfe56800",
+    );
+  });
+
+  it("the timestamp is a uint64, not an IEEE float64", () => {
+    const hex = Buffer.from(buildDocumentAckTbs(FROZEN_ADMISSION, { preHash: false })).toString("hex");
+    // cbor-x encodes a JS number past 0xffffffff as fb (float64). A millisecond timestamp is always
+    // that large, so without the bigint coercion any RFC 8949-canonical implementation computes
+    // different TBS bytes and rejects a GENUINE ack — which reads as forgery.
+    expect(hex).toContain("1b0000018bcfe56800");
+    expect(hex).not.toContain("fb4278bcfe56800000");
+  });
+});
+
+describe("document ack — an honest peer's EMPTY-STRING reason is not a contradiction", () => {
+  it("treats an empty rejection_reason on an admission as ABSENT", () => {
+    const raw = encodeCbor({
+      type: "document_ack",
+      ack_version: 1,
+      document_id: DOC,
+      envelope_hash: ENV,
+      acker_agent_id: "agent-b",
+      admitted: true,
+      rejection_reason: "",
+      acked_at_ms: 1_700_000_000_000,
+      signature: new Uint8Array(64),
+    });
+    // Go and Rust default a non-nullable string field to "". Refusing this as a contradiction it
+    // never expressed meant the sender never settled, retried to the unacked ceiling, and the
+    // document stalled — precisely the failure this frame exists to end.
+    expect(() => decodeDocumentAck(raw)).not.toThrow();
+    expect(decodeDocumentAck(raw).rejection_reason).toBeUndefined();
+  });
+
+  it("still refuses a rejection whose reason is empty", () => {
+    const raw = encodeCbor({
+      type: "document_ack",
+      ack_version: 1,
+      document_id: DOC,
+      envelope_hash: ENV,
+      acker_agent_id: "agent-b",
+      admitted: false,
+      rejection_reason: "",
+      acked_at_ms: 1_700_000_000_000,
+      signature: new Uint8Array(64),
+    });
+    expect(() => decodeDocumentAck(raw)).toThrow(/a rejection must carry its reason/);
+  });
+});
+
+describe("document ack — a version skew is NAMED, not left to fail as a bad signature", () => {
+  it("refuses a future ack version and says which side must upgrade", () => {
+    const map = decodeCbor(encodeDocumentAck(ack())) as Record<string, unknown>;
+    map.ack_version = 2;
+    let caught = "";
+    try {
+      decodeDocumentAck(encodeCbor(map));
+    } catch (e) {
+      caught = (e as Error).message;
+    }
+    // Without a wire version the frame decoded cleanly and failed SIGNATURE verification, sending
+    // an operator to key management for a version problem.
+    expect(caught).toMatch(/document_ack_version/);
+    expect(caught).toContain("upgrading");
+  });
+});
+
+describe("document ack — the ENCODER applies the same cross-field rules as the decoder", () => {
+  it("refuses to encode a contradictory ack locally, rather than shipping it", () => {
+    // Otherwise the sender signs and ships it and it fails only on the remote decode: the sender
+    // sees a silent stall, the peer sees the error, and the two never meet.
+    expect(() => encodeDocumentAck(ack({ rejection_reason: "why" }))).toThrow(
+      /must not carry a rejection reason/,
+    );
+  });
+
+  it("refuses an over-long rejection reason", () => {
+    expect(() =>
+      encodeDocumentAck(ack({ admitted: false, rejection_reason: "x".repeat(500) })),
+    ).toThrow(/at most/);
   });
 });

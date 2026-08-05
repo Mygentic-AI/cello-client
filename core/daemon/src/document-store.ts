@@ -895,6 +895,22 @@ export class DocumentStore {
     return r?.n ?? 0;
   }
 
+  /**
+   * Was a rejection received for THIS envelope? Envelope-scoped on purpose: the document-scoped
+   * reader below answers a different question, and using it to decide whether one envelope was
+   * refused makes a rejection of any OTHER envelope in the document look like a rejection of this
+   * one.
+   */
+  rejectionReceivedFor(ownerAgentId: string, documentId: string, envelopeHash: string): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 AS present FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_envelope_hash = ? LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash) as { present?: number } | undefined;
+    return r?.present === 1;
+  }
+
   /** The most recently received rejection, for the reason an operator is shown on a stall. */
   latestRejectionReceived(
     ownerAgentId: string,

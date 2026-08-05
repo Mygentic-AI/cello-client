@@ -274,6 +274,6 @@ describe("document proposal TBS — the FROZEN vector", () => {
   };
 
   it("the document_id is byte-for-byte what it was the day it was frozen", () => {
-    expect(documentIdFromProposal(FROZEN)).toBe("4d39f568d585ac644d345b5add255d86aa53170549acc2572544f3d334c5dcb0");
+    expect(documentIdFromProposal(FROZEN)).toBe("bbd72f0ad17e1fc07b04b599b760b96b676fba1f7040541cf9e4e13aa3a48a66");
   });
 });

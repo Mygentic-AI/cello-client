@@ -53,6 +53,7 @@ function ack(over: Partial<DocumentAck> = {}): DocumentAck {
     type: "document_ack",
     document_id: DOC,
     envelope_hash: "bb".repeat(32),
+    ack_version: 1,
     acker_agent_id: PEER,
     admitted: true,
     acked_at_ms: NOW,
@@ -193,5 +194,72 @@ describe("DocumentAckInbound — the ORDER of the checks is the security propert
     const f = newFixture();
     const res = f.inbound.receive(AGENT, new Uint8Array([1, 2, 3]), NOW);
     expect(res).toMatchObject({ ok: false, reason: "document_ack_malformed" });
+  });
+});
+
+
+describe("DocumentAckInbound — an envelope is SETTLED ONCE", () => {
+  it("REFUSES a contradicting second ack, and keeps the first verdict", () => {
+    const f = newFixture();
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+
+    expect(
+      f.inbound.receive(AGENT, encodeDocumentAck(ack({ envelope_hash: e.envelopeHash })), NOW),
+    ).toMatchObject({ ok: true, admitted: true });
+
+    const contradiction = f.inbound.receive(
+      AGENT,
+      encodeDocumentAck(
+        ack({
+          envelope_hash: e.envelopeHash,
+          admitted: false,
+          rejection_reason: "changed_my_mind",
+          acked_at_ms: NOW + 1,
+        }),
+      ),
+      NOW + 1,
+    );
+
+    // Nothing binds an ack to the acker's chain, so one acker CAN produce both. Applying the later
+    // one would let a peer that admitted an envelope later claim it refused it — and the sender
+    // would roll back work the peer already holds.
+    expect(contradiction).toMatchObject({ ok: false, reason: "document_ack_contradiction" });
+    expect(f.store.countRejectionsReceived(AGENT, DOC)).toBe(0);
+    expect(f.events.some((ev) => ev.event === "document.ack.contradiction")).toBe(true);
+  });
+
+  it("does NOT read another envelope's rejection as this one's", () => {
+    const f = newFixture();
+    const refused = envelope();
+    const fine = envelope();
+    f.store.appendEnvelope(AGENT, refused);
+    f.store.appendEnvelope(AGENT, fine);
+
+    f.inbound.receive(
+      AGENT,
+      encodeDocumentAck(
+        ack({ envelope_hash: refused.envelopeHash, admitted: false, rejection_reason: "nope" }),
+      ),
+      NOW,
+    );
+    const wire = encodeDocumentAck(ack({ envelope_hash: fine.envelopeHash }));
+    f.inbound.receive(AGENT, wire, NOW + 1);
+
+    // Document-scoped, this redelivered ADMISSION would be refused as a contradiction simply
+    // because something else in the document had been refused.
+    expect(f.inbound.receive(AGENT, wire, NOW + 2)).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("accepts an IDENTICAL redelivery without complaint", () => {
+    const f = newFixture();
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+    const wire = encodeDocumentAck(ack({ envelope_hash: e.envelopeHash }));
+
+    f.inbound.receive(AGENT, wire, NOW);
+    // Delivery retries by design; a redelivered ack is expected traffic, not a fault.
+    expect(f.inbound.receive(AGENT, wire, NOW + 1)).toMatchObject({ ok: true, admitted: true });
+    expect(f.events.some((ev) => ev.event === "document.ack.contradiction")).toBe(false);
   });
 });

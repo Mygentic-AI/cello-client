@@ -115,7 +115,18 @@ export function buildDocumentProposalTbs(
     env.properties.append_only,
     env.starting_content,
     env.nonce,
-    env.proposed_at_ms,
+    // BIGINT past 0xffffffff — the same coercion three sibling builders carry and which
+    // primary-transfer.ts names as a defect it shipped without. cbor-x encodes a JS number that
+    // large as an IEEE float64 (`fb`), not a uint64 (`1b`), so any implementation encoding RFC
+    // 8949-canonically would compute a DIFFERENT document_id from the same proposal — and for this
+    // envelope the id IS the hash, so the two parties would be on two documents.
+    //
+    // Fixed now rather than left as a known wart: M14 is unreleased, nothing is wired, and no
+    // proposal has ever been signed. The frozen vector below is reissued deliberately, which is
+    // exactly the case its own comment describes.
+    typeof env.proposed_at_ms === "number" && env.proposed_at_ms > 0xffffffff
+      ? BigInt(env.proposed_at_ms)
+      : env.proposed_at_ms,
   ]);
   if (opts.preHash === false) return preimage;
   return new Uint8Array(createHash("sha256").update(preimage).digest());

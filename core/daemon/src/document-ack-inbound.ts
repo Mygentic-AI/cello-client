@@ -138,9 +138,46 @@ export class DocumentAckInbound {
       };
     }
 
-    // 6. SETTLE. `markAcked` is idempotent and returns whether this was the first — a redelivered
-    // ack must not move the recorded time, or the delivery record says the peer confirmed at a
-    // moment it did not.
+    // 6. SETTLE ONCE. The wire type's own header states this contract: nothing binds an ack to the
+    // acker's chain, so one acker can produce a valid ADMISSION and a valid REJECTION for the same
+    // envelope. Applying the later one would let a peer that admitted an envelope later claim it
+    // refused it — and the sender would roll back work the peer already holds. A second,
+    // CONTRADICTING ack is an error; a second identical one is an ordinary redelivery.
+    const alreadyAcked = row.ackedAtMs != null;
+    if (alreadyAcked) {
+      // ENVELOPE-scoped. The document-scoped reader answers a different question, and using it
+      // here would make a rejection of any OTHER envelope in this document read as a rejection of
+      // this one — so an honest redelivered admission would be refused as a contradiction the
+      // moment anything else in the document had ever been refused.
+      const previouslyRejected = this.#d.store.rejectionReceivedFor(
+        ownerAgentId,
+        ack.document_id,
+        ack.envelope_hash,
+      );
+      const contradicts = ack.admitted === previouslyRejected;
+      if (contradicts) {
+        this.#d.logger.error("document.ack.contradiction", {
+          documentId: ack.document_id,
+          envelopeHash: ack.envelope_hash,
+          ackerAgentId: ack.acker_agent_id,
+          nowSays: ack.admitted ? "admitted" : "rejected",
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "document_ack_contradiction",
+          detail:
+            `${ack.acker_agent_id} already settled envelope ${ack.envelope_hash.slice(0, 16)}… and ` +
+            `now says the opposite — this envelope stays settled as it was, and both claims are ` +
+            `retained`,
+        };
+      }
+      // An identical redelivery. Nothing to do, and nothing to complain about.
+      return { ok: true, admitted: ack.admitted, envelopeHash: ack.envelope_hash };
+    }
+
+    // `markAcked` is idempotent and returns whether this was the first — a redelivered ack must not
+    // move the recorded time, or the delivery record says the peer confirmed at a moment it did not.
     const first = this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
 
     if (!ack.admitted) {
