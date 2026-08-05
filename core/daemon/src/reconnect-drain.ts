@@ -48,9 +48,16 @@ export function createReconnectDrain(deps: ReconnectDrainDeps): (agentName: stri
   const drain = (agentName: string): Promise<void> => {
     // Sender re-park first: it needs the receiver the ensure step just rebuilt, and a failure here
     // must not cost the inbound pull — hence its own catch rather than a shared chain.
-    void flushSender?.(agentName).catch((err: unknown) => {
-      logger.warn("content.park.flush.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
-    });
+    // Wrapped rather than `flushSender(agentName).catch(...)`: a dep that throws SYNCHRONOUSLY would
+    // otherwise propagate out of drain() and take the inbound pull with it — the exact coupling the
+    // separate catch exists to prevent.
+    if (flushSender) {
+      void Promise.resolve()
+        .then(() => flushSender(agentName))
+        .catch((err: unknown) => {
+          logger.warn("content.park.flush.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
+        });
+    }
     return drainParked(agentName).catch((err: unknown) => {
       logger.warn("content.recover.auto.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
     });

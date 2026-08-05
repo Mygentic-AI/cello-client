@@ -59,6 +59,7 @@ class FixedFactory implements ISessionNodeFactory {
 
 const SID = "ab".repeat(32);
 
+
 describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
   let tempDir: string;
   let handle: Awaited<ReturnType<typeof startDaemon>> | null;
@@ -68,6 +69,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     tempDir = await mkdtemp(join(tmpdir(), "cello-leavemsg-"));
     handle = null;
     clients = [];
+    captured.length = 0;
   });
   afterEach(async () => {
     for (const c of clients) { try { c.close(); } catch { /* closed */ } }
@@ -81,8 +83,14 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await FileKeyProvider.load(join(dir, "key"));
   }
 
+  const captured: Array<{ event: string; context: Record<string, unknown> }> = [];
   async function start(node: CelloNode): Promise<Awaited<ReturnType<typeof startDaemon>>> {
-    const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+    const noopLogger: Logger = {
+      debug(event, context) { captured.push({ event, context: context ?? {} }); },
+      info(event, context) { captured.push({ event, context: context ?? {} }); },
+      warn(event, context) { captured.push({ event, context: context ?? {} }); },
+      error(event, context) { captured.push({ event, context: context ?? {} }); },
+    };
     const config: DaemonConfig = {
     securityGateway: new PassthroughGatewayClient(),
       celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
@@ -251,7 +259,41 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
     expect(seen).toHaveLength(1);
     expect(Buffer.from(seen[0].content).equals(Buffer.from(content))).toBe(true);
+    // This session has no relay witness, so there is no ordering record to carry — assert that
+    // explicitly rather than leaving it unstated. The witnessed case is pinned separately below,
+    // where reverting the durable columns turns it red.
+    expect(seen[0].s1).toBeUndefined();
   });
+
+  it("M12-P12 (review pass 2, F6): a session with NO relay configured writes no durable row — it would never drain", async () => {
+    // "unconfigured" is not "refused". Queuing it grows the database forever with rows whose only
+    // possible outcome is no_persisted_relay_endpoint, retried on every boot and every agent start.
+    // A one-line regression to `if (attempt !== "parked")` restores that silently.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
+
+    const content = new TextEncoder().encode("nowhere to park");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
+
+    const rows = snm.getDb()!
+      .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
+      .get(SID) as { n: number };
+    expect(rows.n).toBe(0);
+  });
+
+  // M12-P12 (review pass 2, F1) — KNOWN COVERAGE GAP, deliberately not faked.
+  // The reconnect half of the sender flush IS unit-tested (dod-park-drain-1). The other half — the
+  // `flushAwaitingContent` call inside daemon.ts's setParkedDrainHook — is NOT, and deleting that
+  // line leaves this suite green. Reaching it needs a standing receiver that actually builds, which
+  // needs a live relay: `ensureStandingReceiverForAgent` no-ops for an agent that was never started,
+  // and starting the agent fires the long-standing agent-start flush, which would mask a missing
+  // hook and make the test pass for the wrong reason. It is covered by the two-machine live run that
+  // DOD-PARK-DRAIN-1 requires anyway — watch for `content.park.flush.completed` under a
+  // `standing_receiver_ready` trigger. Recorded here so the gap is visible at the point of absence.
 
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
     await makeAgentDir("alice");

@@ -1318,8 +1318,8 @@ async function startDaemonHoldingLock(
     onPersisted: (agentName, sessionId, contentHashHex) => {
       retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));
     },
-    onTtf: (agentName, sessionId, contentHashHex, content) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
+    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
     },
     // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
     // TTF timer is already cancelled on this path, so this is the only thing holding the content.
@@ -1507,7 +1507,33 @@ async function startDaemonHoldingLock(
   // the native `startupParkFn` needs the OWNING agent's standing receiver, which exists only once
   // that agent is online. `filterAgentName` scopes the drain to one agent's sessions on the agent-
   // online re-run; with no filter it attempts all (the pre-IPC pass / injected-target test path).
+  // M12-P12 (review pass 2): the sender flush now has FOUR triggers (boot, agent start, the parked-
+  // drain hook, signaling reconnect), and two of them fire deterministically together on agent start
+  // — the drain hook runs inside ensureStandingReceiver, whose own .then() then calls this again
+  // while the first pass is still dialling the relay. The receiver twin (contentPark) already
+  // coalesces for exactly this reason; adding triggers to the sender half without the same guard was
+  // an asymmetry, not a decision. Re-run once at the end if a trigger arrived mid-flight, so a
+  // coalesced call never DROPS work — it defers it.
+  const flushInFlight = new Set<string>();
+  const flushRerunRequested = new Set<string>();
   async function flushAwaitingContent(filterAgentName?: string): Promise<void> {
+    const flushKey = filterAgentName ?? "*";
+    if (flushInFlight.has(flushKey)) {
+      flushRerunRequested.add(flushKey);
+      return;
+    }
+    flushInFlight.add(flushKey);
+    try {
+      await flushAwaitingContentInner(filterAgentName);
+    } finally {
+      flushInFlight.delete(flushKey);
+    }
+    if (flushRerunRequested.delete(flushKey)) {
+      await flushAwaitingContent(filterAgentName);
+    }
+  }
+
+  async function flushAwaitingContentInner(filterAgentName?: string): Promise<void> {
     // DOD-AGENT-ID-JOINKEY-1: the queue is keyed by the STABLE agent_id, but the caller (and the
     // human-readable log) speak the NAME. Resolve once here; log the name, filter by the id.
     const filterAgentId = filterAgentName !== undefined

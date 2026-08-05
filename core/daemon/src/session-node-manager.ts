@@ -400,7 +400,7 @@ export class SessionNodeManager {
   // because RetryQueue is built later in daemon.ts. When unset, the awaiting-ACK timer
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
   // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
   // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
   // the wrong cause is how this path stayed invisible.
@@ -504,7 +504,7 @@ export class SessionNodeManager {
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
     onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
@@ -4469,7 +4469,10 @@ export class SessionNodeManager {
     if (bySession.size === 0) this.#awaitingAck.delete(ackKey);
     this.#logger.debug("content.delivery.ttf_expired", { sessionId, contentHash: hashHex });
     try {
-      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content);
+      // M12-P12 (review pass 2): the ordering record travels on THIS path too. It is in hand — the
+      // very next statement hands it to #parkContent — and a TTF row written without it re-parks in
+      // arrival order, which is the divergent-leaf-index failure the durable columns exist to stop.
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),

@@ -413,7 +413,13 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       return {
         ok: false,
         reason: sendResult.reason,
-        guidance: "The content could not be delivered over the session stream right now. It has been queued in the durable retry queue and will be retried when the counterparty reconnects. The session remains usable — check cello_status for the counterparty's status.",
+        // M12-P12 (review pass 2): sendContent knows whether the content is actually recoverable;
+        // this boundary used to overwrite that with one sentence promising a retry for EVERY
+        // failure — including a persist that threw, where the message is simply gone, and a session
+        // with no relay, where the direct nonce queue it names has no production drain. Telling an
+        // operator "it will be retried" about a lost message is the same lie that let the original
+        // defect sit unnoticed; the caller's own guidance wins whenever it has one.
+        guidance: sendResult.guidance ?? "The content could not be delivered over the session stream right now, and no relay is configured for this session — it is NOT queued for automatic retry. Send it again once the counterparty is reachable; check cello_status for their status.",
       };
     }
 
