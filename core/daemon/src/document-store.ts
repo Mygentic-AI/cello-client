@@ -86,7 +86,6 @@ export interface DocumentEnvelopeRow {
   /** Position in this document's log. Assigned on append; absent until then. */
   logIndex?: number;
   /** DELIVERY-1 bookkeeping, read back from the log. Absent on a row being appended. */
-  deliveredAtMs?: number | null;
   ackedAtMs?: number | null;
   attempts?: number;
   nextAttemptAtMs?: number | null;
@@ -188,7 +187,11 @@ const CREATE_ENVELOPES_SQL = `
     -- a queue in memory does not survive a restart, and a queue in its own table is a second
     -- source of truth that can disagree with the log about what was sent. "Unacknowledged
     -- envelopes I authored" is the whole definition, and it is a WHERE clause.
-    delivered_at    INTEGER,
+    -- acked_at only. There was a delivered_at column beside it whose ONLY writer was
+    -- COALESCE(delivered_at, ?) inside the ack, guarded by acked_at IS NULL — so it was invariably
+    -- NULL at that point and always took the new value, making it equal to acked_at on every row,
+    -- always. Nothing read it. A column that can only ever equal its neighbour invites a reader to
+    -- infer a distinction ("sent, awaiting confirmation") the schema cannot express.
     acked_at        INTEGER,
     -- How many times delivery has been attempted, and when the next attempt is due. On the row,
     -- because a backoff that resets on restart is not a backoff — a daemon restarting in a
@@ -696,6 +699,15 @@ export class DocumentStore {
             -- would ship both, and the withdrawal would arrive as a reference to an envelope the
             -- peer has never seen.
             AND kind = 'update'
+            -- An ENDED document does not deliver. A killed or closed document that kept shipping
+            -- would contradict the verb the operator just used, and the peer would receive updates
+            -- on a collaboration they were told had stopped.
+            AND EXISTS (
+              SELECT 1 FROM documents d
+               WHERE d.owner_agent_id = document_envelopes.owner_agent_id
+                 AND d.document_id = document_envelopes.document_id
+                 AND d.status NOT IN ('killed', 'closed')
+            )
             AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
             -- A WITHDRAWN update is not pending. Derived from the withdrawal record rather than a
             -- flag on the row, so there is one fact in one place: without this the delivery worker
@@ -707,7 +719,11 @@ export class DocumentStore {
                  AND w.kind = 'withdrawal'
                  AND w.references_hash = document_envelopes.envelope_hash
             )
-          ORDER BY log_index ASC LIMIT ?`,
+          -- log_index is PER DOCUMENT, so it alone is not a total order across documents and the
+          -- bounded window could be filled by one document's backlog forever. The tiebreaks make
+          -- the window deterministic; the no-peer branch scheduling its rows is what stops one
+          -- document monopolising it.
+          ORDER BY log_index ASC, document_id ASC, envelope_hash ASC LIMIT ?`,
       )
       .all(ownerAgentId, ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
     return rows.map(toEnvelopeRow);
@@ -745,10 +761,10 @@ export class DocumentStore {
   ): boolean {
     const info = this.#db
       .prepare(
-        `UPDATE document_envelopes SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
+        `UPDATE document_envelopes SET acked_at = ?
           WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND acked_at IS NULL`,
       )
-      .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash);
+      .run(nowMs, ownerAgentId, documentId, envelopeHash);
     return Number(info.changes) > 0;
   }
 
@@ -940,7 +956,6 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
     logIndex: r["log_index"] as number,
-    deliveredAtMs: (r["delivered_at"] as number | null) ?? null,
     ackedAtMs: (r["acked_at"] as number | null) ?? null,
     attempts: (r["attempts"] as number | null) ?? 0,
     nextAttemptAtMs: (r["next_attempt_at"] as number | null) ?? null,

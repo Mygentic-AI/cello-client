@@ -11,6 +11,7 @@ import {
   DocumentDelivery,
   backoffFor,
   DELIVERY_BACKOFF_CAP_MS,
+  DELIVERY_BACKOFF_MS,
   type DocumentDeliveryTransport,
 } from "../document-delivery.js";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
@@ -47,21 +48,23 @@ function envelope(sender: string, prev: string | null): DocumentEnvelopeRow {
   };
 }
 
-function newFixture(transport: Partial<DocumentDeliveryTransport> = {}) {
+function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existingDb?: DatabaseSync) {
   const { logger, events } = recordingLogger();
-  const db = new DatabaseSync(":memory:");
+  const db = existingDb ?? new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   const store = new DocumentStore(db, logger);
-  store.createDocument({
-    documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-    properties: {}, status: "active", createdAtMs: 1,
-  });
+  if (!existingDb) {
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+  }
   const calls: Array<{ envelopeHash: string; sessionHint?: string }> = [];
   const t: DocumentDeliveryTransport = {
     isPeerReachable: async () => true,
     deliver: async (input) => {
       calls.push({ envelopeHash: input.envelope.envelopeHash, sessionHint: input.sessionHint });
-      return { ok: true, sessionId: "session-1" };
+      return { ok: true, admitted: true, sessionId: "session-1", sessionOpened: true };
     },
     ...transport,
   };
@@ -69,6 +72,7 @@ function newFixture(transport: Partial<DocumentDeliveryTransport> = {}) {
     store,
     events,
     calls,
+    db,
     delivery: new DocumentDelivery(store, t, logger),
     peerFor: () => PEER,
   };
@@ -85,15 +89,24 @@ describe("DocumentDelivery — pending is DERIVED from the log", () => {
     expect(f.store.pendingDeliveries(AGENT, NOW)).toHaveLength(0);
   });
 
-  it("SURVIVES a restart — a fresh worker over the same store still finds the backlog", async () => {
+  it("SURVIVES a restart — a SECOND worker over a SECOND store finds the backlog and the count", async () => {
     const f = newFixture({ isPeerReachable: async () => false });
     f.store.appendEnvelope(AGENT, envelope(AGENT, null));
     await f.delivery.tick(AGENT, f.peerFor, NOW);
 
-    // A queue in memory would be gone here, and the operator's update would never be delivered
-    // with nothing anywhere reporting a problem. The log is the queue.
+    // A genuine restart: a new DocumentStore AND a new DocumentDelivery over the same database.
+    // The previous version of this test reused both objects, so it asserted "a deferred envelope
+    // is due again later" — which an in-memory Map satisfies just as well, and which is the exact
+    // thing it was named to disprove.
+    const restarted = newFixture({ isPeerReachable: async () => false }, f.db);
     const later = NOW + DELIVERY_BACKOFF_CAP_MS;
-    expect(f.store.pendingDeliveries(AGENT, later)).toHaveLength(1);
+    const backlog = restarted.store.pendingDeliveries(AGENT, later);
+    expect(backlog).toHaveLength(1);
+    // The accumulated attempt count survives too — otherwise the backoff restarts at full rate on
+    // every restart, and a daemon in a reconnect loop hammers an unreachable peer forever.
+    expect(backlog[0]!.attempts).toBe(1);
+    await restarted.delivery.tick(AGENT, restarted.peerFor, later);
+    expect(restarted.store.getEnvelopeLog(AGENT, DOC)[0]!.attempts).toBe(2);
   });
 
   it("never re-sends the PEER's own envelopes back at them", async () => {
@@ -131,7 +144,7 @@ describe("DocumentDelivery — an unreachable peer costs a lookup, not a dial", 
       isPeerReachable: async () => false,
       deliver: async () => {
         dialed += 1;
-        return { ok: true, sessionId: "s" };
+        return { ok: true, admitted: true, sessionId: "s", sessionOpened: true };
       },
     });
     f.store.appendEnvelope(AGENT, envelope(AGENT, null));
@@ -194,7 +207,7 @@ describe("DocumentDelivery — the backoff is on the ROW, and capped", () => {
     expect(backoffFor(50)).toBe(backoffFor(5_000));
   });
 
-  it("the schedule SURVIVES a restart rather than resetting to full rate", async () => {
+  it("the attempt count is persisted on the row, not held in the worker", async () => {
     const f = newFixture({ isPeerReachable: async () => false });
     const e = envelope(AGENT, null);
     f.store.appendEnvelope(AGENT, e);
@@ -206,6 +219,22 @@ describe("DocumentDelivery — the backoff is on the ROW, and capped", () => {
     // A backoff held in memory is not a backoff: a daemon restarting in a reconnect loop would
     // hammer an unreachable peer at full rate forever.
     expect(row.nextAttemptAtMs).toBeGreaterThan(NOW + DELIVERY_BACKOFF_CAP_MS);
+  });
+
+  it("schedules the EXACT interval the schedule names, from the pre-increment count", async () => {
+    const f = newFixture({ isPeerReachable: async () => false });
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+
+    // Nothing asserted the scheduled VALUE before, only that it was "later" — so shifting the
+    // schedule by one (backoffFor(attempts + 1)) kept every test green. The delay following the
+    // Nth attempt is the Nth entry, counting from the first.
+    let at = NOW;
+    for (const expected of [DELIVERY_BACKOFF_MS[0], DELIVERY_BACKOFF_MS[1], DELIVERY_BACKOFF_MS[2]]) {
+      await f.delivery.tick(AGENT, f.peerFor, at);
+      expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.nextAttemptAtMs).toBe(at + expected!);
+      at += expected!;
+    }
   });
 
   it("an envelope whose next attempt is not yet due is not attempted", async () => {
@@ -222,7 +251,7 @@ describe("DocumentDelivery — one failure does not abandon the rest", () => {
       deliver: async (input) =>
         input.envelope.logIndex === 0
           ? Promise.reject(new Error("stream reset"))
-          : { ok: true, sessionId: "s" },
+          : { ok: true, admitted: true, sessionId: "s", sessionOpened: false },
     });
     let prev: string | null = null;
     for (let i = 0; i < 2; i++) {
@@ -247,9 +276,39 @@ describe("DocumentDelivery — one failure does not abandon the rest", () => {
 
     expect(res).toMatchObject({ attempted: 0, failed: 1 });
     expect(f.events.some((e) => e.event === "document.delivery.no_peer")).toBe(true);
-    // The envelopes are the operator's work. Abandoning them silently is the one outcome an
-    // append-only log exists to make impossible.
-    expect(f.store.pendingDeliveries(AGENT, NOW)).toHaveLength(1);
+    // Kept — the envelopes are the operator's work, and abandoning them silently is the one
+    // outcome an append-only log exists to make impossible …
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(1);
+    // … but SCHEDULED. The earlier version asserted it was due immediately, which pinned a hot
+    // loop: a missing document row is not transient, so those rows stayed due on every tick
+    // forever, and being ordered and bounded, the pending window they filled starved every other
+    // document — the operator's work elsewhere silently never leaving the machine.
+    expect(f.store.pendingDeliveries(AGENT, NOW + 1)).toHaveLength(0);
+  });
+
+  it("a document with no peer does not STARVE a healthy one", async () => {
+    const f = newFixture();
+    const OTHER = "dd".repeat(32);
+    f.store.createDocument({
+      documentId: OTHER, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    for (let i = 0; i < 3; i++) f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    for (let i = 0; i < 3; i++) {
+      const e = envelope(AGENT, null);
+      f.store.appendEnvelope(AGENT, { ...e, documentId: OTHER });
+    }
+
+    // The healthy document makes progress in the SAME pass — a document whose peer cannot be
+    // resolved must not hold up one whose peer is right there.
+    const first = await f.delivery.tick(AGENT, (d) => (d === DOC ? null : PEER), NOW);
+    expect(first).toMatchObject({ delivered: 3, failed: 3 });
+
+    // And on the next pass the broken document is no longer due at all, so it stops consuming the
+    // bounded window. Left unscheduled, its rows were due on every tick forever and — being
+    // ordered and bounded — could fill that window and starve the healthy document indefinitely.
+    const second = await f.delivery.tick(AGENT, (d) => (d === DOC ? null : PEER), NOW + 1);
+    expect(second).toMatchObject({ attempted: 0, failed: 0, delivered: 0 });
   });
 });
 
@@ -265,5 +324,88 @@ describe("DocumentDelivery — the session hint (§16.4)", () => {
     await g.delivery.tick(AGENT, g.peerFor, NOW);
     // Omitted, the daemon chooses — that is the default, not a fallback for a missing value.
     expect(g.calls[0]!.sessionHint).toBeUndefined();
+  });
+});
+
+
+describe("DocumentDelivery — a rejection is an ACK for delivery purposes (§3.2)", () => {
+  it("stops retrying an envelope the peer answered by refusing", async () => {
+    const f = newFixture({
+      deliver: async () => ({
+        ok: true,
+        admitted: false,
+        sessionId: "s",
+        sessionOpened: true,
+        rejectionReason: "document_append_only_violation",
+      }),
+    });
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    const res = await f.delivery.tick(AGENT, f.peerFor, NOW);
+    expect(res).toMatchObject({ attempted: 1, delivered: 0, rejected: 1 });
+    // The peer has DECIDED. Retrying re-triggers their gate and their retry-round counter until
+    // the document stalls for reasons the operator cannot see — and supersession is the rejection
+    // protocol's job, not the delivery worker's.
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 10)).toHaveLength(0);
+  });
+
+  it("logs a rejection DISTINCTLY from an admission", async () => {
+    const f = newFixture({
+      deliver: async () => ({
+        ok: true, admitted: false, sessionId: "s", sessionOpened: false,
+        rejectionReason: "document_update_too_large",
+      }),
+    });
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    await f.delivery.tick(AGENT, f.peerFor, NOW);
+
+    // One string for both would tell the operator their update was accepted when it was refused.
+    expect(f.events.some((e) => e.event === "document.delivery.acked")).toBe(false);
+    const rejected = f.events.find((e) => e.event === "document.delivery.rejected");
+    expect(rejected!.fields.reason).toBe("document_update_too_large");
+  });
+});
+
+describe("DocumentDelivery — every event carries the correlationId, and the session is logged", () => {
+  it("threads one id through lookup, session and ack", async () => {
+    const f = newFixture();
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    await f.delivery.tick(AGENT, f.peerFor, NOW, { correlationId: "corr-1" });
+
+    const documentEvents = f.events.filter((e) => e.event.startsWith("document.delivery."));
+    expect(documentEvents.length).toBeGreaterThan(0);
+    // Without a shared id an operator reading a failure cannot tie it to the lookup that preceded
+    // it or the session that carried it — across ticks and across restarts.
+    for (const e of documentEvents) expect(e.fields.correlationId).toBe("corr-1");
+    const session = f.events.find((e) => e.event === "document.delivery.session");
+    expect(session!.fields.opened).toBe(true);
+  });
+});
+
+describe("DocumentDelivery — overlapping ticks do not dial twice", () => {
+  it("a second tick during a slow deliver joins the first rather than re-dialing", async () => {
+    let dials = 0;
+    let release: (() => void) | null = null;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const f = newFixture({
+      deliver: async () => {
+        dials += 1;
+        await gate;
+        return { ok: true, admitted: true, sessionId: "s", sessionOpened: true };
+      },
+    });
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    const first = f.delivery.tick(AGENT, f.peerFor, NOW);
+    const second = f.delivery.tick(AGENT, f.peerFor, NOW);
+    release!();
+    await Promise.all([first, second]);
+
+    // A deliver slower than the tick interval is the ordinary case for a distant peer. Without the
+    // guard the second tick returns the same rows and dials again: two autonomous sessions and two
+    // seals for one envelope, and the loser's ack recorded as if the PEER had redelivered it.
+    expect(dials).toBe(1);
   });
 });

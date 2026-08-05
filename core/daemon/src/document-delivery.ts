@@ -46,31 +46,61 @@ export interface DocumentDeliveryTransport {
    * default; `sessionHint` is the one case with audit value — the agent is mid-conversation about
    * the document and wants the discussion and the change in one sealed record).
    */
+  /**
+   * `ok` means the peer's daemon ANSWERED about this envelope — it is not "the peer liked it".
+   * `admitted: false` is a rejection (§3.2's `0x05`), and a rejection IS an ack for delivery
+   * purposes: the peer has decided, so there is nothing left to retry. Without the distinction the
+   * adapter has to map a rejection onto one of two lies — `ok: true` makes the delivery record say
+   * the peer admitted content it refused, and `ok: false` redelivers an envelope the peer has
+   * already ruled on, forever, re-triggering their gate and their retry counter until the document
+   * stalls for reasons the operator cannot see.
+   *
+   * `sessionOpened` distinguishes a session this delivery opened from one it reused — the audit
+   * distinction §16.4 cares about, and unrecoverable after the fact.
+   */
   deliver(input: {
     peerAgentId: string;
     documentId: string;
     envelope: DocumentEnvelopeRow;
     sessionHint?: string;
-  }): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string; detail?: string }>;
+    correlationId: string;
+  }): Promise<
+    | { ok: true; admitted: boolean; sessionId: string; sessionOpened: boolean; rejectionReason?: string }
+    | { ok: false; reason: string; detail?: string }
+  >;
 }
 
-/** Backoff schedule in ms: ~1s, 5s, 30s, 2m, 10m, then capped. */
-export const DELIVERY_BACKOFF_MS = [1_000, 5_000, 30_000, 120_000, 600_000] as const;
 /**
- * The cap. Capped rather than unbounded because the peer coming back online is the event we are
- * waiting for and it can happen at any time — an exponential curve with no ceiling would leave a
- * peer that returned after a long absence waiting hours for a delivery that is ready to go.
+ * Backoff schedule in ms: ~1s, 5s, 30s, 2m, 10m, then the last entry repeats.
+ *
+ * The final entry IS the cap — there is no separate ceiling constant. There was one, set to 900s,
+ * and it was unreachable: the index clamp meant the schedule never produced a value above 600s, so
+ * the exported "cap" was a number the code could not emit and the tests were using it as a synonym
+ * for "much later". A documented limit the implementation cannot reach is worse than none.
+ *
+ * Capped at all because the peer coming back online is the event we are waiting for and it can
+ * happen at any moment — an uncapped curve leaves a peer that returned after a long absence waiting
+ * hours for a delivery that has been ready the whole time.
  */
-export const DELIVERY_BACKOFF_CAP_MS = 900_000;
+export const DELIVERY_BACKOFF_MS = [1_000, 5_000, 30_000, 120_000, 600_000] as const;
+export const DELIVERY_BACKOFF_CAP_MS = DELIVERY_BACKOFF_MS[DELIVERY_BACKOFF_MS.length - 1];
+
+/**
+ * A document whose peer cannot be resolved is not transient, so it gets the cap immediately rather
+ * than climbing to it — but it DOES get scheduled. See the `no_peer` branch.
+ */
+export const DELIVERY_UNRESOLVABLE_RETRY_MS = DELIVERY_BACKOFF_CAP_MS;
 
 export function backoffFor(attempts: number): number {
-  const idx = Math.min(attempts, DELIVERY_BACKOFF_MS.length - 1);
-  return Math.min(DELIVERY_BACKOFF_MS[idx] ?? DELIVERY_BACKOFF_CAP_MS, DELIVERY_BACKOFF_CAP_MS);
+  const idx = Math.min(Math.max(attempts, 0), DELIVERY_BACKOFF_MS.length - 1);
+  return DELIVERY_BACKOFF_MS[idx]!;
 }
 
 export interface DeliveryTickResult {
   attempted: number;
   delivered: number;
+  /** Answered but refused. Acked all the same — the peer has decided. */
+  rejected: number;
   deferred: number;
   failed: number;
 }
@@ -79,6 +109,7 @@ export class DocumentDelivery {
   readonly #store: DocumentStore;
   readonly #transport: DocumentDeliveryTransport;
   readonly #logger: Logger;
+  #inFlight: Promise<DeliveryTickResult> | null = null;
 
   constructor(store: DocumentStore, transport: DocumentDeliveryTransport, logger: Logger) {
     this.#store = store;
@@ -95,10 +126,35 @@ export class DocumentDelivery {
     ownerAgentId: string,
     peerFor: (documentId: string) => string | null,
     nowMs: number,
-    opts: { sessionHint?: string } = {},
+    opts: { sessionHint?: string; correlationId?: string } = {},
   ): Promise<DeliveryTickResult> {
+    // NO RE-ENTRY. Nothing marks a row in-flight until its outcome lands, so a `deliver` slower
+    // than the tick interval — a dial to a distant peer is exactly that — would have the next tick
+    // return the same rows and dial again: two autonomous sessions and two seals for one envelope,
+    // and the loser's markAcked returning false, which logs as if the PEER had redelivered an ack.
+    if (this.#inFlight) return this.#inFlight;
+    const run = this.#run(ownerAgentId, peerFor, nowMs, opts);
+    this.#inFlight = run;
+    try {
+      return await run;
+    } finally {
+      this.#inFlight = null;
+    }
+  }
+
+  async #run(
+    ownerAgentId: string,
+    peerFor: (documentId: string) => string | null,
+    nowMs: number,
+    opts: { sessionHint?: string; correlationId?: string },
+  ): Promise<DeliveryTickResult> {
+    // Minted once per pass and threaded through every event, so an operator can tie a failure back
+    // to the lookup that preceded it and the session that carried it. Delivery is precisely the
+    // async multi-step flow the convention exists for: lookup, dial, deliver, ack — across ticks
+    // and across restarts.
+    const correlationId = opts.correlationId ?? `dlv-${ownerAgentId.slice(0, 8)}-${nowMs}`;
     const pending = this.#store.pendingDeliveries(ownerAgentId, nowMs);
-    const result: DeliveryTickResult = { attempted: 0, delivered: 0, deferred: 0, failed: 0 };
+    const result: DeliveryTickResult = { attempted: 0, delivered: 0, rejected: 0, deferred: 0, failed: 0 };
 
     // Group by document so one reachability lookup serves every pending envelope for that peer.
     // Per-envelope lookups would multiply directory traffic by the size of the backlog, which is
@@ -113,10 +169,26 @@ export class DocumentDelivery {
     for (const [documentId, envelopes] of byDocument) {
       const peerAgentId = peerFor(documentId);
       if (peerAgentId === null) {
-        // No peer means the document row is gone or malformed. Log it and defer rather than
-        // dropping the envelopes: they are the operator's work, and silently abandoning them is
-        // the one outcome an append-only log is supposed to make impossible.
-        this.#logger.error("document.delivery.no_peer", { documentId, pending: envelopes.length });
+        // No peer means the document row is gone or malformed, which is NOT transient — so it goes
+        // straight to the cap rather than climbing to it, and crucially it is SCHEDULED. Skipping
+        // the schedule made this the one exit that never self-corrects: the rows stayed due on
+        // every tick forever, emitting an error line each time, and — because the pending window
+        // is ordered and bounded — they filled it and starved every other document. The operator's
+        // work on an unrelated document would silently never leave the machine, with the only
+        // signal being an error naming a different one.
+        this.#logger.error("document.delivery.no_peer", {
+          documentId,
+          pending: envelopes.length,
+          correlationId,
+        });
+        for (const e of envelopes) {
+          this.#store.recordDeliveryAttempt(
+            ownerAgentId,
+            documentId,
+            e.envelopeHash,
+            nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
+          );
+        }
         result.failed += envelopes.length;
         continue;
       }
@@ -131,6 +203,7 @@ export class DocumentDelivery {
         this.#logger.warn("document.delivery.lookup_failed", {
           documentId,
           peerAgentId,
+          correlationId,
           reason: err instanceof Error ? err.message : String(err),
         });
         this.#defer(ownerAgentId, documentId, envelopes, nowMs);
@@ -143,6 +216,7 @@ export class DocumentDelivery {
           documentId,
           peerAgentId,
           pending: envelopes.length,
+          correlationId,
         });
         this.#defer(ownerAgentId, documentId, envelopes, nowMs);
         result.deferred += envelopes.length;
@@ -151,6 +225,15 @@ export class DocumentDelivery {
 
       for (const envelope of envelopes) {
         result.attempted += 1;
+        // CLAIM THE ROW BEFORE DIALING. Scheduling only on the outcome leaves the row due for the
+        // whole duration of the dial, and leaves it due FOREVER if the daemon dies mid-dial. The
+        // claim is corrected below when the outcome lands.
+        const attempts = this.#store.recordDeliveryAttempt(
+          ownerAgentId,
+          documentId,
+          envelope.envelopeHash,
+          nowMs + backoffFor(envelope.attempts ?? 0),
+        );
         let outcome: Awaited<ReturnType<DocumentDeliveryTransport["deliver"]>>;
         try {
           outcome = await this.#transport.deliver({
@@ -158,6 +241,7 @@ export class DocumentDelivery {
             documentId,
             envelope,
             sessionHint: opts.sessionHint,
+            correlationId,
           });
         } catch (err: unknown) {
           // A THROW IS A FAILURE, never a success. Wrapped here rather than left to propagate so
@@ -170,30 +254,44 @@ export class DocumentDelivery {
         }
 
         if (outcome.ok) {
-          // The ack IS the admission (or the rejection — a 0x05 is an ack for delivery purposes;
-          // supersession is REJECT-1's job). Recording delivery without an ack would leave the
-          // worker believing the peer has content it may never have received.
+          // ACK = the peer's daemon ANSWERED, admitted or not. A rejection is an ack for delivery
+          // purposes (§3.2's 0x05): the peer has decided, so there is nothing left to retry, and
+          // retrying would re-trigger their gate and their retry counter until the document stalls
+          // for reasons the operator cannot see. Supersession is REJECT-1's job, not the worker's.
           const first = this.#store.markAcked(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-          this.#logger.info("document.delivery.acked", {
+          this.#logger.info("document.delivery.session", {
             documentId,
-            envelopeHash: envelope.envelopeHash,
             sessionId: outcome.sessionId,
-            firstAck: first,
+            opened: outcome.sessionOpened,
+            correlationId,
           });
-          result.delivered += 1;
+          if (outcome.admitted) {
+            this.#logger.info("document.delivery.acked", {
+              documentId,
+              envelopeHash: envelope.envelopeHash,
+              sessionId: outcome.sessionId,
+              firstAck: first,
+              correlationId,
+            });
+            result.delivered += 1;
+          } else {
+            this.#logger.warn("document.delivery.rejected", {
+              documentId,
+              envelopeHash: envelope.envelopeHash,
+              sessionId: outcome.sessionId,
+              reason: outcome.rejectionReason,
+              correlationId,
+            });
+            result.rejected += 1;
+          }
         } else {
-          const attempts = this.#store.recordDeliveryAttempt(
-            ownerAgentId,
-            documentId,
-            envelope.envelopeHash,
-            nowMs + backoffFor(envelope.attempts ?? 0),
-          );
           this.#logger.warn("document.delivery.failed", {
             documentId,
             envelopeHash: envelope.envelopeHash,
             reason: outcome.reason,
             detail: outcome.detail,
             attempts,
+            correlationId,
           });
           result.failed += 1;
         }
