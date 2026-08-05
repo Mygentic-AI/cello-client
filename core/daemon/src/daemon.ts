@@ -86,6 +86,7 @@ import { registerContactHandlers } from "./contact-handlers.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
+import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
@@ -3156,6 +3157,53 @@ async function startDaemonHoldingLock(
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");
   });
+
+  // M14 / DOD-DOC-INBOUND-2: the document layer, wired to the session content path.
+  //
+  // Built as ONE thing (see `document-layer.ts`): every half-wiring is a distinct silent failure —
+  // an inbound path with no ack producer leaves the peer retrying until their document stalls, a
+  // delivery worker with no inbound counterpart publishes envelopes nobody can answer.
+  //
+  // It shares the daemon's SQLCipher handle rather than opening its own. One encrypted database,
+  // one key, one file to back up — and a second opener is a second thing that has to agree about
+  // the key, which is how a store ends up plaintext.
+  const documentLayer = createDocumentLayer({
+    db: sessionNodeManager.getDb(),
+    logger,
+    // M14-D5: a remote agent's id IS its K_local pubkey hex, so this needs no lookup — and a lookup
+    // on the critical path of every signature check is precisely what it must not have.
+    publicKeyFor: agentPublicKeyFromId,
+    notifyPeer: async () => ({
+      // NOT WIRED YET, and it says so rather than reporting a notification that did not happen.
+      // `kill` still succeeds locally — LIFECYCLE-1 made it deliberately independent of the peer
+      // being reachable — and reports `peerNotified: false`, which is the truthful answer.
+      ok: false,
+      reason: "document_peer_notify_not_wired",
+    }),
+    rollback: () => ({
+      // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting
+      // success having reverted nothing tells an operator their update was retracted while their
+      // file still contains it.
+      ok: false,
+      reason: "document_rollback_not_wired",
+    }),
+    sign: async (ownerAgentId, tbs) => {
+      // Signs as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
+      // Resolved by NAME because `keyProviders` is keyed by agent name; a missing provider throws
+      // rather than substituting another agent's key — an earlier version of this callback took no
+      // agent at all and reached for whichever provider was first in the map, which is fabricated
+      // crypto wearing a real signature.
+      const provider = keyProviders.get(ownerAgentId);
+      if (!provider) {
+        throw new Error(
+          `document_rejection_unsigned: no key provider for ${ownerAgentId}, so its rejection ` +
+            `cannot be signed — refusing rather than writing an unsigned leaf into an append-only log`,
+        );
+      }
+      return provider.sign(tbs);
+    },
+  });
+  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame);
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
