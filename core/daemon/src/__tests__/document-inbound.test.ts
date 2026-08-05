@@ -95,7 +95,7 @@ function newFixture(opts: { verify?: () => boolean; order?: string[]; appendOnly
     store, engine, gate, rejections, logger,
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
-    crypto: () => ({
+    crypto: async () => ({
       signature: new Uint8Array(64).fill(1),
       stateVector: new Uint8Array([0]),
       nonce: `n${Math.floor(NOW)}`,
@@ -105,20 +105,20 @@ function newFixture(opts: { verify?: () => boolean; order?: string[]; appendOnly
 }
 
 describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
-  it("appends it, applies it, and reports admitted", () => {
+  it("appends it, applies it, and reports admitted", async () => {
     const f = newFixture();
     const env = envelope();
 
-    const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
     expect(res).toMatchObject({ ok: true, admitted: true });
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
     expect(f.live.getText("content").toString()).toContain("peer text");
   });
 
-  it("the ack names the envelope, so the sender can settle the right one", () => {
+  it("the ack names the envelope, so the sender can settle the right one", async () => {
     const f = newFixture();
     const env = envelope();
-    const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
     // An ack that does not identify what it acknowledges cannot settle anything — the sender has
     // a backlog, not a single outstanding envelope.
     expect((res as { envelopeHash: string }).envelopeHash).toBe(documentEnvelopeHash(env));
@@ -126,9 +126,9 @@ describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
 });
 
 describe("DocumentInbound — the ORDER is the security property", () => {
-  it("REFUSES an envelope whose signature does not verify, and applies NOTHING", () => {
+  it("REFUSES an envelope whose signature does not verify, and applies NOTHING", async () => {
     const f = newFixture({ verify: () => false });
-    const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
 
     expect(res).toMatchObject({ ok: false, reason: "document_signature_invalid" });
     // Not admitted, not logged, not applied, and NOT rejected either: a rejection is a protocol
@@ -138,7 +138,7 @@ describe("DocumentInbound — the ORDER is the security property", () => {
     expect(f.store.listQuarantined(AGENT, DOC)).toHaveLength(0);
   });
 
-  it("verifies the signature BEFORE the gate — an unsigned envelope never REACHES the rules", () => {
+  it("verifies the signature BEFORE the gate — an unsigned envelope never REACHES the rules", async () => {
     const order: string[] = [];
     const f = newFixture({
       order,
@@ -147,7 +147,7 @@ describe("DocumentInbound — the ORDER is the security property", () => {
         return false;
       },
     });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
     // The gate is INSTRUMENTED, so this asserts it was never reached. The earlier version only ever
     // pushed from the verify callback, so `["verify"]` was satisfied by any implementation calling
     // verify once — including one that ran the gate first. It was the headline test and it pinned
@@ -155,7 +155,7 @@ describe("DocumentInbound — the ORDER is the security property", () => {
     expect(order).toEqual(["verify"]);
   });
 
-  it("reaches the gate ONLY after a signature that verifies", () => {
+  it("reaches the gate ONLY after a signature that verifies", async () => {
     const order: string[] = [];
     const f = newFixture({
       order,
@@ -164,14 +164,14 @@ describe("DocumentInbound — the ORDER is the security property", () => {
         return true;
       },
     });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
     // The positive half. Swap the two steps and this becomes ["gate", "verify"].
     expect(order).toEqual(["verify", "gate"]);
   });
 
-  it("does not disclose the peer's identity to an unauthenticated sender", () => {
+  it("does not disclose the peer's identity to an unauthenticated sender", async () => {
     const f = newFixture();
-    const res = f.inbound.receive(
+    const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: "a-stranger" })),
       NOW,
@@ -181,9 +181,9 @@ describe("DocumentInbound — the ORDER is the security property", () => {
     expect((res as { detail: string }).detail).not.toContain(PEER);
   });
 
-  it("refuses a malformed envelope by name, before anything else happens", () => {
+  it("refuses a malformed envelope by name, before anything else happens", async () => {
     const f = newFixture();
-    const res = f.inbound.receive(AGENT, new Uint8Array([1, 2, 3]), NOW);
+    const res = await f.inbound.receive(AGENT, new Uint8Array([1, 2, 3]), NOW);
     expect(res).toMatchObject({ ok: false });
     // Wrapped, not passed through raw: a lib0/CBOR decoder message names library internals and
     // reads as a crash, not a protocol refusal.
@@ -191,15 +191,15 @@ describe("DocumentInbound — the ORDER is the security property", () => {
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 
-  it("refuses an envelope for a document this agent does not have", () => {
+  it("refuses an envelope for a document this agent does not have", async () => {
     const f = newFixture();
-    const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope({ document_id: "ab".repeat(32) })), NOW);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope({ document_id: "ab".repeat(32) })), NOW);
     expect(res).toMatchObject({ ok: false, reason: "document_unknown" });
   });
 
-  it("refuses an envelope from someone who is not this document's peer", () => {
+  it("refuses an envelope from someone who is not this document's peer", async () => {
     const f = newFixture();
-    const res = f.inbound.receive(
+    const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: "a-stranger" })),
       NOW,
@@ -212,12 +212,12 @@ describe("DocumentInbound — the ORDER is the security property", () => {
 });
 
 describe("DocumentInbound — a chain gap refuses; a REDELIVERY is benign", () => {
-  it("acks a redelivered envelope without applying it twice", () => {
+  it("acks a redelivered envelope without applying it twice", async () => {
     const f = newFixture();
     const wire = encodeDocumentUpdateEnvelope(envelope());
 
-    expect(f.inbound.receive(AGENT, wire, NOW)).toMatchObject({ ok: true, admitted: true });
-    const second = f.inbound.receive(AGENT, wire, NOW + 1);
+    expect(await f.inbound.receive(AGENT, wire, NOW)).toMatchObject({ ok: true, admitted: true });
+    const second = await f.inbound.receive(AGENT, wire, NOW + 1);
 
     // Delivery retries across restarts by design, so a redelivery is expected traffic. It must ack
     // — otherwise the sender never settles it — and it must not append or apply a second time.
@@ -225,9 +225,9 @@ describe("DocumentInbound — a chain gap refuses; a REDELIVERY is benign", () =
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
   });
 
-  it("REFUSES an envelope that chains to something we have never seen", () => {
+  it("REFUSES an envelope that chains to something we have never seen", async () => {
     const f = newFixture();
-    const res = f.inbound.receive(
+    const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(envelope({ doc_prev_hash: "ee".repeat(32) })),
       NOW,
@@ -239,11 +239,11 @@ describe("DocumentInbound — a chain gap refuses; a REDELIVERY is benign", () =
 });
 
 describe("DocumentInbound — a gate refusal becomes a REJECTION, and the ack says so", () => {
-  it("quarantines the bytes, writes the 0x05 leaf, and acks as NOT admitted", () => {
+  it("quarantines the bytes, writes the 0x05 leaf, and acks as NOT admitted", async () => {
     const f = newFixture({ appendOnly: true });
     // Seed an accepted base so the peer's update can delete from it.
     const base = envelope({ update: update(PEER_CLIENT, "original content. ") });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
 
     const deleting = new Y.Doc();
     deleting.clientID = PEER_CLIENT;
@@ -254,7 +254,7 @@ describe("DocumentInbound — a gate refusal becomes a REJECTION, and the ack sa
       doc_prev_hash: documentEnvelopeHash(base),
     });
 
-    const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW + 1);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW + 1);
     // A rejection IS an ack for delivery purposes — the peer has decided, so the sender must stop
     // retrying and supersede instead.
     expect(res).toMatchObject({ ok: true, admitted: false });
@@ -262,17 +262,17 @@ describe("DocumentInbound — a gate refusal becomes a REJECTION, and the ack sa
     expect(f.store.listQuarantined(AGENT, DOC)).toHaveLength(1);
   });
 
-  it("does NOT apply a refused update to the live document", () => {
+  it("does NOT apply a refused update to the live document", async () => {
     const f = newFixture({ appendOnly: true });
     const base = envelope({ update: update(PEER_CLIENT, "original content. ") });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
     const before = f.live.getText("content").toString();
 
     const deleting = new Y.Doc();
     deleting.clientID = PEER_CLIENT;
     Y.applyUpdate(deleting, base.update);
     deleting.getText("content").delete(0, 8);
-    f.inbound.receive(
+    await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(
         envelope({ update: Y.encodeStateAsUpdate(deleting), doc_prev_hash: documentEnvelopeHash(base) }),
@@ -289,11 +289,11 @@ describe("DocumentInbound — a gate refusal becomes a REJECTION, and the ack sa
 
 describe("DocumentInbound — a document that has STOPPED accepting does not admit", () => {
   for (const status of ["killed", "closed", "stalled"] as const) {
-    it(`refuses while ${status}, naming that as the cause`, () => {
+    it(`refuses while ${status}, naming that as the cause`, async () => {
       const f = newFixture();
       f.store.setDocumentStatus(AGENT, DOC, status);
 
-      const res = f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+      const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
       expect(res.ok).toBe(false);
       // Reporting this envelope's own gate verdict instead would send an operator to the
       // append-only rule for a document that has been frozen for days.
@@ -304,10 +304,10 @@ describe("DocumentInbound — a document that has STOPPED accepting does not adm
 });
 
 describe("DocumentInbound — a REJECTED envelope redelivered does not advance the round", () => {
-  it("re-answers with the recorded reason instead of rejecting again", () => {
+  it("re-answers with the recorded reason instead of rejecting again", async () => {
     const f = newFixture({ appendOnly: true });
     const base = envelope({ update: update(PEER_CLIENT, "original content. ") });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
 
     const deleting = new Y.Doc();
     deleting.clientID = PEER_CLIENT;
@@ -317,14 +317,14 @@ describe("DocumentInbound — a REJECTED envelope redelivered does not advance t
       envelope({ update: Y.encodeStateAsUpdate(deleting), doc_prev_hash: documentEnvelopeHash(base) }),
     );
 
-    const first = f.inbound.receive(AGENT, wire, NOW + 1);
+    const first = await f.inbound.receive(AGENT, wire, NOW + 1);
     expect(first).toMatchObject({ ok: true, admitted: false });
 
     // A rejected envelope's hash is never written to the log, so a redelivery is NOT a duplicate.
     // Re-running the gate minted a fresh nonce and advanced the retry round — so a peer whose acks
     // were being lost, which is delivery's ordinary retry behaviour, permanently stalled the shared
     // document in three attempts with no hostility required.
-    for (let i = 0; i < 5; i++) f.inbound.receive(AGENT, wire, NOW + 2 + i);
+    for (let i = 0; i < 5; i++) await f.inbound.receive(AGENT, wire, NOW + 2 + i);
 
     expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
     expect(f.store.listQuarantined(AGENT, DOC)).toHaveLength(1);
@@ -332,10 +332,10 @@ describe("DocumentInbound — a REJECTED envelope redelivered does not advance t
 });
 
 describe("DocumentInbound — append_only comes from the AGREED property", () => {
-  it("enforces it with no caller option, because the property is where it was agreed", () => {
+  it("enforces it with no caller option, because the property is where it was agreed", async () => {
     const f = newFixture({ appendOnly: true });
     const base = envelope({ update: update(PEER_CLIENT, "original content. ") });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
 
     const deleting = new Y.Doc();
     deleting.clientID = PEER_CLIENT;
@@ -345,7 +345,7 @@ describe("DocumentInbound — append_only comes from the AGREED property", () =>
     // Taken from a caller option defaulting to OFF, a document configured append-only was
     // unprotected unless every future call site remembered the flag — and the gate's own header
     // says append_only is the only thing standing between a bound peer and erasure.
-    const res = f.inbound.receive(
+    const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(
         envelope({ update: Y.encodeStateAsUpdate(deleting), doc_prev_hash: documentEnvelopeHash(base) }),
@@ -355,16 +355,16 @@ describe("DocumentInbound — append_only comes from the AGREED property", () =>
     expect(res).toMatchObject({ ok: true, admitted: false });
   });
 
-  it("does NOT enforce it when the document did not agree to it", () => {
+  it("does NOT enforce it when the document did not agree to it", async () => {
     const f = newFixture({ appendOnly: false });
     const base = envelope({ update: update(PEER_CLIENT, "original content. ") });
-    f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(base), NOW);
 
     const deleting = new Y.Doc();
     deleting.clientID = PEER_CLIENT;
     Y.applyUpdate(deleting, base.update);
     deleting.getText("content").delete(0, 8);
-    const res = f.inbound.receive(
+    const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(
         envelope({ update: Y.encodeStateAsUpdate(deleting), doc_prev_hash: documentEnvelopeHash(base) }),

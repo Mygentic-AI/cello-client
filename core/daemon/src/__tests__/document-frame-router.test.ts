@@ -5,7 +5,7 @@
  * wrong in the other makes a message vanish. Neither is recoverable by the operator.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   encodeDocumentUpdateEnvelope,
   encodeDocumentAck,
@@ -79,51 +79,59 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
 }
 
 describe("DocumentFrameRouter — classification is by DECODE", () => {
-  it("routes an update envelope to the document inbound path", () => {
+  it("routes an update envelope to the document inbound path", async () => {
     const r = newRouter();
-    const res = r.router.route(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-    expect(res).toMatchObject({ consumed: true, kind: "update", ok: true });
-    expect(r.calls).toEqual(["update"]);
+    // routeSync answers what the session path needs INLINE — is this document traffic, and which
+    // leaf kind. The handling is async because a refusal must sign a 0x05 leaf.
+    expect(r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    await vi.waitFor(() => expect(r.calls).toEqual(["update"]));
   });
 
-  it("routes an ack to the ack path", () => {
+  it("routes an ack to the ack path", async () => {
     const r = newRouter();
-    const res = r.router.route(AGENT, encodeDocumentAck(ackFrame), NOW, "c");
-    expect(res).toMatchObject({ consumed: true, kind: "ack", ok: true });
-    expect(r.calls).toEqual(["ack"]);
+    expect(r.router.routeSync(AGENT, encodeDocumentAck(ackFrame), NOW, "c")).toEqual({
+      consumed: true,
+      kind: "ack",
+    });
+    await vi.waitFor(() => expect(r.calls).toEqual(["ack"]));
   });
 
-  it("leaves an ordinary conversation message alone", () => {
+  it("leaves an ordinary conversation message alone", async () => {
     const r = newRouter();
     const message = new TextEncoder().encode("Hey - did you see the draft I sent over?");
     // Not consumed means the caller records it as a transcript message and fires the doorbell
     // exactly as before. Nothing about the conversation path changes.
-    expect(r.router.route(AGENT, message, NOW, "c")).toEqual({ consumed: false });
+    expect(r.router.routeSync(AGENT, message, NOW, "c")).toEqual({ consumed: false });
     expect(r.calls).toEqual([]);
   });
 
-  it("leaves ARBITRARY bytes alone rather than guessing", () => {
+  it("leaves ARBITRARY bytes alone rather than guessing", async () => {
     const r = newRouter();
     for (const bytes of [new Uint8Array(0), new Uint8Array([0]), new Uint8Array([0xa1, 0x01, 0x02])]) {
-      expect(r.router.route(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
+      expect(r.router.routeSync(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
     }
     // A misrouted document frame lands in a transcript and is visible; a misrouted MESSAGE would
     // vanish into the document layer and never reach the operator. Not-document is the safe default.
     expect(r.calls).toEqual([]);
   });
 
-  it("does not let one document type claim the other's frame", () => {
+  it("does not let one document type claim the other's frame", async () => {
     const r = newRouter();
-    r.router.route(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-    r.router.route(AGENT, encodeDocumentAck(ackFrame), NOW, "c");
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+    r.router.routeSync(AGENT, encodeDocumentAck(ackFrame), NOW, "c");
     // Both decoders check their `type` discriminator before anything else, so the try-in-turn
-    // ordering cannot misassign a well-formed frame.
-    expect(r.calls).toEqual(["update", "ack"]);
+    // ordering cannot misassign a well-formed frame. And the two arrive in the order sent — the
+    // per-owner queue is what guarantees an envelope's predecessor is stored before its successor
+    // is chain-checked.
+    await vi.waitFor(() => expect(r.calls).toEqual(["update", "ack"]));
   });
 
-  it("says nothing in the log for an ordinary message", () => {
+  it("says nothing in the log for an ordinary message", async () => {
     const r = newRouter();
-    r.router.route(AGENT, new TextEncoder().encode("hello"), NOW, "c");
+    r.router.routeSync(AGENT, new TextEncoder().encode("hello"), NOW, "c");
     // EVERY conversation message reaches the classifier. A log line here would put one entry per
     // message into the daemon log for the ordinary case.
     expect(r.events).toEqual([]);
@@ -131,38 +139,46 @@ describe("DocumentFrameRouter — classification is by DECODE", () => {
 });
 
 describe("DocumentFrameRouter — a refusal is CONSUMED, not handed to the conversation path", () => {
-  it("reports the document layer's reason without falling back to transcript", () => {
+  it("reports the document layer's reason without falling back to transcript", async () => {
     const r = newRouter({
       onUpdate: () => ({ ok: false, reason: "document_signature_invalid", detail: "nope" }),
     });
-    const res = r.router.route(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
     // Falling through to the conversation path on a refusal would put a refused CRDT envelope into
     // the operator's transcript, where cello_receive hands it to an agent as something a person said.
-    expect(res).toMatchObject({ consumed: true, ok: false, reason: "document_signature_invalid" });
+    // The frame is CONSUMED synchronously; the refusal is reported when the handling completes.
+    expect(r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    await vi.waitFor(() =>
+      expect(r.events.some((e) => e.event === "document.frame.refused")).toBe(true),
+    );
   });
 });
 
 describe("DocumentFrameRouter — a handler throw does not take the session down", () => {
-  it("contains it, reports it, and keeps the frame consumed", () => {
+  it("contains it, reports it, and keeps the frame consumed", async () => {
     const r = newRouter({
       onUpdate: () => {
         throw new Error("boom");
       },
     });
-    const res = r.router.route(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
 
-    // Letting it escape into the session content path means a peer could stop the operator's
-    // MESSAGES from being delivered by sending one bad document frame.
-    expect(res).toMatchObject({ consumed: true, ok: false, reason: "document_frame_handler_threw" });
-    const logged = r.events.find((e) => e.event === "document.frame.handler_threw");
-    expect(logged!.fields.reason).toContain("boom");
-    expect(logged!.fields.correlationId).toBe("c");
+    // Letting it escape means a peer could stop the operator's MESSAGES from being delivered by
+    // sending one bad document frame — and now that handling is async, an escaped throw would also
+    // be an unhandled rejection.
+    await vi.waitFor(() => {
+      const logged = r.events.find((e) => e.event === "document.frame.handler_threw");
+      expect(logged!.fields.reason).toContain("boom");
+      expect(logged!.fields.correlationId).toBe("c");
+    });
   });
 });
 
 
 describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () => {
-  it("handles every MEASURED pathological input in milliseconds", () => {
+  it("handles every MEASURED pathological input in milliseconds", async () => {
     const r = newRouter();
     // Each of these cost SECONDS and gigabytes before the decoder was bounded. The last two get
     // PAST the header guard — `a1 9f` is a one-pair map whose first key is an indefinite array, and
@@ -171,14 +187,14 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     for (const hex of ["9fb0", "9f26", "9f", "bf", "a19f", "b9000a9f26", "a1bf", "b8209f26"]) {
       const bytes = Uint8Array.from(Buffer.from(hex, "hex"));
       const started = Date.now();
-      r.router.route(AGENT, bytes, NOW, "c");
+      r.router.routeSync(AGENT, bytes, NOW, "c");
       // The guarded path measures well under a millisecond and the regression this catches is a
       // 5-10 SECOND stall, so the margin is ~300x — a GC pause cannot false-positive it.
       expect(Date.now() - started).toBeLessThan(100);
     }
   });
 
-  it("a map header claiming an enormous field count never reaches a decoder", () => {
+  it("a map header claiming an enormous field count never reaches a decoder", async () => {
     const r = newRouter();
     // The wall clock is the assertion that has teeth. Asserting only `consumed: false` was hollow:
     // these inputs also return consumed:false WITHOUT the guard, because they throw quickly — so
@@ -188,12 +204,12 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
       new Uint8Array([0xb9, 0xff, 0xff]),
     ]) {
       const started = Date.now();
-      expect(r.router.route(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
+      expect(r.router.routeSync(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
       expect(Date.now() - started).toBeLessThan(100);
     }
   });
 
-  it("the real frames declare fewer fields than the CONSTANT admits", () => {
+  it("the real frames declare fewer fields than the CONSTANT admits", async () => {
     // Against the CONSTANT, not a hardcoded 32. The earlier version compared to a literal, so
     // lowering MAX_DOCUMENT_FRAME_FIELDS to 8 kept it green while real frames were reclassified as
     // conversation — the exact defect its own comment described.
@@ -203,18 +219,18 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     }
   });
 
-  it("refuses an oversized frame without decoding it", () => {
+  it("refuses an oversized frame without decoding it", async () => {
     const r = newRouter();
     const huge = new Uint8Array(MAX_DOCUMENT_FRAME_BYTES + 1);
     huge[0] = 0xb9;
     const started = Date.now();
     // The length cap is what bounds the nesting depth, and it runs before anything else looks at
     // the frame. The decoder's per-container limit only reduces amplification.
-    expect(r.router.route(AGENT, huge, NOW, "c")).toEqual({ consumed: false });
+    expect(r.router.routeSync(AGENT, huge, NOW, "c")).toEqual({ consumed: false });
     expect(Date.now() - started).toBeLessThan(100);
   });
 
-  it("the admitted header range stays inside the UTF-8 continuation bytes", () => {
+  it("the admitted header range stays inside the UTF-8 continuation bytes", async () => {
     // The header comment's proof — that no conversation message can be classified as a document
     // frame — rests entirely on every admitted first byte being a UTF-8 CONTINUATION byte
     // (0x80-0xbf), which can never begin a valid sequence. Widen the range past 0xbf and the
@@ -240,19 +256,19 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     }
   });
 
-  it("the byte cap clears the largest update the gate will admit", () => {
+  it("the byte cap clears the largest update the gate will admit", async () => {
     // Sized off the payload rather than picked: refusing a legitimate 1 MiB update would be the
     // worse failure direction, exactly as with the decoder limit.
     expect(MAX_DOCUMENT_FRAME_BYTES).toBeGreaterThan(1024 * 1024);
   });
 
-  it("STILL admits the real frames, which use a non-minimal 2-byte count", () => {
+  it("STILL admits the real frames, which use a non-minimal 2-byte count", async () => {
     const r = newRouter();
     const wire = encodeDocumentUpdateEnvelope(updateEnvelope);
     // b9 00 0a — cbor.ts documents this encoder's non-minimal map header deliberately, so a guard
     // that only admitted the inline-count form would route every genuine document frame to the
     // transcript.
     expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000a");
-    expect(r.router.route(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
+    expect(r.router.routeSync(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
   });
 });

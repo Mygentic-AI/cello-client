@@ -85,6 +85,18 @@ export type FrameRouting =
   | { consumed: false }
   | { consumed: true; kind: "update" | "ack"; ok: boolean; reason?: string };
 
+/**
+ * What the session layer needs SYNCHRONOUSLY: is this document traffic, and therefore which leaf
+ * kind does the frame get.
+ *
+ * The handling itself is async — a gate refusal has to SIGN a `0x05` leaf, and signing goes through
+ * an async key provider — but `#appendVerifiedContent` decides the leaf kind inline and cannot wait.
+ * Splitting the two is what lets both be true without making the whole content path async.
+ */
+export type FrameClassification =
+  | { consumed: false }
+  | { consumed: true; kind: "update" | "ack" };
+
 export interface DocumentFrameRouterDeps {
   inbound: DocumentInbound;
   ackInbound: DocumentAckInbound;
@@ -93,6 +105,8 @@ export interface DocumentFrameRouterDeps {
 
 export class DocumentFrameRouter {
   readonly #d: DocumentFrameRouterDeps;
+  /** One promise chain per owning agent — the serialization point. See `#enqueue`. */
+  readonly #queues = new Map<string, Promise<void>>();
 
   constructor(deps: DocumentFrameRouterDeps) {
     this.#d = deps;
@@ -106,18 +120,88 @@ export class DocumentFrameRouter {
    * malformed. A document frame that cannot be handled is consumed and reported; the session keeps
    * running.
    */
-  route(
+  /**
+   * The SYNCHRONOUS half: classify, and start the handling.
+   *
+   * Returns immediately with what the session layer needs to pick a leaf kind. The handling runs on
+   * a per-document queue — see `#handle` — so the caller never waits and frames for one document
+   * never overtake each other.
+   */
+  routeSync(
     ownerAgentId: string,
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
-  ): FrameRouting {
+  ): FrameClassification {
     const kind = classify(content);
     if (kind === null) return { consumed: false };
+    void this.#enqueue(ownerAgentId, content, nowMs, correlationId, kind);
+    return { consumed: true, kind };
+  }
 
+  /**
+   * SERIALIZED PER DOCUMENT-OWNER, because the chain check is order-dependent even though Yjs is
+   * not. An envelope's `doc_prev_hash` must find its predecessor already stored, so two frames
+   * handled concurrently can have the second refuse with `document_chain_broken` purely because the
+   * first has not finished writing — a self-inflicted fork that looks like a peer fault.
+   *
+   * Keyed by owner rather than by document: the document id is inside the frame, and reading it
+   * requires the decode this queue exists to schedule.
+   */
+  #enqueue(
+    ownerAgentId: string,
+    content: Uint8Array,
+    nowMs: number,
+    correlationId: string,
+    kind: "update" | "ack",
+  ): Promise<void> {
+    const previous = this.#queues.get(ownerAgentId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {
+        // A previous frame's failure must not cancel this one's turn. It was already reported.
+      })
+      .then(async () => {
+        // `kind` is passed through rather than re-derived: `classify` does up to two full CBOR
+        // decodes, and this runs on every inbound frame.
+        const outcome = await this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind);
+        if (outcome.consumed && !outcome.ok) {
+          this.#d.logger.warn("document.frame.refused", {
+            kind: outcome.kind,
+            reason: outcome.reason,
+            correlationId,
+          });
+        }
+      });
+    this.#queues.set(ownerAgentId, next);
+    // Drop the entry once it is the tail, so the map does not grow one promise per agent forever.
+    void next.finally(() => {
+      if (this.#queues.get(ownerAgentId) === next) this.#queues.delete(ownerAgentId);
+    });
+    return next;
+  }
+
+  /** Classify and handle, awaiting the outcome. The path a caller takes when it wants the verdict. */
+  async route(
+    ownerAgentId: string,
+    content: Uint8Array,
+    nowMs: number,
+    correlationId: string,
+  ): Promise<FrameRouting> {
+    const kind = classify(content);
+    if (kind === null) return { consumed: false };
+    return this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind);
+  }
+
+  async #dispatch(
+    ownerAgentId: string,
+    content: Uint8Array,
+    nowMs: number,
+    correlationId: string,
+    kind: "update" | "ack",
+  ): Promise<FrameRouting> {
     try {
       if (kind === "update") {
-        const res = this.#d.inbound.receive(ownerAgentId, content, nowMs, correlationId);
+        const res = await this.#d.inbound.receive(ownerAgentId, content, nowMs, correlationId);
         return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
       }
       const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);

@@ -62,8 +62,14 @@ export interface DocumentLayerDeps {
     documentId: string,
     envelopeHash: string,
   ): { ok: true } | { ok: false; reason: string };
-  /** The rejection's own signature, state vector and nonce. Never fabricated inside the layer. */
-  crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: string };
+  /**
+   * The rejection's own signature, state vector and nonce. Never fabricated inside the layer.
+   *
+   * ASYNC because signing goes through a key provider. That async is what forced the router to
+   * split synchronous CLASSIFICATION (which the session path needs inline, to pick a leaf kind)
+   * from asynchronous HANDLING.
+   */
+  crypto(): Promise<{ signature: Uint8Array; stateVector: Uint8Array; nonce: string }>;
 }
 
 export interface DocumentLayer {
@@ -165,6 +171,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // frame, and the envelope's own signed `sender_agent_id` is what the inbound path checks
       // against that binding. Trusting the transport identity instead would let a frame arriving
       // on any session act on any document that session's peer happens to share.
-      router.route(agentName, content, Date.now(), correlationId ?? "frame"),
+      router.routeSync(agentName, content, Date.now(), correlationId ?? "frame"),
   };
 }

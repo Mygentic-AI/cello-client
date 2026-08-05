@@ -8,7 +8,7 @@
  * `node:sqlite` here is the test-file allowance; production is SQLCipher.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import * as Y from "yjs";
 import { generateKeypair } from "@cello-protocol/crypto";
@@ -58,7 +58,7 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
       agentId === PEER && opts.knowPeerKey !== false ? publicKey : null,
     notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),
-    crypto: () => ({
+    crypto: async () => ({
       signature: new Uint8Array(64).fill(1),
       stateVector: new Uint8Array([0]),
       nonce: `n${NOW}`,
@@ -95,9 +95,13 @@ describe("document layer — a REAL signature is verified end to end", () => {
     const f = await newFixture();
     const env = await f.signedEnvelope();
 
-    const routed = f.layer.onDocumentFrame(AGENT, "session-1", encodeDocumentUpdateEnvelope(env), "pk");
-    expect(routed).toMatchObject({ consumed: true, kind: "update", ok: true });
-    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+    // The hook answers SYNCHRONOUSLY with what the session path needs — is this document traffic,
+    // and which leaf kind. The handling is async because a refusal must sign a 0x05 leaf.
+    expect(f.layer.onDocumentFrame(AGENT, "session-1", encodeDocumentUpdateEnvelope(env), "pk")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1));
     expect(f.layer.live.get(AGENT, DOC).getText("content").toString()).toContain("from the peer");
   });
 
@@ -108,8 +112,10 @@ describe("document layer — a REAL signature is verified end to end", () => {
     const tampered = { ...env, signature: new Uint8Array(env.signature) };
     tampered.signature[0] ^= 0xff;
 
-    const routed = f.layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(tampered), "pk");
-    expect(routed).toMatchObject({ consumed: true, ok: false, reason: "document_signature_invalid" });
+    f.layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(tampered), "pk");
+    await vi.waitFor(() =>
+      expect(f.events.some((e) => e.event === "document.inbound.signature_invalid")).toBe(true),
+    );
     expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 
@@ -117,11 +123,11 @@ describe("document layer — a REAL signature is verified end to end", () => {
     const f = await newFixture({ knowPeerKey: false });
     const env = await f.signedEnvelope();
 
-    const routed = f.layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
+    f.layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
     // "Cannot verify" must land as a refusal, not as an admission — admitting what we cannot
     // authenticate is the outcome the verify step exists to prevent.
-    expect(routed).toMatchObject({ consumed: true, ok: false, reason: "document_signature_invalid" });
-    expect(f.events.some((e) => e.event === "document.verify.no_key")).toBe(true);
+    await vi.waitFor(() => expect(f.events.some((e) => e.event === "document.verify.no_key")).toBe(true));
+    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 
   it("treats a MALFORMED key as a refusal, not a crash", async () => {
@@ -134,7 +140,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
       publicKeyFor: () => new Uint8Array(3), // not a valid Ed25519 key
       notifyPeer: async () => ({ ok: true }),
       rollback: () => ({ ok: true }),
-      crypto: () => ({ signature: new Uint8Array(64), stateVector: new Uint8Array([0]), nonce: "n" }),
+      crypto: async () => ({ signature: new Uint8Array(64), stateVector: new Uint8Array([0]), nonce: "n" }),
     });
     layer.store.createDocument({
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
@@ -146,9 +152,8 @@ describe("document layer — a REAL signature is verified end to end", () => {
     // The bytes came from a peer, so a bad key is a refusal rather than a crash. `verify` fails
     // closed by contract — its own body catches and returns false — which is why the layer wraps it
     // in no try/catch: that branch would be unreachable.
-    const routed = layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
-    expect(routed).toMatchObject({ consumed: true, ok: false, reason: "document_signature_invalid" });
-    expect(layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
+    await vi.waitFor(() => expect(layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0));
   });
 });
 
@@ -161,19 +166,31 @@ describe("document layer — the frame is scoped by the OWNING AGENT, not the se
     // A document is bound to its PEER by the handshake, not to whichever session carried the
     // frame. Trusting the transport identity would let a frame arriving on any session act on any
     // document that session's peer happens to share.
-    const viaOne = f.layer.onDocumentFrame(AGENT, "session-A", wire, "pubkey-A");
-    expect(viaOne).toMatchObject({ consumed: true, ok: true });
-    const viaAnother = f.layer.onDocumentFrame(AGENT, "session-B", wire, "pubkey-B");
-    // Same envelope, different session: a redelivery, acked, not a second admission.
-    expect(viaAnother).toMatchObject({ consumed: true, ok: true });
-    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+    expect(f.layer.onDocumentFrame(AGENT, "session-A", wire, "pubkey-A")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    // Same envelope, different session: a redelivery, not a second admission. The per-owner queue
+    // is what makes that deterministic — handled concurrently, the second could refuse with a
+    // chain break purely because the first had not finished writing.
+    expect(f.layer.onDocumentFrame(AGENT, "session-B", wire, "pubkey-B")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1));
   });
 
   it("refuses a frame for an agent that does not hold the document", async () => {
     const f = await newFixture();
     const env = await f.signedEnvelope();
-    const routed = f.layer.onDocumentFrame("someone-else", "s", encodeDocumentUpdateEnvelope(env), "pk");
-    expect(routed).toMatchObject({ consumed: true, ok: false, reason: "document_unknown" });
+    f.layer.onDocumentFrame("someone-else", "s", encodeDocumentUpdateEnvelope(env), "pk");
+    await vi.waitFor(() =>
+      expect(
+        f.events.some(
+          (e) => e.event === "document.frame.refused" && e.fields.reason === "document_unknown",
+        ),
+      ).toBe(true),
+    );
   });
 });
 

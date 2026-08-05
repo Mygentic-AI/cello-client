@@ -60,8 +60,13 @@ export interface DocumentInboundDeps {
   verifySignature(senderAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
-  /** The rejection's own signature, state vector and nonce. Never fabricated here. */
-  crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: string };
+  /**
+   * The rejection's own signature, state vector and nonce. Never fabricated here.
+   *
+   * ASYNC, and that is what makes `receive` async: signing goes through a key provider, and
+   * REJECT-1 requires a real signature rather than a placeholder.
+   */
+  crypto(): Promise<{ signature: Uint8Array; stateVector: Uint8Array; nonce: string }>;
 }
 
 /** The agreed property, read from the row rather than from whoever called us. */
@@ -90,12 +95,22 @@ export class DocumentInbound {
     ];
   }
 
-  receive(
+  /**
+   * ASYNC because a gate refusal must SIGN a `0x05` leaf, and signing goes through an async key
+   * provider. REJECT-1 refuses to fabricate a signature — an all-zero placeholder in an immutable
+   * log is indistinguishable from a real one that fails to verify — so the async is real, not
+   * incidental.
+   *
+   * The session content path still decides the LEAF KIND synchronously; `DocumentFrameRouter`
+   * splits the two, and serializes the handling per owner so an envelope's predecessor is always
+   * stored before its successor is checked.
+   */
+  async receive(
     ownerAgentId: string,
     wire: Uint8Array,
     nowMs: number,
     correlationId = "inbound",
-  ): InboundResult {
+  ): Promise<InboundResult> {
     // 1. DECODE.
     let env: DocumentUpdateEnvelope;
     try {
@@ -282,6 +297,7 @@ export class DocumentInbound {
     if (!verdict.admit) {
       // 7a. REJECT. The bytes are held, a 0x05 leaf references them, and the peer is ANSWERED —
       // a rejection is an ack for delivery purposes, so the sender stops retrying and supersedes.
+      const crypto = await this.#d.crypto();
       this.#d.rejections.reject(ownerAgentId, env.document_id, {
         rejectedEnvelopeHash: envelopeHash,
         quarantined: verdict.quarantined,
@@ -291,7 +307,7 @@ export class DocumentInbound {
         rejectedDocPrevHash: env.doc_prev_hash,
         rule: verdict.rule,
         limit: verdict.limit,
-        ...this.#d.crypto(),
+        ...crypto,
       });
       return {
         ok: true,
