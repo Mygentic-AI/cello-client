@@ -79,6 +79,23 @@ const CREATE_PROPOSALS_SQL = `
   );
 `;
 
+/**
+ * COLUMN BIRTH for the peer's answer to a proposal WE authored (the `document_proposal_ack` frame).
+ *
+ * Separate from the CREATE because a daemon that already holds proposals must gain the columns
+ * without losing them. `ALTER TABLE ... ADD COLUMN` throws on a re-run, which is why each is
+ * wrapped rather than guarded by a version number nobody maintains.
+ *
+ * Distinct from `consent_state`, which is OUR decision about THEIR proposal. Overloading one column
+ * for both directions is how "we accepted" and "they accepted" become indistinguishable — and the
+ * operator surface exists precisely to tell those apart.
+ */
+const PEER_DECISION_COLUMNS = [
+  "ALTER TABLE document_proposals ADD COLUMN peer_accepted INTEGER",
+  "ALTER TABLE document_proposals ADD COLUMN peer_reason TEXT",
+  "ALTER TABLE document_proposals ADD COLUMN peer_decided_at INTEGER",
+];
+
 export interface DocumentProposalRecord {
   documentId: string;
   proposerAgentId: string;
@@ -104,6 +121,15 @@ export class DocumentHandshake {
     this.#logger = logger;
     this.#verify = verify;
     this.#db.exec(CREATE_PROPOSALS_SQL);
+    for (const sql of PEER_DECISION_COLUMNS) {
+      try {
+        this.#db.exec(sql);
+      } catch {
+        // Already present. The only other way this throws is a corrupt schema, which the very next
+        // query surfaces with its own message — swallowing that one is not worth a version table
+        // whose whole job would be to answer a question `ALTER` already answers.
+      }
+    }
   }
 
   /**
@@ -242,6 +268,78 @@ export class DocumentHandshake {
         nowMs,
       );
     return documentId;
+  }
+
+  /**
+   * Record the PEER's answer to a proposal we authored.
+   *
+   * The caller verifies the signature first — this only stores. Kept as its own method rather than
+   * folded into `accept`/`refuse` because those are OUR decision about THEIR proposal, and this is
+   * the mirror: their decision about ours. Collapsing them would put a peer-controlled reason
+   * through a path whose refusal text is written by the local operator.
+   *
+   * SETTLE ONCE. A second, contradicting answer is refused rather than applied: a peer that
+   * accepted must not be able to later claim it refused, or the proposer tears down a document the
+   * peer is still editing.
+   */
+  recordPeerDecision(
+    ownerAgentId: string,
+    documentId: string,
+    decision: { accepted: boolean; reason?: string; decidedAtMs: number },
+  ): { ok: true } | { ok: false; reason: string; detail: string } {
+    const record = this.get(ownerAgentId, documentId);
+    if (!record) {
+      return {
+        ok: false,
+        reason: "document_proposal_unknown",
+        detail: `no proposal ${documentId.slice(0, 16)}… authored by this agent`,
+      };
+    }
+    if (record.proposerAgentId !== ownerAgentId) {
+      // Their answer to their OWN proposal is not a thing. Recording it would overwrite this
+      // operator's consent decision with the counterparty's assertion about it.
+      return {
+        ok: false,
+        reason: "document_proposal_not_ours",
+        detail: `proposal ${documentId.slice(0, 16)}… was authored by the peer, not by this agent`,
+      };
+    }
+    const already = this.#peerDecision(ownerAgentId, documentId);
+    if (already !== null) {
+      if (already === decision.accepted) return { ok: true };
+      return {
+        ok: false,
+        reason: "document_proposal_ack_contradicts",
+        detail:
+          `the peer already answered this proposal with ${already ? "accepted" : "refused"} and now ` +
+          `says ${decision.accepted ? "accepted" : "refused"} — a decision is made once, and both ` +
+          `signatures are retained`,
+      };
+    }
+    this.#db
+      .prepare(
+        `UPDATE document_proposals SET peer_accepted = ?, peer_reason = ?, peer_decided_at = ?
+          WHERE owner_agent_id = ? AND document_id = ?`,
+      )
+      .run(decision.accepted ? 1 : 0, decision.reason ?? null, decision.decidedAtMs, ownerAgentId, documentId);
+    this.#logger.info("document.proposal.answered", {
+      documentId,
+      accepted: decision.accepted,
+      reason: decision.reason,
+    });
+    return { ok: true };
+  }
+
+  /** The peer's answer to a proposal we authored: true accepted, false refused, null unanswered. */
+  peerDecision(ownerAgentId: string, documentId: string): boolean | null {
+    return this.#peerDecision(ownerAgentId, documentId);
+  }
+
+  #peerDecision(ownerAgentId: string, documentId: string): boolean | null {
+    const row = this.#db
+      .prepare("SELECT peer_accepted FROM document_proposals WHERE owner_agent_id = ? AND document_id = ?")
+      .get(ownerAgentId, documentId) as { peer_accepted: number | null } | undefined;
+    return row?.peer_accepted === null || row?.peer_accepted === undefined ? null : row.peer_accepted === 1;
   }
 
   /** Proposals still awaiting a decision — the operator's inbox for documents. */

@@ -38,6 +38,8 @@ import {
   decodeDocumentRejection,
   buildDocumentRejectionTbs,
   documentRejectionHash,
+  decodeDocumentProposalAck,
+  buildDocumentProposalAckTbs,
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
@@ -189,6 +191,30 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
+    recordProposalAck: (ownerAgentId, wire, _nowMs) => {
+      const ack = decodeDocumentProposalAck(wire);
+      // VERIFIED against the agent it names, before anything is written. A refusal ack makes the
+      // proposer stop waiting and, at the surface, reads as "they said no" — so unsigned, anyone on
+      // the channel could make a proposal appear refused by a party who never saw it, and the two
+      // operators would each believe the other walked away.
+      if (!verifySignature(ack.acker_agent_id, buildDocumentProposalAckTbs(ack), ack.signature)) {
+        throw new Error(
+          `document_proposal_ack_signature_invalid: the answer claims to come from ` +
+            `${ack.acker_agent_id} but its signature does not verify against that agent`,
+        );
+      }
+      const stored = handshake.recordPeerDecision(ownerAgentId, ack.document_id, {
+        accepted: ack.accepted,
+        ...(ack.refusal_reason !== undefined ? { reason: ack.refusal_reason } : {}),
+        decidedAtMs: ack.decided_at_ms,
+      });
+      if (!stored.ok) {
+        // SETTLE ONCE — a contradicting second answer is an error, never an update. A peer that
+        // accepted must not be able to later claim it refused, or the proposer tears down a
+        // document the peer is still editing.
+        throw new Error(`${stored.reason}: ${stored.detail}`);
+      }
+    },
     recordRejection: (ownerAgentId, wire, _nowMs) => {
       const env = decodeDocumentRejection(wire);
       if (!verifySignature(env.rejecting_agent_id, buildDocumentRejectionTbs(env), env.signature)) {

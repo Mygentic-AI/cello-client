@@ -347,3 +347,101 @@ describe("concurrent writes MERGE — they do not concatenate the two documents"
     expect(row.payload!.length).toBeLessThan(200);
   });
 });
+
+describe("the proposer is TOLD the decision — not left to infer it", () => {
+  it("an ACCEPT comes back as the peer's own signed answer", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+
+    // Before the answer: unanswered, and the surface says so rather than guessing.
+    const before = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+    expect(before.peerAccepted).toBeNull();
+
+    expect(await b.call("cello_doc_accept", { document_id: documentId })).toMatchObject({
+      ok: true,
+      proposerNotified: true,
+    });
+
+    await vi.waitFor(async () => {
+      const after = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+      // A FACT now, from Bob's signature — not "he has published into it", which cannot tell
+      // refused from unreceived from accepted-but-untouched.
+      expect(after.peerAccepted).toBe(true);
+      expect(after.peerHasPublished).toBe(false);
+    });
+  });
+
+  it("a REFUSAL comes back WITH its reason", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_refuse", { document_id: documentId, reason: "wrong document type" });
+
+    await vi.waitFor(async () => {
+      const after = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+      // Distinguishable from "not yet answered", which is the whole point: those two want opposite
+      // actions from the operator, and a refusal with no reason leaves them unable to propose
+      // anything better.
+      expect(after.peerAccepted).toBe(false);
+    });
+    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(false);
+  });
+
+  it("a decision made while the proposer is OFFLINE still stands locally", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+
+    b.wire.online = false;
+    // Consent is LOCAL and final the moment the operator makes it. Refusing to accept because the
+    // counterparty is momentarily unreachable would hand any network blip a veto over the
+    // operator's own choice.
+    expect(await b.call("cello_doc_accept", { document_id: documentId })).toMatchObject({
+      ok: true,
+      proposerNotified: false,
+    });
+    expect(b.layer.store.getDocument(b.owner, documentId)).not.toBeNull();
+    // Alice is still waiting, and the surface reports waiting — never a refusal.
+    const alice = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+    expect(alice.peerAccepted).toBeNull();
+  });
+
+  it("a CONTRADICTING second answer is refused, not applied", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+    await vi.waitFor(() => expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(true));
+
+    // Settle once. A peer that accepted must not be able to later claim it refused, or the proposer
+    // tears down a document the peer is still editing.
+    const flip = a.layer.handshake.recordPeerDecision(a.owner, documentId, {
+      accepted: false,
+      reason: "changed my mind",
+      decidedAtMs: NOW + 1,
+    });
+    expect(flip).toMatchObject({ ok: false, reason: "document_proposal_ack_contradicts" });
+    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(true);
+  });
+});

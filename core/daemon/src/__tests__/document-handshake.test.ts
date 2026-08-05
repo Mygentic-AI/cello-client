@@ -250,7 +250,12 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
     // row's properties — its INSERT is ON CONFLICT DO NOTHING, so a stored proposal is unreachable
     // from it. That is the justification this allowlist exists to demand.
     expect(Object.getOwnPropertyNames(DocumentHandshake.prototype).sort()).toEqual(
-      ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse"].sort(),
+      // `recordPeerDecision`/`peerDecision` are the mirror direction — THEIR answer to OUR proposal.
+      // They write `peer_accepted`, never `consent_state` or `envelope`, so the properties this
+      // test guards remain unreachable from them. Justified for the same reason `recordOutgoing`
+      // is: this allowlist demands a reason, and "it writes a different column" is one.
+      ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse",
+       "recordPeerDecision", "peerDecision"].sort(),
     );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });

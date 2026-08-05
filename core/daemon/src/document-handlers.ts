@@ -34,6 +34,11 @@ import {
   ASSURANCE_TIER_V1,
   TOPOLOGY_V1,
   DOCUMENT_FEATURE_VERSION,
+  encodeDocumentProposalAck,
+  buildDocumentProposalAckTbs,
+  DOCUMENT_PROPOSAL_ACK_VERSION,
+  MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
+  type DocumentProposalAck,
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import type { IpcHandler } from "./ipc-server.js";
@@ -255,6 +260,45 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     return { ok: true, documentId, proposalSent: true, peerAgentId };
   });
 
+  /**
+   * Tell the proposer what was decided.
+   *
+   * BEST-EFFORT, and the caller says so rather than failing the decision. Consent is local and
+   * final the moment the operator makes it — refusing to accept a document because the counterparty
+   * is momentarily unreachable would hand any network blip a veto over the operator's own choice.
+   * What an unsent ack costs is that the proposer keeps waiting, which the surface reports as
+   * unanswered rather than as a refusal.
+   */
+  async function tellProposer(
+    who: Resolved,
+    documentId: string,
+    proposerAgentId: string,
+    accepted: boolean,
+    reason: string | undefined,
+  ): Promise<boolean> {
+    const ack: DocumentProposalAck = {
+      type: "document_proposal_ack",
+      ack_version: DOCUMENT_PROPOSAL_ACK_VERSION,
+      document_id: documentId,
+      acker_agent_id: who.ownerAgentId,
+      accepted,
+      ...(accepted ? {} : { refusal_reason: (reason ?? "declined").slice(0, MAX_PROPOSAL_REFUSAL_REASON_LENGTH) }),
+      decided_at_ms: deps.now(),
+      signature: new Uint8Array(0),
+    };
+    ack.signature = await deps.sign(who.agentName, buildDocumentProposalAckTbs(ack));
+    const sent = await deps.transportFor(who.agentName).sendBytes({
+      peerAgentId: proposerAgentId,
+      documentId,
+      bytes: encodeDocumentProposalAck(ack),
+      correlationId: randomUUID(),
+    });
+    if (!sent.ok) {
+      logger.warn("document.proposal.ack_unsent", { documentId, accepted, reason: sent.reason });
+    }
+    return sent.ok;
+  }
+
   // ─── inbox / accept / refuse ──────────────────────────────────────────────────────────────
 
   handlers.set("cello_doc_inbox", async (params, connectionId) => {
@@ -301,7 +345,8 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), outcome.envelope.starting_content);
     }
     logger.info("document.accepted", { documentId, proposerAgentId: outcome.envelope.proposer_agent_id });
-    return { ok: true, documentId, peerAgentId: outcome.envelope.proposer_agent_id };
+    const told = await tellProposer(who, documentId, outcome.envelope.proposer_agent_id, true, undefined);
+    return { ok: true, documentId, peerAgentId: outcome.envelope.proposer_agent_id, proposerNotified: told };
   });
 
   handlers.set("cello_doc_refuse", async (params, connectionId) => {
@@ -312,9 +357,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
+    const proposal = layer.handshake.get(who.ownerAgentId, documentId);
     const outcome = layer.handshake.refuse(who.ownerAgentId, documentId, reason, deps.now());
     if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
-    return { ok: true, documentId };
+    // The REASON travels. A refusal the proposer cannot see the reason for leaves them unable to
+    // propose anything better, which is what makes people abandon a protocol rather than adjust.
+    const told = proposal
+      ? await tellProposer(who, documentId, proposal.proposerAgentId, false, reason)
+      : false;
+    return { ok: true, documentId, proposerNotified: told };
   });
 
   // ─── list / read / write ──────────────────────────────────────────────────────────────────
@@ -336,11 +387,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         return {
           ...d,
           proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
-          // INFERRED, and named as an inference. There is no proposal ACK on the wire — the
-          // proposer is not told the decision (owed, and recorded on the DoD line) — so the only
-          // honest evidence that the counterparty accepted is that they have published into it.
-          // Absent, the document may be refused, unreceived, or simply untouched; this field must
-          // never be read as "they refused".
+          // THE PEER'S OWN SIGNED ANSWER — true accepted, false refused, null not yet heard. This
+          // replaced an inference ("they have published into it") that could not tell refused from
+          // unreceived from accepted-but-untouched, two of which want the operator to act.
+          peerAccepted: layer.handshake.peerDecision(who.ownerAgentId, d.documentId),
+          // Kept alongside it, because they answer different questions: whether they agreed, and
+          // whether anything has actually come back. A document accepted an hour ago with nothing
+          // in it is a fine state; it is just not the same state.
           peerHasPublished:
             layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
           consentState: proposal?.consentState ?? null,

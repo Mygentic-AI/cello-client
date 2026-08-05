@@ -264,6 +264,16 @@ export {
 } from "./document-ack.js";
 export type { DocumentAck } from "./document-ack.js";
 export {
+  encodeDocumentProposalAck,
+  decodeDocumentProposalAck,
+  buildDocumentProposalAckTbs,
+  assertDocumentProposalAckConsistent,
+  DOCUMENT_PROPOSAL_ACK_DOMAIN,
+  DOCUMENT_PROPOSAL_ACK_VERSION,
+  MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
+} from "./document-proposal-ack.js";
+export type { DocumentProposalAck } from "./document-proposal-ack.js";
+export {
   DOCUMENT_REJECTION_DOMAIN,
   DOCUMENT_REJECTION_VERSION,
   MAX_REJECTION_DETAIL_LENGTH,
