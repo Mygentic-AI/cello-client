@@ -188,6 +188,40 @@ export class DocumentRejections {
     return { stalled, round };
   }
 
+  /**
+   * Record a rejection ARRIVING from the peer — the receiving half of §3.2's "both sides".
+   *
+   * ── THE ROUTING DECISION (the DoD requires it resolved in-unit) ─────────────────────────────
+   *
+   * A document rejection is written **daemon-side**, into this document's own log and quarantine,
+   * NOT through the gateway record store's `source` discriminator.
+   *
+   * The gateway's record store exists for SCREENING verdicts, and most V1 rejection reasons are
+   * not screening at all — `append_only`, the receiver-local limits, malformed updates, unresolved
+   * dependencies. Routing every document rejection through a screening store would file structural
+   * protocol events as policy verdicts, and it would couple this unit to a schema owned by a
+   * component that is not involved. DOD-DOC-SCREEN-1 is parked, so that coupling would also have
+   * to be built speculatively and unwound if screening lands differently.
+   *
+   * When SCREEN-1 does land, a rejection whose reason came from the screening rule can ADDITIONALLY
+   * write a gateway record — the discriminator exists for exactly that, and adding it later costs
+   * nothing, whereas removing a premature coupling costs a migration.
+   */
+  recordIncomingRejection(
+    agentId: string,
+    documentId: string,
+    input: { rejectedEnvelopeHash: string; reason: string; detail?: string; fromAgentId: string },
+  ): void {
+    this.#logger.warn("document.rejection.received", {
+      documentId,
+      fromAgentId: input.fromAgentId,
+      rejectedEnvelopeHash: input.rejectedEnvelopeHash,
+      reason: input.reason,
+      detail: input.detail,
+      round: this.#round(agentId, documentId),
+    });
+  }
+
   /** Entries held for this document — never admitted, never discarded (§3.2). From the store. */
   quarantined(agentId: string, documentId: string): QuarantineEntry[] {
     return this.#store.listQuarantined(agentId, documentId).map((r) => ({

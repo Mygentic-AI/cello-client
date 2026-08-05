@@ -447,3 +447,42 @@ describe("DocumentRejections — a duplicate rejection does not advance the roun
     expect(store.getEnvelopeLog(AGENT, DOC).filter((e) => e.kind === "rejection")).toHaveLength(1);
   });
 });
+
+describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)", () => {
+  it("the sender's side records a rejection ARRIVING, with the reason intact", () => {
+    const { rejections, events } = newFixture();
+    rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectedEnvelopeHash: "ab".repeat(32),
+      reason: "document_append_only_violation",
+      detail: "the update deletes 12 existing range(s)",
+      fromAgentId: PEER,
+    });
+
+    const received = events.find((e) => e.event === "document.rejection.received");
+    expect(received).toBeDefined();
+    // Both operators need the reason, not just the one who refused — a rejection an operator
+    // cannot see the cause of is indistinguishable from the document silently not converging.
+    expect(received!.fields.reason).toBe("document_append_only_violation");
+    expect(received!.fields.fromAgentId).toBe(PEER);
+    expect(received!.fields.detail).toContain("deletes 12");
+  });
+
+  it("the two halves are DISTINCT events — a log reader can tell who refused whom", () => {
+    const { rejections, events } = newFixture();
+    rejections.reject(AGENT, DOC, {
+      rejectedEnvelopeHash: "11".repeat(32),
+      quarantined: new Uint8Array([1]),
+      reason: "document_update_malformed",
+      senderAgentId: PEER,
+      ...crypto(),
+    });
+    rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectedEnvelopeHash: "22".repeat(32),
+      reason: "document_update_malformed",
+      fromAgentId: PEER,
+    });
+
+    expect(events.filter((e) => e.event === "document.rejection.sent")).toHaveLength(1);
+    expect(events.filter((e) => e.event === "document.rejection.received")).toHaveLength(1);
+  });
+});
