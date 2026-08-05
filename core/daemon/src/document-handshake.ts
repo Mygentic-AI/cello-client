@@ -285,6 +285,20 @@ export class DocumentHandshake {
   recordPeerDecision(
     ownerAgentId: string,
     documentId: string,
+    /**
+     * WHO IS ANSWERING. Required, and checked against the proposal's own peer.
+     *
+     * The caller verifies the ack's signature against the agent the frame NAMES, which proves the
+     * frame is authentic and says nothing about whether that agent was ever entitled to answer. Any
+     * third party with a session to us could sign a well-formed ack for a document we proposed to
+     * someone else, and it landed as that someone's decision — reported to the operator as "they
+     * said no" for a peer who never saw it. Worse, settle-once is by VALUE, so the real peer's
+     * later genuine answer contradicts and is discarded: the poisoned state is permanent.
+     *
+     * Verified is not authorized. The control path (`recordPeerClose`, `recordPeerKill`) has
+     * carried this check from the start; the ack path was written without it.
+     */
+    ackerAgentId: string,
     decision: { accepted: boolean; reason?: string; decidedAtMs: number },
   ): { ok: true } | { ok: false; reason: string; detail: string } {
     const record = this.get(ownerAgentId, documentId);
@@ -293,6 +307,20 @@ export class DocumentHandshake {
         ok: false,
         reason: "document_proposal_unknown",
         detail: `no proposal ${documentId.slice(0, 16)}… authored by this agent`,
+      };
+    }
+    if (ackerAgentId !== record.peerAgentId) {
+      this.#logger.warn("document.proposal.ack_not_peer", {
+        documentId,
+        claimedBy: ackerAgentId,
+        peerAgentId: record.peerAgentId,
+      });
+      return {
+        ok: false,
+        reason: "document_proposal_ack_not_peer",
+        detail:
+          `${ackerAgentId} is not the party this proposal was addressed to (${record.peerAgentId}), ` +
+          `so their answer is not the decision it asks for`,
       };
     }
     if (record.proposerAgentId !== ownerAgentId) {
@@ -333,6 +361,27 @@ export class DocumentHandshake {
   /** The peer's answer to a proposal we authored: true accepted, false refused, null unanswered. */
   peerDecision(ownerAgentId: string, documentId: string): boolean | null {
     return this.#peerDecision(ownerAgentId, documentId);
+  }
+
+  /**
+   * The peer's answer AND the words they sent with it.
+   *
+   * The reason was stored and never read by anything — write-only, which defeats the entire
+   * justification for putting it on the wire and making it mandatory there: "a refusal the proposer
+   * cannot see a reason for leaves them unable to propose anything better". Enforced at the
+   * signature, discarded at the last hop.
+   */
+  peerAnswer(
+    ownerAgentId: string,
+    documentId: string,
+  ): { accepted: boolean | null; reason: string | null } {
+    const row = this.#db
+      .prepare(
+        "SELECT peer_accepted, peer_reason FROM document_proposals WHERE owner_agent_id = ? AND document_id = ?",
+      )
+      .get(ownerAgentId, documentId) as { peer_accepted: number | null; peer_reason: string | null } | undefined;
+    if (!row || row.peer_accepted === null) return { accepted: null, reason: null };
+    return { accepted: row.peer_accepted === 1, reason: row.peer_reason ?? null };
   }
 
   #peerDecision(ownerAgentId: string, documentId: string): boolean | null {

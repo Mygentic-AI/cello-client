@@ -129,4 +129,14 @@ describe("decode refuses rather than defaulting", () => {
     const long = "x".repeat(MAX_CONTROL_REASON_LENGTH + 1);
     expect(() => encodeDocumentControl(control({ reason: long }))).toThrow(/at most 200/);
   });
+
+  it("a DIFFERENT SENDER AGENT ID is a different preimage", () => {
+    // The identity slot was UNPINNED: delete it from the TBS array and every other test in this
+    // file still passed. Not exploitable today, because the verify key is derived from that same
+    // field — but the binding is what makes that derivation safe, and a captured kill could
+    // otherwise be presented as coming from someone else.
+    const mine = buildDocumentControlTbs(control());
+    const theirs = buildDocumentControlTbs(control({ sender_agent_id: "ff".repeat(32) }));
+    expect(Buffer.from(mine).equals(Buffer.from(theirs))).toBe(false);
+  });
 });

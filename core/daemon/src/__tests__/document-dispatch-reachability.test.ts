@@ -95,7 +95,7 @@ describe("the document verbs answer over the daemon socket", () => {
     const client = await connectToDaemon(join(dir, "daemon.sock"));
     await client.send("ipc.connect", { clientType: "cli" });
     await client.send("cello_use_agent", { name: "alice" });
-    return { client, pubkey };
+    return { client, pubkey, handle: h };
   }
 
   it("every cello_doc_* verb dispatches — none answers method_not_found", async () => {
@@ -133,10 +133,14 @@ describe("the document verbs answer over the daemon socket", () => {
   }, 30_000);
 
   it("a handler registered AFTER the server started is still dispatchable", async () => {
-    const { client } = await boot();
-    // The property directly, so the fix cannot silently regress into a snapshot copy again. Every
-    // registration in daemon.ts happens before `start()` today; nothing enforces that it stays
-    // true, and the last time it did not the failure was invisible for a whole unit.
-    expect(await client.send("cello_doc_list", {})).toMatchObject({ ok: true });
+    const { client, handle } = await boot();
+    // THE PROPERTY ITSELF. The first version of this test called `cello_doc_list` and asserted
+    // ok:true — a duplicate of the test above, claiming a property it never exercised. It would
+    // have stayed green against the snapshot copy this whole file exists to prevent, as long as the
+    // document handlers happened to be registered early enough.
+    //
+    // So: register something genuinely new, after `start()` has already resolved, and call it.
+    handle.getHandlers().set("cello_test_late_binding", async () => ({ ok: true, late: true }));
+    expect(await client.send("cello_test_late_binding", {})).toMatchObject({ ok: true, late: true });
   }, 30_000);
 });

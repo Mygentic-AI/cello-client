@@ -138,6 +138,16 @@ export interface DaemonHandle {
    * DOD-REGISTRY-1: the in-memory type registry — classify signal types.
    */
   getTypeRegistry(): TypeRegistry;
+  /**
+   * DOD-DOC-TOOLS-1 test hook: the LIVE handler map.
+   *
+   * Dispatch resolves from this map when a request arrives, and the only way to prove that rather
+   * than assume it is to register a handler after `start()` has resolved and call it. The property
+   * is load-bearing — a snapshot copy here once made every `cello_doc_*` verb unreachable while the
+   * whole suite stayed green. Not part of the production API surface; nothing in production mutates
+   * it after boot.
+   */
+  getHandlers(): Map<string, IpcHandler>;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -3235,15 +3245,27 @@ async function startDaemonHoldingLock(
     }),
     sign: async (ownerAgentId, tbs) => {
       // Signs as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
-      // Resolved by NAME because `keyProviders` is keyed by agent name; a missing provider throws
-      // rather than substituting another agent's key — an earlier version of this callback took no
-      // agent at all and reached for whichever provider was first in the map, which is fabricated
-      // crypto wearing a real signature.
-      const provider = keyProviders.get(ownerAgentId);
+      //
+      // `ownerAgentId` here is the OWNER KEY — pubkey hex — because that is what the layer is
+      // scoped by, and `keyProviders` is keyed by agent NAME. This did `keyProviders.get(ownerAgentId)`
+      // and the comment above it asserted the two were the same thing. They are not: the lookup
+      // missed on every call, so every auto-rejection threw `document_rejection_unsigned` and NO
+      // rejection was ever signed or sent. A peer whose update we refused was never told why —
+      // their sender retried into a gate that would refuse it every time, until the document
+      // stalled for a reason neither operator could see.
+      //
+      // Invisible to every test: the unit and e2e fixtures alike wire `sign: (_o, tbs) => keys.sign(tbs)`,
+      // discarding the agent argument, so nothing could disagree about which key was resolved.
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      const provider = agentName ? keyProviders.get(agentName) : undefined;
       if (!provider) {
+        // Still throws rather than substituting another agent's key — an earlier version took no
+        // agent at all and reached for whichever provider was first in the map, which is fabricated
+        // crypto wearing a real signature.
         throw new Error(
-          `document_rejection_unsigned: no key provider for ${ownerAgentId}, so its rejection ` +
-            `cannot be signed — refusing rather than writing an unsigned leaf into an append-only log`,
+          `document_rejection_unsigned: no key provider for owner ${ownerAgentId.slice(0, 16)}…, ` +
+            `so its rejection cannot be signed — refusing rather than writing an unsigned leaf ` +
+            `into an append-only log`,
         );
       }
       return provider.sign(tbs);
@@ -3618,5 +3640,21 @@ async function startDaemonHoldingLock(
   // prior run, without waiting for any agent to come online or any client to attach.
   startTelegramPollerIfConfigured();
 
-  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry };
+  /**
+   * The live handler map.
+   *
+   * Exposed so the LATE-BINDING property can be asserted rather than assumed: dispatch resolves
+   * from this map when a request arrives, and the only way to prove that is to register something
+   * after `start()` has resolved and call it. The property is not decorative — a snapshot copy here
+   * once made every `cello_doc_*` verb unreachable while the whole suite stayed green.
+   *
+   * Sits alongside `getSessionNodeManager` and `getTypeRegistry`, which are exposed for the same
+   * reason. Production code has no business mutating it after boot.
+   */
+  const getHandlers = (): Map<string, IpcHandler> => handlers;
+
+  return {
+    stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry,
+    getHandlers,
+  };
 }

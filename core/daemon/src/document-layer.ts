@@ -226,7 +226,10 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
             `${ack.acker_agent_id} but its signature does not verify against that agent`,
         );
       }
-      const stored = handshake.recordPeerDecision(ownerAgentId, ack.document_id, {
+      // The acker is passed through and CHECKED against the proposal's peer. Verifying the
+      // signature proves the frame is authentic; it says nothing about whether its author was
+      // entitled to answer this proposal.
+      const stored = handshake.recordPeerDecision(ownerAgentId, ack.document_id, ack.acker_agent_id, {
         accepted: ack.accepted,
         ...(ack.refusal_reason !== undefined ? { reason: ack.refusal_reason } : {}),
         decidedAtMs: ack.decided_at_ms,

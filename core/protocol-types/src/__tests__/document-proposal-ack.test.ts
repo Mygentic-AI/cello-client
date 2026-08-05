@@ -179,4 +179,14 @@ describe("decode refuses rather than defaulting", () => {
   it("refuses a non-map frame", () => {
     expect(() => decodeDocumentProposalAck(encodeCbor([1, 2, 3]))).toThrow(/not a CBOR map/);
   });
+
+  it("a DIFFERENT ACKER AGENT ID is a different preimage", () => {
+    // The identity slot was UNPINNED: delete it from the TBS array and every other test in this
+    // file still passed. Not exploitable today, because the verify key is derived from that same
+    // field — but the binding is what makes that derivation safe, and a captured ack could
+    // otherwise be re-signed by another party and presented as theirs.
+    const mine = buildDocumentProposalAckTbs(ack());
+    const theirs = buildDocumentProposalAckTbs(ack({ acker_agent_id: "ff".repeat(32) }));
+    expect(Buffer.from(mine).equals(Buffer.from(theirs))).toBe(false);
+  });
 });

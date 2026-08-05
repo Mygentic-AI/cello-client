@@ -254,8 +254,11 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
       // They write `peer_accepted`, never `consent_state` or `envelope`, so the properties this
       // test guards remain unreachable from them. Justified for the same reason `recordOutgoing`
       // is: this allowlist demands a reason, and "it writes a different column" is one.
+      // `peerAnswer` joins its siblings for the same reason: it READS `peer_accepted`/`peer_reason`
+      // and touches neither `consent_state` nor `envelope`, so the properties this test guards stay
+      // unreachable from it.
       ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse",
-       "recordPeerDecision", "peerDecision"].sort(),
+       "recordPeerDecision", "peerDecision", "peerAnswer"].sort(),
     );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });

@@ -66,9 +66,19 @@ const CREATE_READ_MARKS_SQL = `
     document_id  TEXT    NOT NULL,
     seen_text    TEXT    NOT NULL,
     seen_at      INTEGER NOT NULL,
+    -- The last text WE wrote since that read, or NULL if we have not written since. See the
+    -- myEditedLines comment below for why it exists: it is what makes the overlap flag a computed
+    -- answer rather than a hardcoded null.
+    --
+    -- No backticks in this string. It is a JS template literal, so one would terminate it — which
+    -- is exactly how this shipped broken for a minute.
+    my_text      TEXT,
     PRIMARY KEY (agent_id, document_id)
   );
 `;
+
+/** Born on an existing table. See `PEER_DECISION_COLUMNS` in document-handshake.ts for the pattern. */
+const READ_MARK_COLUMNS = ["ALTER TABLE document_read_marks ADD COLUMN my_text TEXT"];
 
 /** Types `diff` can render. Decided in-unit; see the header for why the list is closed. */
 export const DIFFABLE_DOCUMENT_TYPES = ["markdown", "text", "json"] as const;
@@ -122,6 +132,15 @@ export class DocumentNotifications {
     this.#logger = logger;
     this.#store.rawDb.exec(CREATE_NOTICES_SQL);
     this.#store.rawDb.exec(CREATE_READ_MARKS_SQL);
+    for (const sql of READ_MARK_COLUMNS) {
+      // Birth-gated so a daemon that already holds read marks gains the column instead of losing
+      // them. A failure here is either "already present" — the ordinary case — or a locked
+      // database, and the latter surfaces loudly on the very next SELECT rather than degrading.
+      const has = (
+        this.#store.rawDb.prepare("PRAGMA table_info(document_read_marks)").all() as Array<{ name: string }>
+      ).some((c) => c.name === "my_text");
+      if (!has) this.#store.rawDb.exec(sql);
+    }
   }
 
   /**
@@ -133,11 +152,68 @@ export class DocumentNotifications {
   markRead(agentId: string, documentId: string, text: string, nowMs: number): void {
     this.#store.rawDb
       .prepare(
-        `INSERT INTO document_read_marks (agent_id, document_id, seen_text, seen_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT (agent_id, document_id) DO UPDATE SET seen_text = excluded.seen_text, seen_at = excluded.seen_at`,
+        `INSERT INTO document_read_marks (agent_id, document_id, seen_text, seen_at, my_text)
+         VALUES (?, ?, ?, ?, NULL)
+         ON CONFLICT (agent_id, document_id) DO UPDATE SET
+           seen_text = excluded.seen_text, seen_at = excluded.seen_at,
+           -- CLEARED. A read establishes a new baseline, so edits made before it are no longer
+           -- "mine since I looked" — carrying them forward would report an overlap against work
+           -- the operator has already seen merged.
+           my_text = NULL`,
       )
       .run(agentId, documentId, text, nowMs);
+  }
+
+  /**
+   * Record the text WE just wrote, against the current read mark.
+   *
+   * No-ops when there is no read mark: without a baseline there is nothing to measure our edit
+   * against, and inventing one would make the first diff after a write report the whole document as
+   * a conflict.
+   */
+  markWritten(agentId: string, documentId: string, text: string): void {
+    this.#store.rawDb
+      .prepare("UPDATE document_read_marks SET my_text = ? WHERE agent_id = ? AND document_id = ?")
+      .run(text, agentId, documentId);
+  }
+
+  /**
+   * The lines WE edited since the last read, 1-based, in the baseline's coordinate space — or null
+   * when we have not written since, which is "not computed" and must stay distinguishable from "no
+   * conflict". `diffStats` requires the distinction for exactly that reason.
+   */
+  /**
+   * WHY THIS EXISTS, stated where the reader will need it:
+   *
+   * At diff time the two texts in hand are the baseline and the current document, and no amount of
+   * comparing them says which of the changes were the PEER's. So `overlap` was hardcoded `null`
+   * while three shipped instruction sheets told agents to branch on it — and `null` is falsy in
+   * JSON, so every one of them got the reassuring answer on every call. That is the precise trap
+   * `diffStats` made its `myEdits` parameter required to prevent, defeated by the one caller.
+   *
+   * Diffing the baseline against what WE last wrote gives our own edited lines in the baseline's
+   * coordinate space, which is the space the diff reports its ranges in. Exact, not inferred.
+   */
+  myEditedLines(agentId: string, documentId: string): number[] | null {
+    const row = this.#store.rawDb
+      .prepare("SELECT seen_text, my_text FROM document_read_marks WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { seen_text: string; my_text: string | null } | undefined;
+    if (!row || row.my_text === null) return null;
+    const lines: number[] = [];
+    const runs = lineRuns(toChunks(row.seen_text), toChunks(row.my_text));
+    if (runs === null) {
+      // Above the LCS limit. Said as "not computed" rather than degraded into a whole-file range,
+      // which would report every diff as an overlap and train the agent to ignore the field.
+      return null;
+    }
+    for (const hunk of runs) {
+      // The hunk's BEFORE range, which is what the diff reports its own ranges in. A pure insertion
+      // has an empty before-range and is attributed to the line it precedes, matching `diffStats`.
+      const start = hunk.aStart + 1;
+      const end = hunk.aEnd === hunk.aStart ? hunk.aStart + 1 : hunk.aEnd;
+      for (let n = start; n <= end; n++) lines.push(n);
+    }
+    return lines;
   }
 
   /**

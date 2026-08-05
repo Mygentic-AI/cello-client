@@ -410,9 +410,13 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
     await vi.waitFor(async () => {
       const after = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
       // Distinguishable from "not yet answered", which is the whole point: those two want opposite
-      // actions from the operator, and a refusal with no reason leaves them unable to propose
-      // anything better.
+      // actions from the operator.
       expect(after.peerAccepted).toBe(false);
+      // AND THE REASON. This assertion did not exist, and could not have: the reason was verified,
+      // stored, and read by nothing. That defeats why it is mandatory on the wire — a refusal whose
+      // reason the proposer cannot see leaves them unable to propose anything better. Without this
+      // line, replacing every reason with the constant "declined" keeps the suite green forever.
+      expect(after.peerRefusalReason).toBe("wrong document type");
     });
     expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(false);
   });
@@ -455,7 +459,9 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
 
     // Settle once. A peer that accepted must not be able to later claim it refused, or the proposer
     // tears down a document the peer is still editing.
-    const flip = a.layer.handshake.recordPeerDecision(a.owner, documentId, {
+    // Bob's own key — the acker check must be satisfied so the SETTLE-ONCE rule is what refuses,
+    // not the authorization one. Passing anyone else here would test the wrong guard.
+    const flip = a.layer.handshake.recordPeerDecision(a.owner, documentId, b.owner, {
       accepted: false,
       reason: "changed my mind",
       decidedAtMs: NOW + 1,
@@ -632,5 +638,128 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
 
     // Bob's document is untouched: Carol is not its peer.
     expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("active");
+  });
+});
+
+describe("an ack is VERIFIED and also AUTHORIZED", () => {
+  it("a THIRD party cannot answer a proposal that was never addressed to them", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    const c = await makeParty("carol");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+
+    // Carol signs a REAL, well-formed ack for a document she is not part of and delivers it to
+    // Alice's inbound path. The signature verifies — against Carol, who is exactly who she says she
+    // is — and that says nothing about whether she was entitled to answer.
+    //
+    // Recorded, this is permanent: Alice's surface reports "they said no" for a peer who never saw
+    // it, and settle-once is by VALUE, so Bob's genuine later answer contradicts and is discarded.
+    c.wire.deliverToPeer = (bytes) => a.receive(bytes);
+    const poisoned = c.layer.handshake.recordPeerDecision(a.owner, documentId, c.owner, {
+      accepted: false,
+      reason: "no thanks",
+      decidedAtMs: NOW,
+    });
+    void poisoned;
+    const direct = a.layer.handshake.recordPeerDecision(a.owner, documentId, c.owner, {
+      accepted: false,
+      reason: "no thanks",
+      decidedAtMs: NOW,
+    });
+    expect(direct).toMatchObject({ ok: false, reason: "document_proposal_ack_not_peer" });
+    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBeNull();
+
+    // And Bob's real answer still lands, which is the half that matters: the poisoning attempt must
+    // not have consumed the one decision slot.
+    await b.call("cello_doc_accept", { document_id: documentId });
+    await vi.waitFor(() => expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(true));
+  });
+});
+
+describe("a KILL arriving after a settled CLOSE does not rewrite it", () => {
+  it("ignores a late or redelivered kill on a closed document", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    await a.call("cello_doc_close", { document_id: documentId });
+    await b.call("cello_doc_close", { document_id: documentId });
+    await vi.waitFor(() => expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed"));
+
+    // The transport WILL redeliver, and nothing bounds a control frame's freshness — `sent_at_ms`
+    // is signed and never checked. Unconditional, this rewrote a settled agreement as a unilateral
+    // end: the operator's "closed by agreement" becomes "killed", and nothing says why.
+    const late = a.layer.lifecycle.recordPeerKill(a.owner, documentId, b.owner, NOW + 10_000);
+    expect(late).toMatchObject({ ok: true });
+    expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed");
+  });
+});
+
+describe("cello_doc_diff reports OVERLAP as a computed answer", () => {
+  it("flags a peer edit landing on a line WE also changed", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "one\ntwo\nthree\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    await a.call("cello_doc_read", { document_id: documentId });
+    // Alice edits line two; Bob edits line two.
+    await a.call("cello_doc_write", { document_id: documentId, content: "one\ntwo ALICE\nthree\n" });
+    await b.call("cello_doc_write", { document_id: documentId, content: "one\ntwo BOB\nthree\n" });
+    await b.sweep();
+
+    await vi.waitFor(async () => {
+      const diff = (await a.call("cello_doc_diff", { document_id: documentId })) as {
+        stats?: { overlap?: boolean | null };
+      };
+      // `null` here is the reassuring answer three instruction sheets told agents to trust while it
+      // was hardcoded — and null is falsy, so every one of them read it as "no conflict".
+      expect(diff.stats?.overlap).toBe(true);
+    });
+  });
+
+  it("reports NOT COMPUTED, never false, when we have not written since the read", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "one\ntwo\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+    await a.call("cello_doc_read", { document_id: documentId });
+    await b.call("cello_doc_write", { document_id: documentId, content: "one\ntwo BOB\n" });
+    await b.sweep();
+
+    await vi.waitFor(async () => {
+      const diff = (await a.call("cello_doc_diff", { document_id: documentId })) as {
+        unchanged?: boolean;
+        stats?: { overlap?: boolean | null };
+      };
+      expect(diff.unchanged).toBe(false);
+      // Alice made no edit, so there is nothing to overlap WITH — that is "not computed", and it
+      // must stay distinguishable from "checked, and there is no conflict".
+      expect(diff.stats?.overlap).toBeNull();
+    });
   });
 });

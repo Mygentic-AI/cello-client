@@ -175,7 +175,11 @@ export class DocumentLifecycle {
   }
 
   /** Our half of a bilateral close. Completes only when the peer's half is also on record. */
-  async close(ownerAgentId: string, documentId: string, nowMs: number): Promise<Verdict> {
+  async close(
+    ownerAgentId: string,
+    documentId: string,
+    nowMs: number,
+  ): Promise<(Verdict & { ok: true; peerNotified: boolean }) | (Verdict & { ok: false })> {
     const doc = this.#store.getDocument(ownerAgentId, documentId);
     if (!doc) {
       return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
@@ -183,11 +187,16 @@ export class DocumentLifecycle {
     this.#recordClose(ownerAgentId, documentId, ownerAgentId, nowMs);
     const notified = await this.#notifier.notifyPeer(documentId, "close");
     if (!notified.ok) {
-      this.#logger.warn("document.close.peer_not_notified", { documentId, reason: notified.reason });
+      // RAISED to error, and RETURNED, matching `kill`. This was a warn whose outcome went nowhere:
+      // the caller answered `{ok: true, status: "active"}`, which is indistinguishable from "sent
+      // fine, they have not answered yet". Control frames are fire-once — not in the log, never
+      // swept — so a close the peer never received means the document can never settle, and neither
+      // operator has anything to look at.
+      this.#logger.error("document.close.peer_not_notified", { documentId, reason: notified.reason });
     }
     this.#settleClose(ownerAgentId, documentId, doc.peerAgentId);
-    this.#logger.info("document.close.requested", { documentId });
-    return { ok: true };
+    this.#logger.info("document.close.requested", { documentId, peerNotified: notified.ok });
+    return { ok: true, peerNotified: notified.ok };
   }
 
   /** The peer's half, arriving over the session. */
@@ -269,6 +278,17 @@ export class DocumentLifecycle {
       };
     }
     void nowMs;
+    if (doc.status !== "active" && doc.status !== "stalled") {
+      // ONLY FROM ACTIVE, the same guard `#settleClose` carries and for the mirror reason. The
+      // transport WILL redeliver, and nothing bounds a control frame's freshness — `sent_at_ms` is
+      // signed and never checked. Unconditional, a kill arriving after a bilateral close rewrote a
+      // settled agreement as a unilateral end.
+      this.#logger.info("document.kill.peer_requested.ignored", {
+        documentId,
+        status: doc.status,
+      });
+      return { ok: true };
+    }
     this.#store.setDocumentStatus(ownerAgentId, documentId, "killed");
     this.#logger.info("document.kill.peer_requested", { documentId, peerAgentId: doc.peerAgentId });
     return { ok: true };

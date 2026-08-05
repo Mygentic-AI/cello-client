@@ -384,13 +384,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // operator cannot tell "they said no" from "they are asleep", and those want opposite
         // actions.
         const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
+        const peerAnswer = layer.handshake.peerAnswer(who.ownerAgentId, d.documentId);
         return {
           ...d,
           proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
           // THE PEER'S OWN SIGNED ANSWER — true accepted, false refused, null not yet heard. This
           // replaced an inference ("they have published into it") that could not tell refused from
           // unreceived from accepted-but-untouched, two of which want the operator to act.
-          peerAccepted: layer.handshake.peerDecision(who.ownerAgentId, d.documentId),
+          //
+          // The REASON comes with it. It was stored and read by nothing, which defeats why it is
+          // mandatory on the wire: a refusal whose reason the proposer cannot see leaves them
+          // unable to propose anything better.
+          peerAccepted: peerAnswer.accepted,
+          peerRefusalReason: peerAnswer.reason,
           // Kept alongside it, because they answer different questions: whether they agreed, and
           // whether anything has actually come back. A document accepted an hour ago with nothing
           // in it is a fine state; it is just not the same state.
@@ -472,7 +478,12 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const rendered = layer.notifications.diff(document.documentType, before, after, documentId);
     // The STATS come from the same pair of texts, so an agent branching on `overlap` is branching on
     // the same comparison it is being shown.
-    const stats = layer.notifications.diffStats(documentId, before, after, null, document.documentType);
+    // OUR OWN edited lines, so `overlap` is a computed answer rather than the reassuring null three
+    // instruction sheets were telling agents to trust. Null here still means "not computed" — we
+    // have not written since the read — and `diffStats` keeps that distinct from "no conflict",
+    // which is the whole reason its parameter is required.
+    const myEdits = layer.notifications.myEditedLines(who.ownerAgentId, documentId);
+    const stats = layer.notifications.diffStats(documentId, before, after, myEdits, document.documentType);
     if (!rendered.ok) {
       // The stats still stand — they are structural and type-independent — so a document type this
       // build cannot render is not a document an agent has to read blind.
@@ -565,6 +576,10 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         guidance: result.detail,
       };
     }
+    // WHAT WE WROTE, against the current read mark. Without it `cello_doc_diff` shows our own edits
+    // back to us as "what changed since I looked" — which the tool description frames as the
+    // COUNTERPARTY's contribution — and `overlap` has nothing to separate mine from theirs.
+    layer.notifications.markWritten(who.ownerAgentId, documentId, content);
     // Delivery is the worker's, not this call's — publish is fire-and-forget by design (§16.4), and
     // a write that blocked on an offline peer would make editing a shared document depend on the
     // other party being awake.
@@ -582,13 +597,29 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const outcome = await layer.lifecycle.close(who.ownerAgentId, documentId, deps.now());
     if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
+    const status = layer.store.getDocument(who.ownerAgentId, documentId)?.status ?? "unknown";
     // BILATERAL. The document settles when both sides have said it, so "closed" is not this call's
     // answer to give — reporting it would tell an operator the collaboration is over while the peer
     // is still editing.
+    //
+    // `peerNotified` is reported for the same reason `kill` reports it, and its absence here was an
+    // asymmetry with teeth: `status: "active"` after a close is INDISTINGUISHABLE from "sent fine,
+    // they have not answered yet". Control frames are fire-once — unlike update envelopes they are
+    // not in the log and the delivery sweep never retries them — so a close sent while the peer was
+    // offline means the document can never settle, forever, with nothing on either screen.
     return {
       ok: true,
       documentId,
-      status: layer.store.getDocument(who.ownerAgentId, documentId)?.status ?? "unknown",
+      status,
+      peerNotified: outcome.peerNotified,
+      ...(outcome.peerNotified
+        ? {}
+        : {
+            guidance:
+              `Your close was recorded but did not reach the peer, so the document cannot settle ` +
+              `until they hear it. A close is not retried — run cello_doc_close again when they ` +
+              `are back, or cello_doc_kill if you need it over now.`,
+          }),
     };
   });
 
