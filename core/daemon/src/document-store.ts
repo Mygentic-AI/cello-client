@@ -293,6 +293,16 @@ export class DocumentStore {
   readonly #db: DaemonDatabase;
   readonly #logger: Logger;
 
+  /**
+   * The underlying handle, for modules that own their OWN tables alongside this one
+   * (DocumentLifecycle). Deliberately not a licence to query this store's tables from outside —
+   * every one of them has a method here, and a second query path is a second set of rules about
+   * scoping that nobody remembers to keep in step.
+   */
+  get rawDb(): DaemonDatabase {
+    return this.#db;
+  }
+
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
@@ -680,7 +690,23 @@ export class DocumentStore {
       .prepare(
         `SELECT * FROM document_envelopes
           WHERE owner_agent_id = ? AND sender_agent_id = ? AND acked_at IS NULL
+            -- UPDATES only. A withdrawal record is local audit — the update it concerns was never
+            -- delivered, so there is nothing for the peer to act on — and a rejection reaches the
+            -- peer through the rejection protocol, not this worker. Without the scope the worker
+            -- would ship both, and the withdrawal would arrive as a reference to an envelope the
+            -- peer has never seen.
+            AND kind = 'update'
             AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            -- A WITHDRAWN update is not pending. Derived from the withdrawal record rather than a
+            -- flag on the row, so there is one fact in one place: without this the delivery worker
+            -- ships the very update the operator just withdrew.
+            AND NOT EXISTS (
+              SELECT 1 FROM document_envelopes w
+               WHERE w.owner_agent_id = document_envelopes.owner_agent_id
+                 AND w.document_id = document_envelopes.document_id
+                 AND w.kind = 'withdrawal'
+                 AND w.references_hash = document_envelopes.envelope_hash
+            )
           ORDER BY log_index ASC LIMIT ?`,
       )
       .all(ownerAgentId, ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
