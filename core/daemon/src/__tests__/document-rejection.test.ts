@@ -40,7 +40,22 @@ function newFixture() {
     properties: {}, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
-  return { store, engine, rejections: new DocumentRejections(store, logger), events };
+  return { store, engine, logger, rejections: new DocumentRejections(store, logger), events };
+}
+
+/**
+ * Signature, state vector and nonce are REQUIRED inputs — the unit refuses to fabricate crypto,
+ * because an all-zero placeholder in an immutable log is indistinguishable from a real signature
+ * that fails to verify. ENVELOPE-1 produces the real ones.
+ */
+let nonceCounter = 0;
+function crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: string } {
+  nonceCounter += 1;
+  return {
+    signature: new Uint8Array(64).fill(7),
+    stateVector: new Uint8Array([1, 0]),
+    nonce: `n${nonceCounter}`,
+  };
 }
 
 let seq = 0;
@@ -72,6 +87,7 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
       reason: "document_append_only_violation",
       detail: "removes existing content",
       senderAgentId: PEER,
+      ...crypto(),
     });
 
     const log = store.getEnvelopeLog(AGENT, DOC);
@@ -95,6 +111,7 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
       quarantined: bytes,
       reason: "document_update_malformed",
       senderAgentId: PEER,
+      ...crypto(),
     });
 
     const held = rejections.quarantined(AGENT, DOC);
@@ -110,6 +127,7 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
       reason: "document_append_only_violation",
       detail: "the update deletes 12 existing range(s)",
       senderAgentId: PEER,
+      ...crypto(),
     });
 
     const emitted = events.find((e) => e.event === "document.rejection.sent");
@@ -186,6 +204,7 @@ describe("DocumentRejections — supersession, not rollback on both sides (§3.2
       quarantined: new Uint8Array([1, 1]),
       reason: "document_append_only_violation",
       senderAgentId: PEER,
+      ...crypto(),
     });
     expect(rejections.quarantined(AGENT, DOC)).toHaveLength(1);
 
@@ -197,12 +216,17 @@ describe("DocumentRejections — supersession, not rollback on both sides (§3.2
 describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
   it("allows exactly one more round, then flips the document to stalled", () => {
     const { store, rejections } = newFixture();
+    // DISTINCT envelopes per round, which is what the protocol produces — the original update,
+    // then the supersession, then its supersession. Re-rejecting one hash collapsed to a single
+    // log row and is what hid the chain fork.
+    let n = 0;
     const reject = () =>
       rejections.reject(AGENT, DOC, {
-        rejectedEnvelopeHash: "ab".repeat(32),
+        rejectedEnvelopeHash: `${(n += 1)}`.padStart(64, "e"),
         quarantined: new Uint8Array([1, 1]),
         reason: "document_append_only_violation",
         senderAgentId: PEER,
+        ...crypto(),
       });
 
     expect(reject().stalled).toBe(false); // the original rejection
@@ -217,10 +241,11 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
     const { store, rejections } = newFixture();
     for (let i = 0; i < 3; i++) {
       rejections.reject(AGENT, DOC, {
-        rejectedEnvelopeHash: "ab".repeat(32),
+        rejectedEnvelopeHash: `${i}`.padStart(64, "e"),
         quarantined: new Uint8Array([1, 1]),
         reason: "document_append_only_violation",
         senderAgentId: PEER,
+        ...crypto(),
       });
     }
 
@@ -239,10 +264,11 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
     const { rejections, events } = newFixture();
     for (let i = 0; i < 5; i++) {
       rejections.reject(AGENT, DOC, {
-        rejectedEnvelopeHash: "ab".repeat(32),
+        rejectedEnvelopeHash: `${i}`.padStart(64, "f"),
         quarantined: new Uint8Array([1, 1]),
         reason: "document_append_only_violation",
         senderAgentId: PEER,
+        ...crypto(),
       });
     }
     expect(events.filter((e) => e.event === "document.stalled")).toHaveLength(1);
@@ -263,12 +289,12 @@ describe("DocumentRejections — mutual concurrent rejections are independent", 
     // from deadlocking.
     rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "11".repeat(32), quarantined: new Uint8Array([1]),
-      reason: "document_append_only_violation", senderAgentId: PEER,
+      reason: "document_append_only_violation", senderAgentId: PEER, ...crypto(),
     });
     for (let i = 0; i < 3; i++) {
       rejections.reject(AGENT, other, {
-        rejectedEnvelopeHash: "22".repeat(32), quarantined: new Uint8Array([2]),
-        reason: "document_update_malformed", senderAgentId: PEER,
+        rejectedEnvelopeHash: `${i}`.padStart(64, "2"), quarantined: new Uint8Array([2]),
+        reason: "document_update_malformed", senderAgentId: PEER, ...crypto(),
       });
     }
 
@@ -291,8 +317,133 @@ describe("DocumentRejections — erasure by a BOUND peer (the question GATE-1 ha
       reason: "document_bound_peer_erasure",
       detail: "the update deletes content this agent authored",
       senderAgentId: PEER,
+      ...crypto(),
     });
     expect(outcome.stalled).toBe(false);
     expect(rejections.quarantined(AGENT, DOC)).toHaveLength(1);
+  });
+});
+
+// ─── Pass-one: the cases the original tests could not see ───────────────────
+
+describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
+  it("a new instance over the same store still holds the bytes, the round, and the stall", () => {
+    const { store, rejections, logger } = newFixture();
+    for (let i = 0; i < 3; i++) {
+      rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: `${i}`.padStart(64, "a"),
+        quarantined: new Uint8Array([i, i]),
+        reason: "document_append_only_violation",
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+    }
+    expect(store.getDocument(AGENT, DOC)!.status).toBe("stalled");
+
+    // A fresh instance stands in for a daemon restart. Holding this in memory meant the document
+    // row said `stalled` while the daemon happily accepted updates on it, the held bytes were
+    // gone, and the retry counter restarted — the system reporting two contradictory states.
+    const restarted = new DocumentRejections(store, logger);
+    expect(restarted.acceptsUpdates(AGENT, DOC).ok).toBe(false);
+    expect(restarted.quarantined(AGENT, DOC)).toHaveLength(3);
+  });
+
+  it("the held bytes are recovered from the STORE, not from the caller's array", () => {
+    const { store, rejections, logger } = newFixture();
+    rejections.reject(AGENT, DOC, {
+      rejectedEnvelopeHash: "ab".repeat(32),
+      quarantined: new Uint8Array([4, 5, 6]),
+      reason: "document_update_malformed",
+      senderAgentId: PEER,
+      ...crypto(),
+    });
+
+    const recovered = new DocumentRejections(store, logger).quarantined(AGENT, DOC);
+    expect(Buffer.from(recovered[0]!.quarantined)).toEqual(Buffer.from([4, 5, 6]));
+  });
+
+  it("the bytes are COPIED — a caller reusing its buffer cannot change what was refused", () => {
+    const { rejections } = newFixture();
+    const buffer = new Uint8Array([7, 7, 7]);
+    rejections.reject(AGENT, DOC, {
+      rejectedEnvelopeHash: "cd".repeat(32),
+      quarantined: buffer,
+      reason: "document_update_malformed",
+      senderAgentId: PEER,
+      ...crypto(),
+    });
+    buffer.fill(0); // a pooled network read buffer is reused
+
+    expect(Buffer.from(rejections.quarantined(AGENT, DOC)[0]!.quarantined)).toEqual(
+      Buffer.from([7, 7, 7]),
+    );
+  });
+});
+
+describe("DocumentRejections — rejections do not fork the chain", () => {
+  it("three rejections leave the chain VERIFIABLE and the document rebuildable", () => {
+    const { store, engine, rejections } = newFixture();
+    for (let i = 0; i < 3; i++) {
+      rejections.reject(AGENT, DOC, {
+        rejectedEnvelopeHash: `${i}`.padStart(64, "b"),
+        quarantined: new Uint8Array([i]),
+        reason: "document_append_only_violation",
+        senderAgentId: PEER,
+        ...crypto(),
+      });
+    }
+
+    // Writing docPrevHash: null made every rejection a second GENESIS row, so two rejections
+    // forked the chain — and the retry protocol guarantees at least two before a stall. The
+    // document then rebuilt until the next daemon start and was permanently unopenable after it.
+    expect(store.verifyChainLinkage(AGENT, DOC)).toEqual({ ok: true });
+    expect(() => store.rebuildSnapshot(AGENT, DOC, (rows) => engine.replay(rows))).not.toThrow();
+  });
+});
+
+describe("DocumentRejections — rollback refuses rather than undoing the wrong work", () => {
+  it("REFUSES when local edits are stacked since tracking began", () => {
+    const { rejections } = newFixture();
+    const doc = new Y.Doc();
+    doc.clientID = 3_000;
+    doc.getText("content").insert(0, "base");
+
+    const tracked = rejections.trackLocalEdits(doc);
+    doc.getText("content").insert(4, " REFUSED");
+    doc.getText("content").insert(doc.getText("content").length, " legitimate");
+
+    // Unguarded, this undid the LEGITIMATE work and KEPT the refused content — so the supersession
+    // re-ships the refused bytes, is rejected again, and the document stalls with a reason
+    // pointing at the peer while the operator's writing is gone.
+    expect(() => rejections.rollback(tracked)).toThrow(/document_rollback_out_of_order/);
+    expect(doc.getText("content").toString()).toBe("base REFUSED legitimate");
+  });
+
+  it("REFUSES when nothing was tracked at all, rather than reporting success", () => {
+    const { rejections } = newFixture();
+    const doc = new Y.Doc();
+    doc.clientID = 3_000;
+    const tracked = rejections.trackLocalEdits(doc);
+    expect(() => rejections.rollback(tracked)).toThrow(/document_rollback/);
+  });
+});
+
+describe("DocumentRejections — a duplicate rejection does not advance the round", () => {
+  it("re-rejecting the same envelope for the same reason writes one leaf and one round", () => {
+    const { store, rejections } = newFixture();
+    const input = {
+      rejectedEnvelopeHash: "ef".repeat(32),
+      quarantined: new Uint8Array([1]),
+      reason: "document_update_malformed",
+      senderAgentId: PEER,
+      signature: new Uint8Array(64).fill(7),
+      stateVector: new Uint8Array([1, 0]),
+      nonce: "same",
+    };
+    expect(rejections.reject(AGENT, DOC, input).round).toBe(1);
+    // A duplicate must not advance the counter, or a document reaches `stalled` with fewer
+    // rejection leaves than rounds and an auditor replaying the log cannot see why.
+    expect(rejections.reject(AGENT, DOC, input).round).toBe(1);
+    expect(store.getEnvelopeLog(AGENT, DOC).filter((e) => e.kind === "rejection")).toHaveLength(1);
   });
 });

@@ -87,6 +87,20 @@ export interface DocumentEnvelopeRow {
   logIndex?: number;
 }
 
+export interface QuarantineRow {
+  documentId: string;
+  rejectedEnvelopeHash: string;
+  payload: Uint8Array;
+  reason: string;
+  detail?: string;
+  /** Which pluggable rule refused, when one did — the gate produces this and it must not be lost. */
+  rule?: string;
+  limitName?: string;
+  limitValue?: number;
+  limitActual?: number;
+  createdAtMs: number;
+}
+
 export interface DocumentSnapshot {
   binary: Uint8Array;
   stateVector: Uint8Array;
@@ -177,6 +191,35 @@ const CREATE_ENVELOPES_SQL = `
   );
 `;
 
+/**
+ * Quarantined updates (DOD-DOC-REJECT-1). A separate table, deliberately:
+ *
+ * `document_envelopes` cannot hold them — its CHECK forbids a payload on a non-update row — and
+ * putting the refused bytes in as an `update` row would be worse, because `replay` applies every
+ * payload in order and does not honour references. The refused content would come back on every
+ * rebuild, which is the opposite of quarantine.
+ *
+ * So the log stays clean and replay is untouched, while the bytes a `0x05` leaf references
+ * actually survive a restart — which is the whole point of "held, never discarded" (§3.2).
+ */
+const CREATE_QUARANTINE_SQL = `
+  CREATE TABLE IF NOT EXISTS document_quarantine (
+    owner_agent_id        TEXT    NOT NULL,
+    document_id           TEXT    NOT NULL,
+    rejected_envelope_hash TEXT   NOT NULL,
+    payload               BLOB    NOT NULL,
+    reason                TEXT    NOT NULL,
+    detail                TEXT,
+    rule                  TEXT,
+    limit_name            TEXT,
+    limit_value           INTEGER,
+    limit_actual          INTEGER,
+    created_at            INTEGER NOT NULL,
+    PRIMARY KEY (owner_agent_id, document_id, rejected_envelope_hash),
+    FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
+  );
+`;
+
 const CREATE_SNAPSHOTS_SQL = `
   CREATE TABLE IF NOT EXISTS document_snapshots (
     owner_agent_id      TEXT    NOT NULL,
@@ -198,6 +241,7 @@ export class DocumentStore {
     this.#logger = logger;
     this.#db.exec(CREATE_DOCUMENTS_SQL);
     this.#db.exec(CREATE_ENVELOPES_SQL);
+    this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
@@ -434,6 +478,88 @@ export class DocumentStore {
       }
     }
     return { ok: true };
+  }
+
+  // ─── quarantine (held, never discarded) ───────────────────────────────────
+
+  /** Hold a refused update's bytes. Idempotent per rejected envelope. */
+  holdQuarantined(ownerAgentId: string, row: QuarantineRow): void {
+    this.#db
+      .prepare(
+        `INSERT INTO document_quarantine
+           (owner_agent_id, document_id, rejected_envelope_hash, payload, reason, detail,
+            rule, limit_name, limit_value, limit_actual, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id, rejected_envelope_hash) DO NOTHING`,
+      )
+      .run(
+        ownerAgentId,
+        row.documentId,
+        row.rejectedEnvelopeHash,
+        Buffer.from(row.payload),
+        row.reason,
+        row.detail ?? null,
+        row.rule ?? null,
+        row.limitName ?? null,
+        row.limitValue ?? null,
+        row.limitActual ?? null,
+        row.createdAtMs,
+      );
+  }
+
+  listQuarantined(ownerAgentId: string, documentId: string): QuarantineRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM document_quarantine
+          WHERE owner_agent_id = ? AND document_id = ? ORDER BY created_at ASC`,
+      )
+      .all(ownerAgentId, documentId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      documentId: r["document_id"] as string,
+      rejectedEnvelopeHash: r["rejected_envelope_hash"] as string,
+      payload: toU8(r["payload"]),
+      reason: r["reason"] as string,
+      detail: (r["detail"] as string | null) ?? undefined,
+      rule: (r["rule"] as string | null) ?? undefined,
+      limitName: (r["limit_name"] as string | null) ?? undefined,
+      limitValue: (r["limit_value"] as number | null) ?? undefined,
+      limitActual: (r["limit_actual"] as number | null) ?? undefined,
+      createdAtMs: r["created_at"] as number,
+    }));
+  }
+
+  /** Release one entry once its superseding update has been admitted. Returns whether it existed. */
+  releaseQuarantined(ownerAgentId: string, documentId: string, rejectedEnvelopeHash: string): boolean {
+    const info = this.#db
+      .prepare(
+        `DELETE FROM document_quarantine
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_envelope_hash = ?`,
+      )
+      .run(ownerAgentId, documentId, rejectedEnvelopeHash);
+    return Number(info.changes) > 0;
+  }
+
+  /** The rejecting agent's most recent envelope for this document, for chain linkage. */
+  lastEnvelopeHashBySender(ownerAgentId: string, documentId: string, senderAgentId: string): string | null {
+    const r = this.#db
+      .prepare(
+        `SELECT envelope_hash FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?
+          ORDER BY log_index DESC LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, senderAgentId) as { envelope_hash?: string } | undefined;
+    return r?.envelope_hash ?? null;
+  }
+
+  /** How many rejection records this document carries — the retry round, derived not remembered. */
+  countRejections(ownerAgentId: string, documentId: string): number {
+    const r = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND kind = 'rejection'`,
+      )
+      .get(ownerAgentId, documentId) as { n?: number } | undefined;
+    return r?.n ?? 0;
   }
 
   // ─── the snapshot (disposable) ────────────────────────────────────────────
