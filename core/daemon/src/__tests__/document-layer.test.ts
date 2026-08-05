@@ -19,7 +19,7 @@ import {
   DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
-import { createDocumentLayer } from "../document-layer.js";
+import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import type { Logger } from "../types.js";
 
 const AGENT = "owner-agent";
@@ -184,5 +184,33 @@ describe("document layer — a conversation message passes straight through", ()
     // The whole layer must be invisible to the conversation path — that is what lets it be wired
     // without changing message handling.
     expect(f.layer.onDocumentFrame(AGENT, "s", message, "pk")).toEqual({ consumed: false });
+  });
+});
+
+describe("agentPublicKeyFromId — a remote agent id IS its pubkey (M14-D5)", () => {
+  it("decodes a 32-byte hex id to the key bytes", () => {
+    const hex = "ab".repeat(32);
+    const key = agentPublicKeyFromId(hex);
+    expect(key).toBeInstanceOf(Uint8Array);
+    expect(key).toHaveLength(32);
+    expect(Buffer.from(key!).toString("hex")).toBe(hex);
+  });
+
+  it("returns null for anything that is not one, rather than throwing", () => {
+    // Null is a refusal at the verify step. An id that is not a key is a frame that does not follow
+    // the protocol, not "a peer we have no key for" — but both must refuse, and this is where.
+    for (const bad of ["", "not-hex", "AB".repeat(32), "ab".repeat(16), "ab".repeat(33)]) {
+      expect(agentPublicKeyFromId(bad)).toBeNull();
+    }
+  });
+
+  it("verifies a real signature end to end through the default resolver", async () => {
+    const keys = generateKeypair();
+    const pub = await keys.getPublicKey();
+    const asId = Buffer.from(pub).toString("hex");
+    // The whole point of M14-D5: the id round-trips to the key with no lookup at all.
+    expect(Buffer.from(agentPublicKeyFromId(asId)!).toString("hex")).toBe(
+      Buffer.from(pub).toString("hex"),
+    );
   });
 });

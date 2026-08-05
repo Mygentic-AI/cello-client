@@ -40,11 +40,15 @@ export interface DocumentLayerDeps {
   db: DaemonDatabase;
   logger: Logger;
   /**
-   * The public key an agent id signs with, or null when this daemon has no binding for it.
+   * The public key an agent id signs with, or null when this daemon cannot resolve one.
    *
    * REQUIRED. Returning null means "cannot verify", which both inbound paths treat as a refusal —
    * the same answer as a bad signature, because admitting an envelope we cannot authenticate is
    * the outcome the whole verify step exists to prevent.
+   *
+   * Injected rather than computed here even though M14-D5 makes a remote agent id BE its pubkey
+   * hex, because the daemon may want to refuse a peer it has no contact for, or resolve through a
+   * different binding later. `agentPublicKeyFromId` below is the default implementation.
    */
   publicKeyFor(agentId: string): Uint8Array | null;
   /** Tell the peer about a unilateral end. Injected — the transport is not this layer's. */
@@ -82,6 +86,23 @@ export interface DocumentLayer {
     senderPubkey: string,
     correlationId?: string,
   ): { consumed: boolean; kind?: string; ok?: boolean; reason?: string };
+}
+
+/**
+ * The default `publicKeyFor`: a remote agent's id IS its K_local public key, hex-encoded (M14-D5).
+ *
+ * `agent_id` in this daemon is a LOCAL primary key on the `agents` table — it names rows in our own
+ * database and cannot identify a remote peer. The pubkey is the only self-verifying identifier
+ * available: the signature checks against it directly, with no lookup that could be stale, missing
+ * or poisoned sitting on the critical path of every authentication.
+ *
+ * Malformed input returns null rather than throwing, and null is a refusal. An id that is not a
+ * 32-byte hex key is not "a peer we have no key for" — it is a frame that does not follow the
+ * protocol — but both must refuse, and refusing loudly at the verify step is where it belongs.
+ */
+export function agentPublicKeyFromId(agentId: string): Uint8Array | null {
+  if (!/^[0-9a-f]{64}$/.test(agentId)) return null;
+  return Uint8Array.from(Buffer.from(agentId, "hex"));
 }
 
 export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
