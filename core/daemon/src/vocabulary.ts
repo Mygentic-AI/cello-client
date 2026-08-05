@@ -83,12 +83,18 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_attestation_consent_list", cli: "cello attestation-consent list" },
   { mcp: "cello_attestation_consent_accept", cli: "cello attestation-consent accept" },
   { mcp: "cello_attestation_consent_refuse", cli: "cello attestation-consent refuse" },
-  // Federated documents (M14 / DOD-DOC-TOOLS-1) are DELIBERATELY NOT DECLARED HERE YET. The
-  // handler module exists (`document-handlers.ts`) but the lockstep registration does not: no
-  // daemon wiring, no CLI commands, no MCP shim entries. Declaring the names first made three
-  // guards fail at once — "every declared tool has a handler behind it", "every dual-surface
-  // capability's CLI name is a real command", and the source audit — which is exactly what those
-  // guards are for. A vocabulary entry is a promise to an operator that a command exists.
+  // Federated documents (M14 / DOD-DOC-TOOLS-1). Declared only now that all four places exist —
+  // daemon handlers, this table, the CLI commands, and the MCP shim. A vocabulary entry is a
+  // promise to an operator that a command exists, and declaring the names ahead of the handlers
+  // failed three guards at once: "every declared tool has a handler behind it", "every
+  // dual-surface capability's CLI name is a real command", and the source audit.
+  { mcp: "cello_doc_propose", cli: "cello doc propose" },
+  { mcp: "cello_doc_inbox", cli: "cello doc inbox" },
+  { mcp: "cello_doc_accept", cli: "cello doc accept" },
+  { mcp: "cello_doc_refuse", cli: "cello doc refuse" },
+  { mcp: "cello_doc_list", cli: "cello doc list" },
+  { mcp: "cello_doc_read", cli: "cello doc read" },
+  { mcp: "cello_doc_write", cli: "cello doc write" },
   // Other
   { mcp: "cello_moniker", cli: "cello moniker" },
   { mcp: "cello_settings_get", cli: "cello settings get" },

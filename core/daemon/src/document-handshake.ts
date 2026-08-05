@@ -206,6 +206,44 @@ export class DocumentHandshake {
     return { documentId, state, ...(storedReason ? { reason: storedReason } : {}) };
   }
 
+  /**
+   * Record a proposal WE authored, so it can be re-sent without minting a new one.
+   *
+   * The proposer had no record of the envelope it sent. That is fine until the send fails — an
+   * offline peer is the ordinary case — and then the document exists locally with no way to reach
+   * the counterparty: re-proposing mints a fresh nonce, hence a fresh `document_id`, hence a second
+   * document, leaving the first as an orphan the operator cannot explain or clear.
+   *
+   * Stored `accepted`, because we consented by authoring it — so it never appears in our own inbox
+   * (`pending` filters on state), which would be an offer to ourselves.
+   *
+   * Deliberately NOT routed through `recordProposal`: that path's checks are for a proposal
+   * ARRIVING — verify the signature against the named proposer, and refuse one not addressed to us.
+   * Ours is addressed to the peer by definition, so reusing that path would require weakening the
+   * check that stops a proposal being recorded under an agent it never named.
+   */
+  recordOutgoing(ownerAgentId: string, envelope: DocumentProposalEnvelope, nowMs: number): string {
+    const documentId = documentIdFromProposal(envelope);
+    this.#db
+      .prepare(
+        `INSERT INTO document_proposals
+           (owner_agent_id, document_id, proposer_agent_id, peer_agent_id, envelope,
+            consent_state, refusal_reason, created_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, 'accepted', NULL, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id) DO NOTHING`,
+      )
+      .run(
+        ownerAgentId,
+        documentId,
+        envelope.proposer_agent_id,
+        envelope.peer_agent_id,
+        Buffer.from(encodeDocumentProposal(envelope)),
+        nowMs,
+        nowMs,
+      );
+    return documentId;
+  }
+
   /** Proposals still awaiting a decision — the operator's inbox for documents. */
   pending(ownerAgentId: string): DocumentProposalRecord[] {
     return this.#rows(ownerAgentId, "WHERE owner_agent_id = ? AND consent_state = 'pending'", []);

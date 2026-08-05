@@ -87,6 +87,8 @@ import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
+import { registerDocumentHandlers } from "./document-handlers.js";
+import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { DocumentDelivery } from "./document-delivery.js";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
@@ -3233,12 +3235,14 @@ async function startDaemonHoldingLock(
   // The sweep's serial loop happens to cover it today; a cached worker means it is covered because
   // the guard exists, not by accident of loop shape.
   const documentDeliveryWorkers = new Map<string, DocumentDelivery>();
-  const documentDeliveryFor = (agentName: string): DocumentDelivery => {
-    const existing = documentDeliveryWorkers.get(agentName);
-    if (existing) return existing;
-    const worker = new DocumentDelivery(
-      documentLayer.store,
-      createDocumentDeliveryTransport({
+  // Cached separately from the worker because the OPERATOR SURFACE needs it too: a proposal is not
+  // in the envelope log — there is no document yet — so it has no delivery record to schedule, and
+  // it still has to travel the same open-or-reuse-then-seal path an update does.
+  const documentTransports = new Map<string, ReturnType<typeof createDocumentDeliveryTransport>>();
+  const documentTransportFor = (agentName: string) => {
+    const cached = documentTransports.get(agentName);
+    if (cached) return cached;
+    const transport = createDocumentDeliveryTransport({
         agentName,
         logger,
         // The SAME 3-state discovery answer cello_initiate_session uses, from the same closure —
@@ -3310,12 +3314,62 @@ async function startDaemonHoldingLock(
           });
           return { bytes, hash: new Uint8Array(createHash("sha256").update(bytes).digest()) };
         },
-      }),
-      logger,
-    );
+    });
+    documentTransports.set(agentName, transport);
+    return transport;
+  };
+
+  const documentDeliveryFor = (agentName: string): DocumentDelivery => {
+    const existing = documentDeliveryWorkers.get(agentName);
+    if (existing) return existing;
+    const worker = new DocumentDelivery(documentLayer.store, documentTransportFor(agentName), logger);
     documentDeliveryWorkers.set(agentName, worker);
     return worker;
   };
+
+  // M14 / DOD-DOC-TOOLS-1 — the OPERATOR SURFACE. Registered last of the document wiring, because
+  // it is the only part that can create a document, and everything it creates has to have somewhere
+  // to go: without the inbound path a peer's answer is unroutable, and without the delivery worker a
+  // published update never leaves.
+  const documentPublish = new DocumentPublish({
+    store: documentLayer.store,
+    engine: documentLayer.engine,
+    logger,
+    sign: async (ownerAgentId, tbs) => {
+      // `ownerAgentId` is the owner KEY here, and keyProviders is keyed by NAME — so it is resolved
+      // back through the same map the owner key came from rather than guessed. A miss throws: an
+      // unsigned envelope in an append-only log is worse than a failed publish.
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      const provider = agentName ? keyProviders.get(agentName) : undefined;
+      if (!provider) {
+        throw new Error(
+          `document_publish_unsigned: no key provider for owner ${ownerAgentId.slice(0, 16)}…, ` +
+            `so this update cannot be signed`,
+        );
+      }
+      return provider.sign(tbs);
+    },
+    // M14-D5: our wire sender id IS the owner key. Kept as its own callback because they are
+    // different facts that happen to coincide — see DocumentStore.pendingDeliveries.
+    senderIdFor: (ownerAgentId) => ownerAgentId,
+    canPublish: (ownerAgentId, documentId) => documentLayer.lifecycle.canPublish(ownerAgentId, documentId),
+  });
+  registerDocumentHandlers({
+    handlers,
+    logger,
+    layer: documentLayer,
+    publish: documentPublish,
+    transportFor: documentTransportFor,
+    resolveAgent: (connectionId, explicit) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicit),
+    ownerKeyFor: documentOwnerKeyFor,
+    sign: async (agentName, tbs) => {
+      const provider = keyProviders.get(agentName);
+      if (!provider) throw new Error(`document_proposal_unsigned: no key provider for ${agentName}`);
+      return provider.sign(tbs);
+    },
+    now: () => Date.now(),
+  });
 
   /**
    * The delivery tick.

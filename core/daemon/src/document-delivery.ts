@@ -61,6 +61,27 @@ export interface DocumentDeliveryTransport {
    * `sessionOpened` distinguishes a session this delivery opened from one it reused — the audit
    * distinction §16.4 cares about, and unrecoverable after the fact.
    */
+  /**
+   * Send already-encoded bytes to a peer over the same open-or-reuse-then-seal path `deliver` uses.
+   *
+   * Exists for the frames that are NOT in the envelope log and therefore have no delivery record to
+   * schedule: a proposal (there is no document yet), an ack, a rejection. Those still have to reach
+   * the peer, and the alternative — a second implementation of session acquisition — would drift on
+   * exactly the things that matter here: which session gets reused, and whether one this daemon
+   * opened gets sealed.
+   *
+   * `documentId` is for the log line only; nothing about the send depends on it.
+   */
+  sendBytes(input: {
+    peerAgentId: string;
+    documentId: string;
+    bytes: Uint8Array;
+    sessionHint?: string;
+    correlationId: string;
+  }): Promise<
+    | { ok: true; sessionId: string; sessionOpened: boolean }
+    | { ok: false; reason: string; detail?: string }
+  >;
   deliver(input: {
     peerAgentId: string;
     documentId: string;

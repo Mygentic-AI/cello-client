@@ -38,6 +38,13 @@ import {
   contactList,
   contactSetTier,
   contactSetSignal,
+  docPropose,
+  docInbox,
+  docAccept,
+  docRefuse,
+  docList,
+  docRead,
+  docWrite,
   attestationConsentList,
   attestationConsentAccept,
   attestationConsentRefuse,
@@ -106,6 +113,10 @@ export const GROUP_ORDER = [
   "Agents",
   "Messaging",
   "Sessions & receipts",
+  // After the conversation surfaces, before the trust ones: a shared document is something two
+  // agents DO together, so it belongs with the doing — not filed under "Other", where an operator
+  // finds it only if they already know it exists.
+  "Documents",
   "Contacts",
   // TWO GROUPS, NOT ONE. On the wire an attestation is a trust signal, and they sat together for
   // exactly that reason — which made the person-to-person primitive read as a wallet chore. What the
@@ -995,6 +1006,75 @@ export const COMMANDS: readonly CommandSpec[] = [
         return attestationConsentRefuse(ctx.celloDir, hash, msg.length > 0 ? msg : null, o);
       }
       return { stdout: helpForSpec("attestation-consent"), stderr: "", exitCode: 1 };
+    },
+  },
+
+  // ═══ Documents (M14 / DOD-DOC-TOOLS-1) ══════════════════════════════════════════════════════
+  {
+    name: "doc",
+    group: "Documents",
+    summary: "Share a living document with a counterparty — both sides edit, both sides converge.",
+    help:
+      "Usage:\n" +
+      "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--content <text>]\n" +
+      "                                                    — offer a shared document. They must accept.\n" +
+      "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
+      "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
+      "  cello doc refuse <document-id> [why…]             — refuse one\n" +
+      "  cello doc list                                    — your documents and their state\n" +
+      "  cello doc read <document-id>                      — the current text\n" +
+      "  cello doc write <document-id> <text…>             — replace the text and publish the change\n" +
+      "\n" +
+      "A document is a STANDING AGREEMENT to apply a counterparty's signed operations to your local\n" +
+      "copy. That is a bigger grant than receiving a message, which is why accepting is a separate,\n" +
+      "deliberate act — after it, edits converge without asking you again. 'inbox' is where you read\n" +
+      "what was offered before agreeing to it.\n" +
+      "\n" +
+      "'write' takes the COMPLETE new text, not a patch. The daemon diffs it against the current\n" +
+      "state, so your offsets cannot go stale under an edit the peer made while you were typing.\n" +
+      "\n" +
+      "Publishing does NOT wait for the peer. A change is signed, logged, and delivered by a\n" +
+      "background worker when they are reachable — so editing a shared document never depends on the\n" +
+      "other party being awake. 'list' shows what has not yet been acknowledged.\n" +
+      "\n" +
+      "These act on the SELECTED agent unless you pass --agent. Select with 'cello use-agent <name>'.",
+    jsonOut: true,
+    async run(ctx, args) {
+      const { pretty, agent, positional } = parityOpts(args);
+      const o = { pretty, ...(agent !== undefined ? { agent } : {}) };
+      const [sub, target] = positional;
+      if (sub === "inbox") return docInbox(ctx.celloDir, o);
+      if (sub === "list") return docList(ctx.celloDir, o);
+      if (sub === "propose" && target) {
+        const rest = positional.slice(2);
+        const { value: documentType } = takeValueFlag(rest, "--type");
+        const { value: startingContent } = takeValueFlag(rest, "--content");
+        const appendOnly = rest.includes("--append-only");
+        return docPropose(ctx.celloDir, target, {
+          ...o,
+          ...(documentType !== undefined ? { documentType } : {}),
+          ...(startingContent !== undefined ? { startingContent } : {}),
+          ...(appendOnly ? { appendOnly } : {}),
+        });
+      }
+      if (sub === "accept" && target) return docAccept(ctx.celloDir, target, o);
+      if (sub === "refuse" && target) {
+        // Everything after the id is the reason — free text, so joined rather than parsed.
+        const why = positional.slice(2).join(" ");
+        return docRefuse(ctx.celloDir, target, why.length > 0 ? why : null, o);
+      }
+      if (sub === "read" && target) return docRead(ctx.celloDir, target, o);
+      if (sub === "write" && target) {
+        // Joined, not positional[2] alone: the whole point is the COMPLETE text, and a shell splits
+        // it on spaces. Taking only the first word would publish a one-word document and report
+        // success.
+        const content = positional.slice(2).join(" ");
+        if (content.length === 0) {
+          return { stdout: helpForSpec("doc"), stderr: "", exitCode: 1 };
+        }
+        return docWrite(ctx.celloDir, target, content, o);
+      }
+      return { stdout: helpForSpec("doc"), stderr: "", exitCode: 1 };
     },
   },
 

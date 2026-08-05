@@ -34,6 +34,7 @@
  * as delivered, leaves it unacked, and asks again on the capped backoff.
  */
 
+import { createHash } from "node:crypto";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import type { DocumentEnvelopeRow } from "./document-store.js";
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
@@ -80,6 +81,48 @@ export interface DocumentTransportDeps {
 export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
 ): DocumentDeliveryTransport {
+  /**
+   * Acquire a session with the peer — the hint, then the most recent active one, then a fresh dial.
+   *
+   * ONE implementation for every document frame kind. A proposal that opened its own session by a
+   * separate code path would drift on which session gets reused and on whether a session this
+   * daemon opened is sealed, and both are unrecoverable after the fact.
+   */
+  async function acquireSession(
+    peerAgentId: string,
+    sessionHint: string | undefined,
+    correlationId: string,
+  ): Promise<
+    | { ok: true; sessionId: string; sessionOpened: boolean }
+    | { ok: false; reason: string; detail?: string }
+  > {
+    const active = deps.activeSessionsWith(deps.agentName, peerAgentId);
+    if (sessionHint !== undefined) {
+      if (!active.includes(sessionHint)) {
+        // Refused, not replaced. The only reason to pass a hint is to control which sealed record
+        // the change lands in; quietly substituting the daemon's own pick would defeat exactly
+        // that, and it would do so silently.
+        return {
+          ok: false,
+          reason: "document_session_hint_invalid",
+          detail:
+            `session ${sessionHint.slice(0, 16)}… is not an active session with ${peerAgentId}, ` +
+            `so the change cannot be placed in that record`,
+        };
+      }
+      return { ok: true, sessionId: sessionHint, sessionOpened: false };
+    }
+    // Most recent LAST — activeSessionsWith is ordered oldest-first by the daemon's adapter.
+    if (active.length > 0) return { ok: true, sessionId: active[active.length - 1]!, sessionOpened: false };
+    const opened = await deps.openSession(deps.agentName, peerAgentId, correlationId);
+    if (!opened.ok) {
+      // The upstream reason verbatim. `document_delivery_threw` is reserved for a genuine
+      // programming fault; a dial that was refused should say it was refused.
+      return { ok: false, reason: opened.reason, detail: opened.guidance };
+    }
+    return { ok: true, sessionId: opened.sessionId, sessionOpened: true };
+  }
+
   return {
     async isPeerReachable(peerAgentId: string, correlationId: string) {
       // The PASS's correlation id, threaded through. A per-peer constant was fabricated here, so
@@ -94,39 +137,38 @@ export function createDocumentDeliveryTransport(
       return reachabilityFromDiscovery(outcome);
     },
 
+    async sendBytes(input) {
+      const { peerAgentId, documentId, bytes, sessionHint, correlationId } = input;
+      const session = await acquireSession(peerAgentId, sessionHint, correlationId);
+      if (!session.ok) return session;
+
+      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId);
+      if (!sent.ok) {
+        // Sealed even on a send failure, for the same reason as below: a session this daemon opened
+        // and walked away from is a live node the operator never started. A failed send is exactly
+        // when that is most likely to happen.
+        if (session.sessionOpened) await deps.sealSession(deps.agentName, session.sessionId, correlationId);
+        return { ok: false, reason: sent.reason, detail: sent.error };
+      }
+      deps.logger.info("document.frame.sent", {
+        documentId,
+        sessionId: session.sessionId,
+        sessionOpened: session.sessionOpened,
+        bytes: bytes.length,
+        parked: sent.delivered === false,
+        correlationId,
+      });
+      if (session.sessionOpened) await deps.sealSession(deps.agentName, session.sessionId, correlationId);
+      return { ok: true, sessionId: session.sessionId, sessionOpened: session.sessionOpened };
+    },
+
     async deliver(input) {
       const { peerAgentId, documentId, envelope, sessionHint, correlationId } = input;
 
-      let sessionId: string;
-      let sessionOpened = false;
-
-      const active = deps.activeSessionsWith(deps.agentName, peerAgentId);
-      if (sessionHint !== undefined) {
-        if (!active.includes(sessionHint)) {
-          // Refused, not replaced. The only reason to pass a hint is to control which sealed
-          // record the change lands in; quietly substituting the daemon's own pick would defeat
-          // exactly that, and it would do so silently.
-          return {
-            ok: false,
-            reason: "document_session_hint_invalid",
-            detail:
-              `session ${sessionHint.slice(0, 16)}… is not an active session with ${peerAgentId}, ` +
-              `so the change cannot be placed in that record`,
-          };
-        }
-        sessionId = sessionHint;
-      } else if (active.length > 0) {
-        sessionId = active[active.length - 1]!;
-      } else {
-        const opened = await deps.openSession(deps.agentName, peerAgentId, correlationId);
-        if (!opened.ok) {
-          // The upstream reason verbatim. `document_delivery_threw` is reserved for a genuine
-          // programming fault; a dial that was refused should say it was refused.
-          return { ok: false, reason: opened.reason, detail: opened.guidance };
-        }
-        sessionId = opened.sessionId;
-        sessionOpened = true;
-      }
+      const session = await acquireSession(peerAgentId, sessionHint, correlationId);
+      if (!session.ok) return session;
+      const { sessionId, sessionOpened } = session;
 
       const { bytes, hash } = deps.encodeEnvelope(envelope);
       const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId);

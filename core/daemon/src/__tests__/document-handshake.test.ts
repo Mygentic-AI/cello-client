@@ -245,8 +245,12 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
     // thought of is exactly the one a denylist misses. A new public method fails this test until
     // someone justifies it, which is the point: a property change is an epoch event and therefore
     // V2, and mutating after acceptance would silently change the rules the other party agreed to.
+    // `recordOutgoing` is on the list deliberately: it WRITES a proposal (one we authored, so it can
+    // be re-sent to an offline peer without minting a second document) and never touches an existing
+    // row's properties — its INSERT is ON CONFLICT DO NOTHING, so a stored proposal is unreachable
+    // from it. That is the justification this allowlist exists to demand.
     expect(Object.getOwnPropertyNames(DocumentHandshake.prototype).sort()).toEqual(
-      ["accept", "constructor", "get", "pending", "recordProposal", "refuse"].sort(),
+      ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse"].sort(),
     );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });

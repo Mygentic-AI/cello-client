@@ -35,7 +35,7 @@ import {
   verifyDocumentChainLink,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
-import type { DocumentStore } from "./document-store.js";
+import type { DocumentStore, DocumentProperties } from "./document-store.js";
 import type { DocumentEngine } from "./document-engine.js";
 import type { DocumentGate } from "./document-gate.js";
 import type { DocumentRejections } from "./document-rejection.js";
@@ -71,8 +71,8 @@ export interface DocumentInboundDeps {
 }
 
 /** The agreed property, read from the row rather than from whoever called us. */
-function appendOnly(doc: { properties: Record<string, unknown> }): boolean {
-  return doc.properties["append_only"] === true;
+function appendOnly(doc: { properties: DocumentProperties }): boolean {
+  return doc.properties.append_only === true;
 }
 
 export class DocumentInbound {

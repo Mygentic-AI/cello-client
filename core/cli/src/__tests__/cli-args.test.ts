@@ -48,6 +48,8 @@ describe("F1: usage string lists every command", () => {
         "initiate-session", "await-session", "close-session", "name-session", "dismiss", "send", "receive", "inbox",
         // Sessions & receipts
         "sessions", "transcript", "sealed-receipt", "relay-receipts",
+        // Documents (M14)
+        "doc",
         // Contacts
         "contacts", "contact",
         // Trust & endorsements

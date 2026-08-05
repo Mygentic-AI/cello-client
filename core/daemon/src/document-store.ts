@@ -44,14 +44,17 @@ export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
  */
 export type DocumentEnvelopeKind = "update" | "withdrawal" | "rejection";
 
-export interface DocumentProperties {
-  /** V1 accepts only `authenticated` — the Tier-2 seam (§16.1). */
-  assurance_tier?: string;
-  /** V1 accepts only `false` — the Tier-2 seam (§16.1). */
-  schema_enforcement?: boolean;
-  append_only?: boolean;
-  [key: string]: unknown;
-}
+/**
+ * RE-EXPORTED, not redefined.
+ *
+ * This was a second, structurally-similar interface declared here, and that is a drift risk with
+ * teeth: `properties` is inside the proposal's SIGNED preimage and `seamViolation` reads it, so two
+ * definitions of what a property is means two answers to what is admissible — one enforced at the
+ * signature and one at the store. They agreed by coincidence, and the first field added to one of
+ * them would have ended that quietly.
+ */
+export type { DocumentProperties } from "@cello-protocol/protocol-types";
+import type { DocumentProperties } from "@cello-protocol/protocol-types";
 
 export interface DocumentRow {
   documentId: string;
@@ -807,11 +810,15 @@ export class DocumentStore {
     ownerAgentId: string,
     nowMs: number,
     /**
-     * OUR OWN sender id on the wire, which is NOT the owner key. M14-D5 makes an envelope's
-     * `sender_agent_id` the author's pubkey hex, while this store is keyed by the local agent id —
-     * so assuming the two are equal silently returned nothing pending and every published update
-     * sat in the log undelivered, with no error anywhere. Defaults to the owner key for callers
-     * whose ids do coincide (and for the tests that predate the split).
+     * OUR OWN sender id on the wire — the author's pubkey hex (M14-D5).
+     *
+     * Kept as a separate parameter, and separately named, even though the daemon now scopes the
+     * store by that same pubkey hex so the two coincide. They are different FACTS: the owner key
+     * says whose local store this row is in, the sender id says who signed the envelope. An
+     * earlier version of the daemon scoped by agent name, and the mismatch returned nothing
+     * pending — every published update sitting in the log undelivered, with no error anywhere.
+     * Collapsing them into one argument makes that class of bug unrepresentable in the call and
+     * invisible in the query.
      */
     senderAgentId: string = ownerAgentId,
     limit = 100,
