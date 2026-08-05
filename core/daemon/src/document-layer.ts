@@ -57,6 +57,14 @@ export interface DocumentLayerDeps {
    * different binding later. `agentPublicKeyFromId` below is the default implementation.
    */
   publicKeyFor(agentId: string): Uint8Array | null;
+  /**
+   * The stable owner key for a daemon agent NAME — our own K_local pubkey hex (M14-D5).
+   *
+   * The session content path knows agents by name; every document row is scoped by owner key. Both
+   * halves of the layer must agree, and the delivery sweep already uses the pubkey hex. See
+   * `DocumentFrameRouterDeps.ownerKeyFor` for what a disagreement hides.
+   */
+  ownerKeyFor(agentName: string): string | null;
   /** Tell the peer about a unilateral end. Injected — the transport is not this layer's. */
   notifyPeer(
     documentId: string,
@@ -172,6 +180,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     inbound,
     ackInbound,
     logger,
+    ownerKeyFor: deps.ownerKeyFor,
     recordProposal: (ownerAgentId, wire, nowMs) => {
       // THROWS on a forged or misaddressed proposal, which the router contains and reports. That is
       // right: those are refusals, and nothing should be recorded for them.
@@ -210,8 +219,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     rejections,
     router,
     onDocumentFrame: (agentName, _sessionId, content, _senderPubkey, correlationId) =>
-      // `agentName` is the owning agent for the session, which is the scope every document call is
-      // keyed by. The session id and the sender's transport pubkey are deliberately unused: a
+      // `agentName` names the owning agent for the session; the router maps it to the owner KEY
+      // that scopes the store. The session id and the sender's transport pubkey are unused: a
       // document is bound to its PEER by the handshake, not to whichever session carried the
       // frame, and the envelope's own signed `sender_agent_id` is what the inbound path checks
       // against that binding. Trusting the transport identity instead would let a frame arriving

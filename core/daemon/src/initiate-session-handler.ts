@@ -37,9 +37,27 @@ export interface InitiateSessionDeps {
  * open a session without an IPC connection. See `openSessionAs`.
  */
 export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
+  /**
+   * The raw opener. `params` is forwarded to the negotiator as MCP wire names — an INTERNAL caller
+   * should use `openSessionFor` instead, which cannot get those names wrong.
+   */
   openSessionAs(
     agentName: string,
     params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>>;
+  /**
+   * Open a session as `agentName` with a counterparty, named in TypeScript rather than in wire
+   * strings.
+   *
+   * This exists because the wire names are not guessable and a wrong one fails silently-ish: the
+   * negotiator reads `target_pubkey` (falling back to `counterparty_pubkey`) and nothing else, so a
+   * caller passing `pubkey` gets `invalid_target_pubkey` — an error that sends whoever reads it to
+   * look at the PEER's key when the bug is in the caller's own field name. The same class of defect
+   * already exists one seam over in the close handler (`session_id` vs `sessionId`).
+   */
+  openSessionFor(
+    agentName: string,
+    target: { targetPubkey: string },
   ): Promise<Record<string, unknown>>;
 } {
   const {
@@ -220,5 +238,10 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     return openSessionAs(agentName, params);
   });
 
-  return { openSessionAs };
+  return {
+    openSessionAs,
+    openSessionFor: (agentName, target) =>
+      // The ONE place the wire name is written for internal callers.
+      openSessionAs(agentName, { target_pubkey: target.targetPubkey }),
+  };
 }

@@ -114,6 +114,24 @@ export interface DocumentFrameRouterDeps {
   recordProposal(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /** Record a rejection the PEER sent us — the receiving half of §3.2. */
   recordRejection(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /**
+   * Map the daemon's AGENT NAME — the only identifier the session content path carries — to the
+   * stable owner key every document row is scoped by (M14-D5: our own K_local pubkey hex).
+   *
+   * REQUIRED, and required to be here rather than at the call site, because classification must
+   * stay synchronous and must not be done twice: `classify` runs up to four CBOR decodes and this
+   * is on every inbound frame.
+   *
+   * The two identifiers are NOT interchangeable and the store says so. Scoping inbound by name
+   * while the delivery sweep scopes by pubkey hex writes every received envelope where no query
+   * looks: `pendingDeliveries` returns empty, the sweep reports nothing attempted, and a fully
+   * synced document is invisible to both halves with no error on any path. Agent NAME is also
+   * mutable and reusable after retirement, so it may never be a join key.
+   *
+   * Returning null is a refusal, not a fallback — the frame is still consumed, because it IS a
+   * document frame and letting it fall through would put CRDT bytes in the operator's transcript.
+   */
+  ownerKeyFor(agentName: string): string | null;
   logger: Logger;
 }
 
@@ -142,13 +160,22 @@ export class DocumentFrameRouter {
    * never overtake each other.
    */
   routeSync(
-    ownerAgentId: string,
+    agentName: string,
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
   ): FrameClassification {
     const kind = classify(content);
     if (kind === null) return { consumed: false };
+    // Resolved AFTER classification and BEFORE handling: a frame that is not document traffic never
+    // pays for the lookup, and one that is never reaches the store under the wrong scope.
+    const ownerAgentId = this.#d.ownerKeyFor(agentName);
+    if (ownerAgentId === null) {
+      this.#d.logger.error("document.frame.owner_unresolved", { agentName, kind, correlationId });
+      // Consumed anyway. This IS a document frame; the only alternative is the conversation path,
+      // which would hand an operator's agent a CBOR envelope as something a person said.
+      return { consumed: true, kind };
+    }
     void this.#enqueue(ownerAgentId, content, nowMs, correlationId, kind);
     return { consumed: true, kind };
   }

@@ -380,6 +380,17 @@ export class DocumentStore {
     return r ? toDocumentRow(r) : null;
   }
 
+  /**
+   * Does this daemon hold ANY document, under any owner?
+   *
+   * Deliberately unscoped, and that is the point: it is the only question that can tell a delivery
+   * sweep visiting zero agents apart from a daemon that simply has no documents. Without it the two
+   * look identical in the log, which is what let an owner-key mismatch hide.
+   */
+  anyDocumentExists(): boolean {
+    return this.#db.prepare("SELECT 1 FROM documents LIMIT 1").get() !== undefined;
+  }
+
   listDocuments(ownerAgentId: string): DocumentRow[] {
     const rows = this.#db
       .prepare("SELECT * FROM documents WHERE owner_agent_id = ? ORDER BY created_at ASC")

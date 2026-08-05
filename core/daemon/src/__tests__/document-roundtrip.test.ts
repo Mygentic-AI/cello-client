@@ -59,6 +59,7 @@ async function makeParty(name: string, clientId: number) {
     db,
     logger,
     publicKeyFor: agentPublicKeyFromId,
+    ownerKeyFor: (agentName) => (agentName === name ? id : null),
     notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),
     sign: async (_owner, tbs) => keys.sign(tbs),

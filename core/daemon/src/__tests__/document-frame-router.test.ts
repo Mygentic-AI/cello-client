@@ -25,7 +25,10 @@ import type { DocumentInbound } from "../document-inbound.js";
 import type { DocumentAckInbound } from "../document-ack-inbound.js";
 import type { Logger } from "../types.js";
 
+/** The agent NAME the session path carries — deliberately not the owner key it maps to. */
 const AGENT = "owner-agent";
+/** The stable owner key every document row is scoped by (M14-D5: our own pubkey hex). */
+const OWNER = "dd".repeat(32);
 const DOC = "cc".repeat(32);
 const NOW = 1_700_000_000_000;
 
@@ -65,15 +68,19 @@ const ackFrame: DocumentAck = {
 function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {}) {
   const { logger, events } = recordingLogger();
   const calls: string[] = [];
+  /** Whichever id each downstream call was actually scoped by. */
+  const owners: string[] = [];
   const inbound = {
-    receive: () => {
+    receive: (ownerAgentId: string) => {
       calls.push("update");
+      owners.push(ownerAgentId);
       return over.onUpdate ? over.onUpdate() : { ok: true, admitted: true, envelopeHash: "x", duplicate: false };
     },
   } satisfies Pick<DocumentInbound, "receive"> as DocumentInbound;
   const ackInbound = {
-    receive: () => {
+    receive: (ownerAgentId: string) => {
       calls.push("ack");
+      owners.push(ownerAgentId);
       return over.onAck ? over.onAck() : { ok: true, admitted: true, envelopeHash: "x" };
     },
   } satisfies Pick<DocumentAckInbound, "receive"> as DocumentAckInbound;
@@ -83,16 +90,20 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       inbound,
       ackInbound,
       logger,
-      recordProposal: () => {
+      ownerKeyFor: (agentName) => (agentName === AGENT ? OWNER : null),
+      recordProposal: (ownerAgentId) => {
         recorded.push("proposal");
+        owners.push(ownerAgentId);
       },
-      recordRejection: () => {
+      recordRejection: (ownerAgentId) => {
         recorded.push("rejection");
+        owners.push(ownerAgentId);
       },
     }),
     calls,
     events,
     recorded,
+    owners,
   };
 }
 
@@ -343,5 +354,30 @@ describe("DocumentFrameRouter — every document frame kind is classified", () =
       consumed: false,
     });
     expect(r.recorded).toEqual([]);
+  });
+});
+
+
+describe("DocumentFrameRouter — the AGENT NAME is mapped, never used as an owner key", () => {
+  it("scopes every downstream call by the OWNER KEY", async () => {
+    const r = newRouter();
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+    await vi.waitFor(() => expect(r.owners).toEqual([OWNER]));
+    // The name must not reach the store. Scoped by name, an inbound envelope lands where the
+    // delivery sweep — which scopes by key — never looks: no rows returned, nothing attempted, no
+    // error on any path. Agent NAME is also mutable and reusable, so it is not a join key at all.
+    expect(r.owners).not.toContain(AGENT);
+  });
+
+  it("CONSUMES a frame whose owner key cannot be resolved, and reports it", async () => {
+    const r = newRouter();
+    // Consumed: it IS document traffic. The alternative is the conversation path, which would hand
+    // an operator's agent a CBOR envelope as something a person said.
+    expect(r.router.routeSync("unknown-agent", encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    expect(r.calls).toEqual([]);
+    expect(r.events.map((e) => e.event)).toContain("document.frame.owner_unresolved");
   });
 });

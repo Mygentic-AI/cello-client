@@ -2777,7 +2777,7 @@ async function startDaemonHoldingLock(
 
   // cello_initiate_session (initiate-session-handler.ts). The relay witness is BEST-EFFORT: a
   // session with no relay still runs on the direct content path. Degraded, never blocked.
-  const { openSessionAs } = registerInitiateSessionHandler({
+  const { openSessionFor } = registerInitiateSessionHandler({
     handlers,
     logger,
     sessionNodeManager,
@@ -3170,12 +3170,23 @@ async function startDaemonHoldingLock(
   // It shares the daemon's SQLCipher handle rather than opening its own. One encrypted database,
   // one key, one file to back up — and a second opener is a second thing that has to agree about
   // the key, which is how a store ends up plaintext.
+  // THE owner key. One function, used by the inbound router and the delivery sweep alike, because
+  // the two halves scoping differently is a silent-empty-query bug rather than a visible one.
+  //
+  // Reads `loadedAgents`, which is the live registry — `cello_create_agent` pushes into it at
+  // runtime — rather than the boot-time snapshot, so an agent registered after startup resolves
+  // without a restart. Lower-cased because the store compares owner keys as strings and a peer's
+  // id arrives off the wire in whatever case they sent.
+  const documentOwnerKeyFor = (agentName: string): string | null =>
+    loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null;
+
   const documentLayer = createDocumentLayer({
     db: sessionNodeManager.getDb(),
     logger,
     // M14-D5: a remote agent's id IS its K_local pubkey hex, so this needs no lookup — and a lookup
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,
+    ownerKeyFor: documentOwnerKeyFor,
     notifyPeer: async () => ({
       // NOT WIRED YET, and it says so rather than reporting a notification that did not happen.
       // `kill` still succeeds locally — LIFECYCLE-1 made it deliberately independent of the peer
@@ -3214,10 +3225,18 @@ async function startDaemonHoldingLock(
   // unacked ceiling.
   //
   // PER AGENT, because every capability below is: the signaling stream is authenticated as one
-  // agent, sessions belong to one agent, and `openSessionAs` signs as one agent. A single worker
+  // agent, sessions belong to one agent, and `openSessionFor` signs as one agent. A single worker
   // with an agent-shaped hole in it is how a delivery ends up sent under the wrong identity.
-  const documentDeliveryFor = (agentName: string): DocumentDelivery =>
-    new DocumentDelivery(
+  //
+  // CACHED per agent. A worker rebuilt every tick has its own re-entry guard (`#inFlight`)
+  // constructed away — permanently null, and the comment claiming it protected anything was wrong.
+  // The sweep's serial loop happens to cover it today; a cached worker means it is covered because
+  // the guard exists, not by accident of loop shape.
+  const documentDeliveryWorkers = new Map<string, DocumentDelivery>();
+  const documentDeliveryFor = (agentName: string): DocumentDelivery => {
+    const existing = documentDeliveryWorkers.get(agentName);
+    if (existing) return existing;
+    const worker = new DocumentDelivery(
       documentLayer.store,
       createDocumentDeliveryTransport({
         agentName,
@@ -3245,7 +3264,7 @@ async function startDaemonHoldingLock(
             .reverse(),
         openSession: async (agent, peerAgentId, correlationId) => {
           // The same path `cello_initiate_session` takes, now callable without an IPC connection.
-          const res = (await openSessionAs(agent, { pubkey: peerAgentId })) as {
+          const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
             ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
           };
           if (res.ok !== true || typeof res.sessionId !== "string") {
@@ -3259,8 +3278,20 @@ async function startDaemonHoldingLock(
           // seal does not. Only ever called for a session this worker OPENED; one it reused belongs
           // to whoever started that conversation.
           const close = handlers.get("cello_close_session");
-          if (!close) return;
-          await close({ session_id: sessionId, agent }, `doc-delivery-${correlationId}`);
+          if (!close) {
+            // Reported, not swallowed. The outcome of a missing handler is a live session node the
+            // operator never started, with no sealed record — the exact thing the seal exists to
+            // prevent, and previously indistinguishable from a clean seal.
+            logger.error("document.delivery.seal_failed", { agent, sessionId, reason: "close_handler_missing", correlationId });
+            return;
+          }
+          const sealed = (await close({ session_id: sessionId, agent }, `doc-delivery-${correlationId}`)) as
+            { ok?: boolean; reason?: string } | undefined;
+          if (sealed?.ok !== true) {
+            // `cello_close_session` has distinct failure codes — session_already_sealed,
+            // seal_interrupted_*, signaling_reconnecting — and every one of them landed nowhere.
+            logger.warn("document.delivery.seal_failed", { agent, sessionId, reason: sealed?.reason ?? "unknown", correlationId });
+          }
         },
         sendContent: (agent, sessionId, content, contentHash, correlationId) =>
           sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId),
@@ -3282,6 +3313,9 @@ async function startDaemonHoldingLock(
       }),
       logger,
     );
+    documentDeliveryWorkers.set(agentName, worker);
+    return worker;
+  };
 
   /**
    * The delivery tick.
@@ -3298,25 +3332,47 @@ async function startDaemonHoldingLock(
    */
   const DOCUMENT_DELIVERY_TICK_MS = 60_000;
   let documentDeliveryRunning = false;
+  let documentDeliveryStopping = false;
+  let documentDeliveryInFlight: Promise<void> | null = null;
   const documentDeliveryTimer = setInterval(() => {
     // NO OVERLAP. A tick that dials a slow peer can outlast the interval, and a second pass would
     // re-send envelopes already in flight — the worker's own re-entry guard covers one agent, this
     // covers the sweep across all of them.
     if (documentDeliveryRunning) return;
     documentDeliveryRunning = true;
-    void (async () => {
+    documentDeliveryInFlight = (async () => {
       try {
+        let agentsSwept = 0;
+        let attempted = 0;
+        let delivered = 0;
+        let failed = 0;
         for (const agentName of perAgentSignaling.keys()) {
-          const senderId = keyProviders.get(agentName)
-            ? Buffer.from(await keyProviders.get(agentName)!.getPublicKey()).toString("hex")
-            : null;
-          // M14-D5: our wire sender id is our pubkey hex, and it is NOT the local agent key the
-          // store is otherwise scoped by. Passing the wrong one returns nothing pending and every
-          // published update sits in the log undelivered with no error on any path.
-          if (senderId === null) continue;
+          // M2: a tick already running when the daemon stops must not keep dialling into a
+          // half-torn-down transport. `clearInterval` stops the NEXT tick, not this one.
+          if (documentDeliveryStopping) break;
+          const ownerAgentId = documentOwnerKeyFor(agentName);
+          // M14-D5: the owner key is our own pubkey hex. It is what BOTH halves scope by — the
+          // inbound router resolves the same function — and it is what the wire sender id is.
+          // Scoping the two halves differently returns nothing pending, reports nothing attempted,
+          // and leaves a fully synced document invisible with no error on any path.
+          if (ownerAgentId === null) continue;
+          agentsSwept++;
           const peerFor = (documentId: string): string | null =>
-            documentLayer.store.getDocument(senderId, documentId)?.peerAgentId ?? null;
-          await documentDeliveryFor(agentName).tick(senderId, peerFor, Date.now(), { senderAgentId: senderId });
+            documentLayer.store.getDocument(ownerAgentId, documentId)?.peerAgentId ?? null;
+          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, peerFor, Date.now(), {
+            senderAgentId: ownerAgentId,
+          });
+          attempted += result.attempted;
+          delivered += result.delivered;
+          failed += result.failed;
+        }
+        // H3: a sweep that delivers nothing was byte-for-byte identical to a healthy idle one, which
+        // is what made every scoping bug above invisible. One line per tick, always.
+        logger.debug("document.delivery.sweep", { agents: agentsSwept, attempted, delivered, failed });
+        if (agentsSwept === 0 && documentLayer.store.anyDocumentExists()) {
+          logger.warn("document.delivery.sweep_empty", {
+            reason: "documents exist but no agent was swept — nothing will ever be delivered",
+          });
         }
       } catch (err: unknown) {
         // Contained: one agent's delivery failure must not stop the sweep, and an unhandled
@@ -3324,8 +3380,10 @@ async function startDaemonHoldingLock(
         logger.warn("document.delivery.tick.failed", { reason: extractErrorMessage(err) });
       } finally {
         documentDeliveryRunning = false;
+        documentDeliveryInFlight = null;
       }
     })();
+    void documentDeliveryInFlight;
   }, DOCUMENT_DELIVERY_TICK_MS);
   // Never hold the process open on account of document delivery.
   documentDeliveryTimer.unref?.();
@@ -3387,6 +3445,10 @@ async function startDaemonHoldingLock(
     // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
     // teardown would dial into a daemon that is going away.
     clearInterval(documentDeliveryTimer);
+    // ...and wait for the tick already running. `clearInterval` stops the next one, not this one,
+    // which may be mid-dial into a transport that is going away.
+    documentDeliveryStopping = true;
+    if (documentDeliveryInFlight) await documentDeliveryInFlight;
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check

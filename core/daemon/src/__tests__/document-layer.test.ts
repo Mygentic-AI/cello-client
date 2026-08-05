@@ -22,7 +22,18 @@ import {
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import type { Logger } from "../types.js";
 
+/**
+ * AGENT is the daemon's agent NAME — what the session content path carries. OWNER is the stable
+ * owner key every document row is scoped by (M14-D5: our own pubkey hex). They are DELIBERATELY
+ * different values here, because when they were the same string the fixture could not tell a layer
+ * that scoped by name from one that scoped by key — and production scopes by one at the inbound
+ * seam and the other in the delivery sweep, so the mismatch returned empty on every query with no
+ * error on any path.
+ */
 const AGENT = "owner-agent";
+const OWNER = "dd".repeat(32);
+const OTHER_AGENT = "someone-else";
+const OTHER_OWNER = "ee".repeat(32);
 const PEER = "peer-agent";
 const DOC = "cc".repeat(32);
 const PEER_CLIENT = 4242;
@@ -57,11 +68,15 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
       agentId === PEER && opts.knowPeerKey !== false ? publicKey : null,
     notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),
+    // A SECOND real agent, so "resolves to a key but does not hold this document" stays reachable
+    // and distinct from "has no key at all".
+    ownerKeyFor: (agentName) =>
+      agentName === AGENT ? OWNER : agentName === OTHER_AGENT ? OTHER_OWNER : null,
     sign: async () => new Uint8Array(64).fill(1),
   });
 
   layer.store.createDocument({
-    documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+    documentId: DOC, ownerAgentId: OWNER, peerAgentId: PEER, documentType: "markdown",
     properties: {}, status: "active", createdAtMs: 1,
   });
 
@@ -96,8 +111,8 @@ describe("document layer — a REAL signature is verified end to end", () => {
       consumed: true,
       kind: "update",
     });
-    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1));
-    expect(f.layer.live.get(AGENT, DOC).getText("content").toString()).toContain("from the peer");
+    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(1));
+    expect(f.layer.live.get(OWNER, DOC).getText("content").toString()).toContain("from the peer");
   });
 
   it("REFUSES an envelope whose signature does not match the peer's key", async () => {
@@ -111,7 +126,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
     await vi.waitFor(() =>
       expect(f.events.some((e) => e.event === "document.inbound.signature_invalid")).toBe(true),
     );
-    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(0);
   });
 
   it("REFUSES when this daemon holds no key for the sender, and says so", async () => {
@@ -122,7 +137,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
     // "Cannot verify" must land as a refusal, not as an admission — admitting what we cannot
     // authenticate is the outcome the verify step exists to prevent.
     await vi.waitFor(() => expect(f.events.some((e) => e.event === "document.verify.no_key")).toBe(true));
-    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(0);
   });
 
   it("treats a MALFORMED key as a refusal, not a crash", async () => {
@@ -133,12 +148,13 @@ describe("document layer — a REAL signature is verified end to end", () => {
       db,
       logger,
       publicKeyFor: () => new Uint8Array(3), // not a valid Ed25519 key
+      ownerKeyFor: () => OWNER,
       notifyPeer: async () => ({ ok: true }),
       rollback: () => ({ ok: true }),
       sign: async () => new Uint8Array(64),
     });
     layer.store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      documentId: DOC, ownerAgentId: OWNER, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
     const f = await newFixture();
@@ -148,7 +164,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
     // closed by contract — its own body catches and returns false — which is why the layer wraps it
     // in no try/catch: that branch would be unreachable.
     layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
-    await vi.waitFor(() => expect(layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0));
+    await vi.waitFor(() => expect(layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(0));
   });
 });
 
@@ -172,13 +188,13 @@ describe("document layer — the frame is scoped by the OWNING AGENT, not the se
       consumed: true,
       kind: "update",
     });
-    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1));
+    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(1));
   });
 
   it("refuses a frame for an agent that does not hold the document", async () => {
     const f = await newFixture();
     const env = await f.signedEnvelope();
-    f.layer.onDocumentFrame("someone-else", "s", encodeDocumentUpdateEnvelope(env), "pk");
+    f.layer.onDocumentFrame(OTHER_AGENT, "s", encodeDocumentUpdateEnvelope(env), "pk");
     await vi.waitFor(() =>
       expect(
         f.events.some(
@@ -224,5 +240,33 @@ describe("agentPublicKeyFromId — a remote agent id IS its pubkey (M14-D5)", ()
     expect(Buffer.from(agentPublicKeyFromId(asId)!).toString("hex")).toBe(
       Buffer.from(pub).toString("hex"),
     );
+  });
+});
+
+
+describe("document layer — the AGENT NAME is mapped to the OWNER KEY, never used as one", () => {
+  it("stores an admitted envelope under the OWNER KEY, not the name the frame arrived with", async () => {
+    const f = await newFixture();
+    f.layer.onDocumentFrame(AGENT, "s", encodeDocumentUpdateEnvelope(await f.signedEnvelope()), "pk");
+
+    await vi.waitFor(() => expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(1));
+    // The other half of the assertion, and the one that actually catches the bug: nothing under the
+    // NAME. Scoped by name, the row lands where the delivery sweep — which scopes by key — never
+    // looks, so a fully received document is invisible and no query errors.
+    expect(f.layer.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
+
+  it("CONSUMES a document frame whose owner key cannot be resolved, and says so", async () => {
+    const f = await newFixture();
+    const wire = encodeDocumentUpdateEnvelope(await f.signedEnvelope());
+
+    // An unknown agent has no owner key. The frame is still document traffic: falling through would
+    // hand the operator's agent a CBOR envelope as something a person said.
+    expect(f.layer.onDocumentFrame("not-an-agent", "s", wire, "pk")).toEqual({
+      consumed: true,
+      kind: "update",
+    });
+    expect(f.events.map((e) => e.event)).toContain("document.frame.owner_unresolved");
+    expect(f.layer.store.getEnvelopeLog(OWNER, DOC)).toHaveLength(0);
   });
 });
