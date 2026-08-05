@@ -256,3 +256,10 @@ export type {
   DocumentProperties,
   DocumentConsentState,
 } from "./document-proposal.js";
+export {
+  DOCUMENT_ACK_DOMAIN,
+  buildDocumentAckTbs,
+  encodeDocumentAck,
+  decodeDocumentAck,
+} from "./document-ack.js";
+export type { DocumentAck } from "./document-ack.js";
