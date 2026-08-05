@@ -1310,6 +1310,11 @@ async function startDaemonHoldingLock(
     onTtf: (agentName, sessionId, contentHashHex, content) => {
       retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
     },
+    // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
+    // TTF timer is already cancelled on this path, so this is the only thing holding the content.
+    onParkFailed: (agentName, sessionId, contentHashHex, content) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
+    },
   });
 
   // MSG-001-3b (2b): the LIVE content-park deposit. On a not-confirmed send (direct delivery

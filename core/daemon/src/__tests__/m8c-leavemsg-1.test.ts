@@ -182,6 +182,50 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
+  it("M12-P12: a park hook that resolves {ok:false} ENQUEUES the content durably — the response shape is not the whole contract", async () => {
+    // Found live 2026-08-05, two machines through the GCP relay (M12 Entry 84). The sender's park
+    // deposit failed with `standing_receiver_unavailable` and was never retried; the recipient then
+    // held every later message behind the missing sequence, permanently, and neither side was told.
+    //
+    // The test directly above this one already drove this exact resolved-not-thrown shape, and its
+    // own comment says the danger is skipping "the durable retry_queue enqueue that only fires on
+    // an honest {ok:false}". It never asserted that enqueue — so the response shape was pinned and
+    // the durability was not, and the production path did no enqueue at all.
+    //
+    // Asserted against the REAL retry queue via getStatus(), not an injected hook: overriding
+    // setAwaitingAckHooks here would test a double and leave the daemon's own wiring unproven,
+    // which is the same gap that let this ship.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const content = new TextEncoder().encode("must not vanish");
+    const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+
+    // The honest failure response is unchanged — this is additive durability, not a shape change.
+    expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
+
+    // Assert the DURABLE row, not an in-memory counter: surviving a restart is the whole point,
+    // and getStatus().retryQueueDepth counts the nonce queue, not the awaiting store — an assertion
+    // there would have passed on a purely in-memory fix and read as proof of durability.
+    const row = snm.getDb()!
+      .prepare("SELECT content_hash_hex, awaiting_ack FROM retry_queue WHERE session_id = ? AND content_hash_hex = ?")
+      .get(SID, hashHex) as { content_hash_hex: string; awaiting_ack: number } | undefined;
+    expect(row).toBeDefined();
+    expect(row!.awaiting_ack).toBe(1);
+  });
+
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));

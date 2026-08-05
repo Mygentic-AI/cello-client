@@ -393,6 +393,10 @@ export class SessionNodeManager {
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
+  // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
+  // the wrong cause is how this path stayed invisible.
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -493,9 +497,11 @@ export class SessionNodeManager {
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
     onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
+    this.#onParkFailed = hooks.onParkFailed ?? null;
   }
 
   /**
@@ -3418,9 +3424,24 @@ export class SessionNodeManager {
       // DOD-LEAVEMSG-1: the deposit is now AWAITED (was fire-and-forget) so a genuine park success
       // can be reported as "dispatched to relay" instead of a raw stream failure — the operator/
       // agent sees the truth (the message IS in flight, just not direct), not a false negative.
-      const parked = await this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content, orderingS1, orderingS2);
+      const hashHex = Buffer.from(contentHash).toString("hex");
+      const parked = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (parked) {
         return { ok: true, delivered: false, parked: true };
+      }
+      // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
+      // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
+      // have enqueued it is cancelled. The recipient has already witnessed this sequence, so it
+      // holds every later message in the session behind the gap, forever, and tells no one.
+      // Enqueue durably instead: flushAwaitingContent re-parks it when the standing receiver is
+      // back. Only on an honest failure — a successful deposit must not be re-parked.
+      try {
+        this.#onParkFailed?.(agentName, sessionId, hashHex, content);
+      } catch (hookErr: unknown) {
+        this.#logger.error("content.park.backstop.failed", {
+          sessionId, contentHash: hashHex,
+          error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+        });
       }
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
