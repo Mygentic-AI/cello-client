@@ -67,7 +67,7 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
-import { extractErrorMessage } from "./session-relay-client.js";
+import { AgentRelayClient, extractErrorMessage } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
 import {
@@ -1348,6 +1348,23 @@ async function startDaemonHoldingLock(
   // throw into the content stream handler.
   // DOD-AGENT-ID-JOINKEY-1: RetryQueue owns an agent-scoped table, so it is handed the STABLE
   // agent_id. The daemon resolves the operator-facing name ONCE, here at its own boundary.
+  // M12-P15: let a session with NO in-memory node still reach its relay to seal. The manager
+  // deliberately holds no K_local, so the client is built here where the keys live. This is what
+  // makes the detached path work after a RESTART — the exact situation that marked the session
+  // interrupted and then left it unsealable, with force-abandon (no receipt) as the only exit.
+  sessionNodeManager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs) => {
+    const kp = keyProviders.get(agentName);
+    const agent = agents.find((a) => a.name === agentName);
+    if (!kp || !agent?.pubkey) return undefined;
+    return new AgentRelayClient({
+      relayPeerId,
+      relayAddrs,
+      keyProvider: kp,
+      senderPubkey: Buffer.from(agent.pubkey, "hex"),
+      logger,
+    });
+  });
+
   sessionNodeManager.setAwaitingAckHooks({
     onPersisted: (agentName, sessionId, contentHashHex) => {
       retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));

@@ -262,6 +262,58 @@ export class SessionNodeManager {
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
   // agent's sessions share one authenticated relay stream (each frame carries session_id).
   #relayClients = new Map<string, AgentRelayClient>();
+
+  /**
+   * M12-P15: build a relay client for a session that has NO in-memory node.
+   *
+   * Injected by the composition root because it needs the agent's K_local and pubkey, which this
+   * manager deliberately does not hold. Only consulted on the detached seal path — an ACTIVE session
+   * always uses its own registered client.
+   */
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[]) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[]) => AgentRelayClient | undefined): void {
+    this.#detachedRelayClientBuilder = fn;
+  }
+
+  /**
+   * M12-P15: what a seal leaf actually needs, resolved from a LIVE node when there is one and from
+   * durable state when there is not.
+   *
+   * `submitSealLeaf` used to hard-require an `#activeNodes` entry. But it is reachable — by design —
+   * for an `interrupted` session, and EVERY producer of that status deletes the entry. So the guard
+   * refused 100% of the calls the seal-interrupted path could ever make, which is what made M12-P15's
+   * first fix inert. `submitLeaf(node, sessionId, contentHash, leafKind)` takes everything
+   * explicitly; nothing about it needs a per-session node.
+   *
+   * The fallback is the same shape `startupParkFn` already uses for content: the persisted relay
+   * endpoint (`relay_peer_id`/`relay_addrs`, columns that exist for exactly this reason) plus the
+   * owning agent's standing receiver. Every failure is named for its own cause rather than collapsed
+   * into "no node", because that collapse is what sent this investigation at the session lifecycle
+   * instead of at the endpoint.
+   */
+  #resolveSealTransport(agentName: string, sessionId: string):
+    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array }
+    | { error: string } {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (entry) {
+      // The live path is unchanged and takes precedence — a session with its own registered client
+      // must never seal through a rebuilt one.
+      if (!entry.relayClient || !entry.relaySessionIdBytes) return { error: "relay_unavailable" };
+      return { node: entry.node, relayClient: entry.relayClient, relaySessionIdBytes: entry.relaySessionIdBytes };
+    }
+    const ep = this.getPersistedRelayEndpoint(agentName, sessionId);
+    if (!ep) return { error: "no_persisted_relay_endpoint" };
+    const node = this.getStandingReceiverNode(agentName);
+    if (!node) return { error: "standing_receiver_unavailable" };
+    // Reuse the agent's existing client for this relay when the process still has one; otherwise ask
+    // the composition root to build one. Without the builder this path would work only within the
+    // lifetime that created the session — and the case that matters most is precisely a daemon that
+    // RESTARTED, which is what marked the session interrupted in the first place.
+    const client = this.#relayClients.get(`${agentName}::${ep.relayPeerId}`)
+      ?? this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs]);
+    if (!client) return { error: "relay_client_unavailable" };
+    return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")) };
+  }
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
   // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
   // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
@@ -3626,9 +3678,11 @@ export class SessionNodeManager {
     | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
   > {
     const sealKey = this.#k(agentName, sessionId);
-    const entry = this.#activeNodes.get(sealKey);
-    if (!entry) return { ok: false, reason: "session_node_unavailable" };
-    if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
+    // M12-P15: resolved, not required. See #resolveSealTransport — an interrupted session has no
+    // in-memory node BY CONSTRUCTION, and refusing here is what made the first fix inert.
+    const transport = this.#resolveSealTransport(agentName, sessionId);
+    if ("error" in transport) return { ok: false, reason: transport.error };
+    const entry = transport;
 
     // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
     // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
