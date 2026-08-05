@@ -206,10 +206,14 @@ export class DocumentEngine {
     // otherwise BUFFER an out-of-order update and resolve it on the next state-vector exchange;
     // this refuses instead. That is right for replay, where a gap means a corrupt log — a live
     // receive path wanting buffer-and-re-request semantics needs its own entry point, not this one.
-    if (shadow.store.pendingStructs !== null) {
+    // BOTH pending sets: an update carrying a delete set for structs never seen leaves
+    // pendingStructs null and pendingDs populated, and retains just the same.
+    if (shadow.store.pendingStructs !== null || shadow.store.pendingDs !== null) {
       return this.#refuse(
         "document_update_unresolved_dependencies",
-        `depends on ${shadow.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
+        shadow.store.pendingStructs
+          ? `depends on ${shadow.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`
+          : "carries a delete set referring to operations this document has never seen",
         update,
       );
     }
@@ -238,10 +242,12 @@ export class DocumentEngine {
     } catch (err: unknown) {
       return this.#refuse("document_update_malformed", err instanceof Error ? err.message : String(err), update);
     }
-    if (doc.store.pendingStructs !== null) {
+    if (doc.store.pendingStructs !== null || doc.store.pendingDs !== null) {
       return this.#refuse(
         "document_update_unresolved_dependencies",
-        `depends on ${doc.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
+        doc.store.pendingStructs
+          ? `depends on ${doc.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`
+          : "carries a delete set referring to operations this document has never seen",
         update,
       );
     }

@@ -17,7 +17,6 @@ import * as Y from "yjs";
 import { DocumentEngine } from "../document-engine.js";
 import { DocumentGate, UPDATE_ENCODING_V1, type GateVerdict } from "../document-gate.js";
 
-const AGENT = "aa".repeat(32);
 const PEER = "bb".repeat(32);
 const DOC = "cc".repeat(32);
 
@@ -60,7 +59,6 @@ function peerUpdate(accepted: Y.Doc, clientId: number, mutate: (doc: Y.Doc) => v
  * pure-delete v1 delta's.
  */
 const context = {
-  agentId: AGENT,
   documentId: DOC,
   senderAgentId: PEER,
   senderClientIds: [500],
@@ -421,6 +419,183 @@ describe("DocumentGate — the screening hook (DOD-DOC-SCREEN-1 plugs in here)",
     if (!verdict.admit) {
       expect(verdict.reason).toBe("document_screening_refused");
       expect(verdict.rule).toBe("refusing-rule");
+    }
+  });
+});
+
+// ─── Pass-one: each rule was tested against the ONE input class it handled ───
+//
+// Every test above survives the revert test, and five bugs still shipped green — because each
+// rule's test picked the case that rule got right. These pick the cases they got wrong.
+
+describe("DocumentGate — (h) the forgery the novelty check could not see", () => {
+  it("QUARANTINES an update authored under the DOCUMENT OWNER'S OWN clientID", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("honest content");
+
+    // Integrate the accepted state, THEN take the owner's clientID — that sidesteps Yjs's own
+    // "Changed the client-id" guard, and a hand-rolled encoder needs no trick at all. The
+    // previous rule asked whether a clientID was NEW, so it exempted this one, and the forgery
+    // was admitted and attributed to the owner.
+    const attacker = new Y.Doc();
+    Y.applyUpdate(attacker, Y.encodeStateAsUpdate(accepted));
+    attacker.clientID = 1_000_000; // the owner's
+    attacker.getText("content").insert(0, "FORGED ");
+    const update = Y.encodeStateAsUpdate(attacker, Y.encodeStateVector(accepted));
+
+    const verdict = gate.validate(accepted, update, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_update_unbound_client");
+  });
+
+  it("ADMITS a bound peer advancing only its OWN clock", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("base");
+    const update = peerUpdate(accepted, 500, (d) => d.getText("content").insert(4, " theirs"));
+    expect(gate.validate(accepted, update, context).admit).toBe(true);
+  });
+});
+
+describe("DocumentGate — (i) append_only must see the MAP, not only the text root", () => {
+  it("QUARANTINES a key deletion on a json-shaped document", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    accepted.getMap("data").set("kept", "value");
+    accepted.getMap("data").set("removed", "value");
+
+    // An 8-byte update empties the map. Diffing only the text root made append_only a COMPLETE
+    // no-op for json documents, whose content is exactly this map.
+    const update = peerUpdate(accepted, 500, (d) => d.getMap("data").delete("removed"));
+    const verdict = gate.validate(accepted, update, { ...context, appendOnly: true });
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_append_only_violation");
+  });
+
+  it("QUARANTINES a key being REWRITTEN — an edit of existing content (§16.7-1)", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    accepted.getMap("data").set("k", "before");
+    const update = peerUpdate(accepted, 500, (d) => d.getMap("data").set("k", "after"));
+
+    const verdict = gate.validate(accepted, update, { ...context, appendOnly: true });
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_append_only_violation");
+  });
+
+  it("ADMITS a NEW key on an append_only json document", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+    accepted.getMap("data").set("existing", 1);
+    const update = peerUpdate(accepted, 500, (d) => d.getMap("data").set("added", 2));
+    expect(gate.validate(accepted, update, { ...context, appendOnly: true }).admit).toBe(true);
+  });
+});
+
+describe("DocumentGate — (d) a legitimate update must not read as an attack", () => {
+  it("ADMITS an update batched across several transactions", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("log:");
+    const peer = new Y.Doc();
+    peer.clientID = 500;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(accepted));
+
+    // Several transactions merged into one update — the NORMAL shape for an append-only log
+    // under publish-on-intent. It is legitimately larger than the canonical delta, and comparing
+    // against the delta refused it as "trailing bytes": an attack label on a benign encoding.
+    const parts: Uint8Array[] = [];
+    peer.on("update", (u: Uint8Array) => parts.push(u));
+    for (let i = 0; i < 5; i++) {
+      peer.getText("content").insert(peer.getText("content").length, ` e${i}`);
+    }
+    const batched = Y.mergeUpdates(parts);
+
+    expect(gate.validate(accepted, batched, context).admit).toBe(true);
+  });
+
+  it("ADMITS a FULL-STATE update, which is what a sync with no state vector sends", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("shared");
+    const peer = new Y.Doc();
+    peer.clientID = 500;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(accepted));
+    peer.getText("content").insert(6, " more");
+
+    expect(gate.validate(accepted, Y.encodeStateAsUpdate(peer), context).admit).toBe(true);
+  });
+});
+
+describe("DocumentGate — (a) a delete set can be pending too", () => {
+  it("QUARANTINES an update whose DELETE SET refers to operations never seen", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc("");
+
+    // Build content in a doc the receiver never sees, delete it there, send only the deletion.
+    // pendingStructs stays null while pendingDs fills — and it retains just the same, which is
+    // the unbounded growth rule (a) exists to stop.
+    const stranger = new Y.Doc();
+    stranger.clientID = 500;
+    stranger.getText("content").insert(0, "content the receiver never saw");
+    const seen = Y.encodeStateVector(stranger);
+    stranger.getText("content").delete(0, 30);
+    const deleteOnly = Y.encodeStateAsUpdate(stranger, seen);
+
+    const verdict = gate.validate(accepted, deleteOnly, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_update_unresolved_dependencies");
+  });
+});
+
+describe("DocumentGate — (f) depth is measured across ALL roots", () => {
+  it("QUARANTINES deep nesting under a root the gate was not told about", () => {
+    const { gate } = newGate({ maxNestingDepth: 5 });
+    const accepted = acceptedDoc("");
+    const peer = new Y.Doc();
+    peer.clientID = 500;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(accepted));
+
+    // Measuring only `data` let 5,000 levels under any other root through, well under both caps.
+    let map = peer.getMap("elsewhere");
+    for (let i = 0; i < 30; i++) {
+      const child = new Y.Map();
+      map.set("child", child);
+      map = child;
+    }
+    const update = Y.encodeStateAsUpdate(peer, Y.encodeStateVector(accepted));
+
+    const verdict = gate.validate(accepted, update, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) expect(verdict.reason).toBe("document_nesting_too_deep");
+  });
+});
+
+describe("DocumentGate — the rate limit counts ARRIVALS, not admissions", () => {
+  it("rate-limits a peer sending only INVALID updates", () => {
+    const { gate } = newGate({ maxUpdatesPerMinute: 3 });
+    const accepted = acceptedDoc();
+    const malformed = new Uint8Array([0xff, 0xff, 0xff, 0xff]);
+
+    // Counting admissions left this peer unlimited, and everything past the pre-parse checks
+    // costs a full encode+apply of the whole document per attempt.
+    let last: GateVerdict | null = null;
+    for (let i = 0; i < 6; i++) last = gate.validate(accepted, malformed, context);
+
+    expect(last!.admit).toBe(false);
+    if (!last!.admit) expect(last!.reason).toBe("document_update_rate_exceeded");
+  });
+});
+
+describe("DocumentGate — a quarantined update is HELD, not merely named", () => {
+  it("every quarantine verdict carries the update bytes for the caller to persist", () => {
+    const { gate } = newGate();
+    const accepted = acceptedDoc();
+    const malformed = new Uint8Array([0xff, 0xff, 0xff]);
+
+    const verdict = gate.validate(accepted, malformed, context);
+    expect(verdict.admit).toBe(false);
+    if (!verdict.admit) {
+      // §3.2: never admitted, never discarded. Returning only a reason would let the bytes die
+      // with this stack frame, and DOD-DOC-REJECT-1 needs them to reference from a 0x05 leaf.
+      expect(Buffer.from(verdict.quarantined)).toEqual(Buffer.from(malformed));
     }
   });
 });

@@ -61,6 +61,8 @@ export interface GateLimits {
 
 /** Published so a peer can discover them — a receiver-local limit nobody can learn is not a protocol. */
 export const DEFAULT_GATE_LIMITS: GateLimits = {
+  // Deliberately the same number the engine enforces, taken from the engine at construction so
+  // the two cannot drift into two sources of truth.
   maxUpdateBytes: 1024 * 1024,
   maxDocumentBytes: 8 * 1024 * 1024,
   maxNestingDepth: 64,
@@ -79,7 +81,6 @@ export interface ProjectedDiff {
 }
 
 export interface GateContext {
-  agentId: string;
   documentId: string;
   senderAgentId: string;
   /** clientIDs this peer is KNOWN to write under — the out-of-band binding (h) requires. */
@@ -88,15 +89,20 @@ export interface GateContext {
    * The document the ENVELOPE says this update belongs to (§14). Declared, never inferred: an
    * update carries no document identity, so a well-formed one built on an unrelated document
    * merges silently and no property of the bytes can reveal it. Absent is a refusal.
+   *
+   * REQUIRED rather than optional so a caller cannot forget it — and the runtime refusal stays
+   * for the untyped boundary. **These fields carry no security on their own: they are only as
+   * trustworthy as the envelope signature that covers them.** DOD-DOC-ENVELOPE-1 owes a blocking
+   * AC that `documentId`, the encoding, and the sender's clientID are inside the signed TBS.
    */
-  declaredDocumentId?: string;
+  declaredDocumentId: string | undefined;
   /**
    * The update encoding the ENVELOPE declares (§16.7-8 pins it). Declared rather than sniffed
    * because the byte-level signatures overlap: a v2 update begins `[0, 0, …]` and a legitimate
    * pure-delete v1 delta begins `[0, 1, …]`, so a first-byte heuristic refuses real deletions.
    * Absent is a refusal.
    */
-  declaredEncoding?: string;
+  declaredEncoding: string | undefined;
   appendOnly?: boolean;
 }
 
@@ -120,6 +126,13 @@ export interface GateQuarantine {
   limit?: GateLimitBreach;
   /** The pluggable rule that refused, when one did. */
   rule?: string;
+  /**
+   * THE UPDATE ITSELF. §3.2: a quarantined update is HELD — never admitted, never discarded — so
+   * the caller can persist it, reference it from a `0x05` leaf, and resolve it by supersession
+   * (DOD-DOC-REJECT-1). Returning only a reason would have made "never discarded" a comment
+   * rather than a property: the bytes would die with this stack frame.
+   */
+  quarantined: Uint8Array;
 }
 
 export type GateVerdict = { admit: true; projectedDiff: ProjectedDiff } | GateQuarantine;
@@ -134,7 +147,9 @@ export class DocumentGate {
 
   constructor(engine: DocumentEngine, limits: Partial<GateLimits>, logger: Logger) {
     this.#engine = engine;
-    this.#limits = { ...DEFAULT_GATE_LIMITS, ...limits };
+    // The engine already enforces a pre-parse cap; take it rather than repeat the constant, so a
+    // change in one place cannot leave the gate admitting what the engine will refuse.
+    this.#limits = { ...DEFAULT_GATE_LIMITS, maxUpdateBytes: engine.maxUpdateBytes, ...limits };
     this.#logger = logger;
   }
 
@@ -159,7 +174,7 @@ export class DocumentGate {
     } catch (err: unknown) {
       // The catch-all is the no-silent-drop invariant made structural: a rule with a bug in it
       // must not become an admission.
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_gate_rule_failed",
         detail: err instanceof Error ? err.message : String(err),
@@ -170,7 +185,7 @@ export class DocumentGate {
   #validate(accepted: Y.Doc, update: Uint8Array, context: GateContext, now: number): GateVerdict {
     // ── Pre-parse, before Yjs sees the bytes ────────────────────────────────
     if (update.length > this.#limits.maxUpdateBytes) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_too_large",
         limit: { name: "maxUpdateBytes", limit: this.#limits.maxUpdateBytes, actual: update.length },
@@ -179,7 +194,7 @@ export class DocumentGate {
     if (update.length < 2) {
       // (e) The floor. Below it Yjs throws "Unexpected end of array" — a decoder string naming
       // lib0 internals rather than a protocol fault the peer could act on.
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_too_small",
         detail: `${update.length} bytes is below the 2-byte minimum for a Yjs update`,
@@ -189,7 +204,7 @@ export class DocumentGate {
     // (c) V2 bytes are ACCEPTED by the v1 decoder and silently drop all content, so the encoding
     // is pinned. Declared, not sniffed — see GateContext.
     if (context.declaredEncoding !== UPDATE_ENCODING_V1) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_encoding_unsupported",
         detail: `envelope declares encoding ${JSON.stringify(context.declaredEncoding ?? null)}; ` +
@@ -200,7 +215,7 @@ export class DocumentGate {
     // (b) An update carries NO document identity, so the binding is the envelope's and the check
     // is the receiver's. ABSENT IS NOT FINE: an unbound update is refused, not trusted.
     if (context.declaredDocumentId !== context.documentId) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_foreign_origin",
         detail: `envelope declares document ${String(context.declaredDocumentId ?? "(none)").slice(0, 16)}… ` +
@@ -210,10 +225,13 @@ export class DocumentGate {
     }
 
     // ── Rate, per sender ────────────────────────────────────────────────────
+    // Counted on ARRIVAL, after the cheap pre-parse checks and BEFORE the shadow rebuild.
+    // Counting admissions instead left a peer who sends only invalid updates un-rate-limited,
+    // and everything past this point costs a full encode+apply of the whole document per attempt.
     const window = (this.#recent.get(context.senderAgentId) ?? []).filter((t) => now - t < 60_000);
     if (window.length >= this.#limits.maxUpdatesPerMinute) {
       this.#recent.set(context.senderAgentId, window);
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_rate_exceeded",
         limit: {
@@ -224,12 +242,15 @@ export class DocumentGate {
       });
     }
 
+    window.push(now);
+    this.#recent.set(context.senderAgentId, window);
+
     // ── Shadow apply, on state rebuilt from ACCEPTED — never long-lived ─────
     const shadow = new Y.Doc();
     try {
       Y.applyUpdate(shadow, Y.encodeStateAsUpdate(accepted));
     } catch (err: unknown) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_accepted_state_unreadable",
         detail: err instanceof Error ? err.message : String(err),
@@ -244,40 +265,54 @@ export class DocumentGate {
     } catch (err: unknown) {
       // (g) ONE typed reason per throw. The decoder string is useful and travels as detail —
       // it is simply not a reason an operator or a policy log can key on.
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_malformed",
         detail: err instanceof Error ? err.message : String(err),
       });
     }
 
-    // (a) Yjs returned success — that is not evidence the update integrated.
-    if (shadow.store.pendingStructs !== null) {
-      return this.#quarantine(context, {
+    // (a) Yjs returned success — that is not evidence the update integrated. BOTH pending sets
+    // count: an update carrying a DELETE SET for structs the receiver has never seen leaves
+    // pendingStructs null and pendingDs populated, and that retains forever exactly as the
+    // struct case does. Reading one field was coding the mechanism; the rule is about whether
+    // the update actually integrated.
+    const pendingStructs = shadow.store.pendingStructs;
+    const pendingDs = shadow.store.pendingDs;
+    if (pendingStructs !== null || pendingDs !== null) {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_unresolved_dependencies",
-        detail: `depends on ${shadow.store.pendingStructs.missing.size} client(s) whose earlier operations are absent`,
+        detail: pendingStructs
+          ? `depends on ${pendingStructs.missing.size} client(s) whose earlier operations are absent`
+          : `carries a delete set referring to operations this document has never seen`,
       });
     }
 
-    // (d) Trailing bytes past the decoder's cursor are ignored, so the detector is re-encoding
-    // the SAME delta canonically — the shadow's state since the accepted state vector — and
-    // comparing byte counts. Comparing against the full state would compare a delta to a
-    // snapshot, which are different things and different lengths for legitimate reasons.
-    const canonicalDelta = Y.encodeStateAsUpdate(shadow, Y.encodeStateVector(accepted));
+    // (d) Re-encode THE UPDATE ITSELF and compare. Comparing against the canonical DELTA looked
+    // equivalent and is not: a peer that batches several transactions (the normal shape for an
+    // append-only log) or sends full state (what y-protocols sync step 2 does with no state
+    // vector) produces an update legitimately LARGER than the delta, and both were measured
+    // being refused as "trailing bytes" — an attack label on a benign encoding, which sends an
+    // operator hunting a malicious peer while the document stops converging.
+    //
+    // `Y.diffUpdate` against an empty state vector re-encodes the update's own content and drops
+    // slack. `Y.mergeUpdates([padded])` does NOT — it preserves the padding — so it is not a
+    // usable detector here.
+    const canonicalUpdate = Y.diffUpdate(update, Y.encodeStateVector(new Y.Doc()));
     const reEncoded = Y.encodeStateAsUpdate(shadow);
-    if (update.length > canonicalDelta.length) {
-      return this.#quarantine(context, {
+    if (update.length > canonicalUpdate.length) {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_trailing_bytes",
-        detail: `${update.length - canonicalDelta.length} bytes past the decoder's cursor — the encoding ` +
+        detail: `${update.length - canonicalUpdate.length} bytes past the decoder's cursor — the encoding ` +
           `would otherwise be malleable, and this update's hash becomes a 0x04 leaf`,
       });
     }
 
     // (b) and (h): who wrote this, and on what.
     const authorship = this.#checkAuthorship(accepted, shadow, context);
-    if (authorship) return this.#quarantine(context, authorship);
+    if (authorship) return this.#quarantine(context, update, authorship);
 
     // ── The PROJECTED DIFF — what the update would do ───────────────────────
     const afterText = shadow.getText("content").toString();
@@ -289,45 +324,54 @@ export class DocumentGate {
         (k) => JSON.stringify(beforeKeys.get(k)) !== JSON.stringify(afterKeys.get(k)),
       ),
       resultingBytes: reEncoded.length,
-      maxDepth: maxDepth(shadow.getMap("data").toJSON()),
+      maxDepth: deepestRoot(shadow),
     };
 
     // ── Structural limits, on the projected result ──────────────────────────
     if (diff.resultingBytes > this.#limits.maxDocumentBytes) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_too_large",
         limit: { name: "maxDocumentBytes", limit: this.#limits.maxDocumentBytes, actual: diff.resultingBytes },
       });
     }
     if (diff.maxDepth > this.#limits.maxNestingDepth) {
-      return this.#quarantine(context, {
+      return this.#quarantine(context, update, {
         admit: false,
         reason: "document_nesting_too_deep",
         limit: { name: "maxNestingDepth", limit: this.#limits.maxNestingDepth, actual: diff.maxDepth },
       });
     }
 
-    // (i) append_only, judged on the PROJECTED DIFF rather than on the update's size — a
-    // ten-byte update can delete everything, and every structural limit passes it.
-    if (context.appendOnly === true && diff.deletedChars > 0) {
-      return this.#quarantine(context, {
-        admit: false,
-        reason: "document_append_only_violation",
-        detail: `the projected diff removes ${diff.deletedChars} character(s) of existing content`,
-      });
+    // (i) append_only, judged on the PROJECTED DIFF rather than the update's size — a ten-byte
+    // update deletes everything and every structural limit passes it.
+    //
+    // Measured in BOTH coordinate spaces the write path projects from. Diffing only the text root
+    // made append_only a COMPLETE NO-OP for json documents, whose content lives in the map: an
+    // 8-byte update emptied `data` with deletedChars = 0 and was admitted.
+    if (context.appendOnly === true) {
+      const removedKeys = [...beforeKeys.keys()].filter(
+        (k) => !afterKeys.has(k) || JSON.stringify(afterKeys.get(k)) !== JSON.stringify(beforeKeys.get(k)),
+      );
+      if (diff.deletedChars > 0 || removedKeys.length > 0) {
+        return this.#quarantine(context, update, {
+          admit: false,
+          reason: "document_append_only_violation",
+          detail: diff.deletedChars > 0
+            ? `the projected diff removes ${diff.deletedChars} character(s) of existing content`
+            : `the projected diff removes or rewrites existing key(s): ${removedKeys.join(", ")}`,
+        });
+      }
     }
 
     // ── Pluggable rules (DOD-DOC-SCREEN-1 registers here) ───────────────────
     for (const [name, rule] of this.#rules) {
       const refusal = rule(diff, context);
       if (refusal) {
-        return this.#quarantine(context, { admit: false, ...refusal, rule: name });
+        return this.#quarantine(context, update, { admit: false, ...refusal, rule: name });
       }
     }
 
-    window.push(now);
-    this.#recent.set(context.senderAgentId, window);
     this.#logger.info("document.update.admitted", {
       documentId: context.documentId,
       senderAgentId: context.senderAgentId,
@@ -338,33 +382,46 @@ export class DocumentGate {
   }
 
   /**
-   * (h) Every newly-seen clientID must be one this peer is bound to.
+   * (h) Every client whose CLOCK ADVANCED must be one this peer is bound to.
    *
-   * Not detectable from the update — authorship in Yjs IS the clientID, which is exactly why a
-   * colliding one silently outranks the honest client and leaves an EMPTY pending set, so rule
-   * (a) cannot see it. The binding is an out-of-band fact the gate is given.
+   * The first version asked whether a clientID was NEW — exempting any already present in the
+   * accepted state, including the document owner's own. That is exactly the attack AC (h) was
+   * written from, and it was measured working: integrate the accepted state, THEN set clientID to
+   * the owner's, and the forged update is admitted and attributed to the owner ("FORGED honest
+   * content"), with an empty pending set so rule (a) cannot see it either. Setting the clientID
+   * after integration sidesteps Yjs's own "Changed the client-id" guard; a hand-rolled encoder
+   * needs no trick at all.
+   *
+   * Advancement is the right question because a peer never legitimately advances another client's
+   * clock — that is what authorship MEANS in Yjs.
    */
   #checkAuthorship(
     accepted: Y.Doc,
     shadow: Y.Doc,
     context: GateContext,
   ): { admit: false; reason: string; detail?: string } | null {
-    const acceptedClients = new Set(Y.decodeStateVector(Y.encodeStateVector(accepted)).keys());
-    const shadowClients = [...Y.decodeStateVector(Y.encodeStateVector(shadow)).keys()];
+    const before = Y.decodeStateVector(Y.encodeStateVector(accepted));
+    const after = Y.decodeStateVector(Y.encodeStateVector(shadow));
     const bound = new Set(context.senderClientIds);
-    const unbound = shadowClients.filter((c) => !acceptedClients.has(c) && !bound.has(c));
+
+    const advanced: number[] = [];
+    for (const [client, clock] of after) {
+      if (clock > (before.get(client) ?? 0)) advanced.push(client);
+    }
+    const unbound = advanced.filter((c) => !bound.has(c));
     if (unbound.length > 0) {
       return {
         admit: false,
         reason: "document_update_unbound_client",
-        detail: `clientID(s) ${unbound.join(", ")} are not bound to sender ${context.senderAgentId.slice(0, 16)}… — ` +
-          `authorship in Yjs IS the clientID, so an unbound one can silently outrank the honest client`,
+        detail: `clientID(s) ${unbound.join(", ")} advanced but are not bound to sender ` +
+          `${context.senderAgentId.slice(0, 16)}… — authorship in Yjs IS the clientID, so an ` +
+          `unbound one silently outranks the honest client`,
       };
     }
     return null;
   }
 
-  #quarantine(context: GateContext, verdict: GateQuarantine): GateVerdict {
+  #quarantine(context: GateContext, update: Uint8Array, verdict: Omit<GateQuarantine, "quarantined">): GateVerdict {
     // A quarantined update is HELD — never admitted, never discarded — so the record carries what
     // is needed to act on it: which document, which peer, and why (§3.2).
     this.#logger.warn("document.update.quarantined", {
@@ -375,7 +432,7 @@ export class DocumentGate {
       limit: verdict.limit,
       rule: verdict.rule,
     });
-    return verdict;
+    return { ...verdict, quarantined: update };
   }
 }
 
@@ -400,6 +457,26 @@ function deletedCount(before: string, after: string): number {
     suffix++;
   }
   return Math.max(0, before.length - from - suffix);
+}
+
+/**
+ * The deepest nesting across EVERY root, not just the ones this gate knows by name.
+ *
+ * `doc.toJSON()` is not enough: it returns each root's key, but does NOT recurse into a root that
+ * was never instantiated as a concrete type — measured, a 30-level map under an unnamed root
+ * reported depth 1. Instantiating each root by name is what exposes it. Measuring only `data` let
+ * 5,000 levels through under any other root, comfortably under both size caps.
+ */
+function deepestRoot(doc: Y.Doc): number {
+  let deepest = 0;
+  for (const name of doc.share.keys()) {
+    try {
+      deepest = Math.max(deepest, maxDepth(doc.getMap(name).toJSON()));
+    } catch {
+      // A root that is not map-shaped contributes no nesting of this kind.
+    }
+  }
+  return deepest;
 }
 
 function maxDepth(value: unknown, depth = 0): number {
