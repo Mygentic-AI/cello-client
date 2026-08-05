@@ -42,10 +42,19 @@ export class LiveDocuments {
   /** Insertion-ordered, so the oldest key is the eviction candidate. */
   readonly #live = new Map<string, Y.Doc>();
 
-  constructor(store: DocumentStore, engine: DocumentEngine, logger: Logger) {
+  /** Epoch zero for a document, from its stored proposal. See `get`. */
+  readonly #startingContentFor: (ownerAgentId: string, documentId: string) => Uint8Array | null;
+
+  constructor(
+    store: DocumentStore,
+    engine: DocumentEngine,
+    logger: Logger,
+    startingContentFor: (ownerAgentId: string, documentId: string) => Uint8Array | null = () => null,
+  ) {
     this.#store = store;
     this.#engine = engine;
     this.#logger = logger;
+    this.#startingContentFor = startingContentFor;
   }
 
   /**
@@ -80,6 +89,25 @@ export class LiveDocuments {
       this.#engine.replay(rows),
     );
     const doc = this.#engine.restore(snapshot.binary);
+    // EPOCH ZERO FIRST, and it is not in the envelope log.
+    //
+    // A document's starting content is agreed in the PROPOSAL — both sides apply the same bytes, so
+    // neither has to author it and there is no first envelope carrying it. That is correct on the
+    // wire and it left the content living only in the `Y.Doc` the propose/accept handler happened to
+    // be holding: restart the daemon and the document came back EMPTY, on both sides, with the row
+    // still present and the log still valid. An operator would open a document they had been
+    // working in and find nothing there — and then write into it, publishing the deletion of
+    // everything the peer still had.
+    //
+    // Re-applied here rather than logged at accept time because the proposal is already stored and
+    // `document_id` is the hash of it: taking epoch zero from the proposal is deterministic on both
+    // sides forever, while an envelope written at accept would be one side's authored operation and
+    // the two would not match.
+    //
+    // Applying to a rebuilt doc is safe and idempotent — a Yjs update already present is a no-op,
+    // which is the property the whole replay depends on.
+    const starting = this.#startingContentFor(ownerAgentId, documentId);
+    if (starting) this.#engine.applyUpdate(doc, starting);
     this.#live.set(key, doc);
     this.#evictIfNeeded();
     return doc;

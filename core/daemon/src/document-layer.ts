@@ -42,6 +42,10 @@ import {
   buildDocumentProposalAckTbs,
   decodeDocumentControl,
   buildDocumentControlTbs,
+  decodeDocumentUpdateEnvelope,
+  encodeDocumentAck,
+  buildDocumentAckTbs,
+  type DocumentAck,
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
@@ -89,6 +93,18 @@ export interface DocumentLayerDeps {
    * split synchronous CLASSIFICATION from asynchronous HANDLING.
    */
   sign(ownerAgentId: string, tbs: Uint8Array): Promise<Uint8Array>;
+  /**
+   * Put an already-encoded frame on the wire to a peer — the ack, today.
+   *
+   * Injected because the transport is not this layer's, and REQUIRED for the same reason the layer
+   * is all-or-nothing: an inbound path that cannot answer leaves every sender retrying until their
+   * document stalls.
+   */
+  sendFrame(
+    ownerAgentId: string,
+    peerAgentId: string,
+    bytes: Uint8Array,
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 export interface DocumentLayer {
@@ -138,7 +154,13 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const engine = new DocumentEngine(logger);
   const gate = new DocumentGate(engine, {}, logger);
   const rejections = new DocumentRejections(store, logger);
-  const live = new LiveDocuments(store, engine, logger);
+  // Epoch zero comes from the stored PROPOSAL, not from the envelope log — see `LiveDocuments.get`.
+  // Declared before `handshake` exists, so it is resolved lazily; a rebuild only ever happens long
+  // after construction.
+  const live = new LiveDocuments(store, engine, logger, (ownerAgentId, documentId) => {
+    const record = handshake.get(ownerAgentId, documentId);
+    return record?.envelope.starting_content ?? null;
+  });
   const lifecycle = new DocumentLifecycle(store, logger, { notifyPeer: deps.notifyPeer }, deps.rollback);
   const notifications = new DocumentNotifications(store, logger);
 
@@ -193,6 +215,35 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
+    sendAck: async (ownerAgentId, wire, outcome) => {
+      const env = decodeDocumentUpdateEnvelope(wire);
+      const ack: DocumentAck = {
+        type: "document_ack",
+        // The wire version this build speaks. Inlined rather than imported because protocol-types
+        // exports the domain and the codec but not the constant; the decoder pins it by value.
+        ack_version: 1,
+        document_id: env.document_id,
+        envelope_hash: outcome.envelopeHash,
+        acker_agent_id: ownerAgentId,
+        admitted: outcome.admitted,
+        ...(outcome.admitted ? {} : { rejection_reason: outcome.rejectionReason ?? "refused" }),
+        acked_at_ms: Date.now(),
+        signature: new Uint8Array(0),
+      };
+      ack.signature = await deps.sign(ownerAgentId, buildDocumentAckTbs(ack));
+      // BEST-EFFORT, and it must be: an ack that could not be sent is not a reason to refuse
+      // content we have already admitted. The sender redelivers on its own timer, and the
+      // redelivery is acked too — which is the case this whole path exists to terminate.
+      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, encodeDocumentAck(ack));
+      if (!sent.ok) {
+        logger.warn("document.ack.unsent", {
+          documentId: env.document_id,
+          envelopeHash: outcome.envelopeHash,
+          reason: sent.reason,
+          correlationId: outcome.correlationId,
+        });
+      }
+    },
     recordControl: (ownerAgentId, wire, nowMs) => {
       const control = decodeDocumentControl(wire);
       // VERIFIED FIRST. A kill frame ends a collaboration; unsigned, anyone reaching the channel

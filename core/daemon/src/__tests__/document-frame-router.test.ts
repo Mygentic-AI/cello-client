@@ -90,6 +90,7 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       inbound,
       ackInbound,
       logger,
+      sendAck: async () => {},
       ownerKeyFor: (agentName) => (agentName === AGENT ? OWNER : null),
       recordProposal: (ownerAgentId) => {
         recorded.push("proposal");

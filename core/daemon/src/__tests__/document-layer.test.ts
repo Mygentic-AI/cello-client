@@ -70,6 +70,9 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
     rollback: () => ({ ok: true }),
     // A SECOND real agent, so "resolves to a key but does not hold this document" stays reachable
     // and distinct from "has no key at all".
+    // The ack's road back. Required: an inbound path that cannot answer leaves every sender
+    // retrying until their document stalls.
+    sendFrame: async () => ({ ok: true as const }),
     ownerKeyFor: (agentName) =>
       agentName === AGENT ? OWNER : agentName === OTHER_AGENT ? OTHER_OWNER : null,
     sign: async () => new Uint8Array(64).fill(1),

@@ -3215,6 +3215,19 @@ async function startDaemonHoldingLock(
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: documentOwnerKeyFor,
+    // The ack's road to the peer — the same open-or-reuse-then-seal path every other document frame
+    // takes. Resolved from the owner KEY back to the agent name, because the transport is per agent.
+    sendFrame: async (ownerAgentId, peerAgentId, bytes) => {
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      if (!agentName) return { ok: false, reason: "document_ack_no_agent" };
+      const sent = await documentTransportFor(agentName).sendBytes({
+        peerAgentId,
+        documentId: "ack",
+        bytes,
+        correlationId: randomUUID(),
+      });
+      return sent.ok ? { ok: true } : { ok: false, reason: sent.reason };
+    },
     // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
     // how the surface tests passed while the feature did nothing: the test wired this seam to
     // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever

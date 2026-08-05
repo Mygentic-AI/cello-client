@@ -59,6 +59,9 @@ async function makeParty(name: string, clientId: number) {
     db,
     logger,
     publicKeyFor: agentPublicKeyFromId,
+    // The ack's road back. Required: an inbound path that cannot answer leaves every sender
+    // retrying until their document stalls.
+    sendFrame: async () => ({ ok: true as const }),
     ownerKeyFor: (agentName) => (agentName === name ? id : null),
     notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),

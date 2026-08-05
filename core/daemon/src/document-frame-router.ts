@@ -134,6 +134,23 @@ export interface DocumentFrameRouterDeps {
    */
   recordControl(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
+   * Tell the sender what happened to their envelope — admitted or refused, both of which SETTLE it.
+   *
+   * REQUIRED, not optional. Without it the sender has no answer and redelivers until the document
+   * stalls; an optional callback would make that outcome a configuration rather than a bug.
+   */
+  sendAck(
+    ownerAgentId: string,
+    /** The envelope as it arrived — the document id and the party to answer are both inside it. */
+    wire: Uint8Array,
+    outcome: {
+      envelopeHash: string;
+      admitted: boolean;
+      rejectionReason?: string;
+      correlationId: string;
+    },
+  ): Promise<void>;
+  /**
    * Map the daemon's AGENT NAME — the only identifier the session content path carries — to the
    * stable owner key every document row is scoped by (M14-D5: our own K_local pubkey hex).
    *
@@ -281,6 +298,45 @@ export class DocumentFrameRouter {
     try {
       if (kind === "update") {
         const res = await this.#d.inbound.receive(ownerAgentId, content, nowMs, correlationId);
+        if (res.ok) {
+          // ANSWER THE SENDER. Nothing did, and `encodeDocumentAck` had no production caller at all
+          // — the frame type, the preimage and the receiving half all existed and no code path ever
+          // produced one. The layer's own header names this as a distinct silent failure: an
+          // inbound path with no ack producer leaves the peer retrying until their document stalls
+          // at the unacked ceiling, and every redelivery re-triggers their gate.
+          //
+          // A REJECTION IS AN ACK. `admitted: false` says the peer has decided, so the sender stops
+          // retrying and supersedes instead — modelling it as "no ack" is what makes a refused
+          // envelope redeliver forever.
+          //
+          // A DUPLICATE IS ACKED TOO, and that is the case that matters most here: a redelivery is
+          // usually evidence the first ack was lost, so staying silent about it guarantees the loop
+          // never ends.
+          // NOT AWAITED, deliberately. This runs inside the per-owner queue, and that queue exists
+          // to serialize the CHAIN CHECK — an envelope's predecessor must be stored before the next
+          // is examined. It does not exist to serialize network I/O. Awaiting a dial here means one
+          // slow or unreachable peer stalls every subsequent inbound frame for that agent, and the
+          // symptom is not "the ack was slow": it is documents failing to converge, minutes later,
+          // for no reason visible at the point of failure. Measured — it turned a 7-second live run
+          // into a 124-second timeout.
+          //
+          // The ack is best-effort by contract anyway: it cannot fail the content we have already
+          // admitted, and a lost one is recovered by the sender's redelivery, which is acked in
+          // turn.
+          void this.#d.sendAck(ownerAgentId, content, {
+            envelopeHash: res.envelopeHash,
+            admitted: res.admitted,
+            ...(res.admitted ? {} : { rejectionReason: res.rejectionReason }),
+            correlationId,
+          }).catch((err: unknown) => {
+            // Contained: an unhandled rejection out of a fire-and-forget send takes the daemon down,
+            // and the one thing an ack must never do is cost us content we already hold.
+            this.#d.logger.warn("document.ack.send_threw", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
         return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
       }
       if (kind === "proposal") {
