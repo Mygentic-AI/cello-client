@@ -347,3 +347,97 @@ describe("DocumentWritePath — refusals are typed and name their cause", () => 
     expect((thrown as DocumentWriteError).detail).toBeTruthy();
   });
 });
+
+// ─── Pass-two: the round-trip the DoD actually asks for ─────────────────────
+//
+// "edit → publish → … → identical content". The previous suite proved that only for a
+// single-line, equal-line-count edit — the one shape the hand-rolled diff handled. Four of these
+// six published text that was NOT what the file said.
+describe("DocumentWritePath — publish round-trips EVERY ordinary edit shape", () => {
+  const cases: Array<{ name: string; before: string; after: string }> = [
+    { name: "edit within a line", before: "one two three", after: "one TWO three" },
+    { name: "append a line", before: "para one.\npara two.", after: "para one.\npara two.\npara three." },
+    { name: "insert a line in the middle", before: "a\nb\nc", after: "a\nNEW\nb\nc" },
+    { name: "delete the last line", before: "a\nb\nc", after: "a\nb" },
+    { name: "delete a middle line", before: "a\nb\nc", after: "a\nc" },
+    { name: "append a paragraph", before: "Body here.", after: "Body here.\n\nA second paragraph." },
+    { name: "two edits plus a line insert", before: "one\ntwo\nthree", after: "ONE\ntwo\nEXTRA\nTHREE" },
+  ];
+
+  for (const { name, before, after } of cases) {
+    it(`round-trips: ${name}`, async () => {
+      const wp = newWritePath();
+      const doc = wp.engine.createDocument(before);
+      doc.clientID = 1_000_000;
+      const path = await wp.materialize(AGENT, DOC, "markdown", doc);
+
+      await writeFile(path, after, "utf8");
+      await wp.publish(AGENT, DOC, "markdown", doc);
+
+      // The document must hold exactly what the file said — the whole point of the write path.
+      expect(wp.engine.readTextRoot(doc)).toBe(after);
+    });
+  }
+});
+
+describe("DocumentWritePath — the guards pass two found missing", () => {
+  it("REFUSES to admit when the projection baseline is gone, rather than duplicating the document", async () => {
+    const wp = newWritePath();
+    const doc = wp.engine.createDocument("The whole document body.");
+    doc.clientID = 1_000_000;
+    await wp.materialize(AGENT, DOC, "markdown", doc);
+
+    // The baseline is deleted — a tidy-up, a git clean, or a crash between two renames.
+    await rm(join(workspace, ".cello"), { recursive: true, force: true });
+
+    const peer = peerOf(wp, doc, 500);
+    peer.getText("content").insert(0, "PEER: ");
+    const incoming = wp.engine.encodeState(peer, wp.engine.encodeStateVector(doc));
+
+    await expect(wp.admit(AGENT, DOC, "markdown", doc, incoming)).rejects.toThrow(
+      /document_projection_missing/,
+    );
+    // Substituting "" would have diffed the whole file in as an insert at offset 0, duplicating
+    // the body into the CRDT and out to the peer, permanently.
+    expect(wp.engine.readTextRoot(doc)).toBe("The whole document body.");
+  });
+
+  it("REFUSES to publish when the document has advanced past the projection, even if the file was edited", async () => {
+    const wp = newWritePath();
+    const mine = wp.engine.createDocument("Alpha.\nBeta.\nGamma.");
+    mine.clientID = 1_000_000;
+    const path = await wp.materialize(AGENT, DOC, "markdown", mine);
+
+    // The doc advances (a merge landed) but the file rewrite never completed...
+    const peer = peerOf(wp, mine, 500);
+    peer.getText("content").insert(0, "PEER PARAGRAPH.\n");
+    wp.engine.applyUpdate(mine, wp.engine.encodeState(peer, wp.engine.encodeStateVector(mine)));
+
+    // ...and the agent then edits the file. The earlier guard only fired when the file was
+    // UNTOUCHED, so this state applied projection-offset hunks to a longer document and mutilated
+    // the peer's paragraph.
+    await writeFile(path, "Alpha EDITED.\nBeta.\nGamma.", "utf8");
+
+    await expect(wp.publish(AGENT, DOC, "markdown", mine)).rejects.toThrow(/document_file_stale/);
+    expect(wp.engine.readTextRoot(mine)).toContain("PEER PARAGRAPH.");
+  });
+
+  it("a peer DELETION above the local edit is NOT overlap — the flag must not fire on the ordinary case", async () => {
+    const wp = newWritePath();
+    const mine = wp.engine.createDocument("First paragraph.\nMiddle paragraph.\nLast paragraph.");
+    mine.clientID = 1_000_000;
+    const path = await wp.materialize(AGENT, DOC, "markdown", mine);
+
+    // The peer deletes the MIDDLE paragraph — above the agent's edit, unrelated to it.
+    const peer = peerOf(wp, mine, 500);
+    peer.getText("content").delete(17, 18);
+    const incoming = wp.engine.encodeState(peer, wp.engine.encodeStateVector(mine));
+
+    await writeFile(path, "First paragraph.\nMiddle paragraph.\nLast paragraph EDITED.", "utf8");
+    const res = await wp.admit(AGENT, DOC, "markdown", mine, incoming);
+
+    // Recording the delete's old width made this read as overlap whenever the peer's deletion was
+    // large enough — the flag sensitive to size rather than position.
+    expect(res.overlap).toBe(false);
+  });
+});

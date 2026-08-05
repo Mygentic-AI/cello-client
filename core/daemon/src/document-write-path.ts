@@ -22,8 +22,7 @@
  * intent. Measured, so the projection is written to disk beside the document and read back.
  */
 
-import { mkdir, readFile, writeFile, rename, stat } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
@@ -44,6 +43,8 @@ export type DocumentWriteFailure =
   | "document_file_unparseable"
   | "document_file_stale"
   | "document_file_changed_during_merge"
+  | "document_projection_missing"
+  | "document_file_unreadable"
   | "document_type_unsupported"
   | "document_id_invalid";
 
@@ -125,12 +126,19 @@ export class DocumentWritePath {
     // a rewrite did not complete (admit merges into the doc and rewrites the file as two steps).
     // Diffing it would read the peer's admitted content as an agent deletion and publish that
     // deletion as deliberate intent. Refuse and re-materialize instead.
+    // THE BASELINE MUST MATCH THE DOCUMENT. Hunks are offsets into the projection, applied to the
+    // doc's text, so they are sound only while the two agree. An earlier version refused only when
+    // the file was ALSO untouched, which let through the one state that matters: the doc advanced
+    // past the projection AND the agent edited the file. That applies projection-offset hunks to a
+    // longer document and mutilates the peer's admitted content — measured. The condition is the
+    // invariant itself, not a symptom of it.
     const current = this.#project(doc, documentType);
-    if (onDisk === projection && projection !== current) {
+    if (projection !== current) {
       throw new DocumentWriteError(
         "document_file_stale",
-        `the file for ${documentId} still holds the pre-merge projection — a rewrite did not ` +
-          `complete, so re-materialize before publishing rather than diffing against it`,
+        `the recorded projection for ${documentId} no longer matches the document — a rewrite did ` +
+          `not complete, so re-materialize before publishing rather than diffing against a ` +
+          `baseline the document has moved past`,
       );
     }
 
@@ -156,33 +164,57 @@ export class DocumentWritePath {
 
     // 1. FOLD unpublished local edits in as local operations.
     let onDisk: string | null = null;
-    let mtimeBefore = 0;
     try {
       onDisk = await readFile(path, "utf8");
-      mtimeBefore = (await stat(path)).mtimeMs;
-    } catch {
+    } catch (err: unknown) {
+      // ONLY a missing file means "nothing local to lose". Any other errno — EACCES, EIO, EMFILE —
+      // read as that would skip the fold and then overwrite the file with the merged projection,
+      // discarding the agent's unpublished work with no event at all.
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        throw new DocumentWriteError(
+          "document_file_unreadable",
+          `the file for ${documentId} could not be read (${(err as NodeJS.ErrnoException)?.code ?? "unknown"}) — ` +
+            `refusing rather than treating it as absent and overwriting unpublished edits`,
+        );
+      }
       onDisk = null;
     }
 
-    const projection = (await this.#loadProjection(agentId, documentId, documentType)) ?? "";
+    // REFUSE a missing baseline rather than substituting "". Diffing "" against the file yields a
+    // whole-file hunk inserted at offset 0 of a document that already holds that content — the
+    // body duplicated into the CRDT and out to the peer, permanently.
+    const projection = await this.#loadProjection(agentId, documentId, documentType);
+    if (onDisk !== null && projection === null) {
+      throw new DocumentWriteError(
+        "document_projection_missing",
+        `no recorded projection for document ${documentId} — re-materialize before admitting, ` +
+          `since without a baseline the file cannot be told apart from an empty document`,
+      );
+    }
     let localText: { from: number; to: number } | null = null;
     const localKeys = new Set<string>();
     if (onDisk !== null) {
-      const folded = this.#fold(doc, projection, onDisk, documentType);
+      const folded = this.#fold(doc, projection!, onDisk, documentType);
       if (folded && "from" in folded) localText = folded;
       else if (folded) for (const k of folded.keys) localKeys.add(k);
     }
 
     // 2. MERGE, observing what the incoming update touches — in BOTH coordinate spaces, because
     //    a JSON document's edits live in the map and a text observer sees none of them.
-    const touched: Array<{ from: number; to: number }> = [];
+    // Inserts and deletes are compared DIFFERENTLY, and the asymmetry is the point. A re-homed
+    // insert landing exactly on the local edit's boundary IS overlap — Yjs put it there because
+    // the local fold deleted the characters it was anchored to. A deletion landing on that
+    // boundary is NOT: it happened above the local edit and merely shifted it down, which is the
+    // ordinary case of a peer editing the paragraph above yours.
+    const inserted: Array<{ from: number; to: number }> = [];
+    const deletedAt: number[] = [];
     const mergedKeys = new Set<string>();
     const onText = (event: Y.YTextEvent): void => {
       let cursor = 0;
       for (const delta of event.delta) {
         if (delta.retain !== undefined) cursor += delta.retain;
         else if (typeof delta.insert === "string") {
-          touched.push({ from: cursor, to: cursor + delta.insert.length });
+          inserted.push({ from: cursor, to: cursor + delta.insert.length });
           // Shift any local region that sits at or after this insert into the SAME coordinate
           // system. Without it the flag depends on how LONG the peer's insert was rather than
           // where it landed — a disjoint edit reads as overlapping once the insert is big enough.
@@ -191,7 +223,10 @@ export class DocumentWritePath {
           }
           cursor += delta.insert.length;
         } else if (delta.delete !== undefined) {
-          touched.push({ from: cursor, to: cursor + delta.delete });
+          // A POINT in post-delete coordinates. Recording the delete's OLD width made any local
+          // edit within N characters after it read as overlapping — the flag sensitive to how BIG
+          // the peer's delete was rather than where it landed.
+          deletedAt.push(cursor);
           if (localText && localText.from >= cursor) {
             const shift = Math.min(delta.delete, Math.max(0, localText.from - cursor));
             localText = { from: localText.from - shift, to: localText.to - shift };
@@ -216,8 +251,20 @@ export class DocumentWritePath {
 
     // 3. REWRITE so the agent sees the merged projection — refusing if the file moved under us.
     if (onDisk !== null) {
-      const mtimeNow = (await stat(path).catch(() => ({ mtimeMs: mtimeBefore }))).mtimeMs;
-      if (mtimeNow !== mtimeBefore) {
+      // Re-read the CONTENT rather than trusting mtime: second-granularity filesystems hide a save
+      // inside the merge window, and a stat that itself fails must not read as "unchanged" — this
+      // guard exists precisely to prevent a silent clobber.
+      let nowOnDisk: string;
+      try {
+        nowOnDisk = await readFile(path, "utf8");
+      } catch (err: unknown) {
+        throw new DocumentWriteError(
+          "document_file_unreadable",
+          `the file for ${documentId} became unreadable during the merge ` +
+            `(${(err as NodeJS.ErrnoException)?.code ?? "unknown"}) — refusing rather than rewriting it`,
+        );
+      }
+      if (nowOnDisk !== onDisk) {
         throw new DocumentWriteError(
           "document_file_changed_during_merge",
           `the file for ${documentId} was written while the merge was in flight — its content was ` +
@@ -234,8 +281,11 @@ export class DocumentWritePath {
     //    was anchored to, Yjs re-homes that insert onto the boundary of the local edit — and
     //    which side depends on its random clientID tie-break, so exclusive comparison answers a
     //    definite question with a coin flip.
-    const overlap = localText
-      ? touched.some((t) => t.from <= localText!.to && localText!.from <= t.to)
+    const region = localText;
+    const overlap = region
+      ? inserted.some((t) => t.from <= region.to && region.from <= t.to) ||
+        // STRICTLY inside: a deletion at the region's own boundary is adjacency, not overlap.
+        deletedAt.some((at) => at > region.from && at < region.to)
       : [...localKeys].some((k) => mergedKeys.has(k));
 
     this.#logger.info("document.file.rewritten", { documentId, bytes: merged.length });
@@ -349,13 +399,21 @@ export class DocumentWritePath {
     await rename(tmp, path);
   }
 
+  /**
+   * The baseline lives in a dot-directory, NOT beside the document. §16.2's premise is that the
+   * agent edits an ordinary file and no new surface exists — a sibling `<name>.md.projection` IS
+   * a new surface, one an agent may open, edit, or tidy away, and deleting it used to duplicate
+   * the document.
+   */
   #projectionPath(agentId: string, documentId: string, documentType: string): string {
-    return `${this.filePath(agentId, documentId, documentType)}.projection`;
+    const extension = JSON_TYPES.has(documentType) ? "json" : "md";
+    return join(this.#root, ".cello", agentId, `${documentId}.${extension}.projection`);
   }
 
   /** The projection is persisted so it survives a restart — see the header. */
   async #saveProjection(agentId: string, documentId: string, documentType: string, content: string): Promise<void> {
     const path = this.#projectionPath(agentId, documentId, documentType);
+    await mkdir(join(this.#root, ".cello", agentId), { recursive: true });
     await writeFile(`${path}.tmp`, content, "utf8");
     await rename(`${path}.tmp`, path);
   }
@@ -399,80 +457,80 @@ export class DocumentWritePath {
   }
 }
 
-/** Content hash of a projection, for callers that persist it beside a snapshot. */
-export function projectionHash(content: string): string {
-  return createHash("sha256").update(content, "utf8").digest("hex");
-}
-
 /**
  * Line-level hunks between two texts, as character offsets into `before`.
  *
- * Common leading and trailing LINES are skipped, then each changed run becomes its own hunk, so
- * two edits far apart do not drag the untouched text between them into a rewrite.
+ * Lines are represented as CHUNKS — each line carries its own trailing newline, except the last,
+ * which does not. That representation is what makes newline handling fall out instead of being
+ * special-cased: appending a line to "a\nb" turns the chunk "b" into "b\n" + "c", so the LCS
+ * sees the last line as changed and the hunk replaces "b" with "b\nc". A hand-rolled
+ * prefix/suffix trim got this wrong for every edit that changed the line count — measured, four
+ * of six ordinary markdown edits published text that was not what the file said.
+ *
+ * A real LCS (not a prefix/suffix trim) is required because the whole point is to emit SEPARATE
+ * hunks for separated edits: one span from the first change to the last would delete and
+ * re-insert everything between them as new operations, resurrecting text a peer concurrently
+ * deleted. Under publish-on-intent, multi-edit publishes are the modal case.
  */
 export function lineHunks(
   before: string,
   after: string,
 ): Array<{ from: number; to: number; insert: string }> {
   if (before === after) return [];
-  const beforeLines = before.split("\n");
-  const afterLines = after.split("\n");
 
-  let head = 0;
-  while (head < beforeLines.length && head < afterLines.length && beforeLines[head] === afterLines[head]) head++;
+  const a = toChunks(before);
+  const b = toChunks(after);
 
-  let tail = 0;
-  while (
-    tail < beforeLines.length - head &&
-    tail < afterLines.length - head &&
-    beforeLines[beforeLines.length - 1 - tail] === afterLines[afterLines.length - 1 - tail]
-  ) {
-    tail++;
+  // O(n·m) table. Documents this large are not the collaborative-editing case, and a quadratic
+  // table on them would be the wrong kind of thorough — fall back to one hunk and say so.
+  if (a.length > LCS_LINE_LIMIT || b.length > LCS_LINE_LIMIT) {
+    return [{ from: 0, to: before.length, insert: after }];
   }
 
-  const changedBefore = beforeLines.slice(head, beforeLines.length - tail);
-  const changedAfter = afterLines.slice(head, afterLines.length - tail);
-
-  // Offset of the first changed line.
-  let offset = 0;
-  for (let i = 0; i < head; i++) offset += beforeLines[i]!.length + 1;
-
-  // When the changed runs have equal line counts, emit one hunk per differing line so untouched
-  // lines between two edits are never rewritten. Otherwise the run is one hunk — lines were added
-  // or removed, so positions inside it cannot be matched up without a full LCS.
-  const hunks: Array<{ from: number; to: number; insert: string }> = [];
-  if (changedBefore.length === changedAfter.length) {
-    let cursor = offset;
-    for (let i = 0; i < changedBefore.length; i++) {
-      const b = changedBefore[i]!;
-      const a = changedAfter[i]!;
-      if (b !== a) {
-        const { from, to } = charRange(b, a);
-        hunks.push({ from: cursor + from, to: cursor + to, insert: a.slice(from, a.length - (b.length - to)) });
-      }
-      cursor += b.length + 1;
+  // Longest common subsequence over chunks.
+  const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i]![j] = a[i] === b[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!);
     }
-    return hunks;
   }
 
-  const beforeText = changedBefore.join("\n");
-  const afterText = changedAfter.join("\n");
-  return [{ from: offset, to: offset + beforeText.length, insert: afterText }];
+  // Walk the table, collecting contiguous runs of non-matching chunks into hunks.
+  const offsets: number[] = [0];
+  for (const chunk of a) offsets.push(offsets[offsets.length - 1]! + chunk.length);
+
+  const hunks: Array<{ from: number; to: number; insert: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length || j < b.length) {
+    if (i < a.length && j < b.length && a[i] === b[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    const startI = i;
+    const startJ = j;
+    while (
+      (i < a.length || j < b.length) &&
+      !(i < a.length && j < b.length && a[i] === b[j])
+    ) {
+      if (j < b.length && (i === a.length || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) j++;
+      else i++;
+    }
+    hunks.push({
+      from: offsets[startI]!,
+      to: offsets[i]!,
+      insert: b.slice(startJ, j).join(""),
+    });
+  }
+  return hunks;
 }
 
-/** The span that differs between two strings, as an offset range into `before`. */
-export function charRange(before: string, after: string): { from: number; to: number } {
-  let from = 0;
-  const maxPrefix = Math.min(before.length, after.length);
-  while (from < maxPrefix && before[from] === after[from]) from++;
+/** Above this many lines the LCS table is not worth building — see `lineHunks`. */
+const LCS_LINE_LIMIT = 4000;
 
-  let suffix = 0;
-  const maxSuffix = Math.min(before.length - from, after.length - from);
-  while (
-    suffix < maxSuffix &&
-    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
-  ) {
-    suffix++;
-  }
-  return { from, to: before.length - suffix };
+/** Lines carrying their own trailing newline; the last line carries none. */
+function toChunks(text: string): string[] {
+  const lines = text.split("\n");
+  return lines.map((line, index) => (index < lines.length - 1 ? `${line}\n` : line));
 }
