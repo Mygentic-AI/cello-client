@@ -83,6 +83,8 @@ export interface DocumentEnvelopeRow {
   /** For a withdrawal or rejection: the envelope it concerns. */
   referencesEnvelopeHash?: string | null;
   createdAtMs: number;
+  /** The Yjs clientID this sender signed for — the gate's authorship binding. */
+  senderClientId?: number | null;
   /** Position in this document's log. Assigned on append; absent until then. */
   logIndex?: number;
   /** DELIVERY bookkeeping, read back from the log. Absent on a row being appended. */
@@ -181,6 +183,11 @@ const CREATE_ENVELOPES_SQL = `
     state_vector    BLOB    NOT NULL,
     payload         BLOB,
     kind            TEXT    NOT NULL CHECK (kind IN ('update', 'withdrawal', 'rejection')),
+    -- The Yjs clientID the sender SIGNED for (ENVELOPE-1 puts it inside the TBS). Recorded so the
+    -- gate's authorship rule has a binding derived from authenticated data rather than from a seam
+    -- somebody has to remember to implement. §14 forbids persisting a clientID for REUSE — this is
+    -- the opposite: a record of which ones a peer has actually signed for.
+    sender_client_id INTEGER,
     references_hash TEXT,
     created_at      INTEGER NOT NULL,
     log_index       INTEGER NOT NULL,
@@ -414,8 +421,9 @@ export class DocumentStore {
       .prepare(
         `INSERT INTO document_envelopes
            (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash, epoch_id,
-            signature, state_vector, payload, kind, references_hash, created_at, log_index)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            signature, state_vector, payload, kind, references_hash, sender_client_id,
+            created_at, log_index)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE((SELECT MAX(log_index) + 1 FROM document_envelopes
                            WHERE owner_agent_id = ? AND document_id = ?), 0)
          ON CONFLICT (owner_agent_id, document_id, envelope_hash) DO NOTHING`,
@@ -432,6 +440,7 @@ export class DocumentStore {
         envelope.payload === null ? null : Buffer.from(envelope.payload),
         envelope.kind,
         envelope.referencesEnvelopeHash ?? null,
+        envelope.senderClientId ?? null,
         envelope.createdAtMs,
         ownerAgentId,
         envelope.documentId,
@@ -687,6 +696,37 @@ export class DocumentStore {
       )
       .run(ownerAgentId, documentId, rejectedEnvelopeHash);
     return Number(info.changes) > 0;
+  }
+
+  /**
+   * Every envelope hash we hold from one sender. Hash-only on purpose: the caller needs a set for a
+   * membership test, and `getEnvelopeLog` selects `*` — including every payload BLOB — so building
+   * that set from it materialized the whole document's content on every inbound update.
+   */
+  knownEnvelopeHashesBySender(
+    ownerAgentId: string,
+    documentId: string,
+    senderAgentId: string,
+  ): Set<string> {
+    const rows = this.#db
+      .prepare(
+        `SELECT envelope_hash FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?`,
+      )
+      .all(ownerAgentId, documentId, senderAgentId) as Array<{ envelope_hash: string }>;
+    return new Set(rows.map((r) => r.envelope_hash));
+  }
+
+  /** The clientIDs one sender has signed for on this document. Also hash-free — see above. */
+  senderClientIdsFor(ownerAgentId: string, documentId: string, senderAgentId: string): number[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT DISTINCT sender_client_id FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?
+            AND sender_client_id IS NOT NULL`,
+      )
+      .all(ownerAgentId, documentId, senderAgentId) as Array<{ sender_client_id: number }>;
+    return rows.map((r) => r.sender_client_id);
   }
 
   /** The rejecting agent's most recent envelope for this document, for chain linkage. */
@@ -995,6 +1035,7 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     stateVector: toU8(r["state_vector"]),
     payload: payload === null || payload === undefined ? null : toU8(payload),
     kind: r["kind"] as DocumentEnvelopeKind,
+    senderClientId: (r["sender_client_id"] as number | null) ?? null,
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
     logIndex: r["log_index"] as number,

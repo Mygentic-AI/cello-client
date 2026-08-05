@@ -60,10 +60,13 @@ export interface DocumentInboundDeps {
   verifySignature(senderAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
-  /** clientIDs this peer is known to write under — the binding GATE-1's rule (h) needs. */
-  boundClientIds(ownerAgentId: string, documentId: string): number[];
   /** The rejection's own signature, state vector and nonce. Never fabricated here. */
   crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: string };
+}
+
+/** The agreed property, read from the row rather than from whoever called us. */
+function appendOnly(doc: { properties: Record<string, unknown> }): boolean {
+  return doc.properties["append_only"] === true;
 }
 
 export class DocumentInbound {
@@ -73,11 +76,25 @@ export class DocumentInbound {
     this.#d = deps;
   }
 
+  /**
+   * The clientIDs this sender has SIGNED for on this document: the one this envelope declares,
+   * plus every one previously admitted from them. Both are authenticated — each arrived inside a
+   * verified TBS — so the set can only grow through signatures the peer actually made.
+   */
+  #boundClientIds(ownerAgentId: string, env: DocumentUpdateEnvelope): number[] {
+    return [
+      ...new Set<number>([
+        env.sender_client_id,
+        ...this.#d.store.senderClientIdsFor(ownerAgentId, env.document_id, env.sender_agent_id),
+      ]),
+    ];
+  }
+
   receive(
     ownerAgentId: string,
     wire: Uint8Array,
     nowMs: number,
-    opts: { appendOnly?: boolean } = {},
+    correlationId = "inbound",
   ): InboundResult {
     // 1. DECODE.
     let env: DocumentUpdateEnvelope;
@@ -85,7 +102,7 @@ export class DocumentInbound {
       env = decodeDocumentUpdateEnvelope(wire);
     } catch (err: unknown) {
       const detail = err instanceof Error ? err.message : String(err);
-      this.#d.logger.warn("document.inbound.malformed", { detail });
+      this.#d.logger.warn("document.inbound.malformed", { detail, correlationId });
       // ONE reason code, with the upstream message in the detail. Two kinds of failure arrive here:
       // our own decoder's named refusals ("document_envelope_missing_field: …"), and CBOR/lib0
       // errors from bytes that are not a CBOR map at all ("Data read, but end of buffer not
@@ -106,19 +123,44 @@ export class DocumentInbound {
       };
     }
 
+    // 2b. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
+    // comment describing the bug it was written to fix — "after a restart the document row said
+    // `stalled` while the daemon happily accepted updates on it". The only inbound path in the
+    // codebase was reintroducing it, and a killed document is defined by LIFECYCLE-1 as one that
+    // stops accepting.
+    if (doc.status === "killed" || doc.status === "closed") {
+      return {
+        ok: false,
+        reason: doc.status === "killed" ? "document_killed" : "document_closed",
+        detail:
+          doc.status === "killed"
+            ? "this document was ended locally and no longer accepts updates"
+            : "this document was closed by agreement and no longer accepts updates",
+      };
+    }
+    const accepts = this.#d.rejections.acceptsUpdates(ownerAgentId, env.document_id);
+    if (!accepts.ok) {
+      // The stall reason, composed by the unit that owns the stall. Reporting this envelope's own
+      // gate verdict instead would send an operator to the append-only rule for a document that has
+      // been frozen for days.
+      return { ok: false, reason: accepts.reason, detail: accepts.detail };
+    }
+
     // 3. The sender must be THIS document's peer.
     if (env.sender_agent_id !== doc.peerAgentId) {
       this.#d.logger.warn("document.inbound.not_peer", {
         documentId: env.document_id,
         senderAgentId: env.sender_agent_id,
         peerAgentId: doc.peerAgentId,
+        correlationId,
       });
       return {
         ok: false,
         reason: "document_sender_not_peer",
-        detail:
-          `${env.sender_agent_id} is not this document's peer (${doc.peerAgentId}) — a document is ` +
-          `a pairwise agreement, so there is no collaboration here to supersede`,
+        // The peer's identity is NOT in the reply. This sender has not authenticated, and anyone
+        // reaching the channel with a guessed or leaked document_id would otherwise learn who the
+        // owner collaborates with. The full detail is in the warn above, where it belongs.
+        detail: "you are not a party to this document",
       };
     }
 
@@ -128,6 +170,7 @@ export class DocumentInbound {
         documentId: env.document_id,
         senderAgentId: env.sender_agent_id,
         envelopeHash,
+        correlationId,
       });
       return {
         ok: false,
@@ -139,11 +182,12 @@ export class DocumentInbound {
     }
 
     // 5. CHAIN. A redelivery is expected traffic and must still be answered.
-    const known = new Set(
-      this.#d.store
-        .getEnvelopeLog(ownerAgentId, env.document_id)
-        .filter((e) => e.senderAgentId === env.sender_agent_id)
-        .map((e) => e.envelopeHash),
+    // Hash-only. Reading the whole log meant materializing every payload BLOB on every inbound
+    // update, just to build a set for one membership test.
+    const known = this.#d.store.knownEnvelopeHashesBySender(
+      ownerAgentId,
+      env.document_id,
+      env.sender_agent_id,
     );
     const head = this.#d.store.lastEnvelopeHashBySender(ownerAgentId, env.document_id, env.sender_agent_id);
     let duplicate: boolean;
@@ -151,15 +195,58 @@ export class DocumentInbound {
       duplicate = verifyDocumentChainLink(env, { head, known }).duplicate;
     } catch (err: unknown) {
       const detail = err instanceof Error ? err.message : String(err);
-      this.#d.logger.warn("document.inbound.chain_refused", { documentId: env.document_id, detail });
-      return { ok: false, reason: detail.split(":")[0] ?? "document_chain_broken", detail };
+      this.#d.logger.warn("document.inbound.chain_refused", {
+        documentId: env.document_id,
+        correlationId,
+        detail,
+      });
+      // MATCHED against the known set, not split on ":". This file explains sixty lines earlier why
+      // splitting an upstream message produces reason codes made of English prose — and the old
+      // `?? "document_chain_broken"` fallback mislabelled a FORK as a gap, which is precisely the
+      // distinction the envelope module went out of its way to create.
+      const reason = ["document_chain_forked", "document_chain_broken"].find((r) =>
+        detail.startsWith(r),
+      );
+      return { ok: false, reason: reason ?? "document_chain_refused", detail };
     }
     if (duplicate) {
       // ACK, and change nothing. Not acking would leave the sender retrying an envelope we already
       // hold, forever; applying it again is unnecessary (Yjs is idempotent) and appending it again
       // is refused by the store anyway.
-      this.#d.logger.info("document.inbound.duplicate", { documentId: env.document_id, envelopeHash });
+      this.#d.logger.info("document.inbound.duplicate", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        envelopeHash,
+        correlationId,
+      });
       return { ok: true, admitted: true, envelopeHash, duplicate: true };
+    }
+
+    // 5b. ALREADY REJECTED? A rejected envelope's hash is deliberately never written to the log, so
+    // it is not in `known` and a redelivery is NOT a duplicate. Without this it re-ran the gate,
+    // was rejected again, and `reject()` minted a fresh nonce — advancing the retry round. Since
+    // MAX_REJECTED_ROUNDS is 3, a peer whose ACKS ARE BEING LOST — which is delivery's ordinary
+    // retry behaviour — permanently stalled the shared document in three attempts, with no
+    // hostility required. Hostile, it was a one-line denial of service.
+    //
+    // Re-answered with the RECORDED reason: the peer needs the same answer it was given before, so
+    // it supersedes rather than retries.
+    const alreadyRejected = this.#d.store
+      .listQuarantined(ownerAgentId, env.document_id)
+      .find((q) => q.rejectedEnvelopeHash === envelopeHash);
+    if (alreadyRejected) {
+      this.#d.logger.info("document.inbound.already_rejected", {
+        documentId: env.document_id,
+        envelopeHash,
+        correlationId,
+      });
+      return {
+        ok: true,
+        admitted: false,
+        envelopeHash,
+        rejectionReason: alreadyRejected.reason,
+        duplicate: false,
+      };
     }
 
     // 6. GATE — against the LIVE doc, which the gate itself trials on a copy.
@@ -170,10 +257,24 @@ export class DocumentInbound {
       {
         documentId: env.document_id,
         senderAgentId: env.sender_agent_id,
-        senderClientIds: this.#d.boundClientIds(ownerAgentId, env.document_id),
+        // DERIVED from authenticated data, not from a seam nobody produces. ENVELOPE-1 puts
+        // `sender_client_id` inside the signed TBS precisely because "this envelope is where it is
+        // learned" — and the assembler was decoding it, verifying the signature over it, and then
+        // throwing it away, leaving rule (h) wired to a function with no implementation. Left as a
+        // seam it would default to wrong in whichever direction its implementer guessed: `[]`
+        // refuses every peer update, the union of everything observed admits anything.
+        //
+        // §14 forbids persisting a clientID for REUSE; recording which ones a peer has SIGNED for
+        // is the opposite — it is the binding the gate's rule exists to check.
+        senderClientIds: this.#boundClientIds(ownerAgentId, env),
         declaredDocumentId: env.document_id,
         declaredEncoding: env.update_encoding,
-        appendOnly: opts.appendOnly ?? false,
+        // THE PERSISTED PROPERTY, not a caller option defaulting to off. append_only is agreed at
+        // the handshake and stored on the row, and the gate's own header says it "is the only thing
+        // standing between a bound peer and erasure" — rule (h) provably cannot see a deletion.
+        // Taking it from an option meant a document configured append-only was unprotected unless
+        // every future call site remembered to pass the flag.
+        appendOnly: appendOnly(doc),
       },
       nowMs,
     );
@@ -215,11 +316,27 @@ export class DocumentInbound {
       payload: env.update,
       kind: "update",
       referencesEnvelopeHash: null,
+      // Recorded so the authorship binding for this peer is derived from what they SIGNED, not
+      // from a seam somebody has to remember to implement.
+      senderClientId: env.sender_client_id,
       createdAtMs: nowMs,
     });
     this.#d.engine.applyUpdateOrThrow(live, env.update);
 
-    this.#d.logger.info("document.inbound.admitted", { documentId: env.document_id, envelopeHash });
+    // §3.2 step 4: admit AND CLEAR THE QUARANTINE. This is the supersession closing — the held
+    // bytes are released, the chain bridge stub for the superseded envelope goes with them, and
+    // `document.supersession.admitted` finally has a producer. Without it the entries stayed held
+    // forever and the event was a name with nothing behind it.
+    if (env.doc_prev_hash !== null) {
+      this.#d.rejections.clearQuarantine(ownerAgentId, env.document_id, env.doc_prev_hash);
+    }
+
+    this.#d.logger.info("document.inbound.admitted", {
+      documentId: env.document_id,
+      senderAgentId: env.sender_agent_id,
+      envelopeHash,
+      correlationId,
+    });
     return { ok: true, admitted: true, envelopeHash, duplicate: false };
   }
 }
