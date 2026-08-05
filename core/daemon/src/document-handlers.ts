@@ -322,7 +322,31 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   handlers.set("cello_doc_list", async (params, connectionId) => {
     const who = resolve(params, connectionId);
     if (isRefusal(who)) return who;
-    return { ok: true, documents: layer.lifecycle.list(who.ownerAgentId, deps.now()) };
+    return {
+      ok: true,
+      documents: layer.lifecycle.list(who.ownerAgentId, deps.now()).map((d) => {
+        // WHOSE OFFER WAS IT, and has the other side actually shown up?
+        //
+        // Without these three fields, `cello_doc_list` renders identically for a document the peer
+        // refused, one whose offer never reached them, and one being actively co-edited — the only
+        // moving part is `pendingUnsent`, which also moves for a peer who is merely offline. An
+        // operator cannot tell "they said no" from "they are asleep", and those want opposite
+        // actions.
+        const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
+        return {
+          ...d,
+          proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
+          // INFERRED, and named as an inference. There is no proposal ACK on the wire — the
+          // proposer is not told the decision (owed, and recorded on the DoD line) — so the only
+          // honest evidence that the counterparty accepted is that they have published into it.
+          // Absent, the document may be refused, unreceived, or simply untouched; this field must
+          // never be read as "they refused".
+          peerHasPublished:
+            layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
+          consentState: proposal?.consentState ?? null,
+        };
+      }),
+    };
   });
 
   handlers.set("cello_doc_read", async (params, connectionId) => {

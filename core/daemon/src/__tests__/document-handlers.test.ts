@@ -314,3 +314,28 @@ describe("the surface refuses when it cannot name an agent or a document", () =>
     expect(f.sent).toHaveLength(0);
   });
 });
+
+
+describe("cello_doc_list distinguishes states that otherwise render identically", () => {
+  it("says WHOSE offer it was, and whether the peer has actually shown up", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+
+    const listed = ((await f.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+    expect(listed).toMatchObject({ documentId, proposedByUs: true, peerHasPublished: false });
+    // Without these, a document the peer refused, one whose offer never arrived, and one being
+    // actively co-edited all render the same — the only moving part is pendingUnsent, which also
+    // moves for a peer who is merely offline. "They said no" and "they are asleep" want opposite
+    // actions from the operator.
+  });
+
+  it("marks a document we ACCEPTED as not ours", async () => {
+    const f = await newFixture();
+    const env = await f.incomingProposal();
+    const documentId = f.layer.handshake.recordProposal(f.owner, encodeDocumentProposal(env), NOW).documentId;
+    await f.call("cello_doc_accept", { document_id: documentId });
+
+    const listed = ((await f.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+    expect(listed).toMatchObject({ proposedByUs: false, consentState: "accepted" });
+  });
+});
