@@ -33,6 +33,12 @@ import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
 import { DocumentNotifications } from "./document-notify.js";
+import { DocumentHandshake } from "./document-handshake.js";
+import {
+  decodeDocumentRejection,
+  buildDocumentRejectionTbs,
+  documentRejectionHash,
+} from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
@@ -75,6 +81,7 @@ export interface DocumentLayerDeps {
 
 export interface DocumentLayer {
   store: DocumentStore;
+  handshake: DocumentHandshake;
   engine: DocumentEngine;
   live: LiveDocuments;
   lifecycle: DocumentLifecycle;
@@ -155,10 +162,47 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   });
 
   const ackInbound = new DocumentAckInbound({ store, rejections, logger, verifySignature });
-  const router = new DocumentFrameRouter({ inbound, ackInbound, logger });
+
+  // The handshake verifies a proposal against its NAMED proposer — the same resolver, so a forged
+  // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
+  // arrival's bytes permanent for that id).
+  const handshake = new DocumentHandshake(db, logger, verifySignature);
+
+  const router = new DocumentFrameRouter({
+    inbound,
+    ackInbound,
+    logger,
+    recordProposal: (ownerAgentId, wire, nowMs) => {
+      // THROWS on a forged or misaddressed proposal, which the router contains and reports. That is
+      // right: those are refusals, and nothing should be recorded for them.
+      handshake.recordProposal(ownerAgentId, wire, nowMs);
+    },
+    // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
+    // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
+    // third time on one event.
+    recordRejection: (ownerAgentId, wire, _nowMs) => {
+      const env = decodeDocumentRejection(wire);
+      if (!verifySignature(env.rejecting_agent_id, buildDocumentRejectionTbs(env), env.signature)) {
+        // A rejection stops the sender retrying and makes them supersede. Unsigned, anyone on the
+        // channel could freeze a document by asserting a refusal nobody made.
+        throw new Error(
+          `document_rejection_signature_invalid: the rejection claims to come from ` +
+            `${env.rejecting_agent_id} but its signature does not verify against that agent`,
+        );
+      }
+      rejections.recordIncomingRejection(ownerAgentId, env.document_id, {
+        rejectionEnvelopeHash: documentRejectionHash(env),
+        rejectedEnvelopeHash: env.rejected_envelope_hash,
+        reason: env.reason,
+        detail: env.detail,
+        fromAgentId: env.rejecting_agent_id,
+      });
+    },
+  });
 
   return {
     store,
+    handshake,
     engine,
     live,
     lifecycle,

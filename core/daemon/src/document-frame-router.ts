@@ -70,6 +70,8 @@
 import {
   decodeDocumentUpdateEnvelope,
   decodeDocumentAck,
+  decodeDocumentProposal,
+  decodeDocumentRejection,
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
 import type { DocumentAckInbound } from "./document-ack-inbound.js";
@@ -81,9 +83,12 @@ import type { Logger } from "./types.js";
  * `consumed: false` means "this is not document traffic" — the caller records it as a transcript
  * message and fires the doorbell exactly as before. Nothing about the conversation path changes.
  */
+/** Every document frame kind that can arrive on the session channel. */
+export type DocumentFrameKind = "update" | "ack" | "proposal" | "rejection";
+
 export type FrameRouting =
   | { consumed: false }
-  | { consumed: true; kind: "update" | "ack"; ok: boolean; reason?: string };
+  | { consumed: true; kind: DocumentFrameKind; ok: boolean; reason?: string };
 
 /**
  * What the session layer needs SYNCHRONOUSLY: is this document traffic, and therefore which leaf
@@ -95,11 +100,20 @@ export type FrameRouting =
  */
 export type FrameClassification =
   | { consumed: false }
-  | { consumed: true; kind: "update" | "ack" };
+  | { consumed: true; kind: DocumentFrameKind };
 
 export interface DocumentFrameRouterDeps {
   inbound: DocumentInbound;
   ackInbound: DocumentAckInbound;
+  /**
+   * Record an arriving PROPOSAL. Without this a proposal frame is not document traffic as far as
+   * the router is concerned, so it falls through to the conversation path and lands in the
+   * operator's transcript as unreadable bytes — the exact failure the classification exists to
+   * prevent, arriving through the one frame kind nobody had wired.
+   */
+  recordProposal(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /** Record a rejection the PEER sent us — the receiving half of §3.2. */
+  recordRejection(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   logger: Logger;
 }
 
@@ -153,7 +167,7 @@ export class DocumentFrameRouter {
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
-    kind: "update" | "ack",
+    kind: DocumentFrameKind,
   ): Promise<void> {
     const previous = this.#queues.get(ownerAgentId) ?? Promise.resolve();
     const next = previous
@@ -197,12 +211,20 @@ export class DocumentFrameRouter {
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
-    kind: "update" | "ack",
+    kind: DocumentFrameKind,
   ): Promise<FrameRouting> {
     try {
       if (kind === "update") {
         const res = await this.#d.inbound.receive(ownerAgentId, content, nowMs, correlationId);
         return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
+      }
+      if (kind === "proposal") {
+        this.#d.recordProposal(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
+      }
+      if (kind === "rejection") {
+        this.#d.recordRejection(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
       }
       const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);
       return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
@@ -277,7 +299,7 @@ function couldBeDocumentFrame(b: Uint8Array): boolean {
  * wins; both decoders check a `type` discriminator before anything else, so neither can claim the
  * other's frame. A conversation message is arbitrary operator text and will not decode as either.
  */
-function classify(content: Uint8Array): "update" | "ack" | null {
+function classify(content: Uint8Array): DocumentFrameKind | null {
   // LENGTH FIRST. See the header: this is what bounds the nesting depth, and it is checked before
   // the frame is looked at in any other way.
   if (content.length > MAX_DOCUMENT_FRAME_BYTES) return null;
@@ -293,6 +315,18 @@ function classify(content: Uint8Array): "update" | "ack" | null {
   try {
     decodeDocumentAck(content);
     return "ack";
+  } catch {
+    /* not an ack */
+  }
+  try {
+    decodeDocumentProposal(content);
+    return "proposal";
+  } catch {
+    /* not a proposal */
+  }
+  try {
+    decodeDocumentRejection(content);
+    return "rejection";
   } catch {
     // Not document traffic at all.
   }

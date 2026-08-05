@@ -9,6 +9,8 @@ import { describe, it, expect, vi } from "vitest";
 import {
   encodeDocumentUpdateEnvelope,
   encodeDocumentAck,
+  encodeDocumentProposal,
+  encodeDocumentRejection,
   DOCUMENT_UPDATE_ENCODING_V1,
   DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
@@ -75,7 +77,23 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       return over.onAck ? over.onAck() : { ok: true, admitted: true, envelopeHash: "x" };
     },
   } satisfies Pick<DocumentAckInbound, "receive"> as DocumentAckInbound;
-  return { router: new DocumentFrameRouter({ inbound, ackInbound, logger }), calls, events };
+  const recorded: string[] = [];
+  return {
+    router: new DocumentFrameRouter({
+      inbound,
+      ackInbound,
+      logger,
+      recordProposal: () => {
+        recorded.push("proposal");
+      },
+      recordRejection: () => {
+        recorded.push("rejection");
+      },
+    }),
+    calls,
+    events,
+    recorded,
+  };
 }
 
 describe("DocumentFrameRouter — classification is by DECODE", () => {
@@ -270,5 +288,60 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     // transcript.
     expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000a");
     expect(r.router.routeSync(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
+  });
+});
+
+
+describe("DocumentFrameRouter — every document frame kind is classified", () => {
+  it("routes a PROPOSAL to the handshake instead of the transcript", async () => {
+    const r = newRouter();
+    const proposal = encodeDocumentProposal({
+      type: "document_proposal",
+      feature_version: 1,
+      proposer_agent_id: "peer-agent",
+      peer_agent_id: AGENT,
+      document_type: "markdown",
+      properties: {
+        assurance_tier: "authenticated",
+        schema_enforcement: false,
+        topology: "hub-and-spoke",
+        append_only: false,
+      },
+      starting_content: null,
+      nonce: new Uint8Array([1]),
+      proposed_at_ms: NOW,
+      signature: new Uint8Array(64),
+    });
+
+    // Unclassified, a proposal is "not document traffic" and lands in the operator's transcript as
+    // unreadable bytes — the exact failure the classification exists to prevent, arriving through
+    // the one frame kind nobody had wired.
+    expect(r.router.routeSync(AGENT, proposal, NOW, "c")).toEqual({ consumed: true, kind: "proposal" });
+    await vi.waitFor(() => expect(r.recorded).toEqual(["proposal"]));
+  });
+
+  it("routes a REJECTION to the receiving half", async () => {
+    const r = newRouter();
+    const rejection = encodeDocumentRejection({
+      type: "document_rejection",
+      rejection_version: 1,
+      document_id: DOC,
+      rejected_envelope_hash: "bb".repeat(32),
+      rejecting_agent_id: "peer-agent",
+      reason: "document_append_only_violation",
+      round: 1,
+      rejected_at_ms: NOW,
+      signature: new Uint8Array(64),
+    });
+    expect(r.router.routeSync(AGENT, rejection, NOW, "c")).toEqual({ consumed: true, kind: "rejection" });
+    await vi.waitFor(() => expect(r.recorded).toEqual(["rejection"]));
+  });
+
+  it("still leaves a conversation message alone", async () => {
+    const r = newRouter();
+    expect(r.router.routeSync(AGENT, new TextEncoder().encode("just a message"), NOW, "c")).toEqual({
+      consumed: false,
+    });
+    expect(r.recorded).toEqual([]);
   });
 });
