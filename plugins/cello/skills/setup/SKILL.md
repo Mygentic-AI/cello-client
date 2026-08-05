@@ -75,7 +75,7 @@ cello moniker "Alice @ Acme"
 
 This is the name that appears when **you** contact someone. Without it, counterparties see a
 truncated public key and nothing else. Note the direction: `cello moniker` is what *others* see of
-*you*; `cello contact set-moniker` is *your private pet name* for *them*, which they cannot see and
+*you*; `cello contact <pubkey> set-moniker` is *your private pet name* for *them*, which they cannot see and
 cannot spoof.
 
 ### Per-tier reachability limits
@@ -110,7 +110,7 @@ What a caller hears when nobody is attending the agent:
 ```bash
 cello settings set away.default "Alice is away — leave a message and she'll reply." --agent alice
 cello settings set away.tier.vip "Alice is away but sees VIP messages first." --agent alice
-cello contact set-away <pubkey> "Back Monday."     # what ONE specific peer hears
+cello contact <pubkey> set-away "Back Monday."     # what ONE specific peer hears
 ```
 
 **The away responder only fires when the agent is unattended.** Selecting an agent with
