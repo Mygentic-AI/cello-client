@@ -32,6 +32,7 @@
  * wrong is worse than no diff, because the agent cannot tell.
  */
 
+import { lineRuns, toChunks } from "./line-lcs.js";
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
@@ -69,6 +70,8 @@ export interface DiffStats {
    * is a judgement rather than a count, and the reason an agent reads stats before deciding.
    */
   overlap: boolean;
+  /** The document exceeded the LCS limit, so the numbers above are bounds, not a measurement. */
+  truncated: boolean;
 }
 
 export type DiffResult =
@@ -145,31 +148,43 @@ export class DocumentNotifications {
    *
    * `before` and `after` are the materialized text of the document at the two points; the caller
    * holds the engine and therefore the materialization.
+   *
+   * Uses the SHARED line LCS, not a positional walk. The first version compared line i to line i,
+   * which is correct only while the line count is unchanged: inserting one line at the top of a
+   * three-line file reported `+4 -3` with a single range covering the whole document. The counts
+   * being wrong is the smaller half — `overlap` is derived from those ranges, so it became
+   * permanently true, and a flag that always says yes trains the agent to ignore it. Same defect
+   * class WRITE-1 measured, which is why there is now one LCS rather than two.
    */
   diffStats(documentId: string, before: string, after: string, myEdits: readonly number[] = []): DiffStats {
-    const a = before.split("\n");
-    const b = after.split("\n");
-    const ranges: Array<{ start: number; end: number }> = [];
+    const a = toChunks(before);
+    const b = toChunks(after);
+    const runs = lineRuns(a, b);
+    if (runs === null) {
+      // Above the LCS limit. Said plainly rather than degraded silently into a whole-file range
+      // that would read as a measurement.
+      return {
+        documentId,
+        linesAdded: b.length,
+        linesRemoved: a.length,
+        ranges: [{ start: 1, end: Math.max(a.length, b.length) }],
+        keyPaths: [],
+        overlap: myEdits.length > 0,
+        truncated: true,
+      };
+    }
+
     let added = 0;
     let removed = 0;
-
-    let i = 0;
-    while (i < Math.max(a.length, b.length)) {
-      if (a[i] === b[i]) {
-        i += 1;
-        continue;
-      }
-      const start = i + 1;
-      while (i < Math.max(a.length, b.length) && a[i] !== b[i]) {
-        if (i >= a.length) added += 1;
-        else if (i >= b.length) removed += 1;
-        else {
-          added += 1;
-          removed += 1;
-        }
-        i += 1;
-      }
-      ranges.push({ start, end: i });
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (const r of runs) {
+      added += r.bEnd - r.bStart;
+      removed += r.aEnd - r.aStart;
+      // 1-based inclusive, over the BEFORE text — which is the text the operator's own edit line
+      // numbers refer to, and therefore the only coordinate space in which the overlap comparison
+      // means anything. A pure insertion has an empty before-range, so it is reported at the line
+      // it precedes rather than as a zero-width range nobody can act on.
+      ranges.push({ start: r.aStart + 1, end: r.aEnd === r.aStart ? r.aStart + 1 : r.aEnd });
     }
 
     const touched = new Set<number>();
@@ -181,6 +196,7 @@ export class DocumentNotifications {
       ranges,
       keyPaths: [],
       overlap: myEdits.some((line) => touched.has(line)),
+      truncated: false,
     };
   }
 

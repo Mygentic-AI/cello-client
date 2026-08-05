@@ -120,10 +120,57 @@ describe("DocumentNotifications — diffStats is STRUCTURAL, with no content", (
     expect(stats.overlap).toBe(true);
   });
 
+  it("handles INSERTED and DELETED lines, not just changed ones", () => {
+    const f = newFixture();
+    // The first version compared line i to line i, which is right only while the line count is
+    // unchanged. Inserting ONE line at the top of a three-line file reported +4 -3 with a single
+    // range covering the whole document — the same defect class WRITE-1 measured, where a
+    // positional walk published text the file did not contain.
+    expect(f.notify.diffStats(DOC, "b\nc\n", "a\nb\nc\n")).toMatchObject({
+      linesAdded: 1,
+      linesRemoved: 0,
+      ranges: [{ start: 1, end: 1 }],
+    });
+    expect(f.notify.diffStats(DOC, "a\nb\nc\n", "b\nc\n")).toMatchObject({
+      linesAdded: 0,
+      linesRemoved: 1,
+    });
+    expect(f.notify.diffStats(DOC, "a\nc\n", "a\nb\nc\n")).toMatchObject({
+      linesAdded: 1,
+      linesRemoved: 0,
+      ranges: [{ start: 2, end: 2 }],
+    });
+  });
+
+  it("reports SEPARATED edits as separate ranges", () => {
+    const f = newFixture();
+    // One span from the first change to the last would describe the untouched middle as changed,
+    // and the overlap flag would then fire for an operator who edited only that middle.
+    const stats = f.notify.diffStats(DOC, "a\nb\nc\nd\ne\n", "A\nb\nc\nd\nE\n");
+    expect(stats.ranges).toEqual([
+      { start: 1, end: 1 },
+      { start: 5, end: 5 },
+    ]);
+  });
+
+  it("does NOT report overlap when an insertion shifts the operator's lines", () => {
+    const f = newFixture();
+    // The reason the ranges are in BEFORE coordinates: those are the line numbers the operator's
+    // own edits refer to. Under the positional walk this returned true for every insertion above
+    // the operator's line, and a flag that always says yes trains the agent to ignore it.
+    expect(f.notify.diffStats(DOC, "a\nb\nc\n", "x\na\nb\nc\n", [3]).overlap).toBe(false);
+  });
+
   it("reports nothing changed as nothing changed", () => {
     const f = newFixture();
     const stats = f.notify.diffStats(DOC, "a\nb\n", "a\nb\n", [1, 2]);
-    expect(stats).toMatchObject({ linesAdded: 0, linesRemoved: 0, ranges: [], overlap: false });
+    expect(stats).toMatchObject({
+      linesAdded: 0,
+      linesRemoved: 0,
+      ranges: [],
+      overlap: false,
+      truncated: false,
+    });
   });
 });
 
