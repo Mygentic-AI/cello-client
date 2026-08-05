@@ -14,7 +14,11 @@ import {
   type DocumentUpdateEnvelope,
   type DocumentAck,
 } from "@cello-protocol/protocol-types";
-import { DocumentFrameRouter } from "../document-frame-router.js";
+import {
+  DocumentFrameRouter,
+  MAX_DOCUMENT_FRAME_BYTES,
+  MAX_DOCUMENT_FRAME_FIELDS,
+} from "../document-frame-router.js";
 import type { DocumentInbound } from "../document-inbound.js";
 import type { DocumentAckInbound } from "../document-ack-inbound.js";
 import type { Logger } from "../types.js";
@@ -91,7 +95,7 @@ describe("DocumentFrameRouter — classification is by DECODE", () => {
 
   it("leaves an ordinary conversation message alone", () => {
     const r = newRouter();
-    const message = new TextEncoder().encode("Hey — did you see the draft I sent over?");
+    const message = new TextEncoder().encode("Hey - did you see the draft I sent over?");
     // Not consumed means the caller records it as a transcript message and fires the doorbell
     // exactly as before. Nothing about the conversation path changes.
     expect(r.router.route(AGENT, message, NOW, "c")).toEqual({ consumed: false });
@@ -189,14 +193,57 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     }
   });
 
-  it("the real frames declare FEWER fields than the guard admits", () => {
-    // Pins the relationship the guard's bound depends on. Cross 32 fields and a genuine frame is
-    // silently reclassified as CONVERSATION — CRDT bytes into the operator's transcript, with no log
-    // and no other test failing. This fails at build time instead.
+  it("the real frames declare fewer fields than the CONSTANT admits", () => {
+    // Against the CONSTANT, not a hardcoded 32. The earlier version compared to a literal, so
+    // lowering MAX_DOCUMENT_FRAME_FIELDS to 8 kept it green while real frames were reclassified as
+    // conversation — the exact defect its own comment described.
     for (const wire of [encodeDocumentUpdateEnvelope(updateEnvelope), encodeDocumentAck(ackFrame)]) {
       expect(wire[0]).toBe(0xb9);
-      expect((wire[1]! << 8) | wire[2]!).toBeLessThan(32);
+      expect((wire[1]! << 8) | wire[2]!).toBeLessThanOrEqual(MAX_DOCUMENT_FRAME_FIELDS);
     }
+  });
+
+  it("refuses an oversized frame without decoding it", () => {
+    const r = newRouter();
+    const huge = new Uint8Array(MAX_DOCUMENT_FRAME_BYTES + 1);
+    huge[0] = 0xb9;
+    const started = Date.now();
+    // The length cap is what bounds the nesting depth, and it runs before anything else looks at
+    // the frame. The decoder's per-container limit only reduces amplification.
+    expect(r.router.route(AGENT, huge, NOW, "c")).toEqual({ consumed: false });
+    expect(Date.now() - started).toBeLessThan(100);
+  });
+
+  it("the admitted header range stays inside the UTF-8 continuation bytes", () => {
+    // The header comment's proof — that no conversation message can be classified as a document
+    // frame — rests entirely on every admitted first byte being a UTF-8 CONTINUATION byte
+    // (0x80-0xbf), which can never begin a valid sequence. Widen the range past 0xbf and the
+    // argument dies silently, with an operator's message vanishing from their transcript. So it is
+    // a test rather than a paragraph.
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    for (let b = 0xa0; b <= 0xb9; b++) {
+      expect(() => decoder.decode(new Uint8Array([b]))).toThrow();
+    }
+    // And the other half: a real message is UTF-8 by construction, not by convention — the send
+    // path encodes it with TextEncoder. Its first byte is ASCII (< 0x80) or a LEAD byte (>= 0xc2);
+    // it is never a continuation byte, which is the range the guard admits.
+    //
+    // Stated as "always below 0x80" first, which this test proved false: "Ça va?" begins 0xc3. A
+    // message in French, Arabic or Chinese starts at or above 0x80 and is still perfectly safe,
+    // because 0xc2-0xf4 are lead bytes and sit clear of 0xa0-0xb9. The property is "never a
+    // CONTINUATION byte", and getting that wrong in the comment would have invited someone to
+    // widen the guard's range on a false premise.
+    for (const text of ["hello", "Ça va?", "مرحبا", "你好", "1234", " ", "[[WRAP]]"]) {
+      const first = new TextEncoder().encode(text)[0]!;
+      expect(first < 0x80 || first >= 0xc2).toBe(true);
+      expect(first >= 0xa0 && first <= 0xb9).toBe(false);
+    }
+  });
+
+  it("the byte cap clears the largest update the gate will admit", () => {
+    // Sized off the payload rather than picked: refusing a legitimate 1 MiB update would be the
+    // worse failure direction, exactly as with the decoder limit.
+    expect(MAX_DOCUMENT_FRAME_BYTES).toBeGreaterThan(1024 * 1024);
   });
 
   it("STILL admits the real frames, which use a non-minimal 2-byte count", () => {

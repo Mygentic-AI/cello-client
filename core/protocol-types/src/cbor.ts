@@ -53,16 +53,46 @@ import { setSizeLimits } from "cbor-x";
  * followed by an indefinite array is admitted by any header check, including one requiring the real
  * frames' own `b9 000a` prefix. The bound has to be on the decoder.
  *
- * 65,536 is chosen against BOTH failure directions, measured. Above: worst hostile decode drops to
- * 5 ms from 9,600 ms. Below: it must never refuse a legitimate structure, and the largest one CELLO
- * builds is a seal's `leaves` array on a long-running session — 60,000 leaves decodes in 8 ms and is
- * admitted, which is far beyond any real session. Byte strings are NOT counted against these limits,
- * so a 1 MB Yjs update is unaffected (measured: 0 ms).
+ * ── WHY 250,000 AND NOT SOMETHING TIGHTER ─────────────────────────────────────────────────────
  *
- * Process-global to cbor-x, which is the right blast radius: the decode functions are public API of
- * this package, so a limit attached to one caller would leave every other caller unguarded.
+ * The bound is set by the LARGEST LEGITIMATE STRUCTURE, not by the attack. `ae-channel.ts` in
+ * trustless-cello declares `MAX_WIRE_ITEMS = 250_000` as the anti-hostile-peer bound for
+ * directory-to-directory replication, and it decodes BEFORE applying it — so a tighter global cap
+ * here silently supersedes it. A first attempt at 65,536 did exactly that: at 65,537 rows in any
+ * replicated table (`agent_profiles`, `conversation_seals`, `seal_notarizations`, …, none of which
+ * the AE store paginates) replication would have stopped permanently and been reported as a PEER
+ * protocol violation. That is the same shape of failure this repo already ate on 2026-08-01.
+ *
+ * Refusing real data is the worse direction. A slow decode is a nuisance; a directory that cannot
+ * replicate, blaming its peer, is an outage nobody can diagnose from the message.
+ *
+ * The limit is EXCLUSIVE — cbor-x throws "Array length exceeds N" at exactly N, not above it — so a
+ * cap of 250,000 would refuse a frame carrying exactly `MAX_WIRE_ITEMS`, which is the boundary the
+ * AE channel is most likely to sit on because that is its own declared maximum. 262,144 (2^18) is
+ * the next round number clear of it, and the margin is the point rather than the roundness.
+ *
+ * Measured: a legitimate 250,000-element frame decodes in ~30 ms; the three-byte hostile inputs
+ * above are 3–4 ms; byte strings are not counted at all, so a 1 MB Yjs update is unaffected.
+ *
+ * ── WHAT THIS DOES *NOT* CLOSE ────────────────────────────────────────────────────────────────
+ *
+ * A size limit is not a completeness argument, and saying otherwise was the previous version of
+ * this comment. cbor-x pre-allocates `new Array(declaredCount)` BEFORE reading any element, so
+ * NESTED definite-length arrays each sitting just under the cap still allocate: measured, 15 KB of
+ * such input costs ~230 ms and ~2.3 GB before V8's stack depth stops it. The missing invariant is
+ * "a container cannot declare more elements than there are bytes left to fill it", which cbor-x
+ * does not enforce and this cannot express.
+ *
+ * So every caller that hands PEER-CONTROLLED bytes to `decodeCbor` must also bound the INPUT
+ * LENGTH — that is what makes the nesting depth finite. This limit reduces the per-byte
+ * amplification by roughly 43,000×; the input cap is what closes the class.
+ *
+ * Process-global to cbor-x, which is the right blast radius for the part it does cover: the decode
+ * functions are public API of this package, so a limit attached to one caller would leave every
+ * other caller unguarded. `maxObjectSize` is passed for symmetry and is inert — cbor-x 1.6.4
+ * accepts it and never reads it; plain-object key counts are bounded by `maxMapSize`.
  */
-setSizeLimits({ maxArraySize: 65536, maxMapSize: 65536, maxObjectSize: 65536 });
+setSizeLimits({ maxArraySize: 262_144, maxMapSize: 262_144, maxObjectSize: 262_144 });
 
 const ENCODER = new Encoder({ tagUint8Array: false, useRecords: false });
 

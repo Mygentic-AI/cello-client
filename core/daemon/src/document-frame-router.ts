@@ -31,7 +31,10 @@
  *     UTF-8 sequence — they are all continuation bytes (checked against a fatal `TextDecoder`).
  *   - A legitimate message IS UTF-8, by construction rather than by convention: the send path
  *     encodes it with `new TextEncoder().encode(...)` (`session-content-handlers.ts`), and there is
- *     no binary-content path that could produce some other first byte.
+ *     no binary-content path. Its first byte is therefore ASCII (`< 0x80`) or a LEAD byte
+ *     (`0xc2`–`0xf4`) — never a continuation byte. Note it is NOT always `< 0x80`: a message
+ *     beginning in French, Arabic or Chinese starts at `0xc2` or above and is still clear of the
+ *     admitted range. Getting that wrong would invite someone to widen the range on a false premise.
  *
  * So no text an operator types, and no text an attacker persuades them to send, is ever classified
  * as a document frame. (A hostile PEER can put raw non-UTF-8 bytes on the channel and have them
@@ -49,10 +52,19 @@
  * 1.1 GB. Prefixing the real frames' own `b9 000a` does the same. No header-shaped guard can be
  * sound here.
  *
- * The bound belongs on the DECODER, and it is now in `cbor.ts` — see the note there. This guard
- * stays because it is a correct, cheap fast path that keeps every conversation message out of the
- * decoder entirely, and because the UTF-8 argument above depends on it. It must never again be
- * described as what makes hostile input safe.
+ * The decoder limit in `cbor.ts` cuts the per-byte amplification by ~43,000×, and it is still not
+ * the whole answer: cbor-x pre-allocates `new Array(declaredCount)` before reading any element, so
+ * NESTED arrays each under that cap still allocate — measured, 15 KB of them costs ~230 ms and
+ * ~2.3 GB. What makes the nesting depth finite is an INPUT LENGTH CAP, which is why one is applied
+ * here, at the peer-bytes boundary, before anything else looks at the frame.
+ *
+ * So the three layers, in the order they run and with what each is actually for:
+ *   MAX_DOCUMENT_FRAME_BYTES — bounds the nesting depth. The one that closes the class.
+ *   couldBeDocumentFrame     — a cheap fast path; keeps every conversation message out of the
+ *                              decoder, and is what the UTF-8 argument above rests on.
+ *   cbor.ts size limits      — bounds a single container. Reduces amplification; not a boundary.
+ *
+ * The guard must never again be described as what makes hostile input safe. It was, and it was not.
  */
 
 import {
@@ -129,7 +141,21 @@ export class DocumentFrameRouter {
  * ack has 9; the bound is generous so a future field does not silently start routing frames to the
  * transcript, and tight enough that a map header claiming millions of pairs never reaches a decoder.
  */
-const MAX_DOCUMENT_FRAME_FIELDS = 32;
+export const MAX_DOCUMENT_FRAME_FIELDS = 32;
+
+/**
+ * The largest a document frame can legitimately be, and the bound that makes the decode's nesting
+ * depth finite.
+ *
+ * Sized off the payload it has to carry: the gate caps an update at 1 MiB, and everything else in
+ * the envelope — two hashes, an agent id, a state vector, a signature — is small. 2 MiB is
+ * comfortably above any real frame and far below the size at which nested-array pre-allocation
+ * becomes expensive.
+ *
+ * This is the layer that actually closes the pathological-input class. The decoder's per-container
+ * limit reduces amplification; only a bound on the INPUT can bound the depth.
+ */
+export const MAX_DOCUMENT_FRAME_BYTES = 2 * 1024 * 1024;
 
 /**
  * Could these bytes be a document frame at all — cheaply, and without decoding?
@@ -153,6 +179,10 @@ function couldBeDocumentFrame(b: Uint8Array): boolean {
   }
   // Everything else — including 0xbf (indefinite-length map) and 0x9f (indefinite-length ARRAY,
   // the header in both measured pathological inputs) — is not a document frame.
+  //
+  // The upper end of the admitted range must stay at or below 0xbf, or the UTF-8 argument in the
+  // header stops holding: 0x80-0xbf are exactly the continuation bytes, and 0xc0 upward CAN begin a
+  // valid sequence. A test pins that.
   return false;
 }
 
@@ -164,13 +194,17 @@ function couldBeDocumentFrame(b: Uint8Array): boolean {
  * other's frame. A conversation message is arbitrary operator text and will not decode as either.
  */
 function classify(content: Uint8Array): "update" | "ack" | null {
+  // LENGTH FIRST. See the header: this is what bounds the nesting depth, and it is checked before
+  // the frame is looked at in any other way.
+  if (content.length > MAX_DOCUMENT_FRAME_BYTES) return null;
   if (!couldBeDocumentFrame(content)) return null;
   try {
     decodeDocumentUpdateEnvelope(content);
     return "update";
   } catch {
-    // Not an update. Deliberately silent: every conversation message reaches this line, and logging
-    // here would put one line per message into the daemon log for the ordinary case.
+    // Not an update. Deliberately silent — a frame reaching here is one that PASSED the header
+    // guard, so it is not a conversation message (see the UTF-8 argument in the header); it is a
+    // peer's malformed or unrecognised document-shaped frame, and the caller reports the outcome.
   }
   try {
     decodeDocumentAck(content);

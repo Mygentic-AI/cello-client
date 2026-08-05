@@ -325,10 +325,19 @@ describe("cbor decoder — the size limits are ACTIVE, not just declared", () =>
   });
 
   it("still admits the largest structure CELLO legitimately builds", () => {
-    // The bound has to clear a long-running session's seal leaves — refusing one would make a real
-    // seal unverifiable, which is the failure direction that matters more than a slow decode.
-    const leaves = encodeCbor({ leaves: Array.from({ length: 20_000 }, (_, i) => ({ kind: "msg", i })) });
-    expect(() => decodeCbor(leaves)).not.toThrow();
+    // 250,000 is the number the comment claims and the number that matters: trustless-cello's
+    // ae-channel declares MAX_WIRE_ITEMS = 250_000 and decodes BEFORE applying it, so a tighter
+    // limit here silently supersedes it and directory-to-directory replication dies — reported as a
+    // PEER protocol violation. An earlier version of this test pinned 20,000 while the comment
+    // claimed 60,000, so lowering the limit would have kept it green.
+    //
+    // Refusing real data is the worse failure direction: a slow decode is a nuisance, a directory
+    // that cannot replicate and blames its peer is an outage nobody can diagnose from the message.
+    // EXACTLY MAX_WIRE_ITEMS. cbor-x's limit is exclusive — it throws at exactly N — so a cap set
+    // to 250,000 refuses this, which is the boundary the AE channel is most likely to sit on
+    // because it is its own declared maximum.
+    const wire = encodeCbor({ records: Array.from({ length: 250_000 }, (_, i) => i) });
+    expect(() => decodeCbor(wire)).not.toThrow();
     // Byte strings are not counted against the limits, so a 1 MB Yjs update is unaffected.
     expect(() => decodeCbor(encodeCbor({ update: new Uint8Array(1024 * 1024) }))).not.toThrow();
   });
