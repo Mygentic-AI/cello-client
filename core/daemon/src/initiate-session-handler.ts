@@ -32,7 +32,16 @@ export interface InitiateSessionDeps {
   getRelayCircuitAddress?: () => string;
 }
 
-export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void {
+/**
+ * Registers `cello_initiate_session` and returns the agent-scoped opener behind it, so a worker can
+ * open a session without an IPC connection. See `openSessionAs`.
+ */
+export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
+  openSessionAs(
+    agentName: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>>;
+} {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, resolvedSessionNegotiator, transportSelector, autoNatService,
@@ -53,15 +62,23 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void 
   //   5. Drive the transport selector to dial the counterparty using the
   //      assignment's authoritative transport_mode (SI-001). Map the TransportResult
   //      to the MCP response.
-  handlers.set("cello_initiate_session", async (params, connectionId) => {
-    const connState = getConnState(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
-    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
-    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
+  /**
+   * Open a session AS a named agent — the handler body, minus the connection.
+   *
+   * Extracted for M14 / DOD-DOC-DELIVERY-2: §16.4's premise is a daemon that opens a session with no
+   * agent attention on either end, and until now this path existed only as an IPC handler, reachable
+   * only by an agent calling `cello_initiate_session`. A worker had nothing to call.
+   *
+   * The split is exactly at the connection boundary: the handler resolves WHICH agent from the
+   * connection's state, and everything after that is agent-scoped and identical for both callers.
+   * Deliberately one implementation rather than two — session establishment is where the transport
+   * mode, the FROST-signed assignment and the counterparty binding are decided, and a second copy
+   * would drift on precisely those.
+   */
+  async function openSessionAs(
+    agentName: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>> {
     const correlationId = randomUUID();
 
     // AC-004/AC-019: the advertised address is chosen from the standing receiver's
@@ -189,5 +206,19 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void 
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
     return { ok: true, sessionId, transportMode: result.mode, correlationId };
+  }
+
+  handlers.set("cello_initiate_session", async (params, connectionId) => {
+    const connState = getConnState(connectionId);
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    if (!agentName) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    return openSessionAs(agentName, params);
   });
+
+  return { openSessionAs };
 }
