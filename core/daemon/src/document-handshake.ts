@@ -25,17 +25,39 @@
  */
 
 import {
+  buildDocumentProposalTbs,
   decodeDocumentProposal,
+  documentFeatureIncompatibility,
   documentIdFromProposal,
   encodeDocumentProposal,
   seamViolation,
-  DOCUMENT_FEATURE_VERSION,
   type DocumentConsentState,
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
+/**
+ * Verify a proposal's signature against the agent that claims to have made it.
+ *
+ * INJECTED and REQUIRED — this class cannot resolve `proposer_agent_id` to a public key, and a
+ * default implementation would be a default answer to "is this authentic". The composition root
+ * wires the real one.
+ */
+export type ProposalSignatureVerifier = (
+  proposerAgentId: string,
+  tbs: Uint8Array,
+  signature: Uint8Array,
+) => boolean;
+
+/**
+ * NOTE FOR THE NEXT COLUMN. `CREATE TABLE IF NOT EXISTS` is correct only while no daemon has ever
+ * created this table — true today, since it is new in an unreleased milestone. The moment any dev
+ * or staging DB holds it, adding a column here returns silently and that column never appears on
+ * an upgraded database while fresh installs get it. That divergence has already shipped once in
+ * this repo (see `consent-migration.ts`). Any future column needs a `PRAGMA table_info` birth-gated
+ * ALTER under `BEGIN IMMEDIATE`, following that file.
+ */
 const CREATE_PROPOSALS_SQL = `
   CREATE TABLE IF NOT EXISTS document_proposals (
     owner_agent_id  TEXT    NOT NULL,
@@ -75,10 +97,12 @@ export type AcceptOutcome =
 export class DocumentHandshake {
   readonly #db: DaemonDatabase;
   readonly #logger: Logger;
+  readonly #verify: ProposalSignatureVerifier;
 
-  constructor(db: DaemonDatabase, logger: Logger) {
+  constructor(db: DaemonDatabase, logger: Logger, verify: ProposalSignatureVerifier) {
     this.#db = db;
     this.#logger = logger;
+    this.#verify = verify;
     this.#db.exec(CREATE_PROPOSALS_SQL);
   }
 
@@ -97,11 +121,45 @@ export class DocumentHandshake {
     const envelope = decodeDocumentProposal(wire);
     const documentId = documentIdFromProposal(envelope);
 
-    const incompatible =
-      envelope.feature_version === DOCUMENT_FEATURE_VERSION
-        ? null
-        : `document_feature_version_mismatch: the proposal declares document feature version ` +
-          `${envelope.feature_version} and this client speaks ${DOCUMENT_FEATURE_VERSION}`;
+    // AUTHENTICITY FIRST, and it is fatal rather than a recorded refusal. The operator's consent
+    // decision rests entirely on the proposal having come from the agent it names, and an
+    // unverified proposal must not reach the inbox at all — `ON CONFLICT DO NOTHING` means the
+    // FIRST arrival's bytes are the permanent record for a document_id, so anyone who observed the
+    // honest proposal (and therefore knows the nonce) could race a byte-variant carrying junk,
+    // win the primary key, and permanently poison the id while the honest proposal is silently
+    // discarded. The proposer would have to re-propose under a new nonce with no signal why.
+    if (!this.#verify(envelope.proposer_agent_id, buildDocumentProposalTbs(envelope), envelope.signature)) {
+      this.#logger.error("document.proposal.signature_invalid", {
+        documentId,
+        proposerAgentId: envelope.proposer_agent_id,
+      });
+      throw new Error(
+        `document_proposal_signature_invalid: the proposal claims to come from ` +
+          `${envelope.proposer_agent_id} but its signature does not verify against that agent`,
+      );
+    }
+
+    // ADDRESSED TO US. `ownerAgentId` comes from the caller and `peer_agent_id` comes from the
+    // wire, and on a multi-agent daemon — which is why owner_agent_id is in the key at all — an
+    // unchecked pair lets a proposal addressed to agent Z be recorded under agent Y and accepted
+    // BY agent Y. Consent would then be taken from a party the proposal never named, while the
+    // document_id (which does commit to peer_agent_id) says otherwise, with no error anywhere.
+    if (envelope.peer_agent_id !== ownerAgentId) {
+      this.#logger.warn("document.proposal.wrong_peer", {
+        documentId,
+        addressedTo: envelope.peer_agent_id,
+        recordedFor: ownerAgentId,
+      });
+      throw new Error(
+        `document_proposal_wrong_peer: this proposal is addressed to ${envelope.peer_agent_id}, ` +
+          `not to ${ownerAgentId} — consent belongs to the agent the proposer named`,
+      );
+    }
+
+    // The HUMAN answer, not a machine label. The clause exists because the alternative to a
+    // sentence is a proposal that is never answered, which surfaces as a hang and gets diagnosed
+    // as a network fault — and because "upgrade" is useless without saying WHOSE client.
+    const incompatible = documentFeatureIncompatibility(envelope.feature_version);
     const reason = incompatible ?? seamViolation(envelope.properties);
 
     this.#db
@@ -124,15 +182,28 @@ export class DocumentHandshake {
         reason ? nowMs : null,
       );
 
-    if (reason) {
-      this.#logger.warn("document.proposal.refused", { documentId, reason, autoRefused: true });
-      return { documentId, state: "refused", reason };
+    // READ BACK THE ROW, do not report what we intended. On a redelivery the INSERT does nothing —
+    // correct — and returning the state we would have written announces a decision the operator
+    // already made as still awaiting one, and logs an arrival that did not happen.
+    const stored = this.get(ownerAgentId, documentId);
+    const state = stored?.consentState ?? (reason ? "refused" : "pending");
+    const storedReason = stored?.refusalReason ?? reason ?? undefined;
+
+    if (state === "refused") {
+      this.#logger.warn("document.proposal.refused", {
+        documentId,
+        reason: storedReason,
+        autoRefused: true,
+      });
+      return { documentId, state, reason: storedReason };
     }
-    this.#logger.info("document.proposal.pending", {
-      documentId,
-      proposerAgentId: envelope.proposer_agent_id,
-    });
-    return { documentId, state: "pending" };
+    if (state === "pending") {
+      this.#logger.info("document.proposal.pending", {
+        documentId,
+        proposerAgentId: envelope.proposer_agent_id,
+      });
+    }
+    return { documentId, state, ...(storedReason ? { reason: storedReason } : {}) };
   }
 
   /** Proposals still awaiting a decision — the operator's inbox for documents. */
@@ -166,6 +237,25 @@ export class DocumentHandshake {
     // Re-checked at the transition, not merely at arrival — the proposer runs a different build.
     const violation = seamViolation(record.envelope.properties);
     if (violation) {
+      // TRANSITION, do not just refuse the call. Leaving the row pending gives the operator an
+      // inbox entry they can never clear, carrying no reason — while the arrival path records one
+      // for the identical condition. Two behaviours for one fact, and the one that persists is the
+      // one with no explanation attached.
+      if (record.consentState === "pending") {
+        this.#db
+          .prepare(
+            `UPDATE document_proposals SET consent_state = 'refused', refusal_reason = ?,
+                    decided_at = ?
+              WHERE owner_agent_id = ? AND document_id = ? AND consent_state = 'pending'`,
+          )
+          .run(violation, nowMs, ownerAgentId, documentId);
+        this.#logger.warn("document.proposal.refused", {
+          documentId,
+          reason: violation,
+          autoRefused: true,
+          at: "accept",
+        });
+      }
       return { ok: false, reason: "document_seam_violation", detail: violation };
     }
 

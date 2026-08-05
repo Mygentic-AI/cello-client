@@ -85,6 +85,11 @@ export interface DocumentEnvelopeRow {
   createdAtMs: number;
   /** Position in this document's log. Assigned on append; absent until then. */
   logIndex?: number;
+  /** DELIVERY-1 bookkeeping, read back from the log. Absent on a row being appended. */
+  deliveredAtMs?: number | null;
+  ackedAtMs?: number | null;
+  attempts?: number;
+  nextAttemptAtMs?: number | null;
 }
 
 export interface QuarantineRow {
@@ -179,6 +184,17 @@ const CREATE_ENVELOPES_SQL = `
     references_hash TEXT,
     created_at      INTEGER NOT NULL,
     log_index       INTEGER NOT NULL,
+    -- DELIVERY-1. Pending outbound is DERIVED from these columns rather than held in a queue:
+    -- a queue in memory does not survive a restart, and a queue in its own table is a second
+    -- source of truth that can disagree with the log about what was sent. "Unacknowledged
+    -- envelopes I authored" is the whole definition, and it is a WHERE clause.
+    delivered_at    INTEGER,
+    acked_at        INTEGER,
+    -- How many times delivery has been attempted, and when the next attempt is due. On the row,
+    -- because a backoff that resets on restart is not a backoff — a daemon restarting in a
+    -- reconnect loop would hammer an unreachable peer at full rate forever.
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER,
     PRIMARY KEY (owner_agent_id, document_id, envelope_hash),
     -- A duplicate index would make ORDER BY log_index non-deterministic, and this log's entire
     -- value is deterministic replay. Two daemons on one DB file (the orphan-process case this
@@ -650,6 +666,66 @@ export class DocumentStore {
     return r?.envelope_hash ?? null;
   }
 
+  // ─── delivery (DELIVERY-1) ────────────────────────────────────────────────
+
+  /**
+   * Envelopes this agent authored that the peer has not acknowledged, and whose next attempt is
+   * due. DERIVED — there is no queue. Survives a restart because the log does.
+   *
+   * Scoped to `senderAgentId = ownerAgentId`: an envelope we RECEIVED is not ours to deliver, and
+   * without the scope a receiver would helpfully re-send the sender's own updates back at it.
+   */
+  pendingDeliveries(ownerAgentId: string, nowMs: number, limit = 100): DocumentEnvelopeRow[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM document_envelopes
+          WHERE owner_agent_id = ? AND sender_agent_id = ? AND acked_at IS NULL
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY log_index ASC LIMIT ?`,
+      )
+      .all(ownerAgentId, ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
+    return rows.map(toEnvelopeRow);
+  }
+
+  /** Mark an attempt: bumps the counter and schedules the next one. Returns the new count. */
+  recordDeliveryAttempt(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nextAttemptAtMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_envelopes
+            SET attempts = attempts + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash);
+    const r = this.#db
+      .prepare(
+        `SELECT attempts FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash) as { attempts?: number } | undefined;
+    return r?.attempts ?? 0;
+  }
+
+  /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
+  markAcked(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nowMs: number,
+  ): boolean {
+    const info = this.#db
+      .prepare(
+        `UPDATE document_envelopes SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND acked_at IS NULL`,
+      )
+      .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash);
+    return Number(info.changes) > 0;
+  }
+
   /** Record a rejection the PEER sent us. Returns whether a row was written (idempotent by leaf). */
   recordRejectionReceived(
     ownerAgentId: string,
@@ -838,6 +914,10 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
     logIndex: r["log_index"] as number,
+    deliveredAtMs: (r["delivered_at"] as number | null) ?? null,
+    ackedAtMs: (r["acked_at"] as number | null) ?? null,
+    attempts: (r["attempts"] as number | null) ?? 0,
+    nextAttemptAtMs: (r["next_attempt_at"] as number | null) ?? null,
   };
 }
 

@@ -61,10 +61,13 @@ function proposal(over: Partial<DocumentProposalEnvelope> = {}): DocumentProposa
   };
 }
 
-function newFixture() {
+/** Verifies everything — the signature seam is exercised on its own in its own block. */
+const ALWAYS_VALID = () => true;
+
+function newFixture(verify = ALWAYS_VALID) {
   const { logger, events } = recordingLogger();
   const db = new DatabaseSync(":memory:");
-  return { handshake: new DocumentHandshake(db, logger), events, db, logger };
+  return { handshake: new DocumentHandshake(db, logger, verify), events, db, logger };
 }
 
 describe("DocumentHandshake — a proposal becomes a pending item", () => {
@@ -84,9 +87,12 @@ describe("DocumentHandshake — a proposal becomes a pending item", () => {
     const { handshake } = newFixture();
     const env = proposal();
     const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(env), NOW);
-    // The stored bytes are re-decoded on read. If that round trip were lossy the id would drift
-    // from the one both parties agreed on, and the two sides would be on different documents.
-    expect(documentIdFromProposal(handshake.get(OWNER, documentId)!.envelope)).toBe(documentId);
+    // Compared against the ORIGINAL in-memory envelope, not against another decode of the same
+    // bytes: a decode that dropped a field CONSISTENTLY would make both sides equally lossy and
+    // the assertion would hold while the id drifted from what the peer computed.
+    expect(documentIdFromProposal(handshake.get(OWNER, documentId)!.envelope)).toBe(
+      documentIdFromProposal(env),
+    );
   });
 
   it("a redelivered proposal does not reset a decision already made", () => {
@@ -96,10 +102,14 @@ describe("DocumentHandshake — a proposal becomes a pending item", () => {
     const { documentId } = handshake.recordProposal(OWNER, wire, NOW);
     handshake.refuse(OWNER, documentId, "not now", NOW);
 
-    handshake.recordProposal(OWNER, wire, NOW + 1);
+    const redelivered = handshake.recordProposal(OWNER, wire, NOW + 1);
     // Re-arrival is normal — delivery retries. Resetting to pending would let a peer un-refuse a
     // proposal the operator declined, simply by sending it again.
     expect(handshake.get(OWNER, documentId)!.consentState).toBe("refused");
+    // And the RETURN must match the row. Reporting "pending" for a decision already made surfaces
+    // it to the operator as still awaiting them, and logs an arrival that did not happen.
+    expect(redelivered.state).toBe("refused");
+    expect(redelivered.reason).toBe("not now");
   });
 });
 
@@ -139,7 +149,8 @@ describe("DocumentHandshake — the seam is refused at PROPOSAL and again at ACC
     const res = handshake.accept(OWNER, documentId, NOW);
     expect(res.ok).toBe(false);
     expect((res as { detail: string }).detail).toMatch(/document_seam_topology/);
-    expect(handshake.get(OWNER, documentId)!.consentState).toBe("pending");
+    // And the row is DECIDED, not left pending — see the dedicated block below for why.
+    expect(handshake.get(OWNER, documentId)!.consentState).toBe("refused");
   });
 
   it("auto-refuses a feature-version mismatch, naming both versions", () => {
@@ -150,7 +161,10 @@ describe("DocumentHandshake — the seam is refused at PROPOSAL and again at ACC
       NOW,
     );
     expect(res.state).toBe("refused");
-    expect(res.reason).toMatch(/document_feature_version_mismatch/);
+    // The clause asks for a HUMAN answer, and the useful part is which side must upgrade. A
+    // machine label like "version_mismatch: 2 vs 1" is accurate and tells the operator nothing
+    // they can act on.
+    expect(res.reason).toContain("upgrade this client");
     expect(res.reason).toContain(String(DOCUMENT_FEATURE_VERSION + 1));
   });
 });
@@ -227,11 +241,13 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
     const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(env), NOW);
     handshake.accept(OWNER, documentId, NOW);
 
-    // A property change is an epoch event and therefore V2. The absence of a setter is the
-    // enforcement — mutating after acceptance would silently change the rules the other party
-    // agreed to, which is the one thing the handshake exists to prevent.
-    expect("setProperties" in handshake).toBe(false);
-    expect("updateProperties" in handshake).toBe(false);
+    // An ALLOWLIST over the prototype, not a denylist of two guessed names — the method nobody
+    // thought of is exactly the one a denylist misses. A new public method fails this test until
+    // someone justifies it, which is the point: a property change is an epoch event and therefore
+    // V2, and mutating after acceptance would silently change the rules the other party agreed to.
+    expect(Object.getOwnPropertyNames(DocumentHandshake.prototype).sort()).toEqual(
+      ["accept", "constructor", "get", "pending", "recordProposal", "refuse"].sort(),
+    );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });
 
@@ -252,5 +268,103 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
     // document — the id moves. That is the property doing the enforcement.
     expect(second).not.toBe(first);
     expect(handshake.pending(OWNER)).toHaveLength(2);
+  });
+});
+
+
+describe("DocumentHandshake — acceptance is CONCURRENCY-safe, not merely sequential", () => {
+  it("a decision landing BETWEEN the read and the write does not get overwritten", () => {
+    const { handshake, db } = newFixture();
+    const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(proposal()), NOW);
+
+    // The real interleaving. A sequential "call accept twice" test cannot tell compare-and-set
+    // from read-then-write — both return an error on the second call. This one can: it refuses the
+    // proposal from OUTSIDE, after accept() has read the row and before it writes. Read-then-write
+    // accepts a proposal the operator declined, which is the one outcome consent exists to prevent.
+    let fired = false;
+    const realPrepare = db.prepare.bind(db);
+    (db as unknown as { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (!fired && sql.includes("SELECT * FROM document_proposals")) {
+        const all = stmt.all.bind(stmt);
+        return new Proxy(stmt, {
+          get: (t, k) =>
+            k === "all"
+              ? (...args: unknown[]) => {
+                  const rows = all(...(args as never[]));
+                  if (!fired) {
+                    fired = true;
+                    handshake.refuse(OWNER, documentId, "declined while you were reading", NOW);
+                  }
+                  return rows;
+                }
+              : Reflect.get(t, k, t),
+        });
+      }
+      return stmt;
+    }) as typeof db.prepare;
+
+    const res = handshake.accept(OWNER, documentId, NOW);
+    expect(res.ok).toBe(false);
+    expect(handshake.get(OWNER, documentId)!.consentState).toBe("refused");
+  });
+});
+
+describe("DocumentHandshake — an unverified proposal never reaches the inbox", () => {
+  it("REFUSES a proposal whose signature does not verify, and stores nothing", () => {
+    const { handshake } = newFixture(() => false);
+    expect(() =>
+      handshake.recordProposal(OWNER, encodeDocumentProposal(proposal()), NOW),
+    ).toThrow(/document_proposal_signature_invalid/);
+    // Nothing stored: ON CONFLICT DO NOTHING makes the FIRST arrival's bytes permanent for a
+    // document_id, so admitting an unverified one lets anyone who observed the honest proposal
+    // race a junk variant, win the key, and poison the id while the real proposal is discarded.
+    expect(handshake.pending(OWNER)).toHaveLength(0);
+  });
+
+  it("verifies against the PROPOSER and over the proposal's own preimage", () => {
+    const seen: Array<{ agent: string; sigByte: number }> = [];
+    const { handshake } = newFixture((agent, _tbs, sig) => {
+      seen.push({ agent, sigByte: sig[0]! });
+      return true;
+    });
+    handshake.recordProposal(OWNER, encodeDocumentProposal(proposal()), NOW);
+    expect(seen[0]!.agent).toBe("agent-a");
+    expect(seen[0]!.sigByte).toBe(5);
+  });
+});
+
+describe("DocumentHandshake — a proposal must be ADDRESSED to the accepting agent", () => {
+  it("refuses to record a proposal naming a different peer", () => {
+    const { handshake } = newFixture();
+    expect(() =>
+      handshake.recordProposal(
+        OWNER,
+        encodeDocumentProposal(proposal({ peer_agent_id: "someone-else" })),
+        NOW,
+      ),
+    ).toThrow(/document_proposal_wrong_peer/);
+    // On a multi-agent daemon an unchecked pair lets consent be taken from a party the proposal
+    // never named, while document_id — which does commit to peer_agent_id — says otherwise.
+    expect(handshake.pending(OWNER)).toHaveLength(0);
+  });
+});
+
+describe("DocumentHandshake — a seam violation at ACCEPT is recorded, not just returned", () => {
+  it("transitions the row to refused so the operator can clear it", () => {
+    const { handshake, db } = newFixture();
+    const env = proposal({ properties: props({ topology: "mesh" }) });
+    const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(env), NOW);
+    db.prepare("UPDATE document_proposals SET consent_state = 'pending' WHERE document_id = ?").run(
+      documentId,
+    );
+
+    handshake.accept(OWNER, documentId, NOW);
+    const row = handshake.get(OWNER, documentId)!;
+    // Left pending, this is an inbox entry the operator can never clear, carrying no reason —
+    // while the arrival path records one for the identical condition.
+    expect(row.consentState).toBe("refused");
+    expect(row.refusalReason).toMatch(/document_seam_topology/);
+    expect(handshake.pending(OWNER)).toHaveLength(0);
   });
 });
