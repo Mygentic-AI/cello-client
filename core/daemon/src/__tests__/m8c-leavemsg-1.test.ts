@@ -340,6 +340,93 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(denied).toMatchObject({ error: "fault_injection_disabled" });
   });
 
+  it("M12-P13: a durably-queued send reports `durable` as a FIELD — the caller must not have to read prose to know", async () => {
+    // M12-P12 shipped the durable/lost distinction in the `guidance` SENTENCE only. Every caller
+    // that has to act on it — append the leaf or not — would have to substring-match English to
+    // find out, so in practice no caller acted on it at all. This is the machine-readable half.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const content = new TextEncoder().encode("queued, not lost");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable", durable: true });
+  });
+
+  it("M12-P13: an UNCONFIGURED park reports durable:false — the two failures must never read alike", async () => {
+    // The whole point of the field is that it separates "we are retrying this" from "it is gone".
+    // A `durable: true` constant would satisfy the test above and lose messages here.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
+
+    const content = new TextEncoder().encode("nowhere to go");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: false, durable: false });
+  });
+
+  it("M12-P13: a durably-queued cello_send COMMITS ITS LEAF — the relay already witnessed the sequence, so an unappended tree stalls the receiver forever", async () => {
+    // Found live 2026-08-05 (M12 Entry 89, sessions 4c28edcd / dcd0aadc). `nextExpected` is
+    // literally `getSessionTree(...).size()` (session-node-manager.ts:4178). The relay witnesses the
+    // content hash BEFORE direct delivery is attempted, so the sequence is committed whether or not
+    // the send succeeds. Skipping the append on a failed-but-queued send leaves this side's tree one
+    // short of the sequence the counterparty will receive at, and every later message is held behind
+    // the gap — permanently, silently, and unsealably (both live sessions ended in force-abandon).
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const client = await connectAs("alice");
+    const res = await client.send("cello_send", { session_id: SID, content: "queued but committed" }) as Record<string, unknown>;
+
+    // Still an honest failure — the message is NOT delivered and NOT parked. What changes is that
+    // the sequence it already occupies is recorded locally instead of being left as a hole.
+    expect(res.ok).toBe(false);
+    expect(res.queued).toBe(true);
+    expect(typeof res.sequence_number).toBe("number");
+    expect(snm.getSessionTree("alice", SID).size(), "the committed sequence must exist locally, or nextExpected stalls").toBe(1);
+    // And the operator must be able to read back what they sent, exactly as for a parked message.
+    const { messages } = snm.readTranscript("alice", SID);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].direction).toBe("sent");
+  });
+
+  it("M12-P13: a LOST cello_send appends NOTHING — a leaf for content no one will ever receive is a permanent root mismatch", async () => {
+    // The mirror image, and the reason the fix keys on `durable` rather than on "the send failed".
+    // Appending unconditionally would trade a stalled receiver for two trees that can never seal.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay, no park
+
+    const client = await connectAs("alice");
+    const res = await client.send("cello_send", { session_id: SID, content: "this one is gone" }) as Record<string, unknown>;
+    expect(res.ok).toBe(false);
+    expect(res.queued).toBeUndefined();
+    expect(snm.getSessionTree("alice", SID).size()).toBe(0);
+  });
+
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));

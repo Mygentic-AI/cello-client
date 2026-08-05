@@ -839,4 +839,91 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(30);
     expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "message")).toBeDefined();
   });
+
+  // M12-P13 — found live 2026-08-05 on the EC2 receiver (M12 Entry 89):
+  //   session.relay.leaf.delivered  sequenceNumber=1
+  //   session.away.response.failed  reason=session_stream_unavailable
+  // and then nothing, forever. The away reply owns the sequence the relay already witnessed for it;
+  // when its send failed the leaf was never appended, so this side's tree stayed at size 0 while the
+  // counterparty's content arrived claiming canonicalSeq 1. `nextExpected` IS the tree size, so
+  // every later message was held behind a gap that nothing could ever fill. The receiver stranded
+  // its own session — and the operator was told nothing at all.
+  //
+  // `sendContent` is stubbed here rather than driven through a real relay: this pins the AWAY path's
+  // own decision (commit the leaf when the content is durably queued), and that the `durable` flag
+  // it keys on is truthfully produced is pinned separately, against the real queue, in
+  // m8c-leavemsg-1.test.ts. Stubbing what is already proven elsewhere beats not testing this at all.
+  it("M12-P13: an away reply whose send is DURABLY QUEUED still commits its leaf — otherwise the receiver stalls at its own sequence forever", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    snm.sendContent = async () => ({
+      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
+    });
+
+    const hi = new TextEncoder().encode("hi");
+    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1");
+    await wait(30);
+
+    // The inbound message is leaf 0; the away reply owns leaf 1 whether or not its send landed.
+    expect(snm.getSessionTree("alice", SID_HEX).size(), "the away reply's witnessed sequence must exist locally").toBe(2);
+    const sent = snm.readTranscript("alice", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent).toHaveLength(1);
+    // Deferred is not failed, and it must be visible as its own event — a queued reply that reads
+    // as `failed` sends the next investigation looking for a message that is not actually lost.
+    expect(events.find((e) => e.event === "session.away.response.deferred")).toBeDefined();
+  });
+
+  it("M12-P13: a durably-queued away reply is NOT re-sent on the next arrival — the queued one already owns that sequence", async () => {
+    // The pre-existing retry-on-failure behaviour (test above) is correct for a LOST reply and wrong
+    // for a queued one: retrying mints a second away message at a second sequence, and the recipient
+    // gets the same greeting twice with a hole where the first one was.
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    snm.sendContent = async () => ({
+      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
+    });
+
+    const a = new TextEncoder().encode("hi");
+    await snm.ingestReceivedContent("alice", SID_HEX, a, msgLeafHash(a), "c1");
+    await wait(30);
+    const b = new TextEncoder().encode("hi again");
+    await snm.ingestReceivedContent("alice", SID_HEX, b, msgLeafHash(b), "c2");
+    await wait(30);
+
+    const sent = snm.readTranscript("alice", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent, "one away period, one away reply").toHaveLength(1);
+  });
+
+  it("M12-P13: a LOST away reply appends nothing and says so at ERROR — silence is what made this cost two sessions", async () => {
+    // The mirror of the durable case. A leaf here would commit a sequence the counterparty will
+    // never receive content for, which is a permanent root mismatch — the sessions become
+    // unsealable and the only exit is a force-abandon with no notarized receipt.
+    const { logger, events } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    snm.sendContent = async () => ({
+      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: false,
+    });
+
+    const hi = new TextEncoder().encode("hi");
+    await snm.ingestReceivedContent("alice", SID_HEX, hi, msgLeafHash(hi), "c1");
+    await wait(30);
+
+    expect(snm.getSessionTree("alice", SID_HEX).size(), "no leaf for content that is gone").toBe(1);
+    const failed = events.find((e) => e.event === "session.away.response.failed");
+    expect(failed).toBeDefined();
+    expect(failed!.level, "a lost message is an error, not a warning").toBe("error");
+    expect(String(failed!.context.impact)).toContain("lost");
+  });
 });

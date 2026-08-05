@@ -3398,10 +3398,13 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; guidance?: string }> {
+  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; guidance?: string }> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
-      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
+      // M12-P13: no node, so nothing was witnessed and nothing was queued — the caller must NOT
+      // commit a leaf for this. `durable` is a required field precisely so a new failure branch
+      // cannot be added without answering the question every caller now asks.
+      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session", durable: false };
     }
     // R1 (MSG-001-3b): witness the message-leaf HASH to the relay FIRST, INDEPENDENT of
     // direct delivery. The relay is the ordering authority (Structure 2): it assigns the
@@ -3552,6 +3555,11 @@ export class SessionNodeManager {
         ok: false,
         reason: "session_stream_unavailable",
         error: errMsg,
+        // M12-P13: the machine-readable half of the distinction below. M12-P12 shipped it in the
+        // guidance SENTENCE only, so the callers that have to ACT on it — commit the leaf for a
+        // queued message, never for a lost one — would have had to substring-match English. None
+        // did, and the sequence the relay had already witnessed was left as a permanent hole.
+        durable,
         guidance: durable
           ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. No action needed."
           : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",

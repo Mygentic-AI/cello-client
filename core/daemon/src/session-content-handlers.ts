@@ -408,8 +408,31 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         recipientPubkey,
         reason: sendResult.reason,
         errorMessage: sendResult.error,
+        durable: sendResult.durable,
         correlationId,
       });
+      // M12-P13: a DURABLY QUEUED message still owns the sequence the relay witnessed for it before
+      // direct delivery was ever attempted — the same reasoning that makes a parked message occupy
+      // its leaf position below. Leaving the hole here is what stalls the far side: `nextExpected`
+      // is this tree's size, so the counterparty's next message arrives at a sequence this tree can
+      // never reach and is held behind the gap forever (found live 2026-08-05, M12 Entry 89).
+      // A LOST message gets no leaf — that would commit a sequence no content will ever fill, and
+      // the two roots could then never seal.
+      if (sendResult.durable) {
+        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
+        sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
+        advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
+        logger.info("session.content.queued.committed", {
+          sessionId, sequenceNumber: queuedLeaf, contentHash: contentHashHex, correlationId,
+        });
+        return {
+          ok: false,
+          reason: sendResult.reason,
+          queued: true,
+          sequence_number: queuedLeaf,
+          guidance: sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.",
+        };
+      }
       return {
         ok: false,
         reason: sendResult.reason,

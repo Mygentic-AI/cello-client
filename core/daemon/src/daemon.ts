@@ -1169,14 +1169,36 @@ async function startDaemonHoldingLock(
         : draftBytes;
       const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
-      if (!sendResult.ok) {
+      if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
         // away period — clear the guard so the next inbound arrival retries the ack.
         awayAckSent.delete(dedupKey);
-        logger.warn("session.away.response.failed", { agentName, sessionId, kind, reason: sendResult.reason });
+        // M12-P13: this branch now means the reply is GONE, not merely late (the queued case is
+        // handled below), so it is an error and it says what the consequence is. It was a bare warn
+        // when it fired live on 2026-08-05 and read as routine churn.
+        logger.error("session.away.response.failed", {
+          agentName, sessionId, kind, reason: sendResult.reason,
+          impact: "the away reply is lost and was NOT queued — the counterparty gets no acknowledgement",
+        });
         return;
       }
       const contentHashHex = Buffer.from(contentHash).toString("hex");
+      if (!sendResult.ok) {
+        // M12-P13 (found live 2026-08-05, M12 Entry 89): the reply is durably queued and already
+        // owns the sequence the relay witnessed for it, so its leaf MUST be committed here. Without
+        // it this side's tree stays one short of that sequence, and since `nextExpected` is the tree
+        // size, every message the counterparty sends afterwards is held behind a gap nothing can
+        // fill. That is exactly how the receiver stranded its own session at sequence 0.
+        //
+        // The dedup guard deliberately STAYS SET: a queued reply is coming, and re-sending on the
+        // next arrival would mint a second greeting at a second sequence.
+        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
+        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, queuedLeaf, "sent", contentBytes, randomUUID());
+        logger.info("session.away.response.deferred", {
+          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf, reason: sendResult.reason,
+        });
+        return;
+      }
       const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
       sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
       logger.info("session.away.response.sent", { agentName, sessionId, kind, isKnown, sequenceNumber: leafIndex });
