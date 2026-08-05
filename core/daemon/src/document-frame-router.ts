@@ -25,11 +25,17 @@
  * operator.
  *
  * A CONVERSATION MESSAGE CANNOT REACH A DECODER AT ALL, and the reason is structural rather than
- * statistical. `content` on this path is decrypted plaintext, and `couldBeDocumentFrame` requires
- * byte 0 in `0xa0`–`0xb9` — every one of which is a UTF-8 CONTINUATION byte, which can never begin a
- * valid UTF-8 sequence. So no text an operator types, and no text an attacker chooses, is ever
- * classified as a document frame. (A hostile PEER can put raw non-UTF-8 bytes on the channel and
- * have them classified as document traffic — but that only suppresses their own message.)
+ * statistical. Both halves verified here, not assumed:
+ *
+ *   - `couldBeDocumentFrame` requires byte 0 in `0xa0`–`0xb9`, and NONE of those can begin a valid
+ *     UTF-8 sequence — they are all continuation bytes (checked against a fatal `TextDecoder`).
+ *   - A legitimate message IS UTF-8, by construction rather than by convention: the send path
+ *     encodes it with `new TextEncoder().encode(...)` (`session-content-handlers.ts`), and there is
+ *     no binary-content path that could produce some other first byte.
+ *
+ * So no text an operator types, and no text an attacker persuades them to send, is ever classified
+ * as a document frame. (A hostile PEER can put raw non-UTF-8 bytes on the channel and have them
+ * classified as document traffic — but that only suppresses their own message.)
  *
  * ── THE HEADER GUARD IS A FAST PATH, NOT THE SECURITY BOUNDARY ────────────────────────────────
  *
