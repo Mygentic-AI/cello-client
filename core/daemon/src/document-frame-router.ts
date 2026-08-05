@@ -185,7 +185,26 @@ export class DocumentFrameRouter {
     correlationId: string,
   ): FrameClassification {
     const kind = classify(content);
-    if (kind === null) return { consumed: false };
+    if (kind === null) {
+      // ANOMALY, worth a line. A frame that passed the header guard and then decoded as NOTHING is
+      // not an ordinary conversation message — the guard's whole argument is that operator text
+      // cannot begin with a CBOR map header (see the UTF-8 reasoning above). So this is either a
+      // peer running a frame type this build does not know, or our own encoder and decoder
+      // disagreeing, and both are invisible today: the frame silently becomes a transcript entry.
+      //
+      // This was the missing diagnostic when a live proposal reached its peer, passed the content
+      // hash cross-check byte for byte, and never reached the document layer — every log on the
+      // receiving side said "an ordinary message arrived", because that is what the fall-through
+      // makes it.
+      if (content.length <= MAX_DOCUMENT_FRAME_BYTES && couldBeDocumentFrame(content)) {
+        this.#d.logger.warn("document.frame.undecodable", {
+          bytes: content.length,
+          header: content[0],
+          correlationId,
+        });
+      }
+      return { consumed: false };
+    }
     // Resolved AFTER classification and BEFORE handling: a frame that is not document traffic never
     // pays for the lookup, and one that is never reaches the store under the wrong scope.
     const ownerAgentId = this.#d.ownerKeyFor(agentName);

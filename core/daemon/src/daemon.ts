@@ -3451,7 +3451,16 @@ async function startDaemonHoldingLock(
    * minute later is working correctly, while a tight loop over every attended agent is a cost paid
    * forever for a case that is rare.
    */
-  const DOCUMENT_DELIVERY_TICK_MS = 60_000;
+  //
+  // Overridable for tests, the way `CELLO_SEAL_BILATERAL_TIMEOUT_MS` already is. The live enforcers
+  // spend their wall clock waiting for this tick — two of them is four minutes — and a test that
+  // must sit out a production-paced timer either runs slowly or is written with a window so tight
+  // that adding a second test to the file makes the first one fail. Both happened.
+  //
+  // Floored, so a misread env cannot turn the sweep into a busy loop against the directory.
+  const tickOverride = Number(process.env["CELLO_DOCUMENT_DELIVERY_TICK_MS"]);
+  const DOCUMENT_DELIVERY_TICK_MS =
+    Number.isFinite(tickOverride) && tickOverride >= 250 ? tickOverride : 60_000;
   let documentDeliveryRunning = false;
   let documentDeliveryStopping = false;
   let documentDeliveryInFlight: Promise<void> | null = null;
