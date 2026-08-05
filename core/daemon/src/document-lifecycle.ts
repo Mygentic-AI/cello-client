@@ -25,7 +25,6 @@
  * going nowhere, with their work piling up locally and no sign anything is wrong.
  */
 
-import { createHash } from "node:crypto";
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
@@ -46,6 +45,32 @@ const CREATE_LIFECYCLE_SQL = `
     closed_by      TEXT    NOT NULL,
     created_at     INTEGER NOT NULL,
     PRIMARY KEY (owner_agent_id, document_id, closed_by)
+  );
+
+  -- WITHDRAWALS live here, NOT in document_envelopes, and that placement is the fix for three
+  -- separate defects rather than a filing preference.
+  --
+  -- 1. CHAIN. A withdrawal is local-only by design: it is never delivered (the update it concerns
+  --    was never delivered, so the peer has nothing to act on). As an envelope it still advanced
+  --    our per-sender chain, so our NEXT update chained onto a node the peer will never hold and
+  --    the peer refused it with document_chain_broken — sending an operator to the chain layer for
+  --    a withdrawal-scoping bug, and leaving the document unopenable after their next restart.
+  --    Chaining it to the last DELIVERABLE envelope instead would fork our chain, since the next
+  --    update claims the same predecessor. It cannot be a node in that chain at all.
+  -- 2. CRYPTO. As an envelope it needed a signature and a state vector, and it had neither of its
+  --    own — the first version copied the ORIGINAL's, putting a real Ed25519 signature made over a
+  --    different record onto a permanent append-only row. document-rejection.ts states the rule
+  --    this violated in writing: required, never fabricated.
+  -- 3. REPLAY. An envelope row is something rebuildSnapshot must reason about; an audit row is not.
+  --
+  -- Same shape as document_quarantine, for the same reason: audit that must survive, must not be
+  -- replayed, and must not be chained.
+  CREATE TABLE IF NOT EXISTS document_withdrawals (
+    owner_agent_id TEXT    NOT NULL,
+    document_id    TEXT    NOT NULL,
+    envelope_hash  TEXT    NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (owner_agent_id, document_id, envelope_hash)
   );
 
   CREATE TABLE IF NOT EXISTS agent_platform_pause (
@@ -74,11 +99,28 @@ export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
   readonly #notifier: LifecycleNotifier;
+  readonly #rollback: (
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+  ) => { ok: true } | { ok: false; reason: string };
 
-  constructor(store: DocumentStore, logger: Logger, notifier: LifecycleNotifier) {
+  constructor(
+    store: DocumentStore,
+    logger: Logger,
+    notifier: LifecycleNotifier,
+    /**
+     * Undo one envelope's operations on the LIVE document, as inverses. Injected because the live
+     * `Y.Doc` and its UndoManager belong to the engine, not here — and REQUIRED, because a default
+     * that quietly did nothing would restore exactly the defect this argument exists to fix.
+     */
+    rollback: (ownerAgentId: string, documentId: string, envelopeHash: string) =>
+      { ok: true } | { ok: false; reason: string },
+  ) {
     this.#store = store;
     this.#logger = logger;
     this.#notifier = notifier;
+    this.#rollback = rollback;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
@@ -123,10 +165,44 @@ export class DocumentLifecycle {
   }
 
   /** The peer's half, arriving over the session. */
-  recordPeerClose(ownerAgentId: string, documentId: string, peerAgentId: string, nowMs: number): void {
-    this.#recordClose(ownerAgentId, documentId, peerAgentId, nowMs);
-    this.#settleClose(ownerAgentId, documentId, peerAgentId);
-    this.#logger.info("document.close.peer_requested", { documentId, peerAgentId });
+  recordPeerClose(
+    ownerAgentId: string,
+    documentId: string,
+    peerAgentId: string,
+    nowMs: number,
+  ): Verdict {
+    const doc = this.#store.getDocument(ownerAgentId, documentId);
+    if (!doc) {
+      // Without this the row is written for a document that does not exist — there is no foreign
+      // key on this table — and `setDocumentStatus` updates zero rows and returns silently.
+      return {
+        ok: false,
+        reason: "document_unknown",
+        detail: `no document ${documentId.slice(0, 16)}… for this agent`,
+      };
+    }
+    if (peerAgentId !== doc.peerAgentId) {
+      // THE BILATERAL GUARANTEE. The closer id came from the caller and was written as `closed_by`
+      // and settled against ITSELF, so any second distinct string — a stale contact id, a
+      // pubkey-vs-name mismatch, a hostile session — plus our own close flipped the document to
+      // closed. The whole point of recording WHO closed is defeated if who is never checked.
+      this.#logger.warn("document.close.not_peer", {
+        documentId,
+        claimedBy: peerAgentId,
+        peerAgentId: doc.peerAgentId,
+      });
+      return {
+        ok: false,
+        reason: "document_close_not_peer",
+        detail:
+          `${peerAgentId} is not this document's peer (${doc.peerAgentId}), so their close is not ` +
+          `the other half of a bilateral close`,
+      };
+    }
+    this.#recordClose(ownerAgentId, documentId, doc.peerAgentId, nowMs);
+    this.#settleClose(ownerAgentId, documentId, doc.peerAgentId);
+    this.#logger.info("document.close.peer_requested", { documentId, peerAgentId: doc.peerAgentId });
+    return { ok: true };
   }
 
   /**
@@ -186,7 +262,7 @@ export class DocumentLifecycle {
     const original = log.find((e) => e.envelopeHash === envelopeHash);
     if (!original) {
       // A withdrawal record pointing at nothing is worse than a refusal: it is a permanent claim
-      // in an append-only log about an envelope that never existed.
+      // in an append-only store about an envelope that never existed.
       return {
         ok: false,
         reason: "document_envelope_unknown",
@@ -202,7 +278,7 @@ export class DocumentLifecycle {
     }
     if (original.ackedAtMs != null) {
       // The honest refusal. Withdrawing a delivered update would tell the operator their content
-      // was retracted while the peer is holding it — the promise this whole module refuses to make.
+      // was retracted while the peer is holding it — the promise this module refuses to make.
       return {
         ok: false,
         reason: "document_already_delivered",
@@ -212,32 +288,62 @@ export class DocumentLifecycle {
       };
     }
 
-    this.#store.appendEnvelope(ownerAgentId, {
-      envelopeHash: withdrawalHash(envelopeHash, nowMs),
-      documentId,
-      senderAgentId: ownerAgentId,
-      docPrevHash: this.#store.lastEnvelopeHashBySender(ownerAgentId, documentId, ownerAgentId),
-      epochId: 0,
-      signature: original.signature,
-      stateVector: original.stateVector,
-      payload: null,
-      kind: "withdrawal",
-      referencesEnvelopeHash: envelopeHash,
-      createdAtMs: nowMs,
-    });
+    // THE LOCAL ROLLBACK — the half that was missing. Writing only the record left the original in
+    // the log WITH its payload, and replay applies every update payload in order, so the withdrawn
+    // text stayed in the operator's own document and came back on every rebuild. The operator was
+    // told their update was withdrawn while their file still contained it.
+    //
+    // Rolled back as INVERSES through the same undo path a rejection uses, never by dropping the
+    // payload: our own later work may be causally stacked on these operations, and REJECT-1
+    // measured what removing them costs — everything after stays pending forever and the document
+    // silently loses the legitimate work. The inverse enters the log on the next ordinary publish,
+    // computed from the live document, which is also why neither the original nor the inverse is
+    // ever delivered: the peer holds neither, and the next publish carries the net effect.
+    const rolledBack = this.#rollback(ownerAgentId, documentId, envelopeHash);
+    if (!rolledBack.ok) {
+      return {
+        ok: false,
+        reason: "document_withdraw_rollback_failed",
+        detail:
+          `the local rollback did not happen (${rolledBack.reason}), so nothing was withdrawn — ` +
+          `reporting success here would tell you your update was retracted while your file still ` +
+          `contains it`,
+      };
+    }
+
+    const info = this.#store.rawDb
+      .prepare(
+        `INSERT INTO document_withdrawals (owner_agent_id, document_id, envelope_hash, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id, envelope_hash) DO NOTHING`,
+      )
+      .run(ownerAgentId, documentId, envelopeHash, nowMs);
+    if (Number(info.changes) === 0) {
+      // Already withdrawn. Reported rather than inferred — the earlier version ignored the write's
+      // outcome and returned success for a no-op.
+      return {
+        ok: false,
+        reason: "document_already_withdrawn",
+        detail: `envelope ${envelopeHash.slice(0, 16)}… was already withdrawn`,
+      };
+    }
+
     this.#logger.info("document.withdrawn", { documentId, envelopeHash });
     return { ok: true };
   }
 
   // ─── the kill switch (§16.7-11) ───────────────────────────────────────────
 
-  setPlatformPaused(agentId: string, paused: boolean): void {
+  setPlatformPaused(agentId: string, paused: boolean, nowMs: number): void {
     this.#store.rawDb
       .prepare(
         `INSERT INTO agent_platform_pause (agent_id, paused, updated_at) VALUES (?, ?, ?)
          ON CONFLICT (agent_id) DO UPDATE SET paused = excluded.paused, updated_at = excluded.updated_at`,
       )
-      .run(agentId, paused ? 1 : 0, 0);
+      // Hard-wired to 0 before, so every row read 1970 — on the KILL SWITCH, where "when was this
+      // agent paused by the platform" is the audit fact of the whole feature. The tell was that it
+      // was the only method in the class taking no clock.
+      .run(agentId, paused ? 1 : 0, nowMs);
     this.#logger.warn("agent.platform_pause.changed", { agentId, paused });
   }
 
@@ -269,6 +375,17 @@ export class DocumentLifecycle {
     if (doc.status === "killed") {
       return { ok: false, reason: "document_killed", detail: "this document was ended locally" };
     }
+    if (doc.status === "stalled") {
+      // REJECT-1 stalls a document after its retry rounds. A stalled document has stopped
+      // converging, so publishing into it is the same lie as publishing into a killed one — and
+      // two partial gates that each know half the terminal states is how a caller ends up wrong
+      // about the other half.
+      return {
+        ok: false,
+        reason: "document_stalled",
+        detail: "this document stopped accepting updates after repeated rejections",
+      };
+    }
     return { ok: true };
   }
 
@@ -283,6 +400,13 @@ export class DocumentLifecycle {
     }
     if (doc.status === "closed") {
       return { ok: false, reason: "document_closed", detail: "this document was closed by agreement" };
+    }
+    if (doc.status === "stalled") {
+      return {
+        ok: false,
+        reason: "document_stalled",
+        detail: "this document stopped accepting updates after repeated rejections",
+      };
     }
     return { ok: true };
   }
@@ -314,6 +438,10 @@ export class DocumentLifecycle {
   }
 
   #settleClose(ownerAgentId: string, documentId: string, peerAgentId: string): void {
+    // ONLY FROM ACTIVE. Unconditional, a peer close arriving after a unilateral kill overwrote
+    // `killed` with `closed` — the operator's own decision replaced by "closed by agreement", which
+    // is a different fact and the one they did not choose. Same for `stalled`.
+    if (this.#store.getDocument(ownerAgentId, documentId)?.status !== "active") return;
     if (
       this.#hasClosed(ownerAgentId, documentId, ownerAgentId) &&
       this.#hasClosed(ownerAgentId, documentId, peerAgentId)
@@ -322,8 +450,4 @@ export class DocumentLifecycle {
       this.#logger.info("document.closed", { documentId });
     }
   }
-}
-
-function withdrawalHash(envelopeHash: string, nowMs: number): string {
-  return createHash("sha256").update(`withdrawal:${envelopeHash}:${nowMs}`).digest("hex");
 }

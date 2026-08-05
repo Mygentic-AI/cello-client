@@ -69,13 +69,25 @@ export interface DiffStats {
    * Whether the peer's change touches a region this operator also edited. The one field here that
    * is a judgement rather than a count, and the reason an agent reads stats before deciding.
    */
-  overlap: boolean;
+  overlap: boolean | null;
+  /** Whether `keyPaths` was computed at all — an empty list is otherwise read as "none changed". */
+  keyPathsComputed: boolean;
   /** The document exceeded the LCS limit, so the numbers above are bounds, not a measurement. */
   truncated: boolean;
 }
 
 export type DiffResult =
-  | { ok: true; documentType: DiffableDocumentType; diff: string }
+  | {
+      ok: true;
+      documentType: DiffableDocumentType;
+      diff: string;
+      /**
+       * Set when the renderer could not do what the type asked for. A notice inside the diff STRING
+       * is readable by a human and invisible to a caller branching on the result — and it travels
+       * as screened content, which is the wrong channel for a fact about the renderer.
+       */
+      fallback?: "unparseable_json_line_diff";
+    }
   | { ok: false; reason: string; detail: string };
 
 export class DocumentNotifications {
@@ -99,7 +111,12 @@ export class DocumentNotifications {
     if (pending <= 0) {
       // Nothing pending is not a notice with zero in it — it is the absence of a notice. A row
       // saying "0 unread" is an inbox entry the agent must read to discover it has nothing to read.
-      this.clear(agentId, documentId);
+      //
+      // Deleted DIRECTLY rather than through `clear()`: that method's event means "the agent
+      // fetched", and firing it because a count fell to zero reports a fetch that never happened.
+      this.#store.rawDb
+        .prepare("DELETE FROM document_notices WHERE agent_id = ? AND document_id = ?")
+        .run(agentId, documentId);
       return;
     }
     this.#store.rawDb
@@ -139,7 +156,9 @@ export class DocumentNotifications {
       .prepare("DELETE FROM document_notices WHERE agent_id = ? AND document_id = ?")
       .run(agentId, documentId);
     const cleared = Number(info.changes) > 0;
-    if (cleared) this.#logger.info("document.notice.cleared", { documentId });
+    // agentId included: this daemon attends several agents, and an event that names only the
+    // document cannot be attributed to one of them.
+    if (cleared) this.#logger.info("document.notice.cleared", { agentId, documentId });
     return cleared;
   }
 
@@ -156,7 +175,19 @@ export class DocumentNotifications {
    * permanently true, and a flag that always says yes trains the agent to ignore it. Same defect
    * class WRITE-1 measured, which is why there is now one LCS rather than two.
    */
-  diffStats(documentId: string, before: string, after: string, myEdits: readonly number[] = []): DiffStats {
+  diffStats(
+    documentId: string,
+    before: string,
+    after: string,
+    /**
+     * The operator's own edited line numbers. REQUIRED — pass `null` to say "not computed".
+     * Defaulting to `[]` made a caller that simply forgot receive `overlap: false`, the reassuring
+     * answer, indistinguishable from "checked, and there is no conflict". This is the one
+     * judgement field in an otherwise structural result.
+     */
+    myEdits: readonly number[] | null,
+    documentType?: string,
+  ): DiffStats {
     const a = toChunks(before);
     const b = toChunks(after);
     const runs = lineRuns(a, b);
@@ -169,9 +200,23 @@ export class DocumentNotifications {
         linesRemoved: a.length,
         ranges: [{ start: 1, end: Math.max(a.length, b.length) }],
         keyPaths: [],
-        overlap: myEdits.length > 0,
+        keyPathsComputed: false,
+        overlap: myEdits === null ? null : myEdits.length > 0,
         truncated: true,
       };
+    }
+
+    // G3: for a JSON document the DoD asks for KEY ranges, not line ranges. Produced here rather
+    // than left as a permanently-empty array, which reads as "no key paths changed" instead of
+    // "not computed" — the same absent-is-not-fine trap as the overlap default above.
+    let keyPaths: string[] = [];
+    let keyPathsComputed = false;
+    if (documentType === "json") {
+      const paths = changedKeyPaths(before, after);
+      if (paths !== null) {
+        keyPaths = paths;
+        keyPathsComputed = true;
+      }
     }
 
     let added = 0;
@@ -194,8 +239,9 @@ export class DocumentNotifications {
       linesAdded: added,
       linesRemoved: removed,
       ranges,
-      keyPaths: [],
-      overlap: myEdits.some((line) => touched.has(line)),
+      keyPaths,
+      keyPathsComputed,
+      overlap: myEdits === null ? null : myEdits.some((line) => touched.has(line)),
       truncated: false,
     };
   }
@@ -223,6 +269,15 @@ export class DocumentNotifications {
       // touches it, so a line diff reports the entire document as rewritten for a change of one
       // value — which is the false "everything changed" alarm that makes an agent stop reading
       // diffs at all.
+      const parsedPaths = changedKeyPaths(before, after);
+      if (parsedPaths === null) {
+        return {
+          ok: true,
+          documentType: "json",
+          diff: `! this document does not parse as JSON; showing a line diff instead\n${lineDiff(before, after)}`,
+          fallback: "unparseable_json_line_diff",
+        };
+      }
       return { ok: true, documentType: "json", diff: jsonDiff(before, after) };
     }
     return { ok: true, documentType: documentType as DiffableDocumentType, diff: lineDiff(before, after) };
@@ -230,19 +285,31 @@ export class DocumentNotifications {
 }
 
 function lineDiff(before: string, after: string): string {
-  const a = before.split("\n");
-  const b = after.split("\n");
+  // The SHARED LCS, same as diffStats. This renderer kept the positional walk after diffStats moved
+  // off it, which is the worse half to leave behind: inserting one line into a ten-line file
+  // rendered eighteen +/- lines, reporting the entire remainder as rewritten. That is the false
+  // "everything changed" alarm that makes an agent stop reading diffs at all — the exact reasoning
+  // that gave JSON a key-path diff, applied to markdown at last.
+  const a = toChunks(before);
+  const b = toChunks(after);
+  const runs = lineRuns(a, b);
+  if (runs === null) return "! this document is too large to diff line-by-line";
+
   const out: string[] = [];
-  const max = Math.max(a.length, b.length);
-  for (let i = 0; i < max; i++) {
-    if (a[i] === b[i]) {
-      if (a[i] !== undefined) out.push(`  ${a[i]}`);
-      continue;
-    }
-    if (a[i] !== undefined) out.push(`- ${a[i]}`);
-    if (b[i] !== undefined) out.push(`+ ${b[i]}`);
+  let ai = 0;
+  for (const r of runs) {
+    for (; ai < r.aStart; ai++) out.push(`  ${strip(a[ai]!)}`);
+    for (let i = r.aStart; i < r.aEnd; i++) out.push(`- ${strip(a[i]!)}`);
+    for (let j = r.bStart; j < r.bEnd; j++) out.push(`+ ${strip(b[j]!)}`);
+    ai = r.aEnd;
   }
+  for (; ai < a.length; ai++) out.push(`  ${strip(a[ai]!)}`);
   return out.join("\n");
+}
+
+/** Chunks carry their own trailing newline; the rendered diff supplies its own line breaks. */
+function strip(chunk: string): string {
+  return chunk.endsWith("\n") ? chunk.slice(0, -1) : chunk;
 }
 
 function flatten(value: unknown, prefix = ""): Map<string, string> {
@@ -252,10 +319,29 @@ function flatten(value: unknown, prefix = ""): Map<string, string> {
     return out;
   }
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    const path = prefix ? `${prefix}.${k}` : k;
+    // The separator is ESCAPED in the key. Unescaped, {"a.b": 1} and {"a": {"b": 1}} flatten to the
+    // same path, so a document using dotted keys reports no change where there was one — silently,
+    // which is the exact behaviour this unit refuses everywhere else.
+    const path = prefix ? `${prefix}.${k.replace(/\\/g, "\\\\").replace(/\./g, "\\.")}` : k.replace(/\\/g, "\\\\").replace(/\./g, "\\.");
     for (const [p, s] of flatten(v, path)) out.set(p, s);
   }
   return out;
+}
+
+/** The changed key paths, or null when either side does not parse. */
+function changedKeyPaths(before: string, after: string): string[] | null {
+  let a: Map<string, string>;
+  let b: Map<string, string>;
+  try {
+    a = flatten(JSON.parse(before));
+    b = flatten(JSON.parse(after));
+  } catch {
+    return null;
+  }
+  const paths = new Set<string>();
+  for (const [path, value] of a) if (!b.has(path) || b.get(path) !== value) paths.add(path);
+  for (const [path] of b) if (!a.has(path)) paths.add(path);
+  return [...paths].sort();
 }
 
 function jsonDiff(before: string, after: string): string {

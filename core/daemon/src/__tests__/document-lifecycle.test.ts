@@ -75,13 +75,22 @@ function newFixture() {
   });
   const engine = new DocumentEngine(logger);
   const notified: Array<{ documentId: string; verb: string }> = [];
-  const lifecycle = new DocumentLifecycle(store, logger, {
-    notifyPeer: async (documentId, verb) => {
-      notified.push({ documentId, verb });
+  const rolledBack: string[] = [];
+  const lifecycle = new DocumentLifecycle(
+    store,
+    logger,
+    {
+      notifyPeer: async (documentId, verb) => {
+        notified.push({ documentId, verb });
+        return { ok: true };
+      },
+    },
+    (_a, _d, envelopeHash) => {
+      rolledBack.push(envelopeHash);
       return { ok: true };
     },
-  });
-  return { store, engine, lifecycle, events, notified, db };
+  );
+  return { store, engine, lifecycle, events, notified, rolledBack, db };
 }
 
 describe("DocumentLifecycle — list", () => {
@@ -130,7 +139,7 @@ describe("DocumentLifecycle — close is BILATERAL", () => {
   it("closes once the peer's close arrives too", async () => {
     const f = newFixture();
     await f.lifecycle.close(AGENT, DOC, NOW);
-    f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1);
+    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(true);
 
     expect(f.store.getDocument(AGENT, DOC)!.status).toBe("closed");
   });
@@ -197,9 +206,12 @@ describe("DocumentLifecycle — kill is UNILATERAL, and honest about what it can
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
-    const lifecycle = new DocumentLifecycle(store, logger, {
-      notifyPeer: async () => ({ ok: false, reason: "peer_offline" }),
-    });
+    const lifecycle = new DocumentLifecycle(
+      store,
+      logger,
+      { notifyPeer: async () => ({ ok: false, reason: "peer_offline" }) },
+      () => ({ ok: true }),
+    );
 
     const res = await lifecycle.kill(AGENT, DOC, NOW);
     expect(res.ok).toBe(true);
@@ -224,9 +236,56 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
     // The original is still there with its payload. "Marked, never deleted" is what keeps the log
     // verifiable — a hole in an append-only log is indistinguishable from tampering.
     expect(log.find((r) => r.envelopeHash === e.envelopeHash)!.payload).not.toBeNull();
-    const record = log.find((r) => r.kind === "withdrawal");
-    expect(record!.referencesEnvelopeHash).toBe(e.envelopeHash);
-    expect(record!.payload).toBeNull();
+    // And the record is NOT an envelope. As one it advanced our per-sender chain over a node the
+    // peer will never hold — a withdrawal is never delivered — so our next update chained onto
+    // something they had never seen and they refused it as document_chain_broken, sending an
+    // operator to the chain layer for a withdrawal-scoping bug.
+    expect(log.filter((r) => r.kind === "withdrawal")).toHaveLength(0);
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("ROLLS BACK locally — the operator's own document no longer contains it", () => {
+    const f = newFixture();
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+
+    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
+    // The clause is "local rollback + a withdrawal record". Only the record shipped, so the
+    // operator was told their update was withdrawn while their own file still contained it —
+    // replay applies every update payload in order, so it came back on every rebuild forever.
+    expect(f.rolledBack).toEqual([e.envelopeHash]);
+  });
+
+  it("REFUSES rather than reporting success when the rollback did not happen", () => {
+    const { logger } = recordingLogger();
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const store = new DocumentStore(db, logger);
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    const lifecycle = new DocumentLifecycle(
+      store, logger,
+      { notifyPeer: async () => ({ ok: true }) },
+      () => ({ ok: false, reason: "nothing_tracked" }),
+    );
+    const e = envelope(AGENT, null);
+    store.appendEnvelope(AGENT, e);
+
+    const res = lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toBe("document_withdraw_rollback_failed");
+  });
+
+  it("refuses a SECOND withdrawal of the same envelope instead of reporting success", () => {
+    const f = newFixture();
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
+    const second = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
+    expect(second.ok).toBe(false);
+    expect((second as { reason: string }).reason).toBe("document_already_withdrawn");
   });
 
   it("REFUSES to withdraw an update the peer already has", () => {
@@ -271,7 +330,7 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
 describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
   it("a paused agent refuses outbound publishes LOUDLY", () => {
     const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true);
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
 
     const verdict = f.lifecycle.canPublish(AGENT, DOC);
     expect(verdict.ok).toBe(false);
@@ -283,7 +342,7 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
 
   it("a paused agent STILL admits incoming updates, mechanically", () => {
     const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true);
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     // Refusing inbound would make the pause visible to the peer as a protocol fault and would
     // force a rejection round for something that is not the peer's doing.
     expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
@@ -291,14 +350,14 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
 
   it("a paused agent suppresses notifications", () => {
     const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true);
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     expect(f.lifecycle.shouldNotify(AGENT)).toBe(false);
   });
 
   it("unpausing resumes all three", () => {
     const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true);
-    f.lifecycle.setPlatformPaused(AGENT, false);
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
+    f.lifecycle.setPlatformPaused(AGENT, false, NOW + 1);
 
     expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(true);
     expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
@@ -307,9 +366,74 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
 
   it("the pause is per-agent, not global", () => {
     const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true);
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     // A daemon can attend several agents; pausing one because another was paused would take a
     // platform action against an agent it was never aimed at.
     expect(f.lifecycle.shouldNotify("another-agent")).toBe(true);
+  });
+});
+
+
+describe("DocumentLifecycle — a close only counts from the document's ACTUAL peer", () => {
+  it("refuses a close from anyone else, and the document stays open", async () => {
+    const f = newFixture();
+    await f.lifecycle.close(AGENT, DOC, NOW);
+
+    const res = f.lifecycle.recordPeerClose(AGENT, DOC, "someone-else", NOW + 1);
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toBe("document_close_not_peer");
+    // The closer id was written as `closed_by` and settled against ITSELF, so any second distinct
+    // string plus our own close flipped the document closed — the bilateral guarantee the whole
+    // table exists to protect, bypassed by passing a different string twice.
+    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
+  });
+
+  it("refuses a close for a document that does not exist", () => {
+    const f = newFixture();
+    const res = f.lifecycle.recordPeerClose(AGENT, "ff".repeat(32), PEER, NOW);
+    expect(res.ok).toBe(false);
+    // There is no foreign key on this table, and setDocumentStatus on a missing row updates zero
+    // rows and returns silently — so an unchecked write leaves an orphan and no signal.
+    expect((res as { reason: string }).reason).toBe("document_unknown");
+  });
+});
+
+describe("DocumentLifecycle — a close does not overwrite an ending the operator chose", () => {
+  it("a peer close arriving after a KILL leaves the document killed", async () => {
+    const f = newFixture();
+    await f.lifecycle.close(AGENT, DOC, NOW);
+    await f.lifecycle.kill(AGENT, DOC, NOW + 1);
+    f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 2);
+
+    // "Closed by agreement" is a different fact from "I ended this", and it is the one the
+    // operator did not choose.
+    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("killed");
+  });
+});
+
+describe("DocumentLifecycle — a STALLED document is terminal too", () => {
+  it("refuses publish and admit, naming the stall", () => {
+    const f = newFixture();
+    f.store.setDocumentStatus(AGENT, DOC, "stalled");
+
+    for (const verdict of [f.lifecycle.canPublish(AGENT, DOC), f.lifecycle.canAdmit(AGENT, DOC)]) {
+      expect(verdict.ok).toBe(false);
+      // REJECT-1 stalls a document after its retry rounds. Two partial gates that each know half
+      // the terminal states is how a caller ends up wrong about the other half.
+      expect((verdict as { reason: string }).reason).toBe("document_stalled");
+    }
+  });
+});
+
+describe("DocumentLifecycle — the pause records WHEN", () => {
+  it("writes the timestamp it was given, not 1970", () => {
+    const f = newFixture();
+    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
+    const row = f.db
+      .prepare("SELECT updated_at FROM agent_platform_pause WHERE agent_id = ?")
+      .get(AGENT) as { updated_at: number };
+    // On the kill switch, "when was this agent paused by the platform" is the audit fact of the
+    // whole feature.
+    expect(row.updated_at).toBe(NOW);
   });
 });

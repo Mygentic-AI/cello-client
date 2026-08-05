@@ -280,6 +280,17 @@ const CREATE_REJECTIONS_RECEIVED_SQL = `
   );
 `;
 
+/** Mirrors `DocumentLifecycle`'s definition exactly — see the note at the exec site. */
+const CREATE_WITHDRAWALS_SQL = `
+  CREATE TABLE IF NOT EXISTS document_withdrawals (
+    owner_agent_id TEXT    NOT NULL,
+    document_id    TEXT    NOT NULL,
+    envelope_hash  TEXT    NOT NULL,
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (owner_agent_id, document_id, envelope_hash)
+  );
+`;
+
 const CREATE_SNAPSHOTS_SQL = `
   CREATE TABLE IF NOT EXISTS document_snapshots (
     owner_agent_id      TEXT    NOT NULL,
@@ -313,6 +324,12 @@ export class DocumentStore {
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
+    // Owned by DocumentLifecycle, created HERE too because `pendingDeliveries` references it and a
+    // store used without the lifecycle module is a legitimate configuration. Both statements are
+    // CREATE TABLE IF NOT EXISTS over the same definition, so whichever runs first wins and the
+    // other is a no-op — the alternative is a query that throws on a missing table and takes an
+    // entire delivery pass down with it.
+    this.#db.exec(CREATE_WITHDRAWALS_SQL);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
@@ -712,12 +729,16 @@ export class DocumentStore {
             -- A WITHDRAWN update is not pending. Derived from the withdrawal record rather than a
             -- flag on the row, so there is one fact in one place: without this the delivery worker
             -- ships the very update the operator just withdrew.
+            --
+            -- The table is created by DocumentLifecycle, which may not have run — a store used
+            -- without it is a legitimate configuration — so the reference is guarded rather than
+            -- assumed. A missing table would otherwise throw here and take the whole delivery pass
+            -- down with it.
             AND NOT EXISTS (
-              SELECT 1 FROM document_envelopes w
+              SELECT 1 FROM document_withdrawals w
                WHERE w.owner_agent_id = document_envelopes.owner_agent_id
                  AND w.document_id = document_envelopes.document_id
-                 AND w.kind = 'withdrawal'
-                 AND w.references_hash = document_envelopes.envelope_hash
+                 AND w.envelope_hash = document_envelopes.envelope_hash
             )
           -- log_index is PER DOCUMENT, so it alone is not a total order across documents and the
           -- bounded window could be filled by one document's backlog forever. The tiebreaks make

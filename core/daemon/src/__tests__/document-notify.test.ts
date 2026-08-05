@@ -95,7 +95,7 @@ describe("DocumentNotifications — cleared by an EXPLICIT fetch", () => {
 describe("DocumentNotifications — diffStats is STRUCTURAL, with no content", () => {
   it("reports counts and ranges but never a line of the document", () => {
     const f = newFixture();
-    const stats = f.notify.diffStats(DOC, "one\ntwo\nthree\n", "one\nTWO CHANGED\nthree\n");
+    const stats = f.notify.diffStats(DOC, "one\ntwo\nthree\n", "one\nTWO CHANGED\nthree\n", null);
 
     expect(stats.ranges).toEqual([{ start: 2, end: 2 }]);
     expect(stats.linesAdded).toBe(1);
@@ -126,16 +126,16 @@ describe("DocumentNotifications — diffStats is STRUCTURAL, with no content", (
     // unchanged. Inserting ONE line at the top of a three-line file reported +4 -3 with a single
     // range covering the whole document — the same defect class WRITE-1 measured, where a
     // positional walk published text the file did not contain.
-    expect(f.notify.diffStats(DOC, "b\nc\n", "a\nb\nc\n")).toMatchObject({
+    expect(f.notify.diffStats(DOC, "b\nc\n", "a\nb\nc\n", null)).toMatchObject({
       linesAdded: 1,
       linesRemoved: 0,
       ranges: [{ start: 1, end: 1 }],
     });
-    expect(f.notify.diffStats(DOC, "a\nb\nc\n", "b\nc\n")).toMatchObject({
+    expect(f.notify.diffStats(DOC, "a\nb\nc\n", "b\nc\n", null)).toMatchObject({
       linesAdded: 0,
       linesRemoved: 1,
     });
-    expect(f.notify.diffStats(DOC, "a\nc\n", "a\nb\nc\n")).toMatchObject({
+    expect(f.notify.diffStats(DOC, "a\nc\n", "a\nb\nc\n", null)).toMatchObject({
       linesAdded: 1,
       linesRemoved: 0,
       ranges: [{ start: 2, end: 2 }],
@@ -146,7 +146,7 @@ describe("DocumentNotifications — diffStats is STRUCTURAL, with no content", (
     const f = newFixture();
     // One span from the first change to the last would describe the untouched middle as changed,
     // and the overlap flag would then fire for an operator who edited only that middle.
-    const stats = f.notify.diffStats(DOC, "a\nb\nc\nd\ne\n", "A\nb\nc\nd\nE\n");
+    const stats = f.notify.diffStats(DOC, "a\nb\nc\nd\ne\n", "A\nb\nc\nd\nE\n", null);
     expect(stats.ranges).toEqual([
       { start: 1, end: 1 },
       { start: 5, end: 5 },
@@ -223,5 +223,101 @@ describe("DocumentNotifications — diff renders the supported types and REFUSES
     // act on it. The refusal names the type and the supported set.
     expect((res as { detail: string }).detail).toContain("spreadsheet");
     expect((res as { detail: string }).detail).toContain("markdown");
+  });
+});
+
+
+describe("DocumentNotifications — overlap says NOT COMPUTED rather than 'no conflict'", () => {
+  it("returns null when the caller did not supply its own edits", () => {
+    const f = newFixture();
+    // Defaulting to [] handed a caller that simply forgot `overlap: false` — the reassuring
+    // answer, indistinguishable from "checked, and there is no conflict". This is the one
+    // judgement field in an otherwise structural result.
+    expect(f.notify.diffStats(DOC, "a\nb\n", "a\nB\n", null).overlap).toBeNull();
+  });
+});
+
+describe("DocumentNotifications — the DIFF renderer uses the same LCS", () => {
+  it("renders one inserted line as one line, not the whole remainder", () => {
+    const f = newFixture();
+    const before = Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n");
+    const after = before.split("\n").toSpliced(3, 0, "inserted").join("\n");
+
+    const res = f.notify.diff("markdown", before, after, DOC);
+    const diff = (res as { diff: string }).diff;
+    // The renderer kept the positional walk after diffStats moved off it, which is the worse half
+    // to leave behind: this rendered eighteen +/- lines for a one-line insertion, reporting the
+    // entire remainder as rewritten — the false "everything changed" alarm that makes an agent
+    // stop reading diffs at all.
+    expect(diff.split("\n").filter((l) => l.startsWith("+"))).toEqual(["+ inserted"]);
+    expect(diff.split("\n").filter((l) => l.startsWith("-"))).toEqual([]);
+  });
+});
+
+describe("DocumentNotifications — key paths for JSON", () => {
+  it("produces the changed key paths, and marks them computed", () => {
+    const f = newFixture();
+    const before = JSON.stringify({ a: 1, b: { c: 2 } });
+    const after = JSON.stringify({ a: 2, b: { c: 2 } });
+
+    const stats = f.notify.diffStats(DOC, before, after, null, "json");
+    expect(stats.keyPaths).toEqual(["a"]);
+    expect(stats.keyPathsComputed).toBe(true);
+  });
+
+  it("marks key paths NOT COMPUTED for a line-oriented document", () => {
+    const f = newFixture();
+    const stats = f.notify.diffStats(DOC, "a\n", "b\n", null, "markdown");
+    // An always-empty list reads as "no key paths changed" rather than "not computed" — the same
+    // absent-is-not-fine trap as the overlap default.
+    expect(stats.keyPaths).toEqual([]);
+    expect(stats.keyPathsComputed).toBe(false);
+  });
+
+  it("distinguishes a dotted KEY from a nested path", () => {
+    const f = newFixture();
+    const dotted = f.notify.diffStats(DOC, JSON.stringify({ "a.b": 1 }), JSON.stringify({ "a.b": 2 }), null, "json");
+    const nested = f.notify.diffStats(DOC, JSON.stringify({ a: { b: 1 } }), JSON.stringify({ a: { b: 2 } }), null, "json");
+    // Unescaped, both flatten to `a.b`, so a document using dotted keys reports no change where
+    // there was one — silently, which is what this unit refuses everywhere else.
+    expect(dotted.keyPaths).not.toEqual(nested.keyPaths);
+  });
+});
+
+describe("DocumentNotifications — the JSON fallback is TYPED, not a sentence in the body", () => {
+  it("flags an unparseable document so a caller can branch on it", () => {
+    const f = newFixture();
+    const res = f.notify.diff("json", "{not json", "{still not", DOC);
+    expect(res.ok).toBe(true);
+    // A notice inside the diff string is readable by a human and invisible to a caller — and it
+    // travels as screened content, which is the wrong channel for a fact about the renderer.
+    expect((res as { fallback?: string }).fallback).toBe("unparseable_json_line_diff");
+  });
+
+  it("sets no fallback when the JSON parsed", () => {
+    const f = newFixture();
+    const res = f.notify.diff("json", "{\"a\":1}", "{\"a\":2}", DOC);
+    expect((res as { fallback?: string }).fallback).toBeUndefined();
+  });
+});
+
+describe("DocumentNotifications — a count falling to zero is not a FETCH", () => {
+  it("does not emit the cleared event when the count drops to zero", () => {
+    const f = newFixture();
+    f.notify.notice(AGENT, DOC, 2, NOW);
+    f.notify.notice(AGENT, DOC, 0, NOW + 1);
+    // That event's whole meaning is "the agent fetched". Firing it because a count fell to zero
+    // reports a fetch that never happened.
+    expect(f.events.filter((e) => e.event === "document.notice.cleared")).toHaveLength(0);
+    expect(f.notify.pending(AGENT)).toHaveLength(0);
+  });
+
+  it("the cleared event names the AGENT, not just the document", () => {
+    const f = newFixture();
+    f.notify.notice(AGENT, DOC, 1, NOW);
+    f.notify.clear(AGENT, DOC);
+    // This daemon attends several agents, and an event naming only the document cannot be
+    // attributed to one of them.
+    expect(f.events.find((e) => e.event === "document.notice.cleared")!.fields.agentId).toBe(AGENT);
   });
 });
