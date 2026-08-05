@@ -28,6 +28,13 @@ export interface ReconnectDrainDeps {
   isAgentOnline: (agentName: string) => boolean;
   ensureStandingReceiver: (agentName: string) => Promise<void>;
   drainParked: (agentName: string) => Promise<void>;
+  /**
+   * M12-P12: the SENDER half. `drainParked` pulls what OTHERS parked for this agent; this re-parks
+   * what THIS agent failed to deposit. Both are stranded by the same relay churn, so both belong on
+   * the same reconnect — draining only the inbound half leaves the outbound message lost.
+   * Optional so existing callers/tests keep compiling; absent means sender re-park is skipped.
+   */
+  flushSender?: (agentName: string) => Promise<void>;
 }
 
 /**
@@ -36,12 +43,18 @@ export interface ReconnectDrainDeps {
  * of the stage that produced it.
  */
 export function createReconnectDrain(deps: ReconnectDrainDeps): (agentName: string) => void {
-  const { logger, isAgentOnline, ensureStandingReceiver, drainParked } = deps;
+  const { logger, isAgentOnline, ensureStandingReceiver, drainParked, flushSender } = deps;
 
-  const drain = (agentName: string): Promise<void> =>
-    drainParked(agentName).catch((err: unknown) => {
+  const drain = (agentName: string): Promise<void> => {
+    // Sender re-park first: it needs the receiver the ensure step just rebuilt, and a failure here
+    // must not cost the inbound pull — hence its own catch rather than a shared chain.
+    void flushSender?.(agentName).catch((err: unknown) => {
+      logger.warn("content.park.flush.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
+    });
+    return drainParked(agentName).catch((err: unknown) => {
       logger.warn("content.recover.auto.failed", { agentName, stage: "reconnect", error: extractErrorMessage(err) });
     });
+  };
 
   return (agentName: string): void => {
     // The ensure fires on the FIRST connect too, and an agent that was never started must not

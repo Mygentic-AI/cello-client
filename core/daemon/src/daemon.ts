@@ -402,6 +402,14 @@ async function startDaemonHoldingLock(
   // rebuild, auth_ok rebuild) and on its slow backstop sweep. Before this, a message that hit a
   // relay churn gap sat parked until a human restarted the receiving daemon.
   sessionNodeManager.setParkedDrainHook((agentName: string, reason: string) => {
+    // M12-P12 (review F1): the SENDER half of the same event. A refused park deposit leaves a
+    // durable retry_queue row, and until this call existed the only things that drained it were a
+    // daemon restart and cello_start_agent — so the fix made a lost message restart-recoverable
+    // while the DoD line promises "no restart". The watchdog rebuild is where parking actually
+    // happens, so it is where the re-park has to fire too.
+    void flushAwaitingContent(agentName).catch((err: unknown) => {
+      logger.warn("content.park.flush.failed", { agentName, trigger: reason, stage: "drain_hook", error: extractErrorMessage(err) });
+    });
     void autoRecoverForAgent(agentName, reason).catch((err: unknown) => {
       // autoRecoverForAgent catches per-relay errors internally; this is the backstop, and it uses
       // extractErrorMessage because the transport rejects with structured plain objects that
@@ -419,6 +427,9 @@ async function startDaemonHoldingLock(
     isAgentOnline: (agentName: string) => onlineAgents.has(agentName),
     ensureStandingReceiver: (agentName: string) => sessionNodeManager.ensureStandingReceiverForAgent(agentName),
     drainParked: (agentName: string) => autoRecoverForAgent(agentName, "signaling_reconnect"),
+    // M12-P12 (review F1): ordered AFTER ensureStandingReceiver by createReconnectDrain's own
+    // ensure→drain contract — a re-park needs the receiver that the ensure step rebuilds.
+    flushSender: (agentName: string) => flushAwaitingContent(agentName),
   });
 
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
@@ -1312,8 +1323,8 @@ async function startDaemonHoldingLock(
     },
     // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
     // TTF timer is already cancelled on this path, so this is the only thing holding the content.
-    onParkFailed: (agentName, sessionId, contentHashHex, content) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
+    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
     },
   });
 
@@ -1364,12 +1375,18 @@ async function startDaemonHoldingLock(
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       const reason = "standing_receiver_unavailable";
-      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason });
+      // M12-P12 (review F4): `standing_receiver_unavailable` is the exit-point label that already
+      // misnamed this incident 102 times; standingReceiverAbsenceReason() names WHICH of the four
+      // causes it is. That distinction is what separates "mid-rebuild, a retry in seconds works"
+      // from "agent offline, this will never work" — the difference between a backstop that helps
+      // and one that spins. The wire reason stays put; the cause rides alongside.
+      const cause = sessionNodeManager.standingReceiverAbsenceReason(agentName);
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason, cause });
       // DOD-LEAVEMSG-1 (reviewer HIGH fix): return the typed failure, never resolve as if this
       // were a success — #parkContent's caller (sendContent) shapes a live "dispatched to relay"
       // response from this, and a silently-resolved void here would report a message as safely
       // parked when nothing was ever deposited.
-      return { ok: false, reason };
+      return { ok: false, reason, cause };
     }
     // SEC-1: sign the entry as the SENDING agent. Without a key we cannot produce an envelope the
     // recipient will accept, so fail LOUD rather than depositing something that will be refused on
@@ -1445,26 +1462,31 @@ async function startDaemonHoldingLock(
     const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
     if (!node) return { parked: false, error: "standing_receiver_unavailable" };
     // SEC-1: the crash backstop must sign too — an unsigned re-park would be REFUSED on recovery,
-    // which would turn the message-loss backstop into a message-loss cause. This is why the SEC-1
-    // signature binds to the sender's own K_local and NOT to the relay's ordering record: the
-    // ordering record is not persisted in retry_queue (see below) and so cannot be reproduced here,
-    // but the KEY can — the owning agent still holds it after a crash. Hence: NO schema migration.
+    // which would turn the message-loss backstop into a message-loss cause. The SEC-1 signature
+    // binds to the sender's own K_local, which the owning agent still holds after a crash.
+    // M12-P12 (review F2): the ordering record IS now persisted (retry_queue.structure{1,2}_cbor),
+    // so a re-park is self-ordering whenever the row carries one. Rows written before that column
+    // existed carry none and still recover in arrival order — the pre-existing behaviour, now the
+    // exception rather than the rule.
     const senderKp = keyProviders.get(ownerName);
     if (!senderKp) return { parked: false, error: "signing_key_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
     const contentHashBytes = Buffer.from(entry.contentHashHex, "hex");
     logger.info("content.park.signed", { agentName: ownerName, sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
-    // DOD-MSG-4 (2b): seal the envelope shape too (content only — the durable awaiting queue does not
-    // persist the ordering record, so a crash-backstop re-park recovers in arrival order; the common
-    // live-park path above carries the full Structure2). Keeps ONE envelope format on the recover side.
+    // DOD-MSG-4 (2b): ONE envelope format on the recover side. M12-P12 (F2): carry the persisted
+    // ordering record when the row has one, so the recipient places the content at its WITNESSED
+    // sequence rather than its arrival index — the receiver's #witnessedSeq map is in-memory and
+    // empty after a restart, so arrival order there means a wrong leaf index and a divergent tree.
     // SEC-1: same sole producer as the live hook — the backstop signs from the persisted
-    // (sessionId, recipient, contentHash), which is why it survives a crash with NO schema migration.
+    // (sessionId, recipient, contentHash).
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: entry.sessionId,
       recipientPubkey,
       contentHash: contentHashBytes,
       content: entry.contentBlob,
+      structure1Cbor: entry.structure1Cbor,
+      structure2Cbor: entry.structure2Cbor,
     });
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {

@@ -220,6 +220,14 @@ type CreateSessionResult =
  */
 const RECEIVED_BUFFER_CAP = 32;
 
+/**
+ * M12-P12 (review F6): the outcome of one park-deposit attempt. A bare boolean conflated
+ * "this session has no relay to park to" with "the relay refused the deposit" — only the latter is
+ * worth queuing for a later retry, and queuing the former grows the durable queue with rows that
+ * can never drain.
+ */
+type ParkAttempt = "parked" | "refused" | "unconfigured";
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -396,7 +404,7 @@ export class SessionNodeManager {
   // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
   // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
   // the wrong cause is how this path stayed invisible.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -411,7 +419,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
     | null = null;
 
   constructor(opts: {
@@ -497,7 +505,7 @@ export class SessionNodeManager {
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
     onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -518,7 +526,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -593,10 +601,14 @@ export class SessionNodeManager {
    * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
    * result — the deposit itself and its logging are unchanged either way.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<boolean> {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<ParkAttempt> {
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return false;
+    // M12-P12 (review F6): "no park target configured" is NOT a refused deposit. Content in a
+    // session with no relay was never recoverable through the park, so queuing it for re-park would
+    // be a lie that grows the DB forever — every boot and every agent start would retry a row whose
+    // only possible outcome is no_persisted_relay_endpoint. Reported as unconfigured, not refused.
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return "unconfigured";
     try {
       const result = await hook({
         // SEC-1: the hook must sign as the SENDING agent — it needs to know who that is.
@@ -621,17 +633,18 @@ export class SessionNodeManager {
           sessionId,
           contentHash: contentHashHex,
           reason: result.reason,
+          cause: result.cause,
         });
-        return false;
+        return "refused";
       }
-      return true;
+      return "parked";
     } catch (err: unknown) {
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
         contentHash: contentHashHex,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return "refused";
     }
   }
 
@@ -3335,7 +3348,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string }> {
+  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; guidance?: string }> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
@@ -3425,23 +3438,40 @@ export class SessionNodeManager {
       // can be reported as "dispatched to relay" instead of a raw stream failure — the operator/
       // agent sees the truth (the message IS in flight, just not direct), not a false negative.
       const hashHex = Buffer.from(contentHash).toString("hex");
-      const parked = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
-      if (parked) {
+      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+      if (attempt === "parked") {
         return { ok: true, delivered: false, parked: true };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
       // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
       // have enqueued it is cancelled. The recipient has already witnessed this sequence, so it
       // holds every later message in the session behind the gap, forever, and tells no one.
-      // Enqueue durably instead: flushAwaitingContent re-parks it when the standing receiver is
-      // back. Only on an honest failure — a successful deposit must not be re-parked.
-      try {
-        this.#onParkFailed?.(agentName, sessionId, hashHex, content);
-      } catch (hookErr: unknown) {
-        this.#logger.error("content.park.backstop.failed", {
-          sessionId, contentHash: hashHex,
-          error: hookErr instanceof Error ? hookErr.message : String(hookErr),
-        });
+      // Enqueue durably instead; the drain hook re-parks it the moment the standing receiver is
+      // rebuilt. Only on a REFUSAL — a successful deposit must not be re-parked, and an
+      // unconfigured session has no park target to retry against (F6).
+      let durable = false;
+      if (attempt === "refused") {
+        try {
+          this.#onParkFailed?.(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+          durable = true;
+          // F5: the successful enqueue must be visible. Without this the live run that has to
+          // PROVE this fix has nothing to point at, and this log is the sender-side counterpart to
+          // `session.content.held` on the receiver — the two together make the trace readable.
+          this.#logger.info("content.park.deferred", {
+            sessionId, contentHash: hashHex, agentName,
+            selfOrdering: Boolean(orderingS1 && orderingS2),
+          });
+        } catch (hookErr: unknown) {
+          // F3: enqueueAwaitingContent throws ON PURPOSE when the persist fails, because that is
+          // data loss. Swallowing it into the same response the durable case returns would tell the
+          // operator "it will retry" about a message that is simply gone. Named for its own cause,
+          // and the response says so below.
+          this.#logger.error("content.park.durable_enqueue.failed", {
+            sessionId, contentHash: hashHex, agentName,
+            impact: "content is NOT durable and will NOT be retried — the message is lost",
+            error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+          });
+        }
       }
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
@@ -3457,7 +3487,17 @@ export class SessionNodeManager {
                   return String(err);
                 }
               })();
-      return { ok: false, reason: "session_stream_unavailable", error: errMsg };
+      // F3: the two failures are NOT interchangeable to the caller. `reason` is a contract string
+      // and stays put; `guidance` carries the difference, because "we are retrying this" and "this
+      // message is gone, send it again" demand opposite actions from the operator.
+      return {
+        ok: false,
+        reason: "session_stream_unavailable",
+        error: errMsg,
+        guidance: durable
+          ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. No action needed."
+          : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
+      };
     }
   }
 

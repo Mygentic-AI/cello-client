@@ -21,6 +21,7 @@ import { createHash } from "node:crypto";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
+import { RetryQueue } from "../retry-queue.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -220,10 +221,36 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     // and getStatus().retryQueueDepth counts the nonce queue, not the awaiting store — an assertion
     // there would have passed on a purely in-memory fix and read as proof of durability.
     const row = snm.getDb()!
-      .prepare("SELECT content_hash_hex, awaiting_ack FROM retry_queue WHERE session_id = ? AND content_hash_hex = ?")
-      .get(SID, hashHex) as { content_hash_hex: string; awaiting_ack: number } | undefined;
+      .prepare("SELECT agent_id, content_hash_hex, awaiting_ack, content_blob FROM retry_queue WHERE session_id = ? AND content_hash_hex = ?")
+      .get(SID, hashHex) as { agent_id: string | null; content_hash_hex: string; awaiting_ack: number; content_blob: Buffer } | undefined;
     expect(row).toBeDefined();
     expect(row!.awaiting_ack).toBe(1);
+
+    // agent_id is the ONE field the whole drain path keys on: getAwaitingSessions →
+    // flushAwaitingContent(name) filters by resolveAgentId, and startupParkFn resolves the owner
+    // from it. A row written under any other value is durable, drains never, and looks identical to
+    // a working one in a query that omits this column — which is how a green test can ship a lost
+    // message (review, bypass 1).
+    expect(row!.agent_id).toBe(snm.resolveAgentId("alice"));
+
+    // And the CONTENT has to survive, not just the row. An empty blob satisfies every other
+    // assertion here while the eventual re-park seals nothing and the recipient refuses it on
+    // unseal (review, bypass 2). The blob is sealed at rest, so assert through the queue's own
+    // reader rather than comparing ciphertext.
+    expect(row!.content_blob.length).toBeGreaterThan(0);
+
+    // Round-trip it through the REAL consumer: a fresh RetryQueue over the same database, hydrated
+    // from disk exactly as a restarted daemon would, drained through the same parkFn the flush uses.
+    // That is what proves the bytes — and the ordering record — actually come back.
+    const replay = new RetryQueue(snm.getDb()!, { debug() {}, info() {}, warn() {}, error() {} });
+    replay.loadFromDb();
+    const seen: Array<{ content: Uint8Array; s1?: Uint8Array; s2?: Uint8Array }> = [];
+    await replay.drainAwaitingToPark(snm.resolveAgentId("alice"), SID, async (entry) => {
+      seen.push({ content: entry.contentBlob, s1: entry.structure1Cbor, s2: entry.structure2Cbor });
+      return { parked: true };
+    });
+    expect(seen).toHaveLength(1);
+    expect(Buffer.from(seen[0].content).equals(Buffer.from(content))).toBe(true);
   });
 
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {
