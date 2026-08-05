@@ -87,6 +87,9 @@ import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
+import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
+import { DocumentDelivery } from "./document-delivery.js";
+import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
@@ -1277,7 +1280,7 @@ async function startDaemonHoldingLock(
 
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
-  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator } = createOutboundSessions({
+  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup } = createOutboundSessions({
     logger,
     sessionNodeManager,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
@@ -2774,7 +2777,7 @@ async function startDaemonHoldingLock(
 
   // cello_initiate_session (initiate-session-handler.ts). The relay witness is BEST-EFFORT: a
   // session with no relay still runs on the direct content path. Degraded, never blocked.
-  registerInitiateSessionHandler({
+  const { openSessionAs } = registerInitiateSessionHandler({
     handlers,
     logger,
     sessionNodeManager,
@@ -3205,6 +3208,128 @@ async function startDaemonHoldingLock(
   });
   sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame);
 
+  // M14 / DOD-DOC-DELIVERY-2 — the outbound half, wired only now that INBOUND-2 is. The ordering
+  // constraint on the DoD line is real and this is where it is honoured: a delivery worker with no
+  // inbound counterpart publishes envelopes nobody can answer, so every document would stall at the
+  // unacked ceiling.
+  //
+  // PER AGENT, because every capability below is: the signaling stream is authenticated as one
+  // agent, sessions belong to one agent, and `openSessionAs` signs as one agent. A single worker
+  // with an agent-shaped hole in it is how a delivery ends up sent under the wrong identity.
+  const documentDeliveryFor = (agentName: string): DocumentDelivery =>
+    new DocumentDelivery(
+      documentLayer.store,
+      createDocumentDeliveryTransport({
+        agentName,
+        logger,
+        // The SAME 3-state discovery answer cello_initiate_session uses, from the same closure —
+        // online / offline / unknown_agent, kept distinct from "the lookup itself failed". A second
+        // implementation of that distinction drifts until one of them reports a directory outage as
+        // the peer being offline.
+        lookupPeer: async (peerAgentId, correlationId) => {
+          const entry = perAgentSignaling.get(agentName);
+          if (!entry) {
+            // Our OWN stream is not up. A transport fault, never the peer being away — the
+            // reachability mapper turns this into a throw, which the worker logs as lookup_failed.
+            return { kind: "send_failed", reason: "signaling_unavailable" };
+          }
+          return runDiscoveryLookup(entry.signaling, peerAgentId, 10_000, correlationId);
+        },
+        // Most recent LAST — §16.4 reuses the most recent active session, and getSessionsForAgent
+        // returns newest first.
+        activeSessionsWith: (agent, peerAgentId) =>
+          sessionNodeManager
+            .getSessionsForAgent(agent)
+            .filter((row) => row.status === "active" && row.counterparty_pubkey === peerAgentId)
+            .map((row) => row.session_id)
+            .reverse(),
+        openSession: async (agent, peerAgentId, correlationId) => {
+          // The same path `cello_initiate_session` takes, now callable without an IPC connection.
+          const res = (await openSessionAs(agent, { pubkey: peerAgentId })) as {
+            ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
+          };
+          if (res.ok !== true || typeof res.sessionId !== "string") {
+            return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+          }
+          logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
+          return { ok: true, sessionId: res.sessionId };
+        },
+        sealSession: async (agent, sessionId, correlationId) => {
+          // §16.4: the autonomous session still carries the seal — the ceremony goes to zero, the
+          // seal does not. Only ever called for a session this worker OPENED; one it reused belongs
+          // to whoever started that conversation.
+          const close = handlers.get("cello_close_session");
+          if (!close) return;
+          await close({ session_id: sessionId, agent }, `doc-delivery-${correlationId}`);
+        },
+        sendContent: (agent, sessionId, content, contentHash, correlationId) =>
+          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId),
+        encodeEnvelope: (envelope) => {
+          const bytes = encodeDocumentUpdateEnvelope({
+            type: "document_update",
+            document_id: envelope.documentId,
+            epoch_id: envelope.epochId,
+            doc_prev_hash: envelope.docPrevHash,
+            sender_agent_id: envelope.senderAgentId,
+            sender_client_id: envelope.senderClientId ?? 0,
+            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+            state_vector: envelope.stateVector,
+            update: envelope.payload ?? new Uint8Array(0),
+            signature: envelope.signature,
+          });
+          return { bytes, hash: new Uint8Array(createHash("sha256").update(bytes).digest()) };
+        },
+      }),
+      logger,
+    );
+
+  /**
+   * The delivery tick.
+   *
+   * Interval-driven rather than event-driven because the event we are actually waiting for — the
+   * peer coming back online — is not one this daemon observes. There is no presence subscription
+   * (parked, M14-P4), so the honest substitute is to ask periodically and let the per-envelope
+   * backoff keep the cost down: a peer that has been away an hour is checked at the cap, not every
+   * tick.
+   *
+   * Slow on purpose. Publish is fire-and-forget and nothing waits on this; a document that syncs a
+   * minute later is working correctly, while a tight loop over every attended agent is a cost paid
+   * forever for a case that is rare.
+   */
+  const DOCUMENT_DELIVERY_TICK_MS = 60_000;
+  let documentDeliveryRunning = false;
+  const documentDeliveryTimer = setInterval(() => {
+    // NO OVERLAP. A tick that dials a slow peer can outlast the interval, and a second pass would
+    // re-send envelopes already in flight — the worker's own re-entry guard covers one agent, this
+    // covers the sweep across all of them.
+    if (documentDeliveryRunning) return;
+    documentDeliveryRunning = true;
+    void (async () => {
+      try {
+        for (const agentName of perAgentSignaling.keys()) {
+          const senderId = keyProviders.get(agentName)
+            ? Buffer.from(await keyProviders.get(agentName)!.getPublicKey()).toString("hex")
+            : null;
+          // M14-D5: our wire sender id is our pubkey hex, and it is NOT the local agent key the
+          // store is otherwise scoped by. Passing the wrong one returns nothing pending and every
+          // published update sits in the log undelivered with no error on any path.
+          if (senderId === null) continue;
+          const peerFor = (documentId: string): string | null =>
+            documentLayer.store.getDocument(senderId, documentId)?.peerAgentId ?? null;
+          await documentDeliveryFor(agentName).tick(senderId, peerFor, Date.now(), { senderAgentId: senderId });
+        }
+      } catch (err: unknown) {
+        // Contained: one agent's delivery failure must not stop the sweep, and an unhandled
+        // rejection out of a timer takes the daemon down.
+        logger.warn("document.delivery.tick.failed", { reason: extractErrorMessage(err) });
+      } finally {
+        documentDeliveryRunning = false;
+      }
+    })();
+  }, DOCUMENT_DELIVERY_TICK_MS);
+  // Never hold the process open on account of document delivery.
+  documentDeliveryTimer.unref?.();
+
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
   ipcServer.onDisconnect((connectionId) => {
@@ -3259,6 +3384,9 @@ async function startDaemonHoldingLock(
 
   // Graceful shutdown
   async function stop(reason: string): Promise<void> {
+    // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
+    // teardown would dial into a daemon that is going away.
+    clearInterval(documentDeliveryTimer);
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
