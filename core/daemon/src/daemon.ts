@@ -3352,6 +3352,18 @@ async function startDaemonHoldingLock(
         },
         sendContent: (agent, sessionId, content, contentHash, correlationId) =>
           sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId),
+        // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
+        // successful send. See the comment at the call site for why this is delivery-critical and
+        // not audit bookkeeping.
+        appendLeaf: (agent, sessionId, contentHash, correlationId) => {
+          sessionNodeManager.appendSessionLeaf(
+            agent,
+            sessionId,
+            "doc",
+            Buffer.from(contentHash).toString("hex"),
+            correlationId,
+          );
+        },
         encodeEnvelope: (envelope) => {
           const bytes = encodeDocumentUpdateEnvelope({
             type: "document_update",

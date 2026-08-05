@@ -49,6 +49,11 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
       opened.push(p);
       return { ok: true, sessionId: "opened-session" };
     },
+    // The sender's own `0x04` leaf. Required, not optional: `cello_send` takes its leaf position
+    // after every successful send, and a document sender that skips it leaves its own tree behind
+    // by one per frame — which starves its INBOUND, because the receive path holds anything whose
+    // canonical sequence is ahead of its own tree size.
+    appendLeaf: () => {},
     sendContent: async (_a, sessionId) => {
       sends.push({ sessionId });
       return { ok: true, delivered: true };

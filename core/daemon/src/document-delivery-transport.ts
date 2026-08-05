@@ -42,6 +42,14 @@ import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
 import type { Logger } from "./types.js";
 
 export interface DocumentTransportDeps {
+  /**
+   * Take this frame's position in OUR OWN session tree, after it has gone out — the `0x04` doc leaf.
+   *
+   * `cello_send` does this and the document path did not, and the consequence is not a missing
+   * audit record: the tree is the sequence space both sides count in, so a sender that skips it
+   * falls one behind per frame and the peer silently drops what it has already consumed.
+   */
+  appendLeaf(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId: string): void;
   /** The agent this worker delivers for. One worker per attended agent. */
   agentName: string;
   /** `runDiscoveryLookup`, supplied by the composition root — it lives in a closure there. */
@@ -156,6 +164,19 @@ export function createDocumentDeliveryTransport(
         if (session.sessionOpened) await deps.sealSession(deps.agentName, session.sessionId, correlationId);
         return { ok: false, reason: sent.reason, detail: sent.error };
       }
+      // APPEND OUR OWN LEAF, exactly as `cello_send` does after a successful send.
+      //
+      // Not bookkeeping. The daemon's session tree is the sequence space both sides count in, and a
+      // sender that puts content on the wire without taking its leaf position leaves its own chain
+      // one behind for every frame it sends. The peer then sees a sequence it has already consumed
+      // and drops the frame — silently, because a duplicate is a normal event, so nothing is logged
+      // anywhere and the send reports success with `parked: false`.
+      //
+      // It hid behind an accident: with no prior traffic every frame is sequence 0, so the FIRST
+      // document frame in a fresh session arrives and everything after it does not. Adding one
+      // ordinary message before the exchange moved the failure earlier, which is what named the
+      // cause.
+      deps.appendLeaf(deps.agentName, session.sessionId, hash, correlationId);
       deps.logger.info("document.frame.sent", {
         documentId,
         sessionId: session.sessionId,
@@ -177,6 +198,7 @@ export function createDocumentDeliveryTransport(
 
       const { bytes, hash } = deps.encodeEnvelope(envelope);
       const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId);
+      if (sent.ok) deps.appendLeaf(deps.agentName, sessionId, hash, correlationId);
       if (!sent.ok) {
         // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it
         // had just dialled — a live node the operator never started, with no sealed record, which
