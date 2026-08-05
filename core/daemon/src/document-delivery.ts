@@ -40,7 +40,10 @@ export interface DocumentDeliveryTransport {
    * for an ordinary "not online"; a throw means the LOOKUP failed, which is a different fact and
    * must not be recorded as the peer being away.
    */
-  isPeerReachable(peerAgentId: string): Promise<boolean>;
+  isPeerReachable(
+    peerAgentId: string,
+    correlationId: string,
+  ): Promise<{ reachable: boolean; unknownAgent: boolean }>;
   /**
    * Deliver one envelope over a session the transport opens or reuses (§16.4: daemon-chooses by
    * default; `sessionHint` is the one case with audit value — the agent is mid-conversation about
@@ -102,6 +105,28 @@ export const DELIVERY_BACKOFF_MS = [1_000, 5_000, 30_000, 120_000, 600_000] as c
 export const DELIVERY_BACKOFF_CAP_MS = DELIVERY_BACKOFF_MS[DELIVERY_BACKOFF_MS.length - 1];
 
 /**
+ * How long to wait for an ACK after a SUCCESSFUL send, before sending again.
+ *
+ * Deliberately NOT the failure backoff. "How long do I wait after a failure" and "how long do I
+ * wait for an answer" are different questions, and reusing the first for the second re-sent a
+ * successfully-delivered envelope one second later — and every resend is not free: `sendContent`
+ * witnesses a message-leaf hash to the relay and appends a leaf to the session chain, so a
+ * never-acked envelope would pollute the peer's sealed conversation record forever.
+ */
+export const DELIVERY_ACK_TIMEOUT_MS = DELIVERY_BACKOFF_CAP_MS;
+
+/**
+ * How many times an envelope may be SENT without ever being acknowledged before the document
+ * stalls.
+ *
+ * A peer that will never answer must eventually stop being treated as a transient. Without a
+ * ceiling, an envelope sent to a peer whose client cannot ack — which is every peer until the
+ * inbound handler ships on both sides — is re-sent forever and is indistinguishable, in the log
+ * and in `list`, from one that is about to land.
+ */
+export const DELIVERY_MAX_UNACKED_SENDS = 5;
+
+/**
  * A document whose peer cannot be resolved is not transient, so it gets the cap immediately rather
  * than climbing to it — but it DOES get scheduled. See the `no_peer` branch.
  */
@@ -144,7 +169,7 @@ export class DocumentDelivery {
     ownerAgentId: string,
     peerFor: (documentId: string) => string | null,
     nowMs: number,
-    opts: { sessionHint?: string; correlationId?: string } = {},
+    opts: { sessionHints?: ReadonlyMap<string, string>; correlationId?: string } = {},
   ): Promise<DeliveryTickResult> {
     // NO RE-ENTRY. Nothing marks a row in-flight until its outcome lands, so a `deliver` slower
     // than the tick interval — a dial to a distant peer is exactly that — would have the next tick
@@ -164,7 +189,7 @@ export class DocumentDelivery {
     ownerAgentId: string,
     peerFor: (documentId: string) => string | null,
     nowMs: number,
-    opts: { sessionHint?: string; correlationId?: string },
+    opts: { sessionHints?: ReadonlyMap<string, string>; correlationId?: string },
   ): Promise<DeliveryTickResult> {
     // Minted once per pass and threaded through every event, so an operator can tie a failure back
     // to the lookup that preceded it and the session that carried it. Delivery is precisely the
@@ -213,9 +238,9 @@ export class DocumentDelivery {
         continue;
       }
 
-      let reachable: boolean;
+      let reach: { reachable: boolean; unknownAgent: boolean };
       try {
-        reachable = await this.#transport.isPeerReachable(peerAgentId);
+        reach = await this.#transport.isPeerReachable(peerAgentId, correlationId);
       } catch (err: unknown) {
         // A FAILED LOOKUP IS NOT AN OFFLINE PEER. Recording it as "away" would report a directory
         // outage to the operator as their collaborator being absent — an error substituted for a
@@ -231,13 +256,14 @@ export class DocumentDelivery {
         continue;
       }
 
-      if (!reachable) {
-        this.#logger.info("document.delivery.peer_unreachable", {
-          documentId,
-          peerAgentId,
-          pending: envelopes.length,
-          correlationId,
-        });
+      if (!reach.reachable) {
+        // The unknown-agent case is announced AGAINST THE DOCUMENT, not in a separate line that
+        // cannot be joined to it. "This address does not resolve" and "your collaborator stepped
+        // away" are different things to tell an operator, and the second is what they saw for both.
+        this.#logger.info(
+          reach.unknownAgent ? "document.delivery.peer_unknown" : "document.delivery.peer_unreachable",
+          { documentId, peerAgentId, pending: envelopes.length, correlationId },
+        );
         this.#defer(ownerAgentId, documentId, envelopes, nowMs);
         result.deferred += envelopes.length;
         continue;
@@ -260,7 +286,11 @@ export class DocumentDelivery {
             peerAgentId,
             documentId,
             envelope,
-            sessionHint: opts.sessionHint,
+            // Per DOCUMENT. One hint applied to every envelope in the pass refused every OTHER
+            // document's delivery — their peer's active sessions cannot contain this document's
+            // session — so an unrelated update failed and backed off, citing a session the
+            // operator never associated with it.
+            sessionHint: opts.sessionHints?.get(documentId),
             correlationId,
           });
         } catch (err: unknown) {
@@ -274,18 +304,43 @@ export class DocumentDelivery {
         }
 
         if (outcome.ok && outcome.admitted === null) {
-          // IN FLIGHT. The content left, and the peer has not answered. Recorded as DELIVERED so
-          // the operator can see it went, and left unacked so the worker keeps asking — on the
-          // capped backoff the claim above already scheduled, not at full rate.
+          // IN FLIGHT. The content left and the peer has not answered.
           this.#store.markDelivered(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
+          // RE-SCHEDULE ON THE ACK TIMEOUT, overwriting the pre-dial failure claim. That claim is
+          // `backoffFor(attempts)`, which for a first send is ONE SECOND — so a successfully
+          // delivered envelope was re-sent a second later, and every resend appends a leaf to the
+          // peer's sealed conversation record. The failure backoff answers a different question.
+          this.#store.recordDeliveryAttempt(
+            ownerAgentId,
+            documentId,
+            envelope.envelopeHash,
+            nowMs + DELIVERY_ACK_TIMEOUT_MS,
+          );
           this.#logger.info("document.delivery.sent", {
             documentId,
             envelopeHash: envelope.envelopeHash,
             sessionId: outcome.sessionId,
             sessionOpened: outcome.sessionOpened,
+            unackedSends: attempts,
             correlationId,
           });
           result.sent += 1;
+
+          if (attempts >= DELIVERY_MAX_UNACKED_SENDS) {
+            // A peer that will never answer must stop being a transient. Otherwise this envelope is
+            // re-sent forever and looks, in the log and in `list`, exactly like one about to land.
+            this.#store.setDocumentStatus(ownerAgentId, documentId, "stalled");
+            this.#logger.error("document.delivery.unacked_limit", {
+              documentId,
+              envelopeHash: envelope.envelopeHash,
+              sends: attempts,
+              correlationId,
+              detail:
+                `this update has been delivered ${attempts} times without the peer's daemon ever ` +
+                `confirming it — the document has stopped publishing. Their client may not support ` +
+                `shared documents yet.`,
+            });
+          }
         } else if (outcome.ok) {
           // ACK = the peer's daemon ANSWERED, admitted or not. A rejection is an ack for delivery
           // purposes (§3.2's 0x05): the peer has decided, so there is nothing left to retry, and

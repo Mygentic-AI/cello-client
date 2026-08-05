@@ -12,6 +12,8 @@ import {
   backoffFor,
   DELIVERY_BACKOFF_CAP_MS,
   DELIVERY_BACKOFF_MS,
+  DELIVERY_ACK_TIMEOUT_MS,
+  DELIVERY_MAX_UNACKED_SENDS,
   type DocumentDeliveryTransport,
 } from "../document-delivery.js";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
@@ -61,7 +63,7 @@ function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existing
   }
   const calls: Array<{ envelopeHash: string; sessionHint?: string }> = [];
   const t: DocumentDeliveryTransport = {
-    isPeerReachable: async () => true,
+    isPeerReachable: async () => ({ reachable: true, unknownAgent: false }),
     deliver: async (input) => {
       calls.push({ envelopeHash: input.envelope.envelopeHash, sessionHint: input.sessionHint });
       return { ok: true, admitted: true, sessionId: "session-1", sessionOpened: true };
@@ -141,7 +143,7 @@ describe("DocumentDelivery — an unreachable peer costs a lookup, not a dial", 
   it("defers without dialing when the peer is offline", async () => {
     let dialed = 0;
     const f = newFixture({
-      isPeerReachable: async () => false,
+      isPeerReachable: async () => ({ reachable: false, unknownAgent: false }),
       deliver: async () => {
         dialed += 1;
         return { ok: true, admitted: true, sessionId: "s", sessionOpened: true };
@@ -162,7 +164,7 @@ describe("DocumentDelivery — an unreachable peer costs a lookup, not a dial", 
     const f = newFixture({
       isPeerReachable: async () => {
         lookups += 1;
-        return true;
+        return { reachable: true, unknownAgent: false };
       },
     });
     let prev: string | null = null;
@@ -316,7 +318,7 @@ describe("DocumentDelivery — the session hint (§16.4)", () => {
   it("passes an explicit hint through, and omits it otherwise", async () => {
     const f = newFixture();
     f.store.appendEnvelope(AGENT, envelope(AGENT, null));
-    await f.delivery.tick(AGENT, f.peerFor, NOW, { sessionHint: "session-abc" });
+    await f.delivery.tick(AGENT, f.peerFor, NOW, { sessionHints: new Map([[DOC, "session-abc"]]) });
     expect(f.calls[0]!.sessionHint).toBe("session-abc");
 
     const g = newFixture();
@@ -431,16 +433,33 @@ describe("DocumentDelivery — SENT is neither done nor failed", () => {
     expect(row.ackedAtMs).toBeNull();
   });
 
-  it("keeps asking on the BACKOFF, not at full rate", async () => {
+  it("waits the ACK TIMEOUT before sending again — not the failure backoff", async () => {
     const f = newFixture(inFlight());
     f.store.appendEnvelope(AGENT, envelope(AGENT, null));
     await f.delivery.tick(AGENT, f.peerFor, NOW);
 
-    // Counting a send that WORKED as a failure would re-send content already in flight — the
-    // permanent-redelivery shape this milestone fixed once already. It stays pending, but due
-    // later, so the worker asks again rather than shouting.
-    expect(await f.delivery.tick(AGENT, f.peerFor, NOW + 1)).toMatchObject({ attempted: 0 });
-    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(1);
+    // The EXACT scheduled time. The earlier version asserted only "not due one millisecond later
+    // and due at the cap", which any backoff of 2ms satisfies — and the real post-send wait was
+    // ONE SECOND, because the pre-dial failure claim was never overwritten. Every resend appends a
+    // leaf to the peer's sealed conversation record, so a second is not a cheap mistake.
+    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.nextAttemptAtMs).toBe(NOW + DELIVERY_ACK_TIMEOUT_MS);
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_ACK_TIMEOUT_MS - 1)).toHaveLength(0);
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_ACK_TIMEOUT_MS)).toHaveLength(1);
+  });
+
+  it("STALLS the document once an envelope has been sent too many times unacked", async () => {
+    const f = newFixture(inFlight());
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    let at = NOW;
+    for (let i = 0; i < DELIVERY_MAX_UNACKED_SENDS; i++) {
+      await f.delivery.tick(AGENT, f.peerFor, at);
+      at += DELIVERY_ACK_TIMEOUT_MS;
+    }
+    // A peer that will never answer must stop being treated as a transient. Unbounded, the envelope
+    // is re-sent forever and looks — in the log and in `list` — exactly like one about to land.
+    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("stalled");
+    expect(f.events.some((e) => e.event === "document.delivery.unacked_limit")).toBe(true);
   });
 
   it("an ack arriving later settles it", async () => {

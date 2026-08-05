@@ -49,7 +49,16 @@ export interface Reachability {
 export function reachabilityFromDiscovery(outcome: DiscoveryOutcome): Reachability {
   switch (outcome.kind) {
     case "result":
-      if (outcome.state === "online") return { reachable: true, unknownAgent: false };
+      if (outcome.state === "online") {
+        if (outcome.owningNodeIds.length === 0) {
+          // `classifyOnlineResult` calls exactly this shape malformed — "online but no owner named
+          // … never dial a fabricated node" — and treats it as retry, not as availability. This
+          // module's whole thesis is that only a RESULT is an answer about the peer; a result that
+          // names no home answers nothing.
+          throw new DiscoveryUnavailableError("online_without_owner", "no owning node named");
+        }
+        return { reachable: true, unknownAgent: false };
+      }
       if (outcome.state === "unknown_agent") return { reachable: false, unknownAgent: true };
       return { reachable: false, unknownAgent: false };
 

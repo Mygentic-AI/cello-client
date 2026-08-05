@@ -89,6 +89,10 @@ export interface DocumentListRow {
   epochId: number;
   status: string;
   pendingDeliveries: number;
+  /** Of those, how many have LEFT and are awaiting the peer's confirmation. */
+  pendingSent: number;
+  /** Of those, how many have not left this machine at all. */
+  pendingUnsent: number;
   /** We have closed and the peer has not. */
   closePending: boolean;
 }
@@ -128,9 +132,15 @@ export class DocumentLifecycle {
     // Every pending envelope regardless of schedule: the operator is asking "what has not reached
     // my peer", not "what is due for a retry in the next few seconds".
     const pending = this.#store.pendingDeliveries(ownerAgentId, Number.MAX_SAFE_INTEGER);
-    const pendingByDocument = new Map<string, number>();
+    const pendingByDocument = new Map<string, { total: number; sent: number }>();
     for (const e of pending) {
-      pendingByDocument.set(e.documentId, (pendingByDocument.get(e.documentId) ?? 0) + 1);
+      const c = pendingByDocument.get(e.documentId) ?? { total: 0, sent: 0 };
+      c.total += 1;
+      // SPLIT, because "sent, awaiting confirmation" and "never left this machine" are different
+      // things to tell an operator asking why their work has not landed — and the column that
+      // records the difference had a writer but no reader, which is how it got deleted once.
+      if (e.deliveredAtMs != null) c.sent += 1;
+      pendingByDocument.set(e.documentId, c);
     }
     void nowMs;
 
@@ -141,7 +151,11 @@ export class DocumentLifecycle {
       assuranceTier: "authenticated",
       epochId: 0,
       status: d.status,
-      pendingDeliveries: pendingByDocument.get(d.documentId) ?? 0,
+      pendingDeliveries: pendingByDocument.get(d.documentId)?.total ?? 0,
+      pendingSent: pendingByDocument.get(d.documentId)?.sent ?? 0,
+      pendingUnsent:
+        (pendingByDocument.get(d.documentId)?.total ?? 0) -
+        (pendingByDocument.get(d.documentId)?.sent ?? 0),
       closePending:
         this.#hasClosed(ownerAgentId, d.documentId, ownerAgentId) &&
         !this.#hasClosed(ownerAgentId, d.documentId, d.peerAgentId),

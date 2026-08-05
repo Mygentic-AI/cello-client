@@ -35,6 +35,7 @@
  */
 
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
+import type { DocumentEnvelopeRow } from "./document-store.js";
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
 import type { Logger } from "./types.js";
@@ -44,6 +45,13 @@ export interface DocumentTransportDeps {
   agentName: string;
   /** `runDiscoveryLookup`, supplied by the composition root — it lives in a closure there. */
   lookupPeer(peerAgentId: string, correlationId: string): Promise<DiscoveryOutcome>;
+  /**
+   * Close and SEAL a session this adapter opened. §16.4: the autonomous session "still happens
+   * because it carries signing, encryption, and the seal" — an opened session left running is a
+   * live node the operator did not start and that never produces the sealed record the whole
+   * design exists for.
+   */
+  sealSession(agentName: string, sessionId: string, correlationId: string): Promise<void>;
   /** Active sessions with this peer, most recent LAST. */
   activeSessionsWith(agentName: string, peerAgentId: string): string[];
   /** The existing initiate path: negotiate, dial, create the session node. */
@@ -65,7 +73,7 @@ export interface DocumentTransportDeps {
     | { ok: false; reason: string; error: string }
   >;
   /** Encode a document envelope row onto the wire, and its content hash. */
-  encodeEnvelope(envelope: unknown): { bytes: Uint8Array; hash: Uint8Array };
+  encodeEnvelope(envelope: DocumentEnvelopeRow): { bytes: Uint8Array; hash: Uint8Array };
   logger: Logger;
 }
 
@@ -73,17 +81,17 @@ export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
 ): DocumentDeliveryTransport {
   return {
-    async isPeerReachable(peerAgentId: string): Promise<boolean> {
-      const outcome = await deps.lookupPeer(peerAgentId, `reach-${peerAgentId.slice(0, 8)}`);
+    async isPeerReachable(peerAgentId: string, correlationId: string) {
+      // The PASS's correlation id, threaded through. A per-peer constant was fabricated here, so
+      // every `directory.discovery.lookup` this worker ever emitted carried the same string and
+      // none of them joined to the pass — breaking the thread at exactly the hop an operator needs
+      // when nothing is syncing.
+      const outcome = await deps.lookupPeer(peerAgentId, correlationId);
       // Throws on everything that is not an answer about the peer — see document-reachability.ts.
       // The worker treats the throw as `lookup_failed` and keeps it out of the offline-peer count.
-      const { reachable, unknownAgent } = reachabilityFromDiscovery(outcome);
-      if (unknownAgent) {
-        // Distinct from "offline": the address does not resolve at all. Same consequence (do not
-        // dial), different thing to tell an operator, so it is said rather than folded in.
-        deps.logger.warn("document.delivery.peer_unknown", { peerAgentId });
-      }
-      return reachable;
+      // The unknown-agent bit is RETURNED rather than logged here, so the worker can announce it
+      // against the document it belongs to.
+      return reachabilityFromDiscovery(outcome);
     },
 
     async deliver(input) {
@@ -133,6 +141,15 @@ export function createDocumentDeliveryTransport(
         parked: sent.delivered === false,
         correlationId,
       });
+
+      // SEAL what we opened. §16.4: the autonomous session still happens because it carries
+      // signing, encryption and the seal — the ceremony goes to zero, the seal does not. A session
+      // this adapter opened and walked away from is a live node the operator never started, and
+      // the sealed record the design exists to produce is never produced. A session we REUSED is
+      // not ours to close: its owner decides when that conversation ends.
+      if (sessionOpened) {
+        await deps.sealSession(deps.agentName, sessionId, correlationId);
+      }
 
       // SENT, NOT ACKED — `admitted: null`. The content left (or was parked for an offline peer),
       // which is a transport fact; the DoD's ack is the peer's daemon confirming admission, and

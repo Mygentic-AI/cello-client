@@ -40,6 +40,7 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
   const { logger, events } = recordingLogger();
   const opened: string[] = [];
   const sends: Array<{ sessionId: string }> = [];
+  const sealed: string[] = [];
   const deps: DocumentTransportDeps = {
     agentName: AGENT,
     lookupPeer: async () => ({ kind: "result", state: "online", owningNodeIds: ["n1"] }),
@@ -52,11 +53,14 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
       sends.push({ sessionId });
       return { ok: true, delivered: true };
     },
+    sealSession: async (_a, sessionId) => {
+      sealed.push(sessionId);
+    },
     encodeEnvelope: () => ({ bytes: new Uint8Array([9]), hash: new Uint8Array(32) }),
     logger,
     ...over,
   };
-  return { transport: createDocumentDeliveryTransport(deps), events, opened, sends };
+  return { transport: createDocumentDeliveryTransport(deps), events, opened, sends, sealed };
 }
 
 const deliverInput = (over: Partial<Parameters<ReturnType<typeof createDocumentDeliveryTransport>["deliver"]>[0]> = {}) => ({
@@ -70,31 +74,33 @@ const deliverInput = (over: Partial<Parameters<ReturnType<typeof createDocumentD
 describe("delivery transport — reachability comes from discovery, not from a dial", () => {
   it("reports an online peer as reachable", async () => {
     const t = newTransport();
-    expect(await t.transport.isPeerReachable(PEER)).toBe(true);
+    expect(await t.transport.isPeerReachable(PEER, "c")).toMatchObject({ reachable: true });
   });
 
   it("reports an offline peer as unreachable", async () => {
     const t = newTransport({
       lookupPeer: async () => ({ kind: "result", state: "offline", owningNodeIds: [] }),
     });
-    expect(await t.transport.isPeerReachable(PEER)).toBe(false);
+    expect(await t.transport.isPeerReachable(PEER, "c")).toMatchObject({ reachable: false });
   });
 
   it("names an unknown agent DISTINCTLY from an offline one", async () => {
     const t = newTransport({
       lookupPeer: async () => ({ kind: "result", state: "unknown_agent", owningNodeIds: [] }),
     });
-    expect(await t.transport.isPeerReachable(PEER)).toBe(false);
-    // Same consequence (do not dial), different thing to tell an operator — an address that does
-    // not resolve is not a collaborator who stepped away.
-    expect(t.events.some((e) => e.event === "document.delivery.peer_unknown")).toBe(true);
+    // RETURNED, not logged here: the worker announces it against the document it belongs to, so
+    // an operator can join "this address does not resolve" to the document it concerns.
+    expect(await t.transport.isPeerReachable(PEER, "c")).toEqual({
+      reachable: false,
+      unknownAgent: true,
+    });
   });
 
   it("THROWS when the lookup itself failed, rather than calling the peer offline", async () => {
     const t = newTransport({ lookupPeer: async () => ({ kind: "timeout" }) });
     // The worker turns this into lookup_failed and keeps it out of the offline count. Returning
     // false would report a directory or transport fault as the peer being absent.
-    await expect(t.transport.isPeerReachable(PEER)).rejects.toThrow(/document_discovery_unavailable/);
+    await expect(t.transport.isPeerReachable(PEER, "c")).rejects.toThrow(/document_discovery_unavailable/);
   });
 });
 
@@ -174,5 +180,24 @@ describe("delivery transport — a send is SENT, not acked", () => {
     const res = await t.transport.deliver(deliverInput());
     expect(res).toMatchObject({ ok: false, reason: "session_node_unavailable" });
     expect((res as { detail?: string }).detail).toContain("no active session node");
+  });
+});
+
+
+describe("delivery transport — an OPENED session is sealed; a REUSED one is not ours to close", () => {
+  it("seals the session it opened", async () => {
+    const t = newTransport();
+    await t.transport.deliver(deliverInput());
+    // §16.4: the autonomous session still happens because it carries signing, encryption and the
+    // seal — the ceremony goes to zero, the seal does not. Walking away leaves a live node the
+    // operator never started, and the sealed record the design exists for is never produced.
+    expect(t.sealed).toEqual(["opened-session"]);
+  });
+
+  it("does NOT seal a session it merely reused", async () => {
+    const t = newTransport({ activeSessionsWith: () => ["theirs"] });
+    await t.transport.deliver(deliverInput());
+    // Its owner decides when that conversation ends.
+    expect(t.sealed).toEqual([]);
   });
 });
