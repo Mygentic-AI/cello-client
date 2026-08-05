@@ -239,3 +239,20 @@ export {
   verifyDocumentChainLink,
 } from "./document-envelope.js";
 export type { DocumentUpdateEnvelope } from "./document-envelope.js";
+export {
+  DOCUMENT_PROPOSAL_DOMAIN,
+  DOCUMENT_FEATURE_VERSION,
+  ASSURANCE_TIER_V1,
+  TOPOLOGY_V1,
+  buildDocumentProposalTbs,
+  documentIdFromProposal,
+  encodeDocumentProposal,
+  decodeDocumentProposal,
+  seamViolation,
+  documentFeatureIncompatibility,
+} from "./document-proposal.js";
+export type {
+  DocumentProposalEnvelope,
+  DocumentProperties,
+  DocumentConsentState,
+} from "./document-proposal.js";

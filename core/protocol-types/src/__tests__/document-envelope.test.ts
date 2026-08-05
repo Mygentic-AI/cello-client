@@ -294,62 +294,81 @@ describe("document update TBS — the FROZEN vector", () => {
 });
 
 describe("verifyDocumentChainLink — the receive-time check names the gap", () => {
-  it("accepts an envelope whose doc_prev_hash is the sender's last known hash", () => {
-    expect(() => verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), PREV)).not.toThrow();
+  const sender = (head: string | null, ...known: string[]) => ({
+    head,
+    known: new Set(head === null ? known : [head, ...known]),
+  });
+
+  it("accepts an envelope whose doc_prev_hash is the sender's head", () => {
+    expect(verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), sender(PREV))).toEqual({
+      duplicate: false,
+    });
   });
 
   it("accepts a genesis envelope when the sender has no prior envelope", () => {
-    expect(() => verifyDocumentChainLink(envelope({ doc_prev_hash: null }), null)).not.toThrow();
+    expect(verifyDocumentChainLink(envelope({ doc_prev_hash: null }), sender(null))).toEqual({
+      duplicate: false,
+    });
   });
 
   it("refuses a genesis envelope from a sender that ALREADY has a chain", () => {
-    // This is a fork: two roots for one sender. It is exactly what a replaying attacker submits,
-    // and — as REJECT-1 found the hard way — it also makes the document unrebuildable.
-    expect(() => verifyDocumentChainLink(envelope({ doc_prev_hash: null }), PREV)).toThrow(
-      /document_chain_fork/,
+    expect(() => verifyDocumentChainLink(envelope({ doc_prev_hash: null }), sender(PREV))).toThrow(
+      /document_chain_forked/,
     );
   });
 
-  it("refuses an envelope that chains to something other than the sender's last hash, NAMING both", () => {
+  it("a REDELIVERED head is benign, not a chain failure", () => {
+    const env = envelope({ doc_prev_hash: PREV });
+    expect(verifyDocumentChainLink(env, sender(documentEnvelopeHash(env), PREV))).toEqual({
+      duplicate: true,
+    });
+  });
+
+  it("an OLDER redelivery is benign too — not only the newest one", () => {
+    // Delivery derives pending from the log and retries across restarts, so if envelope N-1's ack
+    // is lost while N lands, the very next retry is an older duplicate. Compared against the head
+    // alone, that reported a broken chain for the protocol's own designed retry.
+    const older = envelope({ doc_prev_hash: PREV });
+    const head = "9a".repeat(32);
+    expect(
+      verifyDocumentChainLink(older, sender(head, PREV, documentEnvelopeHash(older))),
+    ).toEqual({ duplicate: true });
+  });
+
+  it("distinguishes a BRANCH from a GAP — they are different facts", () => {
+    const head = "9a".repeat(32);
+    // Chains to something we hold, but which is not the head: a branch.
+    expect(() =>
+      verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), sender(head, PREV)),
+    ).toThrow(/document_chain_forked/);
+    // Chains to something we have never seen: a gap. One string for both would hide a fork inside
+    // a delivery-shaped error.
+    expect(() =>
+      verifyDocumentChainLink(envelope({ doc_prev_hash: "ee".repeat(32) }), sender(head, PREV)),
+    ).toThrow(/document_chain_broken/);
+  });
+
+  it("names both links and the sender when the predecessor is unknown", () => {
     const wrong = "ee".repeat(32);
     let caught = "";
     try {
-      verifyDocumentChainLink(envelope({ doc_prev_hash: wrong }), PREV);
+      verifyDocumentChainLink(envelope({ doc_prev_hash: wrong }), sender(PREV));
     } catch (e) {
       caught = (e as Error).message;
     }
-    // "Naming the gap" is the AC: an operator must be able to see WHICH link was expected and
-    // which arrived, or the error is just a label on the exit point.
     expect(caught).toMatch(/document_chain_broken/);
     expect(caught).toContain(wrong);
     expect(caught).toContain(PREV);
     expect(caught).toContain("agent-a");
   });
 
-  it("a REDELIVERED envelope is benign, not a chain gap", () => {
-    const env = envelope({ doc_prev_hash: PREV });
-    // Delivery derives pending from the log and retries across restarts, so a peer re-sending an
-    // envelope whose ack was lost is designed behaviour. Compared naively its doc_prev_hash is the
-    // PREDECESSOR while the head is its own hash, so it reported a chain gap — an operator sent to
-    // hunt a missing envelope or a hostile fork when the fact is "we already have this one".
-    expect(verifyDocumentChainLink(env, documentEnvelopeHash(env))).toEqual({ duplicate: true });
-  });
-
-  it("reports a first delivery as NOT a duplicate", () => {
-    expect(verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), PREV)).toEqual({
-      duplicate: false,
-    });
-  });
-
   it("refuses a non-genesis envelope when the sender has no chain yet", () => {
     let caught = "";
     try {
-      verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), null);
+      verifyDocumentChainLink(envelope({ doc_prev_hash: PREV }), sender(null));
     } catch (e) {
       caught = (e as Error).message;
     }
-    // The sender's first envelope is missing — accepting this would replay a suffix of a chain
-    // whose head we never saw.
     expect(caught).toMatch(/document_chain_broken/);
     expect(caught).toContain(PREV);
   });
