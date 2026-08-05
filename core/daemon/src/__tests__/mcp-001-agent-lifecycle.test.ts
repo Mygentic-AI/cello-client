@@ -159,6 +159,63 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(switchEvent!.context.connectionId).toBeDefined();
   });
 
+  /**
+   * M12-P16 — "offline" must mean STOP TALKING, not "stop accepting new sessions".
+   *
+   * Measured live 2026-08-05 across two machines on published daemon 0.0.124: I set an agent offline,
+   * confirmed it (`state: registered`, `standing_receiver_ready: false`), then sent it a message from
+   * the other machine. It ACCEPTED the content directly, appended a leaf, ran its away logic and
+   * REPLIED — the whole exchange is in its transcript. The handler tore down the standing receiver
+   * (so no NEW inbound session could be accepted) and left every existing per-session node alive and
+   * serving, and direct delivery goes to the session node.
+   *
+   * The CLI's own help says: "Take an agent offline. It stops accepting anything until restarted."
+   * An operator reaching for this is reaching for a kill switch; a kill switch that keeps answering
+   * is worse than none, because it reports success.
+   */
+  it("M12-P16: going offline tears down the agent's ACTIVE SESSION NODES, not just its standing receiver", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+
+    const snm = handle.getSessionNodeManager();
+    const SID = "f1".repeat(32);
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    expect(snm.getSessionRecord("alice", SID)?.status).toBe("active");
+
+    await client.send("cello_set_agent_offline", { name: "alice" });
+
+    // The session must no longer be served. Its row goes `interrupted`, which is the honest record:
+    // this side stopped participating. It is NOT sealed — nothing was agreed with the counterparty —
+    // and it is NOT abandoned, which would be terminal and forfeit the receipt.
+    expect(
+      snm.getSessionRecord("alice", SID)?.status,
+      "an offline agent must not still be serving a live session",
+    ).toBe("interrupted");
+  });
+
+  it("M12-P16: another agent's sessions are untouched — offline is per-agent, never a global stop", async () => {
+    // The obvious way to get the test above green is to tear down every session on the daemon. That
+    // would take an unrelated agent's live conversation down with it.
+    const config = await setupWithAgents("alice", "bob");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
+
+    const snm = handle.getSessionNodeManager();
+    const ALICE_SID = "f2".repeat(32);
+    const BOB_SID = "f3".repeat(32);
+    await snm.createSessionNode(ALICE_SID, "alice", "xpubkeyhex", "x-peer", "corr-a");
+    await snm.createSessionNode(BOB_SID, "bob", "ypubkeyhex", "y-peer", "corr-b");
+
+    await client.send("cello_set_agent_offline", { name: "alice" });
+
+    expect(snm.getSessionRecord("alice", ALICE_SID)?.status).toBe("interrupted");
+    expect(snm.getSessionRecord("bob", BOB_SID)?.status, "bob never went offline").toBe("active");
+  });
+
   // ─── AC-004: cello_set_agent_offline transitions Online→Registered (idempotent) ───
   it("AC-004: cello_set_agent_offline transitions agent to registered and clears current", async () => {
     const config = await setupWithAgents("alice");

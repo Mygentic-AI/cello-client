@@ -329,6 +329,39 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
       logger.warn("agent.stop.receiver_teardown_failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
     });
+
+    // M12-P16: OFFLINE MEANS STOP TALKING.
+    //
+    // Tearing down the standing receiver only stops NEW inbound sessions. Direct delivery goes to
+    // the per-session node, so an agent reported `offline` kept accepting content on every session
+    // it already had, appending leaves, running its away logic and REPLYING. Measured live across
+    // two machines on 2026-08-05; the whole exchange is in the counterparty's transcript. The CLI's
+    // own help promises "It stops accepting anything until restarted", and an operator reaching for
+    // this is reaching for a kill switch — one that keeps answering while reporting success is worse
+    // than none at all.
+    //
+    // Scoped to THIS agent's sessions: another agent on the same daemon is still online and its
+    // conversations must not be collateral. `interrupted` is the honest status — this side stopped
+    // participating. Not `sealed` (nothing was agreed with the counterparty) and not `abandoned`
+    // (terminal, forfeits the receipt); an interrupted session can still be sealed later, which
+    // M12-P15 is what makes reliably possible.
+    const ownSessions = sessionNodeManager.getSessionsByStatus("active").filter((r) => r.agent_name === name);
+    for (const s of ownSessions) {
+      try {
+        await sessionNodeManager.destroySessionNode(name, s.session_id, "interrupted");
+      } catch (err: unknown) {
+        // Never let one stuck session leave the agent half-offline: the others must still be torn
+        // down, and the failure must be visible rather than swallowed into a green `{ ok: true }`.
+        logger.error("agent.stop.session_teardown_failed", {
+          agentName: name, sessionId: s.session_id,
+          impact: "this session may still accept content from the counterparty while the agent reports offline",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (ownSessions.length > 0) {
+      logger.info("agent.stop.sessions_interrupted", { agentName: name, count: ownSessions.length });
+    }
     logger.info("agent.offline", { agentName: name, reason: "stopped" });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     getNotificationDispatcher().dispatchAgentStateChanged(name, "offline", "stopped");
