@@ -680,5 +680,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
   };
 
   // DAEMON-003: Initialize RetryQueue and NonceDedupStore (AC-008).
-  return { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator };
+  return {
+    openVisitingConnection,
+    crossNodeBrokerBySession,
+    resolvedSessionNegotiator,
+    // M14 / DOD-DOC-DELIVERY-2: exposed for the document delivery worker, the first NON-HANDLER
+    // consumer of this module. It needs the same 3-state discovery answer `cello_initiate_session`
+    // uses — online / offline / unknown_agent, kept distinct from "the lookup itself failed" — and
+    // a second implementation of that distinction is how the two drift until one starts reporting a
+    // directory outage as the peer being offline.
+    runDiscoveryLookup,
+  };
 }
