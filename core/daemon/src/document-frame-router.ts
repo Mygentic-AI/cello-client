@@ -73,6 +73,7 @@ import {
   decodeDocumentProposal,
   decodeDocumentRejection,
   decodeDocumentProposalAck,
+  decodeDocumentControl,
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
 import type { DocumentAckInbound } from "./document-ack-inbound.js";
@@ -85,7 +86,13 @@ import type { Logger } from "./types.js";
  * message and fires the doorbell exactly as before. Nothing about the conversation path changes.
  */
 /** Every document frame kind that can arrive on the session channel. */
-export type DocumentFrameKind = "update" | "ack" | "proposal" | "rejection" | "proposal_ack";
+export type DocumentFrameKind =
+  | "update"
+  | "ack"
+  | "proposal"
+  | "rejection"
+  | "proposal_ack"
+  | "control";
 
 export type FrameRouting =
   | { consumed: false }
@@ -120,6 +127,12 @@ export interface DocumentFrameRouterDeps {
    * the conversation path and an operator's agent is handed a CBOR ack as something a person said.
    */
   recordProposalAck(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /**
+   * The peer has CLOSED or KILLED the document. Unclassified, this frame falls through to the
+   * conversation path and the operator keeps publishing into a document that will never answer,
+   * with nothing on their screen explaining why.
+   */
+  recordControl(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * Map the daemon's AGENT NAME — the only identifier the session content path carries — to the
    * stable owner key every document row is scoped by (M14-D5: our own K_local pubkey hex).
@@ -263,6 +276,10 @@ export class DocumentFrameRouter {
         this.#d.recordProposalAck(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
       }
+      if (kind === "control") {
+        this.#d.recordControl(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
+      }
       const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);
       return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
     } catch (err: unknown) {
@@ -370,6 +387,12 @@ function classify(content: Uint8Array): DocumentFrameKind | null {
   try {
     decodeDocumentProposalAck(content);
     return "proposal_ack";
+  } catch {
+    /* not a proposal ack */
+  }
+  try {
+    decodeDocumentControl(content);
+    return "control";
   } catch {
     // Not document traffic at all.
   }

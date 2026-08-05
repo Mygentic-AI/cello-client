@@ -27,6 +27,7 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
+import { createDocumentControlNotifier } from "../document-control-notifier.js";
 import { DocumentPublish } from "../document-publish.js";
 import { DocumentDelivery } from "../document-delivery.js";
 import type { DocumentDeliveryTransport } from "../document-delivery.js";
@@ -56,6 +57,11 @@ async function makeParty(agentName: string) {
 
   const wire: Wire = { deliverToPeer: null, online: true };
 
+  // Declared before the layer because the notifier needs the store, and the store is inside the
+  // layer. Assigned immediately after; the notifier is only ever called from lifecycle, long after
+  // construction.
+  let layerRef: ReturnType<typeof createDocumentLayer>;
+
   const layer = createDocumentLayer({
     db,
     logger,
@@ -63,10 +69,23 @@ async function makeParty(agentName: string) {
     // The NAME→KEY map, exactly as the daemon does it. Both halves resolve through this one
     // function; when they did not, every row landed where the other half never looked.
     ownerKeyFor: (n) => (n === agentName ? owner : null),
-    notifyPeer: async () => ({ ok: true }),
+    // THE REAL NOTIFIER, not a stub. This seam was `async () => ({ ok: true })`, and that single
+    // line is why three tests here passed while `kill` told nobody: a stub on the far side reports
+    // success, sends nothing, and agrees with whatever the near side did. Only the TRANSPORT is
+    // substituted below — the part that genuinely has to be.
+    notifyPeer: createDocumentControlNotifier({
+      get store() {
+        return layerRef.store;
+      },
+      owners: () => [{ agentName, ownerAgentId: owner }],
+      sign: async (_n, tbs) => keys.sign(tbs),
+      send: (_n, input) => transport.sendBytes(input),
+      now: () => NOW,
+    }),
     rollback: () => ({ ok: true }),
     sign: async (_o, tbs) => keys.sign(tbs),
   });
+  layerRef = layer;
 
   const transport = {
     isPeerReachable: async () => ({ reachable: wire.online, unknownAgent: false }),
@@ -524,5 +543,94 @@ describe("cello_doc_diff — reviewing what arrived before building on it", () =
     await a.call("cello_doc_read", { document_id: documentId });
     // An agent that re-reviews the same change on every turn will keep re-reacting to it.
     expect(await a.call("cello_doc_diff", { document_id: documentId })).toMatchObject({ unchanged: true });
+  });
+});
+
+describe("ending a document — the peer is TOLD, over the wire", () => {
+  it("a KILL reaches the peer and stops their document too", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    expect(await a.call("cello_doc_kill", { document_id: documentId })).toMatchObject({
+      ok: true,
+      peerNotified: true,
+    });
+
+    // Bob's copy is terminal too. Until the control frame existed, `notifyPeer` refused and Bob kept
+    // publishing into a document that would never answer, with nothing on his screen explaining why.
+    await vi.waitFor(() => expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("killed"));
+    const write = await b.call("cello_doc_write", { document_id: documentId, content: "still typing" });
+    expect(write).toMatchObject({ published: false });
+  });
+
+  it("a kill SUCCEEDS locally when the peer cannot be reached, and says the peer was not told", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    a.wire.online = false;
+    const killed = await a.call("cello_doc_kill", { document_id: documentId });
+    // A decision to stop that depends on the other party being online is not a decision to stop.
+    // But the operator is TOLD they were not told, because otherwise they will not understand why
+    // the peer keeps writing.
+    expect(killed).toMatchObject({ ok: true, peerNotified: false });
+    expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("killed");
+  });
+
+  it("a CLOSE is bilateral — one side saying it does not end the document", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    await a.call("cello_doc_close", { document_id: documentId });
+    // Still active on BOTH sides. Reporting "closed" here would tell an operator the collaboration
+    // is over while the counterparty is still editing.
+    expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("active");
+    await vi.waitFor(() => expect(b.layer.store.getDocument(b.owner, documentId)).not.toBeNull());
+
+    await b.call("cello_doc_close", { document_id: documentId });
+    await vi.waitFor(() => expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed"));
+  });
+
+  it("a THIRD party cannot end this pair's document", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    const c = await makeParty("carol");
+    connect(a, b);
+    const documentId = (await a.call("cello_doc_propose", { peer_pubkey: b.owner })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Carol signs a real, well-formed kill for a document she is not part of and delivers it
+    // straight to Bob's inbound path. Without the sender check, any string plus a valid signature
+    // ends someone else's document.
+    c.wire.deliverToPeer = (bytes) => b.receive(bytes);
+    c.layer.store.createDocument({
+      documentId, ownerAgentId: c.owner, peerAgentId: b.owner, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    await c.call("cello_doc_kill", { document_id: documentId });
+
+    // Bob's document is untouched: Carol is not its peer.
+    expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("active");
   });
 });

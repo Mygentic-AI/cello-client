@@ -571,7 +571,44 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     return { ok: true, documentId, changed: true, published: true, envelopeHash: result.envelopeHash };
   });
 
+  // ─── close / kill ─────────────────────────────────────────────────────────────────────────
+
+  handlers.set("cello_doc_close", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    const outcome = await layer.lifecycle.close(who.ownerAgentId, documentId, deps.now());
+    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
+    // BILATERAL. The document settles when both sides have said it, so "closed" is not this call's
+    // answer to give — reporting it would tell an operator the collaboration is over while the peer
+    // is still editing.
+    return {
+      ok: true,
+      documentId,
+      status: layer.store.getDocument(who.ownerAgentId, documentId)?.status ?? "unknown",
+    };
+  });
+
+  handlers.set("cello_doc_kill", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    const outcome = await layer.lifecycle.kill(who.ownerAgentId, documentId, deps.now());
+    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
+    // `peerNotified` is REPORTED, never hidden behind ok. A kill is deliberately independent of the
+    // peer being reachable — a decision to stop that depends on the other party being online is not
+    // a decision to stop — but an operator who believes the peer was told, when they were not, will
+    // not understand why updates keep arriving.
+    return { ok: true, documentId, peerNotified: outcome.peerNotified, note: outcome.note };
+  });
+
   logger.debug("document.handlers.registered", {
-    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write"],
+    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write", "close", "kill"],
   });
 }

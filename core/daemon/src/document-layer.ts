@@ -40,6 +40,8 @@ import {
   documentRejectionHash,
   decodeDocumentProposalAck,
   buildDocumentProposalAckTbs,
+  decodeDocumentControl,
+  buildDocumentControlTbs,
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
@@ -191,6 +193,27 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
+    recordControl: (ownerAgentId, wire, nowMs) => {
+      const control = decodeDocumentControl(wire);
+      // VERIFIED FIRST. A kill frame ends a collaboration; unsigned, anyone reaching the channel
+      // could end any document between any two parties and each operator would believe the other
+      // walked away.
+      if (!verifySignature(control.sender_agent_id, buildDocumentControlTbs(control), control.signature)) {
+        throw new Error(
+          `document_control_signature_invalid: the ${control.verb} claims to come from ` +
+            `${control.sender_agent_id} but its signature does not verify against that agent`,
+        );
+      }
+      const verdict =
+        control.verb === "kill"
+          ? lifecycle.recordPeerKill(ownerAgentId, control.document_id, control.sender_agent_id, nowMs)
+          : lifecycle.recordPeerClose(ownerAgentId, control.document_id, control.sender_agent_id, nowMs);
+      if (!verdict.ok) {
+        // Refusals here are real: an unknown document, or a sender who is not this document's peer.
+        // Thrown so the router reports them rather than recording an end nobody was entitled to.
+        throw new Error(`${verdict.reason}: ${verdict.detail}`);
+      }
+    },
     recordProposalAck: (ownerAgentId, wire, _nowMs) => {
       const ack = decodeDocumentProposalAck(wire);
       // VERIFIED against the agent it names, before anything is written. A refusal ack makes the

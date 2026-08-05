@@ -232,6 +232,49 @@ export class DocumentLifecycle {
   }
 
   /**
+   * The peer KILLED the document. Their half of the unilateral end.
+   *
+   * Terminal immediately, and there is no reciprocal step: a kill is one-sided by definition, which
+   * is what separates it from a close. Continuing to publish afterwards would send updates to a
+   * party who has stopped listening — refused at their end forever, with nothing on this screen
+   * explaining why.
+   *
+   * The SENDER IS CHECKED against the document's peer for the same reason `recordPeerClose` checks
+   * it: without that, any string plus a valid-looking frame ends someone else's document.
+   */
+  recordPeerKill(
+    ownerAgentId: string,
+    documentId: string,
+    peerAgentId: string,
+    nowMs: number,
+  ): Verdict {
+    const doc = this.#store.getDocument(ownerAgentId, documentId);
+    if (!doc) {
+      return {
+        ok: false,
+        reason: "document_unknown",
+        detail: `no document ${documentId.slice(0, 16)}… for this agent`,
+      };
+    }
+    if (peerAgentId !== doc.peerAgentId) {
+      this.#logger.warn("document.kill.not_peer", {
+        documentId,
+        claimedBy: peerAgentId,
+        peerAgentId: doc.peerAgentId,
+      });
+      return {
+        ok: false,
+        reason: "document_kill_not_peer",
+        detail: `${peerAgentId} is not this document's peer (${doc.peerAgentId}), so their kill is not theirs to make`,
+      };
+    }
+    void nowMs;
+    this.#store.setDocumentStatus(ownerAgentId, documentId, "killed");
+    this.#logger.info("document.kill.peer_requested", { documentId, peerAgentId: doc.peerAgentId });
+    return { ok: true };
+  }
+
+  /**
    * Unilateral end. Local, and deliberately not contingent on the peer hearing about it — a
    * decision to stop that depends on the other party being online is not a decision to stop.
    */

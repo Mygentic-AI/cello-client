@@ -88,6 +88,7 @@ import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { registerDocumentHandlers } from "./document-handlers.js";
+import { createDocumentControlNotifier } from "./document-control-notifier.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { DocumentDelivery } from "./document-delivery.js";
@@ -3203,12 +3204,27 @@ async function startDaemonHoldingLock(
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: documentOwnerKeyFor,
-    notifyPeer: async () => ({
-      // NOT WIRED YET, and it says so rather than reporting a notification that did not happen.
-      // `kill` still succeeds locally — LIFECYCLE-1 made it deliberately independent of the peer
-      // being reachable — and reports `peerNotified: false`, which is the truthful answer.
-      ok: false,
-      reason: "document_peer_notify_not_wired",
+    // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
+    // how the surface tests passed while the feature did nothing: the test wired this seam to
+    // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever
+    // the near side did.
+    notifyPeer: createDocumentControlNotifier({
+      get store() {
+        // Lazily, because `documentLayer` is what is being constructed. The notifier is only ever
+        // called from lifecycle, long after construction returns.
+        return documentLayer.store;
+      },
+      owners: () =>
+        loadedAgents
+          .filter((a) => a.pubkey)
+          .map((a) => ({ agentName: a.name, ownerAgentId: a.pubkey!.toLowerCase() })),
+      sign: async (agentName, tbs) => {
+        const provider = keyProviders.get(agentName);
+        if (!provider) throw new Error(`document_control_unsigned: no key provider for ${agentName}`);
+        return provider.sign(tbs);
+      },
+      send: (agentName, input) => documentTransportFor(agentName).sendBytes(input),
+      now: () => Date.now(),
     }),
     rollback: () => ({
       // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting

@@ -274,6 +274,17 @@ export {
 } from "./document-proposal-ack.js";
 export type { DocumentProposalAck } from "./document-proposal-ack.js";
 export {
+  encodeDocumentControl,
+  decodeDocumentControl,
+  buildDocumentControlTbs,
+  assertDocumentControlConsistent,
+  DOCUMENT_CONTROL_DOMAIN,
+  DOCUMENT_CONTROL_VERSION,
+  DOCUMENT_CONTROL_VERBS,
+  MAX_CONTROL_REASON_LENGTH,
+} from "./document-control.js";
+export type { DocumentControl, DocumentControlVerb } from "./document-control.js";
+export {
   DOCUMENT_REJECTION_DOMAIN,
   DOCUMENT_REJECTION_VERSION,
   MAX_REJECTION_DETAIL_LENGTH,
