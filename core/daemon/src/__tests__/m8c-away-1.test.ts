@@ -898,8 +898,43 @@ describe("M8C-AWAY-1: away response", () => {
     await snm.ingestReceivedContent("alice", SID_HEX, b, msgLeafHash(b), "c2");
     await wait(30);
 
+    // The second arrival legitimately produces the ONESHOT REJECTION — that is a different message
+    // and it must still happen. What must not happen is a second AWAY GREETING at a second
+    // sequence, which is what clearing the guard on a queued reply would mint.
     const sent = snm.readTranscript("alice", SID_HEX).messages.filter((m) => m.direction === "sent");
-    expect(sent, "one away period, one away reply").toHaveLength(1);
+    const REJECTION = "one message per visit. Closing.";
+    const greetings = sent.filter((m) => !m.text.includes(REJECTION));
+    expect(greetings, "one away period, one away greeting").toHaveLength(1);
+    expect(sent.some((m) => m.text.includes(REJECTION)), "the oneshot rejection still fires").toBe(true);
+  });
+
+  it("M12-P13 (third caller): a durably-queued ONESHOT REJECTION commits its leaf — this path seals immediately after, so a hole here is a guaranteed root mismatch", async () => {
+    // The reject send was the caller I missed on the first pass, and it is the worst of the three:
+    // it is followed straight away by submitSealLeaf. A queued rejection whose leaf is not committed
+    // means we seal a tree that is one leaf short of the sequence the counterparty receives at —
+    // not a stall this time but an unsealable pair of roots, which is precisely the state the two
+    // force-abandoned sessions of 2026-08-05 ended in.
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const a = new TextEncoder().encode("first");
+    await snm.ingestReceivedContent("alice", SID_HEX, a, msgLeafHash(a), "c1");
+    await wait(30);
+    const sizeAfterAway = snm.getSessionTree("alice", SID_HEX).size();
+
+    // Only the REJECTION's send fails-but-queues; the away reply above went out normally.
+    snm.sendContent = async () => ({
+      ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
+    });
+    const b = new TextEncoder().encode("second");
+    await snm.ingestReceivedContent("alice", SID_HEX, b, msgLeafHash(b), "c2");
+    await wait(60);
+
+    // +1 for the inbound "second", +1 for the queued rejection that owns its witnessed sequence.
+    expect(snm.getSessionTree("alice", SID_HEX).size()).toBe(sizeAfterAway + 2);
   });
 
   it("M12-P13: a LOST away reply appends nothing and says so at ERROR — silence is what made this cost two sessions", async () => {

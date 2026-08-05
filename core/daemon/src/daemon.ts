@@ -1010,13 +1010,24 @@ async function startDaemonHoldingLock(
           const rejectHash = createHash("sha256").update(new Uint8Array([0x00])).update(rejectBytes).digest();
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
           const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
-          if (sendResult.ok) {
+          // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
+          // either way the relay already witnessed its sequence. This caller is the sharpest case
+          // of the three: the seal is initiated immediately below, so a hole here does not merely
+          // stall the far side, it seals a tree that is one leaf short of a sequence the
+          // counterparty will still receive content at. The roots then cannot agree, and the
+          // session is unsealable for good.
+          if (sendResult.ok || sendResult.durable) {
             const rejectHashHex = Buffer.from(rejectHash).toString("hex");
             const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", rejectHashHex, randomUUID());
             sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", rejectBytes, randomUUID());
-            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex });
+            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex, queued: !sendResult.ok });
           } else {
-            logger.warn("session.away.inbox.oneshot.reject_send_failed", { agentName, sessionId, reason: sendResult.reason });
+            // Not queued anywhere — the rejection is gone. We still seal (we are closing regardless),
+            // and the counterparty simply never learns why, so say that plainly rather than at warn.
+            logger.error("session.away.inbox.oneshot.reject_send_failed", {
+              agentName, sessionId, reason: sendResult.reason,
+              impact: "the rejection is lost and was NOT queued — the session seals with no explanation to the counterparty",
+            });
           }
           // DOD-INBOX-ONESHOT-1 / DOD-SEAL-BILATERAL-TIMEOUT-1: initiate the seal via the
           // relay-mediated path (submitSealLeaf → bilateral wait → unilateral escalation).
