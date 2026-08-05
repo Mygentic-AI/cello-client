@@ -50,9 +50,19 @@ function guardedApply(doc: Y.Doc, update: Uint8Array): { ok: true } | { ok: fals
   }
 }
 
-/** A well-formed update, for contrast cases and as the source for truncation/corruption. */
+/**
+ * A well-formed update, for contrast cases and as the source for truncation/corruption.
+ *
+ * The clientID is PINNED. Yjs mints a random uint32 and every item reference encodes it as a
+ * varint, so the update's SIZE depends on the draw — a clientID below 2^28 encodes in four bytes
+ * instead of five, making this update 83 bytes rather than 84. That is roughly one run in
+ * sixteen, which is exactly how the byte-count assertion below turned up as an unreproducible
+ * intermittent failure. Same root cause as the deep-nesting measurement in this file, which was
+ * pinned when it was found; this one was missed.
+ */
 function validUpdate(): Uint8Array {
   const doc = new Y.Doc();
+  doc.clientID = 4294967290;
   doc.getText("t").insert(0, "the quick brown fox jumps over the lazy dog");
   doc.getMap("m").set("key", "value");
   doc.getArray("a").insert(0, [1, 2, 3]);
@@ -282,7 +292,7 @@ describe("DOD-DOC-FUZZ-1: Y.applyUpdate under hostile input", () => {
   // ── Truncated and corrupted updates ───────────────────────────────────────
   it("EVERY prefix of a valid update is rejected — counted, and the size is pinned", () => {
     const full = validUpdate();
-    // Pinned so a change to validUpdate() cannot silently shrink this test's coverage.
+    // Deterministic now that validUpdate() pins its clientID — see the note there.
     expect(full.length).toBe(84);
 
     let rejected = 0;
