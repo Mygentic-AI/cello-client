@@ -2,42 +2,67 @@
  * DOD-DOC-WRITE-1 — the write path (§16.2).
  *
  * **The document is a real file.** The agent edits it with Read/Edit like any other file, and the
- * human can open the same file in an editor; the daemon diffs it at publish and converts the diff
- * into Yjs operations. No new editing surface exists — that is the design, not a shortcut.
- *
- * Diff coarseness is acceptable *because* of publish-on-intent (§5): updates are already coarse,
- * intentional batches, so diff-granularity operations are the granularity the design wants.
+ * human can open the same file; the daemon diffs it at publish and converts the diff into Yjs
+ * operations. No new editing surface exists — that is the design, not a shortcut.
  *
  * ── THE FOLD ORDER IS THE DESIGN ──────────────────────────────────────────────────────────────
  *
  * On admission (§16.2): fold the agent's UNPUBLISHED file edits into the `Y.Doc` as local
- * operations FIRST, then merge the incoming update, then rewrite the file.
+ * operations FIRST, then merge the incoming update, then rewrite the file. Reversing the first
+ * two silently destroys the agent's unpublished work, and §4.1's overlap flag — which IS whether
+ * the merge touched what the fold just wrote — disappears with it.
  *
- * Reversing those first two steps silently destroys the agent's unpublished work — the file gets
- * rewritten from a document that never saw it. And §4.1's overlap flag is not a separate feature
- * to compute: it is whether the merge touched regions the local fold had just written. The two
- * mechanisms are one mechanism, and both are lost by getting the order wrong.
+ * ── WHY THE PROJECTION IS PERSISTED ───────────────────────────────────────────────────────────
+ *
+ * §16.2 says publish diffs the file against "the last-known projection", and that baseline has to
+ * outlive the process. Diffing against the DOC's current text instead looks equivalent and is not:
+ * `admit` merges into the doc and rewrites the file as two separate steps, so a crash between them
+ * leaves a stale file beside an advanced doc. Diffing that against the doc reads the peer's
+ * admitted content as something the agent deleted, and publishes the deletion as deliberate
+ * intent. Measured, so the projection is written to disk beside the document and read back.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
 
-/** The Yjs roots a materialized document projects from. Must match DocumentEngine's TEXT_ROOT. */
+/** Yjs roots a materialized document projects from. TEXT_ROOT must match DocumentEngine's. */
 const TEXT_ROOT = "content";
 const MAP_ROOT = "data";
 
-/** Document types with a diff strategy. `xml` is declared in the store but has none yet. */
 const TEXT_TYPES = new Set(["markdown", "text", "plaintext"]);
 const JSON_TYPES = new Set(["json"]);
 
+/** Ids are hex identities, never names, and they become path components. */
+const ID_PATTERN = /^[0-9a-f]{64}$/;
+
+export type DocumentWriteFailure =
+  | "document_file_missing"
+  | "document_file_unparseable"
+  | "document_file_stale"
+  | "document_file_changed_during_merge"
+  | "document_type_unsupported"
+  | "document_id_invalid";
+
+export class DocumentWriteError extends Error {
+  readonly reason: DocumentWriteFailure;
+  readonly detail: string;
+  constructor(reason: DocumentWriteFailure, detail: string) {
+    super(`${reason}: ${detail}`);
+    this.name = "DocumentWriteError";
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
+
 export interface AdmitResult {
   /**
-   * §4.1's overlap flag: the incoming merge touched a region that held UNPUBLISHED local edits.
-   * Not a warning about conflict — Yjs resolved it — but a signal the agent should re-read the
-   * merged projection before building on what it thought it had written.
+   * §4.1's overlap flag: the merge touched a region (or, for JSON, a key) holding UNPUBLISHED
+   * local edits. Not a conflict warning — Yjs resolved it — but a signal that the agent should
+   * re-read the merged projection before building on what it thought it had written.
    */
   overlap: boolean;
 }
@@ -46,8 +71,6 @@ export class DocumentWritePath {
   readonly engine: DocumentEngine;
   readonly #root: string;
   readonly #logger: Logger;
-  /** document_id → the content last written to or read from disk, per agent. */
-  readonly #projection = new Map<string, string>();
 
   constructor(engine: DocumentEngine, workspaceRoot: string, logger: Logger) {
     this.engine = engine;
@@ -56,133 +79,172 @@ export class DocumentWritePath {
   }
 
   /**
-   * The file a document lives at. Keyed on `agent_id`/`document_id` — a filename is display, the
-   * id is identity, and a document's name is mutable while its id is not.
+   * The file a document lives at. Keyed on the FULL `agent_id`/`document_id` — truncating them
+   * would let two documents sharing a prefix collide onto one file and destroy each other, and
+   * both ids are validated because they become path components.
    */
   filePath(agentId: string, documentId: string, documentType: string): string {
+    this.#assertId(agentId, "agent_id");
+    this.#assertId(documentId, "document_id");
     const extension = JSON_TYPES.has(documentType) ? "json" : "md";
-    return join(this.#root, agentId.slice(0, 16), `${documentId.slice(0, 16)}.${extension}`);
+    return join(this.#root, agentId, `${documentId}.${extension}`);
   }
 
-  /** Write the document's current projection to disk, creating the workspace on demand. */
+  /** Write the document's projection to disk and record it as the diff baseline. */
   async materialize(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<string> {
     this.#assertSupported(documentType);
     const path = this.filePath(agentId, documentId, documentType);
-    await mkdir(join(this.#root, agentId.slice(0, 16)), { recursive: true });
-
     const content = this.#project(doc, documentType);
-    await writeFile(path, content, "utf8");
-    this.#projection.set(this.#key(agentId, documentId), content);
+    await this.#writeAtomic(agentId, path, content);
+    await this.#saveProjection(agentId, documentId, documentType, content);
     this.#logger.info("document.file.materialized", { documentId, bytes: content.length });
     return path;
   }
 
   /**
-   * Diff the file against the last-known projection and apply the difference to the document as
-   * local operations. Returns the resulting Yjs update, or null when the file is unchanged.
+   * Diff the file against the LAST-KNOWN PROJECTION and apply the difference as local operations.
+   * Returns the resulting update, or null when the file is unchanged.
    *
-   * Null is a real answer, not a failure: publish is an intent, so a publish with nothing to say
-   * must produce no envelope rather than an empty one that still costs a leaf and a round trip.
+   * Null is a real answer: publish is an intent, so a publish with nothing to say must produce no
+   * envelope rather than an empty one that still costs a leaf and a round trip.
    */
-  async publish(agentId: string, documentId: string, doc: Y.Doc): Promise<Uint8Array | null> {
-    const documentType = this.#typeOf(doc);
+  async publish(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<Uint8Array | null> {
+    this.#assertSupported(documentType);
     const path = this.filePath(agentId, documentId, documentType);
+    const onDisk = await this.#readOrRefuse(path, documentId);
+    const projection = await this.#loadProjection(agentId, documentId, documentType);
 
-    let onDisk: string;
-    try {
-      onDisk = await readFile(path, "utf8");
-    } catch {
-      throw new Error(
-        `document_file_missing: no materialized file for document ${documentId.slice(0, 16)}… at ${path} — ` +
-          `materialize it before publishing`,
+    if (projection === null) {
+      throw new DocumentWriteError(
+        "document_file_missing",
+        `no recorded projection for document ${documentId} — materialize it before publishing`,
+      );
+    }
+
+    // A file that matches NEITHER the recorded projection nor the document's current state means
+    // a rewrite did not complete (admit merges into the doc and rewrites the file as two steps).
+    // Diffing it would read the peer's admitted content as an agent deletion and publish that
+    // deletion as deliberate intent. Refuse and re-materialize instead.
+    const current = this.#project(doc, documentType);
+    if (onDisk === projection && projection !== current) {
+      throw new DocumentWriteError(
+        "document_file_stale",
+        `the file for ${documentId} still holds the pre-merge projection — a rewrite did not ` +
+          `complete, so re-materialize before publishing rather than diffing against it`,
       );
     }
 
     const before = this.engine.encodeStateVector(doc);
-    const changed = this.#foldFileInto(doc, onDisk, documentType);
+    const changed = this.#fold(doc, projection, onDisk, documentType) !== null;
     if (!changed) return null;
 
-    this.#projection.set(this.#key(agentId, documentId), onDisk);
+    await this.#saveProjection(agentId, documentId, documentType, onDisk);
     this.#logger.info("document.publish.diffed", { documentId, bytes: onDisk.length });
     return this.engine.encodeState(doc, before);
   }
 
-  /**
-   * Admit a peer's update: fold local file edits, merge, rewrite the file, report overlap.
-   *
-   * The order is §16.2's, and it is the whole unit.
-   */
-  async admit(agentId: string, documentId: string, doc: Y.Doc, incoming: Uint8Array): Promise<AdmitResult> {
-    const documentType = this.#typeOf(doc);
+  /** Admit a peer's update: fold local edits, merge, rewrite, report overlap. */
+  async admit(
+    agentId: string,
+    documentId: string,
+    documentType: string,
+    doc: Y.Doc,
+    incoming: Uint8Array,
+  ): Promise<AdmitResult> {
+    this.#assertSupported(documentType);
     const path = this.filePath(agentId, documentId, documentType);
 
-    // 1. FOLD unpublished local edits in as local operations. If the file cannot be read the
-    //    document has not been materialized, and there is nothing local to lose.
+    // 1. FOLD unpublished local edits in as local operations.
     let onDisk: string | null = null;
+    let mtimeBefore = 0;
     try {
       onDisk = await readFile(path, "utf8");
+      mtimeBefore = (await stat(path)).mtimeMs;
     } catch {
       onDisk = null;
     }
 
-    const localRegions: Array<{ from: number; to: number }> = [];
+    const projection = (await this.#loadProjection(agentId, documentId, documentType)) ?? "";
+    let localText: { from: number; to: number } | null = null;
+    const localKeys = new Set<string>();
     if (onDisk !== null) {
-      if (TEXT_TYPES.has(documentType)) {
-        // The fold reports where the local edit ENDED UP, which is the coordinate system the
-        // merge's deltas are reported in.
-        const region = this.#foldText(doc, onDisk);
-        if (region) localRegions.push(region);
-      } else {
-        this.#foldFileInto(doc, onDisk, documentType);
-      }
+      const folded = this.#fold(doc, projection, onDisk, documentType);
+      if (folded && "from" in folded) localText = folded;
+      else if (folded) for (const k of folded.keys) localKeys.add(k);
     }
 
-    // 2. MERGE the incoming update, and observe which regions it touched.
+    // 2. MERGE, observing what the incoming update touches — in BOTH coordinate spaces, because
+    //    a JSON document's edits live in the map and a text observer sees none of them.
     const touched: Array<{ from: number; to: number }> = [];
-    const observe = (event: Y.YTextEvent): void => {
+    const mergedKeys = new Set<string>();
+    const onText = (event: Y.YTextEvent): void => {
       let cursor = 0;
       for (const delta of event.delta) {
         if (delta.retain !== undefined) cursor += delta.retain;
         else if (typeof delta.insert === "string") {
           touched.push({ from: cursor, to: cursor + delta.insert.length });
+          // Shift any local region that sits at or after this insert into the SAME coordinate
+          // system. Without it the flag depends on how LONG the peer's insert was rather than
+          // where it landed — a disjoint edit reads as overlapping once the insert is big enough.
+          if (localText && localText.from >= cursor) {
+            localText = { from: localText.from + delta.insert.length, to: localText.to + delta.insert.length };
+          }
           cursor += delta.insert.length;
         } else if (delta.delete !== undefined) {
           touched.push({ from: cursor, to: cursor + delta.delete });
+          if (localText && localText.from >= cursor) {
+            const shift = Math.min(delta.delete, Math.max(0, localText.from - cursor));
+            localText = { from: localText.from - shift, to: localText.to - shift };
+          }
         }
       }
     };
+    const onMap = (event: Y.YMapEvent<unknown>): void => {
+      for (const key of event.keysChanged) mergedKeys.add(key);
+    };
+
     const text = doc.getText(TEXT_ROOT);
-    text.observe(observe);
+    const map = doc.getMap(MAP_ROOT);
+    text.observe(onText);
+    map.observe(onMap);
     try {
       this.engine.applyUpdateOrThrow(doc, incoming);
     } finally {
-      text.unobserve(observe);
+      text.unobserve(onText);
+      map.unobserve(onMap);
     }
 
-    // 3. REWRITE the file so the agent sees the merged projection.
+    // 3. REWRITE so the agent sees the merged projection — refusing if the file moved under us.
+    if (onDisk !== null) {
+      const mtimeNow = (await stat(path).catch(() => ({ mtimeMs: mtimeBefore }))).mtimeMs;
+      if (mtimeNow !== mtimeBefore) {
+        throw new DocumentWriteError(
+          "document_file_changed_during_merge",
+          `the file for ${documentId} was written while the merge was in flight — its content was ` +
+            `not folded in, so rewriting would discard it`,
+        );
+      }
+    }
     const merged = this.#project(doc, documentType);
-    await mkdir(join(this.#root, agentId.slice(0, 16)), { recursive: true });
-    await writeFile(path, merged, "utf8");
-    this.#projection.set(this.#key(agentId, documentId), merged);
+    await this.#writeAtomic(agentId, path, merged);
+    await this.#saveProjection(agentId, documentId, documentType, merged);
 
-    // 4. OVERLAP falls out of the fold — it is not tracked separately.
-    // Endpoints are INCLUSIVE, and that is load-bearing rather than an off-by-one indulgence.
-    // When the local fold deletes the characters an incoming insert was anchored to, Yjs re-homes
-    // that insert to the boundary of the local edit — and which side of the boundary depends on
-    // Yjs's clientID tie-break, which is RANDOM. Strict inequality therefore reported overlap
-    // only about half the time for the very case where both sides rewrote the same words:
-    // a flaky answer to a question that has a definite one.
-    const overlap = localRegions.some((local) =>
-      touched.some((t) => t.from <= local.to && local.from <= t.to),
-    );
-    this.#logger.info("document.file.materialized", { documentId, bytes: merged.length });
+    // 4. OVERLAP falls out of the fold, in whichever space the document lives in.
+    //    Endpoints are INCLUSIVE: when the local fold deletes the characters an incoming insert
+    //    was anchored to, Yjs re-homes that insert onto the boundary of the local edit — and
+    //    which side depends on its random clientID tie-break, so exclusive comparison answers a
+    //    definite question with a coin flip.
+    const overlap = localText
+      ? touched.some((t) => t.from <= localText!.to && localText!.from <= t.to)
+      : [...localKeys].some((k) => mergedKeys.has(k));
+
+    this.#logger.info("document.file.rewritten", { documentId, bytes: merged.length });
     if (overlap) this.#logger.info("document.file.overlap_detected", { documentId });
     return { overlap };
   }
 
   // ─── internals ────────────────────────────────────────────────────────────
 
-  /** Project the document to the text its file holds. */
   #project(doc: Y.Doc, documentType: string): string {
     if (JSON_TYPES.has(documentType)) {
       return `${JSON.stringify(doc.getMap(MAP_ROOT).toJSON(), null, 2)}\n`;
@@ -190,91 +252,216 @@ export class DocumentWritePath {
     return this.engine.readTextRoot(doc);
   }
 
-  /** Apply the file's content to the document. Returns whether anything changed. */
-  #foldFileInto(doc: Y.Doc, onDisk: string, documentType: string): boolean {
-    if (JSON_TYPES.has(documentType)) return this.#foldJson(doc, onDisk);
-    return this.#foldText(doc, onDisk) !== null;
+  /**
+   * Apply the file's content to the document, diffing against the recorded projection.
+   * Returns the region (text) or key set (JSON) the local edit occupies, or null if unchanged.
+   */
+  #fold(
+    doc: Y.Doc,
+    projection: string,
+    onDisk: string,
+    documentType: string,
+  ): { from: number; to: number } | { keys: string[] } | null {
+    if (JSON_TYPES.has(documentType)) {
+      const keys = this.#foldJson(doc, onDisk);
+      return keys.length > 0 ? { keys } : null;
+    }
+    return this.#foldText(doc, projection, onDisk);
   }
 
   /**
-   * Text diff: replace the span between the common prefix and the common suffix.
+   * Text diff producing N hunks, not one span.
    *
-   * Deliberately ONE replacement range rather than a minimal edit script. §16.2 accepts diff
-   * coarseness because publish-on-intent already batches, and a single range is the coarse end of
-   * that: it keeps every character outside the changed span untouched, which is what preserves a
-   * concurrent editor's work in the regions they touched.
+   * A single prefix/suffix range is coarse in a way §16.2 does NOT licence: a publish batch with
+   * two separated edits would delete and re-insert everything between them as new operations,
+   * which resurrects text a peer concurrently deleted and re-homes their insertions into the
+   * middle of it. Measured. Publish-on-intent makes multi-hunk the NORMAL shape — an agent edits
+   * across a turn and publishes once — so the line-level hunks below are the granularity the
+   * design actually wants, and they collapse to the old behaviour for one contiguous edit.
    */
-  #foldText(doc: Y.Doc, onDisk: string): { from: number; to: number } | null {
+  #foldText(doc: Y.Doc, projection: string, onDisk: string): { from: number; to: number } | null {
     const text = doc.getText(TEXT_ROOT);
-    const current = text.toString();
-    if (current === onDisk) return null;
+    if (text.toString() === onDisk) return null;
 
-    const { from, to } = diffRange(current, onDisk);
-    const replacement = onDisk.slice(from, onDisk.length - (current.length - to));
+    const hunks = lineHunks(projection, onDisk);
+    if (hunks.length === 0) return null;
+
+    // Apply back to front so earlier offsets stay valid.
     doc.transact(() => {
-      if (to > from) text.delete(from, to - from);
-      if (replacement.length > 0) text.insert(from, replacement);
+      for (const hunk of [...hunks].reverse()) {
+        if (hunk.to > hunk.from) text.delete(hunk.from, hunk.to - hunk.from);
+        if (hunk.insert.length > 0) text.insert(hunk.from, hunk.insert);
+      }
     });
-    // The region the local edit OCCUPIES AFTER folding. Returning the pre-fold range would
-    // compare two different coordinate systems, since the merge reports its deltas against the
-    // post-fold text.
-    return { from, to: from + replacement.length };
+
+    // The span the local edits occupy AFTER folding — the coordinate system the merge's deltas
+    // will be reported in.
+    let shift = 0;
+    let low = Number.POSITIVE_INFINITY;
+    let high = 0;
+    for (const hunk of hunks) {
+      const from = hunk.from + shift;
+      const to = from + hunk.insert.length;
+      low = Math.min(low, from);
+      high = Math.max(high, to);
+      shift += hunk.insert.length - (hunk.to - hunk.from);
+    }
+    return { from: low, to: high };
   }
 
-  /** Key diff: set what changed, delete what is gone, leave untouched keys alone. */
-  #foldJson(doc: Y.Doc, onDisk: string): boolean {
+  /** Key diff: set what changed, delete what is gone. Returns the keys written. */
+  #foldJson(doc: Y.Doc, onDisk: string): string[] {
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(onDisk) as Record<string, unknown>;
     } catch (err: unknown) {
-      // REFUSE rather than half-apply. A broken file must not corrupt the CRDT, and the reason
-      // names the file — not "unexpected token", which describes the parser's exit point.
-      throw new Error(
-        `document_file_unparseable: the document's file is not valid JSON — ` +
-          `${err instanceof Error ? err.message : String(err)}`,
+      throw new DocumentWriteError(
+        "document_file_unparseable",
+        `the document's file is not valid JSON — ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
     const map = doc.getMap(MAP_ROOT);
-    const before = JSON.stringify(map.toJSON());
+    const written: string[] = [];
     doc.transact(() => {
       for (const [key, value] of Object.entries(parsed)) {
-        if (JSON.stringify(map.get(key)) !== JSON.stringify(value)) map.set(key, value);
+        if (JSON.stringify(map.get(key)) !== JSON.stringify(value)) {
+          map.set(key, value);
+          written.push(key);
+        }
       }
       for (const key of [...map.keys()]) {
-        if (!(key in parsed)) map.delete(key);
+        if (!(key in parsed)) {
+          map.delete(key);
+          written.push(key);
+        }
       }
     });
-    return JSON.stringify(map.toJSON()) !== before;
+    return written;
   }
 
-  #typeOf(doc: Y.Doc): string {
-    // A document carries its shape: a populated map root means JSON. Text is the default, and the
-    // store's `documentType` is authoritative once the caller threads it through (P2).
-    return doc.getMap(MAP_ROOT).size > 0 ? "json" : "markdown";
+  /** tmp + rename, so an interrupted write cannot leave a truncated file a later diff reads as
+   *  a deliberate mass deletion. */
+  async #writeAtomic(agentId: string, path: string, content: string): Promise<void> {
+    await mkdir(join(this.#root, agentId), { recursive: true });
+    const tmp = `${path}.tmp`;
+    await writeFile(tmp, content, "utf8");
+    await rename(tmp, path);
   }
 
-  #assertSupported(documentType: string): void {
-    if (!TEXT_TYPES.has(documentType) && !JSON_TYPES.has(documentType)) {
-      throw new Error(
-        `document_type_unsupported: no diff strategy for '${documentType}' — ` +
-          `supported types are ${[...TEXT_TYPES, ...JSON_TYPES].join(", ")}`,
+  #projectionPath(agentId: string, documentId: string, documentType: string): string {
+    return `${this.filePath(agentId, documentId, documentType)}.projection`;
+  }
+
+  /** The projection is persisted so it survives a restart — see the header. */
+  async #saveProjection(agentId: string, documentId: string, documentType: string, content: string): Promise<void> {
+    const path = this.#projectionPath(agentId, documentId, documentType);
+    await writeFile(`${path}.tmp`, content, "utf8");
+    await rename(`${path}.tmp`, path);
+  }
+
+  async #loadProjection(agentId: string, documentId: string, documentType: string): Promise<string | null> {
+    try {
+      return await readFile(this.#projectionPath(agentId, documentId, documentType), "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  async #readOrRefuse(path: string, documentId: string): Promise<string> {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      throw new DocumentWriteError(
+        "document_file_missing",
+        `no materialized file for document ${documentId} at ${path} — materialize it before publishing`,
       );
     }
   }
 
-  #key(agentId: string, documentId: string): string {
-    return `${agentId}:${documentId}`;
+  #assertSupported(documentType: string): void {
+    if (!TEXT_TYPES.has(documentType) && !JSON_TYPES.has(documentType)) {
+      throw new DocumentWriteError(
+        "document_type_unsupported",
+        `no diff strategy for '${documentType}' — supported types are ${[...TEXT_TYPES, ...JSON_TYPES].join(", ")}`,
+      );
+    }
+  }
+
+  #assertId(value: string, field: string): void {
+    if (!ID_PATTERN.test(value)) {
+      throw new DocumentWriteError(
+        "document_id_invalid",
+        `${field} must be 64 lowercase hex characters — it becomes a path component, and an ` +
+          `unvalidated one escapes the workspace`,
+      );
+    }
   }
 }
 
+/** Content hash of a projection, for callers that persist it beside a snapshot. */
+export function projectionHash(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
 /**
- * The span that differs between two strings, as an offset range into `before`.
+ * Line-level hunks between two texts, as character offsets into `before`.
  *
- * Common prefix and common suffix, so an edit at one end does not report the whole string as
- * changed — which is what keeps the overlap flag meaningful rather than always true.
+ * Common leading and trailing LINES are skipped, then each changed run becomes its own hunk, so
+ * two edits far apart do not drag the untouched text between them into a rewrite.
  */
-export function diffRange(before: string, after: string): { from: number; to: number } {
+export function lineHunks(
+  before: string,
+  after: string,
+): Array<{ from: number; to: number; insert: string }> {
+  if (before === after) return [];
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+
+  let head = 0;
+  while (head < beforeLines.length && head < afterLines.length && beforeLines[head] === afterLines[head]) head++;
+
+  let tail = 0;
+  while (
+    tail < beforeLines.length - head &&
+    tail < afterLines.length - head &&
+    beforeLines[beforeLines.length - 1 - tail] === afterLines[afterLines.length - 1 - tail]
+  ) {
+    tail++;
+  }
+
+  const changedBefore = beforeLines.slice(head, beforeLines.length - tail);
+  const changedAfter = afterLines.slice(head, afterLines.length - tail);
+
+  // Offset of the first changed line.
+  let offset = 0;
+  for (let i = 0; i < head; i++) offset += beforeLines[i]!.length + 1;
+
+  // When the changed runs have equal line counts, emit one hunk per differing line so untouched
+  // lines between two edits are never rewritten. Otherwise the run is one hunk — lines were added
+  // or removed, so positions inside it cannot be matched up without a full LCS.
+  const hunks: Array<{ from: number; to: number; insert: string }> = [];
+  if (changedBefore.length === changedAfter.length) {
+    let cursor = offset;
+    for (let i = 0; i < changedBefore.length; i++) {
+      const b = changedBefore[i]!;
+      const a = changedAfter[i]!;
+      if (b !== a) {
+        const { from, to } = charRange(b, a);
+        hunks.push({ from: cursor + from, to: cursor + to, insert: a.slice(from, a.length - (b.length - to)) });
+      }
+      cursor += b.length + 1;
+    }
+    return hunks;
+  }
+
+  const beforeText = changedBefore.join("\n");
+  const afterText = changedAfter.join("\n");
+  return [{ from: offset, to: offset + beforeText.length, insert: afterText }];
+}
+
+/** The span that differs between two strings, as an offset range into `before`. */
+export function charRange(before: string, after: string): { from: number; to: number } {
   let from = 0;
   const maxPrefix = Math.min(before.length, after.length);
   while (from < maxPrefix && before[from] === after[from]) from++;
@@ -287,6 +474,5 @@ export function diffRange(before: string, after: string): { from: number; to: nu
   ) {
     suffix++;
   }
-
   return { from, to: before.length - suffix };
 }
