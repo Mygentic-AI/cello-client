@@ -103,6 +103,12 @@ export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
   readonly #notifier: LifecycleNotifier;
+  /**
+   * Our own wire sender id for an agent. M14-D5 makes it the pubkey hex, which is NOT the local
+   * owner key this store is otherwise keyed by — and passing the wrong one here reports every
+   * pending update as delivered.
+   */
+  readonly #senderAgentId: (ownerAgentId: string) => string;
   readonly #rollback: (
     ownerAgentId: string,
     documentId: string,
@@ -120,18 +126,24 @@ export class DocumentLifecycle {
      */
     rollback: (ownerAgentId: string, documentId: string, envelopeHash: string) =>
       { ok: true } | { ok: false; reason: string },
+    senderAgentId: (ownerAgentId: string) => string = (id) => id,
   ) {
     this.#store = store;
     this.#logger = logger;
     this.#notifier = notifier;
     this.#rollback = rollback;
+    this.#senderAgentId = senderAgentId;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
   list(ownerAgentId: string, nowMs: number): DocumentListRow[] {
     // Every pending envelope regardless of schedule: the operator is asking "what has not reached
     // my peer", not "what is due for a retry in the next few seconds".
-    const pending = this.#store.pendingDeliveries(ownerAgentId, Number.MAX_SAFE_INTEGER);
+    const pending = this.#store.pendingDeliveries(
+      ownerAgentId,
+      Number.MAX_SAFE_INTEGER,
+      this.#senderAgentId(ownerAgentId),
+    );
     const pendingByDocument = new Map<string, { total: number; sent: number }>();
     for (const e of pending) {
       const c = pendingByDocument.get(e.documentId) ?? { total: 0, sent: 0 };

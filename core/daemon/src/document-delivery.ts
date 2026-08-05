@@ -169,7 +169,12 @@ export class DocumentDelivery {
     ownerAgentId: string,
     peerFor: (documentId: string) => string | null,
     nowMs: number,
-    opts: { sessionHints?: ReadonlyMap<string, string>; correlationId?: string } = {},
+    opts: {
+      sessionHints?: ReadonlyMap<string, string>;
+      correlationId?: string;
+      /** Our own wire sender id. Defaults to the owner key for callers whose ids coincide. */
+      senderAgentId?: string;
+    } = {},
   ): Promise<DeliveryTickResult> {
     // NO RE-ENTRY. Nothing marks a row in-flight until its outcome lands, so a `deliver` slower
     // than the tick interval — a dial to a distant peer is exactly that — would have the next tick
@@ -189,14 +194,21 @@ export class DocumentDelivery {
     ownerAgentId: string,
     peerFor: (documentId: string) => string | null,
     nowMs: number,
-    opts: { sessionHints?: ReadonlyMap<string, string>; correlationId?: string },
+    opts: {
+      sessionHints?: ReadonlyMap<string, string>;
+      correlationId?: string;
+      senderAgentId?: string;
+    },
   ): Promise<DeliveryTickResult> {
     // Minted once per pass and threaded through every event, so an operator can tie a failure back
     // to the lookup that preceded it and the session that carried it. Delivery is precisely the
     // async multi-step flow the convention exists for: lookup, dial, deliver, ack — across ticks
     // and across restarts.
     const correlationId = opts.correlationId ?? `dlv-${ownerAgentId.slice(0, 8)}-${nowMs}`;
-    const pending = this.#store.pendingDeliveries(ownerAgentId, nowMs);
+    // OUR sender id on the wire, which M14-D5 makes the pubkey hex rather than the owner key.
+    // Passing the owner key here returned nothing pending and every published update sat in the log
+    // undelivered, with no error on any path.
+    const pending = this.#store.pendingDeliveries(ownerAgentId, nowMs, opts.senderAgentId);
     const result: DeliveryTickResult = {
       attempted: 0, delivered: 0, sent: 0, rejected: 0, deferred: 0, failed: 0,
     };

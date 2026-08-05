@@ -729,6 +729,48 @@ export class DocumentStore {
     return rows.map((r) => r.sender_client_id);
   }
 
+  /**
+   * The state vector the PEER last told us they had — from their most recent envelope.
+   *
+   * This is what a publish diffs against (§3.2 step 3, §7): an update computed against what they
+   * have already seen carries exactly the operations they lack. Diffing against OUR OWN snapshot
+   * instead publishes what we have not yet snapshotted, which is a different question with an
+   * answer that happens to look plausible.
+   */
+  peerStateVector(ownerAgentId: string, documentId: string, peerAgentId: string): Uint8Array | null {
+    const r = this.#db
+      .prepare(
+        `SELECT state_vector FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ? AND kind = 'update'
+          ORDER BY log_index DESC LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, peerAgentId) as { state_vector?: unknown } | undefined;
+    return r?.state_vector === undefined ? null : toU8(r.state_vector);
+  }
+
+  /**
+   * The state vector OUR last published envelope carried — what we had when we last spoke.
+   *
+   * Distinct from `peerStateVector`, and the distinction is the point: that one answers "what does
+   * the peer lack" (what to send), this one answers "has anything changed since I last published"
+   * (whether to send at all). Conflating them meant a republish with no edits still produced a
+   * non-empty update, because before the peer has ever published the diff is the whole document.
+   */
+  lastPublishedStateVector(
+    ownerAgentId: string,
+    documentId: string,
+    senderAgentId: string,
+  ): Uint8Array | null {
+    const r = this.#db
+      .prepare(
+        `SELECT state_vector FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ? AND kind = 'update'
+          ORDER BY log_index DESC LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, senderAgentId) as { state_vector?: unknown } | undefined;
+    return r?.state_vector === undefined ? null : toU8(r.state_vector);
+  }
+
   /** The rejecting agent's most recent envelope for this document, for chain linkage. */
   lastEnvelopeHashBySender(ownerAgentId: string, documentId: string, senderAgentId: string): string | null {
     const r = this.#db
@@ -750,7 +792,19 @@ export class DocumentStore {
    * Scoped to `senderAgentId = ownerAgentId`: an envelope we RECEIVED is not ours to deliver, and
    * without the scope a receiver would helpfully re-send the sender's own updates back at it.
    */
-  pendingDeliveries(ownerAgentId: string, nowMs: number, limit = 100): DocumentEnvelopeRow[] {
+  pendingDeliveries(
+    ownerAgentId: string,
+    nowMs: number,
+    /**
+     * OUR OWN sender id on the wire, which is NOT the owner key. M14-D5 makes an envelope's
+     * `sender_agent_id` the author's pubkey hex, while this store is keyed by the local agent id —
+     * so assuming the two are equal silently returned nothing pending and every published update
+     * sat in the log undelivered, with no error anywhere. Defaults to the owner key for callers
+     * whose ids do coincide (and for the tests that predate the split).
+     */
+    senderAgentId: string = ownerAgentId,
+    limit = 100,
+  ): DocumentEnvelopeRow[] {
     const rows = this.#db
       .prepare(
         `SELECT * FROM document_envelopes
@@ -791,7 +845,7 @@ export class DocumentStore {
           -- document monopolising it.
           ORDER BY log_index ASC, document_id ASC, envelope_hash ASC LIMIT ?`,
       )
-      .all(ownerAgentId, ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
+      .all(ownerAgentId, senderAgentId, nowMs, limit) as Array<Record<string, unknown>>;
     return rows.map(toEnvelopeRow);
   }
 
