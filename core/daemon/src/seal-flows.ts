@@ -364,40 +364,6 @@ export function createSealFlows(deps: SealFlowDeps) {
           correlationId,
         });
       }
-      // M12-P15: the counterparty just told us which ceremony IT is on. Route on that instead of
-      // dead-ending, because the dead end is what leaves force:true (no receipt) as the only exit.
-      //
-      // The defect this closes: `interrupted` is set by one blanket statement at daemon shutdown —
-      // it records that OUR OWN process stopped and says nothing about the counterparty. Choosing
-      // seal-interrupted from it is the inference "I crashed, therefore they are gone", which was
-      // simply false in the measured case (`dcd0aadc…`): the peer was healthy and had been waiting
-      // on our co-signature for two and a half hours. Both sides picked a reasonable ceremony from
-      // local facts; neither asked the other. The refusal is the answer — act on it.
-      if (ackResult.reason === "session_seal_already_pending") {
-        // The peer holds its half and is waiting for ours. The completing action is to GIVE it, not
-        // to re-ask for a different ceremony. This is the one that unwedges the measured deadlock.
-        logger.info("session.seal.ceremony.realigned", {
-          sessionId, agentName: record.agent_name,
-          from: "seal_interrupted", to: "bilateral_cosign",
-          because: ackResult.reason, correlationId,
-        });
-        const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
-        if (submitted.ok) {
-          return {
-            ok: true,
-            sessionId,
-            status: "seal_interrupted_pending",
-          };
-        }
-        return {
-          ok: false,
-          reason: "seal_cosign_failed",
-          rejection_reason: ackResult.reason,
-          guidance: `The counterparty is already sealing this session and was waiting for our half, so we submitted it instead of re-requesting an interrupted seal — but the submit failed (${submitted.reason}). Nothing is lost and the session is NOT terminal: retry cello_close_session ${sessionId} once the relay is reachable. Do NOT use force:true, which would abandon a session the counterparty is actively sealing.`,
-        };
-      }
-      // `session_already_sealed` deliberately does NOT submit a leaf: a completed seal must not
-      // receive another one, and renderSealRejection already points at the receipt.
       return {
         ok: false,
         reason: "seal_interrupted_rejected_by_counterparty",
