@@ -118,7 +118,9 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
         sealed: "session_already_sealed",
         seal_interrupted_pending: "session_seal_already_pending",
       };
-      await reject(named[localRecord.status] ?? "session_not_interrupted");
+      // Own-property lookup (review MEDIUM-5): `??` does not protect against inherited keys, and a
+      // status that happened to name one would rename the refusal to a function.
+      await reject(Object.hasOwn(named, localRecord.status) ? named[localRecord.status] : "session_not_interrupted");
       return;
     }
     // From our perspective the initiator is our counterparty.

@@ -4336,9 +4336,11 @@ export class SessionNodeManager {
 
   /**
    * DOD-MSG-4: the relay's high-water canonical sequence for this session (largest witnessed leaf),
-   * or -1 if none. Exposed for the next sub-increment (catch-up-before-live — on reconnect B holds
-   * live arrivals until its tree reaches this, because it has more to recover than it has appended);
-   * NOT yet consumed by the gate. Also `recordWitnessedSequence` maintains it.
+   * or -1 if none. The relay is the ordering authority, so this is the outside view of how far the
+   * session has actually progressed — which is why it is the right input to a catch-up-before-live
+   * gate. Consumed by `sealReadiness` (M12-P14) for REPORTING only: the missing-leaf decision is made
+   * from `#witnessedSeq`, because this counts the relay's sequence space (which includes ctrl leaves)
+   * and the tree does not. Maintained by `recordWitnessedSequence`.
    */
   /**
    * DOD-COATTEND-1 (review F2): leaf sequences whose plaintext failed to reach the transcript and
@@ -4385,8 +4387,22 @@ export class SessionNodeManager {
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
-    // high-water is a 0-based index, so a complete chain has treeSize === highWaterSeq + 1.
-    const missingLeaves = Math.max(0, (highWaterSeq + 1) - treeSize);
+    // Review HIGH-2: NOT `(highWaterSeq + 1) - treeSize`. That subtraction silently assumes the
+    // relay's sequence space and this tree's index space count the same things, and they do not:
+    // `relay-node.ts` increments seq_counter for EVERY accepted leaf including CTRL (0x02), while
+    // `appendSessionLeaf` is only ever called with "msg" — `submitSealLeaf` deliberately computes
+    // its root without mutating the durable tree. So one seal ctrl leaf offsets the two spaces
+    // permanently, and any msg witnessed afterwards would read as a missing leaf FOREVER. That is a
+    // false positive, and a false positive here is worse than the bug it guards: it makes a healthy
+    // session unsealable, leaving force-abandon (no receipt) as the only exit. `seal-upgrade.ts`
+    // already documents the same `leaf_count - 1` offset.
+    //
+    // `#witnessedSeq` answers the question directly instead of inferring it. It gains an entry when
+    // the relay witnesses a COUNTERPARTY msg leaf (ctrl leaves are excluded at the call site) and
+    // loses it the moment that leaf is appended. So its remaining size IS the count of leaves the
+    // ordering authority has committed and this tree has not — no arithmetic, no space mismatch,
+    // and it cannot go negative.
+    const missingLeaves = this.#witnessedSeq.get(key)?.size ?? 0;
     return { ready: missingLeaves === 0 && heldCount === 0, treeSize, highWaterSeq, heldCount, missingLeaves };
   }
 

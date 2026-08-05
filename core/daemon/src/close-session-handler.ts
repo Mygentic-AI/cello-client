@@ -30,6 +30,8 @@ export interface CloseSessionDeps {
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
+  /** M12-P14: drain this agent's parked mailbox before judging seal readiness (contentPark.autoRecoverForAgent). */
+  recoverParkedContent?: (agentName: string, trigger: string) => Promise<void>;
   getConnState: (connectionId: string) => ConnState | undefined;
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
   NO_CURRENT_AGENT_RESPONSE: unknown;
@@ -60,6 +62,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, signalingFor, sendOver, waitForSignalingConnected,
     openVisitingConnection, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
+    recoverParkedContent,
   } = deps;
 
   // ─── M7-SESSION-001: cello_close_session ────────────────────────────────────
@@ -214,8 +217,36 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // TERMINAL: nothing in the protocol backfills a missing leaf, so the session's only remaining
     // exit is a force-abandon with no notarized receipt. Refusing here costs the operator a retry;
     // not refusing costs them the receipt permanently.
-    const readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
-    if (!readiness.ready) {
+    // Review HIGH-3: scoped to the two statuses that can actually seal. Unconditional, it also fired
+    // for `seal_interrupted_pending` — displacing that status's accurate answer ("awaiting FROST
+    // notarization") with `session_incomplete`, and offering force:true against a seal that is
+    // mid-notarization. That is the same error substitution e3da3b4 exists to remove, reintroduced
+    // one branch earlier in the same handler. (markInterruptedWithDetails does not evict the caches,
+    // so the signals survive into that status and the branch was genuinely reachable.)
+    const sealable = record.status === "active" || record.status === "interrupted";
+    let readiness = sealable
+      ? sessionNodeManager.sealReadiness(record.agent_name, sessionId)
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0 };
+    // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
+    // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
+    // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
+    // event that would never happen, retried, got the same refusal, and reached for force:true — the
+    // terminal receipt-less outcome this gate exists to prevent. Drain FIRST, then judge, which is
+    // the sequence seal-upgrade.ts already documents: "Recover content -> consult the gate -> REFUSE".
+    if (sealable && !readiness.ready && recoverParkedContent) {
+      try {
+        await recoverParkedContent(record.agent_name, "close_readiness_gate");
+        readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
+      } catch (err: unknown) {
+        // A drain failure is not a reason to block the close: re-judging on the pre-drain readiness
+        // is the same answer we would have given anyway, and it is still the honest one.
+        logger.warn("session.seal.readiness.drain.failed", {
+          agentName: record.agent_name, sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (sealable && !readiness.ready) {
       logger.warn("session.seal.blocked_incomplete", {
         agentName: record.agent_name, sessionId,
         treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
@@ -230,7 +261,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           `This side of the conversation is incomplete, so sealing now would produce a chain the counterparty cannot co-sign — and that refusal is terminal, leaving a force-abandon with no notarized receipt as the only way out. ` +
           `You hold ${readiness.treeSize} message(s); the relay has witnessed ${readiness.highWaterSeq + 1}` +
           (readiness.heldCount > 0 ? `, and ${readiness.heldCount} received message(s) are waiting behind a gap` : "") +
-          `. The daemon pulls missing content automatically — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
+          `. The daemon just pulled from the relay and the gap is still there, so the content is not available yet — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
       };
     }
 

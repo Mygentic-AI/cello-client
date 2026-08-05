@@ -2879,6 +2879,9 @@ async function startDaemonHoldingLock(
   // cello_close_session (close-session-handler.ts). Fifteen dependencies — a long list, but a KNOWN
   // one, which is the whole difference from a closure over 73 shared locals.
   registerCloseSessionHandler({
+    // M12-P14: the pre-seal readiness gate drains the parked mailbox before judging, so a close
+    // does not refuse over content the relay is still holding for us.
+    recoverParkedContent: (agentName: string, trigger: string) => autoRecoverForAgent(agentName, trigger),
     handlers,
     logger,
     sessionNodeManager,

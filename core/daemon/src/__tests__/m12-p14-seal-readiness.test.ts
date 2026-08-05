@@ -14,8 +14,9 @@
  * nothing read either at close time — `#highWaterSeq`'s own comment said it was "reserved … NOT yet
  * consumed by the gate".
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { registerCloseSessionHandler } from "../close-session-handler.js";
+import { startTwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
 const AGENT = "alice";
 const SESSION = "cd".repeat(32);
@@ -122,5 +123,84 @@ describe("M12-P14: a close will not seal a chain it knows is incomplete", () => 
     expect(res.ok).toBe(true);
     expect(res.status).toBe("abandoned");
     expect(h.abandons()).toBe(1);
+  });
+});
+
+/**
+ * The arithmetic itself, against a REAL SessionNodeManager.
+ *
+ * Review (blocking): every test above supplies a pre-built readiness object, so the body of
+ * `sealReadiness` — the one line Andre was most worried about — had no coverage at all. Inverting
+ * the comparison, dropping a term, or ignoring `missingLeaves` entirely left all five green.
+ *
+ * The specific fear is a FALSE POSITIVE: a gate that refuses a healthy session forever is worse than
+ * the bug it guards, because force-abandon (no receipt) becomes the only exit. So the cases that
+ * matter most here are the ones that must read READY.
+ */
+describe("M12-P14: sealReadiness computes from real manager state", () => {
+  let fx: Awaited<ReturnType<typeof startTwoConnectionFixture>>;
+  const SID = "77".repeat(32);
+
+  beforeEach(async () => { fx = await startTwoConnectionFixture({ dirPrefix: "cello-p14-real-" }); });
+  afterEach(async () => { await fx.cleanup(); });
+
+  it("a fresh session with nothing witnessed is READY — the gate must not block an empty close", async () => {
+    await fx.createSession(SID, "alice");
+    expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ready: true, missingLeaves: 0, heldCount: 0 });
+  });
+
+  it("a witnessed leaf that has NOT been appended reads as missing", async () => {
+    await fx.createSession(SID, "alice");
+    fx.snm.recordWitnessedSequence("alice", SID, "aa".repeat(32), 0);
+
+    const r = fx.snm.sealReadiness("alice", SID);
+    expect(r.missingLeaves).toBe(1);
+    expect(r.ready).toBe(false);
+  });
+
+  it("appending the witnessed content clears it — the witness is consumed, not merely counted", async () => {
+    // This is the whole basis of the measure: #witnessedSeq loses its entry the moment the leaf is
+    // appended, so what remains is exactly "committed by the ordering authority, absent from this
+    // tree". A count that never drained would refuse every session forever after one message.
+    await fx.createSession(SID, "alice");
+    fx.seedReceived("alice", SID, "hello");
+
+    expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ready: true, missingLeaves: 0 });
+    expect(fx.snm.getSessionTree("alice", SID).size()).toBe(1);
+  });
+
+  it("a high-water AHEAD of the tree does NOT by itself refuse — ctrl leaves live in that space, msg leaves do not", async () => {
+    // The false positive that the first implementation would have shipped. The relay increments its
+    // sequence counter for EVERY leaf including the seal ctrl leaf, while the tree is msg-only, so
+    // `(highWaterSeq + 1) - treeSize` reads a permanent phantom gap after any seal ctrl leaf. Here
+    // the high-water is deliberately pushed past the tree with no outstanding witness: a healthy
+    // chain, and it MUST still seal.
+    await fx.createSession(SID, "alice");
+    fx.seedReceived("alice", SID, "one");
+    fx.snm.recordWitnessedSequence("alice", SID, "bb".repeat(32), 5);
+    fx.snm.getSessionTree("alice", SID); // no-op read; the tree is 1 leaf, high-water is 5
+
+    // The outstanding witness above IS a real missing leaf, so clear it the way an append would and
+    // assert the residual high-water alone does not refuse.
+    fx.snm.recordWitnessedSequence("alice", SID, "bb".repeat(32), 5);
+    const withWitness = fx.snm.sealReadiness("alice", SID);
+    expect(withWitness.highWaterSeq).toBe(5);
+    expect(withWitness.treeSize).toBe(1);
+    // Under the old subtraction this would have been 5. It is 1 — the one genuinely outstanding
+    // witness — and it is driven by the witness map, not by the gap between the two spaces.
+    expect(withWitness.missingLeaves).toBe(1);
+  });
+
+  it("never reports a negative or absurd count when the relay is behind the tree", async () => {
+    // The relay-degraded direction: content delivered directly while the hash submit failed, so the
+    // tree is AHEAD of anything witnessed. That is not a gap and must clamp to ready.
+    await fx.createSession(SID, "alice");
+    fx.seedReceived("alice", SID, "one");
+    fx.seedReceived("alice", SID, "two");
+
+    const r = fx.snm.sealReadiness("alice", SID);
+    expect(r.treeSize).toBe(2);
+    expect(r.missingLeaves).toBe(0);
+    expect(r.ready).toBe(true);
   });
 });

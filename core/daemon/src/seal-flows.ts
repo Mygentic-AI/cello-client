@@ -104,7 +104,12 @@ export function renderSealRejection(
     session_seal_already_pending:
       `The counterparty has already recorded its half of this seal and is waiting on ours, so a second request cannot be answered. Do not re-send it; check cello_sessions ${sessionId} for the seal's completion.`,
   };
-  if (terminal[reason] !== undefined) {
+  // Review MEDIUM-5: `reason` comes off the wire — the counterparty's rejection, relayed verbatim
+  // by the directory without validation. A plain object-literal lookup is prototype-reachable, so
+  // `reason: "toString"` passes an `!== undefined` guard and returns a FUNCTION as `guidance`,
+  // which serialises away and leaves the operator a rejection with no guidance at all. Own-property
+  // check: a hostile or merely buggy counterparty must not be able to choose that.
+  if (Object.hasOwn(terminal, reason)) {
     return { rejection_reason: reason, guidance: terminal[reason] };
   }
   // Only a leaf_count_mismatch is EXPECTED to carry the numbers, so only there is their absence
