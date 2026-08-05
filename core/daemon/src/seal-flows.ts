@@ -91,6 +91,22 @@ export function renderSealRejection(
         `this machine, read both sides here; there is no other end to check.`,
     };
   }
+  // M12-P14: the terminal-status refusals are the counterparty telling us the session is already
+  // FINISHED on its side. Verbatim relay is right for a condition we cannot interpret; these three
+  // we can, and the generic wording ("check the counterparty's daemon for that condition") sends an
+  // operator hunting a fault where there is none. A sealed session in particular is a SUCCESS —
+  // the receipt exists — and reporting it as a rejection to go investigate is actively wrong.
+  const terminal: Record<string, string> = {
+    session_abandoned:
+      `The counterparty has already ABANDONED this session, so there is nothing left to co-sign — an abandon is terminal and yields no notarized receipt on either side. This is the state someone put it in deliberately (a force-close), not a fault to chase. Close it on this side too: cello_close_session ${sessionId} { force: true }.`,
+    session_already_sealed:
+      `The counterparty has already SEALED this session — a receipt exists on their side. This is not a disagreement and nothing is wrong: fetch it with cello_sealed_receipt ${sessionId} rather than re-requesting a seal.`,
+    session_seal_already_pending:
+      `The counterparty has already recorded its half of this seal and is waiting on ours, so a second request cannot be answered. Do not re-send it; check cello_sessions ${sessionId} for the seal's completion.`,
+  };
+  if (terminal[reason] !== undefined) {
+    return { rejection_reason: reason, guidance: terminal[reason] };
+  }
   // Only a leaf_count_mismatch is EXPECTED to carry the numbers, so only there is their absence
   // evidence of an older daemon. The responder rejects for five other reasons, and rendering those
   // as a version problem asserts a cause the code never observed.

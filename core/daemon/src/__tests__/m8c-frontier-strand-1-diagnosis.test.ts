@@ -172,6 +172,25 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       expect(r.your_leaf_count).toBeUndefined(); // never invents a count it did not receive
     });
 
+    it("M12-P14: an already-SEALED counterparty is not a fault to investigate — it is a receipt to fetch", () => {
+      // The generic branch renders every unknown reason as "check the counterparty's daemon for
+      // that condition". For a sealed session that is actively wrong: nothing is broken, the
+      // artifact the operator wants already exists, and sending them to hunt a fault is how a
+      // success gets read as a failure.
+      const r = renderSealRejection("session_already_sealed", SID_HEX);
+      expect(r.guidance).toMatch(/already SEALED/);
+      expect(r.guidance).toMatch(/cello_sealed_receipt/);
+      expect(r.guidance).not.toMatch(/Check the counterparty's daemon/);
+    });
+
+    it("M12-P14: an ABANDONED counterparty says the abandon is terminal and yields no receipt", () => {
+      // The state that ended both sessions on 2026-08-05. The operator needs to know it is
+      // deliberate and terminal, not a condition to diagnose.
+      const r = renderSealRejection("session_abandoned", SID_HEX);
+      expect(r.guidance).toMatch(/ABANDONED/);
+      expect(r.guidance).toMatch(/no notarized receipt/);
+    });
+
     it("F6 (review F3 — error substitution): OTHER refusals are reported verbatim, never diagnosed as a version", () => {
       // The responder rejects for six reasons and only leaf_count_mismatch carries detail. Rendering
       // the other five as "it is running an older daemon" asserts a cause the code never observed,

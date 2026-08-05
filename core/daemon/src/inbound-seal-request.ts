@@ -107,7 +107,18 @@ export function createInboundSealRequestHandler(deps: InboundSealRequestDeps) {
     // reuses this exchange). We still never re-process a terminal 'sealed' row or
     // an already-pending one.
     if (localRecord.status !== "interrupted" && localRecord.status !== "active") {
-      await reject("session_not_interrupted");
+      // M12-P14: name the state we actually found. `session_not_interrupted` is true in the most
+      // useless sense — the session is not interrupted, it is abandoned or sealed — and it names
+      // neither the status nor the cause. Measured 2026-08-05: a force-abandon on this side produced
+      // that refusal two minutes after the REAL one (`leaf_count_mismatch`), and read on its own it
+      // says "the counterparty disagrees that anything went wrong", which is a different defect. It
+      // cost an hour of investigation pointed the wrong way.
+      const named: Record<string, string> = {
+        abandoned: "session_abandoned",
+        sealed: "session_already_sealed",
+        seal_interrupted_pending: "session_seal_already_pending",
+      };
+      await reject(named[localRecord.status] ?? "session_not_interrupted");
       return;
     }
     // From our perspective the initiator is our counterparty.
