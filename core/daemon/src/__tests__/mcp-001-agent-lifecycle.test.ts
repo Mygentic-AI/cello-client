@@ -189,32 +189,36 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     // The session must no longer be served. Its row goes `interrupted`, which is the honest record:
     // this side stopped participating. It is NOT sealed — nothing was agreed with the counterparty —
     // and it is NOT abandoned, which would be terminal and forfeit the receipt.
+    // Review: asserting the ROW alone is hollow — the measured defect was precisely that the
+    // bookkeeping said one thing while the node kept serving. An implementation that only flips the
+    // status passes a row assertion and reproduces the bug exactly. Assert the things that STOPPED.
     expect(
-      snm.getSessionRecord("alice", SID)?.status,
-      "an offline agent must not still be serving a live session",
-    ).toBe("interrupted");
+      snm.getSessionNodePeerId("alice", SID),
+      "the session node itself must be gone, not merely marked",
+    ).toBeNull();
+    expect(
+      snm.getStandingReceiverReady("alice"),
+      "and the standing receiver must stay down — the teardown ORDER is load-bearing: destroySessionNode "
+      + "re-arms the receiver for any agent still flagged as wanting one, so removeStandingReceiverForAgent "
+      + "must clear that flag BEFORE this loop runs, or every offline resurrects what it just killed",
+    ).toBe(false);
+    expect(snm.getSessionRecord("alice", SID)?.status).toBe("interrupted");
   });
 
-  it("M12-P16: another agent's sessions are untouched — offline is per-agent, never a global stop", async () => {
-    // The obvious way to get the test above green is to tear down every session on the daemon. That
-    // would take an unrelated agent's live conversation down with it.
-    const config = await setupWithAgents("alice", "bob");
-    handle = await startDaemon(config);
-    const client = await connect(config.socketPath);
-    await client.send("cello_start_agent", { name: "alice" });
-    await client.send("cello_start_agent", { name: "bob" });
-
-    const snm = handle.getSessionNodeManager();
-    const ALICE_SID = "f2".repeat(32);
-    const BOB_SID = "f3".repeat(32);
-    await snm.createSessionNode(ALICE_SID, "alice", "xpubkeyhex", "x-peer", "corr-a");
-    await snm.createSessionNode(BOB_SID, "bob", "ypubkeyhex", "y-peer", "corr-b");
-
-    await client.send("cello_set_agent_offline", { name: "alice" });
-
-    expect(snm.getSessionRecord("alice", ALICE_SID)?.status).toBe("interrupted");
-    expect(snm.getSessionRecord("bob", BOB_SID)?.status, "bob never went offline").toBe("active");
-  });
+  // M12-P16 (review F1) — KNOWN COVERAGE GAP, deliberately not faked.
+  //
+  // The inbound half of the kill switch — an offline agent REFUSING a new `session_assignment` — is
+  // fixed in `acceptInboundAssignment` (it now returns `agent_offline` before touching anything, so
+  // `ensureStandingReceiverForAgent` never re-arms the want-flag the offline handler just cleared).
+  // It is NOT unit-tested here: reaching that function means driving a signed assignment through the
+  // per-agent signaling stream, which this suite has no harness for, and the honest observable is
+  // the counterparty NOT getting an away reply — which needs two processes.
+  //
+  // A test that stubbed the assignment path would pin a double and prove nothing, which is exactly
+  // the mistake that shipped the first version of this fix. Covered instead by the live two-machine
+  // check that found the defect: set an agent offline, initiate from the other machine, and assert
+  // NO `session.inbound.accepted` and NO `session.away.response.sent` in the offline daemon's log.
+  // Recorded here at the point of absence rather than left to be discovered.
 
   // ─── AC-004: cello_set_agent_offline transitions Online→Registered (idempotent) ───
   it("AC-004: cello_set_agent_offline transitions agent to registered and clears current", async () => {
