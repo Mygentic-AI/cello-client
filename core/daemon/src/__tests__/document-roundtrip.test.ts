@@ -16,12 +16,22 @@
 
 import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
-import { generateKeypair } from "@cello-protocol/crypto";
-import { encodeDocumentUpdateEnvelope } from "@cello-protocol/protocol-types";
+import { generateKeypair, verify as verifyEd25519 } from "@cello-protocol/crypto";
+import {
+  encodeDocumentUpdateEnvelope,
+  encodeDocumentProposal,
+  buildDocumentProposalTbs,
+  documentIdFromProposal,
+  DOCUMENT_FEATURE_VERSION,
+  ASSURANCE_TIER_V1,
+  TOPOLOGY_V1,
+  type DocumentProposalEnvelope,
+} from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import { DocumentPublish } from "../document-publish.js";
 import { createDocumentDeliveryTransport } from "../document-delivery-transport.js";
 import { DocumentDelivery } from "../document-delivery.js";
+import { DocumentHandshake } from "../document-handshake.js";
 import type { Logger } from "../types.js";
 
 const DOC = "cc".repeat(32);
@@ -72,7 +82,7 @@ async function makeParty(name: string, clientId: number) {
     d.clientID = clientId;
     return d;
   };
-  return { name, id, layer, publish, workingDoc, events, logger };
+  return { name, id, layer, publish, workingDoc, events, logger, db, sign: keys.sign.bind(keys) };
 }
 
 async function openDocument(a: Awaited<ReturnType<typeof makeParty>>, b: Awaited<ReturnType<typeof makeParty>>) {
@@ -400,5 +410,105 @@ describe("M14 round trip — through the REAL delivery worker", () => {
     // double the text; a refusal would strand a delivery that was correct.
     expect(b.layer.store.getEnvelopeLog(b.id, DOC)).toHaveLength(1);
     expect(b.layer.live.get(b.id, DOC).getText("content").toString()).toBe("once. ");
+  });
+});
+
+
+describe("M14 round trip — through the REAL handshake", () => {
+  it("proposes, consents, and both sides mint the SAME document", async () => {
+    const a = await makeParty("A", 9001);
+    const b = await makeParty("B", 9002);
+
+    // Both sides verify a proposal against the proposer's real key. M14-D5 makes the id the key, so
+    // there is no lookup to get wrong.
+    const handshakeFor = (party: Awaited<ReturnType<typeof makeParty>>) =>
+      new DocumentHandshake(party.db, party.logger, (proposerId, tbs, sig) => {
+        const key = agentPublicKeyFromId(proposerId);
+        return key !== null && verifyEd25519(key, tbs, sig);
+      });
+    const handshakeB = handshakeFor(b);
+
+    const base: DocumentProposalEnvelope = {
+      type: "document_proposal",
+      feature_version: DOCUMENT_FEATURE_VERSION,
+      proposer_agent_id: a.id,
+      peer_agent_id: b.id,
+      document_type: "markdown",
+      properties: {
+        assurance_tier: ASSURANCE_TIER_V1,
+        schema_enforcement: false,
+        topology: TOPOLOGY_V1,
+        append_only: false,
+      },
+      starting_content: null,
+      nonce: new Uint8Array([1, 2, 3, 4]),
+      proposed_at_ms: NOW,
+      signature: new Uint8Array(64),
+    };
+    const proposal = { ...base, signature: await a.sign(buildDocumentProposalTbs(base)) };
+    const documentId = documentIdFromProposal(proposal);
+
+    // B receives it, sees it pending, and accepts.
+    const recorded = handshakeB.recordProposal(b.id, encodeDocumentProposal(proposal), NOW);
+    expect(recorded).toMatchObject({ state: "pending", documentId });
+    expect(handshakeB.pending(b.id)).toHaveLength(1);
+    const accepted = handshakeB.accept(b.id, documentId, NOW + 1);
+    expect(accepted.ok).toBe(true);
+
+    // Both mint from the AGREED terms. The id is the hash of the proposal, so neither side chose
+    // it and there was no coordination round — that is what makes it federated.
+    for (const [self, peer] of [[a, b], [b, a]] as const) {
+      self.layer.store.createDocument({
+        documentId,
+        ownerAgentId: self.id,
+        peerAgentId: peer.id,
+        documentType: proposal.document_type,
+        properties: proposal.properties as unknown as Record<string, unknown>,
+        status: "active",
+        createdAtMs: NOW + 1,
+      });
+    }
+    expect(a.layer.store.getDocument(a.id, documentId)).not.toBeNull();
+    expect(b.layer.store.getDocument(b.id, documentId)).not.toBeNull();
+    // Independently computed, never transmitted as a value.
+    expect(documentIdFromProposal(handshakeB.get(b.id, documentId)!.envelope)).toBe(documentId);
+  });
+
+  it("REFUSES a proposal signed by someone other than its proposer", async () => {
+    const a = await makeParty("A", 9101);
+    const b = await makeParty("B", 9102);
+    const impostor = await makeParty("C", 9103);
+
+    const handshakeB = new DocumentHandshake(b.db, b.logger, (proposerId, tbs, sig) => {
+      const key = agentPublicKeyFromId(proposerId);
+      return key !== null && verifyEd25519(key, tbs, sig);
+    });
+
+    const base: DocumentProposalEnvelope = {
+      type: "document_proposal",
+      feature_version: DOCUMENT_FEATURE_VERSION,
+      proposer_agent_id: a.id, // CLAIMS to be A
+      peer_agent_id: b.id,
+      document_type: "markdown",
+      properties: {
+        assurance_tier: ASSURANCE_TIER_V1,
+        schema_enforcement: false,
+        topology: TOPOLOGY_V1,
+        append_only: false,
+      },
+      starting_content: null,
+      nonce: new Uint8Array([9]),
+      proposed_at_ms: NOW,
+      signature: new Uint8Array(64),
+    };
+    // …but signed by C. Admitting this would put a consent decision in front of an operator for a
+    // collaboration the named party never asked for, and ON CONFLICT DO NOTHING would make those
+    // bytes the permanent record for that document_id.
+    const forged = { ...base, signature: await impostor.sign(buildDocumentProposalTbs(base)) };
+
+    expect(() => handshakeB.recordProposal(b.id, encodeDocumentProposal(forged), NOW)).toThrow(
+      /document_proposal_signature_invalid/,
+    );
+    expect(handshakeB.pending(b.id)).toHaveLength(0);
   });
 });
