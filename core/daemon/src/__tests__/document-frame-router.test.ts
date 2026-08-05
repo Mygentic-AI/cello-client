@@ -64,13 +64,13 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       calls.push("update");
       return over.onUpdate ? over.onUpdate() : { ok: true, admitted: true, envelopeHash: "x", duplicate: false };
     },
-  } as unknown as DocumentInbound;
+  } satisfies Pick<DocumentInbound, "receive"> as DocumentInbound;
   const ackInbound = {
     receive: () => {
       calls.push("ack");
       return over.onAck ? over.onAck() : { ok: true, admitted: true, envelopeHash: "x" };
     },
-  } as unknown as DocumentAckInbound;
+  } satisfies Pick<DocumentAckInbound, "receive"> as DocumentAckInbound;
   return { router: new DocumentFrameRouter({ inbound, ackInbound, logger }), calls, events };
 }
 
@@ -158,18 +158,30 @@ describe("DocumentFrameRouter — a handler throw does not take the session down
 
 
 describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () => {
-  it("refuses the MEASURED pathological inputs instantly", () => {
+  it("handles every MEASURED pathological input in milliseconds", () => {
     const r = newRouter();
-    // 9f = indefinite-length ARRAY header. Handed to the decoder, `9f b0` takes 5.0 seconds on this
-    // machine and `9f 26` was independently measured at 10 seconds and 1.6 GB. classify() runs on
-    // EVERY inbound frame, so a peer could stall or OOM the daemon's whole content path — stopping
-    // the operator's ordinary MESSAGES — with a handful of two-byte frames. The try/catch does not
-    // help: the cost is inside the decode, not in the throw.
+    // Each of these cost SECONDS and gigabytes before the decoder was bounded. The last two get
+    // PAST the header guard — `a1 9f` is a one-pair map whose first key is an indefinite array, and
+    // `b9 000a 9f 26` wears the real frames' own header — which is why the guard is a fast path and
+    // the decoder limit in cbor.ts is the actual boundary.
+    for (const hex of ["9fb0", "9f26", "9f", "bf", "a19f", "b9000a9f26", "a1bf", "b8209f26"]) {
+      const bytes = Uint8Array.from(Buffer.from(hex, "hex"));
+      const started = Date.now();
+      r.router.route(AGENT, bytes, NOW, "c");
+      // The guarded path measures well under a millisecond and the regression this catches is a
+      // 5-10 SECOND stall, so the margin is ~300x — a GC pause cannot false-positive it.
+      expect(Date.now() - started).toBeLessThan(100);
+    }
+  });
+
+  it("a map header claiming an enormous field count never reaches a decoder", () => {
+    const r = newRouter();
+    // The wall clock is the assertion that has teeth. Asserting only `consumed: false` was hollow:
+    // these inputs also return consumed:false WITHOUT the guard, because they throw quickly — so
+    // the test passed identically either way and pinned routing rather than cost.
     for (const bytes of [
-      new Uint8Array([0x9f, 0xb0]),
-      new Uint8Array([0x9f, 0x26]),
-      new Uint8Array([0x9f]),
-      new Uint8Array([0xbf]), // indefinite-length MAP
+      new Uint8Array([0xbb, 255, 255, 255, 255, 255, 255, 255, 255]),
+      new Uint8Array([0xb9, 0xff, 0xff]),
     ]) {
       const started = Date.now();
       expect(r.router.route(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
@@ -177,13 +189,14 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     }
   });
 
-  it("refuses a map header claiming an enormous field count", () => {
-    const r = newRouter();
-    // 0xbb + an 8-byte count is a few bytes asking for an enormous allocation. No document frame has
-    // four billion fields, so those header forms never reach a decoder at all.
-    expect(r.router.route(AGENT, new Uint8Array([0xbb, 255, 255, 255, 255, 255, 255, 255, 255]), NOW, "c"))
-      .toEqual({ consumed: false });
-    expect(r.router.route(AGENT, new Uint8Array([0xb9, 0xff, 0xff]), NOW, "c")).toEqual({ consumed: false });
+  it("the real frames declare FEWER fields than the guard admits", () => {
+    // Pins the relationship the guard's bound depends on. Cross 32 fields and a genuine frame is
+    // silently reclassified as CONVERSATION — CRDT bytes into the operator's transcript, with no log
+    // and no other test failing. This fails at build time instead.
+    for (const wire of [encodeDocumentUpdateEnvelope(updateEnvelope), encodeDocumentAck(ackFrame)]) {
+      expect(wire[0]).toBe(0xb9);
+      expect((wire[1]! << 8) | wire[2]!).toBeLessThan(32);
+    }
   });
 
   it("STILL admits the real frames, which use a non-minimal 2-byte count", () => {

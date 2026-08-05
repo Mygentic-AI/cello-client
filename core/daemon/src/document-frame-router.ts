@@ -24,18 +24,29 @@
  * visible, while a misrouted MESSAGE would vanish into the document layer and never reach the
  * operator.
  *
- * But the decode cannot be reached with arbitrary bytes, because handing hostile input to a CBOR
- * decoder on the hot path is a denial of service. MEASURED, on this decoder: the two bytes
- * `9f b0` — an indefinite-length array header followed by a map header, with no data — take
- * **5.0 seconds**; an independent probe found `9f 26` costs 10 seconds and 1.6 GB. `classify` runs
- * on EVERY inbound frame, so a peer could stall or OOM the daemon's whole content path — the
- * operator's ordinary MESSAGES stop being delivered — by sending a handful of two-byte frames. The
- * try/catch below does not help: the cost is inside the decode, not in the throw.
+ * A CONVERSATION MESSAGE CANNOT REACH A DECODER AT ALL, and the reason is structural rather than
+ * statistical. `content` on this path is decrypted plaintext, and `couldBeDocumentFrame` requires
+ * byte 0 in `0xa0`–`0xb9` — every one of which is a UTF-8 CONTINUATION byte, which can never begin a
+ * valid UTF-8 sequence. So no text an operator types, and no text an attacker chooses, is ever
+ * classified as a document frame. (A hostile PEER can put raw non-UTF-8 bytes on the channel and
+ * have them classified as document traffic — but that only suppresses their own message.)
  *
- * So `couldBeDocumentFrame` runs first. It is NOT a sniff and adds no new assumption: both decoders
- * already refuse anything that is not a definite-length CBOR map, and this applies exactly that
- * check to the header bytes before the decoder can be made to burn memory on them. Measured after:
- * 35,671 of 40,000 hostile inputs never reach a decoder, and the worst remaining decode is 1 ms.
+ * ── THE HEADER GUARD IS A FAST PATH, NOT THE SECURITY BOUNDARY ────────────────────────────────
+ *
+ * Handing hostile bytes to a CBOR decoder is a denial of service — measured at seconds and
+ * gigabytes for a few bytes — and `classify` runs on EVERY inbound frame, so a peer could stall or
+ * OOM the daemon's whole content path and stop the operator's ordinary MESSAGES.
+ *
+ * `couldBeDocumentFrame` was written as the fix and IS NOT ONE. It inspects the header, and the cost
+ * lives in structures NESTED inside it: `a1 9f` — a one-pair map whose first key is an
+ * indefinite-length array — is three bytes, passes any header check, and cost 9.6 seconds and
+ * 1.1 GB. Prefixing the real frames' own `b9 000a` does the same. No header-shaped guard can be
+ * sound here.
+ *
+ * The bound belongs on the DECODER, and it is now in `cbor.ts` — see the note there. This guard
+ * stays because it is a correct, cheap fast path that keeps every conversation message out of the
+ * decoder entirely, and because the UTF-8 argument above depends on it. It must never again be
+ * described as what makes hostile input safe.
  */
 
 import {

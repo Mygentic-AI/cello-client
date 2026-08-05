@@ -304,3 +304,32 @@ describe("document ack — the ENCODER applies the same cross-field rules as the
     ).toThrow(/at most/);
   });
 });
+
+describe("cbor decoder — the size limits are ACTIVE, not just declared", () => {
+  it("refuses a hostile nested structure in milliseconds", () => {
+    // These cost SECONDS and gigabytes unbounded: `9f b0` measured 5.0s, `a1 9f` 9.6s and 1.1GB.
+    // The limits live in cbor.ts and are process-global to cbor-x, so this asserts the whole
+    // package's decode surface — the directory's seal_submission and the relay use it too.
+    //
+    // Tested rather than trusted to the import: `setSizeLimits` is absent from cbor-x's shipped
+    // .d.ts, so a future version that dropped the function would leave a compiling no-op.
+    for (const hex of ["9fb0", "a19f", "9f26", "a1bf", "b9000a9f26"]) {
+      const started = Date.now();
+      try {
+        decodeCbor(Uint8Array.from(Buffer.from(hex, "hex")));
+      } catch {
+        /* expected */
+      }
+      expect(Date.now() - started).toBeLessThan(100);
+    }
+  });
+
+  it("still admits the largest structure CELLO legitimately builds", () => {
+    // The bound has to clear a long-running session's seal leaves — refusing one would make a real
+    // seal unverifiable, which is the failure direction that matters more than a slow decode.
+    const leaves = encodeCbor({ leaves: Array.from({ length: 20_000 }, (_, i) => ({ kind: "msg", i })) });
+    expect(() => decodeCbor(leaves)).not.toThrow();
+    // Byte strings are not counted against the limits, so a 1 MB Yjs update is unaffected.
+    expect(() => decodeCbor(encodeCbor({ update: new Uint8Array(1024 * 1024) }))).not.toThrow();
+  });
+});
