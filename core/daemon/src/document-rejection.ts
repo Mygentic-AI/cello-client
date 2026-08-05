@@ -29,8 +29,13 @@
  * DOD-DOC-ENVELOPE-1's job and the cross-daemon proof is DOD-DOC-E2E-REJECT-1's.
  */
 
-import { createHash } from "node:crypto";
 import * as Y from "yjs";
+import {
+  buildDocumentRejectionTbs,
+  documentRejectionHash,
+  DOCUMENT_REJECTION_VERSION,
+  type DocumentRejectionEnvelope,
+} from "@cello-protocol/protocol-types";
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
@@ -68,17 +73,21 @@ export interface RejectionInput {
   /** The limit breached, when one was (from the gate's verdict). */
   limit?: { name: string; limit: number; actual: number };
   /**
-   * The rejection's own signature and state vector.
+   * Sign the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
-   * REQUIRED rather than fabricated. An all-zero placeholder written into an immutable log is
-   * indistinguishable from a real signature that fails to verify, so a later verifier would send
-   * an operator to the crypto layer for a value nobody ever signed. Producing these is
-   * DOD-DOC-ENVELOPE-1's job; this unit refuses to invent them.
+   * The caller supplies the SIGNER, not the signature: a signature with no defined preimage is a
+   * field that can only be filled dishonestly, which is exactly what this used to be. An all-zero
+   * placeholder written into an immutable log is indistinguishable from a real signature that
+   * fails to verify, so a later verifier would send an operator to the crypto layer for a value
+   * nobody ever signed.
    */
-  signature: Uint8Array;
-  stateVector: Uint8Array;
-  /** Distinguishes repeat rejections of the same envelope for the same reason. */
-  nonce: string;
+  sign(tbs: Uint8Array): Promise<Uint8Array>;
+  /**
+   * The clock, passed in rather than read here. The rejection's timestamp is SIGNED, so it must be
+   * the same value in the preimage and in the row — reading `Date.now()` twice would sign one
+   * moment and store another.
+   */
+  nowMs: number;
 }
 
 export interface RejectionOutcome {
@@ -157,7 +166,47 @@ export class DocumentRejections {
    * tombstones. The bytes we refused live in `document_quarantine`, and the chain bridges across
    * the refused envelope so the peer's next link still resolves (see `verifyChainLinkage`).
    */
-  reject(agentId: string, documentId: string, input: RejectionInput): RejectionOutcome {
+  async reject(agentId: string, documentId: string, input: RejectionInput): Promise<RejectionOutcome> {
+    // THE SIGNED PREIMAGE (DOD-DOC-REJECT-2). Until it existed, this method took a `signature` from
+    // its caller with nothing defining what that signature was OVER — so it could only ever be
+    // filled dishonestly, which is what writing the composition-root signer proved. The rejection
+    // is now built, signed, and its LEAF HASH derived from the same preimage: the leaf commits to
+    // exactly the bytes whose signature was verified.
+    // DUPLICATE DETECTION MOVED UP FRONT. It used to fall out of the leaf hash colliding, because
+    // that hash was sha256(envelope + reason + nonce) and a caller reusing the nonce produced the
+    // same row. The real preimage binds the ROUND and the TIMESTAMP, so two rejections of the same
+    // envelope for the same reason now hash differently and would each advance the round — driving
+    // a document to `stalled` on retries that never happened. The check has to be on what makes a
+    // rejection the SAME rejection: this envelope, refused for this reason, by us.
+    const already = this.#store
+      .listQuarantined(agentId, documentId)
+      .find((q) => q.rejectedEnvelopeHash === input.rejectedEnvelopeHash && q.reason === input.reason);
+    if (already) {
+      this.#logger.warn("document.rejection.duplicate", {
+        documentId,
+        rejectedEnvelopeHash: input.rejectedEnvelopeHash,
+        reason: input.reason,
+      });
+      return {
+        stalled: this.#isStalled(agentId, documentId),
+        round: this.#round(agentId, documentId),
+      };
+    }
+
+    const round = this.#round(agentId, documentId) + 1;
+    const envelope: DocumentRejectionEnvelope = {
+      type: "document_rejection",
+      rejection_version: DOCUMENT_REJECTION_VERSION,
+      document_id: documentId,
+      rejected_envelope_hash: input.rejectedEnvelopeHash,
+      rejecting_agent_id: agentId,
+      reason: input.reason,
+      ...(input.detail === undefined ? {} : { detail: input.detail }),
+      round,
+      rejected_at_ms: input.nowMs,
+      signature: new Uint8Array(0),
+    };
+    envelope.signature = await input.sign(buildDocumentRejectionTbs(envelope));
 
     // CHAIN IT. Writing `docPrevHash: null` made every rejection a second GENESIS row for this
     // agent, so two rejections forked the chain — and the retry protocol guarantees at least two
@@ -165,19 +214,22 @@ export class DocumentRejections {
     // document survives a restart, the document rebuilt until the next daemon start and was
     // permanently unopenable after it. Measured. A rejection is this agent's own authored act, so
     // it belongs in this agent's own chain.
-    const rejectionEnvelopeHash = rejectionHash(input.rejectedEnvelopeHash, input.reason, input.nonce);
+    const rejectionEnvelopeHash = documentRejectionHash(envelope);
     const appended = this.#store.appendEnvelope(agentId, {
       envelopeHash: rejectionEnvelopeHash,
       documentId,
       senderAgentId: agentId, // WE authored the rejection, whoever authored the update
       docPrevHash: this.#store.lastEnvelopeHashBySender(agentId, documentId, agentId),
       epochId: 0,
-      signature: input.signature,
-      stateVector: input.stateVector,
+      signature: envelope.signature,
+      // The rejection's own state vector — what THIS agent had seen when it refused. Empty is
+      // honest here: a rejection asserts nothing about document state, and REJECT-1's requirement
+      // was that the SIGNATURE be real, not that every field be populated for its own sake.
+      stateVector: new Uint8Array(0),
       payload: null, // an audit record carries no content
       kind: "rejection",
       referencesEnvelopeHash: input.rejectedEnvelopeHash,
-      createdAtMs: Date.now(),
+      createdAtMs: input.nowMs,
     });
     if (!appended) {
       // The store tells callers whether a row was written precisely so this is not inferred. A
@@ -212,7 +264,7 @@ export class DocumentRejections {
       limitName: input.limit?.name,
       limitValue: input.limit?.limit,
       limitActual: input.limit?.actual,
-      createdAtMs: Date.now(),
+      createdAtMs: input.nowMs,
     });
     if (!held) {
       // Cannot happen while the leaf hash is unique per rejection, which the append above already
@@ -224,8 +276,6 @@ export class DocumentRejections {
         rejectedEnvelopeHash: input.rejectedEnvelopeHash,
       });
     }
-
-    const round = this.#round(agentId, documentId);
 
     // The policy record — on BOTH sides, per §3.2. This is the sending half; the receiving half
     // is written when a rejection arrives.
@@ -473,12 +523,3 @@ export class DocumentRejections {
   }
 }
 
-/** A rejection's own envelope hash — distinct per rejected envelope and reason. */
-function rejectionHash(rejectedEnvelopeHash: string, reason: string, nonce: string): string {
-  // The nonce is what stops two rejections of the same envelope for the same reason collapsing
-  // into one row — which would let a document reach `stalled` with fewer leaves than rounds.
-  // DELIBERATELY a different construction from ENVELOPE-1's update hash (a CBOR-array digest), though both land in the envelope_hash column and the same per-sender chain. The preimage shapes cannot collide, and unifying them would mean signing a rejection as a document update.
-  return createHash("sha256")
-    .update(`rejection:${rejectedEnvelopeHash}:${reason}:${nonce}`, "utf8")
-    .digest("hex");
-}

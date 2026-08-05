@@ -95,11 +95,7 @@ function newFixture(opts: { verify?: () => boolean; order?: string[]; appendOnly
     store, engine, gate, rejections, logger,
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
-    crypto: async () => ({
-      signature: new Uint8Array(64).fill(1),
-      stateVector: new Uint8Array([0]),
-      nonce: `n${Math.floor(NOW)}`,
-    }),
+    sign: async () => new Uint8Array(64).fill(1),
   });
   return { inbound, store, engine, live, events, logger };
 }

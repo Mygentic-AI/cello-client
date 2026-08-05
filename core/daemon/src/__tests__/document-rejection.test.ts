@@ -49,12 +49,11 @@ function newFixture() {
  * that fails to verify. ENVELOPE-1 produces the real ones.
  */
 let nonceCounter = 0;
-function crypto(): { signature: Uint8Array; stateVector: Uint8Array; nonce: string } {
+function crypto(): { sign: (tbs: Uint8Array) => Promise<Uint8Array>; nowMs: number } {
   nonceCounter += 1;
   return {
-    signature: new Uint8Array(64).fill(7),
-    stateVector: new Uint8Array([1, 0]),
-    nonce: `n${nonceCounter}`,
+    sign: async () => new Uint8Array(64).fill(7),
+    nowMs: 1_700_000_000_000 + nonceCounter,
     // The refused envelope's own chain link. Required, so the bridge can never fabricate a
     // genesis for a refused envelope it does not actually know the predecessor of.
     rejectedDocPrevHash: null as string | null,
@@ -103,13 +102,13 @@ function envelope(payload: Uint8Array | null, prev: string | null): DocumentEnve
 }
 
 describe("DocumentRejections — a rejection is a record, not a discard", () => {
-  it("writes a 0x05 row REFERENCING the refused envelope, and never the refused payload", () => {
+  it("writes a 0x05 row REFERENCING the refused envelope, and never the refused payload", async () => {
     const { store, engine, rejections } = newFixture();
     const base = envelope(baseUpdate(), null);
     store.appendEnvelope(AGENT, base);
     const refusedHash = "ab".repeat(32);
 
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: refusedHash,
       quarantined: refusedUpdate(),
       reason: "document_append_only_violation",
@@ -141,10 +140,10 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
     expect(doc.getText("content").toString()).not.toContain("REFUSED");
   });
 
-  it("HOLDS the quarantined bytes — never admitted, never discarded", () => {
+  it("HOLDS the quarantined bytes — never admitted, never discarded", async () => {
     const { rejections } = newFixture();
     const bytes = new Uint8Array([9, 9, 9]);
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: bytes,
       reason: "document_update_malformed",
@@ -157,9 +156,9 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
     expect(Buffer.from(held[0]!.quarantined)).toEqual(Buffer.from(bytes));
   });
 
-  it("writes a policy record carrying the REASON, so both operators can see why", () => {
+  it("writes a policy record carrying the REASON, so both operators can see why", async () => {
     const { rejections, events } = newFixture();
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: new Uint8Array([1, 1]),
       reason: "document_append_only_violation",
@@ -177,7 +176,7 @@ describe("DocumentRejections — a rejection is a record, not a discard", () => 
 });
 
 describe("DocumentRejections — supersession, not rollback on both sides (§3.2)", () => {
-  it("the superseding update NETS TO ZERO for the rejected content, and converges", () => {
+  it("the superseding update NETS TO ZERO for the rejected content, and converges", async () => {
     const { engine, rejections } = newFixture();
 
     // The receiver holds an accepted base. The sender writes something that will be refused.
@@ -216,7 +215,7 @@ describe("DocumentRejections — supersession, not rollback on both sides (§3.2
     expect(receiver.getText("content").toString()).toBe(sender.getText("content").toString());
   });
 
-  it("the rollback ADDS INVERSES rather than erasing — the audit trail survives", () => {
+  it("the rollback ADDS INVERSES rather than erasing — the audit trail survives", async () => {
     const { rejections } = newFixture();
     const doc = new Y.Doc();
     doc.clientID = 3_000;
@@ -235,9 +234,9 @@ describe("DocumentRejections — supersession, not rollback on both sides (§3.2
     expect(doc.getText("content").toString()).toBe("base");
   });
 
-  it("clears the quarantine when the supersession is admitted", () => {
+  it("clears the quarantine when the supersession is admitted", async () => {
     const { rejections } = newFixture();
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: new Uint8Array([1, 1]),
       reason: "document_append_only_violation",
@@ -252,13 +251,13 @@ describe("DocumentRejections — supersession, not rollback on both sides (§3.2
 });
 
 describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
-  it("allows exactly one more round, then flips the document to stalled", () => {
+  it("allows exactly one more round, then flips the document to stalled", async () => {
     const { store, rejections } = newFixture();
     // DISTINCT envelopes per round, which is what the protocol produces — the original update,
     // then the supersession, then its supersession. Re-rejecting one hash collapsed to a single
     // log row and is what hid the chain fork.
     let n = 0;
-    const reject = () =>
+    const reject = async () =>
       rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${(n += 1)}`.padStart(64, "e"),
         quarantined: new Uint8Array([1, 1]),
@@ -267,17 +266,17 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
         ...crypto(),
       });
 
-    expect(reject().stalled).toBe(false); // the original rejection
-    expect(reject().stalled).toBe(false); // the superseding update rejected — one more round
-    expect(reject().stalled).toBe(true); // and that is the limit
+    expect((await reject()).stalled).toBe(false); // the original rejection
+    expect((await reject()).stalled).toBe(false); // the superseding update rejected — one more round
+    expect((await reject()).stalled).toBe(true); // and that is the limit
 
     expect(store.getDocument(AGENT, DOC)!.status).toBe("stalled");
   });
 
-  it("a stalled document STOPS accepting updates, and says why", () => {
+  it("a stalled document STOPS accepting updates, and says why", async () => {
     const { store, rejections } = newFixture();
     for (let i = 0; i < 3; i++) {
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "e"),
         quarantined: new Uint8Array([1, 1]),
         reason: "document_append_only_violation",
@@ -297,10 +296,10 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
     expect(store.getDocument(AGENT, DOC)!.status).toBe("stalled");
   });
 
-  it("emits document.stalled once, not on every subsequent refusal", () => {
+  it("emits document.stalled once, not on every subsequent refusal", async () => {
     const { rejections, events } = newFixture();
     for (let i = 0; i < 5; i++) {
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "f"),
         quarantined: new Uint8Array([1, 1]),
         reason: "document_append_only_violation",
@@ -313,7 +312,7 @@ describe("DocumentRejections — one retry, then stalled (§16.7-2)", () => {
 });
 
 describe("DocumentRejections — mutual concurrent rejections are independent", () => {
-  it("each direction has its own quarantine and its own retry count", () => {
+  it("each direction has its own quarantine and its own retry count", async () => {
     const { store, rejections } = newFixture();
     const other = "dd".repeat(32);
     store.createDocument({
@@ -324,12 +323,12 @@ describe("DocumentRejections — mutual concurrent rejections are independent", 
     // Two documents standing in for the two directions of a mutual rejection: each carries its
     // own quarantine and counter, so neither can stall the other and state vectors keep them
     // from deadlocking.
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "11".repeat(32), quarantined: new Uint8Array([1]),
       reason: "document_append_only_violation", senderAgentId: PEER, ...crypto(),
     });
     for (let i = 0; i < 3; i++) {
-      rejections.reject(AGENT, other, {
+      await rejections.reject(AGENT, other, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "2"), quarantined: new Uint8Array([2]),
         reason: "document_update_malformed", senderAgentId: PEER, ...crypto(),
       });
@@ -342,13 +341,13 @@ describe("DocumentRejections — mutual concurrent rejections are independent", 
 });
 
 describe("DocumentRejections — erasure by a BOUND peer (the question GATE-1 handed over)", () => {
-  it("records the DECISION that erasure is rejectable — detection is owed to the gate", () => {
+  it("records the DECISION that erasure is rejectable — detection is owed to the gate", async () => {
     const { rejections } = newFixture();
     // GATE-1's rule (h) binds insertions only: a Yjs delete set carries no clientID and advances
     // no clock, so a bound peer deleting the owner's content passes the gate silently. That is
     // legitimate CRDT behaviour, not a forgery — but it must be REPORTABLE, or the only defence
     // is append_only, which defaults off.
-    const outcome = rejections.reject(AGENT, DOC, {
+    const outcome = await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: new Uint8Array([1, 1]),
       reason: "document_bound_peer_erasure",
@@ -364,10 +363,10 @@ describe("DocumentRejections — erasure by a BOUND peer (the question GATE-1 ha
 // ─── Pass-one: the cases the original tests could not see ───────────────────
 
 describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
-  it("a new instance over the same store still holds the bytes, the round, and the stall", () => {
+  it("a new instance over the same store still holds the bytes, the round, and the stall", async () => {
     const { store, rejections, logger } = newFixture();
     for (let i = 0; i < 3; i++) {
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "a"),
         quarantined: new Uint8Array([i, i]),
         reason: "document_append_only_violation",
@@ -385,9 +384,9 @@ describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
     expect(restarted.quarantined(AGENT, DOC)).toHaveLength(3);
   });
 
-  it("the held bytes are recovered from the STORE, not from the caller's array", () => {
+  it("the held bytes are recovered from the STORE, not from the caller's array", async () => {
     const { store, rejections, logger } = newFixture();
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: new Uint8Array([4, 5, 6]),
       reason: "document_update_malformed",
@@ -399,10 +398,10 @@ describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
     expect(Buffer.from(recovered[0]!.quarantined)).toEqual(Buffer.from([4, 5, 6]));
   });
 
-  it("the bytes are COPIED — a caller reusing its buffer cannot change what was refused", () => {
+  it("the bytes are COPIED — a caller reusing its buffer cannot change what was refused", async () => {
     const { rejections } = newFixture();
     const buffer = new Uint8Array([7, 7, 7]);
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "cd".repeat(32),
       quarantined: buffer,
       reason: "document_update_malformed",
@@ -418,7 +417,7 @@ describe("DocumentRejections — the quarantine SURVIVES a restart", () => {
 });
 
 describe("DocumentRejections — rejections do not fork the chain", () => {
-  it("three rejections leave the chain VERIFIABLE and the document rebuildable", () => {
+  it("three rejections leave the chain VERIFIABLE and the document rebuildable", async () => {
     const { store, engine, rejections } = newFixture();
     // Three SUCCESSIVE envelopes from the peer, each refused. This is the protocol's own shape:
     // the original, its supersession, and that supersession's — a chain, not three roots. An
@@ -427,7 +426,7 @@ describe("DocumentRejections — rejections do not fork the chain", () => {
     let prev: string | null = null;
     for (let i = 0; i < 3; i++) {
       const hash = `${i}`.padStart(64, "b");
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: hash,
         quarantined: new Uint8Array([i]),
         reason: "document_append_only_violation",
@@ -447,7 +446,7 @@ describe("DocumentRejections — rejections do not fork the chain", () => {
 });
 
 describe("DocumentRejections — rollback refuses rather than undoing the wrong work", () => {
-  it("REFUSES when local edits are stacked since tracking began", () => {
+  it("REFUSES when local edits are stacked since tracking began", async () => {
     const { rejections } = newFixture();
     const doc = new Y.Doc();
     doc.clientID = 3_000;
@@ -464,7 +463,7 @@ describe("DocumentRejections — rollback refuses rather than undoing the wrong 
     expect(doc.getText("content").toString()).toBe("base REFUSED legitimate");
   });
 
-  it("REFUSES when nothing was tracked at all, rather than reporting success", () => {
+  it("REFUSES when nothing was tracked at all, rather than reporting success", async () => {
     const { rejections } = newFixture();
     const doc = new Y.Doc();
     doc.clientID = 3_000;
@@ -474,28 +473,27 @@ describe("DocumentRejections — rollback refuses rather than undoing the wrong 
 });
 
 describe("DocumentRejections — a duplicate rejection does not advance the round", () => {
-  it("re-rejecting the same envelope for the same reason writes one leaf and one round", () => {
+  it("re-rejecting the same envelope for the same reason writes one leaf and one round", async () => {
     const { store, rejections } = newFixture();
     const input = {
       rejectedEnvelopeHash: "ef".repeat(32),
       quarantined: new Uint8Array([1]),
       reason: "document_update_malformed",
       senderAgentId: PEER,
-      signature: new Uint8Array(64).fill(7),
-      stateVector: new Uint8Array([1, 0]),
-      nonce: "same",
+      sign: async () => new Uint8Array(64).fill(7),
+      nowMs: 1_700_000_000_000,
       rejectedDocPrevHash: null,
     };
-    expect(rejections.reject(AGENT, DOC, input).round).toBe(1);
+    expect((await rejections.reject(AGENT, DOC, input)).round).toBe(1);
     // A duplicate must not advance the counter, or a document reaches `stalled` with fewer
     // rejection leaves than rounds and an auditor replaying the log cannot see why.
-    expect(rejections.reject(AGENT, DOC, input).round).toBe(1);
+    expect((await rejections.reject(AGENT, DOC, input)).round).toBe(1);
     expect(store.getEnvelopeLog(AGENT, DOC).filter((e) => e.kind === "rejection")).toHaveLength(1);
   });
 });
 
 describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)", () => {
-  it("the sender's side records a rejection ARRIVING, with the reason intact", () => {
+  it("the sender's side records a rejection ARRIVING, with the reason intact", async () => {
     const { rejections, events } = newFixture();
     rejections.recordIncomingRejection(AGENT, DOC, {
       rejectionEnvelopeHash: "f1".repeat(32),
@@ -514,9 +512,9 @@ describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)",
     expect(received!.fields.detail).toContain("deletes 12");
   });
 
-  it("the two halves are DISTINCT events — a log reader can tell who refused whom", () => {
+  it("the two halves are DISTINCT events — a log reader can tell who refused whom", async () => {
     const { rejections, events } = newFixture();
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "11".repeat(32),
       quarantined: new Uint8Array([1]),
       reason: "document_update_malformed",
@@ -537,13 +535,13 @@ describe("DocumentRejections — the policy record lands on BOTH sides (§3.2)",
 
 
 describe("DocumentRejections — the chain BRIDGES a refused envelope (§3.2 + §16.7-5)", () => {
-  it("the peer's supersession still links, even though the refused envelope is not in the log", () => {
+  it("the peer's supersession still links, even though the refused envelope is not in the log", async () => {
     const { store, engine, rejections } = newFixture();
     const base = envelope(baseUpdate(), null);
     store.appendEnvelope(AGENT, base);
     const refusedHash = "ab".repeat(32);
 
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: refusedHash,
       quarantined: refusedUpdate(),
       reason: "document_append_only_violation",
@@ -567,7 +565,7 @@ describe("DocumentRejections — the chain BRIDGES a refused envelope (§3.2 + �
     expect(doc.getText("content").toString()).not.toContain("REFUSED");
   });
 
-  it("a link to something that is NEITHER logged nor refused still refuses, and says which", () => {
+  it("a link to something that is NEITHER logged nor refused still refuses, and says which", async () => {
     const { store } = newFixture();
     store.appendEnvelope(AGENT, envelope(baseUpdate(), null));
     store.appendEnvelope(AGENT, envelope(new Uint8Array([0]), "de".repeat(32)));
@@ -581,11 +579,11 @@ describe("DocumentRejections — the chain BRIDGES a refused envelope (§3.2 + �
 });
 
 describe("DocumentRejections — a refused envelope re-refused keeps EVERY round's facts", () => {
-  it("three rounds on one envelope hold three sets of bytes, reasons, rules and limits", () => {
+  it("three rounds on one envelope hold three sets of bytes, reasons, rules and limits", async () => {
     const { rejections } = newFixture();
     const refusedHash = "ab".repeat(32);
     for (const [i, reason] of ["reason_ONE", "reason_TWO", "reason_THREE"].entries()) {
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: refusedHash,
         quarantined: new Uint8Array([i]),
         reason,
@@ -606,10 +604,10 @@ describe("DocumentRejections — a refused envelope re-refused keeps EVERY round
     expect(held.map((h) => Array.from(h.quarantined))).toEqual([[0], [1], [2]]);
   });
 
-  it("the stall detail names the LATEST reason, not the first", () => {
+  it("the stall detail names the LATEST reason, not the first", async () => {
     const { rejections } = newFixture();
     for (const reason of ["reason_ONE", "reason_TWO", "reason_THREE"]) {
-      rejections.reject(AGENT, DOC, {
+      await rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: "ab".repeat(32),
         quarantined: new Uint8Array([1]),
         reason,
@@ -625,7 +623,7 @@ describe("DocumentRejections — a refused envelope re-refused keeps EVERY round
 });
 
 describe("DocumentRejections — TWO PEERS, one document, two independent counters", () => {
-  it("each side reaches its own stall, and neither advances the other's round", () => {
+  it("each side reaches its own stall, and neither advances the other's round", async () => {
     // Two stores, because two peers are two daemons. The previous version of this test used two
     // DOCUMENTS owned by one agent, which any implementation passes — it asserted that a composite
     // primary key distinguishes two different keys.
@@ -633,14 +631,14 @@ describe("DocumentRejections — TWO PEERS, one document, two independent counte
     const b = newFixture();
 
     for (let i = 0; i < 2; i++) {
-      a.rejections.reject(AGENT, DOC, {
+      await a.rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "b"),
         quarantined: new Uint8Array([i]),
         reason: "a_refuses_b",
         senderAgentId: PEER,
         ...crypto(),
       });
-      b.rejections.reject(AGENT, DOC, {
+      await b.rejections.reject(AGENT, DOC, {
         rejectedEnvelopeHash: `${i}`.padStart(64, "c"),
         quarantined: new Uint8Array([i]),
         reason: "b_refuses_a",
@@ -654,16 +652,18 @@ describe("DocumentRejections — TWO PEERS, one document, two independent counte
     expect(a.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true);
     expect(b.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true);
 
-    const third = (f: typeof a, reason: string, fill: string): boolean =>
-      f.rejections.reject(AGENT, DOC, {
-        rejectedEnvelopeHash: "9".padStart(64, fill),
-        quarantined: new Uint8Array([9]),
-        reason,
-        senderAgentId: PEER,
-        ...crypto(),
-      }).stalled;
+    const third = async (f: typeof a, reason: string, fill: string): Promise<boolean> =>
+      (
+        await f.rejections.reject(AGENT, DOC, {
+          rejectedEnvelopeHash: "9".padStart(64, fill),
+          quarantined: new Uint8Array([9]),
+          reason,
+          senderAgentId: PEER,
+          ...crypto(),
+        })
+      ).stalled;
 
-    expect(third(a, "a_refuses_b", "b")).toBe(true);
+    expect(await third(a, "a_refuses_b", "b")).toBe(true);
     expect(b.rejections.acceptsUpdates(AGENT, DOC).ok).toBe(true); // A stalling did not stall B
   });
 });
@@ -676,7 +676,7 @@ describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2
     fromAgentId: PEER,
   });
 
-  it("counts the rejections RECEIVED, not the ones this agent authored", () => {
+  it("counts the rejections RECEIVED, not the ones this agent authored", async () => {
     const { rejections } = newFixture();
     // On a pure publisher the authored count is zero forever, so the round read 0 for the first,
     // second and third rejection alike — the one number an operator uses to see how close the
@@ -685,7 +685,7 @@ describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2
     expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(2)).round).toBe(2);
   });
 
-  it("stalls the PUBLISHER on the same threshold the receiver stops accepting on", () => {
+  it("stalls the PUBLISHER on the same threshold the receiver stops accepting on", async () => {
     const { rejections } = newFixture();
     rejections.recordIncomingRejection(AGENT, DOC, incoming(1));
     rejections.recordIncomingRejection(AGENT, DOC, incoming(2));
@@ -698,7 +698,7 @@ describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2
     expect(MAX_REJECTED_ROUNDS).toBe(3);
   });
 
-  it("SURVIVES a restart — the publisher's operator still knows why and how many", () => {
+  it("SURVIVES a restart — the publisher's operator still knows why and how many", async () => {
     const f = newFixture();
     f.rejections.recordIncomingRejection(AGENT, DOC, incoming(1));
     f.rejections.recordIncomingRejection(AGENT, DOC, incoming(2));
@@ -707,7 +707,7 @@ describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2
     expect(restarted.recordIncomingRejection(AGENT, DOC, incoming(3)).round).toBe(3);
   });
 
-  it("a REDELIVERED rejection does not advance the round", () => {
+  it("a REDELIVERED rejection does not advance the round", async () => {
     const { rejections, events } = newFixture();
     expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(1)).round).toBe(1);
     expect(rejections.recordIncomingRejection(AGENT, DOC, incoming(1)).round).toBe(1);
@@ -716,7 +716,7 @@ describe("DocumentRejections — the RECEIVING half is durable and counts (§3.2
 });
 
 describe("DocumentRejections — clearQuarantine only announces a real admission", () => {
-  it("stays silent for a hash that was never quarantined", () => {
+  it("stays silent for a hash that was never quarantined", async () => {
     const { rejections, events } = newFixture();
     rejections.clearQuarantine(AGENT, DOC, "ff".repeat(32));
     // An event that fires on a no-op is a signal on the wrong case: an operator watching for
@@ -724,9 +724,9 @@ describe("DocumentRejections — clearQuarantine only announces a real admission
     expect(events.filter((e) => e.event === "document.supersession.admitted")).toHaveLength(0);
   });
 
-  it("announces once when the entry existed", () => {
+  it("announces once when the entry existed", async () => {
     const { rejections, events } = newFixture();
-    rejections.reject(AGENT, DOC, {
+    await rejections.reject(AGENT, DOC, {
       rejectedEnvelopeHash: "ab".repeat(32),
       quarantined: new Uint8Array([1]),
       reason: "document_update_malformed",

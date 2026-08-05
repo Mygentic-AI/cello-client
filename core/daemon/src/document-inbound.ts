@@ -61,12 +61,13 @@ export interface DocumentInboundDeps {
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
   /**
-   * The rejection's own signature, state vector and nonce. Never fabricated here.
+   * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
-   * ASYNC, and that is what makes `receive` async: signing goes through a key provider, and
-   * REJECT-1 requires a real signature rather than a placeholder.
+   * Takes the agent so it cannot sign with the wrong key. ASYNC, and that is what makes `receive`
+   * async: signing goes through a key provider, and REJECT-1 requires a real signature rather than
+   * a placeholder.
    */
-  crypto(): Promise<{ signature: Uint8Array; stateVector: Uint8Array; nonce: string }>;
+  sign(ownerAgentId: string, tbs: Uint8Array): Promise<Uint8Array>;
 }
 
 /** The agreed property, read from the row rather than from whoever called us. */
@@ -297,8 +298,7 @@ export class DocumentInbound {
     if (!verdict.admit) {
       // 7a. REJECT. The bytes are held, a 0x05 leaf references them, and the peer is ANSWERED —
       // a rejection is an ack for delivery purposes, so the sender stops retrying and supersedes.
-      const crypto = await this.#d.crypto();
-      this.#d.rejections.reject(ownerAgentId, env.document_id, {
+      await this.#d.rejections.reject(ownerAgentId, env.document_id, {
         rejectedEnvelopeHash: envelopeHash,
         quarantined: verdict.quarantined,
         reason: verdict.reason,
@@ -307,7 +307,9 @@ export class DocumentInbound {
         rejectedDocPrevHash: env.doc_prev_hash,
         rule: verdict.rule,
         limit: verdict.limit,
-        ...crypto,
+        // The OWNER signs its own rejection, over the canonical preimage (DOD-DOC-REJECT-2).
+        sign: (tbs) => this.#d.sign(ownerAgentId, tbs),
+        nowMs,
       });
       return {
         ok: true,

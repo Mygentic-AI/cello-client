@@ -26,7 +26,6 @@ const AGENT = "owner-agent";
 const PEER = "peer-agent";
 const DOC = "cc".repeat(32);
 const PEER_CLIENT = 4242;
-const NOW = 1_700_000_000_000;
 
 function recordingLogger(): { logger: Logger; events: Array<{ event: string; fields: Record<string, unknown> }> } {
   const events: Array<{ event: string; fields: Record<string, unknown> }> = [];
@@ -58,11 +57,7 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
       agentId === PEER && opts.knowPeerKey !== false ? publicKey : null,
     notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),
-    crypto: async () => ({
-      signature: new Uint8Array(64).fill(1),
-      stateVector: new Uint8Array([0]),
-      nonce: `n${NOW}`,
-    }),
+    sign: async () => new Uint8Array(64).fill(1),
   });
 
   layer.store.createDocument({
@@ -140,7 +135,7 @@ describe("document layer — a REAL signature is verified end to end", () => {
       publicKeyFor: () => new Uint8Array(3), // not a valid Ed25519 key
       notifyPeer: async () => ({ ok: true }),
       rollback: () => ({ ok: true }),
-      crypto: async () => ({ signature: new Uint8Array(64), stateVector: new Uint8Array([0]), nonce: "n" }),
+      sign: async () => new Uint8Array(64),
     });
     layer.store.createDocument({
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
@@ -205,7 +200,7 @@ describe("document layer — a conversation message passes straight through", ()
 });
 
 describe("agentPublicKeyFromId — a remote agent id IS its pubkey (M14-D5)", () => {
-  it("decodes a 32-byte hex id to the key bytes", () => {
+  it("decodes a 32-byte hex id to the key bytes", async () => {
     const hex = "ab".repeat(32);
     const key = agentPublicKeyFromId(hex);
     expect(key).toBeInstanceOf(Uint8Array);
@@ -213,7 +208,7 @@ describe("agentPublicKeyFromId — a remote agent id IS its pubkey (M14-D5)", ()
     expect(Buffer.from(key!).toString("hex")).toBe(hex);
   });
 
-  it("returns null for anything that is not one, rather than throwing", () => {
+  it("returns null for anything that is not one, rather than throwing", async () => {
     // Null is a refusal at the verify step. An id that is not a key is a frame that does not follow
     // the protocol, not "a peer we have no key for" — but both must refuse, and this is where.
     for (const bad of ["", "not-hex", "AB".repeat(32), "ab".repeat(16), "ab".repeat(33)]) {

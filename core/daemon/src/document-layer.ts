@@ -63,13 +63,14 @@ export interface DocumentLayerDeps {
     envelopeHash: string,
   ): { ok: true } | { ok: false; reason: string };
   /**
-   * The rejection's own signature, state vector and nonce. Never fabricated inside the layer.
+   * Sign as a given agent. Takes the agent id so a rejection cannot be signed with the wrong key —
+   * the first version took no arguments and the composition root reached for whichever key
+   * provider was first in a map, which is fabricated crypto wearing a real signature.
    *
-   * ASYNC because signing goes through a key provider. That async is what forced the router to
-   * split synchronous CLASSIFICATION (which the session path needs inline, to pick a leaf kind)
-   * from asynchronous HANDLING.
+   * ASYNC because signing goes through a key provider, and that async is what forced the router to
+   * split synchronous CLASSIFICATION from asynchronous HANDLING.
    */
-  crypto(): Promise<{ signature: Uint8Array; stateVector: Uint8Array; nonce: string }>;
+  sign(ownerAgentId: string, tbs: Uint8Array): Promise<Uint8Array>;
 }
 
 export interface DocumentLayer {
@@ -150,7 +151,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     logger,
     verifySignature,
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
-    crypto: deps.crypto,
+    sign: deps.sign,
   });
 
   const ackInbound = new DocumentAckInbound({ store, rejections, logger, verifySignature });
