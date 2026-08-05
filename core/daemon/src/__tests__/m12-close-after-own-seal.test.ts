@@ -7,7 +7,7 @@
  *
  * The bug: both parties closing at once is the ORDINARY case — each operator ends the conversation —
  * and whichever call arrives second can find the in-memory session node already gone. `submitSealLeaf`
- * then reports `session_node_unavailable`, which the handler surfaced verbatim with guidance blaming
+ * then cannot submit, and the handler surfaced that verbatim with guidance blaming
  * relay reachability. The relay was fine and the seal was notarized and durable; the operator who asked
  * to close was told it failed and got no root, which is the entire point of closing.
  *
@@ -16,6 +16,13 @@
  * failure while justifying itself for one reason, so a future tree-mismatch or signing failure would
  * have been absorbed into `ok: true` with a stale root and never surfaced. Both the positive and the
  * negative are asserted here; the negative is the one that pins the scope.
+ *
+ * M12-P15 (review HIGH-3): these used to stub `session_node_unavailable`, which `submitSealLeaf` can
+ * no longer produce — once it learned to fall back to a detached transport, the recovery branch went
+ * dead and this suite kept passing against an impossible value. That is a hollow test by drift: the
+ * stub outlived the contract. They now use `relay_session_gone`, a reason the real object emits on
+ * this path, and the handler keys on the SET of reasons that mean "we could not submit; the seal may
+ * already be durable" rather than on one string.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -82,7 +89,7 @@ function harness(opts: {
 describe("a close that lands after its own seal", () => {
   it("returns the stored root instead of the submit's exit-point reason", async () => {
     const { close, getSealCertificate } = harness({
-      submitReason: "session_node_unavailable",
+      submitReason: "relay_session_gone",
       cert: { sealed_root: ROOT, legibility: { attests: "receipt" } },
     });
 
@@ -100,12 +107,12 @@ describe("a close that lands after its own seal", () => {
   it("still surfaces the failure when there is NO stored root", async () => {
     // The negative half. Without it, "return ok when a cert exists" is indistinguishable from
     // "return ok", and a genuine unsealable session would be reported as sealed with no root.
-    const { close } = harness({ submitReason: "session_node_unavailable", cert: null });
+    const { close } = harness({ submitReason: "relay_session_gone", cert: null });
 
     const res = (await close({ session_id: SESSION }, "conn-1")) as { ok: boolean; reason?: string };
 
     expect(res.ok).toBe(false);
-    expect(res.reason).toBe("session_node_unavailable");
+    expect(res.reason).toBe("relay_session_gone");
   });
 
   it("does NOT consult the local cert for an unrelated submit failure", async () => {

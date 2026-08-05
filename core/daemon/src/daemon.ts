@@ -1352,7 +1352,7 @@ async function startDaemonHoldingLock(
   // deliberately holds no K_local, so the client is built here where the keys live. This is what
   // makes the detached path work after a RESTART — the exact situation that marked the session
   // interrupted and then left it unsealable, with force-abandon (no receipt) as the only exit.
-  sessionNodeManager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs) => {
+  sessionNodeManager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs, stores) => {
     const kp = keyProviders.get(agentName);
     const agent = agents.find((a) => a.name === agentName);
     if (!kp || !agent?.pubkey) return undefined;
@@ -1362,6 +1362,10 @@ async function startDaemonHoldingLock(
       keyProvider: kp,
       senderPubkey: Buffer.from(agent.pubkey, "hex"),
       logger,
+      // Review HIGH-1: a client that can submit but cannot RECORD drops the durable evidence the
+      // seal depends on — silently, while reporting success.
+      receiptStore: stores.receiptStore,
+      sealLeafStore: stores.sealLeafStore,
     });
   });
 

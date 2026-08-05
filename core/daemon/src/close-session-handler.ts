@@ -391,8 +391,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           // gate. Honest caveat: for a NON-initiator the stored cert is recorded `verified:false`,
           // so it is ultimately directory-attested over an authenticated channel — the same trust the
           // ordinary bilateral close already returns, not a new one introduced here.
+          // M12-P15 (review HIGH-3): this used to key on `session_node_unavailable` ALONE. That was
+          // the only reason submitSealLeaf could give when the node was gone — until M12-P15 taught
+          // it to fall back to a detached transport, after which it can no longer produce that
+          // string at all and this recovery went DEAD. The ordinary double-close then dialled the
+          // relay, submitted a second ctrl leaf to a session the relay had already destroyed on
+          // seal, and told the operator the close failed — the M12 defect back under a new label.
+          // The question this branch actually asks is "we could not submit; is the seal already
+          // durable?", so it keys on every reason that means exactly that. A stored certificate is
+          // the answer either way, and consulting it is cheap.
+          const SEAL_MAY_ALREADY_BE_DURABLE = new Set([
+            "session_node_unavailable",
+            "no_persisted_relay_endpoint",
+            "standing_receiver_unavailable",
+            "relay_client_unavailable",
+            "relay_unavailable",
+            "relay_session_gone",
+            "session_not_found",
+          ]);
           const localCert =
-            submit.reason === "session_node_unavailable"
+            SEAL_MAY_ALREADY_BE_DURABLE.has(submit.reason)
               ? sessionNodeManager.getSealCertificate(record.agent_name, sessionId)
               : null;
           if (localCert?.sealed_root) {

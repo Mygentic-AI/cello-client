@@ -270,8 +270,8 @@ export class SessionNodeManager {
    * manager deliberately does not hold. Only consulted on the detached seal path — an ACTIVE session
    * always uses its own registered client.
    */
-  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[]) => AgentRelayClient | undefined) | null = null;
-  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[]) => AgentRelayClient | undefined): void {
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined): void {
     this.#detachedRelayClientBuilder = fn;
   }
 
@@ -309,9 +309,35 @@ export class SessionNodeManager {
     // the composition root to build one. Without the builder this path would work only within the
     // lifetime that created the session — and the case that matters most is precisely a daemon that
     // RESTARTED, which is what marked the session interrupted in the first place.
-    const client = this.#relayClients.get(`${agentName}::${ep.relayPeerId}`)
-      ?? this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs]);
-    if (!client) return { error: "relay_client_unavailable" };
+    const clientKey = `${agentName}::${ep.relayPeerId}`;
+    let client = this.#relayClients.get(clientKey);
+    if (!client) {
+      // Review HIGH-1: the stores are NOT optional here. Without them `#captureReceipt` silently
+      // `return false`s — the submit still reports ok while the relay's signed receipt and our OWN
+      // 0x02 ctrl leaf are never persisted. That drops the unilateral-escalation carry chain AND
+      // defeats this very unit's ceremony discriminator, which reads `session_seal_leaves`: a seal
+      // sent through here would later read as "ceremony unknown" and the peer would decline to
+      // sign. The fix would have broken the fix.
+      if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+      if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+      client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
+        receiptStore: this.#relayReceiptStore ?? undefined,
+        sealLeafStore: this.#sealLeafStore ?? undefined,
+      });
+      if (!client) return { error: "relay_client_unavailable" };
+      // Review MEDIUM-4: cache it, so a retry loop does not leak one authenticated relay stream per
+      // attempt. Safe ONLY because the client above now carries the stores — a store-less client
+      // cached under this key would be picked up by the live `#connectSessionRelay` path and poison
+      // it for the rest of the process.
+      this.#relayClients.set(clientKey, client);
+    }
+    // Review HIGH-2: register the session (no assignment — there is nothing to re-present) so the
+    // relay's `session_not_found` is interpreted honestly. Unregistered, `recordedBefore` is false,
+    // the retry loop runs pointlessly, and the `recordedBefore && session_not_found ->
+    // relay_session_gone` branch — which exists to tell "the relay never had it" apart from "the
+    // relay swept or sealed it" — can never fire, so the operator is handed a first-message-race
+    // label for a swept session.
+    client.registerSession(sessionId, node);
     return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")) };
   }
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents

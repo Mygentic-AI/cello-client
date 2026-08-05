@@ -243,12 +243,35 @@ describe("M12-P14: a terminal session is refused by its actual status, not a cat
     return sentReason;
   }
 
-  it("M12-P15: a seal_interrupted_pending refusal NAMES the ceremony, or the initiator cannot act", async () => {
-    // The initiator routes ONLY on `relay_bilateral` and treats an absent field as "do not sign".
-    // So if the responder never sends it, the routing is unreachable and M12-P15 is unfixed — this
-    // is the test that keeps the two halves connected.
+  /**
+   * M12-P15 (review: the previous version of this test was HOLLOW). It asserted `pending_ceremony`
+   * was `undefined` — which is also true on the reverted code, so it passed THE REVERT TEST
+   * vacuously and never once observed a NAMED ceremony. A reversed argument order, a wrong leafKind,
+   * a casing mismatch, or the missing seal-leaf store would all have left it green. It now seeds the
+   * REAL store and asserts each name.
+   */
+  async function ceremonyFor(seed: "own_ctrl_leaf" | "artifacts_row" | "nothing"): Promise<unknown> {
     await fx.createSession(SID, "alice");
-    fx.snm.getDb()!.prepare("UPDATE sessions SET status = 'seal_interrupted_pending' WHERE session_id = ?").run(SID);
+    const db = fx.snm.getDb()!;
+    db.prepare("UPDATE sessions SET status = 'seal_interrupted_pending' WHERE session_id = ?").run(SID);
+    if (seed === "own_ctrl_leaf") {
+      // The store creates its table lazily on first use — touch the real accessor so the seed goes
+      // into the SAME table the discriminator reads, not one this test invented.
+      fx.snm.getSealCarry("alicepubkeyhex", SID);
+      // A 0x02 ctrl leaf authored by US, in OUR store scope — exactly what a relay bilateral seal
+      // leaves behind, and the thing the discriminator must recognise.
+      db.prepare(
+        `INSERT INTO session_seal_leaves (agent_pubkey, session_id, sequence_number, leaf_kind,
+           sender_pubkey_hex, structure2_cbor, structure1_cbor, stored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run("alicepubkeyhex", SID, 1, 0x02, "alicepubkeyhex", Buffer.from([1]), Buffer.from([1]), Date.now());
+    } else if (seed === "artifacts_row") {
+      fx.snm.persistSealInterruptedCommitment({
+        agentName: "alice", sessionId: SID, role: "responder",
+        ownLeaf: { sig: "x" }, counterpartyLeaf: null, merkleRoot: "00".repeat(32), nonce: "n-seed",
+      });
+      db.prepare("UPDATE sessions SET status = 'seal_interrupted_pending' WHERE session_id = ?").run(SID);
+    }
 
     let frame: Record<string, unknown> | undefined;
     const { handleInboundSealInterruptedRequest } = createInboundSealRequestHandler({
@@ -265,12 +288,23 @@ describe("M12-P14: a terminal session is refused by its actual status, not a cat
       initiatorPubkey: "bobpubkeyhex", counterpartyPubkey: "alicepubkeyhex",
       leafCountAtInterruption: 0, merkleRootAtInterruption: "00".repeat(32), nonce: "n-ceremony",
     });
-
     expect(frame?.reason).toBe("session_seal_already_pending");
-    // No relay ctrl leaf and no artifacts row in this fixture, so the ceremony is genuinely UNKNOWN
-    // and must be omitted rather than guessed — the initiator then declines to sign, which is the
-    // safe default. Sending a wrong value is worse than sending none.
-    expect(frame?.pending_ceremony, "unknown must be absent, never guessed").toBeUndefined();
+    return frame?.pending_ceremony;
+  }
+
+  it("M12-P15: our OWN relay ctrl leaf is named relay_bilateral — the only ceremony a peer leaf can complete", async () => {
+    expect(await ceremonyFor("own_ctrl_leaf")).toBe("relay_bilateral");
+  });
+
+  it("M12-P15: a seal-interrupted commitment is named seal_interrupted — a peer leaf could NEVER complete it", async () => {
+    // Getting this one wrong is the expensive direction: the initiator would submit a leaf into a
+    // log that can never hold a second distinct sender, and be told ok for a session that can never
+    // seal. A permanent false success is worse than the dead end.
+    expect(await ceremonyFor("artifacts_row")).toBe("seal_interrupted");
+  });
+
+  it("M12-P15: neither → ABSENT, never guessed; the initiator then declines to sign", async () => {
+    expect(await ceremonyFor("nothing")).toBeUndefined();
   });
 
   it("an ABANDONED session is refused as session_abandoned — the state we put it in, named", async () => {
