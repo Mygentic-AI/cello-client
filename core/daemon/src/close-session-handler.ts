@@ -204,6 +204,36 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       };
     }
 
+    // M12-P14: do not ask for a seal we already know cannot be granted.
+    //
+    // Placed AFTER the force branch on purpose — force is the operator's deliberate escape hatch and
+    // must never be gated — and before every seal path, because both the interrupted and the active
+    // flows sign this side's frontier.
+    //
+    // A short chain produces `leaf_count_mismatch` at the counterparty, which is correct and
+    // TERMINAL: nothing in the protocol backfills a missing leaf, so the session's only remaining
+    // exit is a force-abandon with no notarized receipt. Refusing here costs the operator a retry;
+    // not refusing costs them the receipt permanently.
+    const readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
+    if (!readiness.ready) {
+      logger.warn("session.seal.blocked_incomplete", {
+        agentName: record.agent_name, sessionId,
+        treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
+        heldCount: readiness.heldCount, missingLeaves: readiness.missingLeaves,
+      });
+      return {
+        ok: false,
+        reason: "session_incomplete",
+        missing_leaves: readiness.missingLeaves,
+        held_messages: readiness.heldCount,
+        guidance:
+          `This side of the conversation is incomplete, so sealing now would produce a chain the counterparty cannot co-sign — and that refusal is terminal, leaving a force-abandon with no notarized receipt as the only way out. ` +
+          `You hold ${readiness.treeSize} message(s); the relay has witnessed ${readiness.highWaterSeq + 1}` +
+          (readiness.heldCount > 0 ? `, and ${readiness.heldCount} received message(s) are waiting behind a gap` : "") +
+          `. The daemon pulls missing content automatically — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
+      };
+    }
+
     // AC-011: seal-interrupted already in progress
     if (sealInterruptedInProgress.has(sealKey(record.agent_name, sessionId))) {
       return {

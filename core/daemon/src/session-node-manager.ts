@@ -4352,6 +4352,44 @@ export class SessionNodeManager {
     return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
   }
 
+  /**
+   * M12-P14: is this side's chain COMPLETE enough to be sealed?
+   *
+   * A seal is a bilateral signature over the same conversation, so a side that is missing a leaf
+   * cannot produce a signable one — the counterparty compares frontiers and refuses with
+   * `leaf_count_mismatch`. That refusal is correct and it is also terminal: there is no backfill
+   * request in the protocol, so the only exit is a force-abandon, which yields NO notarized receipt.
+   * Measured 2026-08-05 on two sessions that died exactly this way (initiator 2 leaves, responder 3).
+   *
+   * The cheap prevention is to notice BEFORE asking. Two local signals already exist and, until now,
+   * nothing read either of them at close time:
+   *  - `#highWaterSeq` — the largest canonical sequence the RELAY has witnessed for this session.
+   *    The relay is the ordering authority, so a high-water above our own frontier is proof that a
+   *    leaf exists which we have not appended. (Its own doc comment called it "reserved … NOT yet
+   *    consumed by the gate" — this is that consumer.)
+   *  - `#heldContent` — content we HAVE received and verified but cannot append because it sits
+   *    behind a gap. Holding content and sealing anyway would seal a chain we know is short.
+   *
+   * Deliberately NOT a network call: it must work when the counterparty is unreachable, which is
+   * the whole situation a seal-interrupted exists for.
+   *
+   * KNOWN LIMIT, stated rather than hidden: both maps are in-memory and cleared on teardown, so
+   * after a daemon restart this returns ready for a session whose gap predates the restart — which
+   * is the shape of the 2026-08-05 incident itself. Closing that needs the mailbox drained (or the
+   * high-water persisted) before the check; tracked with M12-P14, not claimed here.
+   */
+  sealReadiness(agentName: string, sessionId: string): {
+    ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number;
+  } {
+    const key = this.#k(agentName, sessionId);
+    const treeSize = this.getSessionTree(agentName, sessionId).size();
+    const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
+    const heldCount = this.#heldContent.get(key)?.size ?? 0;
+    // high-water is a 0-based index, so a complete chain has treeSize === highWaterSeq + 1.
+    const missingLeaves = Math.max(0, (highWaterSeq + 1) - treeSize);
+    return { ready: missingLeaves === 0 && heldCount === 0, treeSize, highWaterSeq, heldCount, missingLeaves };
+  }
+
   /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
   #appendVerifiedContent(
     agentName: string,
