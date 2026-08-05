@@ -404,7 +404,14 @@ export class RetryQueue {
    * retry_queue table (awaiting_ack = 1) so a crash before the relay park confirms is
    * recoverable at startup. Idempotent on (agentId, sessionId, contentHash).
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): void {
+  /**
+   * Returns TRUE only when this copy is actually queued. M12-P13 (review HIGH-1): the dedupe branch
+   * below DROPS the content, and the caller now commits a hash-chain leaf on the strength of this
+   * answer — so "I dropped it" must be reportable, not merely logged. A void return made the drop
+   * indistinguishable from a successful enqueue at the call site, which is how a leaf could be
+   * committed for content that no longer existed anywhere.
+   */
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);
@@ -420,7 +427,7 @@ export class RetryQueue {
         agentId, sessionId, contentHash: contentHashHex,
         impact: "identical content already queued for this session — this copy is NOT separately queued",
       });
-      return;
+      return false;
     }
 
     const currentMax = this.#positionCounters.get(ak) ?? 0;
@@ -455,6 +462,7 @@ export class RetryQueue {
 
     this.#positionCounters.set(ak, position);
     q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, queuedAt, position });
+    return true;
   }
 
   /** Remove an awaiting-ACK entry once its `persisted` ACK arrives. */

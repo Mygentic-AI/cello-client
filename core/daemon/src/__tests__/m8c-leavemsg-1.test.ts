@@ -361,6 +361,18 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const content = new TextEncoder().encode("queued, not lost");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable", durable: true });
+
+    // Review (hollow test): asserting the FLAG alone pins "the park was refused", never "the content
+    // is queued" — deleting the `#onParkFailed?.()` call entirely left this green while every
+    // durably-queued message was silently lost AND had its leaf committed. Assert the row.
+    const row = snm.getDb()!
+      .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
+      .get(SID) as { n: number };
+    expect(row.n, "durable:true must mean the content is actually in the queue").toBe(1);
+
+    // MEDIUM-5: the standing-receiver state is carried to the caller, not discarded at the mapping
+    // site. `reason` names where this surfaced; `cause` names what actually blocked it.
+    expect((res as { cause?: string }).cause).toBe("standing_receiver_unavailable");
   });
 
   it("M12-P13: an UNCONFIGURED park reports durable:false — the two failures must never read alike", async () => {
@@ -415,16 +427,94 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
   it("M12-P13: a LOST cello_send appends NOTHING — a leaf for content no one will ever receive is a permanent root mismatch", async () => {
     // The mirror image, and the reason the fix keys on `durable` rather than on "the send failed".
     // Appending unconditionally would trade a stalled receiver for two trees that can never seal.
+    //
+    // Review finding: this must be driven through a session that HAS a relay, whose durable enqueue
+    // then FAILS. Routed through an unconfigured session instead, it lands on #parkContent's
+    // "unconfigured" branch — which appended nothing long before this fix — so it would stay green
+    // against a `durable` that is never computed at all, and an implementation that ignores the
+    // enqueue outcome entirely would pass it.
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay, no park
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+    // A persist that throws is the production shape of "not durable" on a relay-configured session:
+    // enqueueAwaitingContent fails loud on a real DB failure precisely because the content is lost.
+    snm.setAwaitingAckHooks({ onParkFailed: () => { throw new Error("disk full"); } });
 
     const client = await connectAs("alice");
     const res = await client.send("cello_send", { session_id: SID, content: "this one is gone" }) as Record<string, unknown>;
     expect(res.ok).toBe(false);
     expect(res.queued).toBeUndefined();
-    expect(snm.getSessionTree("alice", SID).size()).toBe(0);
+    expect(String(res.guidance)).toContain("lost");
+    expect(snm.getSessionTree("alice", SID).size(), "no leaf for content that is gone").toBe(0);
+  });
+
+  it("M12-P13 (review HIGH-1): a DEDUPED enqueue reports durable:false and commits no leaf — the queue dropping it must not read as queued", async () => {
+    // The dedupe key is SHA-256(0x00 ‖ content) — content-derived, no sequence, no nonce. Two
+    // identical messages in one session collide and the SECOND IS DROPPED (retry-queue.ts logs
+    // `message.retry.enqueue.deduped` and returns). `durable` was set to true regardless, which
+    // after this commit means committing a leaf for content that was silently discarded — the exact
+    // permanent-root-mismatch outcome the durable gate exists to prevent. `durable` has to be
+    // OBSERVED from the enqueue, not asserted around it.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const same = new TextEncoder().encode("ok");
+    const first = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-1");
+    expect(first).toMatchObject({ ok: false, durable: true });
+
+    const second = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-2");
+    expect(second, "the queue dropped this copy — saying otherwise commits a leaf for nothing").toMatchObject({ ok: false, durable: false });
+
+    // Exactly one durable row, and therefore exactly one message that can ever be re-parked.
+    const rows = snm.getDb()!
+      .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
+      .get(SID) as { n: number };
+    expect(rows.n).toBe(1);
+  });
+
+  it("M12-P13 (review HIGH-1): an UNWIRED durable hook reports durable:false — an optional call that no-ops is not a queue", async () => {
+    // `this.#onParkFailed?.(...)` followed by an unconditional `durable = true` claims durability
+    // from a hook that may not exist at all. The `?.` silently substitutes "did nothing" for
+    // "queued it", which is the same silent-fallback shape as the defect under repair.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
+    snm.setAwaitingAckHooks({}); // as if the composition root never wired it
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const content = new TextEncoder().encode("no hook, no queue");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: false, durable: false });
   });
 
   it("cello_send end-to-end: direct-stream failure + relay park success → ok:true, delivered:false, reason:dispatched_to_relay, guidance names relay recovery; leaf + transcript still committed", async () => {

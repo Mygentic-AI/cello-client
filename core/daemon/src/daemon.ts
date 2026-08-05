@@ -1025,7 +1025,7 @@ async function startDaemonHoldingLock(
             // Not queued anywhere — the rejection is gone. We still seal (we are closing regardless),
             // and the counterparty simply never learns why, so say that plainly rather than at warn.
             logger.error("session.away.inbox.oneshot.reject_send_failed", {
-              agentName, sessionId, reason: sendResult.reason,
+              agentName, sessionId, reason: sendResult.reason, cause: sendResult.cause,
               impact: "the rejection is lost and was NOT queued — the session seals with no explanation to the counterparty",
             });
           }
@@ -1188,7 +1188,7 @@ async function startDaemonHoldingLock(
         // handled below), so it is an error and it says what the consequence is. It was a bare warn
         // when it fired live on 2026-08-05 and read as routine churn.
         logger.error("session.away.response.failed", {
-          agentName, sessionId, kind, reason: sendResult.reason,
+          agentName, sessionId, kind, reason: sendResult.reason, cause: sendResult.cause,
           impact: "the away reply is lost and was NOT queued — the counterparty gets no acknowledgement",
         });
         return;
@@ -1206,7 +1206,8 @@ async function startDaemonHoldingLock(
         const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
         sessionNodeManager.recordTranscriptMessage(agentName, sessionId, queuedLeaf, "sent", contentBytes, randomUUID());
         logger.info("session.away.response.deferred", {
-          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf, reason: sendResult.reason,
+          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf,
+          reason: sendResult.reason, cause: sendResult.cause,
         });
         return;
       }
@@ -1356,8 +1357,10 @@ async function startDaemonHoldingLock(
     },
     // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
     // TTF timer is already cancelled on this path, so this is the only thing holding the content.
+    // M12-P13 (review HIGH-1): the enqueue's own answer is returned, never a bare `true`. A dropped
+    // copy that reports success now buys a committed hash-chain leaf for content that is gone.
     onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
+      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
     },
   });
 

@@ -393,15 +393,23 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
       // surface a named, diagnosable failure.
-      const nonce = randomUUID();
-      try {
-        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
-      } catch (err: unknown) {
-        logger.error("session.content.queue.failed", {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
+      //
+      // M12-P13 (review MEDIUM-4): NOT on the durable path. `drainSession` — this nonce queue's
+      // only consumer — has no production caller, so every row it writes is permanent: unbounded
+      // growth plus a second copy of the message plaintext at rest. On a durable failure the
+      // awaiting-ACK queue already holds the content and actually drains, so writing here too
+      // stored the same plaintext twice and drained neither copy from this table.
+      if (!sendResult.durable) {
+        const nonce = randomUUID();
+        try {
+          retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
+        } catch (err: unknown) {
+          logger.error("session.content.queue.failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+            correlationId,
+          });
+        }
       }
       logger.warn("session.content.send.failed", {
         sessionId,
@@ -409,6 +417,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         reason: sendResult.reason,
         errorMessage: sendResult.error,
         durable: sendResult.durable,
+        cause: sendResult.cause,
         correlationId,
       });
       // M12-P13: a DURABLY QUEUED message still owns the sequence the relay witnessed for it before

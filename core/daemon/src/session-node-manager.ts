@@ -226,7 +226,15 @@ const RECEIVED_BUFFER_CAP = 32;
  * worth queuing for a later retry, and queuing the former grows the durable queue with rows that
  * can never drain.
  */
-type ParkAttempt = "parked" | "refused" | "unconfigured";
+/**
+ * M12-P13 (review MEDIUM-5): the outcome AND the cause. `standing_receiver_unavailable` is an
+ * exit-point label; `cause` is the four-way answer from `standingReceiverAbsenceReason()` that says
+ * WHICH state the receiver was in — the distinction M12-P12 added precisely because the label had
+ * misnamed this incident. It used to be logged here and then discarded at the mapping site, so the
+ * caller (and the operator reading `reason`) was sent to the transport when the blocker was the
+ * standing receiver.
+ */
+type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
 
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
@@ -441,7 +449,10 @@ export class SessionNodeManager {
   // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
   // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
   // the wrong cause is how this path stayed invisible.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
+  // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
+  // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
+  // claim durability — nor commit the leaf that claim now authorises.
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -542,7 +553,7 @@ export class SessionNodeManager {
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
     onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -650,7 +661,7 @@ export class SessionNodeManager {
         cause: this.#parkFaultCause,
         injected: true,
       });
-      return "refused";
+      return { outcome: "refused", cause: this.#parkFaultCause };
     }
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
@@ -658,7 +669,7 @@ export class SessionNodeManager {
     // session with no relay was never recoverable through the park, so queuing it for re-park would
     // be a lie that grows the DB forever — every boot and every agent start would retry a row whose
     // only possible outcome is no_persisted_relay_endpoint. Reported as unconfigured, not refused.
-    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return "unconfigured";
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return { outcome: "unconfigured" };
     try {
       const result = await hook({
         // SEC-1: the hook must sign as the SENDING agent — it needs to know who that is.
@@ -685,16 +696,16 @@ export class SessionNodeManager {
           reason: result.reason,
           cause: result.cause,
         });
-        return "refused";
+        return { outcome: "refused", cause: result.cause ?? result.reason };
       }
-      return "parked";
+      return { outcome: "parked" };
     } catch (err: unknown) {
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
         contentHash: contentHashHex,
         error: err instanceof Error ? err.message : String(err),
       });
-      return "refused";
+      return { outcome: "refused", cause: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -3398,7 +3409,7 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; guidance?: string }> {
+  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string }> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       // M12-P13: no node, so nothing was witnessed and nothing was queued — the caller must NOT
@@ -3500,7 +3511,7 @@ export class SessionNodeManager {
       // agent sees the truth (the message IS in flight, just not direct), not a false negative.
       const hashHex = Buffer.from(contentHash).toString("hex");
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
-      if (attempt === "parked") {
+      if (attempt.outcome === "parked") {
         return { ok: true, delivered: false, parked: true };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
@@ -3511,17 +3522,41 @@ export class SessionNodeManager {
       // rebuilt. Only on a REFUSAL — a successful deposit must not be re-parked, and an
       // unconfigured session has no park target to retry against (F6).
       let durable = false;
-      if (attempt === "refused") {
+      if (attempt.outcome === "refused") {
         try {
-          this.#onParkFailed?.(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
-          durable = true;
-          // F5: the successful enqueue must be visible. Without this the live run that has to
-          // PROVE this fix has nothing to point at, and this log is the sender-side counterpart to
-          // `session.content.held` on the receiver — the two together make the trace readable.
-          this.#logger.info("content.park.deferred", {
-            sessionId, contentHash: hashHex, agentName,
-            selfOrdering: Boolean(orderingS1 && orderingS2),
-          });
+          // M12-P13 (review HIGH-1): `durable` is now OBSERVED from the enqueue, not asserted around
+          // it. Two ways this used to lie, both of which now commit a chain leaf and so cannot be
+          // allowed to: the queue's content-derived dedupe key collides and it silently drops the
+          // copy, and the `?.` no-ops entirely when the composition root never wired the hook. An
+          // absent hook is not a queue.
+          if (this.#onParkFailed === null) {
+            this.#logger.error("content.park.durable_enqueue.unwired", {
+              sessionId, contentHash: hashHex, agentName,
+              impact: "no durable queue is wired — the content is NOT retained and will NOT be retried",
+            });
+          } else {
+            durable = this.#onParkFailed(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+          }
+          if (!durable) {
+            if (this.#onParkFailed !== null) {
+              this.#logger.error("content.park.durable_enqueue.dropped", {
+                sessionId, contentHash: hashHex, agentName,
+                impact: "the durable queue refused this copy (identical content already queued) — it is NOT separately retained",
+              });
+            }
+          } else {
+            // F5: the successful enqueue must be visible. Without this the live run that has to
+            // PROVE this fix has nothing to point at, and this log is the sender-side counterpart to
+            // `session.content.held` on the receiver — the two together make the trace readable.
+            // M12-P13: `witnessed` rides along because the caller is about to commit a hash-chain
+            // leaf on the strength of this. Without a relay ordering record the recipient recovers
+            // in arrival order instead — the accepted degradation, but it must not be invisible.
+            this.#logger.info("content.park.deferred", {
+              sessionId, contentHash: hashHex, agentName,
+              selfOrdering: Boolean(orderingS1 && orderingS2),
+              witnessed: Boolean(orderingS1 && orderingS2),
+            });
+          }
         } catch (hookErr: unknown) {
           // F3: enqueueAwaitingContent throws ON PURPOSE when the persist fails, because that is
           // data loss. Swallowing it into the same response the durable case returns would tell the
@@ -3560,8 +3595,14 @@ export class SessionNodeManager {
         // queued message, never for a lost one — would have had to substring-match English. None
         // did, and the sequence the relay had already witnessed was left as a permanent hole.
         durable,
+        // M12-P13 (review MEDIUM-5): the specific standing-receiver state, carried rather than
+        // discarded. `reason` names where this surfaced; `cause` names what actually blocked it —
+        // the exact distinction M12-P12 added `standingReceiverAbsenceReason()` for, which then
+        // died inside #parkContent. An operator keying on `reason` alone is sent to the transport
+        // when the blocker is the receiver.
+        ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}),
         guidance: durable
-          ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. No action needed."
+          ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
           : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
       };
     }
