@@ -2930,8 +2930,11 @@ async function startDaemonHoldingLock(
     const count = typeof params?.count === "number" ? params.count : 1;
     const cause = typeof params?.cause === "string" ? params.cause : undefined;
     const armed = sessionNodeManager.injectParkFault(count, cause);
-    logger.warn("content.park.fault.armed", { count: armed, cause: cause ?? "standing_receiver_creating" });
-    return { armed };
+    // The park fault alone reproduces nothing — the counterparty's session node accepts the frame
+    // and the park path is never entered. Arm the dial failure with it unless told otherwise.
+    const sendArmed = params?.withSendFault === false ? 0 : sessionNodeManager.injectSendFault(count);
+    logger.warn("content.park.fault.armed", { count: armed, sendArmed, cause: cause ?? "standing_receiver_creating" });
+    return { armed, sendArmed };
   });
 
   handlers.set("enqueue_awaiting_content", async (params, connectionId) => {

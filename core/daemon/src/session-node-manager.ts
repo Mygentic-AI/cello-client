@@ -410,12 +410,27 @@ export class SessionNodeManager {
   // refuses outright otherwise, so a normal daemon cannot be talked into dropping messages.
   #parkFaultRemaining = 0;
   #parkFaultCause = "standing_receiver_creating";
+  // The incident needs BOTH halves: the direct dial has to fail (or the park path is never entered
+  // — measured, the counterparty's session node accepts the frame and reports delivered:true even
+  // with its agent away), and the park deposit that follows has to be refused. One without the
+  // other reproduces nothing.
+  #sendFaultRemaining = 0;
 
   /** Arm the park-deposit fault. Returns the count now armed. */
   injectParkFault(count: number, cause?: string): number {
     this.#parkFaultRemaining = Math.max(0, count);
     if (cause) this.#parkFaultCause = cause;
     return this.#parkFaultRemaining;
+  }
+
+  /** Arm the direct-send fault — makes the next N sends take the dial-failure path. */
+  injectSendFault(count: number): number {
+    this.#sendFaultRemaining = Math.max(0, count);
+    return this.#sendFaultRemaining;
+  }
+
+  getSendFaultRemaining(): number {
+    return this.#sendFaultRemaining;
   }
 
   /** Remaining armed park faults — so a test can assert the fault was actually consumed. */
@@ -3459,6 +3474,14 @@ export class SessionNodeManager {
         structure1_cbor: orderingS1,
         structure2_cbor: orderingS2,
       }) as Uint8Array;
+      // Injected dial failure — thrown from inside the try so it lands in exactly the catch the
+      // real connection_lost lands in, and the whole downstream path (untrack → park → durable
+      // enqueue) runs unmodified.
+      if (this.#sendFaultRemaining > 0) {
+        this.#sendFaultRemaining -= 1;
+        this.#logger.warn("content.send.fault.injected", { sessionId, contentHash: Buffer.from(contentHash).toString("hex") });
+        throw new Error("connection_lost: injected direct-send fault");
+      }
       stream.send(lp.encode.single(frame));
       try { await stream.close(); } catch { /* best-effort close */ }
       return { ok: true, delivered: true };
