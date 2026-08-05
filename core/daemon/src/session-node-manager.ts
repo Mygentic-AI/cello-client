@@ -378,6 +378,27 @@ export class SessionNodeManager {
     | ((agentName: string, sessionId: string, senderPubkey: string) => void)
     | null = null;
 
+  /**
+   * M14 / DOD-DOC-INBOUND-2: the document-layer interception, injected by the composition root.
+   *
+   * Returns whether the document layer CONSUMED the frame. Absent (the default) means every frame
+   * is conversation, exactly as before — the document layer cannot change message handling by being
+   * unwired, which is the property that lets it be wired incrementally.
+   *
+   * It is handed the decrypted CONTENT, unlike `#onContentArrived`, which is content-free by
+   * signature. That is unavoidable: deciding whether bytes are a document frame requires the bytes.
+   * The router it calls never logs them.
+   */
+  #onDocumentFrame:
+    | ((
+        agentName: string,
+        sessionId: string,
+        content: Uint8Array,
+        senderPubkey: string,
+        correlationId?: string,
+      ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string })
+    | null = null;
+
   // A send is NOT fire-and-forget. After a content_frame is delivered over the direct session
   // channel, the sender arms a TTF timer and waits for an unsigned, transport-authenticated
   // `persisted` delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels the
@@ -1858,6 +1879,19 @@ export class SessionNodeManager {
     cb: (agentName: string, sessionId: string, senderPubkey: string) => void,
   ): void {
     this.#onContentArrived = cb;
+  }
+
+  /** M14 / DOD-DOC-INBOUND-2: inject the document-frame interception. See the field's note. */
+  setOnDocumentFrame(
+    cb: (
+      agentName: string,
+      sessionId: string,
+      content: Uint8Array,
+      senderPubkey: string,
+      correlationId?: string,
+    ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string },
+  ): void {
+    this.#onDocumentFrame = cb;
   }
 
   /**
@@ -4193,6 +4227,37 @@ export class SessionNodeManager {
     senderPubkey: string,
     correlationId?: string,
   ): { leafIndex: number } {
+    // M14 / DOD-DOC-INBOUND-2 — DOCUMENT FRAMES DIVERGE HERE, and the three-way split is the whole
+    // contract:
+    //
+    //   LEAF   yes, and as `doc` (0x04) rather than `msg` (0x00). The seal covers document traffic
+    //          — that is what makes the exchange provable — but it is not conversation, and the
+    //          leaf kind is what a verifier renders it by.
+    //   TRANSCRIPT no. Recording CRDT bytes as a received message puts them in the operator's
+    //          conversation history, where `cello_receive` hands them to an agent as something a
+    //          person said.
+    //   DOORBELL no (§11.3). A collaborator typing produces a stream of updates; a doorbell each
+    //          time would interrupt the operator's agent continuously for something with no
+    //          deadline.
+    //
+    // The hook is injected and absent by default, so a daemon without the document layer behaves
+    // exactly as before — this cannot change the conversation path by being unwired.
+    const routed = this.#onDocumentFrame?.(agentName, sessionId, content, senderPubkey, correlationId);
+    if (routed?.consumed === true) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "doc", contentHashHex, correlationId);
+      this.#logger.info("session.document.received", {
+        sessionId,
+        senderPubkey,
+        contentHashHex,
+        sequenceNumber: leafIndex,
+        kind: routed.kind,
+        ok: routed.ok,
+        reason: routed.reason,
+        correlationId,
+      });
+      return { leafIndex };
+    }
+
     const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
