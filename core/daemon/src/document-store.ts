@@ -85,7 +85,8 @@ export interface DocumentEnvelopeRow {
   createdAtMs: number;
   /** Position in this document's log. Assigned on append; absent until then. */
   logIndex?: number;
-  /** DELIVERY-1 bookkeeping, read back from the log. Absent on a row being appended. */
+  /** DELIVERY bookkeeping, read back from the log. Absent on a row being appended. */
+  deliveredAtMs?: number | null;
   ackedAtMs?: number | null;
   attempts?: number;
   nextAttemptAtMs?: number | null;
@@ -187,11 +188,15 @@ const CREATE_ENVELOPES_SQL = `
     -- a queue in memory does not survive a restart, and a queue in its own table is a second
     -- source of truth that can disagree with the log about what was sent. "Unacknowledged
     -- envelopes I authored" is the whole definition, and it is a WHERE clause.
-    -- acked_at only. There was a delivered_at column beside it whose ONLY writer was
-    -- COALESCE(delivered_at, ?) inside the ack, guarded by acked_at IS NULL — so it was invariably
-    -- NULL at that point and always took the new value, making it equal to acked_at on every row,
-    -- always. Nothing read it. A column that can only ever equal its neighbour invites a reader to
-    -- infer a distinction ("sent, awaiting confirmation") the schema cannot express.
+    -- TWO facts, and they are genuinely different: delivered_at is when the envelope LEFT (or was
+    -- parked for an offline peer), acked_at is when the peer's daemon said it admitted or rejected
+    -- it. An earlier version had delivered_at with no real writer — its only assignment was a
+    -- COALESCE inside the ack, so it always equalled acked_at and the distinction was one the
+    -- schema could not express. It has a writer now (markDelivered), so the distinction is real:
+    -- "sent, awaiting confirmation" is exactly the state a store-and-forward transport leaves an
+    -- envelope in, and an operator asking why something has not landed needs to tell it from
+    -- "never sent".
+    delivered_at    INTEGER,
     acked_at        INTEGER,
     -- How many times delivery has been attempted, and when the next attempt is due. On the row,
     -- because a backoff that resets on restart is not a backoff — a daemon restarting in a
@@ -773,6 +778,22 @@ export class DocumentStore {
     return r?.attempts ?? 0;
   }
 
+  /** Record that the envelope left. Not an ack — the peer has not answered yet. */
+  markDelivered(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nowMs: number,
+  ): boolean {
+    const info = this.#db
+      .prepare(
+        `UPDATE document_envelopes SET delivered_at = COALESCE(delivered_at, ?)
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
+      )
+      .run(nowMs, ownerAgentId, documentId, envelopeHash);
+    return Number(info.changes) > 0;
+  }
+
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
   markAcked(
     ownerAgentId: string,
@@ -782,10 +803,10 @@ export class DocumentStore {
   ): boolean {
     const info = this.#db
       .prepare(
-        `UPDATE document_envelopes SET acked_at = ?
+        `UPDATE document_envelopes SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
           WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND acked_at IS NULL`,
       )
-      .run(nowMs, ownerAgentId, documentId, envelopeHash);
+      .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash);
     return Number(info.changes) > 0;
   }
 
@@ -977,6 +998,7 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
     logIndex: r["log_index"] as number,
+    deliveredAtMs: (r["delivered_at"] as number | null) ?? null,
     ackedAtMs: (r["acked_at"] as number | null) ?? null,
     attempts: (r["attempts"] as number | null) ?? 0,
     nextAttemptAtMs: (r["next_attempt_at"] as number | null) ?? null,

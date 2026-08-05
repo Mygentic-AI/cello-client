@@ -65,7 +65,23 @@ export interface DocumentDeliveryTransport {
     sessionHint?: string;
     correlationId: string;
   }): Promise<
-    | { ok: true; admitted: boolean; sessionId: string; sessionOpened: boolean; rejectionReason?: string }
+    | {
+        ok: true;
+        sessionId: string;
+        sessionOpened: boolean;
+        /**
+         * `true` admitted, `false` rejected — both are ACKS, the peer has decided. `null` means the
+         * envelope LEFT (or was parked for an offline peer) and no answer has come back yet.
+         *
+         * The third state is not hedging; both two-valued answers are dishonest for a send whose
+         * outcome is unknown. `true` marks the envelope acknowledged in the log while the peer may
+         * never have applied it — and the log being right about what the peer holds is the entire
+         * reason pending is derived from it. `false` counts a send that WORKED as a failure and
+         * re-sends content already in flight.
+         */
+        admitted: boolean | null;
+        rejectionReason?: string;
+      }
     | { ok: false; reason: string; detail?: string }
   >;
 }
@@ -99,6 +115,8 @@ export function backoffFor(attempts: number): number {
 export interface DeliveryTickResult {
   attempted: number;
   delivered: number;
+  /** Sent (or parked) with no answer yet — in flight, neither done nor failed. */
+  sent: number;
   /** Answered but refused. Acked all the same — the peer has decided. */
   rejected: number;
   deferred: number;
@@ -154,7 +172,9 @@ export class DocumentDelivery {
     // and across restarts.
     const correlationId = opts.correlationId ?? `dlv-${ownerAgentId.slice(0, 8)}-${nowMs}`;
     const pending = this.#store.pendingDeliveries(ownerAgentId, nowMs);
-    const result: DeliveryTickResult = { attempted: 0, delivered: 0, rejected: 0, deferred: 0, failed: 0 };
+    const result: DeliveryTickResult = {
+      attempted: 0, delivered: 0, sent: 0, rejected: 0, deferred: 0, failed: 0,
+    };
 
     // Group by document so one reachability lookup serves every pending envelope for that peer.
     // Per-envelope lookups would multiply directory traffic by the size of the backlog, which is
@@ -253,7 +273,20 @@ export class DocumentDelivery {
           };
         }
 
-        if (outcome.ok) {
+        if (outcome.ok && outcome.admitted === null) {
+          // IN FLIGHT. The content left, and the peer has not answered. Recorded as DELIVERED so
+          // the operator can see it went, and left unacked so the worker keeps asking — on the
+          // capped backoff the claim above already scheduled, not at full rate.
+          this.#store.markDelivered(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
+          this.#logger.info("document.delivery.sent", {
+            documentId,
+            envelopeHash: envelope.envelopeHash,
+            sessionId: outcome.sessionId,
+            sessionOpened: outcome.sessionOpened,
+            correlationId,
+          });
+          result.sent += 1;
+        } else if (outcome.ok) {
           // ACK = the peer's daemon ANSWERED, admitted or not. A rejection is an ack for delivery
           // purposes (§3.2's 0x05): the peer has decided, so there is nothing left to retry, and
           // retrying would re-trigger their gate and their retry counter until the document stalls

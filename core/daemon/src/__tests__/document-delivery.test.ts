@@ -409,3 +409,49 @@ describe("DocumentDelivery — overlapping ticks do not dial twice", () => {
     expect(dials).toBe(1);
   });
 });
+
+
+describe("DocumentDelivery — SENT is neither done nor failed", () => {
+  const inFlight = () => ({
+    deliver: async () => ({ ok: true as const, admitted: null, sessionId: "s", sessionOpened: true }),
+  });
+
+  it("records the envelope as delivered but NOT acked", async () => {
+    const f = newFixture(inFlight());
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+
+    const res = await f.delivery.tick(AGENT, f.peerFor, NOW);
+    expect(res).toMatchObject({ attempted: 1, sent: 1, delivered: 0, failed: 0 });
+
+    const row = f.store.getEnvelopeLog(AGENT, DOC)[0]!;
+    // Two different facts: it LEFT, and the peer has not answered. An operator asking why
+    // something has not landed needs to tell "sent, awaiting confirmation" from "never sent".
+    expect(row.deliveredAtMs).toBe(NOW);
+    expect(row.ackedAtMs).toBeNull();
+  });
+
+  it("keeps asking on the BACKOFF, not at full rate", async () => {
+    const f = newFixture(inFlight());
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    await f.delivery.tick(AGENT, f.peerFor, NOW);
+
+    // Counting a send that WORKED as a failure would re-send content already in flight — the
+    // permanent-redelivery shape this milestone fixed once already. It stays pending, but due
+    // later, so the worker asks again rather than shouting.
+    expect(await f.delivery.tick(AGENT, f.peerFor, NOW + 1)).toMatchObject({ attempted: 0 });
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(1);
+  });
+
+  it("an ack arriving later settles it", async () => {
+    const f = newFixture(inFlight());
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+    await f.delivery.tick(AGENT, f.peerFor, NOW);
+
+    expect(f.store.markAcked(AGENT, DOC, e.envelopeHash, NOW + 5_000)).toBe(true);
+    expect(f.store.pendingDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(0);
+    // The delivery time is NOT overwritten by the ack — they are separate moments.
+    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.deliveredAtMs).toBe(NOW);
+  });
+});

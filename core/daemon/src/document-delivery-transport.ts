@@ -1,0 +1,151 @@
+/**
+ * DOD-DOC-DELIVERY-2 — the transport behind `DocumentDeliveryTransport` (§16.4).
+ *
+ * DELIVERY-1 built the scheduler and the bookkeeping against an injected seam. This is the seam's
+ * implementation: the first NON-HANDLER consumer of the session machinery, which is what makes it
+ * interesting — every other caller of `SessionNegotiator` runs because an agent asked for
+ * something, and this one runs because a document has a pending envelope and nobody is watching.
+ *
+ * ── REUSE BEFORE OPEN, AND WHY THAT ORDER ─────────────────────────────────────────────────────
+ *
+ * §16.4: "the daemon uses the most recent active session with that peer or opens one". Reuse first,
+ * because opening is the expensive half — a directory negotiation, a dial, and a seal — and a
+ * backlog of pending envelopes for one peer would otherwise pay it per envelope. It is also the
+ * behaviour an operator expects when they are mid-conversation about the document: the change lands
+ * in the same sealed record as the discussion, without anyone passing a session hint.
+ *
+ * An explicit `sessionHint` overrides the choice but NOT the validation — a hint naming a session
+ * that is not active with this peer is refused rather than silently replaced by the daemon's own
+ * pick, because the one reason to pass a hint is to control which sealed record the change lands
+ * in, and quietly choosing a different one defeats exactly that.
+ *
+ * ── WHAT AN ACK IS HERE, AND WHAT IT IS NOT ───────────────────────────────────────────────────
+ *
+ * `sendContent` reports that the content left, or was PARKED at the relay for an offline peer. That
+ * is a transport fact. The DoD's ack is a different one — "the peer's daemon confirms admission (or
+ * rejection)" — and it can only come from the peer's inbound document handler, which is its own
+ * line. So this adapter returns `admitted: null`: SENT, not acked.
+ *
+ * That third state is not hedging; both two-valued answers are dishonest here. `true` would mark
+ * the envelope acknowledged in the log while the peer may never have applied it, and the log being
+ * right about what the peer holds is the entire reason pending is derived from it. `false` would
+ * count a send that WORKED as a failure and re-send content already in flight — the
+ * permanent-redelivery shape this milestone has already fixed once. The worker records the envelope
+ * as delivered, leaves it unacked, and asks again on the capped backoff.
+ */
+
+import type { DocumentDeliveryTransport } from "./document-delivery.js";
+import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
+import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
+import type { Logger } from "./types.js";
+
+export interface DocumentTransportDeps {
+  /** The agent this worker delivers for. One worker per attended agent. */
+  agentName: string;
+  /** `runDiscoveryLookup`, supplied by the composition root — it lives in a closure there. */
+  lookupPeer(peerAgentId: string, correlationId: string): Promise<DiscoveryOutcome>;
+  /** Active sessions with this peer, most recent LAST. */
+  activeSessionsWith(agentName: string, peerAgentId: string): string[];
+  /** The existing initiate path: negotiate, dial, create the session node. */
+  openSession(
+    agentName: string,
+    peerAgentId: string,
+    correlationId: string,
+  ): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string; guidance?: string }>;
+  /** `SessionNodeManager.sendContent`. */
+  sendContent(
+    agentName: string,
+    sessionId: string,
+    content: Uint8Array,
+    contentHash: Uint8Array,
+    correlationId: string,
+  ): Promise<
+    | { ok: true; delivered: true }
+    | { ok: true; delivered: false; parked: true }
+    | { ok: false; reason: string; error: string }
+  >;
+  /** Encode a document envelope row onto the wire, and its content hash. */
+  encodeEnvelope(envelope: unknown): { bytes: Uint8Array; hash: Uint8Array };
+  logger: Logger;
+}
+
+export function createDocumentDeliveryTransport(
+  deps: DocumentTransportDeps,
+): DocumentDeliveryTransport {
+  return {
+    async isPeerReachable(peerAgentId: string): Promise<boolean> {
+      const outcome = await deps.lookupPeer(peerAgentId, `reach-${peerAgentId.slice(0, 8)}`);
+      // Throws on everything that is not an answer about the peer — see document-reachability.ts.
+      // The worker treats the throw as `lookup_failed` and keeps it out of the offline-peer count.
+      const { reachable, unknownAgent } = reachabilityFromDiscovery(outcome);
+      if (unknownAgent) {
+        // Distinct from "offline": the address does not resolve at all. Same consequence (do not
+        // dial), different thing to tell an operator, so it is said rather than folded in.
+        deps.logger.warn("document.delivery.peer_unknown", { peerAgentId });
+      }
+      return reachable;
+    },
+
+    async deliver(input) {
+      const { peerAgentId, documentId, envelope, sessionHint, correlationId } = input;
+
+      let sessionId: string;
+      let sessionOpened = false;
+
+      const active = deps.activeSessionsWith(deps.agentName, peerAgentId);
+      if (sessionHint !== undefined) {
+        if (!active.includes(sessionHint)) {
+          // Refused, not replaced. The only reason to pass a hint is to control which sealed
+          // record the change lands in; quietly substituting the daemon's own pick would defeat
+          // exactly that, and it would do so silently.
+          return {
+            ok: false,
+            reason: "document_session_hint_invalid",
+            detail:
+              `session ${sessionHint.slice(0, 16)}… is not an active session with ${peerAgentId}, ` +
+              `so the change cannot be placed in that record`,
+          };
+        }
+        sessionId = sessionHint;
+      } else if (active.length > 0) {
+        sessionId = active[active.length - 1]!;
+      } else {
+        const opened = await deps.openSession(deps.agentName, peerAgentId, correlationId);
+        if (!opened.ok) {
+          // The upstream reason verbatim. `document_delivery_threw` is reserved for a genuine
+          // programming fault; a dial that was refused should say it was refused.
+          return { ok: false, reason: opened.reason, detail: opened.guidance };
+        }
+        sessionId = opened.sessionId;
+        sessionOpened = true;
+      }
+
+      const { bytes, hash } = deps.encodeEnvelope(envelope);
+      const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId);
+      if (!sent.ok) {
+        return { ok: false, reason: sent.reason, detail: sent.error };
+      }
+
+      deps.logger.info("document.delivery.sent", {
+        documentId,
+        sessionId,
+        sessionOpened,
+        parked: sent.delivered === false,
+        correlationId,
+      });
+
+      // SENT, NOT ACKED — `admitted: null`. The content left (or was parked for an offline peer),
+      // which is a transport fact; the DoD's ack is the peer's daemon confirming admission, and
+      // that answer comes from the inbound document handler, which is its own line.
+      //
+      // Neither of the two-valued answers is available honestly. `true` would mark the envelope
+      // acknowledged in the log while the peer may never have applied it — and the log being right
+      // about what the peer holds is the entire reason pending is derived from it. `false` would
+      // count a send that WORKED as a failure and re-send content already in flight, which is the
+      // permanent-redelivery shape this milestone already fixed once.
+      return { ok: true, sessionId, sessionOpened, admitted: null };
+    },
+  };
+}
+
+export { DiscoveryUnavailableError };
