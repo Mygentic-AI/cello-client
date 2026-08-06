@@ -1402,6 +1402,14 @@ describe("SessionNodeManager — integration tests", () => {
     db.prepare(
       "INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
     ).run("sigterm-s2", "bob-id", "pk-bob", "active", now, now);
+    // CROSS-CONNECTION VISIBILITY — this is what made the test flaky, on tag runs especially.
+    // These rows are written on a SEPARATE SQLCipher connection from the daemon's. In WAL mode the
+    // daemon's connection can begin its shutdown `UPDATE ... WHERE status = 'active'` against a
+    // snapshot that predates this commit, match zero rows, and leave both rows 'active' — with no
+    // error anywhere, which is why the "write failed" assertion above stays green while the status
+    // assertion below fails. Checkpoint the WAL into the main database file before the kill so the
+    // rows are unambiguously visible to any other connection.
+    db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
     db.close();
 
     // Step (c): send SIGTERM and wait for clean exit
