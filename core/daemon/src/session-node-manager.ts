@@ -4888,9 +4888,22 @@ export class SessionNodeManager {
   /**
    * F1-b: the terminal answer for a session that sealed while a blocking receive was (or could be)
    * waiting. Idempotent — a sealed session always answers "sealed" to a receive. Null while active.
+   *
+   * DOD-TERMINAL-WAKE-1: the in-memory marker is written only by `destroySessionNode`, so it does
+   * NOT survive a restart — while the `sealed` row on disk does. Reading the absent marker as "not
+   * terminal" is what let a sealed session's unread message come back as live work hours later, and
+   * an agent obey a `[[STANDBY]]` directive out of a conversation that had already ended. Absent is
+   * not fine: fall through to the durable record, which is the authority the marker only caches.
    */
   peekTerminalMarker(agentName: string, sessionId: string): { type: "sealed"; unreadCount: number } | null {
-    return this.#sessionTerminal.get(this.#k(agentName, sessionId)) ?? null;
+    const cached = this.#sessionTerminal.get(this.#k(agentName, sessionId));
+    if (cached) return cached;
+    // Only 'sealed' answers here. 'abandoned' forfeited its receipt and 'interrupted' /
+    // 'seal_interrupted_pending' can still complete, so none of them may claim a seal — the
+    // DOD-SEALED-INBOX-2 lesson, which is what makes this a status read and not a "is it over" read.
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (record?.status !== "sealed") return null;
+    return { type: "sealed", unreadCount: this.getUnreadReceivedCount(agentName, sessionId) };
   }
 
   /**

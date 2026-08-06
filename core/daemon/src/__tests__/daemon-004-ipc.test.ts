@@ -778,4 +778,49 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
       expect(typeof res.guidance).toBe("string");
     } finally { client.close(); }
   });
+
+  it("DOD-TERMINAL-WAKE-1: the sealed answer SURVIVES a daemon restart — an unread message must not come back as live work", async () => {
+    // Observed live 2026-08-05 on Miss_Chelly_H: three sessions sealed in the morning re-fired as
+    // wakes six to eight hours later, and one carried a `[[STANDBY EST:15m]]` directive the agent
+    // obeyed — standing by on a conversation that had ended, against a counterparty whose daemon
+    // held no record of the session. An agent acting on an expired instruction is a correctness
+    // failure, and it is self-concealing: the agent reports a perfectly coherent status.
+    //
+    // The trigger is a RESTART. `#sessionTerminal` is an in-memory Map populated only by
+    // destroySessionNode; the session row on disk still says 'sealed', but after a restart the map
+    // is empty, peekTerminalMarker answers null, and the durable-record read below it happily
+    // delivers the old message as if it had just arrived.
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h1 = await start({ logger, node });
+    const snm = h1.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    const inbound = new TextEncoder().encode("[[STANDBY EST:15m]] hold for my next message");
+    await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
+    await snm.destroySessionNode("alice", SID, "sealed");
+
+    // The restart is the whole point: same celloDir, so the sealed row persists and the marker does not.
+    await h1.stop("test_restart");
+    const { logger: logger2 } = makeLogger();
+    await start({ logger: logger2, node: new FakeNode() });
+
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "test" });
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+      const res = await client.send("cello_receive", { session_id: SID, timeout_ms: 500 }) as Record<string, unknown>;
+
+      // The message must NOT be delivered as live content.
+      expect(res.content).toBeUndefined();
+      expect(res.type).toBe("session_sealed");
+      expect(res.unread_count).toBe(1);
+      // It is still on the record — the seal attests what each side actually consumed, so the
+      // message stays honestly unread. It just stops ringing the bell. (The surface vocabulary
+      // renders the tool name for the caller's surface, hence the loose match on the stem.)
+      expect(String(res.guidance)).toMatch(/transcript/);
+    } finally { client.close(); }
+  });
 });
