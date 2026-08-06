@@ -159,6 +159,56 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(switchEvent!.context.connectionId).toBeDefined();
   });
 
+  /**
+   * M12-P16 — "offline" must mean STOP TALKING, not "stop accepting new sessions".
+   *
+   * Measured live 2026-08-05 across two machines on published daemon 0.0.124: I set an agent offline,
+   * confirmed it (`state: registered`, `standing_receiver_ready: false`), then sent it a message from
+   * the other machine. It ACCEPTED the content directly, appended a leaf, ran its away logic and
+   * REPLIED — the whole exchange is in its transcript. The handler tore down the standing receiver
+   * (so no NEW inbound session could be accepted) and left every existing per-session node alive and
+   * serving, and direct delivery goes to the session node.
+   *
+   * The CLI's own help says: "Take an agent offline. It stops accepting anything until restarted."
+   * An operator reaching for this is reaching for a kill switch; a kill switch that keeps answering
+   * is worse than none, because it reports success.
+   */
+  it("M12-P16: going offline tears down the agent's ACTIVE SESSION NODES, not just its standing receiver", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+
+    const snm = handle.getSessionNodeManager();
+    const SID = "f1".repeat(32);
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    expect(snm.getSessionRecord("alice", SID)?.status).toBe("active");
+
+    await client.send("cello_set_agent_offline", { name: "alice" });
+
+    // The session must no longer be served. Its row goes `interrupted`, which is the honest record:
+    // this side stopped participating. It is NOT sealed — nothing was agreed with the counterparty —
+    // and it is NOT abandoned, which would be terminal and forfeit the receipt.
+    // Review: asserting the ROW alone is hollow — the measured defect was precisely that the
+    // bookkeeping said one thing while the node kept serving. An implementation that only flips the
+    // status passes a row assertion and reproduces the bug exactly. Assert the things that STOPPED.
+    expect(
+      snm.getSessionNodePeerId("alice", SID),
+      "the session node itself must be gone, not merely marked",
+    ).toBeNull();
+    expect(
+      snm.getStandingReceiverReady("alice"),
+      "and the standing receiver must stay down — the teardown ORDER is load-bearing: destroySessionNode "
+      + "re-arms the receiver for any agent still flagged as wanting one, so removeStandingReceiverForAgent "
+      + "must clear that flag BEFORE this loop runs, or every offline resurrects what it just killed",
+    ).toBe(false);
+    expect(snm.getSessionRecord("alice", SID)?.status).toBe("interrupted");
+  });
+
+  // M12-P16 (review F1): the INBOUND half — an offline agent refusing a new assignment and
+  // sending no away reply — is covered in m8c-away-1.test.ts, driven through the real signaling
+  // path, because the observable that matters is the counterparty getting no answer.
+
   // ─── AC-004: cello_set_agent_offline transitions Online→Registered (idempotent) ───
   it("AC-004: cello_set_agent_offline transitions agent to registered and clears current", async () => {
     const config = await setupWithAgents("alice");

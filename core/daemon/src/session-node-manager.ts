@@ -221,6 +221,22 @@ type CreateSessionResult =
  */
 const RECEIVED_BUFFER_CAP = 32;
 
+/**
+ * M12-P12 (review F6): the outcome of one park-deposit attempt. A bare boolean conflated
+ * "this session has no relay to park to" with "the relay refused the deposit" — only the latter is
+ * worth queuing for a later retry, and queuing the former grows the durable queue with rows that
+ * can never drain.
+ */
+/**
+ * M12-P13 (review MEDIUM-5): the outcome AND the cause. `standing_receiver_unavailable` is an
+ * exit-point label; `cause` is the four-way answer from `standingReceiverAbsenceReason()` that says
+ * WHICH state the receiver was in — the distinction M12-P12 added precisely because the label had
+ * misnamed this incident. It used to be logged here and then discarded at the mapping site, so the
+ * caller (and the operator reading `reason`) was sent to the transport when the blocker was the
+ * standing receiver.
+ */
+type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -247,6 +263,84 @@ export class SessionNodeManager {
   // The relay authenticates and keys delivery by the agent's K_local pubkey, so all of an
   // agent's sessions share one authenticated relay stream (each frame carries session_id).
   #relayClients = new Map<string, AgentRelayClient>();
+
+  /**
+   * M12-P15: build a relay client for a session that has NO in-memory node.
+   *
+   * Injected by the composition root because it needs the agent's K_local and pubkey, which this
+   * manager deliberately does not hold. Only consulted on the detached seal path — an ACTIVE session
+   * always uses its own registered client.
+   */
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined): void {
+    this.#detachedRelayClientBuilder = fn;
+  }
+
+  /**
+   * M12-P15: what a seal leaf actually needs, resolved from a LIVE node when there is one and from
+   * durable state when there is not.
+   *
+   * `submitSealLeaf` used to hard-require an `#activeNodes` entry. But it is reachable — by design —
+   * for an `interrupted` session, and EVERY producer of that status deletes the entry. So the guard
+   * refused 100% of the calls the seal-interrupted path could ever make, which is what made M12-P15's
+   * first fix inert. `submitLeaf(node, sessionId, contentHash, leafKind)` takes everything
+   * explicitly; nothing about it needs a per-session node.
+   *
+   * The fallback is the same shape `startupParkFn` already uses for content: the persisted relay
+   * endpoint (`relay_peer_id`/`relay_addrs`, columns that exist for exactly this reason) plus the
+   * owning agent's standing receiver. Every failure is named for its own cause rather than collapsed
+   * into "no node", because that collapse is what sent this investigation at the session lifecycle
+   * instead of at the endpoint.
+   */
+  #resolveSealTransport(agentName: string, sessionId: string):
+    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array }
+    | { error: string } {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (entry) {
+      // The live path is unchanged and takes precedence — a session with its own registered client
+      // must never seal through a rebuilt one.
+      if (!entry.relayClient || !entry.relaySessionIdBytes) return { error: "relay_unavailable" };
+      return { node: entry.node, relayClient: entry.relayClient, relaySessionIdBytes: entry.relaySessionIdBytes };
+    }
+    const ep = this.getPersistedRelayEndpoint(agentName, sessionId);
+    if (!ep) return { error: "no_persisted_relay_endpoint" };
+    const node = this.getStandingReceiverNode(agentName);
+    if (!node) return { error: "standing_receiver_unavailable" };
+    // Reuse the agent's existing client for this relay when the process still has one; otherwise ask
+    // the composition root to build one. Without the builder this path would work only within the
+    // lifetime that created the session — and the case that matters most is precisely a daemon that
+    // RESTARTED, which is what marked the session interrupted in the first place.
+    const clientKey = `${agentName}::${ep.relayPeerId}`;
+    let client = this.#relayClients.get(clientKey);
+    if (!client) {
+      // Review HIGH-1: the stores are NOT optional here. Without them `#captureReceipt` silently
+      // `return false`s — the submit still reports ok while the relay's signed receipt and our OWN
+      // 0x02 ctrl leaf are never persisted. That drops the unilateral-escalation carry chain AND
+      // defeats this very unit's ceremony discriminator, which reads `session_seal_leaves`: a seal
+      // sent through here would later read as "ceremony unknown" and the peer would decline to
+      // sign. The fix would have broken the fix.
+      if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+      if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+      client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
+        receiptStore: this.#relayReceiptStore ?? undefined,
+        sealLeafStore: this.#sealLeafStore ?? undefined,
+      });
+      if (!client) return { error: "relay_client_unavailable" };
+      // Review MEDIUM-4: cache it, so a retry loop does not leak one authenticated relay stream per
+      // attempt. Safe ONLY because the client above now carries the stores — a store-less client
+      // cached under this key would be picked up by the live `#connectSessionRelay` path and poison
+      // it for the rest of the process.
+      this.#relayClients.set(clientKey, client);
+    }
+    // Review HIGH-2: register the session (no assignment — there is nothing to re-present) so the
+    // relay's `session_not_found` is interpreted honestly. Unregistered, `recordedBefore` is false,
+    // the retry loop runs pointlessly, and the `recordedBefore && session_not_found ->
+    // relay_session_gone` branch — which exists to tell "the relay never had it" apart from "the
+    // relay swept or sealed it" — can never fire, so the operator is handed a first-message-race
+    // label for a swept session.
+    client.registerSession(sessionId, node);
+    return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")) };
+  }
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
   // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
   // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
@@ -414,7 +508,51 @@ export class SessionNodeManager {
   // because RetryQueue is built later in daemon.ts. When unset, the awaiting-ACK timer
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
+  // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
+  // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
+  // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
+  // no CLI lever reaches that window: set-agent-offline leaves an open session's node serving, and
+  // the CLI refuses a send from an offline agent. Without this the fix ships unwatched.
+  // INERT unless the daemon is started with CELLO_FAULT_INJECTION=1; the IPC handler that sets it
+  // refuses outright otherwise, so a normal daemon cannot be talked into dropping messages.
+  #parkFaultRemaining = 0;
+  #parkFaultCause = "standing_receiver_creating";
+  // The incident needs BOTH halves: the direct dial has to fail (or the park path is never entered
+  // — measured, the counterparty's session node accepts the frame and reports delivered:true even
+  // with its agent away), and the park deposit that follows has to be refused. One without the
+  // other reproduces nothing.
+  #sendFaultRemaining = 0;
+
+  /** Arm the park-deposit fault. Returns the count now armed. */
+  injectParkFault(count: number, cause?: string): number {
+    this.#parkFaultRemaining = Math.max(0, count);
+    if (cause) this.#parkFaultCause = cause;
+    return this.#parkFaultRemaining;
+  }
+
+  /** Arm the direct-send fault — makes the next N sends take the dial-failure path. */
+  injectSendFault(count: number): number {
+    this.#sendFaultRemaining = Math.max(0, count);
+    return this.#sendFaultRemaining;
+  }
+
+  getSendFaultRemaining(): number {
+    return this.#sendFaultRemaining;
+  }
+
+  /** Remaining armed park faults — so a test can assert the fault was actually consumed. */
+  getParkFaultRemaining(): number {
+    return this.#parkFaultRemaining;
+  }
+
+  // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
+  // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
+  // the wrong cause is how this path stayed invisible.
+  // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
+  // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
+  // claim durability — nor commit the leaf that claim now authorises.
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -429,7 +567,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
     | null = null;
 
   constructor(opts: {
@@ -514,10 +652,12 @@ export class SessionNodeManager {
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array) => void;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
+    this.#onParkFailed = hooks.onParkFailed ?? null;
   }
 
   /**
@@ -534,7 +674,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -609,10 +749,27 @@ export class SessionNodeManager {
    * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
    * result — the deposit itself and its logging are unchanged either way.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<boolean> {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<ParkAttempt> {
+    // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
+    // the live hook refuses (before any deposit), with the same event and the same `cause`.
+    if (this.#parkFaultRemaining > 0) {
+      this.#parkFaultRemaining -= 1;
+      this.#logger.warn("content.park.deposit.failed", {
+        sessionId,
+        contentHash: contentHashHex,
+        reason: "standing_receiver_unavailable",
+        cause: this.#parkFaultCause,
+        injected: true,
+      });
+      return { outcome: "refused", cause: this.#parkFaultCause };
+    }
     const hook = this.#contentParkHook;
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return false;
+    // M12-P12 (review F6): "no park target configured" is NOT a refused deposit. Content in a
+    // session with no relay was never recoverable through the park, so queuing it for re-park would
+    // be a lie that grows the DB forever — every boot and every agent start would retry a row whose
+    // only possible outcome is no_persisted_relay_endpoint. Reported as unconfigured, not refused.
+    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return { outcome: "unconfigured" };
     try {
       const result = await hook({
         // SEC-1: the hook must sign as the SENDING agent — it needs to know who that is.
@@ -637,17 +794,18 @@ export class SessionNodeManager {
           sessionId,
           contentHash: contentHashHex,
           reason: result.reason,
+          cause: result.cause,
         });
-        return false;
+        return { outcome: "refused", cause: result.cause ?? result.reason };
       }
-      return true;
+      return { outcome: "parked" };
     } catch (err: unknown) {
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
         contentHash: contentHashHex,
         error: err instanceof Error ? err.message : String(err),
       });
-      return false;
+      return { outcome: "refused", cause: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -732,6 +890,33 @@ export class SessionNodeManager {
         if (!msg.includes("duplicate column name")) throw err;
       }
     }
+
+    // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
+    // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
+    // notarization), and it must not be thrown away: it is a real message, provably sent to this
+    // operator, that no one would otherwise ever read.
+    //
+    // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
+    // nothing here is joined by `getUnreadSummary`, `getSealedUnread`, any inbox count or any wake
+    // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
+    // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
+    // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed
+    // conversation.
+    //
+    // Keyed on (agent_id, content_hash): `session_id` is recorded for display but is NOT part of the
+    // key, because the sibling case this design must also serve — content we cannot attribute to a
+    // session at all — has no session to key on.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS sealed_session_annex (
+        agent_id      TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        sender_pubkey TEXT,
+        content       BLOB NOT NULL,
+        arrived_at    INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, content_hash)
+      )
+    `);
 
     // M7-SESSION-001 (H-1): side table holding the verified bilateral
     // SEAL-INTERRUPTED commitment artifacts. A side table (CREATE TABLE IF NOT
@@ -1203,13 +1388,18 @@ export class SessionNodeManager {
    *  dismissed. These are answering-machine style messages left in a sealed session — the operator
    *  can read them via cello_transcript but cannot advance the watermark via cello_receive.
    *  Only returned when read_at IS NULL (not yet dismissed). */
-  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
+  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
+        // M12-P17 (review F2): return the ACTUAL status. `#TERMINAL_STATUSES` spans four states and
+        // they are NOT equivalent — an `interrupted` session is not committed, still accepts
+        // appends, and may have a counterparty waiting to seal. Stamping "sealed" over all four
+        // told an agent that live work was dead history: symptom B inverted.
         `SELECT t.session_id AS session_id,
                 COUNT(*)      AS unread_count,
-                MAX(t.sequence) AS last_seq
+                MAX(t.sequence) AS last_seq,
+                s.status      AS status
          FROM transcript t
          LEFT JOIN message_watermarks w
            ON w.agent_id = t.agent_id AND w.session_id = t.session_id
@@ -1223,7 +1413,7 @@ export class SessionNodeManager {
          HAVING unread_count > 0
          ORDER BY t.session_id ASC`,
       )
-      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
+      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number; status: string }>;
     return rows;
   }
 
@@ -3098,6 +3288,49 @@ export class SessionNodeManager {
    * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
    * for a session. Returns null when none exist.
    */
+  /**
+   * M12-P17: durably record verified content that arrived for an ALREADY-ENDED session.
+   *
+   * Returns true only when the row is committed — the caller confirm-deletes the relay copy on the
+   * strength of this answer, and the ORDER is load-bearing: annex first, delete second. A crash
+   * between them must lose nothing, so a failure here MUST report false and leave the relay copy
+   * alone. Getting that backwards converts a noisy re-pull loop into permanent silent loss, which is
+   * the outcome this whole unit exists to prevent.
+   */
+  recordSealedAnnex(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, senderPubkeyHex: string | null): boolean {
+    if (!this.#db) return false;
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO sealed_session_annex (agent_id, content_hash, session_id, sender_pubkey, content, arrived_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(this.#requireAgentId(agentName), contentHashHex, sessionId, senderPubkeyHex, Buffer.from(content), Date.now());
+      return true;
+    } catch (err: unknown) {
+      // FAILS LOUD and reports false: the relay copy is the only other one in existence.
+      this.#logger.error("content.annex.write.failed", {
+        agentName, sessionId, contentHash: contentHashHex,
+        impact: "content NOT annexed — the relay copy must be kept, or the message is lost",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /** M12-P17: read the annex. Operator-initiated ONLY — never wired to a wake path or inbox count. */
+  readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> {
+    if (!this.#db) return [];
+    const rows = (sessionId === undefined
+      ? this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName))
+      : this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? AND session_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName), sessionId)
+    ) as Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; content: Buffer; arrived_at: number }>;
+    return rows.map((r) => ({
+      session_id: r.session_id, content_hash: r.content_hash, sender_pubkey: r.sender_pubkey,
+      text: new TextDecoder().decode(new Uint8Array(r.content)), arrived_at: r.arrived_at,
+    }));
+  }
+
   getSealInterruptedArtifacts(agentName: string, sessionId: string): {
     role: string;
     ownLeaf: unknown;
@@ -3364,10 +3597,13 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId?: string,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string }> {
+  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string }> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
-      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session" };
+      // M12-P13: no node, so nothing was witnessed and nothing was queued — the caller must NOT
+      // commit a leaf for this. `durable` is a required field precisely so a new failure branch
+      // cannot be added without answering the question every caller now asks.
+      return { ok: false, reason: "session_node_unavailable", error: "no active session node for this session", durable: false };
     }
     // R1 (MSG-001-3b): witness the message-leaf HASH to the relay FIRST, INDEPENDENT of
     // direct delivery. The relay is the ordering authority (Structure 2): it assigns the
@@ -3440,6 +3676,14 @@ export class SessionNodeManager {
         structure1_cbor: orderingS1,
         structure2_cbor: orderingS2,
       }) as Uint8Array;
+      // Injected dial failure — thrown from inside the try so it lands in exactly the catch the
+      // real connection_lost lands in, and the whole downstream path (untrack → park → durable
+      // enqueue) runs unmodified.
+      if (this.#sendFaultRemaining > 0) {
+        this.#sendFaultRemaining -= 1;
+        this.#logger.warn("content.send.fault.injected", { sessionId, contentHash: Buffer.from(contentHash).toString("hex") });
+        throw new Error("connection_lost: injected direct-send fault");
+      }
       stream.send(lp.encode.single(frame));
       // NOT SWALLOWED. This was `try { await stream.close(); } catch { }` followed by
       // `delivered: true` — which reports a frame as delivered when the flush failed.
@@ -3465,9 +3709,65 @@ export class SessionNodeManager {
       // DOD-LEAVEMSG-1: the deposit is now AWAITED (was fire-and-forget) so a genuine park success
       // can be reported as "dispatched to relay" instead of a raw stream failure — the operator/
       // agent sees the truth (the message IS in flight, just not direct), not a false negative.
-      const parked = await this.#parkContent(agentName, sessionId, Buffer.from(contentHash).toString("hex"), content, orderingS1, orderingS2);
-      if (parked) {
+      const hashHex = Buffer.from(contentHash).toString("hex");
+      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+      if (attempt.outcome === "parked") {
         return { ok: true, delivered: false, parked: true };
+      }
+      // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
+      // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
+      // have enqueued it is cancelled. The recipient has already witnessed this sequence, so it
+      // holds every later message in the session behind the gap, forever, and tells no one.
+      // Enqueue durably instead; the drain hook re-parks it the moment the standing receiver is
+      // rebuilt. Only on a REFUSAL — a successful deposit must not be re-parked, and an
+      // unconfigured session has no park target to retry against (F6).
+      let durable = false;
+      if (attempt.outcome === "refused") {
+        try {
+          // M12-P13 (review HIGH-1): `durable` is now OBSERVED from the enqueue, not asserted around
+          // it. Two ways this used to lie, both of which now commit a chain leaf and so cannot be
+          // allowed to: the queue's content-derived dedupe key collides and it silently drops the
+          // copy, and the `?.` no-ops entirely when the composition root never wired the hook. An
+          // absent hook is not a queue.
+          if (this.#onParkFailed === null) {
+            this.#logger.error("content.park.durable_enqueue.unwired", {
+              sessionId, contentHash: hashHex, agentName,
+              impact: "no durable queue is wired — the content is NOT retained and will NOT be retried",
+            });
+          } else {
+            durable = this.#onParkFailed(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+          }
+          if (!durable) {
+            if (this.#onParkFailed !== null) {
+              this.#logger.error("content.park.durable_enqueue.dropped", {
+                sessionId, contentHash: hashHex, agentName,
+                impact: "the durable queue refused this copy (identical content already queued) — it is NOT separately retained",
+              });
+            }
+          } else {
+            // F5: the successful enqueue must be visible. Without this the live run that has to
+            // PROVE this fix has nothing to point at, and this log is the sender-side counterpart to
+            // `session.content.held` on the receiver — the two together make the trace readable.
+            // M12-P13: `witnessed` rides along because the caller is about to commit a hash-chain
+            // leaf on the strength of this. Without a relay ordering record the recipient recovers
+            // in arrival order instead — the accepted degradation, but it must not be invisible.
+            this.#logger.info("content.park.deferred", {
+              sessionId, contentHash: hashHex, agentName,
+              selfOrdering: Boolean(orderingS1 && orderingS2),
+              witnessed: Boolean(orderingS1 && orderingS2),
+            });
+          }
+        } catch (hookErr: unknown) {
+          // F3: enqueueAwaitingContent throws ON PURPOSE when the persist fails, because that is
+          // data loss. Swallowing it into the same response the durable case returns would tell the
+          // operator "it will retry" about a message that is simply gone. Named for its own cause,
+          // and the response says so below.
+          this.#logger.error("content.park.durable_enqueue.failed", {
+            sessionId, contentHash: hashHex, agentName,
+            impact: "content is NOT durable and will NOT be retried — the message is lost",
+            error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+          });
+        }
       }
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
@@ -3483,7 +3783,28 @@ export class SessionNodeManager {
                   return String(err);
                 }
               })();
-      return { ok: false, reason: "session_stream_unavailable", error: errMsg };
+      // F3: the two failures are NOT interchangeable to the caller. `reason` is a contract string
+      // and stays put; `guidance` carries the difference, because "we are retrying this" and "this
+      // message is gone, send it again" demand opposite actions from the operator.
+      return {
+        ok: false,
+        reason: "session_stream_unavailable",
+        error: errMsg,
+        // M12-P13: the machine-readable half of the distinction below. M12-P12 shipped it in the
+        // guidance SENTENCE only, so the callers that have to ACT on it — commit the leaf for a
+        // queued message, never for a lost one — would have had to substring-match English. None
+        // did, and the sequence the relay had already witnessed was left as a permanent hole.
+        durable,
+        // M12-P13 (review MEDIUM-5): the specific standing-receiver state, carried rather than
+        // discarded. `reason` names where this surfaced; `cause` names what actually blocked it —
+        // the exact distinction M12-P12 added `standingReceiverAbsenceReason()` for, which then
+        // died inside #parkContent. An operator keying on `reason` alone is sent to the transport
+        // when the blocker is the receiver.
+        ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}),
+        guidance: durable
+          ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
+          : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
+      };
     }
   }
 
@@ -3505,9 +3826,11 @@ export class SessionNodeManager {
     | { ok: false; reason: string; reportedRootHex?: string; sequenceNumber?: number }
   > {
     const sealKey = this.#k(agentName, sessionId);
-    const entry = this.#activeNodes.get(sealKey);
-    if (!entry) return { ok: false, reason: "session_node_unavailable" };
-    if (!entry.relayClient || !entry.relaySessionIdBytes) return { ok: false, reason: "relay_unavailable" };
+    // M12-P15: resolved, not required. See #resolveSealTransport — an interrupted session has no
+    // in-memory node BY CONSTRUCTION, and refusing here is what made the first fix inert.
+    const transport = this.#resolveSealTransport(agentName, sessionId);
+    if ("error" in transport) return { ok: false, reason: transport.error };
+    const entry = transport;
 
     // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
     // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
@@ -4215,9 +4538,11 @@ export class SessionNodeManager {
 
   /**
    * DOD-MSG-4: the relay's high-water canonical sequence for this session (largest witnessed leaf),
-   * or -1 if none. Exposed for the next sub-increment (catch-up-before-live — on reconnect B holds
-   * live arrivals until its tree reaches this, because it has more to recover than it has appended);
-   * NOT yet consumed by the gate. Also `recordWitnessedSequence` maintains it.
+   * or -1 if none. The relay is the ordering authority, so this is the outside view of how far the
+   * session has actually progressed — which is why it is the right input to a catch-up-before-live
+   * gate. Consumed by `sealReadiness` (M12-P14) for REPORTING only: the missing-leaf decision is made
+   * from `#witnessedSeq`, because this counts the relay's sequence space (which includes ctrl leaves)
+   * and the tree does not. Maintained by `recordWitnessedSequence`.
    */
   /**
    * DOD-COATTEND-1 (review F2): leaf sequences whose plaintext failed to reach the transcript and
@@ -4229,6 +4554,58 @@ export class SessionNodeManager {
 
   getHighWaterSeq(agentName: string, sessionId: string): number {
     return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
+  }
+
+  /**
+   * M12-P14: is this side's chain COMPLETE enough to be sealed?
+   *
+   * A seal is a bilateral signature over the same conversation, so a side that is missing a leaf
+   * cannot produce a signable one — the counterparty compares frontiers and refuses with
+   * `leaf_count_mismatch`. That refusal is correct and it is also terminal: there is no backfill
+   * request in the protocol, so the only exit is a force-abandon, which yields NO notarized receipt.
+   * Measured 2026-08-05 on two sessions that died exactly this way (initiator 2 leaves, responder 3).
+   *
+   * The cheap prevention is to notice BEFORE asking. Two local signals already exist and, until now,
+   * nothing read either of them at close time:
+   *  - `#highWaterSeq` — the largest canonical sequence the RELAY has witnessed for this session.
+   *    The relay is the ordering authority, so a high-water above our own frontier is proof that a
+   *    leaf exists which we have not appended. (Its own doc comment called it "reserved … NOT yet
+   *    consumed by the gate" — this is that consumer.)
+   *  - `#heldContent` — content we HAVE received and verified but cannot append because it sits
+   *    behind a gap. Holding content and sealing anyway would seal a chain we know is short.
+   *
+   * Deliberately NOT a network call: it must work when the counterparty is unreachable, which is
+   * the whole situation a seal-interrupted exists for.
+   *
+   * KNOWN LIMIT, stated rather than hidden: both maps are in-memory and cleared on teardown, so
+   * after a daemon restart this returns ready for a session whose gap predates the restart — which
+   * is the shape of the 2026-08-05 incident itself. Closing that needs the mailbox drained (or the
+   * high-water persisted) before the check; tracked with M12-P14, not claimed here.
+   */
+  sealReadiness(agentName: string, sessionId: string): {
+    ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number;
+  } {
+    const key = this.#k(agentName, sessionId);
+    const treeSize = this.getSessionTree(agentName, sessionId).size();
+    const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
+    const heldCount = this.#heldContent.get(key)?.size ?? 0;
+    // Review HIGH-2: NOT `(highWaterSeq + 1) - treeSize`. That subtraction silently assumes the
+    // relay's sequence space and this tree's index space count the same things, and they do not:
+    // `relay-node.ts` increments seq_counter for EVERY accepted leaf including CTRL (0x02), while
+    // `appendSessionLeaf` is only ever called with "msg" — `submitSealLeaf` deliberately computes
+    // its root without mutating the durable tree. So one seal ctrl leaf offsets the two spaces
+    // permanently, and any msg witnessed afterwards would read as a missing leaf FOREVER. That is a
+    // false positive, and a false positive here is worse than the bug it guards: it makes a healthy
+    // session unsealable, leaving force-abandon (no receipt) as the only exit. `seal-upgrade.ts`
+    // already documents the same `leaf_count - 1` offset.
+    //
+    // `#witnessedSeq` answers the question directly instead of inferring it. It gains an entry when
+    // the relay witnesses a COUNTERPARTY msg leaf (ctrl leaves are excluded at the call site) and
+    // loses it the moment that leaf is appended. So its remaining size IS the count of leaves the
+    // ordering authority has committed and this tree has not — no arithmetic, no space mismatch,
+    // and it cannot go negative.
+    const missingLeaves = this.#witnessedSeq.get(key)?.size ?? 0;
+    return { ready: missingLeaves === 0 && heldCount === 0, treeSize, highWaterSeq, heldCount, missingLeaves };
   }
 
   /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
@@ -4514,7 +4891,10 @@ export class SessionNodeManager {
     if (bySession.size === 0) this.#awaitingAck.delete(ackKey);
     this.#logger.debug("content.delivery.ttf_expired", { sessionId, contentHash: hashHex });
     try {
-      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content);
+      // M12-P12 (review pass 2): the ordering record travels on THIS path too. It is in hand — the
+      // very next statement hands it to #parkContent — and a TTF row written without it re-parks in
+      // arrival order, which is the divergent-leaf-index failure the durable columns exist to stop.
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),

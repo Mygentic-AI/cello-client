@@ -91,6 +91,27 @@ export function renderSealRejection(
         `this machine, read both sides here; there is no other end to check.`,
     };
   }
+  // M12-P14: the terminal-status refusals are the counterparty telling us the session is already
+  // FINISHED on its side. Verbatim relay is right for a condition we cannot interpret; these three
+  // we can, and the generic wording ("check the counterparty's daemon for that condition") sends an
+  // operator hunting a fault where there is none. A sealed session in particular is a SUCCESS —
+  // the receipt exists — and reporting it as a rejection to go investigate is actively wrong.
+  const terminal: Record<string, string> = {
+    session_abandoned:
+      `The counterparty has already ABANDONED this session, so there is nothing left to co-sign — an abandon is terminal and yields no notarized receipt on either side. This is the state someone put it in deliberately (a force-close), not a fault to chase. Close it on this side too: cello_close_session ${sessionId} { force: true }.`,
+    session_already_sealed:
+      `The counterparty has already SEALED this session — a receipt exists on their side. This is not a disagreement and nothing is wrong: fetch it with cello_sealed_receipt ${sessionId} rather than re-requesting a seal.`,
+    session_seal_already_pending:
+      `The counterparty has already recorded its half of this seal and is waiting on ours, so a second request cannot be answered. Do not re-send it; check cello_sessions ${sessionId} for the seal's completion.`,
+  };
+  // Review MEDIUM-5: `reason` comes off the wire — the counterparty's rejection, relayed verbatim
+  // by the directory without validation. A plain object-literal lookup is prototype-reachable, so
+  // `reason: "toString"` passes an `!== undefined` guard and returns a FUNCTION as `guidance`,
+  // which serialises away and leaves the operator a rejection with no guidance at all. Own-property
+  // check: a hostile or merely buggy counterparty must not be able to choose that.
+  if (Object.hasOwn(terminal, reason)) {
+    return { rejection_reason: reason, guidance: terminal[reason] };
+  }
   // Only a leaf_count_mismatch is EXPECTED to carry the numbers, so only there is their absence
   // evidence of an older daemon. The responder rejects for five other reasons, and rendering those
   // as a version problem asserts a cause the code never observed.
@@ -144,7 +165,7 @@ export function createSealFlows(deps: SealFlowDeps) {
     // initiator can name the mismatch instead of guessing at it. Optional — an older counterparty
     // sends the bare reason, and the renderer must degrade to the old wording rather than print
     // "undefined vs undefined".
-    | { type: "seal_interrupted_rejection"; reason: string; frontier?: { responder: number; initiator: number; diverging: number } }
+    | { type: "seal_interrupted_rejection"; reason: string; pendingCeremony?: string; frontier?: { responder: number; initiator: number; diverging: number } }
     | { type: "timeout" };
 
   function awaitSealAck(sessionId: string, mgr: SignalingManager | undefined): Promise<SealAckResult> {
@@ -174,6 +195,9 @@ export function createSealFlows(deps: SealFlowDeps) {
         } else {
           // Only treat the frontier detail as present when BOTH numbers are real. A half-populated
           // frame must render as "no detail", never as a mismatch with one side invented.
+          // M12-P15: which ceremony the peer is actually on. ONE status covers two that need
+          // opposite actions, so the initiator must never infer it — absent means do not act.
+          const ceremony = typeof frame["pending_ceremony"] === "string" ? frame["pending_ceremony"] : undefined;
           const responder = frame["responder_leaf_count"];
           const initiator = frame["initiator_leaf_count"];
           const diverging = frame["diverging_leaf_index"];
@@ -181,6 +205,7 @@ export function createSealFlows(deps: SealFlowDeps) {
           resolve({
             type: "seal_interrupted_rejection",
             reason: typeof frame.reason === "string" ? frame.reason : "unknown",
+            ...(ceremony !== undefined ? { pendingCeremony: ceremony } : {}),
             ...(hasFrontier
               ? { frontier: { responder, initiator, diverging: typeof diverging === "number" ? diverging : Math.min(responder, initiator) } }
               : {}),
@@ -342,6 +367,33 @@ export function createSealFlows(deps: SealFlowDeps) {
           divergingLeafIndex: diverging,
           correlationId,
         });
+      }
+      // M12-P15: the counterparty just told us which ceremony IT is on. Act on that rather than
+      // dead-ending — the dead end is what left force:true (no receipt) as the only exit.
+      //
+      // ONLY `relay_bilateral`. A peer on the seal-interrupted ceremony has no relay SEAL ctrl leaf
+      // and never will, so our leaf would be one leaf into a log that can never hold a second
+      // distinct sender: the seal never completes and we would have reported ok. An ABSENT field
+      // (older peer) is not a hint — it is unknown, and unknown means do not sign.
+      if (ackResult.reason === "session_seal_already_pending" && ackResult.pendingCeremony === "relay_bilateral") {
+        logger.info("session.seal.ceremony.realigned", {
+          sessionId, agentName: record.agent_name,
+          from: "seal_interrupted", to: "bilateral_cosign", because: ackResult.reason, correlationId,
+        });
+        const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
+        // `responder_seal_already_submitted` means our half is ALREADY in the relay log. The active
+        // seal path treats it as success for exactly that reason; treating it as failure here told
+        // the operator to retry forever (every retry re-hits the synchronous idempotency mark) while
+        // forbidding the only real exit.
+        if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
+          return { ok: true, sessionId, status: "seal_interrupted_pending" };
+        }
+        return {
+          ok: false,
+          reason: "seal_cosign_failed",
+          rejection_reason: ackResult.reason,
+          guidance: `The counterparty is running the relay bilateral seal and was waiting for our half, so we submitted it instead of re-requesting an interrupted seal — but the submit failed (${submitted.reason}). The session is NOT terminal: retry cello_close_session ${sessionId} once that cause is cleared.`,
+        };
       }
       return {
         ok: false,

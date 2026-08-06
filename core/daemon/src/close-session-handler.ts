@@ -30,6 +30,8 @@ export interface CloseSessionDeps {
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
+  /** M12-P14: drain this agent's parked mailbox before judging seal readiness (contentPark.autoRecoverForAgent). */
+  recoverParkedContent?: (agentName: string, trigger: string) => Promise<void>;
   getConnState: (connectionId: string) => ConnState | undefined;
   resolveCurrentAgent: (connState: ConnState | undefined, explicitAgent?: string) => string | null;
   NO_CURRENT_AGENT_RESPONSE: unknown;
@@ -60,6 +62,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, signalingFor, sendOver, waitForSignalingConnected,
     openVisitingConnection, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
+    recoverParkedContent,
   } = deps;
 
   // ─── M7-SESSION-001: cello_close_session ────────────────────────────────────
@@ -204,6 +207,64 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       };
     }
 
+    // M12-P14: do not ask for a seal we already know cannot be granted.
+    //
+    // Placed AFTER the force branch on purpose — force is the operator's deliberate escape hatch and
+    // must never be gated — and before every seal path, because both the interrupted and the active
+    // flows sign this side's frontier.
+    //
+    // A short chain produces `leaf_count_mismatch` at the counterparty, which is correct and
+    // TERMINAL: nothing in the protocol backfills a missing leaf, so the session's only remaining
+    // exit is a force-abandon with no notarized receipt. Refusing here costs the operator a retry;
+    // not refusing costs them the receipt permanently.
+    // Review HIGH-3: scoped to the two statuses that can actually seal. Unconditional, it also fired
+    // for `seal_interrupted_pending` — displacing that status's accurate answer ("awaiting FROST
+    // notarization") with `session_incomplete`, and offering force:true against a seal that is
+    // mid-notarization. That is the same error substitution e3da3b4 exists to remove, reintroduced
+    // one branch earlier in the same handler. (markInterruptedWithDetails does not evict the caches,
+    // so the signals survive into that status and the branch was genuinely reachable.)
+    const sealable = record.status === "active" || record.status === "interrupted";
+    let readiness = sealable
+      ? sessionNodeManager.sealReadiness(record.agent_name, sessionId)
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0 };
+    // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
+    // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
+    // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
+    // event that would never happen, retried, got the same refusal, and reached for force:true — the
+    // terminal receipt-less outcome this gate exists to prevent. Drain FIRST, then judge, which is
+    // the sequence seal-upgrade.ts already documents: "Recover content -> consult the gate -> REFUSE".
+    if (sealable && !readiness.ready && recoverParkedContent) {
+      try {
+        await recoverParkedContent(record.agent_name, "close_readiness_gate");
+        readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
+      } catch (err: unknown) {
+        // A drain failure is not a reason to block the close: re-judging on the pre-drain readiness
+        // is the same answer we would have given anyway, and it is still the honest one.
+        logger.warn("session.seal.readiness.drain.failed", {
+          agentName: record.agent_name, sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (sealable && !readiness.ready) {
+      logger.warn("session.seal.blocked_incomplete", {
+        agentName: record.agent_name, sessionId,
+        treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
+        heldCount: readiness.heldCount, missingLeaves: readiness.missingLeaves,
+      });
+      return {
+        ok: false,
+        reason: "session_incomplete",
+        missing_leaves: readiness.missingLeaves,
+        held_messages: readiness.heldCount,
+        guidance:
+          `This side of the conversation is incomplete, so sealing now would produce a chain the counterparty cannot co-sign — and that refusal is terminal, leaving a force-abandon with no notarized receipt as the only way out. ` +
+          `You hold ${readiness.treeSize} message(s); the relay has witnessed ${readiness.highWaterSeq + 1}` +
+          (readiness.heldCount > 0 ? `, and ${readiness.heldCount} received message(s) are waiting behind a gap` : "") +
+          `. The daemon just pulled from the relay and the gap is still there, so the content is not available yet — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
+      };
+    }
+
     // AC-011: seal-interrupted already in progress
     if (sealInterruptedInProgress.has(sealKey(record.agent_name, sessionId))) {
       return {
@@ -330,8 +391,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           // gate. Honest caveat: for a NON-initiator the stored cert is recorded `verified:false`,
           // so it is ultimately directory-attested over an authenticated channel — the same trust the
           // ordinary bilateral close already returns, not a new one introduced here.
+          // M12-P15 (review HIGH-3): this used to key on `session_node_unavailable` ALONE. That was
+          // the only reason submitSealLeaf could give when the node was gone — until M12-P15 taught
+          // it to fall back to a detached transport, after which it can no longer produce that
+          // string at all and this recovery went DEAD. The ordinary double-close then dialled the
+          // relay, submitted a second ctrl leaf to a session the relay had already destroyed on
+          // seal, and told the operator the close failed — the M12 defect back under a new label.
+          // The question this branch actually asks is "we could not submit; is the seal already
+          // durable?", so it keys on every reason that means exactly that. A stored certificate is
+          // the answer either way, and consulting it is cheap.
+          const SEAL_MAY_ALREADY_BE_DURABLE = new Set([
+            "session_node_unavailable",
+            "no_persisted_relay_endpoint",
+            "standing_receiver_unavailable",
+            "relay_client_unavailable",
+            "relay_unavailable",
+            "relay_session_gone",
+            "session_not_found",
+          ]);
           const localCert =
-            submit.reason === "session_node_unavailable"
+            SEAL_MAY_ALREADY_BE_DURABLE.has(submit.reason)
               ? sessionNodeManager.getSealCertificate(record.agent_name, sessionId)
               : null;
           if (localCert?.sealed_root) {

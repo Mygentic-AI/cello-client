@@ -66,6 +66,14 @@ export interface InboundSessionWaiter {
 
 
 export interface InboundSessionDeps {
+  /**
+   * M12-P16 (review F1): was this agent DELIBERATELY taken offline? Nothing on this path consulted
+   * agent state at all, so an offline agent accepted new sessions — and `acceptInboundAssignment`'s
+   * call to `ensureStandingReceiverForAgent` re-added the want-flag the offline handler had just
+   * cleared, rebuilding the receiver and firing the away reply. The operator's kill switch reported
+   * success while the agent kept answering strangers.
+   */
+  isExplicitlyOffline: (agentName: string) => boolean;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
   agents: AgentInfo[];
@@ -594,6 +602,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     agentName: string,
     correlationId: string,
   ): Promise<void> {
+    // M12-P16: refuse BEFORE anything else — in particular before ensureStandingReceiverForAgent,
+    // whose first line would resurrect the receiver this agent was just relieved of.
+    if (deps.isExplicitlyOffline(agentName)) {
+      logger.info("session.inbound.refused", {
+        agentName, sessionId: parsed.sessionIdHex, reason: "agent_offline", correlationId,
+      });
+      return;
+    }
     try {
       // M8C-ABUSE-1 + DOD-TIER-2/3: bound acceptance by the sender's TIER — a per-sender cap that is
       // the sender's tier cap (BLOCKED 0 → refused here, indistinguishably from an over-cap stranger),

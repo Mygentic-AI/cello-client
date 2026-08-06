@@ -46,6 +46,14 @@ export interface AwaitingContentEntry {
   sessionId: string;
   contentHashHex: string;
   contentBlob: Uint8Array;
+  /** M12-P12 (review F2): the relay's signed ordering record, carried so a RE-park is self-ordering
+   *  exactly like the live park. Without it `recoverParkedFromRelay` falls back to the in-memory
+   *  #witnessedSeq map, which is empty after a receiver restart — the content then appends at its
+   *  ARRIVAL index instead of its witnessed sequence, and the session tree diverges at seal.
+   *  Nullable: rows written before this column existed, and the agent-less direct-retry rows,
+   *  legitimately have none. */
+  structure1Cbor?: Uint8Array;
+  structure2Cbor?: Uint8Array;
   queuedAt: number;
   position: number;
 }
@@ -83,9 +91,22 @@ export class RetryQueue {
         attempts        INTEGER NOT NULL DEFAULT 1,
         position        INTEGER NOT NULL,
         awaiting_ack    INTEGER NOT NULL DEFAULT 0,
-        content_hash_hex TEXT
+        content_hash_hex TEXT,
+        structure1_cbor BLOB,
+        structure2_cbor BLOB
       )
     `);
+    // Idempotent add for databases created before M12-P12. SQLite has no ADD COLUMN IF NOT EXISTS,
+    // so the duplicate-column error is the expected no-op on an already-migrated DB; any OTHER
+    // error is a real failure and must not be swallowed.
+    for (const col of ["structure1_cbor", "structure2_cbor"]) {
+      try {
+        this.#db.exec(`ALTER TABLE retry_queue ADD COLUMN ${col} BLOB`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/duplicate column name/i.test(msg)) throw err;
+      }
+    }
     this.#db.exec(`
       CREATE INDEX IF NOT EXISTS retry_queue_by_session_position
         ON retry_queue(session_id, position ASC)
@@ -114,7 +135,7 @@ export class RetryQueue {
    */
   loadFromDb(): void {
     const rows = this.#db
-      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex FROM retry_queue ORDER BY session_id, position ASC")
+      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor FROM retry_queue ORDER BY session_id, position ASC")
       .all() as unknown as Array<{
         session_id: string;
         agent_id: string | null;
@@ -125,6 +146,8 @@ export class RetryQueue {
         position: number;
         awaiting_ack: number;
         content_hash_hex: string | null;
+        structure1_cbor: Buffer | null;
+        structure2_cbor: Buffer | null;
       }>;
 
     this.#queues.clear();
@@ -150,6 +173,10 @@ export class RetryQueue {
           sessionId: row.session_id,
           contentHashHex: row.content_hash_hex ?? row.nonce_hex,
           contentBlob: this.#openBlob(Uint8Array.from(row.content_blob)),
+          // M12-P12 (F2): the ordering record is NOT sealed — it is the relay's own signed record,
+          // already public to the relay, and it must be readable to re-seal the park envelope.
+          structure1Cbor: row.structure1_cbor ? Uint8Array.from(row.structure1_cbor) : undefined,
+          structure2Cbor: row.structure2_cbor ? Uint8Array.from(row.structure2_cbor) : undefined,
           queuedAt: row.queued_at,
           position: row.position,
         };
@@ -377,13 +404,31 @@ export class RetryQueue {
    * retry_queue table (awaiting_ack = 1) so a crash before the relay park confirms is
    * recoverable at startup. Idempotent on (agentId, sessionId, contentHash).
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array): void {
+  /**
+   * Returns TRUE only when this copy is actually queued. M12-P13 (review HIGH-1): the dedupe branch
+   * below DROPS the content, and the caller now commits a hash-chain leaf on the strength of this
+   * answer — so "I dropped it" must be reportable, not merely logged. A void return made the drop
+   * indistinguishable from a successful enqueue at the call site, which is how a leaf could be
+   * committed for content that no longer existed anywhere.
+   */
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);
     let q = this.#awaiting.get(ak);
     if (!q) { q = []; this.#awaiting.set(ak, q); }
-    if (q.some((e) => e.contentHashHex === contentHashHex)) return; // idempotent
+    if (q.some((e) => e.contentHashHex === contentHashHex)) {
+      // M12-P12 (review F7): the key is SHA-256(0x00 ‖ content) — content-derived, with no sequence
+      // and no nonce. Two identical messages in one session ("ok" at seq 3 and seq 7) collide, and
+      // the second is DROPPED here. Silently, until now: the drop looked like a successful enqueue
+      // and reproduced the very symptom this class of fix exists to remove. Logged so it is at
+      // least visible; keying on (sessionId, canonicalSeq, contentHash) is the real fix.
+      this.#logger.warn("message.retry.enqueue.deduped", {
+        agentId, sessionId, contentHash: contentHashHex,
+        impact: "identical content already queued for this session — this copy is NOT separately queued",
+      });
+      return false;
+    }
 
     const currentMax = this.#positionCounters.get(ak) ?? 0;
     const position = currentMax + 1;
@@ -397,10 +442,12 @@ export class RetryQueue {
     try {
       this.#db
         .prepare(
-          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
         )
-        .run(sessionId, agentId, contentHashHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, position, contentHashHex);
+        .run(sessionId, agentId, contentHashHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, position, contentHashHex,
+             structure1Cbor ? Buffer.from(structure1Cbor) : null,
+             structure2Cbor ? Buffer.from(structure2Cbor) : null);
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       this.#logger.error("message.retry.persist.failed", {
@@ -414,7 +461,8 @@ export class RetryQueue {
     }
 
     this.#positionCounters.set(ak, position);
-    q.push({ agentId, sessionId, contentHashHex, contentBlob, queuedAt, position });
+    q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, queuedAt, position });
+    return true;
   }
 
   /** Remove an awaiting-ACK entry once its `persisted` ACK arrives. */

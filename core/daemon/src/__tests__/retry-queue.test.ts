@@ -551,4 +551,60 @@ describe("DOD-AGENT-ID-JOINKEY-1 — retry_queue: two local agents, one session,
         "row it should have left behind was never written",
     ).toBe(1);
   });
+
+  it("M12-P12 (review pass 2): the relay's ordering record survives the disk round-trip", async () => {
+    // Without it, a re-parked message recovers at its ARRIVAL index instead of its witnessed
+    // sequence — the recipient's witness map is in-memory and empty after a restart — and the
+    // session tree diverges at seal. Pinned at the persistence layer because producing a genuinely
+    // witnessed send needs a live relay; what this cannot cover is the argument hand-off from
+    // sendContent/#handleTtfExpiry into the hook, which is typechecked but not exercised here.
+    const SESSION = "ordering-session";
+    const AGENT = "agent-id-alice-0001";
+    const HASH = randomBytes(32);
+    const CONTENT = Buffer.from("carries its own order");
+    const S1 = Buffer.from([0xa1, 0x01, 0x02]);
+    const S2 = Buffer.from([0xa2, 0x03, 0x04]);
+
+    const rq = new RetryQueue(db2, log2);
+    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT, S1, S2);
+
+    // A brand-new instance over the same database — what a restarted daemon does.
+    const afterRestart = new RetryQueue(db2, log2);
+    afterRestart.loadFromDb();
+
+    const seen: Array<{ s1?: Uint8Array; s2?: Uint8Array; content: Uint8Array }> = [];
+    await afterRestart.drainAwaitingToPark(AGENT, SESSION, async (entry) => {
+      seen.push({ s1: entry.structure1Cbor, s2: entry.structure2Cbor, content: entry.contentBlob });
+      return { parked: true };
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(Buffer.from(seen[0].content).equals(CONTENT)).toBe(true);
+    expect(seen[0].s1, "the ordering record must come back, or the re-park lands at the wrong leaf").toBeDefined();
+    expect(Buffer.from(seen[0].s1!).equals(S1)).toBe(true);
+    expect(Buffer.from(seen[0].s2!).equals(S2)).toBe(true);
+  });
+
+  it("M12-P12 (review pass 2): a row written WITHOUT an ordering record still round-trips", async () => {
+    // Rows predating the columns, and agent-less direct-retry rows, legitimately carry none. They
+    // must hydrate as undefined rather than throwing or coercing to an empty buffer, which
+    // sealParkEnvelope would then treat as a present-but-empty ordering record.
+    const SESSION = "legacy-session";
+    const AGENT = "agent-id-alice-0001";
+    const HASH = randomBytes(32);
+    const CONTENT = Buffer.from("no order carried");
+
+    const rq = new RetryQueue(db2, log2);
+    rq.enqueueAwaitingContent(AGENT, SESSION, HASH, CONTENT);
+
+    const afterRestart = new RetryQueue(db2, log2);
+    afterRestart.loadFromDb();
+    const seen: Array<{ s1?: Uint8Array }> = [];
+    await afterRestart.drainAwaitingToPark(AGENT, SESSION, async (entry) => {
+      seen.push({ s1: entry.structure1Cbor });
+      return { parked: true };
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].s1).toBeUndefined();
+  });
 });

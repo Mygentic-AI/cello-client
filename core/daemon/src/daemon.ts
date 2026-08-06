@@ -67,7 +67,7 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
-import { extractErrorMessage } from "./session-relay-client.js";
+import { AgentRelayClient, extractErrorMessage } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
 import {
@@ -420,6 +420,14 @@ async function startDaemonHoldingLock(
   // rebuild, auth_ok rebuild) and on its slow backstop sweep. Before this, a message that hit a
   // relay churn gap sat parked until a human restarted the receiving daemon.
   sessionNodeManager.setParkedDrainHook((agentName: string, reason: string) => {
+    // M12-P12 (review F1): the SENDER half of the same event. A refused park deposit leaves a
+    // durable retry_queue row, and until this call existed the only things that drained it were a
+    // daemon restart and cello_start_agent — so the fix made a lost message restart-recoverable
+    // while the DoD line promises "no restart". The watchdog rebuild is where parking actually
+    // happens, so it is where the re-park has to fire too.
+    void flushAwaitingContent(agentName).catch((err: unknown) => {
+      logger.warn("content.park.flush.failed", { agentName, trigger: reason, stage: "drain_hook", error: extractErrorMessage(err) });
+    });
     void autoRecoverForAgent(agentName, reason).catch((err: unknown) => {
       // autoRecoverForAgent catches per-relay errors internally; this is the backstop, and it uses
       // extractErrorMessage because the transport rejects with structured plain objects that
@@ -437,6 +445,9 @@ async function startDaemonHoldingLock(
     isAgentOnline: (agentName: string) => onlineAgents.has(agentName),
     ensureStandingReceiver: (agentName: string) => sessionNodeManager.ensureStandingReceiverForAgent(agentName),
     drainParked: (agentName: string) => autoRecoverForAgent(agentName, "signaling_reconnect"),
+    // M12-P12 (review F1): ordered AFTER ensureStandingReceiver by createReconnectDrain's own
+    // ensure→drain contract — a re-park needs the receiver that the ensure step rebuilds.
+    flushSender: (agentName: string) => flushAwaitingContent(agentName),
   });
 
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
@@ -850,6 +861,17 @@ async function startDaemonHoldingLock(
 
   // Set of agents currently in "online" state (transitioned via cello_start_agent)
   const onlineAgents = new Set<string>();
+  /**
+   * M12-P16 (review F1): agents an operator DELIBERATELY took offline.
+   *
+   * Deliberately NOT `onlineAgents`. That set answers "has this agent been started through
+   * cello_start_agent", which is not the same question as "may this agent receive": several
+   * legitimate paths serve inbound sessions without ever populating it, so gating the inbound path
+   * on it refuses real traffic (proven — it broke 27 tests across 7 suites). This set is empty
+   * unless someone actually pressed the switch, so it can only ever refuse what the operator asked
+   * to have refused.
+   */
+  const explicitlyOfflineAgents = new Set<string>();
 
   // M8C-CURSOR-1: per-connection, per-session read cursor (read-before-write gating).
   // Distinct from message_watermarks (INBOX-1, per-AGENT delivery watermark, persisted) — this is
@@ -1017,13 +1039,24 @@ async function startDaemonHoldingLock(
           const rejectHash = wireContentHash(rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
           const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
-          if (sendResult.ok) {
+          // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
+          // either way the relay already witnessed its sequence. This caller is the sharpest case
+          // of the three: the seal is initiated immediately below, so a hole here does not merely
+          // stall the far side, it seals a tree that is one leaf short of a sequence the
+          // counterparty will still receive content at. The roots then cannot agree, and the
+          // session is unsealable for good.
+          if (sendResult.ok || sendResult.durable) {
             const rejectHashHex = Buffer.from(rejectHash).toString("hex");
             const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", rejectHashHex, randomUUID());
             sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", rejectBytes, randomUUID());
-            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex });
+            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex, queued: !sendResult.ok });
           } else {
-            logger.warn("session.away.inbox.oneshot.reject_send_failed", { agentName, sessionId, reason: sendResult.reason });
+            // Not queued anywhere — the rejection is gone. We still seal (we are closing regardless),
+            // and the counterparty simply never learns why, so say that plainly rather than at warn.
+            logger.error("session.away.inbox.oneshot.reject_send_failed", {
+              agentName, sessionId, reason: sendResult.reason, cause: sendResult.cause,
+              impact: "the rejection is lost and was NOT queued — the session seals with no explanation to the counterparty",
+            });
           }
           // DOD-INBOX-ONESHOT-1 / DOD-SEAL-BILATERAL-TIMEOUT-1: initiate the seal via the
           // relay-mediated path (submitSealLeaf → bilateral wait → unilateral escalation).
@@ -1176,14 +1209,37 @@ async function startDaemonHoldingLock(
         : draftBytes;
       const contentHash = wireContentHash(contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
-      if (!sendResult.ok) {
+      if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
         // away period — clear the guard so the next inbound arrival retries the ack.
         awayAckSent.delete(dedupKey);
-        logger.warn("session.away.response.failed", { agentName, sessionId, kind, reason: sendResult.reason });
+        // M12-P13: this branch now means the reply is GONE, not merely late (the queued case is
+        // handled below), so it is an error and it says what the consequence is. It was a bare warn
+        // when it fired live on 2026-08-05 and read as routine churn.
+        logger.error("session.away.response.failed", {
+          agentName, sessionId, kind, reason: sendResult.reason, cause: sendResult.cause,
+          impact: "the away reply is lost and was NOT queued — the counterparty gets no acknowledgement",
+        });
         return;
       }
       const contentHashHex = Buffer.from(contentHash).toString("hex");
+      if (!sendResult.ok) {
+        // M12-P13 (found live 2026-08-05, M12 Entry 89): the reply is durably queued and already
+        // owns the sequence the relay witnessed for it, so its leaf MUST be committed here. Without
+        // it this side's tree stays one short of that sequence, and since `nextExpected` is the tree
+        // size, every message the counterparty sends afterwards is held behind a gap nothing can
+        // fill. That is exactly how the receiver stranded its own session at sequence 0.
+        //
+        // The dedup guard deliberately STAYS SET: a queued reply is coming, and re-sending on the
+        // next arrival would mint a second greeting at a second sequence.
+        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
+        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, queuedLeaf, "sent", contentBytes, randomUUID());
+        logger.info("session.away.response.deferred", {
+          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf,
+          reason: sendResult.reason, cause: sendResult.cause,
+        });
+        return;
+      }
       const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
       sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
       logger.info("session.away.response.sent", { agentName, sessionId, kind, isKnown, sequenceNumber: leafIndex });
@@ -1321,12 +1377,40 @@ async function startDaemonHoldingLock(
   // throw into the content stream handler.
   // DOD-AGENT-ID-JOINKEY-1: RetryQueue owns an agent-scoped table, so it is handed the STABLE
   // agent_id. The daemon resolves the operator-facing name ONCE, here at its own boundary.
+  // M12-P15: let a session with NO in-memory node still reach its relay to seal. The manager
+  // deliberately holds no K_local, so the client is built here where the keys live. This is what
+  // makes the detached path work after a RESTART — the exact situation that marked the session
+  // interrupted and then left it unsealable, with force-abandon (no receipt) as the only exit.
+  sessionNodeManager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs, stores) => {
+    const kp = keyProviders.get(agentName);
+    const agent = agents.find((a) => a.name === agentName);
+    if (!kp || !agent?.pubkey) return undefined;
+    return new AgentRelayClient({
+      relayPeerId,
+      relayAddrs,
+      keyProvider: kp,
+      senderPubkey: Buffer.from(agent.pubkey, "hex"),
+      logger,
+      // Review HIGH-1: a client that can submit but cannot RECORD drops the durable evidence the
+      // seal depends on — silently, while reporting success.
+      receiptStore: stores.receiptStore,
+      sealLeafStore: stores.sealLeafStore,
+    });
+  });
+
   sessionNodeManager.setAwaitingAckHooks({
     onPersisted: (agentName, sessionId, contentHashHex) => {
       retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));
     },
-    onTtf: (agentName, sessionId, contentHashHex, content) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content);
+    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
+    },
+    // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
+    // TTF timer is already cancelled on this path, so this is the only thing holding the content.
+    // M12-P13 (review HIGH-1): the enqueue's own answer is returned, never a bare `true`. A dropped
+    // copy that reports success now buys a committed hash-chain leaf for content that is gone.
+    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
+      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
     },
   });
 
@@ -1377,12 +1461,18 @@ async function startDaemonHoldingLock(
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       const reason = "standing_receiver_unavailable";
-      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason });
+      // M12-P12 (review F4): `standing_receiver_unavailable` is the exit-point label that already
+      // misnamed this incident 102 times; standingReceiverAbsenceReason() names WHICH of the four
+      // causes it is. That distinction is what separates "mid-rebuild, a retry in seconds works"
+      // from "agent offline, this will never work" — the difference between a backstop that helps
+      // and one that spins. The wire reason stays put; the cause rides alongside.
+      const cause = sessionNodeManager.standingReceiverAbsenceReason(agentName);
+      logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason, cause });
       // DOD-LEAVEMSG-1 (reviewer HIGH fix): return the typed failure, never resolve as if this
       // were a success — #parkContent's caller (sendContent) shapes a live "dispatched to relay"
       // response from this, and a silently-resolved void here would report a message as safely
       // parked when nothing was ever deposited.
-      return { ok: false, reason };
+      return { ok: false, reason, cause };
     }
     // SEC-1: sign the entry as the SENDING agent. Without a key we cannot produce an envelope the
     // recipient will accept, so fail LOUD rather than depositing something that will be refused on
@@ -1458,26 +1548,31 @@ async function startDaemonHoldingLock(
     const node = sessionNodeManager.getStandingReceiverNode(record.agent_name);
     if (!node) return { parked: false, error: "standing_receiver_unavailable" };
     // SEC-1: the crash backstop must sign too — an unsigned re-park would be REFUSED on recovery,
-    // which would turn the message-loss backstop into a message-loss cause. This is why the SEC-1
-    // signature binds to the sender's own K_local and NOT to the relay's ordering record: the
-    // ordering record is not persisted in retry_queue (see below) and so cannot be reproduced here,
-    // but the KEY can — the owning agent still holds it after a crash. Hence: NO schema migration.
+    // which would turn the message-loss backstop into a message-loss cause. The SEC-1 signature
+    // binds to the sender's own K_local, which the owning agent still holds after a crash.
+    // M12-P12 (review F2): the ordering record IS now persisted (retry_queue.structure{1,2}_cbor),
+    // so a re-park is self-ordering whenever the row carries one. Rows written before that column
+    // existed carry none and still recover in arrival order — the pre-existing behaviour, now the
+    // exception rather than the rule.
     const senderKp = keyProviders.get(ownerName);
     if (!senderKp) return { parked: false, error: "signing_key_unavailable" };
     const recipientPubkey = Buffer.from(record.counterparty_pubkey, "hex");
     const contentHashBytes = Buffer.from(entry.contentHashHex, "hex");
     logger.info("content.park.signed", { agentName: ownerName, sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
-    // DOD-MSG-4 (2b): seal the envelope shape too (content only — the durable awaiting queue does not
-    // persist the ordering record, so a crash-backstop re-park recovers in arrival order; the common
-    // live-park path above carries the full Structure2). Keeps ONE envelope format on the recover side.
+    // DOD-MSG-4 (2b): ONE envelope format on the recover side. M12-P12 (F2): carry the persisted
+    // ordering record when the row has one, so the recipient places the content at its WITNESSED
+    // sequence rather than its arrival index — the receiver's #witnessedSeq map is in-memory and
+    // empty after a restart, so arrival order there means a wrong leaf index and a divergent tree.
     // SEC-1: same sole producer as the live hook — the backstop signs from the persisted
-    // (sessionId, recipient, contentHash), which is why it survives a crash with NO schema migration.
+    // (sessionId, recipient, contentHash).
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: entry.sessionId,
       recipientPubkey,
       contentHash: contentHashBytes,
       content: entry.contentBlob,
+      structure1Cbor: entry.structure1Cbor,
+      structure2Cbor: entry.structure2Cbor,
     });
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {
@@ -1498,7 +1593,33 @@ async function startDaemonHoldingLock(
   // the native `startupParkFn` needs the OWNING agent's standing receiver, which exists only once
   // that agent is online. `filterAgentName` scopes the drain to one agent's sessions on the agent-
   // online re-run; with no filter it attempts all (the pre-IPC pass / injected-target test path).
+  // M12-P12 (review pass 2): the sender flush now has FOUR triggers (boot, agent start, the parked-
+  // drain hook, signaling reconnect), and two of them fire deterministically together on agent start
+  // — the drain hook runs inside ensureStandingReceiver, whose own .then() then calls this again
+  // while the first pass is still dialling the relay. The receiver twin (contentPark) already
+  // coalesces for exactly this reason; adding triggers to the sender half without the same guard was
+  // an asymmetry, not a decision. Re-run once at the end if a trigger arrived mid-flight, so a
+  // coalesced call never DROPS work — it defers it.
+  const flushInFlight = new Set<string>();
+  const flushRerunRequested = new Set<string>();
   async function flushAwaitingContent(filterAgentName?: string): Promise<void> {
+    const flushKey = filterAgentName ?? "*";
+    if (flushInFlight.has(flushKey)) {
+      flushRerunRequested.add(flushKey);
+      return;
+    }
+    flushInFlight.add(flushKey);
+    try {
+      await flushAwaitingContentInner(filterAgentName);
+    } finally {
+      flushInFlight.delete(flushKey);
+    }
+    if (flushRerunRequested.delete(flushKey)) {
+      await flushAwaitingContent(filterAgentName);
+    }
+  }
+
+  async function flushAwaitingContentInner(filterAgentName?: string): Promise<void> {
     // DOD-AGENT-ID-JOINKEY-1: the queue is keyed by the STABLE agent_id, but the caller (and the
     // human-readable log) speak the NAME. Resolve once here; log the name, filter by the id.
     const filterAgentId = filterAgentName !== undefined
@@ -1586,6 +1707,7 @@ async function startDaemonHoldingLock(
     logger,
     sessionNodeManager,
     agents,
+    isExplicitlyOffline: (agentName: string) => explicitlyOfflineAgents.has(agentName),
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -1797,6 +1919,8 @@ async function startDaemonHoldingLock(
       return { ok: true };
     }
     onlineAgents.add(name);
+    // Pressing start clears the deliberate-offline mark — that is what makes the switch reversible.
+    explicitlyOfflineAgents.delete(name);
     // CELLO-M7-CONN-001 (DOD-CONN-2, code-review HIGH): the "online" transition establishes THIS
     // agent's OWN directory signaling connection (the documented getAgentSignaling "online" trigger),
     // so the directory has a stream to push inbound session_assignment / seal_interrupted_request to.
@@ -1867,6 +1991,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     agents,
     onlineAgents,
+    explicitlyOfflineAgents,
     getNotificationDispatcher: () => notificationDispatcher,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     perConnectionState,
@@ -2808,6 +2933,9 @@ async function startDaemonHoldingLock(
   // cello_close_session (close-session-handler.ts). Fifteen dependencies — a long list, but a KNOWN
   // one, which is the whole difference from a closure over 73 shared locals.
   registerCloseSessionHandler({
+    // M12-P14: the pre-seal readiness gate drains the parked mailbox before judging, so a close
+    // does not refuse over content the relay is still holding for us.
+    recoverParkedContent: (agentName: string, trigger: string) => autoRecoverForAgent(agentName, trigger),
     handlers,
     logger,
     sessionNodeManager,
@@ -2881,6 +3009,27 @@ async function startDaemonHoldingLock(
   // CELLO-M7-MSG-001 (AC-004/AC-005): the send path records un-acked content here when
   // its TTF timer fires, so a crash before the relay park confirms is recoverable at the
   // next startup flush. Stored in the SAME retry_queue table (awaiting_ack = 1).
+  // M12-P12 verification surface. REFUSES unless the daemon was started with
+  // CELLO_FAULT_INJECTION=1 — the gate is here rather than at the call site so a normal daemon
+  // cannot be talked into dropping messages by anything that can reach the socket, and the refusal
+  // names why rather than silently no-opping.
+  handlers.set("debug_inject_park_fault", async (params) => {
+    if (process.env.CELLO_FAULT_INJECTION !== "1") {
+      return {
+        error: "fault_injection_disabled",
+        guidance: "Start the daemon with CELLO_FAULT_INJECTION=1 to enable. This is a verification surface for M12-P12 and is inert in a normal daemon.",
+      };
+    }
+    const count = typeof params?.count === "number" ? params.count : 1;
+    const cause = typeof params?.cause === "string" ? params.cause : undefined;
+    const armed = sessionNodeManager.injectParkFault(count, cause);
+    // The park fault alone reproduces nothing — the counterparty's session node accepts the frame
+    // and the park path is never entered. Arm the dial failure with it unless told otherwise.
+    const sendArmed = params?.withSendFault === false ? 0 : sessionNodeManager.injectSendFault(count);
+    logger.warn("content.park.fault.armed", { count: armed, sendArmed, cause: cause ?? "standing_receiver_creating" });
+    return { armed, sendArmed };
+  });
+
   handlers.set("enqueue_awaiting_content", async (params, connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
     const contentHashHex = params?.contentHash as string | undefined;

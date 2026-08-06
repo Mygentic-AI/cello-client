@@ -394,27 +394,65 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // DB-001 / dead-channel contract: never silently drop, never desync. Preserve
       // the content in the durable retry_queue so it is retried on reconnect, and
       // surface a named, diagnosable failure.
-      const nonce = randomUUID();
-      try {
-        retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
-      } catch (err: unknown) {
-        logger.error("session.content.queue.failed", {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
+      //
+      // M12-P13 (review MEDIUM-4): NOT on the durable path. `drainSession` — this nonce queue's
+      // only consumer — has no production caller, so every row it writes is permanent: unbounded
+      // growth plus a second copy of the message plaintext at rest. On a durable failure the
+      // awaiting-ACK queue already holds the content and actually drains, so writing here too
+      // stored the same plaintext twice and drained neither copy from this table.
+      if (!sendResult.durable) {
+        const nonce = randomUUID();
+        try {
+          retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);
+        } catch (err: unknown) {
+          logger.error("session.content.queue.failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+            correlationId,
+          });
+        }
       }
       logger.warn("session.content.send.failed", {
         sessionId,
         recipientPubkey,
         reason: sendResult.reason,
         errorMessage: sendResult.error,
+        durable: sendResult.durable,
+        cause: sendResult.cause,
         correlationId,
       });
+      // M12-P13: a DURABLY QUEUED message still owns the sequence the relay witnessed for it before
+      // direct delivery was ever attempted — the same reasoning that makes a parked message occupy
+      // its leaf position below. Leaving the hole here is what stalls the far side: `nextExpected`
+      // is this tree's size, so the counterparty's next message arrives at a sequence this tree can
+      // never reach and is held behind the gap forever (found live 2026-08-05, M12 Entry 89).
+      // A LOST message gets no leaf — that would commit a sequence no content will ever fill, and
+      // the two roots could then never seal.
+      if (sendResult.durable) {
+        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
+        sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
+        advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
+        logger.info("session.content.queued.committed", {
+          sessionId, sequenceNumber: queuedLeaf, contentHash: contentHashHex, correlationId,
+        });
+        return {
+          ok: false,
+          reason: sendResult.reason,
+          queued: true,
+          sequence_number: queuedLeaf,
+          guidance: sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.",
+        };
+      }
       return {
         ok: false,
         reason: sendResult.reason,
-        guidance: "The content could not be delivered over the session stream right now. It has been queued in the durable retry queue and will be retried when the counterparty reconnects. The session remains usable — check cello_status for the counterparty's status.",
+        // M12-P12 (review pass 2): sendContent knows whether the content is actually recoverable;
+        // this boundary used to overwrite that with one sentence promising a retry for EVERY
+        // failure — including a persist that threw, where the message is simply gone, and a session
+        // with no relay, where the direct nonce queue it names has no production drain. Telling an
+        // operator "it will be retried" about a lost message is the same lie that let the original
+        // defect sit unnoticed; the caller's own guidance wins whenever it has one.
+        guidance: sendResult.guidance ?? "The content could not be delivered over the session stream right now, and no relay is configured for this session — it is NOT queued for automatic retry. Send it again once the counterparty is reachable; check cello_status for their status.",
       };
     }
 

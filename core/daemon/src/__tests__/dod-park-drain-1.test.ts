@@ -247,6 +247,60 @@ describe("B: the signaling-reconnect drain chains ensure→drain instead of raci
     expect(order).toEqual(["ensure:start:alice", "ensure:done:alice", "drain:alice"]);
   });
 
+  it("M12-P12 (review F1): the reconnect drains the SENDER half too, after the ensure — a refused park is stranded by the same churn", async () => {
+    // The receiver pull (drainParked) recovers what OTHERS parked for this agent. It does nothing
+    // for what THIS agent failed to deposit — and the live run of 2026-08-05 lost exactly that: a
+    // refused park deposit whose durable row had no running-daemon trigger, so it waited for a
+    // restart while DOD-PARK-DRAIN-1 promises "no restart".
+    const { logger } = makeLogger();
+    const order: string[] = [];
+    let releaseEnsure!: () => void;
+    const ensureGate = new Promise<void>((r) => { releaseEnsure = r; });
+
+    const onConnected = createReconnectDrain({
+      logger,
+      isAgentOnline: () => true,
+      ensureStandingReceiver: async (agentName) => {
+        order.push(`ensure:start:${agentName}`);
+        await ensureGate;
+        order.push(`ensure:done:${agentName}`);
+      },
+      drainParked: async (agentName) => { order.push(`drain:${agentName}`); },
+      flushSender: async (agentName) => { order.push(`flush:${agentName}`); },
+    });
+
+    onConnected("alice");
+    await wait(20);
+    // The sender flush needs the receiver the ensure rebuilds, so it must NOT jump the gate.
+    expect(order, "the sender flush must not start while the ensure is still in flight").toEqual(["ensure:start:alice"]);
+
+    releaseEnsure();
+    await waitUntil(() => order.includes("flush:alice") && order.includes("drain:alice"), 2_000);
+    expect(order.slice(0, 2)).toEqual(["ensure:start:alice", "ensure:done:alice"]);
+    expect(order).toContain("flush:alice");
+    expect(order).toContain("drain:alice");
+  });
+
+  it("M12-P12 (review F1): a sender flush that rejects costs the flush, never the receiver pull", async () => {
+    const { logger, events } = makeLogger();
+    let drained = false;
+    const onConnected = createReconnectDrain({
+      logger,
+      isAgentOnline: () => true,
+      ensureStandingReceiver: async () => {},
+      drainParked: async () => { drained = true; },
+      flushSender: async () => { throw { reason: "db_locked", message: "SQLITE_LOCKED" }; },
+    });
+
+    onConnected("alice");
+    await waitUntil(() => drained, 2_000);
+    expect(drained, "the inbound pull must still run when the outbound re-park fails").toBe(true);
+    const failed = events.find((e) => e.event === "content.park.flush.failed");
+    expect(failed, "the flush failure names itself rather than vanishing").toBeDefined();
+    // Structured plain-object rejections must not render as "[object Object]".
+    expect(String(failed!.context.error)).toContain("SQLITE_LOCKED");
+  });
+
   it("B2: an ensure that rejects names its cause AND still drains — the pull runs from any receiver", async () => {
     const { logger, events } = makeLogger();
     let drained = false;
