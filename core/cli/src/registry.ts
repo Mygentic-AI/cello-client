@@ -46,6 +46,7 @@ import {
   docRead,
   docDiff,
   docWrite,
+  docPublish,
   docClose,
   docKill,
   attestationConsentList,
@@ -1028,6 +1029,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  cello doc read <document-id>                      — the current text\n" +
       "  cello doc diff <document-id>                      — what changed since you last read it\n" +
       "  cello doc write <document-id> <text…>             — replace the text and publish the change\n" +
+      "  cello doc publish <document-id>                   — publish what is in the FILE right now\n" +
       "  cello doc close <document-id>                     — you are done; it settles when they say so too\n" +
       "  cello doc kill <document-id>                      — end it now, one-sided\n" +
       "\n" +
@@ -1071,6 +1073,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       }
       if (sub === "read" && target) return docRead(ctx.celloDir, target, o);
       if (sub === "diff" && target) return docDiff(ctx.celloDir, target, o);
+      if (sub === "publish" && target) return docPublish(ctx.celloDir, target, o);
       if (sub === "close" && target) return docClose(ctx.celloDir, target, o);
       if (sub === "kill" && target) return docKill(ctx.celloDir, target, o);
       if (sub === "write" && target) {

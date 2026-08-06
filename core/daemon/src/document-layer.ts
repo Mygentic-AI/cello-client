@@ -34,6 +34,7 @@ import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
 import { DocumentNotifications } from "./document-notify.js";
 import { DocumentHandshake } from "./document-handshake.js";
+import { DocumentWritePath } from "./document-write-path.js";
 import {
   decodeDocumentRejection,
   buildDocumentRejectionTbs,
@@ -100,6 +101,11 @@ export interface DocumentLayerDeps {
    * is all-or-nothing: an inbound path that cannot answer leaves every sender retrying until their
    * document stalls.
    */
+  /**
+   * Where documents are materialized as files. Absent disables the file surface entirely — the
+   * content verbs still work, and nothing silently half-writes.
+   */
+  workspaceRoot?: string;
   sendFrame(
     ownerAgentId: string,
     peerAgentId: string,
@@ -109,6 +115,8 @@ export interface DocumentLayerDeps {
 
 export interface DocumentLayer {
   store: DocumentStore;
+  /** The file projection, or null when no workspace root was configured. */
+  writePath: DocumentWritePath | null;
   handshake: DocumentHandshake;
   engine: DocumentEngine;
   live: LiveDocuments;
@@ -163,6 +171,11 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   });
   const lifecycle = new DocumentLifecycle(store, logger, { notifyPeer: deps.notifyPeer }, deps.rollback);
   const notifications = new DocumentNotifications(store, logger);
+  // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool
+  // surface had: a complete unit with no production caller reads exactly like a working feature.
+  // Without it §4.1's whole premise is missing, because a human collaborating on a document edits a
+  // file in their editor, and an agent with file tools reaches for them before any MCP verb.
+  const writePath = deps.workspaceRoot ? new DocumentWritePath(engine, deps.workspaceRoot, logger) : null;
 
   /**
    * One verifier for both paths. Ed25519 (RFC 8032) over the TBS the caller built.
@@ -215,6 +228,18 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
+    rewriteFile: async (ownerAgentId, inResponseTo) => {
+      if (!writePath) return;
+      const env = decodeDocumentUpdateEnvelope(inResponseTo);
+      const document = store.getDocument(ownerAgentId, env.document_id);
+      if (!document) return;
+      await writePath.materialize(
+        ownerAgentId,
+        env.document_id,
+        document.documentType,
+        live.get(ownerAgentId, env.document_id),
+      );
+    },
     sendFrameToPeer: async (ownerAgentId, inResponseTo, bytes) => {
       // Addressed to whoever AUTHORED the envelope being answered, taken from the envelope itself
       // rather than from the document row: the row's peer and the envelope's sender are the same
@@ -329,6 +354,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
 
   return {
     store,
+    writePath,
     handshake,
     engine,
     live,

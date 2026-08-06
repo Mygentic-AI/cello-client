@@ -640,6 +640,14 @@ server.tool("cello_doc_write", "Replace a shared document's text and publish the
   return jsonText(result);
 });
 
+server.tool("cello_doc_publish", "Publish whatever is in the document's FILE right now. Every shared document is also a real file on disk — cello_doc_propose and cello_doc_accept return its path — so you or the operator can edit it with ordinary file tools and then publish. Use this instead of cello_doc_write when the change was made in the file. The daemon diffs the file against what it last wrote there, so only your actual edits are published; it refuses rather than guessing if the file has fallen out of step.", {
+  document_id: z.string().describe("Document ID from cello_doc_list"),
+  agent: z.string().optional().describe("Agent publishing (defaults to the current agent)"),
+}, async ({ document_id, agent }) => {
+  const result = await proxy.call("cello_doc_publish", agent !== undefined ? { document_id, agent } : { document_id });
+  return jsonText(result);
+});
+
 server.tool("cello_doc_close", "Say you are done with a shared document. BILATERAL — it settles only when the counterparty says so too, so this does not end their editing and does not end yours until they answer. Use cello_doc_kill if you need it over now.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   agent: z.string().optional().describe("Agent closing (defaults to the current agent)"),

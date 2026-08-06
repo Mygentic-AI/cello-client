@@ -91,6 +91,8 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       ackInbound,
       logger,
       sendAck: async () => {},
+      rewriteFile: async () => {},
+      sendFrameToPeer: async () => {},
       ownerKeyFor: (agentName) => (agentName === AGENT ? OWNER : null),
       recordProposal: (ownerAgentId) => {
         recorded.push("proposal");

@@ -275,6 +275,7 @@ cello_doc_list()                             — your documents and whether your
 cello_doc_read({ document_id })              — the current text, including what they wrote
 cello_doc_diff({ document_id })              — what changed since YOU last read it
 cello_doc_write({ document_id, content })    — replace the text and publish the change
+cello_doc_publish({ document_id })           — publish what is in the document's FILE right now
 cello_doc_close({ document_id })             — you are done; settles when they say so too
 cello_doc_kill({ document_id })              — end it now, one-sided
 ```

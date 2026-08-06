@@ -303,6 +303,7 @@ export const IPC_METHODS = {
   "doc-read": "cello_doc_read",
   "doc-diff": "cello_doc_diff",
   "doc-write": "cello_doc_write",
+  "doc-publish": "cello_doc_publish",
   "doc-close": "cello_doc_close",
   "doc-kill": "cello_doc_kill",
   "attestation-consent-list": "cello_attestation_consent_list",
@@ -863,4 +864,9 @@ export function docClose(celloDir: string, documentId: string, opts: ParityOptio
 /** `cello doc kill <document-id>` → cello_doc_kill. One-sided and immediate; the peer is told best-effort. */
 export function docKill(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["doc-kill"], { document_id: documentId }, opts);
+}
+
+/** `cello doc publish <document-id>` → cello_doc_publish. Publishes what is in the FILE right now. */
+export function docPublish(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-publish"], { document_id: documentId }, opts);
 }

@@ -23,6 +23,7 @@ cello_doc_list()                             — yours, and where each one stand
 cello_doc_read({ document_id })              — the current text
 cello_doc_diff({ document_id })              — what changed since you last read
 cello_doc_write({ document_id, content })    — replace the text, publish the change
+cello_doc_publish({ document_id })           — publish what is in the document's FILE right now
 cello_doc_close({ document_id })             — you are done; settles when they say so too
 cello_doc_kill({ document_id })              — end it now, one-sided
 ```
@@ -79,6 +80,27 @@ A patch with a stale offset in a CRDT is not a rejected patch; it is a silent co
 sides then converge on and neither can see.
 
 The rhythm is: **read → change what you need in the full text → write it all back.**
+
+## Every document is also a real file
+
+`cello_doc_propose` and `cello_doc_accept` return a `filePath`. The document is materialized there
+and rewritten whenever the counterparty's changes are admitted, so the file is always the current
+state — you can read it, and the operator can open it in their editor.
+
+That gives you two ways to change a document, and they are not interchangeable:
+
+- **You edited the FILE** (or the operator did) → `cello_doc_publish({ document_id })`. The daemon
+  diffs the file against what it last wrote there, so only the actual edits are published.
+- **You have the new text in hand** → `cello_doc_write({ document_id, content })` with the complete
+  text.
+
+Do not mix them for one change. If you write the file and then also call `cello_doc_write`, the
+second call's text is what lands and the file edit is diffed away.
+
+`cello_doc_publish` can refuse with `document_file_stale`. That is not a bug to retry around: it
+means the file no longer matches what the daemon last wrote there AND the document has moved on —
+usually a rewrite that did not complete. Publishing anyway would read the counterparty's admitted
+content as a deliberate deletion by you. Re-read the document and redo the edit.
 
 ## Publish like a commit, not like a keystroke
 

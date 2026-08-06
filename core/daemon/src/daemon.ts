@@ -3215,6 +3215,11 @@ async function startDaemonHoldingLock(
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: documentOwnerKeyFor,
+    // Documents materialize as files under the operator's CELLO_DIR, alongside the database that
+    // is their source of truth. Not the current working directory: a daemon serves many agents and
+    // outlives any shell, so a relative root would scatter one operator's documents across
+    // wherever they happened to launch it from.
+    workspaceRoot: join(config.celloDir, "documents"),
     // The ack's road to the peer — the same open-or-reuse-then-seal path every other document frame
     // takes. Resolved from the owner KEY back to the agent name, because the transport is per agent.
     sendFrame: async (ownerAgentId, peerAgentId, bytes) => {

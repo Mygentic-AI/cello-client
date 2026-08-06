@@ -106,6 +106,36 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   const isRefusal = (r: Resolved | { ok: false }): r is { ok: false; reason: string; guidance: string } =>
     (r as { ok?: false }).ok === false;
 
+  /**
+   * Write the document out as a file, or return null when no workspace is configured.
+   *
+   * Failures are LOGGED AND SWALLOWED, deliberately and only here: the file is a projection of the
+   * document, not the document. A disk problem must not fail a proposal or a consent decision that
+   * is otherwise complete and already recorded — the operator would be left with a peer who thinks
+   * they agreed and a local state that says they did not.
+   */
+  async function materialize(
+    ownerAgentId: string,
+    documentId: string,
+    documentType: string,
+  ): Promise<string | null> {
+    if (!layer.writePath) return null;
+    try {
+      return await layer.writePath.materialize(
+        ownerAgentId,
+        documentId,
+        documentType,
+        layer.live.get(ownerAgentId, documentId),
+      );
+    } catch (err: unknown) {
+      logger.warn("document.file.materialize_failed", {
+        documentId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
   // ─── propose ──────────────────────────────────────────────────────────────────────────────
 
   handlers.set("cello_doc_propose", async (params, connectionId) => {
@@ -232,6 +262,10 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // are on the wire at all.
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), startingContent);
     }
+    // THE FILE EXISTS FROM THE START. Materializing lazily would mean the first `cello_doc_publish`
+    // has no recorded projection to diff against and refuses — correct, and a bad first experience
+    // for something the operator never had to ask for.
+    const proposeFilePath = await materialize(who.ownerAgentId, documentId, documentType);
 
     const correlationId = randomUUID();
     const sent = await deps.transportFor(who.agentName).sendBytes({
@@ -257,7 +291,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `re-send this same offer — do not propose a new one, that would make a second document.`,
       };
     }
-    return { ok: true, documentId, proposalSent: true, peerAgentId };
+    return { ok: true, documentId, proposalSent: true, peerAgentId, filePath: proposeFilePath };
   });
 
   /**
@@ -344,9 +378,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (outcome.envelope.starting_content) {
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), outcome.envelope.starting_content);
     }
+    const acceptFilePath = await materialize(who.ownerAgentId, documentId, outcome.envelope.document_type);
     logger.info("document.accepted", { documentId, proposerAgentId: outcome.envelope.proposer_agent_id });
     const told = await tellProposer(who, documentId, outcome.envelope.proposer_agent_id, true, undefined);
-    return { ok: true, documentId, peerAgentId: outcome.envelope.proposer_agent_id, proposerNotified: told };
+    return {
+      ok: true,
+      documentId,
+      peerAgentId: outcome.envelope.proposer_agent_id,
+      proposerNotified: told,
+      filePath: acceptFilePath,
+    };
   });
 
   handlers.set("cello_doc_refuse", async (params, connectionId) => {
@@ -639,7 +680,64 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     return { ok: true, documentId, peerNotified: outcome.peerNotified, note: outcome.note };
   });
 
+  handlers.set("cello_doc_publish", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    if (!layer.writePath) {
+      return {
+        ok: false,
+        reason: "document_files_unavailable",
+        guidance: "This daemon has no document workspace configured, so there is no file to publish from.",
+      };
+    }
+    const document = layer.store.getDocument(who.ownerAgentId, documentId);
+    if (!document) {
+      return {
+        ok: false,
+        reason: "document_unknown",
+        guidance: `No document ${documentId.slice(0, 16)}… for this agent. See cello_doc_list.`,
+      };
+    }
+
+    const doc = layer.live.get(who.ownerAgentId, documentId);
+    let update: Uint8Array | null;
+    try {
+      // Diffs the FILE against the last recorded projection and folds the difference in as local
+      // operations. Refuses loudly on a stale baseline rather than diffing against something the
+      // document has moved past — which would read a peer's admitted content as a deliberate
+      // deletion and publish it as one.
+      update = await layer.writePath.publish(who.ownerAgentId, documentId, document.documentType, doc);
+    } catch (err: unknown) {
+      const reason = err instanceof Error && "reason" in err ? String((err as { reason: unknown }).reason) : "document_file_error";
+      return {
+        ok: false,
+        reason,
+        guidance: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (update === null) {
+      // A publish is an INTENT. Nothing changed on disk, so there is nothing to say, and saying it
+      // anyway costs a leaf and a round trip.
+      return { ok: true, documentId, changed: false, published: false };
+    }
+
+    const result = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
+    if (!result.ok) {
+      // The file's edits are already FOLDED INTO the document — same shape as cello_doc_write's
+      // applied-but-unpublished case, and reported the same way, because an operator told this
+      // failed would edit again and the second publish would diff against a projection that already
+      // contains their change.
+      return { ok: true, documentId, changed: true, published: false, reason: result.reason, guidance: result.detail };
+    }
+    layer.notifications.markWritten(who.ownerAgentId, documentId, doc.getText("content").toString());
+    return { ok: true, documentId, changed: true, published: true, envelopeHash: result.envelopeHash };
+  });
+
   logger.debug("document.handlers.registered", {
-    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write", "close", "kill"],
+    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write", "publish", "close", "kill"],
   });
 }

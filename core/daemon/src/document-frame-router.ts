@@ -139,6 +139,14 @@ export interface DocumentFrameRouterDeps {
    * REQUIRED, not optional. Without it the sender has no answer and redelivers until the document
    * stalls; an optional callback would make that outcome a configuration rather than a bug.
    */
+  /**
+   * Re-project the document onto disk after admitting a peer's update.
+   *
+   * Required rather than optional: a file surface that only ever writes the local operator's edits
+   * out is worse than none, because the stale file reads as the document and gets published back
+   * over the peer's work. A daemon with no workspace configured implements this as a no-op.
+   */
+  rewriteFile(ownerAgentId: string, inResponseTo: Uint8Array): Promise<void>;
   /** Put an already-signed frame on the wire to whoever authored `wire` — the rejection, today. */
   sendFrameToPeer(ownerAgentId: string, inResponseTo: Uint8Array, bytes: Uint8Array): Promise<void>;
   sendAck(
@@ -204,7 +212,8 @@ export class DocumentFrameRouter {
     correlationId: string,
   ): FrameClassification {
     const kind = classify(content);
-    if (kind === null) {
+    if (kind === "unshaped") return { consumed: false };
+    if (kind === "undecodable") {
       // ANOMALY, worth a line. A frame that passed the header guard and then decoded as NOTHING is
       // not an ordinary conversation message — the guard's whole argument is that operator text
       // cannot begin with a CBOR map header (see the UTF-8 reasoning above). So this is either a
@@ -215,13 +224,11 @@ export class DocumentFrameRouter {
       // hash cross-check byte for byte, and never reached the document layer — every log on the
       // receiving side said "an ordinary message arrived", because that is what the fall-through
       // makes it.
-      if (content.length <= MAX_DOCUMENT_FRAME_BYTES && couldBeDocumentFrame(content)) {
-        this.#d.logger.warn("document.frame.undecodable", {
-          bytes: content.length,
-          header: content[0],
-          correlationId,
-        });
-      }
+      this.#d.logger.warn("document.frame.undecodable", {
+        bytes: content.length,
+        header: content[0],
+        correlationId,
+      });
       return { consumed: false };
     }
     // Resolved AFTER classification and BEFORE handling: a frame that is not document traffic never
@@ -286,7 +293,9 @@ export class DocumentFrameRouter {
     correlationId: string,
   ): Promise<FrameRouting> {
     const kind = classify(content);
-    if (kind === null) return { consumed: false };
+    // Both non-kinds mean "not ours" to this async entry point. `routeSync` is the path that
+    // distinguishes them, because it is the one that decides what the session does with the frame.
+    if (kind === "unshaped" || kind === "undecodable") return { consumed: false };
     return this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind);
   }
 
@@ -300,6 +309,22 @@ export class DocumentFrameRouter {
     try {
       if (kind === "update") {
         const res = await this.#d.inbound.receive(ownerAgentId, content, nowMs, correlationId);
+        if (res.ok && res.admitted) {
+          // REWRITE THE FILE. The document has moved; the operator's editor has not been told.
+          // Without this the file surface is write-only — an operator publishes their edits and
+          // never sees the peer's, which is worse than no file surface at all, because the stale
+          // file then looks like the document and gets published back over their work.
+          //
+          // Not awaited, and not allowed to fail the admission: the content is already in the
+          // document, which is the source of truth. A failed rewrite is a stale projection, and
+          // `publish` refuses loudly on a stale baseline rather than diffing against it.
+          void this.#d.rewriteFile(ownerAgentId, content).catch((err: unknown) => {
+            this.#d.logger.warn("document.file.rewrite_threw", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
         if (res.ok) {
           // ANSWER THE SENDER. Nothing did, and `encodeDocumentAck` had no production caller at all
           // — the frame type, the preimage and the receiving half all existed and no code path ever
@@ -447,11 +472,23 @@ function couldBeDocumentFrame(b: Uint8Array): boolean {
  * wins; both decoders check a `type` discriminator before anything else, so neither can claim the
  * other's frame. A conversation message is arbitrary operator text and will not decode as either.
  */
-function classify(content: Uint8Array): DocumentFrameKind | null {
+/**
+ * `"unshaped"` — not document traffic at all, and cheap to know: too long, or its first byte is not
+ * a CBOR map header. `"undecodable"` — it LOOKED like one and decoded as nothing, which is an
+ * anomaly worth reporting.
+ *
+ * Two outcomes rather than one `null` so the caller can tell them apart WITHOUT re-running the
+ * guard. It did re-run it, and the cost landed on exactly the wrong path: the hostile-input budget
+ * is the one this router's guard exists to protect, and doubling its work took a measured
+ * pathological input from comfortably inside the budget to over it.
+ */
+type Unclassified = "unshaped" | "undecodable";
+
+function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
   // LENGTH FIRST. See the header: this is what bounds the nesting depth, and it is checked before
   // the frame is looked at in any other way.
-  if (content.length > MAX_DOCUMENT_FRAME_BYTES) return null;
-  if (!couldBeDocumentFrame(content)) return null;
+  if (content.length > MAX_DOCUMENT_FRAME_BYTES) return "unshaped";
+  if (!couldBeDocumentFrame(content)) return "unshaped";
   try {
     decodeDocumentUpdateEnvelope(content);
     return "update";
@@ -488,7 +525,7 @@ function classify(content: Uint8Array): DocumentFrameKind | null {
     decodeDocumentControl(content);
     return "control";
   } catch {
-    // Not document traffic at all.
+    // Shaped like a document frame and decoded as none of them.
   }
-  return null;
+  return "undecodable";
 }
