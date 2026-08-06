@@ -724,10 +724,31 @@ export class DocumentStore {
   ): Set<string> {
     const rows = this.#db
       .prepare(
+        // THE QUARANTINE COUNTS AS KNOWN, and it has to.
+        //
+        // A refused envelope is deliberately never written to `document_envelopes` — that is the
+        // point of refusing it. But the sender's chain does not rewind: their next envelope links
+        // to the one we refused. Without the second half of this union that link resolves to
+        // nothing and the supersession is rejected as `document_chain_broken` — so ONE gate refusal
+        // permanently broke the document, and the supersede-then-converge protocol §3.2 describes
+        // could never run at all. Measured live.
+        //
+        // The bridge was already designed for exactly this: the quarantine records the refused
+        // envelope's own author and prev-hash so a later link can span it. It had only ever been
+        // applied to `verifyChainLinkage`, the LOCAL replay check — never to inbound admission,
+        // which is the path a peer's supersession actually arrives on.
+        //
+        // Scoped by the refused envelope's own sender, so one peer's quarantine can never make
+        // another peer's broken chain resolve.
         `SELECT envelope_hash FROM document_envelopes
-          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?`,
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?
+         UNION ALL
+         SELECT rejected_envelope_hash AS envelope_hash FROM document_quarantine
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_sender_agent_id = ?`,
       )
-      .all(ownerAgentId, documentId, senderAgentId) as Array<{ envelope_hash: string }>;
+      .all(ownerAgentId, documentId, senderAgentId, ownerAgentId, documentId, senderAgentId) as Array<{
+        envelope_hash: string;
+      }>;
     return new Set(rows.map((r) => r.envelope_hash));
   }
 
