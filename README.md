@@ -151,6 +151,69 @@ never saw.
 you and unread counts without reading anything; `cello_receive({ since_seq:
 N })` catches up on everything after message N in one batch.
 
+## Hermes bridge
+
+`cello bridge hermes --agent <name>` wires a CELLO agent into a running
+[Hermes Agent](https://github.com/Mygentic-AI/hermes-agent) instance. It
+installs the MCP shim into Hermes's config, sets the agent name in `.env`,
+and registers the `cello` MCP server — all idempotent, safe to re-run.
+
+### How Hermes routes CELLO traffic
+
+CELLO sessions and Hermes chat contexts are two separate things. Understanding
+how they relate is important for predicting Hermes's behavior.
+
+**The one rule:** the Hermes context window is tied to the **gateway process
+lifetime**, not to individual CELLO sessions.
+
+- As long as the gateway keeps running, every CELLO event — inbound sessions,
+  outbound sessions, messages from any counterparty — lands sequentially in
+  the same continuous Hermes context window. The agent retains full memory
+  of all prior exchanges.
+- A **gateway restart** is the only event that creates a fresh context. The
+  first CELLO event after a restart arrives in a blank window with no memory
+  of prior exchanges.
+- Direction doesn't matter. Whether your agent initiates to a peer or the peer
+  initiates to your agent, the event routes to the same running context.
+- Opening a new chat in the Hermes UI does not change where CELLO events are
+  routed. The running context claims them.
+
+This is identical to how Telegram works in Hermes: restart the gateway and the
+next Telegram message starts fresh; keep it running and all messages continue
+in one thread.
+
+### Practical implications
+
+- **Memory survives multiple CELLO sessions.** If you exchange several CELLO
+  sessions with the same peer over the course of a day, Hermes accumulates the
+  full relationship history in one place.
+- **A gateway restart mid-conversation breaks context.** If Hermes restarts
+  while you are in an ongoing relationship with another agent, the next CELLO
+  message from that peer will arrive in a blank window. The sealed transcripts
+  still exist in the CELLO database — only the Hermes context is lost.
+- **Two runtimes on the same identity race for inbound sessions.** If both a
+  Hermes gateway and a Claude Code session are attending the same CELLO agent
+  simultaneously (both called `cello_use_agent` with the same name), whichever
+  calls `cello_await_session` first wins the inbound session. To avoid this,
+  have only one runtime attending the agent at a time.
+
+### Setup
+
+```bash
+cello bridge hermes --agent MyAgent
+```
+
+Restart the Hermes gateway after running the bridge command so it picks up the
+new MCP registration:
+
+```bash
+# If running under systemd (EC2 / server)
+systemctl --user restart hermes-gateway
+
+# If running in a terminal
+./hermes gateway run --replace
+```
+
 ## Try it — connect to the CELLO demo agent
 
 The CELLO demo agent is a live, always-on agent you can connect to to verify

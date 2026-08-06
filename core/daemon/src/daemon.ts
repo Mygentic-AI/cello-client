@@ -27,7 +27,7 @@
  */
 
 import { mkdir } from "node:fs/promises";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type {
   DaemonConfig,
@@ -40,7 +40,7 @@ import type {
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
-import { createIpcServer, type IpcServer, type IpcHandler } from "./ipc-server.js";
+import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -86,6 +86,14 @@ import { registerContactHandlers } from "./contact-handlers.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
+import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
+import { registerDocumentHandlers } from "./document-handlers.js";
+import { createDocumentControlNotifier } from "./document-control-notifier.js";
+import { wireContentHash } from "./wire-content-hash.js";
+import { DocumentPublish } from "./document-publish.js";
+import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
+import { DocumentDelivery } from "./document-delivery.js";
+import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
@@ -131,6 +139,16 @@ export interface DaemonHandle {
    * DOD-REGISTRY-1: the in-memory type registry — classify signal types.
    */
   getTypeRegistry(): TypeRegistry;
+  /**
+   * DOD-DOC-TOOLS-1 test hook: the LIVE handler map.
+   *
+   * Dispatch resolves from this map when a request arrives, and the only way to prove that rather
+   * than assume it is to register a handler after `start()` has resolved and call it. The property
+   * is load-bearing — a snapshot copy here once made every `cello_doc_*` verb unreachable while the
+   * whole suite stayed green. Not part of the production API surface; nothing in production mutates
+   * it after boot.
+   */
+  getHandlers(): Map<string, IpcHandler>;
 }
 
 // Minimal no-op KeyProvider stub for session nodes.
@@ -1020,7 +1038,7 @@ async function startDaemonHoldingLock(
           // is anchored on (a counterparty daemon's end-anchored detector must see this close).
           const rejectText = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
           const rejectBytes = new TextEncoder().encode(rejectText);
-          const rejectHash = createHash("sha256").update(new Uint8Array([0x00])).update(rejectBytes).digest();
+          const rejectHash = wireContentHash(rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
           const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
           // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
@@ -1191,7 +1209,7 @@ async function startDaemonHoldingLock(
       const contentBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
         ? new Uint8Array(awayVerdict.content)
         : draftBytes;
-      const contentHash = createHash("sha256").update(new Uint8Array([0x00])).update(contentBytes).digest();
+      const contentHash = wireContentHash(contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
@@ -1334,7 +1352,7 @@ async function startDaemonHoldingLock(
 
   // The OUTBOUND session path (outbound-sessions.ts): discovery, the session request, and cross-node
   // setup via a transient VISITING connection to the counterparty's home node.
-  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator } = createOutboundSessions({
+  const { openVisitingConnection, crossNodeBrokerBySession, resolvedSessionNegotiator, runDiscoveryLookup } = createOutboundSessions({
     logger,
     sessionNodeManager,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
@@ -2900,7 +2918,7 @@ async function startDaemonHoldingLock(
 
   // cello_initiate_session (initiate-session-handler.ts). The relay witness is BEST-EFFORT: a
   // session with no relay still runs on the direct content path. Degraded, never blocked.
-  registerInitiateSessionHandler({
+  const { openSessionFor } = registerInitiateSessionHandler({
     handlers,
     logger,
     sessionNodeManager,
@@ -3254,17 +3272,31 @@ async function startDaemonHoldingLock(
   //
   // Wrapping the handler map is the ONE choke point that has both the response and the connection's
   // clientType. Doing it per-handler would mean 60+ call sites, and the 61st would forget.
-  const renderedHandlers = new Map<string, IpcHandler>();
-  for (const [method, handler] of handlers) {
-    renderedHandlers.set(method, async (params, connectionId) => {
-      const result = await handler(params, connectionId);
-      // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and the
-      // CLI verb is the safe answer — it is at least a real command an operator can run, whereas an
-      // MCP tool name is useless in a terminal.
-      const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
-      return renderForSurface(result, surface);
-    });
-  }
+  //
+  // RESOLVED AT DISPATCH, not copied at construction. This was a `for…of` that snapshotted
+  // `handlers` into a second map, which made the ORDER of registration load-bearing in a file
+  // 3,500 lines long: anything registered after this line was written into a map nothing
+  // dispatched from. The document surface landed 245 lines below it and every `cello_doc_*` verb
+  // answered `method_not_found` — whose guidance blames version skew between the shim and the
+  // daemon, so an operator would re-pin, reinstall and restart, and find both sides matching.
+  //
+  // A comment saying "register above this line" would have been one more rule to remember. Late
+  // binding makes the ordering unrepresentable instead: the map below reads `handlers` when a
+  // request arrives, so a handler registered at any point before the first request is dispatchable.
+  const renderedHandlers: HandlerLookup = {
+    get(method: string): IpcHandler | undefined {
+      const handler = handlers.get(method);
+      if (!handler) return undefined;
+      return async (params, connectionId) => {
+        const result = await handler(params, connectionId);
+        // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
+        // the CLI verb is the safe answer — it is at least a real command an operator can run,
+        // whereas an MCP tool name is useless in a terminal.
+        const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
+        return renderForSurface(result, surface);
+      };
+    },
+  };
 
   // Create and start IPC server
   const ipcServer: IpcServer = createIpcServer(
@@ -3307,6 +3339,353 @@ async function startDaemonHoldingLock(
     // M8C-TGDOOR-1: message-waiting — coalesced (ring-once-until-read) inside sendTelegramDoorbell.
     void sendTelegramDoorbell(agentName, sessionId, "message_waiting", "New message waiting");
   });
+
+  // M14 / DOD-DOC-INBOUND-2: the document layer, wired to the session content path.
+  //
+  // Built as ONE thing (see `document-layer.ts`): every half-wiring is a distinct silent failure —
+  // an inbound path with no ack producer leaves the peer retrying until their document stalls, a
+  // delivery worker with no inbound counterpart publishes envelopes nobody can answer.
+  //
+  // It shares the daemon's SQLCipher handle rather than opening its own. One encrypted database,
+  // one key, one file to back up — and a second opener is a second thing that has to agree about
+  // the key, which is how a store ends up plaintext.
+  // THE owner key. One function, used by the inbound router and the delivery sweep alike, because
+  // the two halves scoping differently is a silent-empty-query bug rather than a visible one.
+  //
+  // Reads `loadedAgents`, which is the live registry — `cello_create_agent` pushes into it at
+  // runtime — rather than the boot-time snapshot, so an agent registered after startup resolves
+  // without a restart. Lower-cased because the store compares owner keys as strings and a peer's
+  // id arrives off the wire in whatever case they sent.
+  const documentOwnerKeyFor = (agentName: string): string | null =>
+    loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null;
+
+  const documentLayer = createDocumentLayer({
+    db: sessionNodeManager.getDb(),
+    logger,
+    // M14-D5: a remote agent's id IS its K_local pubkey hex, so this needs no lookup — and a lookup
+    // on the critical path of every signature check is precisely what it must not have.
+    publicKeyFor: agentPublicKeyFromId,
+    ownerKeyFor: documentOwnerKeyFor,
+    // Documents materialize as files under the operator's CELLO_DIR, alongside the database that
+    // is their source of truth. Not the current working directory: a daemon serves many agents and
+    // outlives any shell, so a relative root would scatter one operator's documents across
+    // wherever they happened to launch it from.
+    workspaceRoot: join(config.celloDir, "documents"),
+    // The ack's road to the peer — the same open-or-reuse-then-seal path every other document frame
+    // takes. Resolved from the owner KEY back to the agent name, because the transport is per agent.
+    sendFrame: async (ownerAgentId, peerAgentId, bytes) => {
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      if (!agentName) return { ok: false, reason: "document_ack_no_agent" };
+      const sent = await documentTransportFor(agentName).sendBytes({
+        peerAgentId,
+        documentId: "ack",
+        bytes,
+        correlationId: randomUUID(),
+      });
+      return sent.ok ? { ok: true } : { ok: false, reason: sent.reason };
+    },
+    // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
+    // how the surface tests passed while the feature did nothing: the test wired this seam to
+    // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever
+    // the near side did.
+    notifyPeer: createDocumentControlNotifier({
+      get store() {
+        // Lazily, because `documentLayer` is what is being constructed. The notifier is only ever
+        // called from lifecycle, long after construction returns.
+        return documentLayer.store;
+      },
+      owners: () =>
+        loadedAgents
+          .filter((a) => a.pubkey)
+          .map((a) => ({ agentName: a.name, ownerAgentId: a.pubkey!.toLowerCase() })),
+      sign: async (agentName, tbs) => {
+        const provider = keyProviders.get(agentName);
+        if (!provider) throw new Error(`document_control_unsigned: no key provider for ${agentName}`);
+        return provider.sign(tbs);
+      },
+      send: (agentName, input) => documentTransportFor(agentName).sendBytes(input),
+      now: () => Date.now(),
+    }),
+    rollback: () => ({
+      // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting
+      // success having reverted nothing tells an operator their update was retracted while their
+      // file still contains it.
+      ok: false,
+      reason: "document_rollback_not_wired",
+    }),
+    sign: async (ownerAgentId, tbs) => {
+      // Signs as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
+      //
+      // `ownerAgentId` here is the OWNER KEY — pubkey hex — because that is what the layer is
+      // scoped by, and `keyProviders` is keyed by agent NAME. This did `keyProviders.get(ownerAgentId)`
+      // and the comment above it asserted the two were the same thing. They are not: the lookup
+      // missed on every call, so every auto-rejection threw `document_rejection_unsigned` and NO
+      // rejection was ever signed or sent. A peer whose update we refused was never told why —
+      // their sender retried into a gate that would refuse it every time, until the document
+      // stalled for a reason neither operator could see.
+      //
+      // Invisible to every test: the unit and e2e fixtures alike wire `sign: (_o, tbs) => keys.sign(tbs)`,
+      // discarding the agent argument, so nothing could disagree about which key was resolved.
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      const provider = agentName ? keyProviders.get(agentName) : undefined;
+      if (!provider) {
+        // Still throws rather than substituting another agent's key — an earlier version took no
+        // agent at all and reached for whichever provider was first in the map, which is fabricated
+        // crypto wearing a real signature.
+        throw new Error(
+          `document_rejection_unsigned: no key provider for owner ${ownerAgentId.slice(0, 16)}…, ` +
+            `so its rejection cannot be signed — refusing rather than writing an unsigned leaf ` +
+            `into an append-only log`,
+        );
+      }
+      return provider.sign(tbs);
+    },
+  });
+  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame);
+
+  // M14 / DOD-DOC-DELIVERY-2 — the outbound half, wired only now that INBOUND-2 is. The ordering
+  // constraint on the DoD line is real and this is where it is honoured: a delivery worker with no
+  // inbound counterpart publishes envelopes nobody can answer, so every document would stall at the
+  // unacked ceiling.
+  //
+  // PER AGENT, because every capability below is: the signaling stream is authenticated as one
+  // agent, sessions belong to one agent, and `openSessionFor` signs as one agent. A single worker
+  // with an agent-shaped hole in it is how a delivery ends up sent under the wrong identity.
+  //
+  // CACHED per agent. A worker rebuilt every tick has its own re-entry guard (`#inFlight`)
+  // constructed away — permanently null, and the comment claiming it protected anything was wrong.
+  // The sweep's serial loop happens to cover it today; a cached worker means it is covered because
+  // the guard exists, not by accident of loop shape.
+  const documentDeliveryWorkers = new Map<string, DocumentDelivery>();
+  // Cached separately from the worker because the OPERATOR SURFACE needs it too: a proposal is not
+  // in the envelope log — there is no document yet — so it has no delivery record to schedule, and
+  // it still has to travel the same open-or-reuse-then-seal path an update does.
+  const documentTransports = new Map<string, ReturnType<typeof createDocumentDeliveryTransport>>();
+  const documentTransportFor = (agentName: string) => {
+    const cached = documentTransports.get(agentName);
+    if (cached) return cached;
+    const transport = createDocumentDeliveryTransport({
+        agentName,
+        logger,
+        // The SAME 3-state discovery answer cello_initiate_session uses, from the same closure —
+        // online / offline / unknown_agent, kept distinct from "the lookup itself failed". A second
+        // implementation of that distinction drifts until one of them reports a directory outage as
+        // the peer being offline.
+        lookupPeer: async (peerAgentId, correlationId) => {
+          const entry = perAgentSignaling.get(agentName);
+          if (!entry) {
+            // Our OWN stream is not up. A transport fault, never the peer being away — the
+            // reachability mapper turns this into a throw, which the worker logs as lookup_failed.
+            return { kind: "send_failed", reason: "signaling_unavailable" };
+          }
+          return runDiscoveryLookup(entry.signaling, peerAgentId, 10_000, correlationId);
+        },
+        // Most recent LAST — §16.4 reuses the most recent active session, and getSessionsForAgent
+        // returns newest first.
+        activeSessionsWith: (agent, peerAgentId) =>
+          sessionNodeManager
+            .getSessionsForAgent(agent)
+            .filter((row) => row.status === "active" && row.counterparty_pubkey === peerAgentId)
+            .map((row) => row.session_id)
+            .reverse(),
+        openSession: async (agent, peerAgentId, correlationId) => {
+          // The same path `cello_initiate_session` takes, now callable without an IPC connection.
+          const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
+            ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
+          };
+          if (res.ok !== true || typeof res.sessionId !== "string") {
+            return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+          }
+          logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
+          return { ok: true, sessionId: res.sessionId };
+        },
+        sealSession: async (agent, sessionId, correlationId) => {
+          // §16.4: the autonomous session still carries the seal — the ceremony goes to zero, the
+          // seal does not. Only ever called for a session this worker OPENED; one it reused belongs
+          // to whoever started that conversation.
+          const close = handlers.get("cello_close_session");
+          if (!close) {
+            // Reported, not swallowed. The outcome of a missing handler is a live session node the
+            // operator never started, with no sealed record — the exact thing the seal exists to
+            // prevent, and previously indistinguishable from a clean seal.
+            logger.error("document.delivery.seal_failed", { agent, sessionId, reason: "close_handler_missing", correlationId });
+            return;
+          }
+          const sealed = (await close({ session_id: sessionId, agent }, `doc-delivery-${correlationId}`)) as
+            { ok?: boolean; reason?: string } | undefined;
+          if (sealed?.ok !== true) {
+            // `cello_close_session` has distinct failure codes — session_already_sealed,
+            // seal_interrupted_*, signaling_reconnecting — and every one of them landed nowhere.
+            logger.warn("document.delivery.seal_failed", { agent, sessionId, reason: sealed?.reason ?? "unknown", correlationId });
+          }
+        },
+        sendContent: (agent, sessionId, content, contentHash, correlationId) =>
+          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId),
+        // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
+        // successful send. See the comment at the call site for why this is delivery-critical and
+        // not audit bookkeeping.
+        appendLeaf: (agent, sessionId, contentHash, correlationId) => {
+          sessionNodeManager.appendSessionLeaf(
+            agent,
+            sessionId,
+            "doc",
+            Buffer.from(contentHash).toString("hex"),
+            correlationId,
+          );
+        },
+        encodeEnvelope: (envelope) => {
+          const bytes = encodeDocumentUpdateEnvelope({
+            type: "document_update",
+            document_id: envelope.documentId,
+            epoch_id: envelope.epochId,
+            doc_prev_hash: envelope.docPrevHash,
+            sender_agent_id: envelope.senderAgentId,
+            sender_client_id: envelope.senderClientId ?? 0,
+            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+            state_vector: envelope.stateVector,
+            update: envelope.payload ?? new Uint8Array(0),
+            signature: envelope.signature,
+          });
+          // Same defect as `sendBytes` had, on the UPDATE path: the receiver recomputes with the
+          // `0x00` domain prefix, so a bare hash is discarded at the authenticity check.
+          return { bytes, hash: wireContentHash(bytes) };
+        },
+    });
+    documentTransports.set(agentName, transport);
+    return transport;
+  };
+
+  const documentDeliveryFor = (agentName: string): DocumentDelivery => {
+    const existing = documentDeliveryWorkers.get(agentName);
+    if (existing) return existing;
+    const worker = new DocumentDelivery(documentLayer.store, documentTransportFor(agentName), logger);
+    documentDeliveryWorkers.set(agentName, worker);
+    return worker;
+  };
+
+  // M14 / DOD-DOC-TOOLS-1 — the OPERATOR SURFACE. Registered last of the document wiring, because
+  // it is the only part that can create a document, and everything it creates has to have somewhere
+  // to go: without the inbound path a peer's answer is unroutable, and without the delivery worker a
+  // published update never leaves.
+  const documentPublish = new DocumentPublish({
+    store: documentLayer.store,
+    engine: documentLayer.engine,
+    logger,
+    sign: async (ownerAgentId, tbs) => {
+      // `ownerAgentId` is the owner KEY here, and keyProviders is keyed by NAME — so it is resolved
+      // back through the same map the owner key came from rather than guessed. A miss throws: an
+      // unsigned envelope in an append-only log is worse than a failed publish.
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      const provider = agentName ? keyProviders.get(agentName) : undefined;
+      if (!provider) {
+        throw new Error(
+          `document_publish_unsigned: no key provider for owner ${ownerAgentId.slice(0, 16)}…, ` +
+            `so this update cannot be signed`,
+        );
+      }
+      return provider.sign(tbs);
+    },
+    // M14-D5: our wire sender id IS the owner key. Kept as its own callback because they are
+    // different facts that happen to coincide — see DocumentStore.pendingDeliveries.
+    senderIdFor: (ownerAgentId) => ownerAgentId,
+    canPublish: (ownerAgentId, documentId) => documentLayer.lifecycle.canPublish(ownerAgentId, documentId),
+  });
+  registerDocumentHandlers({
+    handlers,
+    logger,
+    layer: documentLayer,
+    publish: documentPublish,
+    transportFor: documentTransportFor,
+    resolveAgent: (connectionId, explicit) =>
+      resolveCurrentAgent(perConnectionState.get(connectionId), explicit),
+    ownerKeyFor: documentOwnerKeyFor,
+    sign: async (agentName, tbs) => {
+      const provider = keyProviders.get(agentName);
+      if (!provider) throw new Error(`document_proposal_unsigned: no key provider for ${agentName}`);
+      return provider.sign(tbs);
+    },
+    now: () => Date.now(),
+  });
+
+  /**
+   * The delivery tick.
+   *
+   * Interval-driven rather than event-driven because the event we are actually waiting for — the
+   * peer coming back online — is not one this daemon observes. There is no presence subscription
+   * (parked, M14-P4), so the honest substitute is to ask periodically and let the per-envelope
+   * backoff keep the cost down: a peer that has been away an hour is checked at the cap, not every
+   * tick.
+   *
+   * Slow on purpose. Publish is fire-and-forget and nothing waits on this; a document that syncs a
+   * minute later is working correctly, while a tight loop over every attended agent is a cost paid
+   * forever for a case that is rare.
+   */
+  //
+  // Overridable for tests, the way `CELLO_SEAL_BILATERAL_TIMEOUT_MS` already is. The live enforcers
+  // spend their wall clock waiting for this tick — two of them is four minutes — and a test that
+  // must sit out a production-paced timer either runs slowly or is written with a window so tight
+  // that adding a second test to the file makes the first one fail. Both happened.
+  //
+  // Floored, so a misread env cannot turn the sweep into a busy loop against the directory.
+  const tickOverride = Number(process.env["CELLO_DOCUMENT_DELIVERY_TICK_MS"]);
+  const DOCUMENT_DELIVERY_TICK_MS =
+    Number.isFinite(tickOverride) && tickOverride >= 250 ? tickOverride : 60_000;
+  let documentDeliveryRunning = false;
+  let documentDeliveryStopping = false;
+  let documentDeliveryInFlight: Promise<void> | null = null;
+  const documentDeliveryTimer = setInterval(() => {
+    // NO OVERLAP. A tick that dials a slow peer can outlast the interval, and a second pass would
+    // re-send envelopes already in flight — the worker's own re-entry guard covers one agent, this
+    // covers the sweep across all of them.
+    if (documentDeliveryRunning) return;
+    documentDeliveryRunning = true;
+    documentDeliveryInFlight = (async () => {
+      try {
+        let agentsSwept = 0;
+        let attempted = 0;
+        let delivered = 0;
+        let failed = 0;
+        for (const agentName of perAgentSignaling.keys()) {
+          // M2: a tick already running when the daemon stops must not keep dialling into a
+          // half-torn-down transport. `clearInterval` stops the NEXT tick, not this one.
+          if (documentDeliveryStopping) break;
+          const ownerAgentId = documentOwnerKeyFor(agentName);
+          // M14-D5: the owner key is our own pubkey hex. It is what BOTH halves scope by — the
+          // inbound router resolves the same function — and it is what the wire sender id is.
+          // Scoping the two halves differently returns nothing pending, reports nothing attempted,
+          // and leaves a fully synced document invisible with no error on any path.
+          if (ownerAgentId === null) continue;
+          agentsSwept++;
+          const peerFor = (documentId: string): string | null =>
+            documentLayer.store.getDocument(ownerAgentId, documentId)?.peerAgentId ?? null;
+          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, peerFor, Date.now(), {
+            senderAgentId: ownerAgentId,
+          });
+          attempted += result.attempted;
+          delivered += result.delivered;
+          failed += result.failed;
+        }
+        // H3: a sweep that delivers nothing was byte-for-byte identical to a healthy idle one, which
+        // is what made every scoping bug above invisible. One line per tick, always.
+        logger.debug("document.delivery.sweep", { agents: agentsSwept, attempted, delivered, failed });
+        if (agentsSwept === 0 && documentLayer.store.anyDocumentExists()) {
+          logger.warn("document.delivery.sweep_empty", {
+            reason: "documents exist but no agent was swept — nothing will ever be delivered",
+          });
+        }
+      } catch (err: unknown) {
+        // Contained: one agent's delivery failure must not stop the sweep, and an unhandled
+        // rejection out of a timer takes the daemon down.
+        logger.warn("document.delivery.tick.failed", { reason: extractErrorMessage(err) });
+      } finally {
+        documentDeliveryRunning = false;
+        documentDeliveryInFlight = null;
+      }
+    })();
+    void documentDeliveryInFlight;
+  }, DOCUMENT_DELIVERY_TICK_MS);
+  // Never hold the process open on account of document delivery.
+  documentDeliveryTimer.unref?.();
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
@@ -3362,6 +3741,13 @@ async function startDaemonHoldingLock(
 
   // Graceful shutdown
   async function stop(reason: string): Promise<void> {
+    // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
+    // teardown would dial into a daemon that is going away.
+    clearInterval(documentDeliveryTimer);
+    // ...and wait for the tick already running. `clearInterval` stops the next one, not this one,
+    // which may be mid-dial into a transport that is going away.
+    documentDeliveryStopping = true;
+    if (documentDeliveryInFlight) await documentDeliveryInFlight;
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
@@ -3447,5 +3833,21 @@ async function startDaemonHoldingLock(
   // prior run, without waiting for any agent to come online or any client to attach.
   startTelegramPollerIfConfigured();
 
-  return { stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry };
+  /**
+   * The live handler map.
+   *
+   * Exposed so the LATE-BINDING property can be asserted rather than assumed: dispatch resolves
+   * from this map when a request arrives, and the only way to prove that is to register something
+   * after `start()` has resolved and call it. The property is not decorative — a snapshot copy here
+   * once made every `cello_doc_*` verb unreachable while the whole suite stayed green.
+   *
+   * Sits alongside `getSessionNodeManager` and `getTypeRegistry`, which are exposed for the same
+   * reason. Production code has no business mutating it after boot.
+   */
+  const getHandlers = (): Map<string, IpcHandler> => handlers;
+
+  return {
+    stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry,
+    getHandlers,
+  };
 }
