@@ -68,6 +68,7 @@
  */
 
 import {
+  decodeCbor,
   decodeDocumentUpdateEnvelope,
   decodeDocumentAck,
   decodeDocumentProposal,
@@ -489,43 +490,60 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
   // the frame is looked at in any other way.
   if (content.length > MAX_DOCUMENT_FRAME_BYTES) return "unshaped";
   if (!couldBeDocumentFrame(content)) return "unshaped";
+
+  // DECODE ONCE AND READ THE DISCRIMINATOR, rather than trying every decoder in turn.
+  //
+  // Each decoder validates its own `type` before anything else, so trying them in sequence meant a
+  // frame paid for as many full CBOR decodes as there are frame types ahead of it — and hostile
+  // bytes that pass the header guard paid for ALL of them. That cost grows every time this protocol
+  // gains a frame, which it did three times this milestone: six decoders where there were four, and
+  // the measured pathological inputs went from comfortably inside the DoS budget to over it on a
+  // slower machine.
+  //
+  // The decode itself is already bounded — `cbor.ts` sets process-global size limits, which is the
+  // actual boundary; the header guard above is only a fast path. So one decode is safe, and one is
+  // all this needs: read `type`, then hand the bytes to exactly the decoder that claims them, which
+  // re-validates everything including the type. Two decodes worst case instead of six, and one for
+  // anything that is not a CBOR map at all.
+  let declared: unknown;
   try {
-    decodeDocumentUpdateEnvelope(content);
-    return "update";
+    const decoded = decodeCbor(content);
+    if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return "unshaped";
+    declared = (decoded as Record<string, unknown>)["type"];
   } catch {
-    // Not an update. Deliberately silent — a frame reaching here is one that PASSED the header
-    // guard, so it is not a conversation message (see the UTF-8 argument in the header); it is a
-    // peer's malformed or unrecognised document-shaped frame, and the caller reports the outcome.
+    // Not decodable as CBOR at all. Shaped like a map header and is not one.
+    return "unshaped";
   }
+  if (typeof declared !== "string") return "undecodable";
+
   try {
-    decodeDocumentAck(content);
-    return "ack";
+    switch (declared) {
+      case "document_update":
+        decodeDocumentUpdateEnvelope(content);
+        return "update";
+      case "document_ack":
+        decodeDocumentAck(content);
+        return "ack";
+      case "document_proposal":
+        decodeDocumentProposal(content);
+        return "proposal";
+      case "document_rejection":
+        decodeDocumentRejection(content);
+        return "rejection";
+      case "document_proposal_ack":
+        decodeDocumentProposalAck(content);
+        return "proposal_ack";
+      case "document_control":
+        decodeDocumentControl(content);
+        return "control";
+      default:
+        // A frame type this build does not know. Reported by the caller rather than silently
+        // treated as conversation — see `routeSync`.
+        return "undecodable";
+    }
   } catch {
-    /* not an ack */
+    // It NAMED a document frame type and failed that type's own validation. Not conversation:
+    // conversation does not carry `type: "document_update"`.
+    return "undecodable";
   }
-  try {
-    decodeDocumentProposal(content);
-    return "proposal";
-  } catch {
-    /* not a proposal */
-  }
-  try {
-    decodeDocumentRejection(content);
-    return "rejection";
-  } catch {
-    /* not a rejection */
-  }
-  try {
-    decodeDocumentProposalAck(content);
-    return "proposal_ack";
-  } catch {
-    /* not a proposal ack */
-  }
-  try {
-    decodeDocumentControl(content);
-    return "control";
-  } catch {
-    // Shaped like a document frame and decoded as none of them.
-  }
-  return "undecodable";
 }
