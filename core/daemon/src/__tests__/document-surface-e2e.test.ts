@@ -824,3 +824,49 @@ describe("DOD-DOC-SCREEN-1 — the content gate is REACHED, and it refuses rathe
     expect(a.text(documentId)).toBe(b.text(documentId));
   });
 });
+
+describe("a gate refusal leaves the sender's chain FOLLOWABLE (DOD-DOC-REJECT-1)", () => {
+  it("the refused envelope becomes the head and is known, so a supersession can link to it", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "one\ntwo\nthree\n",
+      append_only: true,
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // B deletes — A's gate must refuse it.
+    await b.call("cello_doc_write", { document_id: documentId, content: "one\n" });
+    await b.sweep();
+
+    await vi.waitFor(() =>
+      expect(a.layer.store.listQuarantined(a.owner, documentId).length).toBeGreaterThan(0),
+    );
+
+    // THE THREE VALUES THE SPINE RUN COULD ONLY GUESS AT. Read straight from A's store instead of
+    // inferred from a log tail three minutes at a time.
+    // THE THREE VALUES THE PROTOCOL DEPENDS ON AFTER A REFUSAL, read straight from the store rather
+    // than inferred from a log tail. A refused envelope is deliberately never written to
+    // `document_envelopes`, so without these the sender's next envelope — their supersession —
+    // links to a hash that is nowhere, and the document dies after one refusal.
+    const q = a.layer.store.listQuarantined(a.owner, documentId);
+    expect(q).toHaveLength(1);
+    // Scoped to the REFUSED envelope's own author, so one peer's quarantine can never make another
+    // peer's broken chain resolve.
+    expect(q[0]!.rejectedSenderAgentId).toBe(b.owner);
+
+    const known = a.layer.store.knownEnvelopeHashesBySender(a.owner, documentId, b.owner);
+    const head = a.layer.store.lastEnvelopeHashBySender(a.owner, documentId, b.owner);
+    // KNOWN answers "have I seen this" (duplicate detection); HEAD is what a forward link is
+    // checked against. Bridging only the first looks right and changes nothing — that was one of
+    // the wrong turns on this path, and both are asserted here so neither can regress alone.
+    expect(known.size).toBe(1);
+    expect(head, "the head did not advance across the refused envelope").toBe(q[0]!.rejectedEnvelopeHash);
+  });
+});

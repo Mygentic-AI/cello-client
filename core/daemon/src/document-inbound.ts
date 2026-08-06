@@ -223,6 +223,18 @@ export class DocumentInbound {
         documentId: env.document_id,
         correlationId,
         detail,
+        // THE COMPARISON ITSELF, not just its verdict.
+        //
+        // The stall path was chased through three fixes on the strength of "the chain was refused",
+        // and each fix was reasoned about rather than measured. What was never printed is the only
+        // thing that decides it: the link the sender claimed, the head we were holding, and whether
+        // we had seen it before. A refusal that names its verdict and hides its inputs is why that
+        // took three rounds — the same shape as reading a log tail for an event that is emitted
+        // earlier, twice today.
+        claimedPrev: env.doc_prev_hash,
+        ourHead: head,
+        prevIsKnown: env.doc_prev_hash !== null && known.has(env.doc_prev_hash),
+        knownCount: known.size,
       });
       // MATCHED against the known set, not split on ":". This file explains sixty lines earlier why
       // splitting an upstream message produces reason codes made of English prose — and the old
