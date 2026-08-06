@@ -13,7 +13,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
-import type { InboundSessionEvent, ExpiredSessionRequest } from "./inbound-sessions.js";
+import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
 import type { AgentInfo } from "./types.js";
 
@@ -29,12 +29,13 @@ export interface NotificationHandlerDeps {
   reapExpiredInboundSessions: (agentName: string) => void;
   inboundSessionQueues: Map<string, InboundSessionEvent[]>;
   expiredSessionRequests: Map<string, ExpiredSessionRequest[]>;
+  refusedSessionRequests: Map<string, RefusedSessionRequest[]>;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
-    loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests,
+    loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests, refusedSessionRequests,
   } = deps;
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
@@ -95,6 +96,15 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
         expired_at: e.expiredAt,
+      }));
+      // M12-P18: sessions THIS agent turned away (cap/abuse bound). Local-only visibility so a cap
+      // firing does not require reading the daemon log to discover — the failure mode that hid a
+      // stranded 297-times-re-pulled message.
+      const refused = (refusedSessionRequests.get(agent) ?? []).map((e) => ({
+        session_id: e.sessionIdHex,
+        from: e.counterpartyPubkeyHex,
+        reason: e.reason,
+        refused_at: e.refusedAt,
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const sealed_unread = sessionNodeManager.getSealedUnread(agent);
@@ -159,7 +169,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check session_state per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

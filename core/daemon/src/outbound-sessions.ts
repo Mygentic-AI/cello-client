@@ -154,7 +154,9 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
     const unregister = signaling.registerInboundHandler((frame) => {
       const t = frame["type"];
-      if (t === "session_assignment" || t === "session_request_error") resolveFrame(frame);
+      // M12-P18: a trusted counterparty may answer with WHY it refused (over-cap etc.) instead of
+      // the directory's generic error. Resolve on it too, so the reason reaches the operator.
+      if (t === "session_assignment" || t === "session_request_error" || t === "session_refused") resolveFrame(frame);
     });
     // MONIKER-2 AC1: the outbound name rides the request (agent name, or the MONIKER-1
     // override), re-validated at offer construction (defense in depth) and OMITTED — never
@@ -358,6 +360,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       if (frame["type"] === "session_request_error") {
         const reason = sessionRequestErrorReason(frame);
         return { ok: false, reason, guidance: `The directory refused the session request (${reason}). Ensure the counterparty is registered and online.` };
+      }
+      // M12-P18: the COUNTERPARTY refused, and told us why (only KNOWN+ senders get this — a
+      // stranger still gets silence, so no block/throttle oracle). Surface their guidance verbatim.
+      if (frame["type"] === "session_refused") {
+        const reason = typeof frame["reason"] === "string" ? frame["reason"] : "refused_by_counterparty";
+        const guidance = typeof frame["guidance"] === "string"
+          ? frame["guidance"]
+          : `The counterparty refused this session (${reason}).`;
+        return { ok: false, reason, guidance };
       }
       const raw = frame["assignment"] as Record<string, unknown> | undefined;
       const assignment = raw ? parseSessionAssignment(raw) : null;
