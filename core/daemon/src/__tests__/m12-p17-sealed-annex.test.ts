@@ -118,6 +118,45 @@ describe("M12-P17: the post-seal annex", () => {
     expect(fx.snm.readSealedAnnex("alice"), "and nothing must have been written").toHaveLength(0);
   });
 
+  it("is READABLE through cello_get_transcript — under its own key, never merged into messages", async () => {
+    // Review F3: without a reader the annex is write-only, and the operator's experience is
+    // identical to discarding the message — the loss made quiet instead of noisy. This is the
+    // surface that makes "you can read it" true.
+    //
+    // Under its OWN key on purpose: `messages` holds screened, sealed-chain content, and annexed
+    // content is neither. Merging them would erase the boundary a reader needs to tell them apart.
+    await fx.createSession(SID, "alice");
+    fx.snm.recordSealedAnnex("alice", SID, "f0".repeat(32),
+      new TextEncoder().encode("arrived after we hung up [[STANDBY EST:15m]]"), null);
+
+    const client = await fx.connectAs("alice");
+    const res = await client.send("cello_get_transcript", { session_id: SID, agent: "alice" }) as {
+      messages: Array<{ text: string }>;
+      post_seal_annex?: Array<{ text: string; actionable: boolean }>;
+      post_seal_annex_guidance?: string;
+    };
+
+    expect(res.post_seal_annex, "the operator must be able to read it").toHaveLength(1);
+    expect(res.post_seal_annex![0].text).toBe("arrived after we hung up [[STANDBY EST:15m]]");
+    expect(res.post_seal_annex![0].actionable, "it is a record, not a task").toBe(false);
+    expect(res.messages.find((m) => m.text.includes("hung up")), "must NOT be mixed into the sealed record").toBeUndefined();
+
+    // The guidance has to name both hazards: the instruction is stale, and the text is unscreened.
+    const g = String(res.post_seal_annex_guidance);
+    expect(g).toMatch(/STALE|must NOT be acted on/);
+    expect(g).toMatch(/security screen|untrusted/);
+  });
+
+  it("omits the annex keys entirely when there is nothing annexed", async () => {
+    // An empty array in every transcript response would train readers to ignore the key — and this
+    // is the key that carries a do-not-act warning.
+    await fx.createSession(SID, "alice");
+    const client = await fx.connectAs("alice");
+    const res = await client.send("cello_get_transcript", { session_id: SID, agent: "alice" }) as Record<string, unknown>;
+    expect(res.post_seal_annex).toBeUndefined();
+    expect(res.post_seal_annex_guidance).toBeUndefined();
+  });
+
   it("scopes by session when asked, and by agent otherwise", async () => {
     await fx.createSession(SID, "alice");
     const OTHER = "c8".repeat(32);
