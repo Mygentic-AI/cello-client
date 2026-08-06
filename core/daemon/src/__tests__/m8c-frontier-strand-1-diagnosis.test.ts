@@ -195,7 +195,7 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       // counterparty — turning a recoverable divergence into a permanent one. The guidance must
       // name that outcome BEFORE the reader gets there.
       const r = renderSealRejection("session_already_sealed", SID_HEX);
-      // Still says the receipt exists and where to look first.
+      // Still says the counterparty claims a seal, and where to look first.
       expect(r.guidance).toMatch(/already SEALED/);
       expect(r.guidance).toMatch(/cello_sealed_receipt/);
       // ...but must now also handle the case where that call comes back empty.
@@ -203,6 +203,35 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       // ...and must warn against the destructive escape, naming what it costs.
       expect(r.guidance).toMatch(/force/i);
       expect(r.guidance).toMatch(/permanent|forfeit|destroy/i);
+      // Polarity guard: every assertion above is keyword presence, so a string that INVERTED the
+      // advice ("force is the permanent fix, use it") would satisfy all of them. Pin the negation.
+      expect(r.guidance).toMatch(/Do NOT/);
+    });
+
+    it("DOD-TERMINAL-STATE-DIVERGENCE-1 (review F1): the guidance must not claim a seal it never verified", () => {
+      // The counterparty's rejection reason arrives off the wire and is relayed verbatim — this
+      // function's own comment calls it "a hostile or merely buggy counterparty". Asserting that a
+      // notarization "provably exists" on that basis is a false claim of notarization, which is the
+      // DOD-SEALED-INBOX-2 defect class and the one error the product cannot afford. The warning
+      // against force must stand on the ASYMMETRY (unverified is recoverable, forfeited is not),
+      // never on a proof this side does not hold.
+      const r = renderSealRejection("session_already_sealed", SID_HEX);
+      expect(r.guidance).not.toMatch(/provabl/i);
+      // It must not tell the reader to compare a sealed_root this side does not have — the whole
+      // premise of the branch is that no local certificate exists.
+      expect(r.guidance).not.toMatch(/compare(d)? (it )?by sealed_root/i);
+      // It must attribute the claim rather than assert it.
+      expect(r.guidance).toMatch(/REPORTS|claim/i);
+    });
+
+    it("DOD-TERMINAL-STATE-DIVERGENCE-1 (review F2): the ABANDONED guidance recommends force, so it must caveat it", () => {
+      // `reason` is chosen by the counterparty. A bug or version skew that reports session_abandoned
+      // for a session that actually sealed would walk this side into the exact destructive action
+      // the sealed branch was hardened to prevent — with the daemon's own encouragement.
+      const r = renderSealRejection("session_abandoned", SID_HEX);
+      expect(r.guidance).toMatch(/force: true/);
+      expect(r.guidance).toMatch(/COUNTERPARTY|not verified/i);
+      expect(r.guidance).toMatch(/cello_sealed_receipt/);
     });
 
     it("M12-P14: an ABANDONED counterparty says the abandon is terminal and yields no receipt", () => {

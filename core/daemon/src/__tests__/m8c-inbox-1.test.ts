@@ -260,6 +260,15 @@ describe("M8C-INBOX-1: cello_check_notifications + watermark + F4", () => {
     // not_sealed_yet — alice's own session, no seal certificate.
     const nsy = (await client.send("cello_get_sealed_receipt", { session_id: aliceSession })) as R;
     expect(nsy["reason"]).toBe("not_sealed_yet");
+    // DOD-TERMINAL-STATE-DIVERGENCE-1 (review: this half of the deadlock shipped untested).
+    // This guidance used to say only "close it with cello_close_session and confirm it reports
+    // sealed" — which, when close answers session_already_sealed, is a cycle whose only exit is a
+    // force-abandon that permanently forfeits this side's half of the receipt. It must name the
+    // other answer and refuse to recommend force.
+    expect(String(nsy["guidance"])).toMatch(/session_already_sealed/);
+    expect(String(nsy["guidance"])).toMatch(/Do NOT use \{ force: true \}/);
+    // …without claiming the counterparty's receipt is verified from here (review F1).
+    expect(String(nsy["guidance"])).not.toMatch(/provabl/i);
 
     // wrong_agent — the session belongs to bob, but alice is current.
     const wa = (await client.send("cello_get_sealed_receipt", { session_id: bobSession })) as R;

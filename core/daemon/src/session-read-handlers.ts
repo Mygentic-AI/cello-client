@@ -113,8 +113,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
         reason: "not_sealed_yet",
         guidance:
           "This session exists but is not sealed yet. Close it with cello_close_session and confirm it reports sealed (or wait for the counterparty to co-seal), then retry. " +
-          "IF cello_close_session ALREADY reported session_already_sealed, do not close again — the two answers are both true and point at each other. It means the seal completed but this side never received the completion frame, so no local certificate exists and none can be produced here. " +
-          "Do NOT use { force: true } to break out: it forfeits this side's receipt permanently while the counterparty's copy stays valid. Report the divergence instead.",
+          "IF cello_close_session ALREADY reported session_already_sealed, do not close again — both answers are true and they point at each other. The seal completion never reached this side, so no local certificate exists and none can be produced here. " +
+          "Do NOT use { force: true } to break out: it PERMANENTLY forfeits this side's half, and a receipt you cannot yet verify is still recoverable where a forfeited one never is. Leave the session as it is and tell the operator the session id and the counterparty's pubkey — this is a known daemon defect (the seal completion is pushed with no pull twin), not an error they caused.",
       };
     }
     // Owned by a DIFFERENT loaded agent → the caller has the wrong current agent selected.

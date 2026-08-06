@@ -197,14 +197,29 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       if (record.status === "abandoned") {
         return { ok: true, status: "abandoned", reason: "already_abandoned", guidance: "This session was already force-abandoned." };
       }
+      // A session that reached a seal attempt (interrupted / seal_interrupted_pending) MIGHT have
+      // been notarized on the counterparty's side without this side ever learning — the
+      // no-pull-twin divergence. A half-open ghost never got that far and forfeits nothing. Warning
+      // on both would put the same paragraph on the ninety routine force-abandons that cost nothing
+      // and the one that cost a receipt, which buries the only occurrence that matters.
+      const mayHaveSealed = record.status === "interrupted" || record.status === "seal_interrupted_pending";
       await sessionNodeManager.abandonSession(record.agent_name, sessionId);
-      logger.info("session.force_abandoned", { agentName: record.agent_name, sessionId, priorStatus: record.status });
+      logger.info("session.force_abandoned", {
+        agentName: record.agent_name,
+        sessionId,
+        priorStatus: record.status,
+        // Makes the destructive case findable in a log instead of reconstructable by hand, which is
+        // how the 2026-08-06 incident had to be traced.
+        mayHaveForfeitedSeal: mayHaveSealed,
+      });
       return {
         ok: true,
         status: "abandoned",
         reason: "force_abandoned",
-        guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt. ` +
-          `If the counterparty had reported session_already_sealed, this has now PERMANENTLY forfeited this side's half of a receipt that still exists on theirs — that is not recoverable from here, and their sealed_root remains the valid record of the conversation.`,
+        guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.` +
+          (mayHaveSealed
+            ? ` This session had reached a seal attempt (prior status: ${record.status}), so if the counterparty did notarize it, this side's half is now PERMANENTLY forfeited and cannot be recovered from here. Their copy, if it exists, is the only remaining one — ask them for their sealed_root and record it with the operator.`
+            : ""),
       };
     }
 

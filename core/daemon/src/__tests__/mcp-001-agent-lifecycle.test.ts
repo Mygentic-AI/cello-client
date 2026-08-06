@@ -452,6 +452,34 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(await statusOf(client, sid)).toBe("abandoned"); // terminal in --all
     });
 
+    it("DOD-TERMINAL-STATE-DIVERGENCE-1 (review F3): the forfeit warning fires on a seal-attempted session and STAYS SILENT on a ghost", async () => {
+      // Force's documented purpose is the half-open ghost the counterparty never joined — the
+      // common case, where nothing was notarized and nothing is forfeited. A session that reached a
+      // seal attempt is the rare one that may have been sealed on the counterparty's side without
+      // this side learning. Warning on both puts identical text on the ninety that cost nothing and
+      // the one that cost a receipt, which buries the only occurrence that matters (§5a: a signal
+      // that fires on the normal case is not a signal).
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const ghost = "c1".repeat(16);
+      seedSession("alice", ghost, { createdAt: Date.now() });
+      const ghostClose = (await client.send("cello_close_session", { session_id: ghost, force: true })) as { ok: boolean; guidance: string };
+      expect(ghostClose.ok).toBe(true);
+      expect(ghostClose.guidance).not.toMatch(/PERMANENTLY forfeited/);
+
+      const attempted = "c2".repeat(16);
+      seedSession("alice", attempted, { createdAt: Date.now(), status: "seal_interrupted_pending" });
+      const attemptedClose = (await client.send("cello_close_session", { session_id: attempted, force: true })) as { ok: boolean; guidance: string };
+      expect(attemptedClose.ok).toBe(true);
+      expect(attemptedClose.guidance).toMatch(/PERMANENTLY forfeited/);
+      // Names the evidence it fired on, so the operator can tell why this one warned.
+      expect(attemptedClose.guidance).toMatch(/seal_interrupted_pending/);
+    });
+
     it("DOD-RETRYQ-STRAND-1: force-abandon reaps the session's stranded retry rows — retryQueueDepth returns to 0", async () => {
       // The live defect: a direct-resend row whose session went terminal is unreachable by every
       // removal path that exists (drainSession, its only consumer, has no production caller), so
