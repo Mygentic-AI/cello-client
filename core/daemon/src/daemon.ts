@@ -3744,6 +3744,10 @@ async function startDaemonHoldingLock(
   // lifecycle is the daemon's, not any agent connection's — so it polls even with zero agents.
 
   // Graceful shutdown
+  // DOD-LOGOUT-EXIT-1: the onStopped hook ends the process in the binary, so it fires at most once
+  // per daemon no matter how many times stop() is called.
+  let stoppedHookFired = false;
+
   async function stop(reason: string): Promise<void> {
     // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
     // teardown would dial into a daemon that is going away.
@@ -3794,6 +3798,11 @@ async function startDaemonHoldingLock(
       config.registryPollScheduler.cancel();
     }
     logger.info("daemon.stopped", { pid: process.pid, reason });
+    // DOD-LOGOUT-EXIT-1: what the teardown actually DID, carried to onStopped so the binary can
+    // exit non-zero on a dirty stop. Without it a shutdown that threw halfway — sessions never
+    // marked interrupted, database never checkpointed — would exit 0 and `cello logout` would
+    // print "Daemon stopped.", which is this unit's own defect one level up.
+    let teardownError: Error | undefined;
     try {
       // stopAllSignaling() stops the shared manager AND every per-agent manager (best-effort). Do
       // not add a separate per-agent stop loop beside it: it would be redundant, and an unguarded
@@ -3802,6 +3811,11 @@ async function startDaemonHoldingLock(
       // Gracefully mark active sessions interrupted (AC-009) before stopping IPC
       await sessionNodeManager.gracefulShutdown();
       await ipcServer.stop();
+    } catch (err: unknown) {
+      // Recorded, then RE-THROWN below by the bare `throw` — the existing contract that a failed
+      // stop() rejects is unchanged. This only makes the failure visible to onStopped as well.
+      teardownError = err instanceof Error ? err : new Error(String(err));
+      throw err;
     } finally {
       // DOD-M9B-WIRE-1: tear down whatever the composition root started alongside us — today the
       // screening sidecar. Two reasons it is HERE and not only in the bin's signal handler:
@@ -3841,6 +3855,27 @@ async function startDaemonHoldingLock(
       // Released LAST: while we hold it, no successor daemon can start, which is what lets
       // ipcServer.stop()'s socket re-check above be race-free.
       singletonLock.release();
+      // DOD-LOGOUT-EXIT-1: signal that this daemon is DONE — the binary's handler is
+      // `process.exit(0)`, so nothing may be sequenced after this line.
+      //
+      // AFTER singletonLock.release(), never before: the process is about to end, and dying while
+      // still holding the kernel lock would make the next `cello login` refuse to start beside a
+      // daemon that no longer exists.
+      //
+      // Inside the `finally` so a throw anywhere above still ends the process. A shutdown that
+      // fails halfway and leaves the daemon alive and on the network is the exact defect this line
+      // closes — "it threw" is not a reason to keep talking to a directory.
+      //
+      // Guarded: `stop()` has no idempotence of its own, and a caller that stops twice (an IPC
+      // shutdown followed by an embedder's own stop) must not exit twice.
+      // The hook's own failure is NOT caught. It is the only call that ends the process, so
+      // swallowing a throw here would leave the daemon alive and handle-free while every check
+      // logout makes agrees it is gone — the original defect, reached through the new code. Letting
+      // it propagate makes stop() reject, which is what lets logout time out and say so.
+      if (!stoppedHookFired) {
+        stoppedHookFired = true;
+        await config.onStopped?.({ ok: teardownError === undefined, error: teardownError });
+      }
     }
   }
 
