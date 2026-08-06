@@ -35,7 +35,7 @@
  * - R1c (AC1): the argv the script literally types parses against the real CLI registry — the one
  *   hop that turns markdown into behavior, and the one nothing else covers.
  * - R1d/R1e/R1f/R1g: the three silent-death paths a review found in the shipped bash (exit code
- *   ignored in favour of empty stdout; `jq` failures swallowed; `sealed_unread` invisible to the
+ *   ignored in favour of empty stdout; `jq` failures swallowed; `ended_unread` invisible to the
  *   poll) plus an unguarded `mktemp`. Each ended the same way — a receptionist that says it is
  *   monitoring, announces nobody, and prints nothing on any stream.
  * - R1h: the lost `use-agent` auto-start is written down, so the refusal does not read as a bug.
@@ -145,9 +145,9 @@ describe("DOD-RECEPTIONIST-AGENT-1: two desks, two receptionists, no shared file
       // `total_unread` counts ACTIVE sessions only (getUnreadSummary excludes terminal statuses),
       // so a caller who leaves a message and seals contributes zero to it and zero pending
       // requests. Polling total_unread alone slept through them indefinitely — and the SKILL
-      // handles sealed_unread explicitly, so the subagent replacing it could not see what the
+      // handles ended_unread explicitly, so the subagent replacing it could not see what the
       // skill could.
-      expect(code).toMatch(/sealed_unread/);
+      expect(code).toMatch(/ended_unread/);
       expect(code).toMatch(/expired_session_requests/);
     });
 

@@ -319,7 +319,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
   });
 
   // ─── DOD-SEALED-INBOX-1: cello_dismiss — mark a terminal session as read locally ───
-  // Sets read_at on the session row so cello_inbox stops surfacing it in sealed_unread.
+  // Sets read_at on the session row so cello_inbox stops surfacing it in ended_unread.
   // Local-only housekeeping — never propagated, never part of the seal or hash chain.
   handlers.set("cello_dismiss", async (params, connectionId) => {
     const connState = getConnState(connectionId);

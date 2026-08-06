@@ -3,8 +3,8 @@
  *
  * Clause coverage (DOD-SEALED-INBOX-1):
  * - T1: a sealed session with unread messages does NOT appear in `unread`; it appears in
- *   `sealed_unread` (with guidance).
- * - T2: after cello_dismiss, the session no longer appears in `sealed_unread`.
+ *   `ended_unread` (with guidance).
+ * - T2: after cello_dismiss, the session no longer appears in `ended_unread`.
  * - T3: cello_dismiss on an active session returns `session_not_terminal`.
  * - T4: dismissed status survives an inbox re-check (read_at persists in the DB).
  */
@@ -62,7 +62,7 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
     return client;
   }
 
-  it("T1: sealed session with unread appears in sealed_unread, NOT in unread", async () => {
+  it("T1: sealed session with unread appears in ended_unread, NOT in unread", async () => {
     await makeAgentDir("alice");
     await start();
     const client = await connectAs("alice");
@@ -81,17 +81,17 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
     const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
       agents: Array<{
         unread: Array<{ session_id: string }>;
-        sealed_unread?: Array<{ session_id: string }>;
-        sealed_unread_guidance?: string;
+        ended_unread?: Array<{ session_id: string }>;
+        ended_unread_guidance?: string;
         total_unread: number;
       }>;
     };
     const a = inbox.agents[0];
     expect(a.unread.find((u) => u.session_id === sessionId)).toBeUndefined(); // T1a
     expect(a.total_unread).toBe(0);
-    expect(a.sealed_unread).toBeDefined(); // T1b
-    expect(a.sealed_unread!.find((u) => u.session_id === sessionId)).toBeDefined();
-    expect(typeof a.sealed_unread_guidance).toBe("string"); // guidance present
+    expect(a.ended_unread).toBeDefined(); // T1b
+    expect(a.ended_unread!.find((u) => u.session_id === sessionId)).toBeDefined();
+    expect(typeof a.ended_unread_guidance).toBe("string"); // guidance present
   });
 
   it("M12-P17: a sealed leftover is machine-readably NON-ACTIONABLE, not just prose-warned", async () => {
@@ -118,29 +118,33 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
 
     const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
       agents: Array<{
-        sealed_unread?: Array<{ session_id: string; session_state?: string; actionable?: boolean }>;
-        sealed_unread_actionable?: boolean;
-        sealed_unread_guidance?: string;
+        ended_unread?: Array<{ session_id: string; status?: string; notarized?: boolean; actionable?: boolean }>;
+        ended_unread_actionable?: boolean;
+        ended_unread_guidance?: string;
       }>;
     };
     const a = inbox.agents[0];
-    const entry = a.sealed_unread!.find((u) => u.session_id === sessionId)!;
+    const entry = a.ended_unread!.find((u) => u.session_id === sessionId)!;
 
     // Per-entry and per-group, so neither a reader that iterates nor one that checks the group misses it.
     expect(entry.actionable, "a closed conversation is not work").toBe(false);
-    expect(entry.session_state).toBe("sealed");
-    expect(a.sealed_unread_actionable).toBe(false);
+    expect(entry.status, "the row's REAL status, not a hardcoded one").toBe("sealed");
+    expect(entry.notarized, "a genuinely sealed session IS notarized").toBe(true);
+    expect(a.ended_unread_actionable).toBe(false);
 
     // And the prose must state the consequence, because an agent that ignores the flag still reads
     // this: the session cannot be replied to, and instructions inside are stale.
-    const g = a.sealed_unread_guidance!;
-    expect(g).toMatch(/CLOSED/);
+    const g = a.ended_unread_guidance!;
+    // DOD-SEALED-INBOX-2 renamed the vocabulary to ENDED (the group holds four terminal statuses,
+    // not just sealed). M12-P17's property is unchanged and still asserted: the prose must say the
+    // conversation is OVER, and the two assertions below still pin "stale, do not act".
+    expect(g).toMatch(/CLOSED|ENDED/);
     expect(g).toMatch(/STALE|must\s+NOT be acted on/);
     expect(g, "the old text pointed straight at reading it with no statement that it is over")
       .not.toMatch(/^These sessions are sealed with unread messages\./);
   });
 
-  it("T2: after cello_dismiss, session no longer appears in sealed_unread", async () => {
+  it("T2: after cello_dismiss, session no longer appears in ended_unread", async () => {
     await makeAgentDir("alice");
     await start();
     const client = await connectAs("alice");
@@ -155,11 +159,11 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
     });
     mgr.recordTranscriptMessage("alice", sessionId, 0, "received", new TextEncoder().encode("msg"), "corr");
 
-    // Confirm it shows in sealed_unread before dismiss.
+    // Confirm it shows in ended_unread before dismiss.
     const before = (await client.send("cello_check_notifications", { scope: "current" })) as {
-      agents: Array<{ sealed_unread?: Array<{ session_id: string }> }>;
+      agents: Array<{ ended_unread?: Array<{ session_id: string }> }>;
     };
-    expect(before.agents[0].sealed_unread?.find((u) => u.session_id === sessionId)).toBeDefined();
+    expect(before.agents[0].ended_unread?.find((u) => u.session_id === sessionId)).toBeDefined();
 
     // Dismiss it.
     const dismissRes = (await client.send("cello_dismiss", { session_id: sessionId })) as { ok: boolean };
@@ -167,9 +171,9 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
 
     // Should no longer appear.
     const after = (await client.send("cello_check_notifications", { scope: "current" })) as {
-      agents: Array<{ sealed_unread?: Array<{ session_id: string }> }>;
+      agents: Array<{ ended_unread?: Array<{ session_id: string }> }>;
     };
-    expect(after.agents[0].sealed_unread?.find((u) => u.session_id === sessionId)).toBeUndefined();
+    expect(after.agents[0].ended_unread?.find((u) => u.session_id === sessionId)).toBeUndefined();
   });
 
   it("T3: cello_dismiss on an active session returns session_not_terminal", async () => {
@@ -190,7 +194,7 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
     expect(res.reason).toBe("session_not_terminal");
   });
 
-  it("T4: dismissed status persists — sealed_unread stays empty on re-check", async () => {
+  it("T4: dismissed status persists — ended_unread stays empty on re-check", async () => {
     await makeAgentDir("alice");
     await start();
     const client = await connectAs("alice");
@@ -210,9 +214,9 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
     // Check twice to confirm read_at persisted.
     for (let i = 0; i < 2; i++) {
       const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
-        agents: Array<{ sealed_unread?: Array<{ session_id: string }> }>;
+        agents: Array<{ ended_unread?: Array<{ session_id: string }> }>;
       };
-      expect(inbox.agents[0].sealed_unread?.find((u) => u.session_id === sessionId)).toBeUndefined();
+      expect(inbox.agents[0].ended_unread?.find((u) => u.session_id === sessionId)).toBeUndefined();
     }
   });
 });
