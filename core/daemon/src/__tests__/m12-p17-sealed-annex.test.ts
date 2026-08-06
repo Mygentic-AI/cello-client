@@ -96,7 +96,7 @@ describe("M12-P17: the post-seal annex", () => {
 
     expect(fx.snm.getUnreadSummary("alice"), "the annex must never count as unread").toEqual([]);
     expect(
-      fx.snm.getSealedUnread("alice").find((u) => u.session_id === SID),
+      fx.snm.getEndedUnread("alice").find((u) => u.session_id === SID),
       "nor appear in the sealed-unread list, which IS surfaced in the inbox",
     ).toBeUndefined();
     // ...and yet it is readable on demand.

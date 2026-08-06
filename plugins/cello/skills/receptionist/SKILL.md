@@ -79,18 +79,20 @@ independent of whatever the connection currently holds. An unknown name is refus
 
 ### 4 — Handle anything already waiting
 
-If there are pending session requests, unread messages, or sealed unread sessions:
+If there are pending session requests, unread messages, or ended sessions with unread messages:
 
 1. **Calculate age:** compute how long ago the message arrived using `createdAt` (ms epoch) vs the current time. Express it as "X minutes ago", "X hours ago", etc.
 2. **Read the content:**
    - For `unread` items: call `cello_transcript({ agent: "<exact name>", cello_session_id })`.
-   - For `sealed_unread` items: call `cello_transcript({ agent: "<exact name>", cello_session_id })`. **Calling `cello_transcript` clears the item from `sealed_unread` automatically** — no further action needed. If the operator wants to dismiss without reading, use `cello_dismiss({ agent: "<exact name>", cello_session_id })` instead (clears from inbox, does not mark messages as read).
+   - For `ended_unread` items: call `cello_transcript({ agent: "<exact name>", cello_session_id })`. **Calling `cello_transcript` clears the item from `ended_unread` automatically** — no further action needed. If the operator wants to dismiss without reading, use `cello_dismiss({ agent: "<exact name>", cello_session_id })` instead (clears from inbox, does not mark messages as read).
+   - **These sessions did NOT all end the same way, and you must not say they did.** `ended_unread` holds four terminal statuses; only `status: "sealed"` / `notarized: true` has a cryptographic receipt. `interrupted`, `abandoned` and `seal_interrupted_pending` ended WITHOUT being notarized. Report the entry's own `status`, and never tell the operator a conversation was notarized, sealed, or has a receipt unless `notarized` is true — a false claim of notarization is the one error this product cannot afford.
    - Name the agent on these too. Step 1 says *every* call, and it means it: these read and clear real state, so a re-pointed connection would clear the wrong desk's inbox.
 3. **Report to the operator** in this format:
 
 ```
 Inbox item for <AGENT_NAME>:
-  Type:     <new_session_request | unread_message | sealed_unread>
+  Type:     <new_session_request | unread_message | ended_unread>
+  Ended as: <only for ended_unread: the entry's status — sealed (notarized) | interrupted | abandoned | seal_interrupted_pending (NOT notarized)>
   Session:  <session ID>
   From:     <sender pubkey or known name if available>
   Age:      <how long ago, e.g. "4 minutes ago">

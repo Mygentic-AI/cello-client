@@ -196,6 +196,26 @@ async function main(): Promise<void> {
     securityGateway: security.client,
     restartSecurityGateway,
     onShutdown: stopSecurityLayer,
+    // DOD-LOGOUT-EXIT-1: THIS is what makes `cello logout` honest. The IPC `shutdown` verb never
+    // reaches the signal handlers below, so before this line the logout path had nothing that
+    // ended the process — it released the socket, the lock file and the singleton lock (the exact
+    // two facts logout consults to decide the daemon is gone) and then kept running, still
+    // connected to a directory node. This is the only place that may exit: the daemon module is
+    // also used in-process by tests and embedders, where exiting would kill the host.
+    //
+    // The log line is not decoration — it is the evidence that the exit was DELIBERATE. Without it
+    // a daemon whose event loop merely happened to drain is indistinguishable from one that was
+    // told to stop, and this wiring could be deleted without any test noticing.
+    onStopped: ({ ok, error }) => {
+      // A dirty stop still ENDS — a half-stopped daemon may not keep talking to a directory — but
+      // it exits non-zero and says why. Exiting 0 for both would let `cello logout` print
+      // "Daemon stopped." over a shutdown that never marked its sessions interrupted.
+      logger.info("daemon.exit", { pid: process.pid, ok, ...(error ? { error: error.message } : {}) });
+      // stdout is a PIPE here (the daemon is spawned detached with piped stdio) and pipe writes are
+      // asynchronous, so `process.exit` can truncate the line above — including the one case where
+      // it matters most, the `ok:false` cause. Yield one turn so the write drains first.
+      setImmediate(() => process.exit(ok ? 0 : 1));
+    },
     registryPubkey: REGISTRY_SIGNER_PUBKEY,
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
@@ -204,6 +224,11 @@ async function main(): Promise<void> {
     // handle.stop() runs onShutdown (stopSecurityLayer) for us — the teardown lives there so that
     // `cello logout`, which stops the daemon over IPC and never reaches this handler, tears the
     // sidecar down too.
+    //
+    // DOD-LOGOUT-EXIT-1: stop()'s onStopped hook exits, so this await does not return while the
+    // hook is wired above — the line below is unreachable in the shipped binary. It is kept so that
+    // removing the hook cannot silently produce a signal path that never exits, which is the state
+    // the IPC path was in before this unit.
     await handle.stop(signal);
     process.exit(0);
   };

@@ -62,13 +62,15 @@ while true; do
     exit 1
   fi
   # Every way a caller can be waiting, not just the two obvious ones. `total_unread` counts ACTIVE
-  # sessions only, so someone who left a message and sealed — the answering-machine case — shows up
-  # in `sealed_unread` and contributes zero here; polling on total_unread alone slept through them
-  # indefinitely. `// []` because the daemon omits sealed_unread entirely when it is empty.
+  # sessions only, so someone who left a message and ended the session — the answering-machine case
+  # — shows up in `ended_unread` and contributes zero here; polling on total_unread alone slept
+  # through them indefinitely. `// []` because the daemon omits ended_unread entirely when empty.
+  # `ended_unread` holds FOUR terminal statuses and only `sealed` is notarized — read each entry's
+  # `status`/`notarized` before telling the operator anything about a receipt.
   PENDING=$(echo "$RESULT" | jq '[.agents[] | select(
       .total_unread > 0
       or ((.pending_session_requests // []) | length) > 0
-      or ((.sealed_unread // []) | length) > 0
+      or ((.ended_unread // []) | length) > 0
       or ((.expired_session_requests // []) | length) > 0
     )] | length')
   # A non-numeric PENDING means jq could not read the response — a real failure, not "nobody called".

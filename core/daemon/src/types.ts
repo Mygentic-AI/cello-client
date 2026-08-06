@@ -338,6 +338,43 @@ export interface DaemonConfig {
    */
   onShutdown?: () => Promise<void>;
   /**
+   * DOD-LOGOUT-EXIT-1: the daemon has finished stopping and is ready for the process to end.
+   * Fired as the LAST act of stop(), after the singleton lock is released, on every path — the
+   * bin's SIGTERM handler AND the IPC `shutdown` verb that `cello logout` uses.
+   *
+   * Why this exists. The two shutdown paths were not symmetric: the signal handler ran
+   * `await handle.stop(); process.exit(0)`, while the IPC path started stop(), acknowledged, and
+   * never exited — it relied on the event loop draining by itself. But stop() releases the socket,
+   * the lock file and the singleton lock, which are exactly the two facts `logout`'s `daemonGone()`
+   * consults, so the daemon went HANDLE-FREE WHILE STILL ALIVE: every local check agreed it was
+   * gone while it still held an ESTABLISHED connection to a directory node. A kill switch may not
+   * lie, and the handles being correctly released is precisely why this one hid.
+   *
+   * Why a hook and not a `process.exit()` in stop(). daemon.ts is called IN-PROCESS by vitest and by
+   * embedders; exiting there would kill the test runner. Only the binary owns the process, so only
+   * the binary may end it.
+   *
+   * Why chasing the stragglers instead was rejected: the set of things that can hold the loop
+   * (unawaited libp2p teardown, an in-flight dial with no timeout, the Telegram long-poll whose
+   * stop only bumps a generation counter, in-flight registry/manifest fetches) is open-ended, and
+   * the next addition would reintroduce the lie silently. Fix them on their own merits; do not make
+   * the kill switch depend on having found all of them.
+   *
+   * Fired at most ONCE per daemon, even if stop() is called again.
+   *
+   * CARRIES THE OUTCOME, and the caller must act on it. `ok: false` means the teardown threw
+   * partway — sessions possibly not marked interrupted, the database possibly not checkpointed.
+   * The process must still end (a half-stopped daemon may not keep talking to a directory), but it
+   * must not claim it stopped cleanly: the binary exits NON-ZERO on `ok: false`. Exiting 0 for both
+   * would reintroduce, one level up, exactly the lie this hook was added to kill.
+   *
+   * A throw from this hook is NOT swallowed — it propagates out of stop(). This is the only call
+   * that ends the process, so a failure here means the kill switch did not fire, and that must be
+   * loud enough for `cello logout` to time out and report failure rather than print "Daemon
+   * stopped." over a daemon that is still running.
+   */
+  onStopped?: (outcome: { ok: boolean; error?: Error }) => void | Promise<void>;
+  /**
    * DOD-REGISTRY-1: Ed25519 pubkey (hex) for verifying the type registry inner signature.
    * Build-time pinned. When absent, the registry poll is disabled (all types unclassified).
    */

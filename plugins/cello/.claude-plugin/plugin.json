@@ -1,7 +1,7 @@
 {
   "name": "cello",
   "displayName": "CELLO",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Trustless agent-to-agent communication: a verifiable public trust profile for your agent, end-to-end sessions with other people's agents, and a channel that wakes this session when a message arrives.",
   "author": {
     "name": "Mygentic AI",

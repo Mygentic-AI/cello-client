@@ -875,7 +875,7 @@ export class SessionNodeManager {
       "ALTER TABLE sessions ADD COLUMN session_name TEXT",
       // DOD-SEALED-INBOX-1: local-only housekeeping flag — epoch-ms timestamp set by cello_dismiss.
       // Never propagated, never part of the seal ceremony or hash chain. A dismissed terminal
-      // session is excluded from cello_inbox's sealed_unread section. Distinct from the read
+      // session is excluded from cello_inbox's ended_unread section. Distinct from the read
       // watermark: this records "operator acknowledged via dismiss", not "operator received via
       // cello_receive". NULL = not yet dismissed.
       "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
@@ -917,7 +917,7 @@ export class SessionNodeManager {
     // operator, that no one would otherwise ever read.
     //
     // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
-    // nothing here is joined by `getUnreadSummary`, `getSealedUnread`, any inbox count or any wake
+    // nothing here is joined by `getUnreadSummary`, `getEndedUnread`, any inbox count or any wake
     // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
     // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
     // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed
@@ -1379,7 +1379,7 @@ export class SessionNodeManager {
 
   /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
    *  messages beyond the read watermark, excluding terminal sessions (sealed, abandoned,
-   *  seal_interrupted_pending) which belong in getSealedUnread instead.
+   *  seal_interrupted_pending) which belong in getEndedUnread instead.
    *  Sessions with no sessions row are treated as non-terminal (LEFT JOIN).
    *  Content-free (counts + ids + last seq, never message text); a COUNT/MAX query, no decrypt. */
   getUnreadSummary(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
@@ -1406,10 +1406,17 @@ export class SessionNodeManager {
   }
 
   /** DOD-SEALED-INBOX-1: terminal sessions with unread received messages that have not been
-   *  dismissed. These are answering-machine style messages left in a sealed session — the operator
+   *  dismissed. These are answering-machine style messages left in an ENDED session — the operator
    *  can read them via cello_transcript but cannot advance the watermark via cello_receive.
-   *  Only returned when read_at IS NULL (not yet dismissed). */
-  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> {
+   *  Only returned when read_at IS NULL (not yet dismissed).
+   *
+   *  DOD-SEALED-INBOX-2: named `getEndedUnread`, not `getSealedUnread`, and it SELECTS `s.status`.
+   *  All four #TERMINAL_STATUSES belong here — that part was always right — but only `sealed` is
+   *  NOTARIZED. The old name and the caller's hardcoded `session_state: "sealed"` asserted a
+   *  cryptographic receipt for `abandoned`, `interrupted` and `seal_interrupted_pending` sessions,
+   *  which have none. Callers must render the row's own status; there is nothing to infer from
+   *  membership in this list beyond "it ended". */
+  getEndedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
