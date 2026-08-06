@@ -763,3 +763,64 @@ describe("cello_doc_diff reports OVERLAP as a computed answer", () => {
     });
   });
 });
+
+describe("DOD-DOC-SCREEN-1 — the content gate is REACHED, and it refuses rather than rewrites", () => {
+  it("refuses a peer's update carrying a bidi override, and the operator's copy is untouched", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "agreed text\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // U+202E renders the text that follows it in reverse, so what an operator READS and what the
+    // document SAYS differ. In a shared document that is a signature on content the signer did not
+    // see — which is why it is refused rather than stripped.
+    await b.call("cello_doc_write", {
+      document_id: documentId,
+      content: "agreed text\nsafe\u202Eelbisiv\n",
+    });
+    await b.sweep();
+
+    // REFUSED, and A's copy is byte-identical to what it held before. Not "sanitized" — the whole
+    // finding behind this line is that rewriting one party's replica is permanent divergence that
+    // both sides converge on and neither can see.
+    await vi.waitFor(() =>
+      expect(a.layer.store.listQuarantined(a.owner, documentId).length, "A never quarantined it").toBeGreaterThan(0),
+    );
+    expect(a.text(documentId)).toBe("agreed text\n");
+    expect(a.text(documentId)).not.toContain("\u202E");
+  });
+
+  it("ADMITS legitimate non-Latin text the message sanitizer would have rewritten", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "notes\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Every one of these was silently altered in the audit. Admitting them is as much the claim as
+    // refusing the override above: a rule that refused these would make CELLO unusable for exactly
+    // the operators most likely to need it.
+    const real = "notes\nकर्‍म 👨‍👩‍👧 Ｈｅｌｌｏ ﬁle is ½ it…\n";
+    await b.call("cello_doc_write", { document_id: documentId, content: real });
+    await b.sweep();
+
+    await vi.waitFor(() => expect(a.text(documentId)).toBe(real));
+    // BYTE-IDENTICAL, which is the property the whole line exists for.
+    expect(a.text(documentId)).toBe(b.text(documentId));
+  });
+});

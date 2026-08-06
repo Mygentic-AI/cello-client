@@ -452,6 +452,36 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(await statusOf(client, sid)).toBe("abandoned"); // terminal in --all
     });
 
+    it("DOD-RETRYQ-STRAND-1: force-abandon reaps the session's stranded retry rows — retryQueueDepth returns to 0", async () => {
+      // The live defect: a direct-resend row whose session went terminal is unreachable by every
+      // removal path that exists (drainSession, its only consumer, has no production caller), so
+      // retryQueueDepth stayed pinned at 1 for 25.6h and could no longer distinguish a real
+      // delivery backlog from a corpse. Revert test: without the terminal-transition wiring the
+      // final assertion reads 1, not 0.
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      const client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "f9".repeat(16);
+      seedSession("alice", sid, { createdAt: Date.now() });
+
+      await client.send("queue_failed_send", {
+        sessionId: sid,
+        nonce: Buffer.from("nonce-strand-1").toString("hex"),
+        content: Buffer.from("content the sender believes was sent").toString("hex"),
+      });
+      const before = (await client.send("status", {})) as { retryQueueDepth: number };
+      expect(before.retryQueueDepth).toBe(1);
+
+      const closed = (await client.send("cello_close_session", { session_id: sid, force: true })) as { ok: boolean };
+      expect(closed.ok).toBe(true);
+
+      const after = (await client.send("status", {})) as { retryQueueDepth: number };
+      expect(after.retryQueueDepth).toBe(0);
+    });
+
     it("reaps a DEAD half-open session on read — 0 RECEIVED + not alive + past TTL — even though message_count is 1 (its own Dispatched ack)", async () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);

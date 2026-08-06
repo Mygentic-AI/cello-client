@@ -508,6 +508,10 @@ export class SessionNodeManager {
   // retry_queue (and, in 3b, the relay park deposit). Injected after construction
   // because RetryQueue is built later in daemon.ts. When unset, the awaiting-ACK timer
   // still fires and the ACK still resolves — only the durable crash-backstop is skipped.
+  // DOD-RETRYQ-STRAND-1: fired on the transition INTO a status from which no resend can ever
+  // succeed, so durable state keyed to that session gets a disposition instead of stranding.
+  // Injected after construction because RetryQueue is built later in daemon.ts.
+  #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
@@ -659,6 +663,15 @@ export class SessionNodeManager {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
     this.#onParkFailed = hooks.onParkFailed ?? null;
+  }
+
+  /**
+   * DOD-RETRYQ-STRAND-1: wire the disposition of durable state a session can no longer drain.
+   * Fires once per transition INTO a status from which no resend can succeed. Injected by the
+   * composition root (daemon.ts) after the RetryQueue exists.
+   */
+  setSessionTerminalHook(hook: (sessionId: string, terminalStatus: "sealed" | "abandoned") => void): void {
+    this.#onSessionTerminal = hook;
   }
 
   /**
@@ -6086,6 +6099,25 @@ export class SessionNodeManager {
           "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?",
         )
         .run(status, now, this.#requireAgentId(agentName), sessionId);
+      // DOD-RETRYQ-STRAND-1: only AFTER the status write actually landed. Disposing of durable
+      // state on the strength of a write that failed would discard content while the session is
+      // still, on disk, drainable. 'interrupted' and 'seal_interrupted_pending' are deliberately
+      // NOT terminal — both can still complete, and reaping them would destroy live content.
+      if (status === "sealed" || status === "abandoned") {
+        try {
+          this.#onSessionTerminal?.(sessionId, status);
+        } catch (hookErr: unknown) {
+          // The status flip is the caller's contract and has already succeeded; a failing
+          // disposition must not turn it into a reported failure. Named so the strand it leaves
+          // behind is attributable rather than mysterious.
+          this.#logger.error("session.terminal.disposition.failed", {
+            sessionId,
+            status,
+            error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+            impact: "durable state keyed to this session was not disposed of and may strand",
+          });
+        }
+      }
       return true;
     } catch (err: unknown) {
       // CC-5 (reviewer F-2): status-agnostic event + the actual target status in context — this method

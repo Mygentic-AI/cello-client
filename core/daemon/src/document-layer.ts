@@ -26,6 +26,7 @@ import { verify } from "@cello-protocol/crypto";
 import { DocumentStore } from "./document-store.js";
 import { DocumentEngine } from "./document-engine.js";
 import { DocumentGate } from "./document-gate.js";
+import { screeningRule, SCREEN_RULE_ID } from "./document-screen.js";
 import { DocumentRejections } from "./document-rejection.js";
 import { DocumentInbound } from "./document-inbound.js";
 import { DocumentAckInbound } from "./document-ack-inbound.js";
@@ -161,6 +162,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const store = new DocumentStore(db, logger);
   const engine = new DocumentEngine(logger);
   const gate = new DocumentGate(engine, {}, logger);
+  // DOD-DOC-SCREEN-1 — REGISTERED, not merely written.
+  //
+  // The gate has carried a comment saying this rule plugs in here since the gate was built, and the
+  // rule not existing was the whole gap: document content reached the CRDT with no content gate at
+  // all, because the message sanitizer is deliberately kept off this path (it REWRITES, and
+  // rewriting a replica is permanent divergence).
+  //
+  // Registered at construction rather than by a caller, for the reason this milestone learned four
+  // separate times — a unit with no caller reads exactly like a working one. If this line is
+  // deleted the screening tests still pass, so `document-surface-e2e` asserts a refusal end to end.
+  gate.addRule(SCREEN_RULE_ID, screeningRule);
   const rejections = new DocumentRejections(store, logger);
   // Epoch zero comes from the stored PROPOSAL, not from the envelope log — see `LiveDocuments.get`.
   // Declared before `handshake` exists, so it is resolved lazily; a rebuild only ever happens long

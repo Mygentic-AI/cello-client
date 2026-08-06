@@ -377,6 +377,69 @@ export class RetryQueue {
     return delivered;
   }
 
+  /**
+   * Remove the DIRECT-resend entries (awaiting_ack = 0) of a session that can never drain again.
+   *
+   * Removal is authorised by ONE thing: the session reached a status from which no resend can
+   * succeed. Never by age — "old" is not "undeliverable", and an age sweep discards live content
+   * on a slow link (the DOD-SESSION-REAP-1 rule).
+   *
+   * Awaiting-ACK rows are deliberately left alone. They drain through `drainAwaitingToPark`, which
+   * the startup flush really calls, so they are not stranded; their terminal disposition is a
+   * separate concern. Deleting them here would discard content that path still owes delivery on.
+   *
+   * @returns how many entries were removed — 0 is the normal case and is silent.
+   */
+  reapTerminalSession(sessionId: string, terminalStatus: "sealed" | "abandoned"): number {
+    // The in-memory queue is not the authority: a row written by an EARLIER daemon exists only in
+    // the DB until loadFromDb runs, and the live strand this fixes was exactly that shape. Delete
+    // by SQL and report what the DB actually removed.
+    const entries = this.#queues.get(sessionId) ?? [];
+
+    let removed: number;
+    try {
+      const result = this.#db
+        .prepare("DELETE FROM retry_queue WHERE session_id = ? AND awaiting_ack = 0")
+        .run(sessionId) as unknown as { changes?: number | bigint };
+      // better-sqlite3 and node:sqlite both report `changes`; normalise the BIGINT some builds return.
+      removed = Number(result?.changes ?? entries.length);
+    } catch (err: unknown) {
+      // A failed DELETE must not leave memory claiming the rows are gone — the next loadFromDb
+      // would resurrect them and the depth would silently disagree with the DB.
+      this.#logger.error("message.retry.persist.failed", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "terminal-session reap did not remove the rows; retryQueueDepth stays pinned",
+      });
+      return 0;
+    }
+
+    // Each dropped entry is content the sender believes it sent. Say so per entry, with the nonce,
+    // so the loss is nameable rather than a bare count.
+    for (const entry of entries) {
+      this.#logger.warn("session.retryqueue.content.dropped", {
+        sessionId,
+        nonce: entry.nonceHex,
+        reason: terminalStatus,
+        impact: "queued content was never delivered and is now discarded — the session can no longer drain",
+      });
+    }
+
+    this.#queues.delete(sessionId);
+    this.#positionCounters.delete(sessionId);
+
+    if (removed > 0) {
+      this.#logger.info("session.retryqueue.reaped", {
+        sessionId,
+        entryCount: removed,
+        disposition: "dropped",
+        reason: terminalStatus,
+      });
+    }
+
+    return removed;
+  }
+
   /** Total retry queue depth across all sessions. */
   getTotalDepth(): number {
     let total = 0;

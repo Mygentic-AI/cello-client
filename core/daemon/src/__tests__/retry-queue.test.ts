@@ -435,6 +435,153 @@ describe("RetryQueue", () => {
   // now provided by whole-DB SQLCipher (proven in persist-002-sqlcipher.test.ts). The RetryQueue
   // stores its content_blob as plaintext bytes within the encrypted DB; these unit tests run against
   // an in-memory node:sqlite handle and assert the queue logic, not at-rest encryption.
+
+  describe("DOD-RETRYQ-STRAND-1: reap direct rows whose session can never drain", () => {
+    // A direct-resend row (awaiting_ack = 0) is reachable ONLY by drainSession, which has no
+    // production caller. Once its session goes terminal no drain can ever succeed — there is no
+    // live transport to resend over — so the row is unreachable by every removal path that exists
+    // and pins retryQueueDepth forever. Found on the live daemon: one row stranded 25.6h.
+
+    it("removes a terminal session's direct rows and returns depth to 0", () => {
+      const sessionId = "session-sealed";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      expect(retryQueue.getTotalDepth()).toBe(2);
+
+      const reaped = retryQueue.reapTerminalSession(sessionId, "sealed");
+
+      expect(reaped).toBe(2);
+      expect(retryQueue.getSessionDepth(sessionId)).toBe(0);
+      expect(retryQueue.getTotalDepth()).toBe(0);
+      // Durable too — a reap that only clears memory comes back at the next loadFromDb.
+      const rows = db
+        .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ?")
+        .get(sessionId) as unknown as { n: number };
+      expect(rows.n).toBe(0);
+    });
+
+    it("tells the operator, per entry, that the content was dropped and never delivered", () => {
+      // AC3: silently discarding a message the sender believes was sent is the worse failure. The
+      // enqueue-time WARN says the SEND failed; this says the queued copy is now GONE. Distinct
+      // events because they are distinct facts — the first still left a retry outstanding.
+      const sessionId = "session-abandoned";
+      const nonce = randomBytes(32);
+      retryQueue.enqueue(sessionId, nonce, randomBytes(64));
+      logEvents.length = 0;
+
+      retryQueue.reapTerminalSession(sessionId, "abandoned");
+
+      const dropped = logEvents.filter((e) => e.event === "session.retryqueue.content.dropped");
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0].level).toBe("warn");
+      expect(dropped[0].context.sessionId).toBe(sessionId);
+      expect(dropped[0].context.nonce).toBe(Buffer.from(nonce).toString("hex"));
+      // The terminal status is the EVIDENCE for the reap — it must reach the operator, or the
+      // message reads as an unexplained deletion.
+      expect(dropped[0].context.reason).toBe("abandoned");
+    });
+
+    it("emits a summary event carrying the count actually reaped", () => {
+      const sessionId = "session-summary";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      logEvents.length = 0;
+
+      retryQueue.reapTerminalSession(sessionId, "sealed");
+
+      const summary = logEvents.find((e) => e.event === "session.retryqueue.reaped");
+      expect(summary).toBeDefined();
+      expect(summary?.context.entryCount).toBe(2);
+      expect(summary?.context.sessionId).toBe(sessionId);
+    });
+
+    it("is silent when the session has no direct rows — a signal that fires on the normal case is not a signal", () => {
+      // §5a corollary: an event on every terminal session (the overwhelming majority have nothing
+      // queued) would bury the one occurrence that means content was actually lost.
+      logEvents.length = 0;
+      const reaped = retryQueue.reapTerminalSession("session-with-nothing-queued", "sealed");
+      expect(reaped).toBe(0);
+      expect(logEvents.filter((e) => e.event === "session.retryqueue.reaped")).toHaveLength(0);
+      expect(logEvents.filter((e) => e.event === "session.retryqueue.content.dropped")).toHaveLength(0);
+    });
+
+    it("NEVER reaps by age — an old row on a still-live session survives", () => {
+      // AC2, and the same rule as DOD-SESSION-REAP-1: "old" is not "undeliverable". An age sweep
+      // discards live content on a slow link. The ONLY evidence that authorises removal is the
+      // session's terminal status.
+      const sessionId = "session-still-active";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      // Backdate it well beyond any plausible age threshold.
+      db.prepare("UPDATE retry_queue SET queued_at = ? WHERE session_id = ?")
+        .run(Date.now() - 90 * 24 * 60 * 60 * 1000, sessionId);
+
+      const reloaded = new RetryQueue(db, logger);
+      reloaded.loadFromDb();
+
+      // There is deliberately no age-based sweep to call. The row stays until its session is
+      // terminal — asserted here so that adding one later turns this test red.
+      expect(reloaded.getSessionDepth(sessionId)).toBe(1);
+    });
+
+    it("leaves OTHER sessions' rows untouched", () => {
+      const doomed = "session-doomed";
+      const healthy = "session-healthy";
+      retryQueue.enqueue(doomed, randomBytes(32), randomBytes(64));
+      retryQueue.enqueue(healthy, randomBytes(32), randomBytes(64));
+
+      retryQueue.reapTerminalSession(doomed, "sealed");
+
+      expect(retryQueue.getSessionDepth(doomed)).toBe(0);
+      expect(retryQueue.getSessionDepth(healthy)).toBe(1);
+    });
+
+    it("does NOT touch awaiting-ACK rows — they have a real consumer and their own disposition", () => {
+      // Scope boundary, deliberate. awaiting_ack = 1 rows drain via drainAwaitingToPark, which the
+      // startup flush actually calls, so they are not stranded by construction. Their terminal
+      // disposition (annex + confirm-delete) is DOD-TERMINAL-WAKE-1's, not this unit's. Reaping
+      // them here would delete content that path is still responsible for delivering.
+      const sessionId = "session-mixed";
+      const agentId = "agent-id-alice-0001";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
+
+      const reaped = retryQueue.reapTerminalSession(sessionId, "sealed");
+
+      expect(reaped).toBe(1);
+      expect(retryQueue.getSessionDepth(sessionId)).toBe(0);
+      expect(retryQueue.getAwaitingDepth(agentId, sessionId)).toBe(1);
+      const surviving = db
+        .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
+        .get(sessionId) as unknown as { n: number };
+      expect(surviving.n).toBe(1);
+    });
+
+    it("is idempotent — reaping twice does not double-report dropped content", () => {
+      const sessionId = "session-twice";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+      expect(retryQueue.reapTerminalSession(sessionId, "sealed")).toBe(1);
+      logEvents.length = 0;
+      expect(retryQueue.reapTerminalSession(sessionId, "sealed")).toBe(0);
+      expect(logEvents.filter((e) => e.event === "session.retryqueue.content.dropped")).toHaveLength(0);
+    });
+
+    it("reaps rows that exist ONLY in the DB — the live strand shape, recovered at startup", () => {
+      // Andre's stranded row predates any in-memory queue: it was written by an earlier daemon and
+      // is present only after loadFromDb. A reap that consulted memory alone would never find it.
+      const sessionId = "session-from-disk";
+      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+
+      const afterRestart = new RetryQueue(db, logger);
+      afterRestart.loadFromDb();
+      expect(afterRestart.getSessionDepth(sessionId)).toBe(1);
+
+      expect(afterRestart.reapTerminalSession(sessionId, "abandoned")).toBe(1);
+      const rows = db
+        .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ?")
+        .get(sessionId) as unknown as { n: number };
+      expect(rows.n).toBe(0);
+    });
+  });
 });
 
 /**
