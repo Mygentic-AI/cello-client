@@ -393,6 +393,8 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     agents,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
+    // M12-P17: annexed content bypasses the live inbound funnel, so it is screened here instead.
+    securityGateway,
   });
   const autoRecoverForAgent = (agentName: string, trigger?: string): Promise<void> =>
     contentPark.autoRecoverForAgent(agentName, trigger);
