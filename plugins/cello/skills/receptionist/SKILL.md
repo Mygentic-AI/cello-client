@@ -79,7 +79,7 @@ independent of whatever the connection currently holds. An unknown name is refus
 
 ### 4 — Handle anything already waiting
 
-If there are pending session requests, unread messages, or sealed unread sessions:
+If there are pending session requests, unread messages, or ended sessions with unread messages:
 
 1. **Calculate age:** compute how long ago the message arrived using `createdAt` (ms epoch) vs the current time. Express it as "X minutes ago", "X hours ago", etc.
 2. **Read the content:**

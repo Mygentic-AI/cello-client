@@ -225,12 +225,19 @@ describe("DOD-SEALED-INBOX-2: the inbox must not claim a session is notarized wh
     const md = await readFile(join(PLUGIN_ROOT, "agents/cello-receptionist.md"), "utf8");
     expect(md).toContain("ended_unread");
     // Anchored so `ended_unread` cannot satisfy a search for the dead name.
-    expect(md, "the dead key must not survive in the shipped agent").not.toMatch(/(?<!_)\bsealed_unread\b/);
+    // Match the STEM, unanchored. `\bsealed_unread\b` looked careful and was worse than useless:
+    // the trailing \b cannot match before `_`, so `sealed_unread_guidance` and
+    // `sealed_unread_actionable` sailed through green. There is no `sealed_unread` substring inside
+    // `ended_unread`, so the loose form cannot false-positive.
+    expect(md, "the dead key must not survive in the shipped agent").not.toMatch(/sealed_unread/);
+    // ...and the prose form of the same dead vocabulary, which no key-shaped grep would catch.
+    expect(md, "the dead WORDING must not survive either").not.toMatch(/sealed unread/i);
   });
 
   it("the shipped receptionist SKILL names the new key", async () => {
     const md = await readFile(join(PLUGIN_ROOT, "skills/receptionist/SKILL.md"), "utf8");
     expect(md).toContain("ended_unread");
-    expect(md, "the dead key must not survive in the shipped skill").not.toMatch(/(?<!_)\bsealed_unread\b/);
+    expect(md, "the dead key must not survive in the shipped skill").not.toMatch(/sealed_unread/);
+    expect(md, "the dead WORDING must not survive either").not.toMatch(/sealed unread/i);
   });
 });
