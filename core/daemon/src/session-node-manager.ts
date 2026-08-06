@@ -4181,7 +4181,21 @@ export class SessionNodeManager {
       this.#logger.warn("session.content.orphaned", { agentName, sessionId, correlationId });
       return { ok: false, reason: "session_orphaned" };
     }
-    if (record.status === "sealed" || record.status === "seal_interrupted_pending") {
+    // DOD-TERMINAL-WAKE-1 (review F1): `abandoned` belongs here too. It is terminal and, unlike
+    // `interrupted`, can NEVER complete — there is nothing left to append to and no seal to join.
+    // Without it, late content for a force-abandoned session was accepted: a leaf was written, the
+    // `cello_message` doorbell rang, the away-response and Telegram doorbell fired, and
+    // `cello_receive` handed it over as live work. That is the same "agent obeys a directive out of
+    // a conversation that has ended" harm as the sealed case, reached with no restart at all.
+    //
+    // `currentStatus` carries the real status onward: the content-park disposition and the operator
+    // must be able to tell an abandoned session from a sealed one, and `session_committed` alone is
+    // the exit point, not the cause.
+    if (
+      record.status === "sealed" ||
+      record.status === "seal_interrupted_pending" ||
+      record.status === "abandoned"
+    ) {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
         reason: "session_committed",

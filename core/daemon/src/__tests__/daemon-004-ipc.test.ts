@@ -779,6 +779,35 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     } finally { client.close(); }
   });
 
+  it("DOD-TERMINAL-WAKE-1 (F1): an ABANDONED session refuses late content — no leaf, no doorbell, no live delivery", async () => {
+    // The review's HIGH finding, and it needs no restart. `abandoned` is terminal and can NEVER
+    // complete — unlike `interrupted` / `seal_interrupted_pending`, which can — so content arriving
+    // for it (via the relay park/recover path, after the node is retired) must not produce a leaf
+    // or ring the doorbell. Before this guard it did both, and cello_receive then delivered it as
+    // live work: the same "agent obeys a directive out of a dead conversation" harm as the sealed
+    // case, on the live-arrival path.
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    const node = new FakeNode();
+    const h = await start({ logger, node });
+    const snm = h.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+
+    let doorbells = 0;
+    snm.setOnContentArrived(() => { doorbells += 1; });
+
+    await snm.abandonSession("alice", SID);
+
+    const late = new TextEncoder().encode("[[STANDBY EST:15m]] still waiting on you");
+    const res = await snm.ingestReceivedContent("alice", SID, late, msgLeafHash(late));
+
+    expect(res.ok).toBe(false);
+    // The refusal must carry the REAL status, not just an exit-point label, or the content-park
+    // disposition cannot tell an abandoned session from a sealed one.
+    expect(res.reason).toBe("session_committed");
+    expect(doorbells).toBe(0);
+  });
+
   it("DOD-TERMINAL-WAKE-1: the sealed answer SURVIVES a daemon restart — an unread message must not come back as live work", async () => {
     // Observed live 2026-08-05 on Miss_Chelly_H: three sessions sealed in the morning re-fired as
     // wakes six to eight hours later, and one carried a `[[STANDBY EST:15m]]` directive the agent
