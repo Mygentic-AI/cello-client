@@ -1017,6 +1017,23 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "doc",
     group: "Documents",
+    // DECLARED, not merely read in the body. The `run` below takes `--type`, `--content` and
+    // `--append-only`, and the help advertises all three — but `checkArgs` validates against THIS
+    // list, so without it every one of them was rejected as an unknown flag before the body ever
+    // ran. Help promising a flag the parser refuses is worse than no help: the operator does
+    // exactly what they were told and is told they are wrong.
+    //
+    // Caught on the first command of the first live smoke, which is the only place it could be —
+    // the parity tests call the exported functions directly and never go through argument parsing.
+    flags: [
+      // `--agent` is `consumesValue: false` to match every other command — see the note on
+      // AGENT_FLAG above: true would turn a typo like `--agent --bogus` from a loud unknown_flag
+      // into a silently swallowed one.
+      { name: "--agent", consumesValue: false },
+      { name: "--type", consumesValue: true },
+      { name: "--content", consumesValue: true },
+      { name: "--append-only", consumesValue: false },
+    ],
     summary: "Share a living document with a counterparty — both sides edit, both sides converge.",
     help:
       "Usage:\n" +

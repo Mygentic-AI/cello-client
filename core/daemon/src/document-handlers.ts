@@ -651,6 +651,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // back to us as "what changed since I looked" — which the tool description frames as the
     // COUNTERPARTY's contribution — and `overlap` has nothing to separate mine from theirs.
     layer.notifications.markWritten(who.ownerAgentId, documentId, content);
+    // AND THE FILE. `cello_doc_write` changes the document; without this the operator's own
+    // projection on disk is stale the moment they use it, and the two surfaces disagree about the
+    // document they both claim to show.
+    //
+    // Worse than cosmetic: `cello_doc_publish` diffs the FILE against the last recorded projection,
+    // so a stale file either refuses as `document_file_stale` or — if it happened to match an older
+    // baseline — republishes text the document has already moved past. Found on the first live
+    // two-agent smoke, where the author's own file was missing the line she had just written.
+    await materialize(who.ownerAgentId, documentId, document.documentType);
     // Delivery is the worker's, not this call's — publish is fire-and-forget by design (§16.4), and
     // a write that blocked on an offline peer would make editing a shared document depend on the
     // other party being awake.
