@@ -38,10 +38,17 @@ export interface ContentParkDeps {
    * as the only thing between a stale instruction and an agent that acts on it.
    */
   securityGateway: SecurityGatewayClient;
+  /**
+   * M12-P17: seam for tests. Production leaves it undefined and gets the real client. Injecting it
+   * is what makes the recover path's screening branches reachable — one of them DELETES the relay
+   * copy, and an untested delete path is where this milestone's defects have consistently lived.
+   */
+  makeContentParkClient?: (opts: { relayPeerId: string; relayAddrs: string[]; logger: Logger }) => ContentParkClient;
 }
 
 export function createContentPark(deps: ContentParkDeps) {
   const { logger, sessionNodeManager, agents, getKeyProvider, securityGateway } = deps;
+  const newParkClient = deps.makeContentParkClient ?? ((o) => new ContentParkClient(o));
 
   // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
   // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
@@ -82,7 +89,7 @@ export function createContentPark(deps: ContentParkDeps) {
     // misdescribed this incident 102 times.
     if (!node) return { ok: false, reason: sessionNodeManager.standingReceiverAbsenceReason(recipientAgent.name) };
     const recipientPubkey = recipientAgent.pubkey ?? "";
-    const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
+    const client = newParkClient({ relayPeerId, relayAddrs, logger });
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
     let recovered = 0;
     // SEC-1 / review M2: a REFUSED entry must not vanish behind `ok:true`. Report it — an operator
@@ -170,17 +177,11 @@ export function createContentPark(deps: ContentParkDeps) {
         // relay holding the ciphertext could substitute content under a genuine hash, have it
         // annexed, and have the real copy confirm-deleted. It also makes INSERT OR IGNORE sound:
         // identical hash now genuinely means identical bytes.
-        // KNOWN COVERAGE GAP, deliberately not faked: the three verdict branches below (allow /
-        // redact, terminal block, transient) have no unit test. Reaching them means driving
-        // `recoverParkedFromRelay`, which needs a ContentParkClient with a real pull + confirm — the
-        // client is constructed inside this module, so it cannot be stubbed without either injecting
-        // it through ContentParkDeps or vi.mock-ing the module. Both are honest; neither is a
-        // five-line change, and a test that stubbed the screen itself would pin a double and prove
-        // nothing — which is the mistake that let this unit's envelope-vs-message defect ship.
-        // Recorded here at the point of absence. The seam to build when it is tested: inject
-        // ContentParkClient via deps, then assert (1) a terminal block is confirm-deleted and NOT
-        // annexed, (2) a transient block keeps the relay copy and annexes nothing, (3) a redact
-        // verdict annexes the ALTERED bytes.
+        // All three verdict branches below are covered by m12-p17-annex-screening.test.ts, driven
+        // through this real function with an injected park client and REAL sealed envelopes. The one
+        // that matters is TRANSIENT: collapsing it into the terminal branch would delete a good
+        // message because the screener was momentarily down — permanent loss caused by an outage.
+        // That exact confusion was injected and the test goes red on it.
         let annexed = false;
         let screenedOut = false;
         let screenDeferred = false;
@@ -434,5 +435,8 @@ export function createContentPark(deps: ContentParkDeps) {
     });
   }
 
-  return { autoRecoverForAgent, registerHandlers };
+  // M12-P17: exported for the screening/annex tests. `autoRecoverForAgent` walks every relay the
+  // agent has a session on and swallows per-relay errors by design, so it cannot assert what one
+  // entry did; this is the single-relay drain the assertions need.
+  return { autoRecoverForAgent, registerHandlers, recoverParkedFromRelay };
 }
