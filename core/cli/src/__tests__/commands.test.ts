@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, type DaemonHandle } from "@cello-protocol/daemon";
+import { startDaemon, acquireLock, readLock, connectToDaemon, isProcessAlive, acquireSingletonLock, type DaemonHandle } from "@cello-protocol/daemon";
 import { PassthroughGatewayClient } from "@cello-protocol/daemon/testing";
 import type { Logger, DaemonConfig } from "@cello-protocol/daemon";
 import { createServer, type Server } from "node:net";
@@ -260,6 +260,46 @@ describe("cli commands", () => {
       expect(parsed.daemon).toBe("running");
       expect(parsed.directory_signaling).toBe("reconnecting");
       expect(Array.isArray(parsed.agents)).toBe(true);
+    });
+
+    // DOD-LOGOUT-EXIT-1 AC3. `status` decided "stopped" from a single FILE STAT — the absence of
+    // daemon.lock. That is precisely the reasoning `logout` refuses by name a few hundred lines
+    // above ("the lock file does not get to decide whether a daemon exists"), and it is the same
+    // lie: an exiting orphan unlinks a healthy daemon's lock, and so does `rm ~/.cello/daemon.lock`.
+    // The operator then reads `stopped` while the daemon is online and on the directory.
+    it("AC3: a LIVE daemon whose daemon.lock was deleted must not read as 'stopped'", async () => {
+      const config = makeConfig();
+      handle = await startDaemon(config);
+
+      await rm(join(tempDir, "daemon.lock"));
+      await expect(readLock(join(tempDir, "daemon.lock"))).resolves.toBeNull();
+
+      const result = await status(tempDir);
+      const parsed = JSON.parse(result.output);
+      // The daemon is right there, answering on the deterministic socket path.
+      expect(parsed.daemon).not.toBe("stopped");
+      expect(parsed.daemon).toBe("running");
+      expect(result.exitCode).toBe(0);
+    });
+
+    // The broken-shutdown state itself: something holds the singleton lock (so a daemon process
+    // exists) but nothing answers on the socket. That is NOT a clean stop and must not read as one.
+    it("AC3: singleton lock held but no socket → a broken shutdown, reported as such, never 'stopped'", async () => {
+      const held = acquireSingletonLock(tempDir, logger);
+      try {
+        const result = await status(tempDir);
+        const parsed = JSON.parse(result.output);
+        // Assert the NAME, not merely "not stopped" — otherwise `unreachable`, `unknown`, or any
+        // other string passes and AC3's actual requirement (this state is identified AS a broken
+        // shutdown) goes untested.
+        expect(parsed.daemon).toBe("broken_shutdown");
+        // ...and that it points the operator at the holder, which is the only actionable part.
+        expect(parsed.detail).toContain("daemon.singleton");
+        expect(parsed.detail).toContain("lsof");
+        expect(result.exitCode).toBe(1);
+      } finally {
+        held.release();
+      }
     });
   });
 
