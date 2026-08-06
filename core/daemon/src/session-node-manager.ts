@@ -917,7 +917,7 @@ export class SessionNodeManager {
     // operator, that no one would otherwise ever read.
     //
     // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
-    // nothing here is joined by `getUnreadSummary`, `getSealedUnread`, any inbox count or any wake
+    // nothing here is joined by `getUnreadSummary`, `getEndedUnread`, any inbox count or any wake
     // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
     // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
     // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed

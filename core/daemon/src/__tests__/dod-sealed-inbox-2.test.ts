@@ -177,10 +177,22 @@ describe("DOD-SEALED-INBOX-2: the inbox must not claim a session is notarized wh
   });
 
   it("guidance states that only sealed sessions are notarized, and no longer asserts they all are", async () => {
+    // Seeds only the genuinely-CLOSED statuses. `interrupted` is deliberately excluded: it is NOT
+    // frozen (it still accepts appends and its counterparty may be waiting to seal), so M12-P17
+    // switches the group to a MIXED guidance and marks it actionable. That branch has its own test;
+    // this one pins the all-closed branch, which is where the "they are all sealed" lie lived.
     await makeAgentDir("alice");
     await start();
     const client = await connectAs("alice");
-    await seedAllTerminalStatuses(client);
+    const mgr = handle!.getSessionNodeManager();
+    for (const [i, status] of ["sealed", "abandoned", "seal_interrupted_pending"].entries()) {
+      const sessionId = String(20 + i).repeat(16).slice(0, 64);
+      await client.send("__test_insert_session_row", {
+        agentName: "alice", sessionId, status, counterpartyPubkey: "cphex",
+      });
+      mgr.recordTranscriptMessage("alice", sessionId, 0, "received",
+        new TextEncoder().encode(`closed ${status}`), "corr");
+    }
 
     const a = await inboxAgent(client);
     const g = a.ended_unread_guidance!;
