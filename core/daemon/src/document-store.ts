@@ -807,15 +807,52 @@ export class DocumentStore {
   }
 
   /** The rejecting agent's most recent envelope for this document, for chain linkage. */
+  /**
+   * The head of a sender's chain AS WE SEE IT — including envelopes we REFUSED.
+   *
+   * A refused envelope is never written to `document_envelopes`, but the sender's chain does not
+   * rewind: their supersession links to the envelope we just refused. Taking the head from the log
+   * alone meant that link never matched, so the supersession was refused as `document_chain_broken`
+   * — and so was everything after it, forever. Measured against two real daemons: the gate fired
+   * ONCE and the next three envelopes never reached it, so the retry round stuck at 1 and the
+   * document could never reach the stall the protocol defines.
+   *
+   * That is the bridge the quarantine was built for — it stores the refused envelope's own author
+   * and prev-hash saying exactly this — and it had only ever been applied to `verifyChainLinkage`,
+   * the local replay check. An earlier attempt added the quarantine to the KNOWN-hash set, which
+   * was not enough and is worth recording: `known` answers "have I seen this before" (duplicate
+   * detection), while the forward link is checked against the HEAD. Bridging the wrong one looks
+   * right and changes nothing.
+   *
+   * `log_index` and the quarantine's `created_at` are different clocks, so they are not merged into
+   * one ORDER BY. Whichever is newer by arrival is the head: a refusal always happens after the
+   * envelope it refuses, so a quarantine row newer than the last admitted envelope IS the head.
+   */
   lastEnvelopeHashBySender(ownerAgentId: string, documentId: string, senderAgentId: string): string | null {
-    const r = this.#db
+    const admitted = this.#db
       .prepare(
-        `SELECT envelope_hash FROM document_envelopes
+        `SELECT envelope_hash, created_at FROM document_envelopes
           WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ?
           ORDER BY log_index DESC LIMIT 1`,
       )
-      .get(ownerAgentId, documentId, senderAgentId) as { envelope_hash?: string } | undefined;
-    return r?.envelope_hash ?? null;
+      .get(ownerAgentId, documentId, senderAgentId) as
+      | { envelope_hash?: string; created_at?: number }
+      | undefined;
+    const refused = this.#db
+      .prepare(
+        `SELECT rejected_envelope_hash AS envelope_hash, created_at FROM document_quarantine
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_sender_agent_id = ?
+          ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, senderAgentId) as
+      | { envelope_hash?: string; created_at?: number }
+      | undefined;
+
+    if (!refused?.envelope_hash) return admitted?.envelope_hash ?? null;
+    if (!admitted?.envelope_hash) return refused.envelope_hash;
+    return (refused.created_at ?? 0) >= (admitted.created_at ?? 0)
+      ? refused.envelope_hash
+      : admitted.envelope_hash;
   }
 
   // ─── delivery (DELIVERY-1) ────────────────────────────────────────────────
