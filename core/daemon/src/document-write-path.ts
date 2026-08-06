@@ -27,6 +27,7 @@ import { join } from "node:path";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
+import { lineRuns, toChunks } from "./line-lcs.js";
 
 /** Yjs roots a materialized document projects from. TEXT_ROOT must match DocumentEngine's. */
 const TEXT_ROOT = "content";
@@ -481,56 +482,19 @@ export function lineHunks(
   const a = toChunks(before);
   const b = toChunks(after);
 
-  // O(n·m) table. Documents this large are not the collaborative-editing case, and a quadratic
-  // table on them would be the wrong kind of thorough — fall back to one hunk and say so.
-  if (a.length > LCS_LINE_LIMIT || b.length > LCS_LINE_LIMIT) {
+  const runs = lineRuns(a, b);
+  if (runs === null) {
+    // Above the LCS limit — one hunk, and the caller is not misled into thinking this is a
+    // measurement of what changed.
     return [{ from: 0, to: before.length, insert: after }];
   }
 
-  // Longest common subsequence over chunks.
-  const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      lcs[i]![j] = a[i] === b[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!);
-    }
-  }
-
-  // Walk the table, collecting contiguous runs of non-matching chunks into hunks.
   const offsets: number[] = [0];
   for (const chunk of a) offsets.push(offsets[offsets.length - 1]! + chunk.length);
 
-  const hunks: Array<{ from: number; to: number; insert: string }> = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length || j < b.length) {
-    if (i < a.length && j < b.length && a[i] === b[j]) {
-      i++;
-      j++;
-      continue;
-    }
-    const startI = i;
-    const startJ = j;
-    while (
-      (i < a.length || j < b.length) &&
-      !(i < a.length && j < b.length && a[i] === b[j])
-    ) {
-      if (j < b.length && (i === a.length || lcs[i]![j + 1]! >= lcs[i + 1]![j]!)) j++;
-      else i++;
-    }
-    hunks.push({
-      from: offsets[startI]!,
-      to: offsets[i]!,
-      insert: b.slice(startJ, j).join(""),
-    });
-  }
-  return hunks;
-}
-
-/** Above this many lines the LCS table is not worth building — see `lineHunks`. */
-const LCS_LINE_LIMIT = 4000;
-
-/** Lines carrying their own trailing newline; the last line carries none. */
-function toChunks(text: string): string[] {
-  const lines = text.split("\n");
-  return lines.map((line, index) => (index < lines.length - 1 ? `${line}\n` : line));
+  return runs.map((r) => ({
+    from: offsets[r.aStart]!,
+    to: offsets[r.aEnd]!,
+    insert: b.slice(r.bStart, r.bEnd).join(""),
+  }));
 }

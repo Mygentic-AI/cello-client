@@ -32,7 +32,34 @@ export interface InitiateSessionDeps {
   getRelayCircuitAddress?: () => string;
 }
 
-export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void {
+/**
+ * Registers `cello_initiate_session` and returns the agent-scoped opener behind it, so a worker can
+ * open a session without an IPC connection. See `openSessionAs`.
+ */
+export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
+  /**
+   * The raw opener. `params` is forwarded to the negotiator as MCP wire names — an INTERNAL caller
+   * should use `openSessionFor` instead, which cannot get those names wrong.
+   */
+  openSessionAs(
+    agentName: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>>;
+  /**
+   * Open a session as `agentName` with a counterparty, named in TypeScript rather than in wire
+   * strings.
+   *
+   * This exists because the wire names are not guessable and a wrong one fails silently-ish: the
+   * negotiator reads `target_pubkey` (falling back to `counterparty_pubkey`) and nothing else, so a
+   * caller passing `pubkey` gets `invalid_target_pubkey` — an error that sends whoever reads it to
+   * look at the PEER's key when the bug is in the caller's own field name. The same class of defect
+   * already exists one seam over in the close handler (`session_id` vs `sessionId`).
+   */
+  openSessionFor(
+    agentName: string,
+    target: { targetPubkey: string },
+  ): Promise<Record<string, unknown>>;
+} {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, resolvedSessionNegotiator, transportSelector, autoNatService,
@@ -53,15 +80,23 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void 
   //   5. Drive the transport selector to dial the counterparty using the
   //      assignment's authoritative transport_mode (SI-001). Map the TransportResult
   //      to the MCP response.
-  handlers.set("cello_initiate_session", async (params, connectionId) => {
-    const connState = getConnState(connectionId);
-    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
-    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
-    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
-    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
-    if (!agentName) {
-      return NO_CURRENT_AGENT_RESPONSE;
-    }
+  /**
+   * Open a session AS a named agent — the handler body, minus the connection.
+   *
+   * Extracted for M14 / DOD-DOC-DELIVERY-2: §16.4's premise is a daemon that opens a session with no
+   * agent attention on either end, and until now this path existed only as an IPC handler, reachable
+   * only by an agent calling `cello_initiate_session`. A worker had nothing to call.
+   *
+   * The split is exactly at the connection boundary: the handler resolves WHICH agent from the
+   * connection's state, and everything after that is agent-scoped and identical for both callers.
+   * Deliberately one implementation rather than two — session establishment is where the transport
+   * mode, the FROST-signed assignment and the counterparty binding are decided, and a second copy
+   * would drift on precisely those.
+   */
+  async function openSessionAs(
+    agentName: string,
+    params: Record<string, unknown> | undefined,
+  ): Promise<Record<string, unknown>> {
     const correlationId = randomUUID();
 
     // AC-004/AC-019: the advertised address is chosen from the standing receiver's
@@ -189,5 +224,24 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): void 
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
     return { ok: true, sessionId, transportMode: result.mode, correlationId };
+  }
+
+  handlers.set("cello_initiate_session", async (params, connectionId) => {
+    const connState = getConnState(connectionId);
+    // CC-3 / M8C-AUTOSTART-1 F18: resolve the target agent — explicit { agent } wins, else this
+    // connection's current agent, else the sole online agent (removes the no_current_agent papercut
+    // after a /mcp reconnect when exactly one agent is online). 2+ online with none selected → null.
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    if (!agentName) {
+      return NO_CURRENT_AGENT_RESPONSE;
+    }
+    return openSessionAs(agentName, params);
   });
+
+  return {
+    openSessionAs,
+    openSessionFor: (agentName, target) =>
+      // The ONE place the wire name is written for internal callers.
+      openSessionAs(agentName, { target_pubkey: target.targetPubkey }),
+  };
 }

@@ -16,23 +16,39 @@
  * access before initialization". Separating construction from registration is what makes a module's
  * POSITION IN THE FILE stop mattering, which is the whole reason startDaemon could be taken apart.
  */
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
+import { decodeParkEnvelope } from "./park-envelope.js";
 
 export interface ContentParkDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
   agents: AgentInfo[];
   getKeyProvider: (agentName: string) => KeyProvider | undefined;
+  /**
+   * M12-P17: the annex is the ONE durable store holding counterparty content that never passed the
+   * inbound screen — `ingestReceivedContent` refuses a committed session before it reaches that
+   * seam. Screening at WRITE makes every future reader safe, rather than leaving a guidance string
+   * as the only thing between a stale instruction and an agent that acts on it.
+   */
+  securityGateway: SecurityGatewayClient;
+  /**
+   * M12-P17: seam for tests. Production leaves it undefined and gets the real client. Injecting it
+   * is what makes the recover path's screening branches reachable — one of them DELETES the relay
+   * copy, and an untested delete path is where this milestone's defects have consistently lived.
+   */
+  makeContentParkClient?: (opts: { relayPeerId: string; relayAddrs: string[]; logger: Logger }) => ContentParkClient;
 }
 
 export function createContentPark(deps: ContentParkDeps) {
-  const { logger, sessionNodeManager, agents, getKeyProvider } = deps;
+  const { logger, sessionNodeManager, agents, getKeyProvider, securityGateway } = deps;
+  const newParkClient = deps.makeContentParkClient ?? ((o) => new ContentParkClient(o));
 
   // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
   // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
@@ -73,7 +89,7 @@ export function createContentPark(deps: ContentParkDeps) {
     // misdescribed this incident 102 times.
     if (!node) return { ok: false, reason: sessionNodeManager.standingReceiverAbsenceReason(recipientAgent.name) };
     const recipientPubkey = recipientAgent.pubkey ?? "";
-    const client = new ContentParkClient({ relayPeerId, relayAddrs, logger });
+    const client = newParkClient({ relayPeerId, relayAddrs, logger });
     const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
     let recovered = 0;
     // SEC-1 / review M2: a REFUSED entry must not vanish behind `ok:true`. Report it — an operator
@@ -135,12 +151,153 @@ export function createContentPark(deps: ContentParkDeps) {
         } catch (err: unknown) {
           logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
         }
+      } else if (ingest.reason === "session_committed") {
+        // M12-P17: the session ENDED before this arrived. It can never join that chain — appending
+        // would change `sealed_root` and invalidate the notarization — but it is VERIFIED content
+        // (SEC-1 authenticated it above; that is what separates this branch from the one below), and
+        // discarding it silently loses a real message the operator was actually sent.
+        //
+        // Without this branch the entry is refused and never confirm-deleted, so every drain pulls,
+        // verifies and refuses it again — measured at ~120 repeats per message, forever, while the
+        // operator never sees it once. Noisy invisible loss.
+        //
+        // ORDER IS LOAD-BEARING: annex FIRST, confirm-delete SECOND, and only if the annex committed.
+        // A crash between them must lose nothing. Reversed, or delete-on-best-effort, converts the
+        // loop into PERMANENT SILENT loss — strictly worse than the bug.
+        // Review F1: annex `env.content`, NOT `unsealed`. `unsealed` is the whole CBOR park envelope
+        // — every other consumer decodes it first (recoverParkedEntry does exactly this before
+        // ingesting). Storing the envelope and then deleting the relay copy on the strength of it
+        // would leave the operator an unreadable blob as the ONLY surviving copy: the loop stops,
+        // the message is still never read, and now nothing else holds it. That is the permanent
+        // silent loss the ordering above exists to prevent, arriving one line earlier.
+        //
+        // Review F5: the hash cross-check has to happen HERE too. `parkSig` covers
+        // (session_id, recipient_pubkey, content_hash) — it does NOT cover the envelope's `content`
+        // field, and this branch returns before `ingestReceivedContent`'s own check. Without it a
+        // relay holding the ciphertext could substitute content under a genuine hash, have it
+        // annexed, and have the real copy confirm-deleted. It also makes INSERT OR IGNORE sound:
+        // identical hash now genuinely means identical bytes.
+        // All three verdict branches below are covered by m12-p17-annex-screening.test.ts, driven
+        // through this real function with an injected park client and REAL sealed envelopes. The one
+        // that matters is TRANSIENT: collapsing it into the terminal branch would delete a good
+        // message because the screener was momentarily down — permanent loss caused by an outage.
+        // That exact confusion was injected and the test goes red on it.
+        let annexed = false;
+        let screenedOut = false;
+        let screenDeferred = false;
+        try {
+          const env = decodeParkEnvelope(unsealed);
+          const computed = createHash("sha256").update(new Uint8Array([0x00])).update(env.content).digest();
+          if (Buffer.from(computed).toString("hex") !== e.contentHashHex) {
+            logger.error("content.recover.annex.hash_mismatch", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              impact: "content does not match its attested hash — NOT annexed, relay copy kept",
+              correlationId,
+            });
+          } else {
+            // M12-P17 (review F4): screen before storing. Same terminal-vs-transient split the live
+            // inbound funnel uses, because the consequences are the same shape.
+            const verdict = await securityGateway.screenInbound(env.content, {
+              direction: "inbound", agentName: recipientAgent.name, sessionId: e.sessionIdHex, correlationId,
+            });
+            const terminalBlock = verdict.disposition === "block" && verdict.terminal === true;
+            if (verdict.disposition !== "allow" && verdict.disposition !== "redact" && !terminalBlock) {
+              // TRANSIENT (gateway down / timeout): keep the relay copy and re-screen next drain.
+              // Fail-closed — never store unscreened content because the screen was unreachable.
+              logger.warn("content.recover.annex.screen_unavailable", {
+                sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+                disposition: verdict.disposition, correlationId,
+              });
+              screenDeferred = true;
+            } else if (terminalBlock) {
+              // TERMINAL: the detector rejected the CONTENT itself, so identical bytes would be
+              // rejected identically forever — keeping it would restore the very re-pull loop this
+              // unit removes. Drop it from the relay and do NOT store it. Logged at warn with the
+              // hash, so the operator can see something was discarded and what it was.
+              logger.warn("content.recover.annex.screened_out", {
+                sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+                impact: "content was terminally blocked by the inbound screen — discarded, NOT annexed",
+                correlationId,
+              });
+              screenedOut = true;
+            } else {
+              // A redact verdict stores the ALTERED bytes, exactly as the live path delivers them.
+              // Those no longer match `content_hash`, which is correct here: the annex is a readable
+              // record, not chain content, and the hash column stays the entry's relay identity.
+              const body = verdict.disposition === "redact" && verdict.content !== undefined
+                ? new Uint8Array(verdict.content)
+                : env.content;
+              annexed = sessionNodeManager.recordSealedAnnex(
+                recipientAgent.name, e.sessionIdHex, e.contentHashHex, body,
+                env.senderPubkey ? Buffer.from(env.senderPubkey).toString("hex") : null,
+              );
+            }
+          }
+        } catch (err: unknown) {
+          logger.error("content.recover.annex.decode_failed", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+            impact: "envelope could not be decoded — NOT annexed, relay copy kept",
+            error: extractErrorMessage(err), correlationId,
+          });
+        }
+        if (annexed) {
+          // Review F6: named under `content.recover.*` like its five siblings in this loop, so a
+          // grep for the recovery family does not miss the one branch you most want to count.
+          logger.info("content.recover.annexed", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+            reason: "session_committed", correlationId,
+          });
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            // The annex holds it, so the message is safe; the relay copy simply gets re-pulled and
+            // deduped by the INSERT OR IGNORE next time. Not data loss.
+            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          }
+        } else if (screenedOut) {
+          // Terminal block: nothing to keep and nothing to store. Delete so it stops being re-pulled.
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          }
+        } else if (screenDeferred) {
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_screen_unavailable" });
+        } else {
+          // The annex failed and said so. Keep the relay copy — it is now the only one.
+          // Review F7: name why the entry is STUCK, not why ingest refused it. Surfacing
+          // `session_committed` here sends the operator to look at session state when the fault is
+          // in the annex write.
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_write_failed" });
+        }
       } else {
-        // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
-        // NOT confirm-deleted — a forgery must not be able to evict itself from the mailbox, and a
-        // genuine v1-peer message must not be destroyed by our refusing it.
-        refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
-        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
+        // M12-P18: content for a session WE REFUSED can be swept — deleting it acts on our own
+        // refusal decision, not on the content, so it does not violate the rule that a forgery must
+        // not evict itself. This is the fix for the counterparty_unknown re-pull loop (78 of 121
+        // stranded entries on one box): the abuse cap refused the session, no session row was ever
+        // created, so every drain re-pulled and re-refused the parked content forever.
+        if (sessionNodeManager.wasSessionRefused(recipientAgent.name, e.sessionIdHex)) {
+          logger.info("content.recover.refused_session.swept", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+            reason: ingest.reason,
+            impact: "content was parked for a session this agent refused — deleted from the relay, not re-pullable",
+            correlationId,
+          });
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          }
+        } else {
+          // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
+          // NOT confirm-deleted for a session we did NOT ourselves refuse — a forgery must not be
+          // able to evict itself, and a genuine message we simply have no row for yet must survive.
+          // M12-P17: this is also why `counterparty_unknown` is NOT annexed above — the content is
+          // UNVERIFIED. The residual (a stranger's stranded content we never refused) needs
+          // relay-side TTL, not client-side deletion.
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
+          logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
+        }
       }
     }
     return { ok: true, recovered, pulled: entries.length, refused: refusals.length, refusals };
@@ -294,5 +451,8 @@ export function createContentPark(deps: ContentParkDeps) {
     });
   }
 
-  return { autoRecoverForAgent, registerHandlers };
+  // M12-P17: exported for the screening/annex tests. `autoRecoverForAgent` walks every relay the
+  // agent has a session on and swallows per-relay errors by design, so it cannot assert what one
+  // entry did; this is the single-relay drain the assertions need.
+  return { autoRecoverForAgent, registerHandlers, recoverParkedFromRelay };
 }

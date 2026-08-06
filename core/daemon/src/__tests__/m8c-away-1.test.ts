@@ -999,4 +999,48 @@ describe("M8C-AWAY-1: away response", () => {
     expect(failed!.level, "a lost message is an error, not a warning").toBe("error");
     expect(String(failed!.context.impact)).toContain("lost");
   });
+
+  // ─── M12-P18: a refused session tells a TRUSTED sender why, and stays silent to a stranger ─────
+  async function driveOverCapRefusal(tier: number, preseed: number) {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
+    const snm = h.getSessionNodeManager();
+    const initiatorPubkey = "cd".repeat(32);
+    // A KNOWN contact is told; a stranger (no contact row → UNKNOWN) is not.
+    if (tier >= TIER.KNOWN) snm.addContact("bob", initiatorPubkey, undefined, null, tier);
+    // Pre-seed the sender to their cap so the NEXT assignment is refused for over-cap, not blocked.
+    const db = snm.getDb()!;
+    const bobId = snm.resolveAgentId("bob");
+    const now = Date.now();
+    for (let i = 0; i < preseed; i++) {
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 1, NULL)`,
+      ).run(("f" + i.toString(16)).padStart(32, "0"), bobId, initiatorPubkey, now, now);
+    }
+    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    await wait(150);
+    return events;
+  }
+
+  it("M12-P18: a KNOWN sender over the cap is NOTIFIED — its own state, no oracle risk", async () => {
+    // KNOWN cap is 5; five pre-seeded sessions puts the sixth over.
+    const events = await driveOverCapRefusal(TIER.KNOWN, 5);
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    const notified = events.find((e) => e.event === "session.inbound.refusal.notified");
+    expect(notified, "a trusted sender is told why").toBeDefined();
+    expect(notified!.context.reason).toBe("abuse_bound_sessions_per_sender");
+  });
+
+  it("M12-P18: an UNKNOWN sender over the cap is SILENT — no block/throttle oracle", async () => {
+    // UNKNOWN cap is 3; three pre-seeded puts the fourth over, and no contact row keeps it UNKNOWN.
+    const events = await driveOverCapRefusal(TIER.UNKNOWN, 3);
+    expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
+    expect(events.find((e) => e.event === "session.inbound.refusal.notified"), "a stranger is NEVER told").toBeUndefined();
+    expect(events.find((e) => e.event === "session.inbound.refusal.silent")).toBeDefined();
+  });
 });

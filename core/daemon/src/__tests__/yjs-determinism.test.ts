@@ -114,10 +114,18 @@ describe("Yjs clientID — why every test that asserts a size or order MUST pin 
 
 describe("Yjs clientID — the rule is enforced, not just documented", () => {
   it("every M14 document test that asserts a byte length pins its clientID", async () => {
-    const files = (await readdir(TEST_DIR)).filter(
-      (f) => f.startsWith("document-") || f.startsWith("dod-doc-"),
-    );
-    expect(files.length).toBeGreaterThan(0);
+    const all = await readdir(TEST_DIR);
+    const files = all.filter((f) => f.startsWith("document-") || f.startsWith("dod-doc-"));
+    // A guard that scans zero files passes vacuously, so the empty case must fail LOUDLY and say
+    // where it looked. A bare `toBeGreaterThan(0)` reports "expected 0 to be greater than 0",
+    // which names neither the directory nor whether the read itself came back empty — and this
+    // assertion failed exactly once in six full-suite runs and has not reproduced since. If it
+    // recurs, this message is the difference between a diagnosis and another unexplained number.
+    expect(
+      files.length,
+      `no document test files found under ${TEST_DIR} — the readdir returned ${all.length} ` +
+        `entr${all.length === 1 ? "y" : "ies"}, so this guard was about to pass over nothing`,
+    ).toBeGreaterThan(0);
 
     const offenders: string[] = [];
     for (const file of files) {

@@ -18,6 +18,7 @@
 // The daemon DB is SQLCipher (whole-file AES-256 at rest), never `node:sqlite`. `DaemonDatabase` is
 // the thin varargs surface; `openEncryptedDatabase` opens with a PRAGMA key and `resolveDbKey`
 // manages the single plaintext key file.
+import { wireContentHash } from "./wire-content-hash.js";
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -234,6 +235,7 @@ const RECEIVED_BUFFER_CAP = 32;
  * caller (and the operator reading `reason`) was sent to the transport when the blocker was the
  * standing receiver.
  */
+// M12-P18: how many refused session ids to retain per agent (drain-sweep matching, not security).
 type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
 
 export class SessionNodeManager {
@@ -470,6 +472,27 @@ export class SessionNodeManager {
   // agent / session / senderPubkey, NEVER the plaintext (INV-CONTENTFREE).
   #onContentArrived:
     | ((agentName: string, sessionId: string, senderPubkey: string) => void)
+    | null = null;
+
+  /**
+   * M14 / DOD-DOC-INBOUND-2: the document-layer interception, injected by the composition root.
+   *
+   * Returns whether the document layer CONSUMED the frame. Absent (the default) means every frame
+   * is conversation, exactly as before — the document layer cannot change message handling by being
+   * unwired, which is the property that lets it be wired incrementally.
+   *
+   * It is handed the decrypted CONTENT, unlike `#onContentArrived`, which is content-free by
+   * signature. That is unavoidable: deciding whether bytes are a document frame requires the bytes.
+   * The router it calls never logs them.
+   */
+  #onDocumentFrame:
+    | ((
+        agentName: string,
+        sessionId: string,
+        content: Uint8Array,
+        senderPubkey: string,
+        correlationId?: string,
+      ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string })
     | null = null;
 
   // A send is NOT fire-and-forget. After a content_frame is delivered over the direct session
@@ -868,6 +891,52 @@ export class SessionNodeManager {
         if (!msg.includes("duplicate column name")) throw err;
       }
     }
+
+    // M12-P18: sessions this agent REFUSED (abuse cap etc.). DURABLE and separate from the in-memory
+    // refusedSessionRequests inbox list, for one reason: content parked for a refused session arrives
+    // AFTER the refusal and often after a restart, and at drain time `counterparty_unknown` cannot
+    // tell "content for a session I declined" from "content I might still want". This table is that
+    // missing memory. Deleting parked content matched here judges NOTHING about the content — it acts
+    // on OUR OWN refusal, so it does not violate the SEC-1 rule that a forgery must not evict itself.
+    // Bounded by pruning on write (keep the most recent N per agent); a refused session id is never
+    // reused (directory-assigned, unique), so forgetting an old one only means its stale parked
+    // content is not proactively swept — the relay TTL backstop still applies.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS refused_sessions (
+        agent_id   TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        refused_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id)
+      )
+    `);
+
+    // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
+    // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
+    // notarization), and it must not be thrown away: it is a real message, provably sent to this
+    // operator, that no one would otherwise ever read.
+    //
+    // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
+    // nothing here is joined by `getUnreadSummary`, `getSealedUnread`, any inbox count or any wake
+    // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
+    // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
+    // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed
+    // conversation.
+    //
+    // Keyed on (agent_id, content_hash): `session_id` is recorded for display but is NOT part of the
+    // key, because the sibling case this design must also serve — content we cannot attribute to a
+    // session at all — has no session to key on.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS sealed_session_annex (
+        agent_id      TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        sender_pubkey TEXT,
+        content       BLOB NOT NULL,
+        arrived_at    INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, content_hash)
+      )
+    `);
 
     // M7-SESSION-001 (H-1): side table holding the verified bilateral
     // SEAL-INTERRUPTED commitment artifacts. A side table (CREATE TABLE IF NOT
@@ -1305,6 +1374,7 @@ export class SessionNodeManager {
            t.direction = 'received'
            AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
 
+  static readonly #REFUSED_SESSIONS_CAP = 200;
   static readonly #TERMINAL_STATUSES = `('sealed','abandoned','seal_interrupted_pending','interrupted')`;
 
   /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
@@ -1350,6 +1420,10 @@ export class SessionNodeManager {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
+        // M12-P17 (review F2): return the ACTUAL status. `#TERMINAL_STATUSES` spans four states and
+        // they are NOT equivalent — an `interrupted` session is not committed, still accepts
+        // appends, and may have a counterparty waiting to seal. Stamping "sealed" over all four
+        // told an agent that live work was dead history: symptom B inverted.
         `SELECT t.session_id AS session_id,
                 COUNT(*)      AS unread_count,
                 MAX(t.sequence) AS last_seq,
@@ -2024,6 +2098,19 @@ export class SessionNodeManager {
     cb: (agentName: string, sessionId: string, senderPubkey: string) => void,
   ): void {
     this.#onContentArrived = cb;
+  }
+
+  /** M14 / DOD-DOC-INBOUND-2: inject the document-frame interception. See the field's note. */
+  setOnDocumentFrame(
+    cb: (
+      agentName: string,
+      sessionId: string,
+      content: Uint8Array,
+      senderPubkey: string,
+      correlationId?: string,
+    ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string },
+  ): void {
+    this.#onDocumentFrame = cb;
   }
 
   /**
@@ -3229,6 +3316,83 @@ export class SessionNodeManager {
    * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
    * for a session. Returns null when none exist.
    */
+  /**
+   * M12-P17: durably record verified content that arrived for an ALREADY-ENDED session.
+   *
+   * Returns true only when the row is committed — the caller confirm-deletes the relay copy on the
+   * strength of this answer, and the ORDER is load-bearing: annex first, delete second. A crash
+   * between them must lose nothing, so a failure here MUST report false and leave the relay copy
+   * alone. Getting that backwards converts a noisy re-pull loop into permanent silent loss, which is
+   * the outcome this whole unit exists to prevent.
+   */
+  recordSealedAnnex(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, senderPubkeyHex: string | null): boolean {
+    if (!this.#db) return false;
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO sealed_session_annex (agent_id, content_hash, session_id, sender_pubkey, content, arrived_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(this.#requireAgentId(agentName), contentHashHex, sessionId, senderPubkeyHex, Buffer.from(content), Date.now());
+      return true;
+    } catch (err: unknown) {
+      // FAILS LOUD and reports false: the relay copy is the only other one in existence.
+      this.#logger.error("content.annex.write.failed", {
+        agentName, sessionId, contentHash: contentHashHex,
+        impact: "content NOT annexed — the relay copy must be kept, or the message is lost",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * M12-P18: record that this agent refused a session, so parked content that later arrives for it
+   * (and fails `counterparty_unknown`, because no session row exists) can be swept instead of
+   * re-pulled forever. Keeps the most recent REFUSED_SESSIONS_CAP per agent.
+   */
+  recordRefusedSession(agentName: string, sessionId: string, reason: string): void {
+    if (!this.#db) return;
+    const agentId = this.#requireAgentId(agentName);
+    try {
+      this.#db.prepare(
+        `INSERT OR REPLACE INTO refused_sessions (agent_id, session_id, reason, refused_at) VALUES (?, ?, ?, ?)`,
+      ).run(agentId, sessionId, reason, Date.now());
+      // Prune to the cap — oldest first.
+      this.#db.prepare(
+        `DELETE FROM refused_sessions WHERE agent_id = ? AND session_id NOT IN (
+           SELECT session_id FROM refused_sessions WHERE agent_id = ? ORDER BY refused_at DESC LIMIT ${SessionNodeManager.#REFUSED_SESSIONS_CAP}
+         )`,
+      ).run(agentId, agentId);
+    } catch (err: unknown) {
+      this.#logger.warn("session.refused.record.failed", {
+        agentName, sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** M12-P18: did this agent refuse this session? Consulted at drain to sweep orphaned parked content. */
+  wasSessionRefused(agentName: string, sessionId: string): boolean {
+    if (!this.#db) return false;
+    const row = this.#db
+      .prepare("SELECT 1 AS present FROM refused_sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { present: number } | undefined;
+    return row !== undefined;
+  }
+
+  /** M12-P17: read the annex. Operator-initiated ONLY — never wired to a wake path or inbox count. */
+  readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> {
+    if (!this.#db) return [];
+    const rows = (sessionId === undefined
+      ? this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName))
+      : this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? AND session_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName), sessionId)
+    ) as Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; content: Buffer; arrived_at: number }>;
+    return rows.map((r) => ({
+      session_id: r.session_id, content_hash: r.content_hash, sender_pubkey: r.sender_pubkey,
+      text: new TextDecoder().decode(new Uint8Array(r.content)), arrived_at: r.arrived_at,
+    }));
+  }
+
   getSealInterruptedArtifacts(agentName: string, sessionId: string): {
     role: string;
     ownLeaf: unknown;
@@ -3583,7 +3747,19 @@ export class SessionNodeManager {
         throw new Error("connection_lost: injected direct-send fault");
       }
       stream.send(lp.encode.single(frame));
-      try { await stream.close(); } catch { /* best-effort close */ }
+      // NOT SWALLOWED. This was `try { await stream.close(); } catch { }` followed by
+      // `delivered: true` — which reports a frame as delivered when the flush failed.
+      //
+      // `close()` waits for the write buffer to drain, so a reset mid-flush throws HERE, and that
+      // is precisely the case where the bytes never left. Discarding it made `delivered: true` mean
+      // "we called send and close did not visibly complain", while every caller reads it as "the
+      // peer has it" — and the sender then never retries, because nothing told it to.
+      //
+      // Letting it reach the catch below is the honest outcome: that path parks the content against
+      // the relay backstop and reports `delivered: false` if it can, or `ok: false` if it cannot.
+      // A close that failed for a benign reason costs a redundant park, which the receiver dedups
+      // on the content hash. A false delivered costs the message.
+      await stream.close();
       return { ok: true, delivered: true };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
@@ -4002,7 +4178,7 @@ export class SessionNodeManager {
       return { ok: false, reason: "session_committed" };
     }
 
-    const computed = createHash("sha256").update(new Uint8Array([0x00])).update(content).digest();
+    const computed = wireContentHash(content);
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     if (Buffer.from(computed).toString("hex") !== contentHashHex) {
       this.#logger.warn("session.content.cross_check.failed", {
@@ -4352,7 +4528,7 @@ export class SessionNodeManager {
     // agent (screenedOut); a delivered message buffers + leafs via #appendVerifiedContent.
     const leafIndex = terminalBlock
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
-      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
+      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId, content).leafIndex;
 
     // DOD-COATTEND-1 (review F2): the plaintext failed to reach the transcript, and since Tier 1 the
     // transcript IS the delivery path — so this message can never be handed to any session. Report
@@ -4502,7 +4678,79 @@ export class SessionNodeManager {
     contentHashHex: string,
     senderPubkey: string,
     correlationId?: string,
+    /**
+     * The bytes as the PEER SENT THEM, before inbound sanitization — for the document classifier
+     * only. Defaults to `content` for callers that never screened (the held-release path).
+     *
+     * A `redact` verdict rewrites `content` for the agent's benefit, and that is right for
+     * conversation: the operator sees the sanitized form while the leaf still binds the original.
+     * It is WRONG for a document frame, and not marginally. Rewriting bytes inside a signed CBOR
+     * envelope does not sanitize it — it destroys it. The frame stops decoding, stops being
+     * recognised as document traffic at all, and falls through to the conversation path, where it
+     * is recorded as something a person said and handed to the agent by `cello_receive`.
+     *
+     * Measured live: roughly half of proposals vanished this way. Intermittent because a proposal
+     * carries a random 16-byte nonce, so whether its bytes trip a sanitizer rule varies per run —
+     * which is why it read as flakiness rather than as a rule firing.
+     *
+     * Documents are NOT unscreened as a result. They are screened by `DocumentGate`, which is built
+     * for them and REFUSES rather than mutates (§16.7) — because mutating one party's replica of a
+     * CRDT is not a false positive, it is permanent divergence that both sides converge on and
+     * neither can see.
+     */
+    originalContent?: Uint8Array,
   ): { leafIndex: number } {
+    // M14 / DOD-DOC-INBOUND-2 — DOCUMENT FRAMES DIVERGE HERE, and the three-way split is the whole
+    // contract:
+    //
+    //   LEAF   yes, and as `doc` (0x04) rather than `msg` (0x00). The seal covers document traffic
+    //          — that is what makes the exchange provable — but it is not conversation, and the
+    //          leaf kind is what a verifier renders it by.
+    //   TRANSCRIPT no. Recording CRDT bytes as a received message puts them in the operator's
+    //          conversation history, where `cello_receive` hands them to an agent as something a
+    //          person said.
+    //   DOORBELL no (§11.3). A collaborator typing produces a stream of updates; a doorbell each
+    //          time would interrupt the operator's agent continuously for something with no
+    //          deadline.
+    //
+    // The hook is injected and absent by default, so a daemon without the document layer behaves
+    // exactly as before — this cannot change the conversation path by being unwired.
+    const routed = this.#onDocumentFrame?.(
+      agentName,
+      sessionId,
+      // THE PEER'S BYTES, not the sanitized ones. See `originalContent` above.
+      originalContent ?? content,
+      senderPubkey,
+      correlationId,
+    );
+    if (routed?.consumed === true) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "doc", contentHashHex, correlationId);
+      // DROP THE WITNESS, exactly as the conversation branch does once its leaf is appended. The
+      // witness has done its ordering job either way — the leaf IS committed here.
+      //
+      // This branch returns early and so never reached that cleanup, and every inbound document
+      // frame left a permanent entry behind. Harmless until `sealReadiness` started deriving
+      // `missingLeaves` from the size of that map (M12-P14): from then on a session that carried
+      // ANY document traffic could never seal, because the ordering authority was recorded as
+      // having committed leaves this tree had — but had not been credited with. The refusal is
+      // `session_incomplete`, whose only escape is a force-abandon with no notarized receipt.
+      //
+      // Two correct changes, each fine alone, that break where they meet. Caught by running the
+      // live enforcers straight after merging main rather than trusting a green unit suite.
+      this.#witnessedSeq.get(this.#k(agentName, sessionId))?.delete(contentHashHex);
+      this.#logger.info("session.document.received", {
+        sessionId,
+        senderPubkey,
+        contentHashHex,
+        sequenceNumber: leafIndex,
+        kind: routed.kind,
+        ok: routed.ok,
+        reason: routed.reason,
+        correlationId,
+      });
+      return { leafIndex };
+    }
+
     const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
@@ -5086,10 +5334,49 @@ export class SessionNodeManager {
         return;
       }
 
-      if (frame["type"] !== "content_frame") return;
+      if (frame["type"] !== "content_frame") {
+        // LOGGED, not silently dropped. This handler is bound to one session, and a frame it does
+        // not understand arriving on that stream is either a peer speaking a newer protocol or a
+        // bug on our side — both worth a line, and neither distinguishable from "nothing arrived"
+        // when the return is silent.
+        this.#logger.warn("session.content.frame_unknown_type", {
+          sessionId,
+          type: typeof frame["type"] === "string" ? String(frame["type"]) : "(absent)",
+        });
+        return;
+      }
+      // THE FRAME NAMES ITS SESSION, and until now nothing checked it.
+      //
+      // The stream binding decides where content lands, so the field was decorative — which is the
+      // problem. A peer holding TWO sessions with us could put content addressed to one on the
+      // other's stream and it was ingested, leafed, transcribed and SEALED under the wrong record.
+      // The sealed transcript is the artifact this protocol exists to produce; a message in it that
+      // its own author addressed elsewhere is exactly the thing it must not contain.
+      //
+      // Refused rather than re-routed: routing it to the session it names would honour a claim made
+      // by the party whose frame arrived in the wrong place, and the stream — which is authenticated
+      // — is the better authority. Refusing leaves the sender to redeliver on the right one.
+      const framedSessionId = frame["session_id"];
+      if (typeof framedSessionId === "string" && framedSessionId !== sessionId) {
+        this.#logger.warn("session.content.session_mismatch", {
+          sessionId,
+          claimedSessionId: framedSessionId,
+        });
+        return;
+      }
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
-      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
+      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) {
+        // Same reasoning as the unknown type above: a malformed frame that vanishes without a trace
+        // is indistinguishable, from the operator's side, from a counterparty who never sent
+        // anything.
+        this.#logger.warn("session.content.frame_malformed", {
+          sessionId,
+          hasContent: contentBytes instanceof Uint8Array,
+          hasHash: contentHash instanceof Uint8Array,
+        });
+        return;
+      }
       // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
       // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
       // ingest — so the strict-in-order gate has the position without waiting on the separate

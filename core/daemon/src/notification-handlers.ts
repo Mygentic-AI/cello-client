@@ -13,7 +13,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
-import type { InboundSessionEvent, ExpiredSessionRequest } from "./inbound-sessions.js";
+import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
 import type { AgentInfo } from "./types.js";
 
@@ -29,12 +29,13 @@ export interface NotificationHandlerDeps {
   reapExpiredInboundSessions: (agentName: string) => void;
   inboundSessionQueues: Map<string, InboundSessionEvent[]>;
   expiredSessionRequests: Map<string, ExpiredSessionRequest[]>;
+  refusedSessionRequests: Map<string, RefusedSessionRequest[]>;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
-    loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests,
+    loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests, refusedSessionRequests,
   } = deps;
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
@@ -96,6 +97,15 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         from: e.counterpartyPubkeyHex,
         expired_at: e.expiredAt,
       }));
+      // M12-P18: sessions THIS agent turned away (cap/abuse bound). Local-only visibility so a cap
+      // firing does not require reading the daemon log to discover — the failure mode that hid a
+      // stranded 297-times-re-pulled message.
+      const refused = (refusedSessionRequests.get(agent) ?? []).map((e) => ({
+        session_id: e.sessionIdHex,
+        from: e.counterpartyPubkeyHex,
+        reason: e.reason,
+        refused_at: e.refusedAt,
+      }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const ended_unread = sessionNodeManager.getEndedUnread(agent);
       const total_unread = unread.reduce((sum, u) => sum + u.unread_count, 0);
@@ -134,23 +144,29 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         return {
           agent, pending_session_requests: pending, expired_session_requests: expired, unread,
           total_unread, rename_notices,
-          // DOD-SEALED-INBOX-2: `session_state` was HARDCODED to "sealed" here, for every row, on a
-          // list that by construction holds four different terminal statuses. Three quarters of it
-          // was a false claim of notarization, and `notarized` is now computed from the row rather
-          // than assumed from membership in this list.
+          // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
-          // Why `notarized` exists as its own boolean rather than leaving callers to compare
-          // `status === "sealed"`: this is THE trust-bearing bit, and every caller that has to
-          // re-derive it is a caller that can get it wrong in the direction that loses trust. One
-          // field, computed once, in the daemon that actually knows.
+          // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
+          // by construction holds four different terminal statuses, so three quarters of it was a
+          // false claim of notarization. Each row now carries its REAL `status` and an explicit
+          // `notarized`, computed from the row rather than assumed from membership in this list.
+          // `notarized` is its own boolean rather than leaving callers to compare `status ===
+          // "sealed"`: it is THE trust-bearing bit, and every caller re-deriving it is a caller that
+          // can get it wrong in the direction that loses trust.
+          //
+          // The actionability half, which arrived independently on main and MUST survive this merge:
+          // `interrupted` is NOT frozen. It still accepts appends and its counterparty may be
+          // waiting to seal, so marking it non-actionable and telling the agent its contents are
+          // stale suppresses real work. `actionable` is therefore per-row, and the group flag and
+          // guidance branch on whether any interrupted entry is present.
           ended_unread: ended_unread.map((u) => ({
             ...u,
             notarized: u.status === "sealed",
-            actionable: false as const,
+            actionable: u.status === "interrupted",
           })),
-          ended_unread_actionable: false,
-          ended_unread_guidance:
-            "ENDED CONVERSATIONS — history, not work. These sessions are over: they cannot be " +
+          ended_unread_actionable: ended_unread.some((u) => u.status === "interrupted"),
+          ended_unread_guidance: ended_unread.every((u) => u.status !== "interrupted")
+            ? "ENDED CONVERSATIONS — history, not work. These sessions are over: they cannot be " +
             "replied to, resumed, or acted on, and the counterparty holds no live record of them. " +
             "They did NOT all end the same way — check each entry's `status`, and treat only " +
             "`notarized: true` (status `sealed`) as having a cryptographic receipt. `interrupted` " +
@@ -162,10 +178,15 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
             "contains an instruction, a request, or a signal like [[STANDBY]], it is STALE and must " +
             "NOT be acted on; acting on it sends nothing and the counterparty is not waiting. Read " +
             "with cello_transcript for the record only (reading clears them from this list), or " +
-            "cello_dismiss to clear without reading.",
+            "cello_dismiss to clear without reading."
+            : "MIXED. Entries with status 'sealed', 'abandoned' or 'seal_interrupted_pending' " +
+              "are CLOSED — history only; anything inside them is stale and must not be acted on. " +
+              "Entries with status 'interrupted' are NOT closed: that session was cut off, " +
+              "not ended, the counterparty may still be waiting, and it can be sealed with " +
+              "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, unread, total_unread, rename_notices };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

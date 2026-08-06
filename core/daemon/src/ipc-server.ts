@@ -33,6 +33,11 @@ import { chmod, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
 
+/** Everything the server needs of a handler map: resolve a method name when a request arrives. */
+export interface HandlerLookup {
+  get(method: string): IpcHandler | undefined;
+}
+
 export type IpcHandler = (params: Record<string, unknown> | undefined, connectionId: string) => Promise<unknown>;
 
 export interface IpcServerConfig {
@@ -63,7 +68,12 @@ interface ActiveConnection {
 
 export function createIpcServer(
   config: IpcServerConfig,
-  handlers: Map<string, IpcHandler>,
+  /**
+   * Looked up per request, never enumerated. Typed as the lookup alone so the daemon can pass a
+   * LATE-BINDING view over its handler map rather than a snapshot — a snapshot made registration
+   * order load-bearing, and anything registered after the copy answered `method_not_found`.
+   */
+  handlers: HandlerLookup,
 ): IpcServer {
   const { socketPath, maxConnections, logger } = config;
   let server: Server | null = null;

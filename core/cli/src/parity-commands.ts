@@ -295,6 +295,17 @@ export const IPC_METHODS = {
   "settings-get": "cello_settings_get",
   "settings-set": "cello_settings_set",
   "moniker-set": "cello_set_moniker",
+  "doc-propose": "cello_doc_propose",
+  "doc-inbox": "cello_doc_inbox",
+  "doc-accept": "cello_doc_accept",
+  "doc-refuse": "cello_doc_refuse",
+  "doc-list": "cello_doc_list",
+  "doc-read": "cello_doc_read",
+  "doc-diff": "cello_doc_diff",
+  "doc-write": "cello_doc_write",
+  "doc-publish": "cello_doc_publish",
+  "doc-close": "cello_doc_close",
+  "doc-kill": "cello_doc_kill",
   "attestation-consent-list": "cello_attestation_consent_list",
   "attestation-consent-accept": "cello_attestation_consent_accept",
   "attestation-consent-refuse": "cello_attestation_consent_refuse",
@@ -768,4 +779,94 @@ export function contactSetSignal(
   celloDir: string, pubkey: string, hashPrefix: string, present: boolean | null, opts: ParityOptions,
 ): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["contact-set-signal"], { pubkey, hash_prefix: hashPrefix, present }, opts);
+}
+
+// ─── M14 / DOD-DOC-TOOLS-1 — federated documents ────────────────────────────────────────────────
+
+/** `cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--from-file <path>]` → cello_doc_propose. */
+export function docPropose(
+  celloDir: string,
+  peerPubkey: string,
+  opts: ParityOptions & { documentType?: string; appendOnly?: boolean; startingContent?: string },
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["doc-propose"],
+    defined({
+      peer_pubkey: peerPubkey,
+      document_type: opts.documentType,
+      append_only: opts.appendOnly === true ? true : undefined,
+      starting_content: opts.startingContent,
+    }),
+    opts,
+  );
+}
+
+/** `cello doc inbox` → cello_doc_inbox. Proposals awaiting a consent decision. */
+export function docInbox(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-inbox"], {}, opts);
+}
+
+/** `cello doc accept <document-id>` → cello_doc_accept. */
+export function docAccept(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-accept"], { document_id: documentId }, opts);
+}
+
+/** `cello doc refuse <document-id> [why…]` → cello_doc_refuse. An empty reason is OMITTED, so the
+ *  daemon applies its own default rather than recording the empty string as the operator's words. */
+export function docRefuse(
+  celloDir: string,
+  documentId: string,
+  reason: string | null,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["doc-refuse"],
+    defined({ document_id: documentId, reason: reason !== null && reason.length > 0 ? reason : undefined }),
+    opts,
+  );
+}
+
+/** `cello doc list` → cello_doc_list. */
+export function docList(celloDir: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-list"], {}, opts);
+}
+
+/** `cello doc read <document-id>` → cello_doc_read. */
+export function docRead(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-read"], { document_id: documentId }, opts);
+}
+
+/** `cello doc diff <document-id>` → cello_doc_diff. What changed since you last read it. */
+export function docDiff(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-diff"], { document_id: documentId }, opts);
+}
+
+/** `cello doc write <document-id> <content…>` → cello_doc_write.
+ *
+ *  The COMPLETE new text, never a patch — the daemon diffs it against current state, so an offset
+ *  cannot go stale under the peer's concurrent edit. */
+export function docWrite(
+  celloDir: string,
+  documentId: string,
+  content: string,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-write"], { document_id: documentId, content }, opts);
+}
+
+/** `cello doc close <document-id>` → cello_doc_close. Bilateral: settles when both sides have said it. */
+export function docClose(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-close"], { document_id: documentId }, opts);
+}
+
+/** `cello doc kill <document-id>` → cello_doc_kill. One-sided and immediate; the peer is told best-effort. */
+export function docKill(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-kill"], { document_id: documentId }, opts);
+}
+
+/** `cello doc publish <document-id>` → cello_doc_publish. Publishes what is in the FILE right now. */
+export function docPublish(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(celloDir, IPC_METHODS["doc-publish"], { document_id: documentId }, opts);
 }

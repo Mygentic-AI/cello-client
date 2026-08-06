@@ -228,3 +228,70 @@ export {
 
 // MONIKER-0 — the single home of the agent-name / moniker charset rule (wire contract).
 export { MONIKER_RE, validateMoniker } from "./moniker.js";
+export {
+  DOCUMENT_UPDATE_DOMAIN,
+  DOCUMENT_UPDATE_ENCODING_V1,
+  DOCUMENT_EPOCH_V1,
+  buildDocumentUpdateTbs,
+  encodeDocumentUpdateEnvelope,
+  decodeDocumentUpdateEnvelope,
+  documentEnvelopeHash,
+  verifyDocumentChainLink,
+} from "./document-envelope.js";
+export type { DocumentUpdateEnvelope } from "./document-envelope.js";
+export {
+  DOCUMENT_PROPOSAL_DOMAIN,
+  DOCUMENT_FEATURE_VERSION,
+  ASSURANCE_TIER_V1,
+  TOPOLOGY_V1,
+  buildDocumentProposalTbs,
+  documentIdFromProposal,
+  encodeDocumentProposal,
+  decodeDocumentProposal,
+  seamViolation,
+  documentFeatureIncompatibility,
+} from "./document-proposal.js";
+export type {
+  DocumentProposalEnvelope,
+  DocumentProperties,
+  DocumentConsentState,
+} from "./document-proposal.js";
+export {
+  DOCUMENT_ACK_DOMAIN,
+  buildDocumentAckTbs,
+  encodeDocumentAck,
+  decodeDocumentAck,
+} from "./document-ack.js";
+export type { DocumentAck } from "./document-ack.js";
+export {
+  encodeDocumentProposalAck,
+  decodeDocumentProposalAck,
+  buildDocumentProposalAckTbs,
+  assertDocumentProposalAckConsistent,
+  DOCUMENT_PROPOSAL_ACK_DOMAIN,
+  DOCUMENT_PROPOSAL_ACK_VERSION,
+  MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
+} from "./document-proposal-ack.js";
+export type { DocumentProposalAck } from "./document-proposal-ack.js";
+export {
+  encodeDocumentControl,
+  decodeDocumentControl,
+  buildDocumentControlTbs,
+  assertDocumentControlConsistent,
+  DOCUMENT_CONTROL_DOMAIN,
+  DOCUMENT_CONTROL_VERSION,
+  DOCUMENT_CONTROL_VERBS,
+  MAX_CONTROL_REASON_LENGTH,
+} from "./document-control.js";
+export type { DocumentControl, DocumentControlVerb } from "./document-control.js";
+export {
+  DOCUMENT_REJECTION_DOMAIN,
+  DOCUMENT_REJECTION_VERSION,
+  MAX_REJECTION_DETAIL_LENGTH,
+  buildDocumentRejectionTbs,
+  documentRejectionHash,
+  assertDocumentRejectionConsistent,
+  encodeDocumentRejection,
+  decodeDocumentRejection,
+} from "./document-rejection-envelope.js";
+export type { DocumentRejectionEnvelope } from "./document-rejection-envelope.js";
