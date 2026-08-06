@@ -4131,7 +4131,7 @@ export class SessionNodeManager {
     // agent (screenedOut); a delivered message buffers + leafs via #appendVerifiedContent.
     const leafIndex = terminalBlock
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
-      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId).leafIndex;
+      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId, content).leafIndex;
 
     // DOD-COATTEND-1 (review F2): the plaintext failed to reach the transcript, and since Tier 1 the
     // transcript IS the delivery path — so this message can never be handed to any session. Report
@@ -4227,6 +4227,27 @@ export class SessionNodeManager {
     contentHashHex: string,
     senderPubkey: string,
     correlationId?: string,
+    /**
+     * The bytes as the PEER SENT THEM, before inbound sanitization — for the document classifier
+     * only. Defaults to `content` for callers that never screened (the held-release path).
+     *
+     * A `redact` verdict rewrites `content` for the agent's benefit, and that is right for
+     * conversation: the operator sees the sanitized form while the leaf still binds the original.
+     * It is WRONG for a document frame, and not marginally. Rewriting bytes inside a signed CBOR
+     * envelope does not sanitize it — it destroys it. The frame stops decoding, stops being
+     * recognised as document traffic at all, and falls through to the conversation path, where it
+     * is recorded as something a person said and handed to the agent by `cello_receive`.
+     *
+     * Measured live: roughly half of proposals vanished this way. Intermittent because a proposal
+     * carries a random 16-byte nonce, so whether its bytes trip a sanitizer rule varies per run —
+     * which is why it read as flakiness rather than as a rule firing.
+     *
+     * Documents are NOT unscreened as a result. They are screened by `DocumentGate`, which is built
+     * for them and REFUSES rather than mutates (§16.7) — because mutating one party's replica of a
+     * CRDT is not a false positive, it is permanent divergence that both sides converge on and
+     * neither can see.
+     */
+    originalContent?: Uint8Array,
   ): { leafIndex: number } {
     // M14 / DOD-DOC-INBOUND-2 — DOCUMENT FRAMES DIVERGE HERE, and the three-way split is the whole
     // contract:
@@ -4243,7 +4264,14 @@ export class SessionNodeManager {
     //
     // The hook is injected and absent by default, so a daemon without the document layer behaves
     // exactly as before — this cannot change the conversation path by being unwired.
-    const routed = this.#onDocumentFrame?.(agentName, sessionId, content, senderPubkey, correlationId);
+    const routed = this.#onDocumentFrame?.(
+      agentName,
+      sessionId,
+      // THE PEER'S BYTES, not the sanitized ones. See `originalContent` above.
+      originalContent ?? content,
+      senderPubkey,
+      correlationId,
+    );
     if (routed?.consumed === true) {
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "doc", contentHashHex, correlationId);
       this.#logger.info("session.document.received", {
