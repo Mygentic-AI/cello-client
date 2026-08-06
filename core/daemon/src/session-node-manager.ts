@@ -5272,10 +5272,49 @@ export class SessionNodeManager {
         return;
       }
 
-      if (frame["type"] !== "content_frame") return;
+      if (frame["type"] !== "content_frame") {
+        // LOGGED, not silently dropped. This handler is bound to one session, and a frame it does
+        // not understand arriving on that stream is either a peer speaking a newer protocol or a
+        // bug on our side — both worth a line, and neither distinguishable from "nothing arrived"
+        // when the return is silent.
+        this.#logger.warn("session.content.frame_unknown_type", {
+          sessionId,
+          type: typeof frame["type"] === "string" ? String(frame["type"]) : "(absent)",
+        });
+        return;
+      }
+      // THE FRAME NAMES ITS SESSION, and until now nothing checked it.
+      //
+      // The stream binding decides where content lands, so the field was decorative — which is the
+      // problem. A peer holding TWO sessions with us could put content addressed to one on the
+      // other's stream and it was ingested, leafed, transcribed and SEALED under the wrong record.
+      // The sealed transcript is the artifact this protocol exists to produce; a message in it that
+      // its own author addressed elsewhere is exactly the thing it must not contain.
+      //
+      // Refused rather than re-routed: routing it to the session it names would honour a claim made
+      // by the party whose frame arrived in the wrong place, and the stream — which is authenticated
+      // — is the better authority. Refusing leaves the sender to redeliver on the right one.
+      const framedSessionId = frame["session_id"];
+      if (typeof framedSessionId === "string" && framedSessionId !== sessionId) {
+        this.#logger.warn("session.content.session_mismatch", {
+          sessionId,
+          claimedSessionId: framedSessionId,
+        });
+        return;
+      }
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
-      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) return;
+      if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) {
+        // Same reasoning as the unknown type above: a malformed frame that vanishes without a trace
+        // is indistinguishable, from the operator's side, from a counterparty who never sent
+        // anything.
+        this.#logger.warn("session.content.frame_malformed", {
+          sessionId,
+          hasContent: contentBytes instanceof Uint8Array,
+          hasHash: contentHash instanceof Uint8Array,
+        });
+        return;
+      }
       // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
       // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
       // ingest — so the strict-in-order gate has the position without waiting on the separate
