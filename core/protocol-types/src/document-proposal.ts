@@ -66,6 +66,19 @@ export interface DocumentProperties {
   topology: string;
   /** Receiver-local append-only enforcement (§16.7-1). Freely settable — not a seam field. */
   append_only: boolean;
+  /**
+   * DOD-DOC-PROFILE-1 — the character space this document is agreed to carry, by NAME.
+   *
+   * Optional on the wire today and inert: the named codepoint sets are not enforced yet. It is in
+   * the SIGNED preimage now because it is bound into `document_id`, and adding it later would
+   * change the id of every existing document.
+   *
+   * Distinct from `schema_enforcement`, which is about structure. This is about which characters
+   * may appear at all — decided at consent, where the question "do I want a Devanagari document
+   * with this person" is answerable, rather than mid-document where "what is U+200D doing at offset
+   * 412" is not.
+   */
+  content_profile?: string;
 }
 
 export interface DocumentProposalEnvelope {
@@ -113,6 +126,19 @@ export function buildDocumentProposalTbs(
     env.properties.schema_enforcement,
     env.properties.topology,
     env.properties.append_only,
+    // DOD-DOC-PROFILE-1's slot. In the preimage from the start, so the profile is bound into
+    // `document_id` and cannot be changed after consent — an upgrade is a NEW document, which is
+    // the property that makes "agreed at the handshake" mean anything.
+    //
+    // Added while M14 has no users: this changes `document_id` for every proposal, and the only
+    // time that is free is before anyone holds a document they care about. The enforcement (named
+    // codepoint sets) follows on this slot; shipping the slot first is deliberate, because the
+    // alternative — enforcing a profile the wire cannot carry — is unimplementable, while a slot
+    // with no enforcement is merely inert and clearly marked as such.
+    //
+    // `null` when the proposer named none, so the slot is always occupied and no field's meaning
+    // depends on whether the one before it was present.
+    env.properties.content_profile ?? null,
     env.starting_content,
     env.nonce,
     // BIGINT past 0xffffffff — the same coercion three sibling builders carry and which

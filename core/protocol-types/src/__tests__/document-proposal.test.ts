@@ -274,6 +274,18 @@ describe("document proposal TBS — the FROZEN vector", () => {
   };
 
   it("the document_id is byte-for-byte what it was the day it was frozen", () => {
-    expect(documentIdFromProposal(FROZEN)).toBe("bbd72f0ad17e1fc07b04b599b760b96b676fba1f7040541cf9e4e13aa3a48a66");
+    // REISSUED 2026-08-06, deliberately and for the second time — see the preimage builder's own
+    // note about the first. `DOD-DOC-PROFILE-1`'s `content_profile` took a slot in the signed
+    // preimage, which changes the id of every proposal.
+    //
+    // That is the whole point of doing it now: the profile has to be bound into `document_id` for
+    // "agreed at the handshake, immutable after accept" to mean anything, and the only moment that
+    // rebinding is free is before anyone holds a document they care about. M14 shipped today, to
+    // one operator, with no documents in existence.
+    //
+    // This test firing was the correct outcome, not an obstacle. A frozen vector that could be
+    // edited without noticing is not a guard — if this ever fails again after real documents exist,
+    // the change is a migration, not a reissue.
+    expect(documentIdFromProposal(FROZEN)).toBe("7e53ceb4df8d5d9640ed1453c052359d195531ff480292f109f69e05b44c15e5");
   });
 });
