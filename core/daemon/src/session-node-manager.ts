@@ -4663,6 +4663,19 @@ export class SessionNodeManager {
     );
     if (routed?.consumed === true) {
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "doc", contentHashHex, correlationId);
+      // DROP THE WITNESS, exactly as the conversation branch does once its leaf is appended. The
+      // witness has done its ordering job either way — the leaf IS committed here.
+      //
+      // This branch returns early and so never reached that cleanup, and every inbound document
+      // frame left a permanent entry behind. Harmless until `sealReadiness` started deriving
+      // `missingLeaves` from the size of that map (M12-P14): from then on a session that carried
+      // ANY document traffic could never seal, because the ordering authority was recorded as
+      // having committed leaves this tree had — but had not been credited with. The refusal is
+      // `session_incomplete`, whose only escape is a force-abandon with no notarized receipt.
+      //
+      // Two correct changes, each fine alone, that break where they meet. Caught by running the
+      // live enforcers straight after merging main rather than trusting a green unit suite.
+      this.#witnessedSeq.get(this.#k(agentName, sessionId))?.delete(contentHashHex);
       this.#logger.info("session.document.received", {
         sessionId,
         senderPubkey,
