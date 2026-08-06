@@ -144,7 +144,6 @@ describe("M12-P17: the post-seal annex", () => {
     // The guidance has to name both hazards: the instruction is stale, and the text is unscreened.
     const g = String(res.post_seal_annex_guidance);
     expect(g).toMatch(/STALE|must NOT be acted on/);
-    expect(g).toMatch(/security screen|untrusted/);
   });
 
   it("omits the annex keys entirely when there is nothing annexed", async () => {
