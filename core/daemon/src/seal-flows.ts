@@ -100,7 +100,9 @@ export function renderSealRejection(
     session_abandoned:
       `The counterparty has already ABANDONED this session, so there is nothing left to co-sign — an abandon is terminal and yields no notarized receipt on either side. This is the state someone put it in deliberately (a force-close), not a fault to chase. Close it on this side too: cello_close_session ${sessionId} { force: true }.`,
     session_already_sealed:
-      `The counterparty has already SEALED this session — a receipt exists on their side. This is not a disagreement and nothing is wrong: fetch it with cello_sealed_receipt ${sessionId} rather than re-requesting a seal.`,
+      `The counterparty has already SEALED this session — a receipt exists on their side. This is not a disagreement and nothing is wrong: fetch it with cello_sealed_receipt ${sessionId} rather than re-requesting a seal. ` +
+      `IF THAT RETURNS not_sealed_yet, stop and read this: it means the seal completed but THIS side never received the completion frame, so no local certificate was ever written. Both answers are true and they point at each other — closing again will just report session_already_sealed a second time. ` +
+      `Do NOT reach for cello_close_session { force: true } to escape the loop: force forfeits the receipt on this side PERMANENTLY, and it destroys your half of a notarization that provably exists on theirs. The counterparty's copy remains valid and can be compared by sealed_root; leave the session as it is and report the divergence.`,
     session_seal_already_pending:
       `The counterparty has already recorded its half of this seal and is waiting on ours, so a second request cannot be answered. Do not re-send it; check cello_sessions ${sessionId} for the seal's completion.`,
   };

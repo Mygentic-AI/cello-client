@@ -203,7 +203,8 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         ok: true,
         status: "abandoned",
         reason: "force_abandoned",
-        guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.`,
+        guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt. ` +
+          `If the counterparty had reported session_already_sealed, this has now PERMANENTLY forfeited this side's half of a receipt that still exists on theirs — that is not recoverable from here, and their sealed_root remains the valid record of the conversation.`,
       };
     }
 

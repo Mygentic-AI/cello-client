@@ -183,6 +183,28 @@ describe("DOD-FRONTIER-STRAND-1 AC2: a frontier mismatch names both frontiers", 
       expect(r.guidance).not.toMatch(/Check the counterparty's daemon/);
     });
 
+    it("DOD-TERMINAL-STATE-DIVERGENCE-1: the sealed guidance must break the deadlock loop, not feed it", () => {
+      // "fetch it with cello_sealed_receipt" is correct ONLY when the local certificate exists. It
+      // exists only if the `session_sealed` push was received — and when it was NOT (the divergence
+      // this line is about), cello_sealed_receipt answers `not_sealed_yet` and sends the reader back
+      // to close-session, which answers `session_already_sealed` again. Two individually-true
+      // answers pointing at each other, with no exit.
+      //
+      // Observed 2026-08-06: an agent followed exactly that loop and then reached for
+      // `{ force: true }`, which forfeits the local half of a receipt that provably exists on the
+      // counterparty — turning a recoverable divergence into a permanent one. The guidance must
+      // name that outcome BEFORE the reader gets there.
+      const r = renderSealRejection("session_already_sealed", SID_HEX);
+      // Still says the receipt exists and where to look first.
+      expect(r.guidance).toMatch(/already SEALED/);
+      expect(r.guidance).toMatch(/cello_sealed_receipt/);
+      // ...but must now also handle the case where that call comes back empty.
+      expect(r.guidance).toMatch(/not_sealed_yet/);
+      // ...and must warn against the destructive escape, naming what it costs.
+      expect(r.guidance).toMatch(/force/i);
+      expect(r.guidance).toMatch(/permanent|forfeit|destroy/i);
+    });
+
     it("M12-P14: an ABANDONED counterparty says the abandon is terminal and yields no receipt", () => {
       // The state that ended both sessions on 2026-08-05. The operator needs to know it is
       // deliberate and terminal, not a condition to diagnose.
