@@ -108,6 +108,36 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     (r as { ok?: false }).ok === false;
 
   /**
+   * Has the peer REFUSED this document? If so, nothing may be published into it.
+   *
+   * Without this a refused document keeps authoring envelopes: each one is signed, leafed, and
+   * delivered forever to a peer who has no such document and answers `document_unknown` every time.
+   * The operator's surface meanwhile shows `active` with a pending count that never clears — the
+   * exact shape of a collaboration that has silently stopped working, which is the failure this
+   * milestone exists to not have.
+   *
+   * Checked HERE rather than in `DocumentLifecycle.canPublish` because the consent decision lives in
+   * the handshake, and giving lifecycle a handshake dependency to answer one question would put the
+   * proposal protocol inside the status machine.
+   *
+   * UNANSWERED IS NOT REFUSED. Publishing before the peer has decided is normal and load-bearing —
+   * the update waits in the log and delivers when they accept, which is what makes proposing to an
+   * offline peer work at all.
+   */
+  function peerRefused(who: Resolved, documentId: string): { ok: false; reason: string; guidance: string } | null {
+    const answer = layer.handshake.peerAnswer(who.ownerAgentId, documentId);
+    if (answer.accepted !== false) return null;
+    return {
+      ok: false,
+      reason: "document_peer_refused",
+      guidance:
+        `Your peer refused this document${answer.reason ? ` — they said: "${answer.reason}"` : ""}. ` +
+        `Nothing published into it can ever reach them, so this write was not recorded. Propose a ` +
+        `new document if you want to try again with different terms.`,
+    };
+  }
+
+  /**
    * Write the document out as a file, or return null when no workspace is configured.
    *
    * Failures are LOGGED AND SWALLOWED, deliberately and only here: the file is a projection of the
@@ -569,6 +599,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
 
+    const refused = peerRefused(who, documentId);
+    if (refused) return refused;
+
     const doc = layer.live.get(who.ownerAgentId, documentId);
     const text = doc.getText("content");
     const before = text.toString();
@@ -741,6 +774,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         guidance: `No document ${documentId.slice(0, 16)}… for this agent. See cello_doc_list.`,
       };
     }
+
+    const refusedByPeer = peerRefused(who, documentId);
+    if (refusedByPeer) return refusedByPeer;
 
     const doc = layer.live.get(who.ownerAgentId, documentId);
     let update: Uint8Array | null;

@@ -339,3 +339,37 @@ describe("cello_doc_list distinguishes states that otherwise render identically"
     expect(listed).toMatchObject({ proposedByUs: false, consentState: "accepted" });
   });
 });
+
+describe("a document the peer REFUSED does not keep publishing", () => {
+  it("refuses the write instead of authoring an envelope nobody will accept", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+
+    // The peer's signed refusal, the way `recordProposalAck` records it.
+    f.layer.handshake.recordPeerDecision(f.owner, documentId, f.peer, {
+      accepted: false,
+      reason: "not this one",
+      decidedAtMs: NOW,
+    });
+
+    // Publishing anyway costs a signed leaf and a delivery that the peer refuses as
+    // `document_unknown` — forever, because they have no such document. The operator meanwhile sees
+    // `active` with a pending count that never clears, which is the shape of a document that has
+    // silently stopped working.
+    const res = await f.call("cello_doc_write", { document_id: documentId, content: "more text" });
+    expect(res).toMatchObject({ ok: false, reason: "document_peer_refused" });
+    // And the refusal names the peer's own words, so the operator knows what happened rather than
+    // being told a generic no.
+    expect(String(res.guidance)).toContain("not this one");
+    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+  });
+
+  it("still allows a write while the peer has NOT yet answered", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    // Unanswered is not refused. Publishing before the peer decides is normal — the update waits in
+    // the log and delivers when they accept, which is what makes an offline proposal work at all.
+    expect(await f.call("cello_doc_write", { document_id: documentId, content: "early text" }))
+      .toMatchObject({ ok: true, published: true });
+  });
+});
