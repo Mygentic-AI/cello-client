@@ -59,6 +59,21 @@ describe("M12-P17: the post-seal annex", () => {
     expect(fx.snm.readSealedAnnex("alice")).toHaveLength(1);
   });
 
+  it("a FAILED annex write reports false — that boolean is what keeps the relay copy alive", async () => {
+    // The ordering property, tested at the only seam a unit test can reach. The drain does:
+    //     if (recordSealedAnnex(...)) { confirm-delete the relay copy }
+    // so the return value is load-bearing: a write that failed but answered `true` would delete the
+    // ONLY other copy of the message and convert a noisy re-pull loop into permanent silent loss —
+    // strictly worse than the bug being fixed. An unresolvable agent is the cheapest way to make the
+    // write genuinely fail without corrupting the database under the other tests.
+    await fx.createSession(SID, "alice");
+    expect(
+      fx.snm.recordSealedAnnex("no-such-agent", SID, "ee".repeat(32), new TextEncoder().encode("x"), null),
+      "a write that did not commit must never answer true",
+    ).toBe(false);
+    expect(fx.snm.readSealedAnnex("alice"), "and nothing must have been written").toHaveLength(0);
+  });
+
   it("scopes by session when asked, and by agent otherwise", async () => {
     await fx.createSession(SID, "alice");
     const OTHER = "c8".repeat(32);
