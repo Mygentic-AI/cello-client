@@ -665,6 +665,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         // only trace was one warn line — the parked content for it then failed authentication 297
         // times before anyone noticed.
         recordRefusal(agentName, parsed.sessionIdHex, parsed.participantAPubkeyHex, bound.reason);
+        // M12-P18: DURABLE record too — content parked for this refused session arrives later and
+        // survives restarts, and this is what lets the drain sweep it instead of re-pulling it
+        // forever (the 78-times-per-message counterparty_unknown loop).
+        sessionNodeManager.recordRefusedSession(agentName, parsed.sessionIdHex, bound.reason);
 
         // M12-P18: TELL THE SENDER — but only if we already trust them.
         //

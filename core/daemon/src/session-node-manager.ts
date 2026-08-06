@@ -235,6 +235,7 @@ const RECEIVED_BUFFER_CAP = 32;
  * caller (and the operator reading `reason`) was sent to the transport when the blocker was the
  * standing receiver.
  */
+// M12-P18: how many refused session ids to retain per agent (drain-sweep matching, not security).
 type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
 
 export class SessionNodeManager {
@@ -891,6 +892,25 @@ export class SessionNodeManager {
       }
     }
 
+    // M12-P18: sessions this agent REFUSED (abuse cap etc.). DURABLE and separate from the in-memory
+    // refusedSessionRequests inbox list, for one reason: content parked for a refused session arrives
+    // AFTER the refusal and often after a restart, and at drain time `counterparty_unknown` cannot
+    // tell "content for a session I declined" from "content I might still want". This table is that
+    // missing memory. Deleting parked content matched here judges NOTHING about the content — it acts
+    // on OUR OWN refusal, so it does not violate the SEC-1 rule that a forgery must not evict itself.
+    // Bounded by pruning on write (keep the most recent N per agent); a refused session id is never
+    // reused (directory-assigned, unique), so forgetting an old one only means its stale parked
+    // content is not proactively swept — the relay TTL backstop still applies.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS refused_sessions (
+        agent_id   TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        refused_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id)
+      )
+    `);
+
     // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
     // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
     // notarization), and it must not be thrown away: it is a real message, provably sent to this
@@ -1354,6 +1374,7 @@ export class SessionNodeManager {
            t.direction = 'received'
            AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
 
+  static readonly #REFUSED_SESSIONS_CAP = 200;
   static readonly #TERMINAL_STATUSES = `('sealed','abandoned','seal_interrupted_pending','interrupted')`;
 
   /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
@@ -3316,6 +3337,40 @@ export class SessionNodeManager {
       });
       return false;
     }
+  }
+
+  /**
+   * M12-P18: record that this agent refused a session, so parked content that later arrives for it
+   * (and fails `counterparty_unknown`, because no session row exists) can be swept instead of
+   * re-pulled forever. Keeps the most recent REFUSED_SESSIONS_CAP per agent.
+   */
+  recordRefusedSession(agentName: string, sessionId: string, reason: string): void {
+    if (!this.#db) return;
+    const agentId = this.#requireAgentId(agentName);
+    try {
+      this.#db.prepare(
+        `INSERT OR REPLACE INTO refused_sessions (agent_id, session_id, reason, refused_at) VALUES (?, ?, ?, ?)`,
+      ).run(agentId, sessionId, reason, Date.now());
+      // Prune to the cap — oldest first.
+      this.#db.prepare(
+        `DELETE FROM refused_sessions WHERE agent_id = ? AND session_id NOT IN (
+           SELECT session_id FROM refused_sessions WHERE agent_id = ? ORDER BY refused_at DESC LIMIT ${SessionNodeManager.#REFUSED_SESSIONS_CAP}
+         )`,
+      ).run(agentId, agentId);
+    } catch (err: unknown) {
+      this.#logger.warn("session.refused.record.failed", {
+        agentName, sessionId, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** M12-P18: did this agent refuse this session? Consulted at drain to sweep orphaned parked content. */
+  wasSessionRefused(agentName: string, sessionId: string): boolean {
+    if (!this.#db) return false;
+    const row = this.#db
+      .prepare("SELECT 1 AS present FROM refused_sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { present: number } | undefined;
+    return row !== undefined;
   }
 
   /** M12-P17: read the annex. Operator-initiated ONLY — never wired to a wake path or inbox count. */
