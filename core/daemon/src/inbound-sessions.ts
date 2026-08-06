@@ -23,6 +23,7 @@ import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
+import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 
@@ -34,6 +35,22 @@ export interface ExpiredSessionRequest {
   sessionIdHex: string;
   counterpartyPubkeyHex: string;
   expiredAt: number;
+}
+
+/**
+ * M12-P18: a session this agent REFUSED, kept so the operator can see it happened.
+ *
+ * The refusal is deliberately silent TO THE SENDER — a blocked peer and an over-cap peer must be
+ * indistinguishable, or the refusal becomes an oracle that tells someone they are blocked. That
+ * stays. What was missing is the other direction: the operator whose own daemon turned someone away
+ * was told nothing either, so a cap firing was invisible until someone read the logs by hand. Local
+ * only; nothing here is sent anywhere.
+ */
+export interface RefusedSessionRequest {
+  sessionIdHex: string;
+  counterpartyPubkeyHex: string;
+  reason: string;
+  refusedAt: number;
 }
 
 export interface InboundSessionEvent {
@@ -66,6 +83,12 @@ export interface InboundSessionWaiter {
 
 
 export interface InboundSessionDeps {
+  /**
+   * M12-P18: send a frame to the counterparty over this agent's directory stream. Needed so a
+   * refusal can actually REACH a trusted sender — until now the responder had no way to answer at
+   * all, which is why every refusal was silent regardless of who it was refusing.
+   */
+  sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
   /**
    * M12-P16 (review F1): was this agent DELIBERATELY taken offline? Nothing on this path consulted
    * agent state at all, so an offline agent accepted new sessions — and `acceptInboundAssignment`'s
@@ -484,6 +507,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   // Expired requests move HERE (from inboundSessionQueues) rather than vanishing — visible via
   // cello_check_notifications so the operator can see what they missed, not just silence.
   const expiredSessionRequests = new Map<string, ExpiredSessionRequest[]>();
+  // M12-P18: same lasting-log shape and the same cap as expiredSessionRequests.
+  const refusedSessionRequests = new Map<string, RefusedSessionRequest[]>();
+  const REFUSED_SESSION_REQUESTS_CAP = 20;
+  function recordRefusal(agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string, reason: string): void {
+    const list = refusedSessionRequests.get(agentName) ?? [];
+    list.push({ sessionIdHex, counterpartyPubkeyHex, reason, refusedAt: Date.now() });
+    refusedSessionRequests.set(agentName, list.slice(-REFUSED_SESSION_REQUESTS_CAP));
+  }
   // A blocked cello_await_session waiter. connectionId is carried so the disconnect
   // hook can evict waiters belonging to a dead connection (otherwise enqueue would hand
   // an inbound event to a closed connection and the event would be lost — review H2).
@@ -629,6 +660,53 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           reason: bound.reason,
           correlationId,
         });
+        // M12-P18: make it visible to OUR operator. A cap firing on your own daemon should not
+        // require reading the log to discover. Measured: a per-sender cap refused a session and the
+        // only trace was one warn line — the parked content for it then failed authentication 297
+        // times before anyone noticed.
+        recordRefusal(agentName, parsed.sessionIdHex, parsed.participantAPubkeyHex, bound.reason);
+
+        // M12-P18: TELL THE SENDER — but only if we already trust them.
+        //
+        // The old blanket silence was defended as oracle-protection: a BLOCKED peer and an over-cap
+        // peer must be indistinguishable, or the refusal tells someone they are blocked. That holds
+        // for strangers, and it is kept for them. But it is weak protection even there — the two
+        // states behave differently over time (a cap clears, a block never does), so a patient
+        // adversary separates them by retrying. Meanwhile the price was paid entirely by legitimate
+        // peers, who get no reason, cannot self-diagnose, and simply conclude the protocol is
+        // broken.
+        //
+        // For a KNOWN+ contact the leak is close to nil: "you have N sessions open with me, the cap
+        // is N" is THEIR OWN state, which they already know. So they get the reason and the numbers.
+        // UNKNOWN and BLOCKED still get silence — a stranger learns nothing, and a blocked party
+        // cannot tell blocking from throttling.
+        const senderTier = sessionNodeManager.getTier(agentName, parsed.participantAPubkeyHex);
+        if (senderTier >= TIER.KNOWN && senderTier <= TIER.VIP) {
+          // The EFFECTIVE cap for THIS operator, not the grid default — caps are per-agent settings
+          // (DOD-TIER-BOUNDS-SETTINGS), so quoting the default would lie to anyone who raised theirs.
+          const effectiveCap = sessionNodeManager.resolveTierBound(agentName, senderTier, "max_sessions");
+          void deps.sendOver(agentName, {
+            type: "session_refused",
+            sessionId: parsed.sessionIdHex,
+            initiatorPubkey: parsed.participantAPubkeyHex,
+            reason: bound.reason,
+            max_sessions_per_sender: effectiveCap,
+            guidance:
+              `They refused this session: you already have ${effectiveCap} session(s) open with them, which is ` +
+              `the limit for your trust level. Close one with cello_close_session and try again. Note a session ` +
+              `that was interrupted still counts until it is sealed or abandoned.`,
+          }).then((sent) => {
+            logger.info("session.inbound.refusal.notified", {
+              agentName, sessionId: parsed.sessionIdHex, reason: bound.reason,
+              delivered: sent.ok, tier: senderTier, correlationId,
+            });
+          }).catch(() => { /* best-effort: the local record above is the durable half */ });
+        } else {
+          logger.debug("session.inbound.refusal.silent", {
+            agentName, sessionId: parsed.sessionIdHex, reason: bound.reason,
+            tier: senderTier, why: "sender is UNKNOWN or BLOCKED — no oracle", correlationId,
+          });
+        }
         return;
       }
       // DOD-RENAME-1 AC1 (review F1 / DEC-AB-4): record the offered name as the rename baseline the
@@ -1177,6 +1255,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     inboundSessionQueues,
     inboundSessionWaiters,
     expiredSessionRequests,
+    refusedSessionRequests,
     offeredMonikers,
     offerKey,
   };

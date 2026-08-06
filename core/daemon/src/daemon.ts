@@ -1703,6 +1703,7 @@ async function startDaemonHoldingLock(
     inboundSessionQueues,
     inboundSessionWaiters,
     expiredSessionRequests,
+    refusedSessionRequests,
     offeredMonikers,
     offerKey,
   } = createInboundSessions({
@@ -1710,6 +1711,8 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     agents,
     isExplicitlyOffline: (agentName: string) => explicitlyOfflineAgents.has(agentName),
+    // M12-P18: lets the responder send a refusal reason back to a TRUSTED sender.
+    sendOver,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -3230,6 +3233,7 @@ async function startDaemonHoldingLock(
     reapExpiredInboundSessions,
     inboundSessionQueues,
     expiredSessionRequests,
+    refusedSessionRequests,
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now
