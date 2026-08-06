@@ -1371,6 +1371,14 @@ async function startDaemonHoldingLock(
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
   const retryQueue = new RetryQueue(sessionNodeManager.getDb(), logger);
   retryQueue.loadFromDb();
+  // DOD-RETRYQ-STRAND-1: the terminal-transition hook below only fires for sessions that go
+  // terminal while this daemon runs. A session already sealed/abandoned before boot never
+  // transitions again — close-session returns `already_abandoned` without reaching abandonSession —
+  // so without this its rows are unreachable by every removal path and retryQueueDepth stays pinned
+  // forever. That is exactly the row found on the live daemon, 25.6h old. Runs after loadFromDb so
+  // the in-memory queues are dropped in step with the rows, and before the IPC socket opens so no
+  // client ever observes the stale depth.
+  retryQueue.reapAlreadyTerminalSessions();
 
   // CELLO-M7-MSG-001 (AC-001/AC-003/AC-019): wire the awaiting-ACK lifecycle's durable
   // side effects to the retry_queue. A `persisted` delivery ACK clears the durable

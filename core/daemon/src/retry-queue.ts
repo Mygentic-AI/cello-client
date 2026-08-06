@@ -391,23 +391,59 @@ export class RetryQueue {
    * @returns how many entries were removed — 0 is the normal case and is silent.
    */
   reapTerminalSession(sessionId: string, terminalStatus: "sealed" | "abandoned"): number {
-    // The in-memory queue is not the authority: a row written by an EARLIER daemon exists only in
-    // the DB until loadFromDb runs, and the live strand this fixes was exactly that shape. Delete
-    // by SQL and report what the DB actually removed.
-    const entries = this.#queues.get(sessionId) ?? [];
+    // The in-memory queue is NOT the authority, and must not be the source for either half of this.
+    // A row written by an earlier daemon exists only in the DB until loadFromDb runs — the live
+    // strand was exactly that shape — so the rows to announce are read from the DB, and the same
+    // set is then deleted. Announcing from memory while deleting from disk would silently discard
+    // any row the map does not happen to hold, which is the precise failure AC3 names as the worse
+    // one.
+    let doomed: Array<{ nonce_hex: string }>;
+    try {
+      doomed = this.#db
+        .prepare("SELECT nonce_hex FROM retry_queue WHERE session_id = ? AND awaiting_ack = 0")
+        .all(sessionId) as unknown as Array<{ nonce_hex: string }>;
+    } catch (err: unknown) {
+      this.#logger.error("message.retry.persist.failed", {
+        sessionId,
+        operation: "terminal_reap_select",
+        error: err instanceof Error ? err.message : String(err),
+        impact: "could not read the rows to reap; nothing was deleted and retryQueueDepth stays pinned",
+      });
+      return 0;
+    }
+
+    if (doomed.length === 0) {
+      // Still drop any memory-only residue so depth cannot disagree with the DB, then stay silent:
+      // the overwhelming majority of terminal sessions have nothing queued, and an event on every
+      // one of them buries the occurrence that means content was actually lost.
+      this.#queues.delete(sessionId);
+      this.#positionCounters.delete(sessionId);
+      return 0;
+    }
 
     let removed: number;
     try {
       const result = this.#db
         .prepare("DELETE FROM retry_queue WHERE session_id = ? AND awaiting_ack = 0")
         .run(sessionId) as unknown as { changes?: number | bigint };
-      // better-sqlite3 and node:sqlite both report `changes`; normalise the BIGINT some builds return.
-      removed = Number(result?.changes ?? entries.length);
+      // Both drivers in use (node:sqlite in tests, SQLCipher in production) report `changes`. Its
+      // absence is a driver contract violation, not a case to paper over with a memory count — the
+      // whole point of this method is that memory is not authoritative.
+      if (result?.changes === undefined) {
+        this.#logger.error("message.retry.persist.failed", {
+          sessionId,
+          operation: "terminal_reap_delete",
+          error: "driver returned no `changes` from DELETE",
+          impact: "rows may or may not have been removed; the reported count cannot be trusted",
+        });
+      }
+      removed = Number(result?.changes ?? doomed.length);
     } catch (err: unknown) {
       // A failed DELETE must not leave memory claiming the rows are gone — the next loadFromDb
       // would resurrect them and the depth would silently disagree with the DB.
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
+        operation: "terminal_reap_delete",
         error: err instanceof Error ? err.message : String(err),
         impact: "terminal-session reap did not remove the rows; retryQueueDepth stays pinned",
       });
@@ -416,10 +452,10 @@ export class RetryQueue {
 
     // Each dropped entry is content the sender believes it sent. Say so per entry, with the nonce,
     // so the loss is nameable rather than a bare count.
-    for (const entry of entries) {
+    for (const row of doomed) {
       this.#logger.warn("session.retryqueue.content.dropped", {
         sessionId,
-        nonce: entry.nonceHex,
+        nonce: row.nonce_hex,
         reason: terminalStatus,
         impact: "queued content was never delivered and is now discarded — the session can no longer drain",
       });
@@ -428,16 +464,62 @@ export class RetryQueue {
     this.#queues.delete(sessionId);
     this.#positionCounters.delete(sessionId);
 
-    if (removed > 0) {
-      this.#logger.info("session.retryqueue.reaped", {
-        sessionId,
-        entryCount: removed,
-        disposition: "dropped",
-        reason: terminalStatus,
-      });
-    }
+    this.#logger.info("session.retryqueue.reaped", {
+      sessionId,
+      entryCount: removed,
+      reason: terminalStatus,
+    });
 
     return removed;
+  }
+
+  /**
+   * DOD-RETRYQ-STRAND-1: reconcile at startup. The terminal-transition hook only covers sessions
+   * that go terminal while THIS daemon is running. A session that was already sealed/abandoned
+   * before boot never transitions again — `cello_close_session` returns `already_abandoned`
+   * without reaching `abandonSession` — so its rows would strand forever with no path that could
+   * ever clear them. That is the shape of the row found on the live daemon.
+   *
+   * Still evidence-gated: the session's terminal status is the evidence, read from the DB. Nothing
+   * here consults age.
+   *
+   * @returns total entries reaped across all already-terminal sessions.
+   */
+  reapAlreadyTerminalSessions(): number {
+    let rows: Array<{ session_id: string; status: string }>;
+    try {
+      rows = this.#db
+        .prepare(
+          `SELECT DISTINCT rq.session_id AS session_id, s.status AS status
+             FROM retry_queue rq
+             JOIN sessions s ON s.session_id = rq.session_id
+            WHERE rq.awaiting_ack = 0
+              AND s.status IN ('sealed', 'abandoned')`,
+        )
+        .all() as unknown as Array<{ session_id: string; status: string }>;
+    } catch (err: unknown) {
+      this.#logger.error("message.retry.persist.failed", {
+        operation: "startup_terminal_reconcile",
+        error: err instanceof Error ? err.message : String(err),
+        impact: "already-terminal sessions were not reconciled; retryQueueDepth may stay pinned",
+      });
+      return 0;
+    }
+
+    let total = 0;
+    for (const row of rows) {
+      total += this.reapTerminalSession(
+        row.session_id,
+        row.status === "sealed" ? "sealed" : "abandoned",
+      );
+    }
+    if (total > 0) {
+      this.#logger.info("session.retryqueue.startup.reconciled", {
+        sessionCount: rows.length,
+        entryCount: total,
+      });
+    }
+    return total;
   }
 
   /** Total retry queue depth across all sessions. */

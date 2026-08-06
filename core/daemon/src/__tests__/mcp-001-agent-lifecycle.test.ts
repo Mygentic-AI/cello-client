@@ -482,6 +482,34 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
       expect(after.retryQueueDepth).toBe(0);
     });
 
+    it("DOD-RETRYQ-STRAND-1: a row whose session was ALREADY terminal before boot is reaped at startup", async () => {
+      // The live strand's shape, and the half the transition hook cannot reach: the session went
+      // abandoned in an EARLIER process, so it never transitions again (close-session returns
+      // `already_abandoned` without reaching abandonSession). Only a startup reconcile clears it.
+      // Revert test: remove `retryQueue.reapAlreadyTerminalSessions()` from daemon.ts and the final
+      // assertion reads 1 — the daemon boots with the corpse still pinning the metric.
+      const config = await setupWithAgents("alice");
+      handle = await startDaemon(config);
+      let client = await connect(config.socketPath);
+      await client.send("cello_start_agent", { name: "alice" });
+      await client.send("cello_use_agent", { name: "alice" });
+
+      const sid = "fa".repeat(16);
+      seedSession("alice", sid, { createdAt: Date.now(), status: "abandoned" });
+      handle.getSessionNodeManager().getDb().prepare(
+        `INSERT INTO retry_queue (session_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack)
+         VALUES (?, ?, ?, ?, 1, 1, 0)`,
+      ).run(sid, Buffer.from("strand-nonce").toString("hex"), Buffer.from("undelivered"), Date.now());
+
+      // Restart onto the same CELLO_DIR: this is the boot that must reconcile.
+      await handle.stop("test_restart");
+      handle = await startDaemon(config);
+      client = await connect(config.socketPath);
+
+      const status = (await client.send("status", {})) as { retryQueueDepth: number };
+      expect(status.retryQueueDepth).toBe(0);
+    });
+
     it("reaps a DEAD half-open session on read — 0 RECEIVED + not alive + past TTL — even though message_count is 1 (its own Dispatched ack)", async () => {
       const config = await setupWithAgents("alice");
       handle = await startDaemon(config);

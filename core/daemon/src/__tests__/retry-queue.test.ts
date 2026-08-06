@@ -19,10 +19,21 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { RetryQueue, RETRY_QUEUE_CAP } from "../retry-queue.js";
 import { NonceDedupStore } from "../nonce-dedup.js";
 import type { Logger } from "../types.js";
 import type { ResendResult } from "../retry-queue.js";
+
+/**
+ * The startup reconcile joins retry_queue against `sessions`, which SessionNodeManager owns and
+ * creates in production. These unit DBs hold only retry_queue, so give them the one column the
+ * join reads. Deliberately minimal — this is not a second schema definition, just the join target.
+ */
+function seedSessionRow(db: DatabaseSync, sessionId: string, status: string): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, status TEXT NOT NULL)`);
+  db.prepare("INSERT OR REPLACE INTO sessions (session_id, status) VALUES (?, ?)").run(sessionId, status);
+}
 
 describe("RetryQueue", () => {
   let db: DatabaseSync;
@@ -505,22 +516,43 @@ describe("RetryQueue", () => {
       expect(logEvents.filter((e) => e.event === "session.retryqueue.content.dropped")).toHaveLength(0);
     });
 
-    it("NEVER reaps by age — an old row on a still-live session survives", () => {
+    it("NEVER reaps by age — no removal path in the module carries a time predicate", () => {
       // AC2, and the same rule as DOD-SESSION-REAP-1: "old" is not "undeliverable". An age sweep
-      // discards live content on a slow link. The ONLY evidence that authorises removal is the
-      // session's terminal status.
-      const sessionId = "session-still-active";
+      // discards live content on a slow link.
+      //
+      // This is asserted STRUCTURALLY, on the source, because the property is structural. The
+      // earlier version of this test enqueued a backdated row and asserted it survived
+      // loadFromDb — which called none of this unit's code, stayed green with the fix reverted,
+      // and would have stayed green against the obvious way anyone would actually add a sweep (a
+      // new method called from daemon.ts). Reading the SQL is the only form that cannot be
+      // sidestepped by putting the predicate somewhere else in the module.
+      const src = readFileSync(new URL("../retry-queue.ts", import.meta.url), "utf8");
+      const deletes = src.match(/DELETE FROM retry_queue[^"`']*/g) ?? [];
+      expect(deletes.length).toBeGreaterThan(0);
+      for (const stmt of deletes) {
+        expect(stmt).not.toMatch(/queued_at/);
+      }
+      // The reap's own SELECT decides what gets deleted, so it must be age-free too.
+      const selects = src.match(/SELECT[^"`']*FROM retry_queue[^"`']*/g) ?? [];
+      for (const stmt of selects) {
+        expect(stmt).not.toMatch(/queued_at\s*[<>]/);
+      }
+    });
+
+    it("an old row on a still-live session survives a full reconcile — age is not evidence", () => {
+      // The behavioural half of AC2: drive the real reconcile path (not loadFromDb) against a row
+      // 90 days old whose session is ACTIVE, and assert it is untouched. Revert-tested: an age
+      // predicate in either statement above deletes this row and turns this red.
+      const sessionId = "session-old-but-active";
       retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
-      // Backdate it well beyond any plausible age threshold.
       db.prepare("UPDATE retry_queue SET queued_at = ? WHERE session_id = ?")
         .run(Date.now() - 90 * 24 * 60 * 60 * 1000, sessionId);
+      seedSessionRow(db, sessionId, "active");
 
-      const reloaded = new RetryQueue(db, logger);
-      reloaded.loadFromDb();
+      const reaped = retryQueue.reapAlreadyTerminalSessions();
 
-      // There is deliberately no age-based sweep to call. The row stays until its session is
-      // terminal — asserted here so that adding one later turns this test red.
-      expect(reloaded.getSessionDepth(sessionId)).toBe(1);
+      expect(reaped).toBe(0);
+      expect(retryQueue.getSessionDepth(sessionId)).toBe(1);
     });
 
     it("leaves OTHER sessions' rows untouched", () => {
@@ -565,21 +597,69 @@ describe("RetryQueue", () => {
       expect(logEvents.filter((e) => e.event === "session.retryqueue.content.dropped")).toHaveLength(0);
     });
 
-    it("reaps rows that exist ONLY in the DB — the live strand shape, recovered at startup", () => {
-      // Andre's stranded row predates any in-memory queue: it was written by an earlier daemon and
-      // is present only after loadFromDb. A reap that consulted memory alone would never find it.
-      const sessionId = "session-from-disk";
-      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
+    it("reaps a row present ONLY in the DB — never loaded into memory — and still names it", () => {
+      // The strand shape: a row written by an earlier daemon, with loadFromDb NOT called, so the
+      // in-memory map is empty. A reap that read the map would delete nothing and announce nothing.
+      // The previous version of this test called loadFromDb first and then asserted the row WAS in
+      // memory — so it never exercised the scenario its name claimed.
+      const sessionId = "session-only-on-disk";
+      const nonceHex = Buffer.from(randomBytes(32)).toString("hex");
+      db.prepare(
+        `INSERT INTO retry_queue (session_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack)
+         VALUES (?, ?, ?, ?, 1, 1, 0)`,
+      ).run(sessionId, nonceHex, Buffer.from("undelivered"), Date.now());
 
-      const afterRestart = new RetryQueue(db, logger);
-      afterRestart.loadFromDb();
-      expect(afterRestart.getSessionDepth(sessionId)).toBe(1);
+      const fresh = new RetryQueue(db, logger);
+      expect(fresh.getSessionDepth(sessionId)).toBe(0); // genuinely not in memory
+      logEvents.length = 0;
 
-      expect(afterRestart.reapTerminalSession(sessionId, "abandoned")).toBe(1);
+      expect(fresh.reapTerminalSession(sessionId, "abandoned")).toBe(1);
+
       const rows = db
         .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ?")
         .get(sessionId) as unknown as { n: number };
       expect(rows.n).toBe(0);
+      // AC3 must hold for a row the map never held — this is the half that failed review.
+      const dropped = logEvents.filter((e) => e.event === "session.retryqueue.content.dropped");
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0].context.nonce).toBe(nonceHex);
+    });
+
+    it("startup reconcile clears rows whose session was ALREADY terminal before boot", () => {
+      // F-1: the transition hook cannot fire for a session that went terminal in an earlier
+      // process — close-session returns `already_abandoned` without reaching abandonSession — so
+      // without this pass the live 25.6h strand is never cleared by anything.
+      const doomed = "session-was-abandoned";
+      const sealed = "session-was-sealed";
+      const live = "session-still-open";
+      for (const s of [doomed, sealed, live]) {
+        retryQueue.enqueue(s, randomBytes(32), randomBytes(64));
+      }
+      seedSessionRow(db, doomed, "abandoned");
+      seedSessionRow(db, sealed, "sealed");
+      seedSessionRow(db, live, "active");
+
+      const afterRestart = new RetryQueue(db, logger);
+      afterRestart.loadFromDb();
+      expect(afterRestart.getTotalDepth()).toBe(3);
+
+      const reaped = afterRestart.reapAlreadyTerminalSessions();
+
+      expect(reaped).toBe(2);
+      expect(afterRestart.getTotalDepth()).toBe(1);
+      expect(afterRestart.getSessionDepth(live)).toBe(1);
+    });
+
+    it("startup reconcile leaves interrupted and seal_interrupted_pending alone — both can still complete", () => {
+      const interrupted = "session-interrupted";
+      const pending = "session-seal-pending";
+      retryQueue.enqueue(interrupted, randomBytes(32), randomBytes(64));
+      retryQueue.enqueue(pending, randomBytes(32), randomBytes(64));
+      seedSessionRow(db, interrupted, "interrupted");
+      seedSessionRow(db, pending, "seal_interrupted_pending");
+
+      expect(retryQueue.reapAlreadyTerminalSessions()).toBe(0);
+      expect(retryQueue.getTotalDepth()).toBe(2);
     });
   });
 });

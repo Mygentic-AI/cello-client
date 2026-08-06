@@ -6094,14 +6094,28 @@ export class SessionNodeManager {
     if (!this.#db) return false;
     const now = Date.now();
     try {
-      this.#db
+      const res = this.#db
         .prepare(
           "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?",
         )
-        .run(status, now, this.#requireAgentId(agentName), sessionId);
+        .run(status, now, this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
+      // "Did not throw" is NOT "landed". An UPDATE whose WHERE matches no row — a wrong agent_id, a
+      // session_id with no row — succeeds silently and changes nothing. Reporting that as a written
+      // status flip is what let a disposition hook delete a live session's content, so the row count
+      // is the answer to both questions.
+      const landed = Number(res?.changes ?? 0) > 0;
+      if (!landed) {
+        this.#logger.error("session.status.write.missed", {
+          sessionId,
+          status,
+          agentName,
+          impact: "no session row matched — the status was NOT changed and no disposition was run",
+        });
+        return false;
+      }
       // DOD-RETRYQ-STRAND-1: only AFTER the status write actually landed. Disposing of durable
-      // state on the strength of a write that failed would discard content while the session is
-      // still, on disk, drainable. 'interrupted' and 'seal_interrupted_pending' are deliberately
+      // state on the strength of a write that did not land would discard content while the session
+      // is still, on disk, drainable. 'interrupted' and 'seal_interrupted_pending' are deliberately
       // NOT terminal — both can still complete, and reaping them would destroy live content.
       if (status === "sealed" || status === "abandoned") {
         try {
