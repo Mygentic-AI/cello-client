@@ -271,17 +271,33 @@ export function createContentPark(deps: ContentParkDeps) {
           refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_write_failed" });
         }
       } else {
-        // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
-        // NOT confirm-deleted — a forgery must not be able to evict itself from the mailbox, and a
-        // genuine v1-peer message must not be destroyed by our refusing it.
-        //
-        // M12-P17: this is why `counterparty_unknown` is NOT annexed above. That reason comes from
-        // the SEC-1 authentication step ("we cannot prove the signer") — the content is UNVERIFIED,
-        // so deleting it would destroy exactly what this comment protects. Only verified content
-        // whose session has ended is safe to move. The unverified backlog needs relay-side expiry,
-        // not client-side deletion.
-        refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
-        logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
+        // M12-P18: content for a session WE REFUSED can be swept — deleting it acts on our own
+        // refusal decision, not on the content, so it does not violate the rule that a forgery must
+        // not evict itself. This is the fix for the counterparty_unknown re-pull loop (78 of 121
+        // stranded entries on one box): the abuse cap refused the session, no session row was ever
+        // created, so every drain re-pulled and re-refused the parked content forever.
+        if (sessionNodeManager.wasSessionRefused(recipientAgent.name, e.sessionIdHex)) {
+          logger.info("content.recover.refused_session.swept", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+            reason: ingest.reason,
+            impact: "content was parked for a session this agent refused — deleted from the relay, not re-pullable",
+            correlationId,
+          });
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          }
+        } else {
+          // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
+          // NOT confirm-deleted for a session we did NOT ourselves refuse — a forgery must not be
+          // able to evict itself, and a genuine message we simply have no row for yet must survive.
+          // M12-P17: this is also why `counterparty_unknown` is NOT annexed above — the content is
+          // UNVERIFIED. The residual (a stranger's stranded content we never refused) needs
+          // relay-side TTL, not client-side deletion.
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
+          logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
+        }
       }
     }
     return { ok: true, recovered, pulled: entries.length, refused: refusals.length, refusals };
