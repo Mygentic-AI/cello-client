@@ -192,6 +192,22 @@ export function seamViolation(props: DocumentProperties): string | null {
       "schema-as-first-update validation (§3.3) is not yet built"
     );
   }
+  // THE PROFILE NAME IS CLOSED (DOD-DOC-PROFILE-1). Refused at the seam like every other property,
+  // because the alternative is a document agreed under a name nothing enforces — which reads as
+  // protected in the inbox, in `list`, and in every review, and is not. Absent is fine: documents
+  // agreed before profiles existed carry none, and the screening floor still applies to them.
+  //
+  // The names live in the daemon (`document-profile.ts`) because that is where the codepoint sets
+  // are; duplicating them here would be two answers to what is admissible, which is the drift
+  // `DocumentProperties` was unified to stop. So this checks SHAPE — a non-empty string — and the
+  // receiving gate checks membership, refusing an unknown name by enforcing nothing while the
+  // denylist still applies.
+  if (props.content_profile !== undefined && typeof props.content_profile !== "string") {
+    return (
+      `content_profile must be a profile NAME (a string) or absent; this build cannot agree a ` +
+      `document whose character space is declared as something else`
+    );
+  }
   if (props.topology !== TOPOLOGY_V1) {
     return (
       `document_seam_topology: this version supports "${TOPOLOGY_V1}" only, and the proposal asks ` +

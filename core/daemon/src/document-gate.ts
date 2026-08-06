@@ -104,6 +104,16 @@ export interface GateContext {
    */
   declaredEncoding: string | undefined;
   appendOnly?: boolean;
+  /**
+   * DOD-DOC-PROFILE-1 — the character space this document was AGREED to carry, from the signed
+   * proposal via the stored row.
+   *
+   * Taken from the persisted document like `appendOnly`, and for the identical reason: it is agreed
+   * at the handshake and bound into `document_id`, so reading it from a caller option would leave a
+   * document configured with a profile unprotected unless every future call site remembered to pass
+   * it.
+   */
+  contentProfile?: string;
 }
 
 /** A pluggable rule. Returns null to allow. DOD-DOC-SCREEN-1 registers here. */

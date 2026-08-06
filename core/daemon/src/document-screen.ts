@@ -45,9 +45,13 @@
  */
 
 import type { GateRule, ProjectedDiff, GateContext } from "./document-gate.js";
+import { profileViolation } from "./document-profile.js";
 
 /** Named so a refusal can say which rule fired without the sender parsing prose (§16.7-6). */
 export const SCREEN_RULE_ID = "document_content_screen";
+
+/** Named separately so a refusal says whether the AGREED profile or the default floor refused. */
+export const PROFILE_RULE_ID = "document_content_profile";
 
 /**
  * Codepoints refused anywhere in inserted text.
@@ -91,9 +95,25 @@ function formatCodepoint(cp: number): string {
  * the character in their own editor — and an offset that lands mid-surrogate in a document with an
  * emoji in it is worse than none.
  */
-export const screeningRule: GateRule = (diff: ProjectedDiff, _context: GateContext) => {
+export const screeningRule: GateRule = (diff: ProjectedDiff, context: GateContext) => {
   const text = diff.inserted;
   if (text.length === 0) return null;
+
+  // THE AGREED PROFILE FIRST (DOD-DOC-PROFILE-1). An allowlist is the stronger instrument — the
+  // decision was made once, at consent, by a human who was engaged — so when a document has one it
+  // answers before the denylist argues character by character.
+  //
+  // It cannot WIDEN anything: every profile still refuses what the denylist below refuses, so a
+  // peer cannot ask for a permissive profile at consent time as a way out of screening. Enforced
+  // here because the sender's own enforcement is unverifiable; that is the security half, and the
+  // authoring check is the ergonomics half, not a substitute for it.
+  const violation = profileViolation(context.contentProfile, text);
+  if (violation) {
+    return {
+      reason: "document_profile_violation",
+      detail: JSON.stringify({ rule: PROFILE_RULE_ID, ...violation }),
+    };
+  }
 
   const codepoints = new Set<string>();
   const offsets: number[] = [];

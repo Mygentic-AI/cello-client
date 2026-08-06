@@ -47,6 +47,7 @@ import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks } from "./document-write-path.js";
+import { profileViolation } from "./document-profile.js";
 
 /** Document types the notification/diff path understands. Anything else is stored, not diffed. */
 const DEFAULT_DOCUMENT_TYPE = "markdown";
@@ -573,6 +574,35 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const before = text.toString();
     if (before === content) {
       return { ok: true, documentId, changed: false, published: false };
+    }
+
+    // AUTHORING-SIDE PROFILE CHECK (DOD-DOC-PROFILE-1, §16.7-14). Caught where the character was
+    // WRITTEN, so it never becomes a rejection round: the peer's gate would refuse this envelope,
+    // the refusal would advance the retry counter, and three of those stall the document. Refusing
+    // here costs one call and no protocol state.
+    //
+    // This is ERGONOMICS, not security, and the distinction is load-bearing — the receiver's gate
+    // runs the identical check and stays authoritative, because a sender's client can be patched or
+    // compromised while the sender themselves is a good actor. Deleting this makes CELLO more
+    // annoying; deleting the receiver's makes it unsafe.
+    const profileFault = profileViolation(
+      typeof document.properties.content_profile === "string"
+        ? document.properties.content_profile
+        : undefined,
+      content,
+    );
+    if (profileFault) {
+      return {
+        ok: false,
+        reason: "document_profile_violation",
+        guidance:
+          `This document was agreed as '${profileFault.profile}', which does not allow ` +
+          `${profileFault.codepoints.join(", ")} (${profileFault.count} occurrence(s), first at ` +
+          `character ${profileFault.offsets[0]}). The profile is fixed for the life of the document ` +
+          `— it was bound into the id when your peer accepted it — so change the text rather than ` +
+          `the setting.`,
+        detail: JSON.stringify(profileFault),
+      };
     }
     // LINE HUNKS, never a whole-text replace — and this is not a preference, it is measured.
     //

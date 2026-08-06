@@ -299,6 +299,10 @@ export class DocumentInbound {
         // Taking it from an option meant a document configured append-only was unprotected unless
         // every future call site remembered to pass the flag.
         appendOnly: appendOnly(doc),
+        // The AGREED profile, from the same persisted row and for the same reason.
+        ...(typeof doc.properties.content_profile === "string"
+          ? { contentProfile: doc.properties.content_profile }
+          : {}),
       },
       nowMs,
     );
