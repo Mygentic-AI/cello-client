@@ -3748,10 +3748,24 @@ async function startDaemonHoldingLock(
     // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
     // teardown would dial into a daemon that is going away.
     clearInterval(documentDeliveryTimer);
-    // ...and wait for the tick already running. `clearInterval` stops the next one, not this one,
-    // which may be mid-dial into a transport that is going away.
+    // `clearInterval` stops the NEXT tick; the flag stops the running one at its next agent.
     documentDeliveryStopping = true;
-    if (documentDeliveryInFlight) await documentDeliveryInFlight;
+    // BOUNDED. This was a bare `await documentDeliveryInFlight`, and shutdown is the one place that
+    // must not block on the network: a sweep mid-dial against an unreachable peer held `stop()`
+    // open, so the interrupt-marking writes that follow did not complete before the process died —
+    // and sessions came back `active` after a restart, which is the exact defect AC-009 exists to
+    // catch. It failed on CI, where a directory node times out at 5s, and passed locally, where it
+    // does not.
+    //
+    // A tick still gets a moment to finish so the common case is orderly; after that we proceed
+    // without it. What the sweep leaves half-done is safe by construction — delivery state is
+    // derived from the log, so an interrupted pass is re-derived on the next start.
+    if (documentDeliveryInFlight) {
+      await Promise.race([
+        documentDeliveryInFlight,
+        new Promise<void>((resolve) => setTimeout(resolve, 500).unref?.()),
+      ]);
+    }
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
