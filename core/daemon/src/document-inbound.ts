@@ -43,7 +43,15 @@ import type { Logger } from "./types.js";
 
 export type InboundResult =
   | { ok: true; admitted: true; envelopeHash: string; duplicate: boolean }
-  | { ok: true; admitted: false; envelopeHash: string; rejectionReason: string; duplicate: false }
+  | {
+      ok: true;
+      admitted: false;
+      envelopeHash: string;
+      rejectionReason: string;
+      duplicate: false;
+      /** The signed `document_rejection` to put on the wire. Absent when this refusal is a repeat. */
+      rejectionWire?: Uint8Array;
+    }
   | { ok: false; reason: string; detail: string };
 
 export interface DocumentInboundDeps {
@@ -298,7 +306,7 @@ export class DocumentInbound {
     if (!verdict.admit) {
       // 7a. REJECT. The bytes are held, a 0x05 leaf references them, and the peer is ANSWERED —
       // a rejection is an ack for delivery purposes, so the sender stops retrying and supersedes.
-      await this.#d.rejections.reject(ownerAgentId, env.document_id, {
+      const rejection = await this.#d.rejections.reject(ownerAgentId, env.document_id, {
         rejectedEnvelopeHash: envelopeHash,
         quarantined: verdict.quarantined,
         reason: verdict.reason,
@@ -315,6 +323,10 @@ export class DocumentInbound {
         ok: true,
         admitted: false,
         envelopeHash,
+        // The signed refusal, for the caller to transmit. Absent on a duplicate — we already told
+        // them once, and re-sending would advance their round counter for a retry that never
+        // happened, driving the document to `stalled` early.
+        ...(rejection.wire ? { rejectionWire: rejection.wire } : {}),
         rejectionReason: verdict.reason,
         duplicate: false,
       };

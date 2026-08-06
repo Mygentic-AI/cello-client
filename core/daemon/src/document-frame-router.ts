@@ -139,6 +139,8 @@ export interface DocumentFrameRouterDeps {
    * REQUIRED, not optional. Without it the sender has no answer and redelivers until the document
    * stalls; an optional callback would make that outcome a configuration rather than a bug.
    */
+  /** Put an already-signed frame on the wire to whoever authored `wire` — the rejection, today. */
+  sendFrameToPeer(ownerAgentId: string, inResponseTo: Uint8Array, bytes: Uint8Array): Promise<void>;
   sendAck(
     ownerAgentId: string,
     /** The envelope as it arrived — the document id and the party to answer are both inside it. */
@@ -323,6 +325,23 @@ export class DocumentFrameRouter {
           // The ack is best-effort by contract anyway: it cannot fail the content we have already
           // admitted, and a lost one is recovered by the sender's redelivery, which is acked in
           // turn.
+          // THE SIGNED REFUSAL ITSELF, when there is one. The ack says "refused"; this frame is what
+          // advances the SENDER's retry round, and their entire supersede-then-stall protocol is
+          // driven by receiving it. Without it their counter never leaves zero and a peer whose
+          // every update is refused republishes forever, with its own surface reporting `active`.
+          //
+          // Absent on a repeat refusal by design — re-sending would advance their round for a retry
+          // that never happened and stall the document early.
+          if (!res.admitted && res.rejectionWire) {
+            void this.#d
+              .sendFrameToPeer(ownerAgentId, content, res.rejectionWire)
+              .catch((err: unknown) => {
+                this.#d.logger.warn("document.rejection.send_threw", {
+                  correlationId,
+                  reason: err instanceof Error ? err.message : String(err),
+                });
+              });
+          }
           void this.#d.sendAck(ownerAgentId, content, {
             envelopeHash: res.envelopeHash,
             admitted: res.admitted,

@@ -33,6 +33,7 @@ import * as Y from "yjs";
 import {
   buildDocumentRejectionTbs,
   documentRejectionHash,
+  encodeDocumentRejection,
   DOCUMENT_REJECTION_VERSION,
   type DocumentRejectionEnvelope,
 } from "@cello-protocol/protocol-types";
@@ -95,6 +96,18 @@ export interface RejectionOutcome {
   stalled: boolean;
   /** How many rejections this document has seen, including this one. */
   round: number;
+  /**
+   * The signed rejection, encoded, for the caller to put on the wire — or absent when this was a
+   * duplicate and nothing new was authored.
+   *
+   * RETURNED, because it was not, and the consequence was that the entire retry protocol was
+   * unreachable. The envelope was built here, signed here, leafed here, and then discarded: nothing
+   * in production ever called `encodeDocumentRejection`. So the refusing side kept a perfect local
+   * record of a decision it never communicated, and the sender — whose round counter is advanced by
+   * RECEIVING this frame — never advanced past round zero. A peer whose every update is refused
+   * republished forever, and its own surface said `active` the whole time. Measured live.
+   */
+  wire?: Uint8Array;
 }
 
 export interface QuarantineEntry {
@@ -306,7 +319,8 @@ export class DocumentRejections {
         rounds: round,
       });
     }
-    return { stalled, round };
+    // The bytes go back to the caller so the peer can actually be told. See `RejectionOutcome.wire`.
+    return { stalled, round, wire: encodeDocumentRejection(envelope) };
   }
 
   /**

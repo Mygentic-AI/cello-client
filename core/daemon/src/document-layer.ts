@@ -215,6 +215,21 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
+    sendFrameToPeer: async (ownerAgentId, inResponseTo, bytes) => {
+      // Addressed to whoever AUTHORED the envelope being answered, taken from the envelope itself
+      // rather than from the document row: the row's peer and the envelope's sender are the same
+      // party in a two-party document, and reading it from the signed bytes means a refusal can
+      // only ever go back to the agent that actually sent the thing refused.
+      const env = decodeDocumentUpdateEnvelope(inResponseTo);
+      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, bytes);
+      if (!sent.ok) {
+        logger.warn("document.rejection.unsent", {
+          documentId: env.document_id,
+          peerAgentId: env.sender_agent_id,
+          reason: sent.reason,
+        });
+      }
+    },
     sendAck: async (ownerAgentId, wire, outcome) => {
       const env = decodeDocumentUpdateEnvelope(wire);
       const ack: DocumentAck = {
