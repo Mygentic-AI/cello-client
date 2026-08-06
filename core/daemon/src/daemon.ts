@@ -843,6 +843,17 @@ async function startDaemonHoldingLock(
 
   // Set of agents currently in "online" state (transitioned via cello_start_agent)
   const onlineAgents = new Set<string>();
+  /**
+   * M12-P16 (review F1): agents an operator DELIBERATELY took offline.
+   *
+   * Deliberately NOT `onlineAgents`. That set answers "has this agent been started through
+   * cello_start_agent", which is not the same question as "may this agent receive": several
+   * legitimate paths serve inbound sessions without ever populating it, so gating the inbound path
+   * on it refuses real traffic (proven — it broke 27 tests across 7 suites). This set is empty
+   * unless someone actually pressed the switch, so it can only ever refuse what the operator asked
+   * to have refused.
+   */
+  const explicitlyOfflineAgents = new Set<string>();
 
   // M8C-CURSOR-1: per-connection, per-session read cursor (read-before-write gating).
   // Distinct from message_watermarks (INBOX-1, per-AGENT delivery watermark, persisted) — this is
@@ -1678,6 +1689,7 @@ async function startDaemonHoldingLock(
     logger,
     sessionNodeManager,
     agents,
+    isExplicitlyOffline: (agentName: string) => explicitlyOfflineAgents.has(agentName),
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -1889,6 +1901,8 @@ async function startDaemonHoldingLock(
       return { ok: true };
     }
     onlineAgents.add(name);
+    // Pressing start clears the deliberate-offline mark — that is what makes the switch reversible.
+    explicitlyOfflineAgents.delete(name);
     // CELLO-M7-CONN-001 (DOD-CONN-2, code-review HIGH): the "online" transition establishes THIS
     // agent's OWN directory signaling connection (the documented getAgentSignaling "online" trigger),
     // so the directory has a stream to push inbound session_assignment / seal_interrupted_request to.
@@ -1959,6 +1973,7 @@ async function startDaemonHoldingLock(
     sessionNodeManager,
     agents,
     onlineAgents,
+    explicitlyOfflineAgents,
     getNotificationDispatcher: () => notificationDispatcher,
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     perConnectionState,

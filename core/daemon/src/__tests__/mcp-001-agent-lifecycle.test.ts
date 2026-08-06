@@ -205,20 +205,9 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(snm.getSessionRecord("alice", SID)?.status).toBe("interrupted");
   });
 
-  // M12-P16 (review F1) — KNOWN COVERAGE GAP, deliberately not faked.
-  //
-  // The inbound half of the kill switch — an offline agent REFUSING a new `session_assignment` — is
-  // fixed in `acceptInboundAssignment` (it now returns `agent_offline` before touching anything, so
-  // `ensureStandingReceiverForAgent` never re-arms the want-flag the offline handler just cleared).
-  // It is NOT unit-tested here: reaching that function means driving a signed assignment through the
-  // per-agent signaling stream, which this suite has no harness for, and the honest observable is
-  // the counterparty NOT getting an away reply — which needs two processes.
-  //
-  // A test that stubbed the assignment path would pin a double and prove nothing, which is exactly
-  // the mistake that shipped the first version of this fix. Covered instead by the live two-machine
-  // check that found the defect: set an agent offline, initiate from the other machine, and assert
-  // NO `session.inbound.accepted` and NO `session.away.response.sent` in the offline daemon's log.
-  // Recorded here at the point of absence rather than left to be discovered.
+  // M12-P16 (review F1): the INBOUND half — an offline agent refusing a new assignment and
+  // sending no away reply — is covered in m8c-away-1.test.ts, driven through the real signaling
+  // path, because the observable that matters is the counterparty getting no answer.
 
   // ─── AC-004: cello_set_agent_offline transitions Online→Registered (idempotent) ───
   it("AC-004: cello_set_agent_offline transitions agent to registered and clears current", async () => {

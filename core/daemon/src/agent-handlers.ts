@@ -32,6 +32,8 @@ export interface AgentHandlerDeps {
   sessionNodeManager: SessionNodeManager;
   agents: AgentInfo[];
   onlineAgents: Set<string>;
+  /** M12-P16: agents an operator deliberately took offline — the inbound refusal keys on THIS. */
+  explicitlyOfflineAgents: Set<string>;
   /** LAZY: the dispatcher is constructed late in startDaemon. These handlers only touch it at
    *  request time, so a getter avoids a temporal-dead-zone crash at registration. */
   getNotificationDispatcher: () => NotificationDispatcher;
@@ -50,7 +52,7 @@ export interface AgentHandlerDeps {
 
 export function registerAgentHandlers(deps: AgentHandlerDeps): void {
   const {
-    handlers, logger, sessionNodeManager, agents, onlineAgents, getNotificationDispatcher,
+    handlers, logger, sessionNodeManager, agents, onlineAgents, explicitlyOfflineAgents, getNotificationDispatcher,
     getConnState, perConnectionState, getAgentsForConnection, startAgentInternal,
     dropAgentSignaling, awayAckSent, keyProviders, loadedAgents, getAgentSignaling,
     waitForSignalingConnected, perAgentSignaling,
@@ -317,6 +319,13 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     if (!agent || agent.state === "load_failed") {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Check agent names with cello_agents.` };
     }
+    // M12-P16: record the OPERATOR'S INTENT first, before any bookkeeping check can short-circuit.
+    // The idempotent early-return below keys on `onlineAgents`, which answers "was this agent started
+    // through cello_start_agent" — not "is it reachable". An agent serving traffic without ever
+    // entering that set (a standing receiver built directly, an auto-start path) would take the
+    // early return, report `ok: true`, and keep answering: the switch pressed, nothing switched off.
+    // Intent is not conditional on internal state.
+    explicitlyOfflineAgents.add(name);
     if (!onlineAgents.has(name)) {
       // Idempotent — already registered/offline, no event
       return { ok: true };

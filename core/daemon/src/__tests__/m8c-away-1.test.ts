@@ -232,6 +232,44 @@ describe("M8C-AWAY-1: away response", () => {
     };
   }
 
+  it("M12-P16: an agent taken OFFLINE refuses the inbound assignment and sends no away reply", async () => {
+    // The half the first version of this fix missed, and the one the counterparty actually saw:
+    // measured live 2026-08-05, an agent confirmed offline accepted a message, appended a leaf and
+    // REPLIED. Tearing down existing sessions was not enough — nothing on the inbound path consulted
+    // agent state at all, and `acceptInboundAssignment` called `ensureStandingReceiverForAgent`,
+    // whose first line re-added the want-flag the offline handler had just cleared. The receiver came
+    // back from the dead and the away reply fired.
+    //
+    // Driven through the REAL assignment path (the same injected signaling frame A1 uses), because
+    // the observable that matters is the counterparty getting no answer.
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    await wait(50);
+    await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
+
+    const initiatorPubkey = "cd".repeat(32);
+    h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+
+    // Press the switch.
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "test" });
+    await client.send("cello_set_agent_offline", { name: "bob" });
+
+    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    await wait(200);
+
+    expect(
+      events.find((e) => e.event === "session.away.response.sent"),
+      "an offline agent must not answer a stranger",
+    ).toBeUndefined();
+    expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
+    const refused = events.find((e) => e.event === "session.inbound.refused");
+    expect(refused?.context.reason).toBe("agent_offline");
+  });
+
   it("A1: an inbound session request while UNATTENDED gets an auto-ack in the transcript", async () => {
     const { logger, events } = makeLogger();
     const bobPubkey = await makeAgentDir("bob");
