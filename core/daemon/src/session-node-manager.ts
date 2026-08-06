@@ -3441,7 +3441,19 @@ export class SessionNodeManager {
         structure2_cbor: orderingS2,
       }) as Uint8Array;
       stream.send(lp.encode.single(frame));
-      try { await stream.close(); } catch { /* best-effort close */ }
+      // NOT SWALLOWED. This was `try { await stream.close(); } catch { }` followed by
+      // `delivered: true` — which reports a frame as delivered when the flush failed.
+      //
+      // `close()` waits for the write buffer to drain, so a reset mid-flush throws HERE, and that
+      // is precisely the case where the bytes never left. Discarding it made `delivered: true` mean
+      // "we called send and close did not visibly complain", while every caller reads it as "the
+      // peer has it" — and the sender then never retries, because nothing told it to.
+      //
+      // Letting it reach the catch below is the honest outcome: that path parks the content against
+      // the relay backstop and reports `delivered: false` if it can, or `ok: false` if it cannot.
+      // A close that failed for a benign reason costs a redundant park, which the receiver dedups
+      // on the content hash. A false delivered costs the message.
+      await stream.close();
       return { ok: true, delivered: true };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
