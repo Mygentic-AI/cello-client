@@ -3760,12 +3760,25 @@ async function startDaemonHoldingLock(
     // A tick still gets a moment to finish so the common case is orderly; after that we proceed
     // without it. What the sweep leaves half-done is safe by construction — delivery state is
     // derived from the log, so an interrupted pass is re-derived on the next start.
-    if (documentDeliveryInFlight) {
-      await Promise.race([
-        documentDeliveryInFlight,
-        new Promise<void>((resolve) => setTimeout(resolve, 500).unref?.()),
-      ]);
-    }
+    // NOT AWAITED AT ALL. Two attempts at waiting for it were both wrong, and the second was worse
+    // than the first:
+    //
+    //   1. a bare await blocked shutdown on the network — a sweep mid-dial against an unreachable
+    //      peer held `stop()` open past the point where the interrupt-marking writes had to happen;
+    //   2. bounding it with `setTimeout(...).unref()` looked like the fix and could HANG FOREVER: an
+    //      unref'd timer does not hold the event loop open, so while the loop is draining during
+    //      shutdown it may never fire, the race never settles, and `stop()` never reaches the line
+    //      that logs `daemon.stopped` — which is exactly what CI showed, a daemon whose log ends at
+    //      `daemon.started` with no shutdown events at all.
+    //
+    // There is nothing to wait for. `documentDeliveryStopping` stops the loop at its next agent, and
+    // whatever a half-finished sweep leaves behind is safe by construction: delivery state is
+    // DERIVED from the envelope log, so an interrupted pass is simply re-derived on the next start —
+    // the property the offline enforcer proves against two real daemons.
+    //
+    // The rule this cost two CI round trips to learn: shutdown may not await anything that can
+    // block on I/O, and a timeout that can outlive the event loop is not a bound.
+    void documentDeliveryInFlight;
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
