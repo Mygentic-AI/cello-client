@@ -135,10 +135,48 @@ export function createContentPark(deps: ContentParkDeps) {
         } catch (err: unknown) {
           logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
         }
+      } else if (ingest.reason === "session_committed") {
+        // M12-P17: the session ENDED before this arrived. It can never join that chain — appending
+        // would change `sealed_root` and invalidate the notarization — but it is VERIFIED content
+        // (SEC-1 authenticated it above; that is what separates this branch from the one below), and
+        // discarding it silently loses a real message the operator was actually sent.
+        //
+        // Without this branch the entry is refused and never confirm-deleted, so every drain pulls,
+        // verifies and refuses it again — measured at ~120 repeats per message, forever, while the
+        // operator never sees it once. Noisy invisible loss.
+        //
+        // ORDER IS LOAD-BEARING: annex FIRST, confirm-delete SECOND, and only if the annex committed.
+        // A crash between them must lose nothing. Reversed, or delete-on-best-effort, converts the
+        // loop into PERMANENT SILENT loss — strictly worse than the bug.
+        const annexed = sessionNodeManager.recordSealedAnnex(
+          recipientAgent.name, e.sessionIdHex, e.contentHashHex, unsealed, null,
+        );
+        if (annexed) {
+          logger.info("content.annexed", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+            reason: "session_committed", correlationId,
+          });
+          try {
+            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+          } catch (err: unknown) {
+            // The annex holds it, so the message is safe; the relay copy simply gets re-pulled and
+            // deduped by the INSERT OR IGNORE next time. Not data loss.
+            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          }
+        } else {
+          // The annex write failed and reported it. Keep the relay copy — it is now the only one.
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
+        }
       } else {
         // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still
         // NOT confirm-deleted — a forgery must not be able to evict itself from the mailbox, and a
         // genuine v1-peer message must not be destroyed by our refusing it.
+        //
+        // M12-P17: this is why `counterparty_unknown` is NOT annexed above. That reason comes from
+        // the SEC-1 authentication step ("we cannot prove the signer") — the content is UNVERIFIED,
+        // so deleting it would destroy exactly what this comment protects. Only verified content
+        // whose session has ended is safe to move. The unverified backlog needs relay-side expiry,
+        // not client-side deletion.
         refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
         logger.warn("content.recover.ingest_failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, reason: ingest.reason, correlationId });
       }

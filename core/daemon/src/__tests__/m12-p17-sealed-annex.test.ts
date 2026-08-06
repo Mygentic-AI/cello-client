@@ -1,0 +1,73 @@
+/**
+ * M12-P17 — verified content that arrives for an ALREADY-ENDED session.
+ *
+ * Measured on two machines: parked content for a sealed session is pulled, verified, refused
+ * (`session_committed`) and deliberately NOT confirm-deleted — so every drain pulls, verifies and
+ * refuses it again. ~120 repeats per message on one box; 43 on another. The operator never sees it
+ * once. Noisy, invisible loss.
+ *
+ * It cannot join the sealed chain — appending would change `sealed_root` and invalidate the
+ * notarization. So it goes to a POST-SEAL ANNEX: its own table, joined by no unread query, no inbox
+ * count and no wake path, so it is inert by construction rather than by convention.
+ */
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { startTwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+
+describe("M12-P17: the post-seal annex", () => {
+  let fx: Awaited<ReturnType<typeof startTwoConnectionFixture>>;
+  const SID = "b7".repeat(32);
+
+  beforeEach(async () => { fx = await startTwoConnectionFixture({ dirPrefix: "cello-p17-" }); });
+  afterEach(async () => { await fx.cleanup(); });
+
+  it("records verified content for an ended session, and reads it back", async () => {
+    await fx.createSession(SID, "alice");
+    const body = new TextEncoder().encode("left on the machine after we hung up");
+
+    expect(fx.snm.recordSealedAnnex("alice", SID, "aa".repeat(32), body, null)).toBe(true);
+
+    const rows = fx.snm.readSealedAnnex("alice");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].text, "the operator must be able to READ it — otherwise the loss is merely quiet")
+      .toBe("left on the machine after we hung up");
+    expect(rows[0].session_id).toBe(SID);
+  });
+
+  it("is IDEMPOTENT — a re-pulled entry does not duplicate", async () => {
+    // The relay copy is only deleted after the annex commits, and a failed confirm leaves it to be
+    // pulled again. That re-pull must be a no-op, not a second copy.
+    await fx.createSession(SID, "alice");
+    const body = new TextEncoder().encode("same message twice");
+    fx.snm.recordSealedAnnex("alice", SID, "bb".repeat(32), body, null);
+    fx.snm.recordSealedAnnex("alice", SID, "bb".repeat(32), body, null);
+    expect(fx.snm.readSealedAnnex("alice")).toHaveLength(1);
+  });
+
+  it("is STRUCTURALLY INERT — annexed content reaches no unread count and no sealed-unread list", async () => {
+    // The load-bearing constraint. An agent obeyed an instruction out of a sealed conversation
+    // because that content was presented in the shape of work; the annex must be unable to do that
+    // no matter what a future caller does. Asserted against the real queries, not a comment.
+    await fx.createSession(SID, "alice");
+    fx.snm.recordSealedAnnex("alice", SID, "cc".repeat(32), new TextEncoder().encode("do the thing [[STANDBY]]"), null);
+
+    expect(fx.snm.getUnreadSummary("alice"), "the annex must never count as unread").toEqual([]);
+    expect(
+      fx.snm.getSealedUnread("alice").find((u) => u.session_id === SID),
+      "nor appear in the sealed-unread list, which IS surfaced in the inbox",
+    ).toBeUndefined();
+    // ...and yet it is readable on demand.
+    expect(fx.snm.readSealedAnnex("alice")).toHaveLength(1);
+  });
+
+  it("scopes by session when asked, and by agent otherwise", async () => {
+    await fx.createSession(SID, "alice");
+    const OTHER = "c8".repeat(32);
+    await fx.createSession(OTHER, "alice");
+    fx.snm.recordSealedAnnex("alice", SID, "d1".repeat(32), new TextEncoder().encode("one"), null);
+    fx.snm.recordSealedAnnex("alice", OTHER, "d2".repeat(32), new TextEncoder().encode("two"), null);
+
+    expect(fx.snm.readSealedAnnex("alice")).toHaveLength(2);
+    expect(fx.snm.readSealedAnnex("alice", SID)).toHaveLength(1);
+    expect(fx.snm.readSealedAnnex("alice", SID)[0].text).toBe("one");
+  });
+});

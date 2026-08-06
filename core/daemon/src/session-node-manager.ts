@@ -869,6 +869,33 @@ export class SessionNodeManager {
       }
     }
 
+    // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
+    // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
+    // notarization), and it must not be thrown away: it is a real message, provably sent to this
+    // operator, that no one would otherwise ever read.
+    //
+    // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
+    // nothing here is joined by `getUnreadSummary`, `getSealedUnread`, any inbox count or any wake
+    // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
+    // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
+    // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed
+    // conversation.
+    //
+    // Keyed on (agent_id, content_hash): `session_id` is recorded for display but is NOT part of the
+    // key, because the sibling case this design must also serve — content we cannot attribute to a
+    // session at all — has no session to key on.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS sealed_session_annex (
+        agent_id      TEXT NOT NULL,
+        content_hash  TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        sender_pubkey TEXT,
+        content       BLOB NOT NULL,
+        arrived_at    INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, content_hash)
+      )
+    `);
+
     // M7-SESSION-001 (H-1): side table holding the verified bilateral
     // SEAL-INTERRUPTED commitment artifacts. A side table (CREATE TABLE IF NOT
     // EXISTS) is inherently idempotent — no ALTER TABLE / duplicate-column
@@ -3221,6 +3248,49 @@ export class SessionNodeManager {
    * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
    * for a session. Returns null when none exist.
    */
+  /**
+   * M12-P17: durably record verified content that arrived for an ALREADY-ENDED session.
+   *
+   * Returns true only when the row is committed — the caller confirm-deletes the relay copy on the
+   * strength of this answer, and the ORDER is load-bearing: annex first, delete second. A crash
+   * between them must lose nothing, so a failure here MUST report false and leave the relay copy
+   * alone. Getting that backwards converts a noisy re-pull loop into permanent silent loss, which is
+   * the outcome this whole unit exists to prevent.
+   */
+  recordSealedAnnex(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, senderPubkeyHex: string | null): boolean {
+    if (!this.#db) return false;
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO sealed_session_annex (agent_id, content_hash, session_id, sender_pubkey, content, arrived_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(this.#requireAgentId(agentName), contentHashHex, sessionId, senderPubkeyHex, Buffer.from(content), Date.now());
+      return true;
+    } catch (err: unknown) {
+      // FAILS LOUD and reports false: the relay copy is the only other one in existence.
+      this.#logger.error("content.annex.write.failed", {
+        agentName, sessionId, contentHash: contentHashHex,
+        impact: "content NOT annexed — the relay copy must be kept, or the message is lost",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  /** M12-P17: read the annex. Operator-initiated ONLY — never wired to a wake path or inbox count. */
+  readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> {
+    if (!this.#db) return [];
+    const rows = (sessionId === undefined
+      ? this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName))
+      : this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? AND session_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName), sessionId)
+    ) as Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; content: Buffer; arrived_at: number }>;
+    return rows.map((r) => ({
+      session_id: r.session_id, content_hash: r.content_hash, sender_pubkey: r.sender_pubkey,
+      text: new TextDecoder().decode(new Uint8Array(r.content)), arrived_at: r.arrived_at,
+    }));
+  }
+
   getSealInterruptedArtifacts(agentName: string, sessionId: string): {
     role: string;
     ownLeaf: unknown;
