@@ -12,6 +12,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { startTwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { generateKeypair } from "@cello-protocol/crypto";
+import { sealParkEnvelope, decodeParkEnvelope } from "../park-envelope.js";
+import { createHash } from "node:crypto";
 
 describe("M12-P17: the post-seal annex", () => {
   let fx: Awaited<ReturnType<typeof startTwoConnectionFixture>>;
@@ -31,6 +34,47 @@ describe("M12-P17: the post-seal annex", () => {
     expect(rows[0].text, "the operator must be able to READ it — otherwise the loss is merely quiet")
       .toBe("left on the machine after we hung up");
     expect(rows[0].session_id).toBe(SID);
+  });
+
+  it("stores the MESSAGE, not the envelope — the bytes production hands it must read back as the text", async () => {
+    // Review F1, and this is the test whose absence let it ship. The drain unseals a park entry and
+    // gets the whole CBOR ENVELOPE ([version, content, s1, s2, senderPubkey, parkSig]); the message
+    // is `env.content`. Annexing the envelope and then confirm-deleting the relay copy leaves the
+    // operator an unreadable blob as the ONLY surviving copy — the loop stops, the message is still
+    // never read, and nothing else holds it. Permanent silent loss, which is worse than the bug.
+    //
+    // Built with the REAL producer (`sealParkEnvelope`, the same function both daemon park sites
+    // call) so the bytes are production's, not the test's idea of them.
+    await fx.createSession(SID, "alice");
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const content = new TextEncoder().encode("the message the operator must be able to read");
+    const contentHash = new Uint8Array(
+      createHash("sha256").update(new Uint8Array([0x00])).update(content).digest(),
+    );
+    const ciphertext = await sealParkEnvelope({
+      signer: sender,
+      sessionIdHex: SID,
+      recipientPubkey: await recipient.getPublicKey(),
+      contentHash,
+      content,
+    });
+    const unsealed = await recipient.openContentSeal!(ciphertext);
+    expect(unsealed).not.toBeNull();
+
+    // The envelope is NOT the message — if it were, this test could not tell the two apart and the
+    // defect would be invisible to it.
+    expect(new TextDecoder().decode(unsealed!)).not.toBe("the message the operator must be able to read");
+
+    const env = decodeParkEnvelope(unsealed!);
+    expect(
+      fx.snm.recordSealedAnnex("alice", SID, Buffer.from(contentHash).toString("hex"), env.content, null),
+    ).toBe(true);
+
+    expect(
+      fx.snm.readSealedAnnex("alice")[0].text,
+      "what comes back must be the message, byte for byte",
+    ).toBe("the message the operator must be able to read");
   });
 
   it("is IDEMPOTENT — a re-pulled entry does not duplicate", async () => {

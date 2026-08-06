@@ -140,6 +140,39 @@ describe("M8C-SEALED-INBOX-1: sealed sessions with unread messages", () => {
       .not.toMatch(/^These sessions are sealed with unread messages\./);
   });
 
+  it("M12-P17 (review F2): an INTERRUPTED session is not reported as sealed, and is NOT marked dead", async () => {
+    // The inverse harm, and the one the first version of this fix shipped. getSealedUnread spans
+    // four terminal-ish statuses and they are not equivalent: `interrupted` still accepts appends
+    // and its counterparty may be waiting to seal. Stamping session_state:"sealed" and
+    // actionable:false over it told an agent that LIVE work was dead history — symptom B inverted,
+    // and strictly worse than the original bug because it suppresses a real conversation.
+    await makeAgentDir("alice");
+    await start();
+    const client = await connectAs("alice");
+    const mgr = handle!.getSessionNodeManager();
+
+    const sessionId = "cc".repeat(16);
+    await client.send("__test_insert_session_row", {
+      agentName: "alice", sessionId, status: "interrupted", counterpartyPubkey: "cphex",
+    });
+    mgr.recordTranscriptMessage("alice", sessionId, 0, "received", new TextEncoder().encode("still live"), "corr");
+
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as {
+      agents: Array<{
+        sealed_unread?: Array<{ session_id: string; session_state?: string; actionable?: boolean }>;
+        sealed_unread_guidance?: string;
+      }>;
+    };
+    const entry = inbox.agents[0].sealed_unread!.find((u) => u.session_id === sessionId)!;
+
+    expect(entry.session_state, "report the state we found, not a category").toBe("interrupted");
+    expect(entry.actionable, "an interrupted session can still be sealed — it is not history").toBe(true);
+    expect(
+      String(inbox.agents[0].sealed_unread_guidance),
+      "and the guidance must not tell the agent this one is stale",
+    ).not.toMatch(/^CLOSED CONVERSATIONS/);
+  });
+
   it("T2: after cello_dismiss, session no longer appears in sealed_unread", async () => {
     await makeAgentDir("alice");
     await start();

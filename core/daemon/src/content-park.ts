@@ -16,13 +16,14 @@
  * access before initialization". Separating construction from registration is what makes a module's
  * POSITION IN THE FILE stop mattering, which is the whole reason startDaemon could be taken apart.
  */
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
+import { decodeParkEnvelope } from "./park-envelope.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -148,11 +149,46 @@ export function createContentPark(deps: ContentParkDeps) {
         // ORDER IS LOAD-BEARING: annex FIRST, confirm-delete SECOND, and only if the annex committed.
         // A crash between them must lose nothing. Reversed, or delete-on-best-effort, converts the
         // loop into PERMANENT SILENT loss — strictly worse than the bug.
-        const annexed = sessionNodeManager.recordSealedAnnex(
-          recipientAgent.name, e.sessionIdHex, e.contentHashHex, unsealed, null,
-        );
+        // Review F1: annex `env.content`, NOT `unsealed`. `unsealed` is the whole CBOR park envelope
+        // — every other consumer decodes it first (recoverParkedEntry does exactly this before
+        // ingesting). Storing the envelope and then deleting the relay copy on the strength of it
+        // would leave the operator an unreadable blob as the ONLY surviving copy: the loop stops,
+        // the message is still never read, and now nothing else holds it. That is the permanent
+        // silent loss the ordering above exists to prevent, arriving one line earlier.
+        //
+        // Review F5: the hash cross-check has to happen HERE too. `parkSig` covers
+        // (session_id, recipient_pubkey, content_hash) — it does NOT cover the envelope's `content`
+        // field, and this branch returns before `ingestReceivedContent`'s own check. Without it a
+        // relay holding the ciphertext could substitute content under a genuine hash, have it
+        // annexed, and have the real copy confirm-deleted. It also makes INSERT OR IGNORE sound:
+        // identical hash now genuinely means identical bytes.
+        let annexed = false;
+        try {
+          const env = decodeParkEnvelope(unsealed);
+          const computed = createHash("sha256").update(new Uint8Array([0x00])).update(env.content).digest();
+          if (Buffer.from(computed).toString("hex") !== e.contentHashHex) {
+            logger.error("content.recover.annex.hash_mismatch", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              impact: "content does not match its attested hash — NOT annexed, relay copy kept",
+              correlationId,
+            });
+          } else {
+            annexed = sessionNodeManager.recordSealedAnnex(
+              recipientAgent.name, e.sessionIdHex, e.contentHashHex, env.content,
+              env.senderPubkey ? Buffer.from(env.senderPubkey).toString("hex") : null,
+            );
+          }
+        } catch (err: unknown) {
+          logger.error("content.recover.annex.decode_failed", {
+            sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+            impact: "envelope could not be decoded — NOT annexed, relay copy kept",
+            error: extractErrorMessage(err), correlationId,
+          });
+        }
         if (annexed) {
-          logger.info("content.annexed", {
+          // Review F6: named under `content.recover.*` like its five siblings in this loop, so a
+          // grep for the recovery family does not miss the one branch you most want to count.
+          logger.info("content.recover.annexed", {
             sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
             reason: "session_committed", correlationId,
           });
@@ -164,8 +200,11 @@ export function createContentPark(deps: ContentParkDeps) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
         } else {
-          // The annex write failed and reported it. Keep the relay copy — it is now the only one.
-          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: ingest.reason });
+          // The annex failed and said so. Keep the relay copy — it is now the only one.
+          // Review F7: name why the entry is STUCK, not why ingest refused it. Surfacing
+          // `session_committed` here sends the operator to look at session state when the fault is
+          // in the annex write.
+          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_write_failed" });
         }
       } else {
         // SEC-1 (M2): carry the refusal out to the caller, not just to the log. Deliberately still

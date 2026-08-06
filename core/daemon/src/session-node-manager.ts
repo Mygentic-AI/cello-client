@@ -1366,13 +1366,18 @@ export class SessionNodeManager {
    *  dismissed. These are answering-machine style messages left in a sealed session — the operator
    *  can read them via cello_transcript but cannot advance the watermark via cello_receive.
    *  Only returned when read_at IS NULL (not yet dismissed). */
-  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
+  getSealedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
+        // M12-P17 (review F2): return the ACTUAL status. `#TERMINAL_STATUSES` spans four states and
+        // they are NOT equivalent — an `interrupted` session is not committed, still accepts
+        // appends, and may have a counterparty waiting to seal. Stamping "sealed" over all four
+        // told an agent that live work was dead history: symptom B inverted.
         `SELECT t.session_id AS session_id,
                 COUNT(*)      AS unread_count,
-                MAX(t.sequence) AS last_seq
+                MAX(t.sequence) AS last_seq,
+                s.status      AS status
          FROM transcript t
          LEFT JOIN message_watermarks w
            ON w.agent_id = t.agent_id AND w.session_id = t.session_id
@@ -1386,7 +1391,7 @@ export class SessionNodeManager {
          HAVING unread_count > 0
          ORDER BY t.session_id ASC`,
       )
-      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
+      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number; status: string }>;
     return rows;
   }
 
