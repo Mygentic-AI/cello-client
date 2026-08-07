@@ -97,6 +97,19 @@ export interface DocumentTransportDeps {
    * on until it has arrived or we have given up on it.
    */
   awaitAck(envelopeHash: string, timeoutMs: number): Promise<boolean>;
+  /**
+   * Try to fill this session's ordering gaps, so anything HELD can be released.
+   *
+   * Without it the grace above cannot help in the very case it was written for. An ack whose
+   * canonical sequence lands ahead of our tree is HELD, and held content is not routed to the
+   * document layer at all — it waits for `#releaseHeld`, which only runs when the missing
+   * in-between sequence arrives. So the ack sits in a buffer, nothing settles, the grace expires in
+   * full, and the seal then discards it. The wait alone converted a fast silent failure into a slow
+   * one.
+   *
+   * A no-op when the session has no gap, so the ordinary delivery pays nothing.
+   */
+  drainHeld(sessionId: string, correlationId: string): Promise<void>;
   logger: Logger;
 }
 
@@ -263,6 +276,20 @@ export function createDocumentDeliveryTransport(
         // The SMALLER of this envelope's share and the standard grace. The caller spends a budget
         // across the whole sweep pass; see DELIVERY_ACK_GRACE_BUDGET_MS.
         const graceMs = Math.min(DELIVERY_ACK_GRACE_MS, input.ackGraceMs);
+        // UNSTICK BEFORE WAITING. If the ack is already sitting in the hold buffer, no amount of
+        // waiting produces it — the release is driven by the missing sequence arriving, not by
+        // time. Ordering-complete sessions return immediately.
+        // CONTAINED. A drain failure must not fail a delivery whose content has already left — the
+        // same contract the ack itself has. Uncontained, a relay hiccup during the drain would
+        // surface as `document_delivery_threw` and re-send content the peer already holds.
+        await deps.drainHeld(sessionId, correlationId).catch((err: unknown) => {
+          deps.logger.warn("document.delivery.drain_threw", {
+            documentId,
+            sessionId,
+            correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        });
         const acked = await deps.awaitAck(envelope.envelopeHash, graceMs);
         if (!acked) {
           // NOT a failure of the send — the content left and the peer may still answer later. Said

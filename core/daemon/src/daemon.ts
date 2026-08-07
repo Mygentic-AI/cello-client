@@ -3587,6 +3587,30 @@ async function startDaemonHoldingLock(
           }
           return documentLayer.awaitAck(ownerKey, envelopeHash, timeoutMs);
         },
+        drainHeld: async (sessionId, correlationId) => {
+          // ONLY WHEN THERE IS A GAP. `sealReadiness` already answers exactly this question, and
+          // gating on it keeps the ordinary delivery — the overwhelming majority — free of a relay
+          // round trip it does not need.
+          const readiness = sessionNodeManager.sealReadiness(agentName, sessionId);
+          if (readiness.heldCount === 0 && readiness.missingLeaves === 0) return;
+          logger.info("document.delivery.drain_held", {
+            agentName,
+            sessionId,
+            heldCount: readiness.heldCount,
+            missingLeaves: readiness.missingLeaves,
+            correlationId,
+          });
+          await autoRecoverForAgent(agentName, "delivery_ack_grace").catch((err: unknown) => {
+            // CONTAINED. A recovery that fails leaves the ack held and the grace expires — the same
+            // outcome as before, and never a reason to fail a delivery whose content already left.
+            logger.warn("document.delivery.drain_held_failed", {
+              agentName,
+              sessionId,
+              correlationId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        },
     });
     documentTransports.set(agentName, transport);
     return transport;

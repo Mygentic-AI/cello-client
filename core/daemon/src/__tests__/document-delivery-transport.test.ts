@@ -65,6 +65,7 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
     encodeEnvelope: () => ({ bytes: new Uint8Array([9]), hash: new Uint8Array(32) }),
     // Default: the peer answers immediately. Overridden per test to model a slow or silent one.
     awaitAck: async () => true,
+    drainHeld: async () => {},
     logger,
     ...over,
   };
@@ -319,6 +320,44 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
     // benign state — a warning that cried wolf on the normal offline-peer case.
     expect(waited).toBe(0);
     expect(t.events.some((e) => e.event === "document.delivery.ack_grace_expired")).toBe(false);
+    expect(t.sealed).toEqual(["opened-session"]);
+  });
+});
+
+describe("the grace DRAINS held content before waiting — otherwise it cannot help at all", () => {
+  it("drains BEFORE the wait, not after", async () => {
+    // The ordering is the property. An ack whose canonical sequence is ahead of our tree is HELD,
+    // and held content is never routed to the document layer — it waits for the missing sequence to
+    // arrive, not for time to pass. Waiting first and draining after would let the full grace
+    // expire on an ack already sitting in the buffer, which is the exact failure the grace was
+    // added to fix, made slower.
+    const order: string[] = [];
+    const t = newTransport({
+      drainHeld: async () => { order.push("drain"); },
+      awaitAck: async () => { order.push("await"); return true; },
+    });
+    await t.transport.deliver(deliverInput());
+    expect(order).toEqual(["drain", "await"]);
+  });
+
+  it("does not drain when it is not going to wait", async () => {
+    // No wait, no point unsticking anything for it — and a relay round trip per parked envelope is
+    // exactly the cost the pass budget exists to bound.
+    const t = newTransport({
+      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
+      drainHeld: async () => { throw new Error("drained on a parked send"); },
+    });
+    await expect(t.transport.deliver(deliverInput())).resolves.toMatchObject({ ok: true });
+  });
+
+  it("a drain that THROWS does not fail the delivery — the content already left", async () => {
+    // Caught by the test disagreeing with its own name: it asserted `rejects.toThrow()` and passed,
+    // which meant a relay hiccup during the drain surfaced as `document_delivery_threw` and
+    // re-sent content the peer already held. The name was right and the code was wrong.
+    const t = newTransport({ drainHeld: async () => { throw new Error("relay down"); } });
+    await expect(t.transport.deliver(deliverInput())).resolves.toMatchObject({ ok: true });
+    expect(t.events.some((e) => e.event === "document.delivery.drain_threw")).toBe(true);
+    // And the session is still sealed — a failed drain must not leave an autonomous session up.
     expect(t.sealed).toEqual(["opened-session"]);
   });
 });
