@@ -578,6 +578,14 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       const from = record ? record.counterparty_pubkey : null;
       const { messages } = sessionNodeManager.readTranscript(agentName, sessionId);
       const received = messages.filter((m) => m.direction === "received" && m.sequence > sinceSeq);
+      // Read ONCE, above both authorities below — the watermark walk and the connection cursor
+      // both need it, and reading the tree twice invites the two to disagree about the same leaf.
+      const leafKinds = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
+      /** A `doc`/`reject` leaf occupies a sequence but is not a message: present, never unread. */
+      const notAMessage = (seq: number) => {
+        const kind = leafKinds[seq]?.kind;
+        return kind === "doc" || kind === "reject";
+      };
       if (received.length > 0) {
         // ─── review F8 (pre-existing, fixed here): this was a RAW VAULT to the highest received
         //     sequence in the batch — `advanceLastDeliveredSeq(…, maxSeq)` — which jumps any leaf
@@ -611,14 +619,38 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         //     screened-out leaf, which have no transcript row at all and ARE unread.
         let frontier = sinceSeq;
         const presentSeqs = new Set(messages.map((m) => m.sequence));
-        while (presentSeqs.has(frontier + 1)) frontier += 1;
+        // A DOCUMENT LEAF IS NOT A HOLE — it is a frame that was never a message.
+        //
+        // `doc` and `reject` leaves take a sequence number and deliberately write no transcript row
+        // ("A document frame is NOT a transcript message" — document-frame-router.ts), so from the
+        // transcript side they are indistinguishable from a row that is missing because it could
+        // never be read. The walk treated both as unread and stopped, permanently: a pair that had
+        // ever exchanged one document frame could never catch up again, and the send gate refused
+        // them while the guidance pointed at the very tool they had just used. Observed live, four
+        // holes in twenty minutes between two agents who never mentioned a document to each other.
+        //
+        // KEYED ON THE LEAF KIND, never on row-absence. That distinction is the entire fix: absent
+        // -and-unreadable and absent-because-not-a-message look identical from the transcript, and
+        // a test for a missing row would relocate the bug rather than close it.
+        while (presentSeqs.has(frontier + 1) || notAMessage(frontier + 1)) frontier += 1;
         sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, frontier); // MONOTONIC — takes MAX
         clearTelegramRung(agentName, sessionId); // M8C-TGDOOR-1: read clears the ring
       }
       // M8C-CURSOR-1 (reviewer HIGH fix): only advance through the CONTIGUOUS run this batch
       // actually delivered — if a sent leaf from another local connection sits in a gap, this
       // correctly refuses to advance past it (cello_get_transcript is still required to catch up).
-      safeCursorAdvance(connectionId, sessionId, new Set(received.map((m) => m.sequence)));
+      // The CONNECTION CURSOR needs the same treatment, and for the same reason. It is the second
+      // authority the send gate consults — the gate passes if EITHER is satisfied — so leaving this
+      // one keyed on received-rows-only means a document leaf still wedges it, and the caller is
+      // still refused after reading everything there is to read.
+      safeCursorAdvance(
+        connectionId,
+        sessionId,
+        new Set([
+          ...received.map((m) => m.sequence),
+          ...leafKinds.flatMap((leaf, index) => (leaf.kind === "doc" || leaf.kind === "reject" ? [index] : [])),
+        ]),
+      );
       logger.info("session.receive.since_seq", { sessionId, agentName, since_seq: sinceSeq, count: received.length });
       return {
         ok: true,

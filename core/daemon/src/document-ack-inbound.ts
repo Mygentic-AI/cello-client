@@ -46,6 +46,13 @@ export interface DocumentAckInboundDeps {
    * question that must never have one.
    */
   verifySignature(ackerAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
+  /**
+   * Called once an envelope is SETTLED — admitted or rejected, both of which end the delivery.
+   *
+   * Exists so the sender can stop holding a session open waiting for an answer that has arrived.
+   * Optional because settling is complete without it; nothing here depends on anyone listening.
+   */
+  onSettled?(ownerAgentId: string, envelopeHash: string): void;
 }
 
 export class DocumentAckInbound {
@@ -179,6 +186,9 @@ export class DocumentAckInbound {
     // `markAcked` is idempotent and returns whether this was the first — a redelivered ack must not
     // move the recorded time, or the delivery record says the peer confirmed at a moment it did not.
     const first = this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
+    // ANNOUNCE THE SETTLE, before the admitted/rejected split — both outcomes end the delivery, and
+    // a waiter that only heard about admissions would keep a session open through every rejection.
+    this.#d.onSettled?.(ownerAgentId, ack.envelope_hash);
 
     if (!ack.admitted) {
       // Durable on the publishing side. A log line would not survive the restart after which the

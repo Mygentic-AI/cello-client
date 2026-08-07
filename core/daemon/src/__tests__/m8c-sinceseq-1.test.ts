@@ -77,6 +77,23 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
     ).run(session, agentRow.agent_id, counterparty, now, now);
   }
 
+  /**
+   * A DOCUMENT leaf: it occupies a sequence number and writes no transcript row, which is exactly
+   * what `document-frame-router.ts` does on purpose ("A document frame is NOT a transcript
+   * message"). Inserted directly because the alternative is standing up a whole document exchange
+   * to produce one row.
+   */
+  function seedLeaf(agent: string, session: string, leafIndex: number, kind: "msg" | "doc") {
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const agentRow = db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agent) as { agent_id: string };
+    db.prepare(
+      `INSERT INTO session_tree_leaves (agent_id, session_id, leaf_index, leaf_kind, leaf_hash_hex, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(agentRow.agent_id, session, leafIndex, kind, "aa".repeat(32), Date.now());
+  }
+
   function seed(agent: string, session: string, seq: number, direction: "received" | "sent", text: string) {
     handle!.getSessionNodeManager().recordTranscriptMessage(agent, session, seq, direction, new TextEncoder().encode(text), "seed");
   }
@@ -316,4 +333,70 @@ describe("M8C-SINCESEQ-1: cello_receive since_seq catch-up", () => {
       expect(batch["reason"]).toBe("session_not_found");
     });
   });
+describe("DOD-DOC-SINCESEQ-1 — a document frame is not a hole in the catch-up walk", () => {
+  it("advances PAST a document leaf, so a pair that co-edits can still catch up", async () => {
+    // THE DEFECT, found live between two agents mid-conversation. A document frame takes a sequence
+    // number and writes no transcript row, so from the transcript side it is indistinguishable from
+    // a row that could never be read — and the contiguous walk treated it as unread and stopped.
+    // Permanently: the hole never fills, so `since_seq` was broken for that pair FOREVER and the
+    // send gate refused them while the guidance pointed at the tool they had just used.
+    //
+    // Not an edge case. The delivery worker REUSES an open session, so document traffic lands in
+    // whatever conversation the two agents already have — any pair that talks and co-edits.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "e".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    seed("alice", s, 0, "received", "m0");
+    seed("alice", s, 1, "received", "m1");
+    seed("alice", s, 3, "received", "m3");
+    // The TREE, dense — leaf index IS the canonical sequence (that is what MSG-4's in-order gate
+    // maintains), so the kind at index 2 is what tells the walk this slot was never a message.
+    seedLeaf("alice", s, 0, "msg");
+    seedLeaf("alice", s, 1, "msg");
+    seedLeaf("alice", s, 2, "doc"); // a shared-document update — no transcript row, by design
+    seedLeaf("alice", s, 3, "msg");
+
+    const res = (await client.send("cello_receive", { session_id: s, since_seq: 1 })) as R;
+    expect(res["ok"]).toBe(true);
+    // Delivery was never the broken half — the readable message always came back.
+    expect((res["messages"] as Array<{ sequence: number }>).map((m) => m.sequence)).toEqual([3]);
+
+    // THE ASSERTION: unread is CLEARED. Before the fix the walk stopped at 2 and seq 3 stayed
+    // unread forever, so this session never left the inbox and every send was refused.
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    const agents = inbox["agents"] as Array<{ agent: string; unread: Array<{ session_id: string }> }>;
+    expect(
+      agents[0].unread.find((u) => u.session_id === s),
+      "the document leaf still reads as an unread message",
+    ).toBeUndefined();
+  });
+
+  it("STILL stops at a genuinely absent index — an unreadable row is not a document leaf", async () => {
+    // The negative control, and the reason the fix keys on LEAF KIND rather than row-absence.
+    // Absent-and-unreadable and absent-because-not-a-message look identical from the transcript, so
+    // a fix that tested for a missing row would have relocated the bug instead of closing it.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "f".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    seed("alice", s, 0, "received", "m0");
+    // No leaf of any kind at 1 — a row nobody could read. It must still block.
+    seed("alice", s, 2, "received", "m2");
+
+    await client.send("cello_receive", { session_id: s, since_seq: 0 });
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    const agents = inbox["agents"] as Array<{ agent: string; unread: Array<{ session_id: string }> }>;
+    expect(
+      agents[0].unread.find((u) => u.session_id === s),
+      "an unreadable row was silently marked read",
+    ).toBeDefined();
+  });
+});
 });

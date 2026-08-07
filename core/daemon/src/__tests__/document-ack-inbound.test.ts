@@ -62,7 +62,7 @@ function ack(over: Partial<DocumentAck> = {}): DocumentAck {
   };
 }
 
-function newFixture(opts: { verify?: () => boolean } = {}) {
+function newFixture(opts: { verify?: () => boolean; onSettled?: (owner: string, hash: string) => void } = {}) {
   const { logger, events } = recordingLogger();
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
@@ -75,6 +75,7 @@ function newFixture(opts: { verify?: () => boolean } = {}) {
   const inbound = new DocumentAckInbound({
     store, rejections, logger,
     verifySignature: opts.verify ?? (() => true),
+    ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
   });
   return { inbound, store, events, rejections };
 }
@@ -261,5 +262,35 @@ describe("DocumentAckInbound — an envelope is SETTLED ONCE", () => {
     // Delivery retries by design; a redelivered ack is expected traffic, not a fault.
     expect(f.inbound.receive(AGENT, wire, NOW + 1)).toMatchObject({ ok: true, admitted: true });
     expect(f.events.some((ev) => ev.event === "document.ack.contradiction")).toBe(false);
+  });
+});
+
+describe("a settled envelope ANNOUNCES itself, so the sender can stop holding a session open", () => {
+  for (const admitted of [true, false]) {
+    it(`fires onSettled for ${admitted ? "an ADMISSION" : "a REJECTION"} — both end the delivery`, () => {
+      // Both outcomes settle. A waiter that only heard about admissions would hold the session open
+      // through every rejection, which is the case where the sender most needs to act.
+      const settled: Array<[string, string]> = [];
+      const f = newFixture({ onSettled: (owner, hash) => settled.push([owner, hash]) });
+      const e = envelope();
+      f.store.appendEnvelope(AGENT, e);
+      // The wire type requires a rejection to name its reason, and enforces it at encode.
+      const answer = admitted
+        ? ack({ envelope_hash: e.envelopeHash, admitted: true })
+        : ack({ envelope_hash: e.envelopeHash, admitted: false, rejection_reason: "gate_refused" });
+      f.inbound.receive(AGENT, encodeDocumentAck(answer), NOW);
+      expect(settled).toEqual([[AGENT, e.envelopeHash]]);
+    });
+  }
+
+  it("does NOT fire for an ack whose signature did not verify", () => {
+    // Nothing was settled, so releasing a waiter here would end a delivery on the word of a party
+    // we could not authenticate.
+    const settled: string[] = [];
+    const f = newFixture({ onSettled: (_owner, hash) => settled.push(hash), verify: () => false });
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+    f.inbound.receive(AGENT, encodeDocumentAck(ack({ envelope_hash: e.envelopeHash })), NOW);
+    expect(settled).toEqual([]);
   });
 });

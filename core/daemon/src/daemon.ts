@@ -3570,6 +3570,14 @@ async function startDaemonHoldingLock(
           // `0x00` domain prefix, so a bare hash is discarded at the authenticity check.
           return { bytes, hash: wireContentHash(bytes) };
         },
+        // The owner KEY, not the agent name — every document row is scoped by our own pubkey hex
+        // (M14-D5), and the store query behind this reads that column. Passing the name here
+        // returns no rows and the wait times out on every delivery.
+        awaitAck: async (envelopeHash, timeoutMs) => {
+          const ownerKey = documentOwnerKeyFor(agentName);
+          if (ownerKey === null) return false;
+          return documentLayer.awaitAck(ownerKey, envelopeHash, timeoutMs);
+        },
     });
     documentTransports.set(agentName, transport);
     return transport;

@@ -2888,6 +2888,29 @@ export class SessionNodeManager {
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
     this.#witnessedSeq.delete(key);
+    // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
+    //
+    // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
+    // canonical sequence put them ahead of our tree. Deleting the map drops them — the sender
+    // believes they were delivered, we never applied them, and until now nothing anywhere recorded
+    // that it happened.
+    //
+    // Found live: a document ack arrived, logged `session.content.held` for a one-slot gap, and was
+    // destroyed with the session three seconds later. The sender then re-sent that envelope 90
+    // times against a ceiling of 5, and every surface reported the delivery as merely pending.
+    //
+    // This is a LOSS REPORT, not a fix — the content is unrecoverable by the time we are here. The
+    // fix is upstream, in not tearing a session down while an answer is still owed on it.
+    const strandedHolds = this.#heldContent.get(key);
+    if (strandedHolds && strandedHolds.size > 0) {
+      this.#logger.error("session.content.held.discarded", {
+        agentName,
+        sessionId,
+        count: strandedHolds.size,
+        canonicalSeqs: [...strandedHolds.keys()].sort((a, b) => a - b),
+        treeSize: this.getSessionTree(agentName, sessionId).size(),
+      });
+    }
     this.#heldContent.delete(key);
     this.#highWaterSeq.delete(key);
   }

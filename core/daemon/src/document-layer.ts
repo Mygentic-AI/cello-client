@@ -137,6 +137,19 @@ export interface DocumentLayer {
     senderPubkey: string,
     correlationId?: string,
   ): { consumed: boolean; kind?: string; ok?: boolean; reason?: string };
+  /**
+   * Resolve when this envelope is SETTLED by the peer, or false when `timeoutMs` elapses first.
+   *
+   * The delivery transport holds a session it opened open until this resolves. See the comment on
+   * `DocumentTransportDeps.awaitAck`: the seal tears the session down and the teardown drops
+   * content still held for ordering, so sealing before the answer arrives can delete an ack that
+   * was correctly sent and correctly received.
+   *
+   * Resolves IMMEDIATELY if the envelope is already settled — the ack can win the race with the
+   * caller, and a waiter that only listened for future events would then wait out the full grace
+   * period on every fast peer.
+   */
+  awaitAck(ownerAgentId: string, envelopeHash: string, timeoutMs: number): Promise<boolean>;
 }
 
 /**
@@ -220,7 +233,53 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     sign: deps.sign,
   });
 
-  const ackInbound = new DocumentAckInbound({ store, rejections, logger, verifySignature });
+  // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
+  // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
+  // session held open for the full grace period with the answer already in hand.
+  const ackWaiters = new Map<string, Set<() => void>>();
+  const waiterKey = (ownerAgentId: string, envelopeHash: string) => `${ownerAgentId}\u0000${envelopeHash}`;
+
+  const ackInbound = new DocumentAckInbound({
+    store,
+    rejections,
+    logger,
+    verifySignature,
+    onSettled: (ownerAgentId, envelopeHash) => {
+      const key = waiterKey(ownerAgentId, envelopeHash);
+      const waiting = ackWaiters.get(key);
+      if (!waiting) return;
+      ackWaiters.delete(key);
+      for (const wake of waiting) wake();
+    },
+  });
+
+  const awaitAck = async (ownerAgentId: string, envelopeHash: string, timeoutMs: number) => {
+    // ALREADY SETTLED WINS. The ack round trip was measured at 4ms on a local pair; the caller
+    // reaches this line after a network send. Checking the store first is not an optimisation —
+    // without it the common case waits out the entire grace period for an answer already recorded.
+    if (store.isEnvelopeAcked(ownerAgentId, envelopeHash)) return true;
+
+    const key = waiterKey(ownerAgentId, envelopeHash);
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const wake = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const set = ackWaiters.get(key) ?? new Set<() => void>();
+      set.add(wake);
+      ackWaiters.set(key, set);
+      timer = setTimeout(() => {
+        // DEREGISTER on the way out. A waiter left in the map for an envelope that is never acked
+        // is a leak the length of the daemon's life, and `unref` is deliberately NOT used: the
+        // grace period must be able to hold the process just as the seal it precedes does.
+        const current = ackWaiters.get(key);
+        current?.delete(wake);
+        if (current && current.size === 0) ackWaiters.delete(key);
+        resolve(false);
+      }, timeoutMs);
+    });
+  };
 
   // The handshake verifies a proposal against its NAMED proposer — the same resolver, so a forged
   // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
@@ -374,6 +433,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     notifications,
     rejections,
     router,
+    awaitAck,
     onDocumentFrame: (agentName, _sessionId, content, _senderPubkey, correlationId) =>
       // `agentName` names the owning agent for the session; the router maps it to the owner KEY
       // that scopes the store. The session id and the sender's transport pubkey are unused: a

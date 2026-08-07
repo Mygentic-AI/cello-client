@@ -989,6 +989,24 @@ export class DocumentStore {
 
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
   /**
+   * Is this envelope SETTLED — the peer answered it, admitted or rejected?
+   *
+   * Keyed by envelope hash ALONE, without the document, because the caller waiting on it is the
+   * delivery transport, which holds a session open and knows the envelope it sent but has no reason
+   * to carry the document id through the wait. The hash is a sha256 over the envelope's own
+   * preimage, so it identifies one envelope across every document this owner holds.
+   */
+  isEnvelopeAcked(ownerAgentId: string, envelopeHash: string): boolean {
+    const row = this.#db
+      .prepare(
+        `SELECT acked_at FROM document_envelopes
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND acked_at IS NOT NULL LIMIT 1`,
+      )
+      .get(ownerAgentId, envelopeHash) as { acked_at?: number } | undefined;
+    return row !== undefined;
+  }
+
+  /**
    * WE GAVE UP — the unacked ceiling. Deliberately not `markAcked`: this records a decision of
    * ours, and says nothing about whether the peer holds the envelope, because we do not know.
    */

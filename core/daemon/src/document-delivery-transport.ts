@@ -83,8 +83,32 @@ export interface DocumentTransportDeps {
   >;
   /** Encode a document envelope row onto the wire, and its content hash. */
   encodeEnvelope(envelope: DocumentEnvelopeRow): { bytes: Uint8Array; hash: Uint8Array };
+  /**
+   * Wait for the peer to ANSWER this envelope, bounded. Resolves true if the ack landed.
+   *
+   * The seal below tears the session down, and the teardown drops any content still held for
+   * ordering — so an ack that arrives correctly and is held for a gap is DELETED rather than
+   * applied. Measured on a live daemon: the ack was sent, logged `session.content.held`, and the
+   * session was destroyed three seconds later with it still buffered. The sender then re-sent the
+   * envelope every tick until the unacked ceiling retired it.
+   *
+   * Waiting here is deliberately indifferent to WHY the answer is slow — held for ordering, a slow
+   * relay, a busy peer. The rule is simply that we do not tear down the channel an answer is due
+   * on until it has arrived or we have given up on it.
+   */
+  awaitAck(envelopeHash: string, timeoutMs: number): Promise<boolean>;
   logger: Logger;
 }
+
+/**
+ * How long a session WE opened stays up waiting for the peer's answer.
+ *
+ * Sized against the observed round trip, not guessed: on a live cross-region session the ack was
+ * on the wire ~375ms after the frame landed, and the seal ceremony itself takes ~3s. Ten seconds
+ * covers a slow relay and a park-and-recover round without keeping an autonomous session alive
+ * long enough to be mistaken for a conversation.
+ */
+export const DELIVERY_ACK_GRACE_MS = 10_000;
 
 export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
@@ -222,6 +246,28 @@ export function createDocumentDeliveryTransport(
       // the sealed record the design exists to produce is never produced. A session we REUSED is
       // not ours to close: its owner decides when that conversation ends.
       if (sessionOpened) {
+        // WAIT FOR THE ANSWER BEFORE TEARING DOWN THE CHANNEL IT COMES BACK ON.
+        //
+        // The seal destroys the session, and the teardown drops content still held for ordering.
+        // Sealing straight after the send therefore raced the peer's ack and, on a real network,
+        // lost: 90 re-sends of one envelope against a ceiling of 5.
+        //
+        // A REUSED session is untouched by this — it is not ours to close, so its owner keeps it
+        // alive and the ack has all the time it needs. That asymmetry is exactly why every spine
+        // enforcer passed: they open a conversation first, so the worker always reused one.
+        const acked = await deps.awaitAck(envelope.envelopeHash, DELIVERY_ACK_GRACE_MS);
+        if (!acked) {
+          // NOT a failure of the send — the content left and the peer may still answer later. Said
+          // out loud because a seal that discards a held ack is otherwise invisible, and this is
+          // the only moment anything knows it is about to happen.
+          deps.logger.warn("document.delivery.ack_grace_expired", {
+            documentId,
+            envelopeHash: envelope.envelopeHash,
+            sessionId,
+            graceMs: DELIVERY_ACK_GRACE_MS,
+            correlationId,
+          });
+        }
         await deps.sealSession(deps.agentName, sessionId, correlationId);
       }
 

@@ -2,7 +2,7 @@
  * DOD-DOC-DELIVERY-2 — the transport behind the delivery worker's seam (§16.4).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   createDocumentDeliveryTransport,
   type DocumentTransportDeps,
@@ -62,6 +62,8 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
       sealed.push(sessionId);
     },
     encodeEnvelope: () => ({ bytes: new Uint8Array([9]), hash: new Uint8Array(32) }),
+    // Default: the peer answers immediately. Overridden per test to model a slow or silent one.
+    awaitAck: async () => true,
     logger,
     ...over,
   };
@@ -204,5 +206,67 @@ describe("delivery transport — an OPENED session is sealed; a REUSED one is no
     await t.transport.deliver(deliverInput());
     // Its owner decides when that conversation ends.
     expect(t.sealed).toEqual([]);
+  });
+});
+
+/**
+ * DOD-DOC-SEAL-ACK-1 — a session we opened stays up until the answer is in.
+ *
+ * The seal DESTROYS the session, and the teardown drops content still held for ordering. So an ack
+ * that is sent correctly and received correctly can still be deleted, and the sender re-sends until
+ * the unacked ceiling retires the envelope. Measured live: `session.content.held` on the ack, then
+ * `session.node.destroyed reason=sealed` three seconds later, then 90 re-sends against a cap of 5.
+ */
+describe("a session the worker OPENED is not sealed until the peer has answered", () => {
+  it("waits for the ack BEFORE sealing", async () => {
+    const order: string[] = [];
+    let releaseAck: (() => void) | undefined;
+    const f = newTransport({
+      awaitAck: () =>
+        new Promise<boolean>((resolve) => {
+          order.push("await");
+          releaseAck = () => resolve(true);
+        }),
+      sealSession: async () => {
+        order.push("seal");
+      },
+    });
+
+    const inFlight = f.transport.deliver(deliverInput());
+    await vi.waitFor(() => expect(order).toEqual(["await"]));
+    // The seal has NOT happened yet. That is the whole property: sealing here is what deletes the
+    // held ack, so the wait has to come first rather than alongside.
+    expect(order).toEqual(["await"]);
+    releaseAck!();
+    await inFlight;
+    expect(order).toEqual(["await", "seal"]);
+  });
+
+  it("SEALS ANYWAY when the peer never answers, and says so", async () => {
+    // The grace period is a bound, not a promise. A peer that never answers must not leave an
+    // autonomous session running — that is the live node the seal exists to prevent.
+    const f = newTransport({ awaitAck: async () => false });
+    await f.transport.deliver(deliverInput());
+    expect(f.sealed).toEqual(["opened-session"]);
+    // Said out loud, because a seal that discards a held ack is otherwise invisible and this is the
+    // only moment anything knows it is about to happen.
+    expect(f.events.some((e) => e.event === "document.delivery.ack_grace_expired")).toBe(true);
+  });
+
+  it("does NOT wait on a session it REUSED — that one is not ours to close", async () => {
+    let waited = 0;
+    const f = newTransport({
+      activeSessionsWith: () => ["existing-session"],
+      awaitAck: async () => {
+        waited += 1;
+        return true;
+      },
+    });
+    await f.transport.deliver(deliverInput());
+    // A reused session stays alive because its owner keeps it, so the ack already has all the time
+    // it needs. Waiting here would hold up every delivery on a live conversation for nothing —
+    // and this asymmetry is exactly why the spine enforcers never saw the defect.
+    expect(waited).toBe(0);
+    expect(f.sealed).toEqual([]);
   });
 });
