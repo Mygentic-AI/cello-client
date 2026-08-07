@@ -1412,8 +1412,8 @@ async function startDaemonHoldingLock(
   // production caller — so once its session can never drain again the row is unreachable by every
   // removal path that exists, and pins retryQueueDepth forever. Found live: one row stranded 25.6h,
   // after which the metric could no longer tell a real delivery backlog from a corpse.
-  sessionNodeManager.setSessionTerminalHook((sessionId, terminalStatus, owningAgentId) => {
-    retryQueue.reapTerminalSession(sessionId, terminalStatus, owningAgentId);
+  sessionNodeManager.setSessionTerminalHook((sessionId, terminalStatus) => {
+    retryQueue.reapTerminalSession(sessionId, terminalStatus);
   });
 
   sessionNodeManager.setAwaitingAckHooks({

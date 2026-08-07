@@ -30,12 +30,9 @@ import type { ResendResult } from "../retry-queue.js";
  * creates in production. These unit DBs hold only retry_queue, so give them the one column the
  * join reads. Deliberately minimal — this is not a second schema definition, just the join target.
  */
-function seedSessionRow(db: DatabaseSync, sessionId: string, status: string, agentId = "agent-id-alice-0001"): void {
-  // `agent_id` is load-bearing, not decoration: the startup reconcile carries the session's OWN
-  // agent out of this join so the awaiting-ACK disposal can be agent-scoped. Omitting it made the
-  // reconcile query throw and silently reap nothing.
-  db.exec(`CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, agent_id TEXT, status TEXT NOT NULL)`);
-  db.prepare("INSERT OR REPLACE INTO sessions (session_id, agent_id, status) VALUES (?, ?, ?)").run(sessionId, agentId, status);
+function seedSessionRow(db: DatabaseSync, sessionId: string, status: string): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, status TEXT NOT NULL)`);
+  db.prepare("INSERT OR REPLACE INTO sessions (session_id, status) VALUES (?, ?)").run(sessionId, status);
 }
 
 describe("RetryQueue", () => {
@@ -570,64 +567,7 @@ describe("RetryQueue", () => {
       expect(retryQueue.getSessionDepth(healthy)).toBe(1);
     });
 
-    it("disposes the OWNING agent's awaiting-ACK rows when its session goes terminal, and tells the operator", () => {
-      // Handed forward by the DOD-RETRYQ-STRAND-1 review: drainAwaitingToPark never evicts on a
-      // failed park — every failure `continue`s and keeps the row for "the next flush". For a
-      // session that can never drain again the park is futile by definition (a sealed or abandoned
-      // session cannot accept an append), so the row is retried at every boot forever. Same strand
-      // shape as the direct rows, minus the retryQueueDepth symptom that made those visible.
-      const sessionId = "session-awaiting-terminal";
-      const agentId = "agent-id-alice-0001";
-      retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
-      expect(retryQueue.getAwaitingDepth(agentId, sessionId)).toBe(1);
-      logEvents.length = 0;
-
-      retryQueue.reapTerminalSession(sessionId, "sealed", agentId);
-
-      expect(retryQueue.getAwaitingDepth(agentId, sessionId)).toBe(0);
-      const rows = db
-        .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
-        .get(sessionId) as unknown as { n: number };
-      expect(rows.n).toBe(0);
-      // This is content the SENDER believes it sent. Discarding it silently is the worse failure.
-      const dropped = logEvents.filter((e) => e.event === "session.retryqueue.content.dropped");
-      expect(dropped).toHaveLength(1);
-      expect(dropped[0].context.awaitingAck).toBe(true);
-    });
-
-    it("agent-scopes the awaiting disposal — a loopback session must not lose the OTHER agent's content", () => {
-      // `sessions` rows are per-agent, so a terminal transition belongs to ONE agent. Two of the
-      // operator's own agents can hold awaiting content for the SAME session_id (loopback). A
-      // session-wide delete would destroy the other agent's undelivered message on the strength of
-      // a status change that was never theirs.
-      const sessionId = "session-loopback";
-      const alice = "agent-id-alice-0001";
-      const bob = "agent-id-bob-0002";
-      retryQueue.enqueueAwaitingContent(alice, sessionId, randomBytes(32), randomBytes(64));
-      retryQueue.enqueueAwaitingContent(bob, sessionId, randomBytes(32), randomBytes(64));
-
-      retryQueue.reapTerminalSession(sessionId, "abandoned", alice);
-
-      expect(retryQueue.getAwaitingDepth(alice, sessionId)).toBe(0);
-      expect(retryQueue.getAwaitingDepth(bob, sessionId)).toBe(1);
-    });
-
-    it("without an owning agentId, awaiting rows are left ALONE — never guessed at", () => {
-      // The startup reconcile knows the session and its status but not necessarily the owner. An
-      // un-scoped awaiting delete would be a guess, and the thing being guessed away is a message
-      // the sender believes was delivered. Absent owner ⇒ leave it.
-      const sessionId = "session-no-owner-given";
-      const agentId = "agent-id-alice-0001";
-      retryQueue.enqueue(sessionId, randomBytes(32), randomBytes(64));
-      retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
-
-      const reaped = retryQueue.reapTerminalSession(sessionId, "sealed");
-
-      expect(reaped).toBe(1); // the direct row only
-      expect(retryQueue.getAwaitingDepth(agentId, sessionId)).toBe(1);
-    });
-
-    it("does NOT touch awaiting-ACK rows of a DIFFERENT session", () => {
+    it("does NOT touch awaiting-ACK rows — they have a real consumer and their own disposition", () => {
       // Scope boundary, deliberate. awaiting_ack = 1 rows drain via drainAwaitingToPark, which the
       // startup flush actually calls, so they are not stranded by construction. Their terminal
       // disposition (annex + confirm-delete) is DOD-TERMINAL-WAKE-1's, not this unit's. Reaping

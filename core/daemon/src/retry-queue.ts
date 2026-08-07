@@ -390,77 +390,7 @@ export class RetryQueue {
    *
    * @returns how many entries were removed — 0 is the normal case and is silent.
    */
-  reapTerminalSession(sessionId: string, terminalStatus: "sealed" | "abandoned", owningAgentId?: string): number {
-    // Awaiting-ACK rows drain toward the relay park, and `drainAwaitingToPark` never evicts on a
-    // failed park — every failure keeps the row "for the next flush". For a session that can never
-    // drain again the park is futile by definition (nothing may be appended to a sealed or
-    // abandoned session), so without this the row is re-attempted at every boot forever: the same
-    // strand as the direct rows, minus the retryQueueDepth symptom that made those visible.
-    //
-    // Scoped to the OWNING agent, never session-wide. `sessions` rows are per-agent, so a terminal
-    // transition belongs to one agent — and two of the operator's own agents can hold awaiting
-    // content for the SAME session_id (loopback). A session-wide delete would destroy the other
-    // agent's undelivered message on the strength of a status change that was never theirs.
-    //
-    // No owner supplied ⇒ leave awaiting rows ALONE. The alternative is guessing, and the thing
-    // guessed away is a message the sender believes was delivered.
-    if (owningAgentId) this.#disposeAwaitingForTerminalSession(owningAgentId, sessionId, terminalStatus);
-    return this.#reapDirectRows(sessionId, terminalStatus);
-  }
-
-  /** Agent-scoped disposal of awaiting-ACK content for a session that can never drain again. */
-  #disposeAwaitingForTerminalSession(agentId: string, sessionId: string, terminalStatus: "sealed" | "abandoned"): void {
-    let doomed: Array<{ content_hash_hex: string | null; nonce_hex: string }>;
-    try {
-      doomed = this.#db
-        .prepare("SELECT content_hash_hex, nonce_hex FROM retry_queue WHERE agent_id = ? AND session_id = ? AND awaiting_ack = 1")
-        .all(agentId, sessionId) as unknown as Array<{ content_hash_hex: string | null; nonce_hex: string }>;
-    } catch (err: unknown) {
-      this.#logger.error("message.retry.persist.failed", {
-        agentId, sessionId, operation: "terminal_reap_awaiting_select",
-        error: err instanceof Error ? err.message : String(err),
-        impact: "awaiting-ACK rows for a terminal session were not disposed of and will be re-parked at every boot",
-      });
-      return;
-    }
-    if (doomed.length === 0) return;
-
-    try {
-      this.#db
-        .prepare("DELETE FROM retry_queue WHERE agent_id = ? AND session_id = ? AND awaiting_ack = 1")
-        .run(agentId, sessionId);
-    } catch (err: unknown) {
-      this.#logger.error("message.retry.persist.failed", {
-        agentId, sessionId, operation: "terminal_reap_awaiting_delete",
-        error: err instanceof Error ? err.message : String(err),
-        impact: "awaiting-ACK rows for a terminal session were not removed; they will be re-parked at every boot",
-      });
-      return;
-    }
-
-    for (const row of doomed) {
-      // Outbound content the sender believes it sent — the same reason AC3 exists for the direct
-      // rows. `awaitingAck` distinguishes it from a direct-resend drop, because the two have
-      // different histories: this one reached the relay park path and was refused there.
-      this.#logger.warn("session.retryqueue.content.dropped", {
-        agentId,
-        sessionId,
-        nonce: row.content_hash_hex ?? row.nonce_hex,
-        reason: terminalStatus,
-        awaitingAck: true,
-        impact: "un-acked content was never delivered and is now discarded — the session can no longer accept it",
-      });
-    }
-
-    this.#awaiting.delete(this.#ak(agentId, sessionId));
-    this.#positionCounters.delete(this.#ak(agentId, sessionId));
-    this.#logger.info("session.retryqueue.reaped", {
-      agentId, sessionId, entryCount: doomed.length, reason: terminalStatus, awaitingAck: true,
-    });
-  }
-
-  /** The direct-resend (awaiting_ack = 0) half of the terminal reap. */
-  #reapDirectRows(sessionId: string, terminalStatus: "sealed" | "abandoned"): number {
+  reapTerminalSession(sessionId: string, terminalStatus: "sealed" | "abandoned"): number {
     // The in-memory queue is NOT the authority, and must not be the source for either half of this.
     // A row written by an earlier daemon exists only in the DB until loadFromDb runs — the live
     // strand was exactly that shape — so the rows to announce are read from the DB, and the same
@@ -556,20 +486,17 @@ export class RetryQueue {
    * @returns total entries reaped across all already-terminal sessions.
    */
   reapAlreadyTerminalSessions(): number {
-    let rows: Array<{ session_id: string; status: string; owning_agent_id: string | null }>;
+    let rows: Array<{ session_id: string; status: string }>;
     try {
-      // Joined on the session's OWN agent_id so the awaiting half can be disposed of agent-scoped.
-      // `rq.agent_id` is NULL for direct rows, so the join keys on the sessions row and carries its
-      // owner out — that is the agent whose status went terminal, which is the only one whose
-      // awaiting content this may touch.
       rows = this.#db
         .prepare(
-          `SELECT DISTINCT rq.session_id AS session_id, s.status AS status, s.agent_id AS owning_agent_id
+          `SELECT DISTINCT rq.session_id AS session_id, s.status AS status
              FROM retry_queue rq
              JOIN sessions s ON s.session_id = rq.session_id
-            WHERE s.status IN ('sealed', 'abandoned')`,
+            WHERE rq.awaiting_ack = 0
+              AND s.status IN ('sealed', 'abandoned')`,
         )
-        .all() as unknown as Array<{ session_id: string; status: string; owning_agent_id: string | null }>;
+        .all() as unknown as Array<{ session_id: string; status: string }>;
     } catch (err: unknown) {
       this.#logger.error("message.retry.persist.failed", {
         operation: "startup_terminal_reconcile",
@@ -584,7 +511,6 @@ export class RetryQueue {
       total += this.reapTerminalSession(
         row.session_id,
         row.status === "sealed" ? "sealed" : "abandoned",
-        row.owning_agent_id ?? undefined,
       );
     }
     if (total > 0) {
