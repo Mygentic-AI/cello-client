@@ -1246,6 +1246,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "Bridge CELLO into a third-party agent runtime (Hermes, OpenClaw, …).",
     help:
       "Usage: cello bridge <runtime> --agent <name> [--hermes-home <path>]\n" +
+      "                                [--delivery-mode channel|wake] [--session-scope agent|peer]\n" +
       "  Wires the local CELLO daemon into a third-party agent runtime so that agent can use CELLO.\n" +
       "  Supported runtimes: hermes  (more coming).\n" +
       "\n" +
@@ -1254,29 +1255,70 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  'hermes mcp add cello'. Idempotent — re-run to upgrade.\n" +
       "  Afterwards, restart the gateway: hermes gateway restart\n" +
       "\n" +
-      "  Example:  cello bridge hermes --agent alice",
-    flags: [{ name: "--agent" }, { name: "--hermes-home" }],
+      "  --delivery-mode  channel (default) CELLO behaves like a normal chat channel: the peer's\n" +
+      "                                     message arrives as a message and your reply is sent\n" +
+      "                                     back automatically.\n" +
+      "                   wake              content-free notices only; the agent reads with\n" +
+      "                                     cello_receive and replies with cello_send itself.\n" +
+      "  --session-scope  agent   (default) one conversation per CELLO agent — calling the same\n" +
+      "                                     agent twice continues it.\n" +
+      "                   peer              one conversation per counterparty — for a support desk,\n" +
+      "                                     where two customers must never share a context.\n" +
+      "\n" +
+      "  Both settings are per-agent and are REWRITTEN on every run: omitting a flag resets it to\n" +
+      "  its default rather than keeping a value from a previous install.\n" +
+      "\n" +
+      "  Example:  cello bridge hermes --agent alice\n" +
+      "            cello bridge hermes --agent support-desk --session-scope peer",
+    flags: [
+      { name: "--agent" },
+      { name: "--hermes-home" },
+      { name: "--delivery-mode" },
+      { name: "--session-scope" },
+    ],
     async run(_ctx, args) {
-      const agentIdx = args.indexOf("--agent");
-      const homeIdx = args.indexOf("--hermes-home");
-      // Find the target positional, excluding both flags AND their values — so
-      // `cello bridge --agent alice hermes` still resolves target=hermes.
-      const target = args.find(
-        (a, i) =>
-          !a.startsWith("-") &&
-          !(agentIdx !== -1 && i === agentIdx + 1) &&
-          !(homeIdx !== -1 && i === homeIdx + 1),
+      // A flag present with no value is NOT the same as an absent flag. Mapping it to undefined
+      // would silently apply the default — the same invisible-setting failure the installer's
+      // validation exists to prevent, one layer up. Return the empty string so validation rejects
+      // it; `--session-scope --agent x` (value eaten by the next flag) is caught the same way.
+      const missingValue: string[] = [];
+      const valueOf = (flag: string): string | undefined => {
+        const i = args.indexOf(flag);
+        if (i === -1) return undefined;
+        const raw = args[i + 1];
+        if (raw === undefined || raw.startsWith("-")) {
+          missingValue.push(flag);
+          return "";
+        }
+        return raw;
+      };
+      // Every flag consumes a value, so a positional is one that is neither a flag nor any
+      // flag's value — that is what lets `cello bridge --agent alice hermes` still find `hermes`.
+      const valueIndexes = new Set(
+        ["--agent", "--hermes-home", "--delivery-mode", "--session-scope"]
+          .map((f) => args.indexOf(f))
+          .filter((i) => i !== -1)
+          .map((i) => i + 1),
       );
+      const target = args.find((a, i) => !a.startsWith("-") && !valueIndexes.has(i));
       if (target !== "hermes") {
         return { stdout: helpForSpec("bridge"), stderr: "", exitCode: 1 };
       }
+      const opts = {
+        agentName: valueOf("--agent") ?? "",
+        hermesHome: valueOf("--hermes-home"),
+        deliveryMode: valueOf("--delivery-mode"),
+        sessionScope: valueOf("--session-scope"),
+      };
+      if (missingValue.length > 0) {
+        return {
+          stdout: "",
+          stderr: `Missing value for ${missingValue.join(", ")}.\n\n${helpForSpec("bridge")}`,
+          exitCode: 1,
+        };
+      }
       const { installHermes } = await import("./hermes/install-hermes.js");
-      return legacy(
-        await installHermes({
-          agentName: agentIdx !== -1 ? (args[agentIdx + 1] ?? "") : "",
-          hermesHome: homeIdx !== -1 ? args[homeIdx + 1] : undefined,
-        }),
-      );
+      return legacy(await installHermes(opts));
     },
   },
 ];

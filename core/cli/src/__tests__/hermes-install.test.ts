@@ -51,6 +51,70 @@ describe("installHermes — argument and environment validation", () => {
     expect(res.output).toContain(missing);
     expect(execCalls).toHaveLength(0);
   });
+
+  // ── DOD-HERMES-4: the two per-agent behaviour settings ───────────────────────────────────────
+
+  it("rejects an invalid --delivery-mode before touching the filesystem", async () => {
+    // Writing a typo into .env and letting the gateway refuse to start hours later moves the
+    // error a long way from the command that caused it. Reject it while the operator is looking.
+    const res = await installHermes({
+      agentName: "alice", hermesHome, deliveryMode: "notifications", exec: okExec,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toContain("--delivery-mode");
+    expect(res.output).toContain("channel");
+    expect(existsSync(join(hermesHome, ".env"))).toBe(false);
+    expect(execCalls).toHaveLength(0);
+  });
+
+  it("rejects an invalid --session-scope before touching the filesystem", async () => {
+    const res = await installHermes({
+      agentName: "alice", hermesHome, sessionScope: "pear", exec: okExec,
+    });
+    expect(res.exitCode).toBe(1);
+    expect(res.output).toContain("--session-scope");
+    expect(existsSync(join(hermesHome, ".env"))).toBe(false);
+    expect(execCalls).toHaveLength(0);
+  });
+
+  it("defaults to channel + agent when neither flag is given", async () => {
+    const res = await installHermes({ agentName: "alice", hermesHome, exec: okExec });
+    expect(res.exitCode).toBe(0);
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).toContain("CELLO_DELIVERY_MODE=channel");
+    expect(env).toContain("CELLO_SESSION_SCOPE=agent");
+  });
+
+  it("writes the chosen settings — a support desk gets per-peer isolation", async () => {
+    const res = await installHermes({
+      agentName: "support-desk", hermesHome, sessionScope: "peer", exec: okExec,
+    });
+    expect(res.exitCode).toBe(0);
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).toContain("CELLO_SESSION_SCOPE=peer");
+    expect(res.output).toContain("CELLO_SESSION_SCOPE=peer");
+  });
+
+  it("re-running WITHOUT a flag resets it to the default — settings never linger invisibly", async () => {
+    await installHermes({ agentName: "alice", hermesHome, deliveryMode: "wake", exec: okExec });
+    expect(readFileSync(join(hermesHome, ".env"), "utf-8")).toContain("CELLO_DELIVERY_MODE=wake");
+
+    await installHermes({ agentName: "alice", hermesHome, exec: okExec });
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    // The alternative — inheriting the previous value — leaves an operator running a mode that
+    // appears nowhere in the command they just typed, and upsertEnvLine keeps exactly one line.
+    expect(env).toContain("CELLO_DELIVERY_MODE=channel");
+    expect(env).not.toContain("CELLO_DELIVERY_MODE=wake");
+  });
+
+  it("preserves unrelated env lines when writing all three settings", async () => {
+    writeFileSync(join(hermesHome, ".env"), "TELEGRAM_BOT_TOKEN=secret\nOTHER=1\n");
+    await installHermes({ agentName: "alice", hermesHome, exec: okExec });
+    const env = readFileSync(join(hermesHome, ".env"), "utf-8");
+    expect(env).toContain("TELEGRAM_BOT_TOKEN=secret");
+    expect(env).toContain("OTHER=1");
+    expect(env).toContain("CELLO_AGENT_NAME=alice");
+  });
 });
 
 describe("installHermes — successful scaffold", () => {
@@ -208,5 +272,21 @@ describe("resolveInstallTarget — positional parsing (bin/cello.ts install case
     // No positional target given → undefined (installer rejects with usage).
     expect(resolveInstallTarget(["--agent", "alice"])).toBeUndefined();
     expect(resolveInstallTarget(["--hermes-home", "/x"])).toBeUndefined();
+  });
+});
+
+/**
+ * The plugin assets live inside String.raw template literals, so a backtick anywhere in the Python
+ * source or its comments silently TERMINATES the template — the file then fails to parse and every
+ * hermes test dies at transform time with an error pointing at a comment. Caught twice while
+ * writing DOD-HERMES-4; this makes the third time a named failure instead of a puzzle.
+ */
+describe("hermes assets — template integrity", () => {
+  it("the Python adapter contains no backtick — String.raw cannot escape one", async () => {
+    // Scoped to the String.raw asset ONLY. HERMES_SKILL_MD is a normal template literal and its
+    // markdown code spans are escaped backticks, which are fine; String.raw has no escape at all,
+    // so a single backtick there ends the template mid-file.
+    const { HERMES_PLUGIN_INIT_PY } = await import("../hermes/assets.js");
+    expect(HERMES_PLUGIN_INIT_PY.includes("`")).toBe(false);
   });
 });

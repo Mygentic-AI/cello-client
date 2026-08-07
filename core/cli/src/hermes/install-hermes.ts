@@ -31,10 +31,20 @@ export interface ExecResult {
 
 export type ExecFn = (cmd: string, args: string[]) => Promise<ExecResult>;
 
+/** DOD-HERMES-4 — the two per-agent behaviour settings, and their defaults. */
+export const DELIVERY_MODES = ["channel", "wake"] as const;
+export const SESSION_SCOPES = ["agent", "peer"] as const;
+export const DEFAULT_DELIVERY_MODE: (typeof DELIVERY_MODES)[number] = "channel";
+export const DEFAULT_SESSION_SCOPE: (typeof SESSION_SCOPES)[number] = "agent";
+
 export interface InstallHermesOptions {
   agentName: string;
   /** Defaults to $HERMES_HOME, falling back to ~/.hermes. */
   hermesHome?: string;
+  /** `channel` (default): CELLO behaves as a normal two-way channel. `wake`: notices only. */
+  deliveryMode?: string;
+  /** `agent` (default): one conversation per agent. `peer`: one per counterparty. */
+  sessionScope?: string;
   /** Injectable for tests; defaults to a spawn-based runner. */
   exec?: ExecFn;
 }
@@ -102,6 +112,29 @@ export async function installHermes(
     };
   }
 
+  // Validate the modes BEFORE touching the filesystem. A typo must not be written into .env and
+  // discovered later as a gateway that refuses to start — reject it here, where the operator is
+  // still looking at the command they just typed.
+  const deliveryMode = (opts.deliveryMode ?? DEFAULT_DELIVERY_MODE).trim().toLowerCase();
+  const sessionScope = (opts.sessionScope ?? DEFAULT_SESSION_SCOPE).trim().toLowerCase();
+  for (const [flag, value, allowed] of [
+    ["--delivery-mode", deliveryMode, DELIVERY_MODES],
+    ["--session-scope", sessionScope, SESSION_SCOPES],
+  ] as const) {
+    if (!(allowed as readonly string[]).includes(value)) {
+      return {
+        exitCode: 1,
+        output:
+          `Invalid ${flag} '${value}'. Expected one of: ${allowed.join(", ")}.\n` +
+          (flag === "--delivery-mode"
+            ? "  channel — CELLO behaves like a normal chat channel (default)\n" +
+              "  wake    — content-free notices only; the agent reads and replies via cello_* tools"
+            : "  agent   — one conversation per CELLO agent (default)\n" +
+              "  peer    — one conversation per counterparty, for a support desk"),
+      };
+    }
+  }
+
   const hermesHome = opts.hermesHome || process.env.HERMES_HOME || join(homedir(), ".hermes");
   if (!existsSync(hermesHome)) {
     return {
@@ -129,10 +162,16 @@ export async function installHermes(
   writeFileSync(join(skillDir, "SKILL.md"), HERMES_SKILL_MD);
   out.push(`Wrote skill:  ${skillDir}/SKILL.md`);
 
-  // 3. Agent binding
+  // 3. Agent binding + behaviour settings. All three are written on every run, so re-running the
+  //    installer without a flag RESETS that flag to its default rather than silently inheriting
+  //    a value the operator can no longer see in the command they typed.
   const envPath = join(hermesHome, ".env");
   upsertEnvLine(envPath, "CELLO_AGENT_NAME", agentName);
+  upsertEnvLine(envPath, "CELLO_DELIVERY_MODE", deliveryMode);
+  upsertEnvLine(envPath, "CELLO_SESSION_SCOPE", sessionScope);
   out.push(`Bound agent:  CELLO_AGENT_NAME=${agentName} (${envPath})`);
+  out.push(`Delivery:     CELLO_DELIVERY_MODE=${deliveryMode}`);
+  out.push(`Scope:        CELLO_SESSION_SCOPE=${sessionScope}`);
 
   // 4. Register through Hermes' own CLI. A failure here is loud: the files are in
   // place, so we print exactly what remains to be run by hand.
