@@ -62,6 +62,24 @@ export interface AwaitingContentEntry {
 export type ParkResult = { parked: true } | { parked: false; error: string };
 export type ParkFn = (entry: AwaitingContentEntry) => Promise<ParkResult>;
 
+/**
+ * Park failures from which the entry can NEVER recover, so keeping it only re-attempts it at every
+ * boot forever. An ALLOWLIST, and deliberately a short one: everything not named here is kept,
+ * because the cost of keeping a deliverable row is one WARN per boot while the cost of dropping one
+ * is a message the sender believes was delivered.
+ *
+ * `owning_agent_not_found` qualifies on evidence, not judgement: it means `agentNameForId` found no
+ * `agents` row for the entry's agent_id, and `remove-agent` is permanent and frees the name. The
+ * owner cannot come back, so no future boot can park this.
+ *
+ * The other four are all recoverable on a later boot and MUST NOT be added:
+ *   no_persisted_relay_endpoint  — the endpoint is learned when the session next reconnects
+ *   no_counterparty              — the sessions row can still gain one
+ *   standing_receiver_unavailable— the receiver is rebuilt on the next agent start
+ *   signing_key_unavailable      — the key provider may simply not be loaded yet
+ */
+const PERMANENT_PARK_FAILURES: ReadonlySet<string> = new Set(["owning_agent_not_found"]);
+
 export class RetryQueue {
   readonly #db: DaemonDatabase;
   readonly #logger: Logger;
@@ -669,6 +687,32 @@ export class RetryQueue {
         // standing_receiver_unavailable, signing_key_unavailable) is otherwise invisible — the only
         // trace would be `parkedCount: 0`, a number with no reason. The entry is still KEPT for the
         // next flush.
+        if (PERMANENT_PARK_FAILURES.has(result.error)) {
+          // Nothing a later boot can change, so keeping it just re-attempts it forever. ERROR, not
+          // WARN: this is the terminal loss of content the sender believes it delivered, and it is
+          // the one occurrence in this path that an operator must actually see.
+          this.#logger.error("content.park.abandoned", {
+            agentId,
+            sessionId,
+            contentHash: entry.contentHashHex,
+            error: result.error,
+            impact: "the owning agent no longer exists, so this content can never be parked or delivered; it is discarded rather than retried at every boot",
+          });
+          const gone = q.indexOf(entry);
+          if (gone !== -1) q.splice(gone, 1);
+          try {
+            this.#db
+              .prepare("DELETE FROM retry_queue WHERE agent_id = ? AND session_id = ? AND content_hash_hex = ? AND awaiting_ack = 1")
+              .run(agentId, sessionId, entry.contentHashHex);
+          } catch (err: unknown) {
+            this.#logger.error("message.retry.persist.failed", {
+              agentId, sessionId, nonce: entry.contentHashHex, operation: "park_abandon_delete",
+              error: err instanceof Error ? err.message : String(err),
+              impact: "the unparkable row was not removed and will be re-attempted at every boot",
+            });
+          }
+          continue;
+        }
         this.#logger.warn("content.park.failed", {
           agentId,
           sessionId,

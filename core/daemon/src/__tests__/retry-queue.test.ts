@@ -447,6 +447,62 @@ describe("RetryQueue", () => {
   // stores its content_blob as plaintext bytes within the encrypted DB; these unit tests run against
   // an in-memory node:sqlite handle and assert the queue logic, not at-rest encryption.
 
+  describe("DOD-RETRYQ-STRAND-1: a park that can never succeed must not be retried forever", () => {
+    // The residual handed forward by review: drainAwaitingToPark keeps the row on EVERY failure,
+    // so a park that can never succeed is re-attempted at every boot forever.
+    //
+    // Only ONE of the five failure reasons is provable from local state. `owning_agent_not_found`
+    // means agentNameForId returned null — no `agents` row for that agent_id — and remove-agent is
+    // permanent ("Cannot be undone"), so the owner can never come back. The other four
+    // (no_persisted_relay_endpoint, no_counterparty, standing_receiver_unavailable,
+    // signing_key_unavailable) are all recoverable on a later boot, and guessing them permanent
+    // would destroy a message the sender believes was delivered.
+
+    it("evicts an awaiting row whose OWNING AGENT no longer exists, and tells the operator", async () => {
+      const sessionId = "session-owner-retired";
+      const agentId = "agent-id-retired-0001";
+      const hash = randomBytes(32);
+      retryQueue.enqueueAwaitingContent(agentId, sessionId, hash, randomBytes(64));
+      logEvents.length = 0;
+
+      const parked = await retryQueue.drainAwaitingToPark(agentId, sessionId, async () => ({
+        parked: false,
+        error: "owning_agent_not_found",
+      }));
+
+      expect(parked).toBe(0);
+      expect(retryQueue.getAwaitingDepth(agentId, sessionId)).toBe(0);
+      const rows = db
+        .prepare("SELECT COUNT(*) AS n FROM retry_queue WHERE session_id = ? AND awaiting_ack = 1")
+        .get(sessionId) as unknown as { n: number };
+      expect(rows.n).toBe(0);
+      // Content the sender believes it sent — the drop must be nameable, with the cause we can prove.
+      const dropped = logEvents.filter((e) => e.event === "content.park.abandoned");
+      expect(dropped).toHaveLength(1);
+      expect(dropped[0].level).toBe("error");
+      expect(dropped[0].context.error).toBe("owning_agent_not_found");
+    });
+
+    it("KEEPS the row for every RECOVERABLE park failure — those come back on a later boot", async () => {
+      // The revert test for the eviction: widen it to any of these and this goes red. Each of the
+      // four is a condition a later boot legitimately fixes.
+      for (const reason of [
+        "no_persisted_relay_endpoint",
+        "no_counterparty",
+        "standing_receiver_unavailable",
+        "signing_key_unavailable",
+      ]) {
+        const sessionId = `session-${reason}`;
+        const agentId = "agent-id-alice-0001";
+        retryQueue.enqueueAwaitingContent(agentId, sessionId, randomBytes(32), randomBytes(64));
+
+        await retryQueue.drainAwaitingToPark(agentId, sessionId, async () => ({ parked: false, error: reason }));
+
+        expect(retryQueue.getAwaitingDepth(agentId, sessionId), `${reason} must NOT evict`).toBe(1);
+      }
+    });
+  });
+
   describe("DOD-RETRYQ-STRAND-1: reap direct rows whose session can never drain", () => {
     // A direct-resend row (awaiting_ack = 0) is reachable ONLY by drainSession, which has no
     // production caller. Once its session goes terminal no drain can ever succeed — there is no
