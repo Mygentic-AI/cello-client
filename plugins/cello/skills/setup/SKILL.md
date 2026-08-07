@@ -142,8 +142,16 @@ or shortening its window — is refused from the agent surface and must be done 
 terminal. That is deliberate: an agent must not be able to weaken its own guards, least of all
 because an incoming message asked it to.
 
-Content screening is **planned, not yet active** — the daemon currently passes messages through
-unscreened. A tier today is a limits setting, not a safety boundary. Do not describe it as one.
+Content screening **is active**, in both directions. Inbound messages are screened before they
+reach any reader, and outbound ones before they leave. A screened-out item does not silently
+vanish: an outbound message can be **held for a decision**, and resolving it means re-sending the
+same content with a `governance_decisions` map — `{flagId: "redact" | "allow_once" |
+"allow_always"}` — deciding each flagged item. Nothing reaches the peer until you do.
+
+(This paragraph previously said screening was "planned, not yet active". That was true when the
+daemon defaulted to a null-object gateway; the default is gone, a real gateway is now required at
+startup, and a live hold was observed on 2026-08-07. Tiers remain a limits setting rather than the
+safety boundary — screening is the boundary.)
 
 ### Optional extras
 

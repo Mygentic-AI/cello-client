@@ -170,6 +170,12 @@ STATE_WAKES_SUPPRESSED_IN_CHANNEL = {"created"}
 # patience is LIMIT x DELAY before the notice fallback.
 BUSY_RETRY_LIMIT = 5
 BUSY_RETRY_DELAY_SECONDS = 2.0
+
+# Bound on the wake backlog. Unbounded, a daemon that pushed faster than the agent could answer
+# would grow this without limit inside the gateway process. Overflow DROPS the newest wake and
+# says so at ERROR: the message itself stays unread in the daemon and is recoverable with the
+# cello_* tools, so a dropped wake costs latency, not content.
+WAKE_QUEUE_MAX = 256
 # Upper bound on one drain. A conversation that has been away a long time can have a lot
 # queued; handing an agent an unbounded turn is its own failure. Hitting this logs loudly -
 # a silent truncation would read as "the agent saw everything" when it did not.
@@ -342,13 +348,21 @@ class CelloAdapter(BasePlatformAdapter):
         # per-entry hint arrives with multi-agent binding (DOD-HERMES-5).
         hint_mode = (os.environ.get("CELLO_DELIVERY_MODE") or DEFAULT_DELIVERY_MODE).strip().lower()
         if hint_mode != self._delivery_mode:
+            # REFUSE rather than warn. Both directions are broken and one is silent: adapter
+            # 'wake' with a 'channel' hint tells the agent not to call cello_send while send() is
+            # a no-op returning success, so every reply is lost with success reported at every
+            # layer. (The other direction merely duplicates.) A bridge that cannot deliver is
+            # worse than one that will not start, because only one of them says so.
             logger.error(
-                "[cello] delivery_mode is '%s' but the agent's standing instructions were built "
-                "for '%s' (CELLO_DELIVERY_MODE). The agent will be told to do the opposite of "
-                "what this adapter does. Set CELLO_DELIVERY_MODE=%s in the Hermes env file and "
-                "restart the gateway, or drop the platform-config override.",
+                "[cello] Refusing to start: delivery_mode is '%s' but the agent's standing "
+                "instructions were built for '%s' (CELLO_DELIVERY_MODE, read once at plugin "
+                "registration). The agent would be told to do the opposite of what this adapter "
+                "does, and in one direction every reply is lost silently. Set "
+                "CELLO_DELIVERY_MODE=%s in the Hermes env file and restart the gateway, or drop "
+                "the platform-config override so the two agree.",
                 self._delivery_mode, hint_mode, self._delivery_mode,
             )
+            return False
 
         complaint = self._invalid_settings()
         if complaint is not None:
@@ -446,9 +460,14 @@ class CelloAdapter(BasePlatformAdapter):
         stack a second consumer, which would let two wakes interleave their fetches.
         """
         if self._wake_queue is None:
-            self._wake_queue = asyncio.Queue()
+            self._wake_queue = asyncio.Queue(maxsize=WAKE_QUEUE_MAX)
         if self._wake_task is None or self._wake_task.done():
             self._wake_task = asyncio.create_task(self._wake_worker())
+            # Without this the only thing that ever restarts the worker is a socket drop. Its
+            # per-frame except makes death unlikely, not impossible - and a dead worker leaves
+            # the reader filling a queue nobody drains, i.e. an adapter that is silently deaf
+            # until the daemon restarts.
+            self._wake_task.add_done_callback(self._on_wake_worker_exit)
 
     def _requeue_wake_later(self, frame: Dict[str, Any], delay: float) -> None:
         """Put a wake back on the queue after the given delay, off the worker.
@@ -472,6 +491,18 @@ class CelloAdapter(BasePlatformAdapter):
         # collected mid-sleep and the wake would vanish with it.
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
+
+    def _on_wake_worker_exit(self, task: Any) -> None:
+        """Restart the wake worker if it ever exits while the adapter is still up."""
+        if self._closing or task.cancelled():
+            return
+        exc = task.exception() if not task.cancelled() else None
+        logger.error(
+            "[cello] The wake worker exited unexpectedly (%r) - restarting it. Wakes queued "
+            "while it was down are still in the queue and will be handled now.", exc,
+        )
+        self._wake_task = None
+        self._start_wake_worker()
 
     async def _wake_worker(self) -> None:
         while True:
@@ -576,7 +607,15 @@ class CelloAdapter(BasePlatformAdapter):
                     # own reply and every wake times out into the fallback path. The queue keeps
                     # arrival ORDER (a bare create_task per frame would not) while leaving the
                     # reader free to deliver the responses the handler is waiting on.
-                    self._wake_queue.put_nowait(frame)
+                    try:
+                        self._wake_queue.put_nowait(frame)
+                    except asyncio.QueueFull:
+                        logger.error(
+                            "[cello] Wake backlog is full (%d); dropped a '%s' notification. The "
+                            "message is still unread in the daemon - the agent can read it with "
+                            "cello_receive - but this bridge will not announce it.",
+                            WAKE_QUEUE_MAX, frame.get("notification"),
+                        )
                     continue
                 fut = self._pending.pop(str(frame.get("id", "")), None)
                 if fut is None or fut.done():
@@ -1017,6 +1056,46 @@ class CelloAdapter(BasePlatformAdapter):
 
     # ------------------------------------------------------------------ outbound (no-op)
 
+    async def _surface_governance_hold(self, session_id: str, guidance: str) -> None:
+        """Tell the agent, in its own conversation, that its reply was held for a decision.
+
+        Delivered as an ordinary turn so it cannot be missed: an operator-visible log line is no
+        use to the agent, and the agent is the only party that can decide redact-vs-allow.
+        """
+        if not self._message_handler:
+            logger.error(
+                "[cello] A reply on session %s was held for a governance decision and there is no "
+                "gateway handler to tell the agent about it - the peer will not receive it.",
+                session_id,
+            )
+            return
+        source = self.build_source(
+            chat_id=self._chat_id_for(None) or self._agent_name,
+            chat_name="CELLO",
+            chat_type="dm",
+            user_id="cello-daemon",
+            user_name="CELLO",
+        )
+        # NO anchor on this event: it is adapter-authored, so the agent's answer to it must not be
+        # auto-delivered to the peer. The agent resolves it with cello_send explicitly.
+        event = MessageEvent(
+            text=(
+                "CELLO: your reply on session " + session_id + " was NOT sent. The security "
+                "gateway held it for a decision. " + guidance + "\n\n"
+                "Nothing has reached the peer, and they are still waiting. To resolve it, call "
+                "the cello_send tool yourself on session " + session_id + " with the SAME content "
+                "plus a governance_decisions map — {flagId: \"redact\" | \"allow_once\" | "
+                "\"allow_always\"} — deciding each flagged item. This is the one case where you "
+                "must send manually; the bridge cannot decide on your behalf."
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"governance_hold": True, "session_id": session_id},
+            message_id="cello-governance-" + uuid.uuid4().hex[:8],
+            internal=True,
+        )
+        await self.handle_message(event)
+
     @staticmethod
     def _session_from_anchor(anchor: Any) -> Any:
         """The CELLO session id (str), None, or the _BAD_ANCHOR sentinel.
@@ -1128,6 +1207,18 @@ class CelloAdapter(BasePlatformAdapter):
             logger.error(
                 "[cello] cello_send refused session %s: %s - %s", session_id, reason, guidance
             )
+            if reason == "governance_warn":
+                # A DEAD END unless we say something. The security gateway held this reply for a
+                # decision, and resolving it means re-sending with a governance_decisions map -
+                # which only the agent can author, because only the agent knows whether each
+                # flagged item should be redacted or allowed. But in channel mode the agent never
+                # called cello_send, so it has no idea any of this happened: it wrote a reply, the
+                # bridge swallowed it, and the peer is still waiting.
+                #
+                # So hand the decision back into the conversation. The agent then re-sends
+                # explicitly with cello_send + the map, which bypasses this method entirely - so
+                # this cannot loop.
+                await self._surface_governance_hold(session_id, guidance)
             return SendResult(success=False, error=reason + ": " + guidance)
 
         logger.info(

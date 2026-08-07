@@ -130,6 +130,8 @@ async def fake_call(method, params=None, timeout=None):
                 raise ConnectionError("socket died mid-drain")
             return {"ok": True, "content": nxt}
         return receive_result
+    if method == "cello_send":
+        return spec.get("send_result") or {"ok": True}
     return {"ok": True}
 
 adapter._call = fake_call
@@ -195,6 +197,21 @@ async def main():
         out["pending_anchors"] = {
             k: getattr(v, "message_id", None) for k, v in adapter._pending_messages.items()
         }
+    elif op == "connect":
+        # The REAL connect() mode-agreement check. hint_mode is what register() baked into the
+        # standing instructions (env, read once); _delivery_mode is what this adapter runs.
+        import os as _os
+        _os.environ["CELLO_DELIVERY_MODE"] = spec["hint_mode"]
+        adapter._closing = False
+        adapter._read_task = None
+        reached = {"v": False}
+        async def _fake_establish():
+            reached["v"] = True
+        adapter._establish = _fake_establish
+        # A mode disagreement returns False BEFORE any socket work. Agreement falls through to
+        # _establish, which succeeds here - so connect() returning True means the check passed.
+        out["connected"] = bool(await adapter.connect())
+        out["reached_establish"] = reached["v"]
     elif op == "send":
         res = await adapter.send(
             chat_id=spec.get("chat_id", "Ms_Chelly_Hermes"),
@@ -204,6 +221,10 @@ async def main():
         )
         out["success"] = res.success
         out["error"] = res.error
+        out["delivered"] = [
+            {"text": e.text, "chat_id": getattr(e.source, "chat_id", None), "message_id": e.message_id}
+            for e in adapter.delivered
+        ]
     out["calls"] = calls
     sys.stdout.write(json.dumps(out))
 
@@ -413,6 +434,58 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     const v = run({ op: "send", metadata: { reply_to_message_id: "cello-wake-a b\nc-deadbeef" } });
     expect(v.success).toBe(false);
     expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
+  });
+
+  // ─── AC13: the residue from the review, fixed rather than carried
+
+  it("AC13: a reply held by the security gateway is surfaced TO THE AGENT, not just logged", () => {
+    // The one case the agent cannot resolve on its own: only it knows whether each flagged item
+    // should be redacted or allowed, but in channel mode it never called cello_send, so without
+    // this it has no idea the reply was swallowed and the peer is still waiting.
+    const inbound = run({ op: "notify", kind: "cello_message", data: MSG });
+    const v = run({
+      op: "send", metadata: { reply_to_message_id: inbound.delivered![0].message_id },
+      send_result: { ok: false, reason: "governance_warn", guidance: "flag-7 held" },
+    });
+    expect(v.success).toBe(false);
+    expect(v.delivered).toHaveLength(1);
+    const notice = v.delivered![0].text;
+    expect(notice).toContain("was NOT sent");
+    expect(notice).toContain("governance_decisions");
+    expect(notice).toContain("flag-7 held");        // the daemon's own reason reaches the agent
+  });
+
+  it("AC13: the governance notice carries NO anchor — its answer must not auto-deliver", () => {
+    // If it had one, the agent's response to "your message was held" would itself be sent to the
+    // peer, which is neither what the agent meant nor a resolution of the hold.
+    const inbound = run({ op: "notify", kind: "cello_message", data: MSG });
+    const v = run({
+      op: "send", metadata: { reply_to_message_id: inbound.delivered![0].message_id },
+      send_result: { ok: false, reason: "governance_warn", guidance: "held" },
+    });
+    expect(v.delivered![0].message_id.startsWith("cello-wake-")).toBe(false);
+  });
+
+  it("AC13: an ordinary send refusal is NOT surfaced — only the one the agent can act on", () => {
+    const inbound = run({ op: "notify", kind: "cello_message", data: MSG });
+    const v = run({
+      op: "send", metadata: { reply_to_message_id: inbound.delivered![0].message_id },
+      send_result: { ok: false, reason: "session_not_active", guidance: "sealed" },
+    });
+    expect(v.success).toBe(false);
+    expect(v.delivered ?? []).toHaveLength(0);
+  });
+
+  it("AC13: connect() REFUSES when the adapter's mode and the standing hint disagree", () => {
+    // One direction is silent: adapter 'wake' + hint 'channel' tells the agent not to send while
+    // send() is a no-op returning success — every reply lost, success reported at every layer.
+    const v = run({ op: "connect", delivery_mode: "wake", hint_mode: "channel" });
+    expect(v.connected).toBe(false);
+  });
+
+  it("AC13: connect() proceeds when they agree", () => {
+    expect(run({ op: "connect", delivery_mode: "wake", hint_mode: "wake" }).connected).toBe(true);
+    expect(run({ op: "connect", delivery_mode: "channel", hint_mode: "channel" }).connected).toBe(true);
   });
 
   // ─── AC11: the phantom doorbell — a 'created' notice must not occupy the agent
