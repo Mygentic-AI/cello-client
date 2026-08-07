@@ -370,12 +370,13 @@ export class DocumentDelivery {
             // again. Measured on the operator's daemon: `sends: 74` against a documented cap of 5,
             // while both the log line and the comment above claimed publishing had stopped.
             //
-            // Retiring the envelope is what actually stops it. `markAcked` is the one thing
-            // `pendingDeliveries` honours, and the peer HAS effectively answered — by never
-            // answering, five times over. This is a local giving-up, not a claim about them: the
-            // rejection record below is what an operator reads for the reason.
+            // Retiring the envelope is what actually stops it — and it is retired as ABANDONED,
+            // not as acked. `markAcked` was the first spelling and it was wrong: `acked_at` means
+            // "the peer's daemon answered", so reusing it made `withdraw` tell the operator "your
+            // peer holds it, so it cannot be withdrawn" about an envelope the peer may never have
+            // seen. Giving up is our decision; it is not evidence about them.
             this.#store.setDocumentStatus(ownerAgentId, documentId, "stalled");
-            this.#store.markAcked(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
+            this.#store.markAbandoned(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
             this.#logger.error("document.delivery.unacked_limit", {
               documentId,
               envelopeHash: envelope.envelopeHash,

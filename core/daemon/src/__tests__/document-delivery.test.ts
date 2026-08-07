@@ -478,6 +478,15 @@ describe("DocumentDelivery — SENT is neither done nor failed", () => {
       f.events.filter((e) => e.event === "document.delivery.sent").length,
       "a tick after the ceiling sent it AGAIN",
     ).toBe(sendsAtCeiling);
+
+    // AND IT IS NOT RECORDED AS ACKED. Giving up is OUR decision; `acked_at` means the peer's
+    // daemon answered, and we do not know whether they ever saw this. The first version of the
+    // stop-actually-stopping fix reused `markAcked` because it is the column `pendingDeliveries`
+    // honours — which would have made `withdraw` tell the operator "your peer holds it, so it
+    // cannot be withdrawn" about an envelope that may never have arrived. Same class as any other
+    // false claim of confirmation.
+    const row = f.store.getEnvelopeLog(AGENT, DOC)[0]!;
+    expect(row.ackedAtMs ?? null, "abandoning an envelope claimed the peer had acked it").toBeNull();
   });
 
   it("an ack arriving later settles it", async () => {

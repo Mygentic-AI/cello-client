@@ -208,6 +208,14 @@ const CREATE_ENVELOPES_SQL = `
     -- "never sent".
     delivered_at    INTEGER,
     acked_at        INTEGER,
+    -- A THIRD fact, and it is not either of the two above. abandoned_at is when WE STOPPED TRYING
+    -- (the unacked ceiling) — a local decision, and NOT a claim about the peer.
+    --
+    -- It exists because the ceiling first stopped delivery by calling markAcked, and acked_at means
+    -- "the peer's daemon said it admitted or rejected it". Overloading it made withdraw tell the
+    -- operator "your peer holds it, so it cannot be withdrawn" about an envelope the peer may never
+    -- have seen. Same class as any other false claim of confirmation, and a column is cheaper.
+    abandoned_at    INTEGER,
     -- How many times delivery has been attempted, and when the next attempt is due. On the row,
     -- because a backoff that resets on restart is not a backoff — a daemon restarting in a
     -- reconnect loop would hammer an unreachable peer at full rate forever.
@@ -346,6 +354,16 @@ export class DocumentStore {
     // entire delivery pass down with it.
     this.#db.exec(CREATE_WITHDRAWALS_SQL);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
+    // COLUMN BIRTH. A daemon that already holds an envelope log must gain the column without
+    // losing the log. `ALTER TABLE ... ADD COLUMN` throws when it is already there, which is the
+    // guard — the same pattern `document-handshake.ts` uses, rather than a version number nobody
+    // maintains.
+    try {
+      this.#db.exec("ALTER TABLE document_envelopes ADD COLUMN abandoned_at INTEGER");
+    } catch {
+      // Already present. Any other cause is a corrupt schema, which the next query reports with a
+      // better message than a rethrow here could.
+    }
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
       "CREATE INDEX IF NOT EXISTS idx_document_envelopes_order ON document_envelopes (owner_agent_id, document_id, log_index)",
@@ -885,6 +903,11 @@ export class DocumentStore {
       .prepare(
         `SELECT * FROM document_envelopes
           WHERE owner_agent_id = ? AND sender_agent_id = ? AND acked_at IS NULL
+            -- ABANDONED rows are not pending. This is what actually stops the worker at the
+            -- unacked ceiling: the selection reads no document STATUS, so setting the document
+            -- stalled changed what the surface said and nothing about what the worker did, and one
+            -- envelope went out 74 times against a cap of 5.
+            AND abandoned_at IS NULL
             -- UPDATES only. A withdrawal record is local audit — the update it concerns was never
             -- delivered, so there is nothing for the peer to act on — and a rejection reaches the
             -- peer through the rejection protocol, not this worker. Without the scope the worker
@@ -965,6 +988,26 @@ export class DocumentStore {
   }
 
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
+  /**
+   * WE GAVE UP — the unacked ceiling. Deliberately not `markAcked`: this records a decision of
+   * ours, and says nothing about whether the peer holds the envelope, because we do not know.
+   */
+  markAbandoned(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nowMs: number,
+  ): boolean {
+    const info = this.#db
+      .prepare(
+        `UPDATE document_envelopes SET abandoned_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(nowMs, ownerAgentId, documentId, envelopeHash);
+    return Number(info.changes) > 0;
+  }
+
   markAcked(
     ownerAgentId: string,
     documentId: string,
