@@ -33,6 +33,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { addColumnIfMissing } from "./column-birth.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -358,12 +359,11 @@ export class DocumentStore {
     // losing the log. `ALTER TABLE ... ADD COLUMN` throws when it is already there, which is the
     // guard — the same pattern `document-handshake.ts` uses, rather than a version number nobody
     // maintains.
-    try {
-      this.#db.exec("ALTER TABLE document_envelopes ADD COLUMN abandoned_at INTEGER");
-    } catch {
-      // Already present. Any other cause is a corrupt schema, which the next query reports with a
-      // better message than a rethrow here could.
-    }
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "document_envelopes",
+      column: "abandoned_at",
+      sql: "ALTER TABLE document_envelopes ADD COLUMN abandoned_at INTEGER",
+    });
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
       "CREATE INDEX IF NOT EXISTS idx_document_envelopes_order ON document_envelopes (owner_agent_id, document_id, log_index)",

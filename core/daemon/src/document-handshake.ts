@@ -36,6 +36,7 @@ import {
 } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { addColumnIfMissing } from "./column-birth.js";
 
 /**
  * Verify a proposal's signature against the agent that claims to have made it.
@@ -91,9 +92,9 @@ const CREATE_PROPOSALS_SQL = `
  * operator surface exists precisely to tell those apart.
  */
 const PEER_DECISION_COLUMNS = [
-  "ALTER TABLE document_proposals ADD COLUMN peer_accepted INTEGER",
-  "ALTER TABLE document_proposals ADD COLUMN peer_reason TEXT",
-  "ALTER TABLE document_proposals ADD COLUMN peer_decided_at INTEGER",
+  { column: "peer_accepted", sql: "ALTER TABLE document_proposals ADD COLUMN peer_accepted INTEGER" },
+  { column: "peer_reason", sql: "ALTER TABLE document_proposals ADD COLUMN peer_reason TEXT" },
+  { column: "peer_decided_at", sql: "ALTER TABLE document_proposals ADD COLUMN peer_decided_at INTEGER" },
 ];
 
 export interface DocumentProposalRecord {
@@ -121,14 +122,8 @@ export class DocumentHandshake {
     this.#logger = logger;
     this.#verify = verify;
     this.#db.exec(CREATE_PROPOSALS_SQL);
-    for (const sql of PEER_DECISION_COLUMNS) {
-      try {
-        this.#db.exec(sql);
-      } catch {
-        // Already present. The only other way this throws is a corrupt schema, which the very next
-        // query surfaces with its own message — swallowing that one is not worth a version table
-        // whose whole job would be to answer a question `ALTER` already answers.
-      }
+    for (const { column, sql } of PEER_DECISION_COLUMNS) {
+      addColumnIfMissing(this.#db, this.#logger, { table: "document_proposals", column, sql });
     }
   }
 
