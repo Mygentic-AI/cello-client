@@ -1107,10 +1107,31 @@ export class DocumentStore {
   }
 
   /** How many rejections this document has RECEIVED — the publishing side's retry round. */
+  /**
+   * How many ROUNDS this document has been through — DISTINCT refused envelopes, not rows.
+   *
+   * ONE REFUSED ENVELOPE IS ONE ROUND, however many times the refusal is announced. A peer's refusal
+   * arrives TWICE by design: once as the signed `document_rejection` frame, and once as the ack that
+   * settles the delivery (`admitted: false`). Both are recorded — correctly, they are two real
+   * events — but the table is keyed on the ANNOUNCEMENT's hash, so the two land as separate rows.
+   *
+   * Counting rows therefore advanced the round by two per refusal, and `MAX_REJECTED_ROUNDS` is 3 —
+   * so a document stalled after TWO refusals instead of three, cutting the supersede-and-retry
+   * budget the protocol grants an operator by a third. Measured: the stall enforcer's sender was
+   * refused at attempt 2 with `document_stalled`.
+   *
+   * Counted rather than deduplicated on write, deliberately. Both announcements genuinely happened
+   * and the audit record should say so; what was wrong is the arithmetic built on top of it. And a
+   * UNIQUE index on the refused hash would fail to create on any database that already holds the
+   * duplicate rows this fix is about.
+   *
+   * Same principle as `ackRecordHash` one layer down — that one collapsed repeated ACKS of one
+   * envelope; this collapses the two KINDS of announcement of one refusal.
+   */
   countRejectionsReceived(ownerAgentId: string, documentId: string): number {
     const r = this.#db
       .prepare(
-        `SELECT COUNT(*) AS n FROM document_rejections_received
+        `SELECT COUNT(DISTINCT rejected_envelope_hash) AS n FROM document_rejections_received
           WHERE owner_agent_id = ? AND document_id = ?`,
       )
       .get(ownerAgentId, documentId) as { n?: number } | undefined;

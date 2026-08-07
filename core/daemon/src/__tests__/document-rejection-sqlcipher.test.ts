@@ -145,3 +145,51 @@ describe("a rejection is RECORDED on the production driver, not just decided", (
     expect(() => db.prepare("INSERT INTO probe (sv) VALUES (?)").run(new Uint8Array([0]))).not.toThrow();
   });
 });
+
+describe("a refusal announced twice is ONE round", () => {
+  it("counts distinct refused envelopes, not announcements", async () => {
+    // A peer's refusal arrives TWICE by design: the signed `document_rejection` frame, and the ack
+    // that settles the delivery (`admitted: false`). The table is keyed on the ANNOUNCEMENT's hash,
+    // so both land as rows — correctly, they are two real events. Counting ROWS advanced the round
+    // by two per refusal, and MAX_REJECTED_ROUNDS is 3, so a document stalled after TWO refusals
+    // instead of three: a third of the operator's supersede-and-retry budget, silently gone.
+    const { store, rejections } = newRealStore();
+    const refused = "ff".repeat(32);
+
+    // The rejection FRAME — identity is the rejection's own hash.
+    const first = rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: "aa11".repeat(16),
+      rejectedEnvelopeHash: refused,
+      reason: "document_append_only_violation",
+      fromAgentId: PEER,
+    });
+    // The ACK for the SAME refused envelope — different identity, same refusal.
+    const second = rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: refused,
+      rejectedEnvelopeHash: refused,
+      reason: "document_append_only_violation",
+      fromAgentId: PEER,
+    });
+
+    expect(first.round).toBe(1);
+    expect(second.round, "the second announcement of one refusal advanced the round").toBe(1);
+    // Both rows are kept — they are two real events and the audit record should say so. Only the
+    // arithmetic on top of them was wrong.
+    expect(store.rejectionReceivedFor(AGENT, DOC, refused)).toBe(true);
+  });
+
+  it("a SECOND refused envelope is a second round", () => {
+    // The other half: collapsing announcements must not collapse genuinely distinct refusals, or
+    // the ceiling never binds and the runaway it exists to stop comes back.
+    const { rejections } = newRealStore();
+    const r1 = rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: "11".repeat(32), rejectedEnvelopeHash: "aa".repeat(32),
+      reason: "r", fromAgentId: PEER,
+    });
+    const r2 = rejections.recordIncomingRejection(AGENT, DOC, {
+      rejectionEnvelopeHash: "22".repeat(32), rejectedEnvelopeHash: "bb".repeat(32),
+      reason: "r", fromAgentId: PEER,
+    });
+    expect([r1.round, r2.round]).toEqual([1, 2]);
+  });
+});
