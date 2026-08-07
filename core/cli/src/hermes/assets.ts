@@ -152,6 +152,10 @@ CALL_TIMEOUT_SECONDS = 30.0
 # Server-side wait for the adapter's own cello_receive. Short on purpose: the notification that
 # triggered it means the content is already durable, so this is a fetch, not a poll.
 RECEIVE_TIMEOUT_MS = 5000
+# Upper bound on one drain. A conversation that has been away a long time can have a lot
+# queued; handing an agent an unbounded turn is its own failure. Hitting this logs loudly -
+# a silent truncation would read as "the agent saw everything" when it did not.
+MAX_DRAIN_MESSAGES = 25
 # Matches the daemon IPC server's MAX_BUFFER_SIZE (4 MB).
 MAX_LINE_BYTES = 4 * 1024 * 1024
 
@@ -593,45 +597,90 @@ class CelloAdapter(BasePlatformAdapter):
         notifications per connection (so this is the connection that was woken), and the
         read-before-send gate (M8C-CURSOR-1) tracks a per-connection cursor - so reading here is
         exactly what later lets send() through on the same socket.
+
+        DRAIN, not a single read. cello_receive serves THIS CONNECTION's oldest unread message,
+        not the one the notification just announced - the two are the same only when the
+        connection is already caught up. On a conversation with any history behind it (which is
+        every existing conversation the first time this adapter attaches) the first read returns
+        a message from minutes ago, and the agent answers the wrong thing.
+
+        Worse, it then cannot answer at all: the read-before-send gate refuses a send while
+        anything is still unread, so the reply the agent just wrote is REFUSED and lost - the
+        agent believes it answered and the peer hears nothing. Observed live 2026-08-07 on
+        session 9bc456f6: adapter read seq 0 (five minutes stale), agent replied, two
+        session.send.blocked with unreadReceived=1, reply gone.
+
+        Draining fixes both: the agent sees everything waiting, in order, and the gate is clear
+        by the time it answers.
         """
-        try:
-            # An explicit SHORT server-side wait. The daemon's default is 30 s, which is exactly
-            # CALL_TIMEOUT_SECONDS - so the two would race and the client timeout could fire on a
-            # call the daemon was about to answer. The content this notification announces is
-            # already durable, so a long wait buys nothing.
-            result = await self._call(
-                "cello_receive",
-                {"session_id": session_id, "timeout_ms": RECEIVE_TIMEOUT_MS},
-                timeout=RECEIVE_TIMEOUT_MS / 1000.0 + 5.0,
-            )
-        except Exception as exc:
-            # Name the EXCEPTION TYPE: asyncio.TimeoutError stringifies to "", so "%s" alone
-            # produced a log line that named a session and no cause at all - pointing the operator
-            # at the daemon when the fault could be entirely local.
-            logger.error(
-                "[cello] Could not fetch content for session %s (%s: %r) - falling back to a wake "
-                "notice so the agent can still read it through the cello_* MCP tools",
-                session_id, exc.__class__.__name__, exc,
-            )
-            return None
-        if not isinstance(result, dict) or result.get("ok") is False:
-            reason = result.get("reason") if isinstance(result, dict) else "malformed_response"
-            logger.error(
-                "[cello] cello_receive refused session %s (%s) - falling back to a wake notice",
-                session_id, reason,
-            )
-            return None
-        content = result.get("content")
-        if not isinstance(content, str) or not content:
-            # An 'ok' answer with nothing in it (timed out, or a sibling connection took the
-            # message). An empty user turn tells the agent nothing; the wake notice at least
-            # names the session.
+        parts: list = []
+        for attempt in range(MAX_DRAIN_MESSAGES):
+            try:
+                # First read waits briefly for the announced message; every later read is
+                # non-blocking (timeout_ms 0) because it is only draining what is ALREADY there.
+                # An explicit SHORT server-side wait on the first: the daemon's default is 30 s,
+                # exactly CALL_TIMEOUT_SECONDS, so the two would race and the client could give up
+                # on a call the daemon was about to answer.
+                wait_ms = RECEIVE_TIMEOUT_MS if attempt == 0 else 0
+                result = await self._call(
+                    "cello_receive",
+                    {"session_id": session_id, "timeout_ms": wait_ms},
+                    timeout=wait_ms / 1000.0 + 5.0,
+                )
+            except Exception as exc:
+                # Name the EXCEPTION TYPE: asyncio.TimeoutError stringifies to "", so "%s" alone
+                # produced a log line that named a session and no cause at all - pointing the
+                # operator at the daemon when the fault could be entirely local.
+                logger.error(
+                    "[cello] Could not fetch content for session %s (%s: %r) - %s",
+                    session_id, exc.__class__.__name__, exc,
+                    "delivering the %d message(s) already read" % len(parts) if parts
+                    else "falling back to a wake notice so the agent can still read it through "
+                         "the cello_* MCP tools",
+                )
+                break
+            if not isinstance(result, dict) or result.get("ok") is False:
+                reason = result.get("reason") if isinstance(result, dict) else "malformed_response"
+                # Only the FIRST read's refusal is a failure to report; a later one just means the
+                # drain reached the end (e.g. the session sealed between reads).
+                if not parts:
+                    logger.error(
+                        "[cello] cello_receive refused session %s (%s) - falling back to a wake "
+                        "notice", session_id, reason,
+                    )
+                break
+            content = result.get("content")
+            if not isinstance(content, str) or not content:
+                # 'ok' with nothing in it: the queue is empty. On the FIRST read that means the
+                # message went to a sibling connection or timed out, and an empty user turn tells
+                # the agent nothing - the wake notice at least names the session.
+                if not parts:
+                    logger.warning(
+                        "[cello] cello_receive returned no content for session %s - falling back "
+                        "to a wake notice", session_id,
+                    )
+                break
+            parts.append(content)
+        else:
+            # Hit the cap with more possibly waiting. Say so: a silent truncation here reads as
+            # "the agent saw everything" when it did not, and the unread tail will keep the
+            # read-before-send gate closed.
             logger.warning(
-                "[cello] cello_receive returned no content for session %s - falling back to a "
-                "wake notice", session_id,
+                "[cello] Stopped draining session %s at %d messages; any remaining are still "
+                "unread and may block this agent's next reply until it catches up",
+                session_id, MAX_DRAIN_MESSAGES,
             )
+
+        if not parts:
             return None
-        return content
+        if len(parts) > 1:
+            logger.info(
+                "[cello] Delivered %d queued messages for session %s as one turn",
+                len(parts), session_id,
+            )
+        # Joined into ONE turn rather than emitted as several events: they share a session, so
+        # they share an anchor, and one turn means one reply - which is what the peer expects.
+        return "\n\n".join(parts)
 
     async def _on_notification(self, frame: Dict[str, Any]) -> None:
         kind = str(frame.get("notification", ""))

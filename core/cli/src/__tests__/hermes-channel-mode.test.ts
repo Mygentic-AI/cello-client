@@ -107,12 +107,23 @@ adapter._wake_task = None
 
 calls = []
 receive_result = spec.get("receive_result", {"ok": True, "content": "hello from the peer"})
+# A QUEUE of pending messages, mirroring the daemon: cello_receive serves this connection's
+# oldest unread and returns an empty 'ok' once drained. Default is a single message so the
+# existing cases are unchanged.
+receive_queue = list(spec.get("receive_queue") or [])
 
 async def fake_call(method, params=None, timeout=None):
     calls.append({"method": method, "params": params or {}})
     if method == "cello_receive":
         if receive_result == "raise":
             raise ConnectionError("socket died")
+        if spec.get("receive_queue") is not None:
+            if not receive_queue:
+                return {"ok": True, "content": None}
+            nxt = receive_queue.pop(0)
+            if nxt == "raise":
+                raise ConnectionError("socket died mid-drain")
+            return {"ok": True, "content": nxt}
         return receive_result
     return {"ok": True}
 
@@ -391,6 +402,62 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     const v = run({ op: "send", metadata: { reply_to_message_id: "cello-wake-a b\nc-deadbeef" } });
     expect(v.success).toBe(false);
     expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
+  });
+
+  // ───────── AC10: the fetch must DRAIN, or the agent answers a stale message and is then muted
+
+  it("AC10: everything queued is delivered, in order, as one turn", () => {
+    // Live failure 2026-08-07: cello_receive serves this CONNECTION's oldest unread, not the
+    // message the notification announced. With history behind it the adapter handed the agent a
+    // five-minute-old message; the agent answered THAT, and the send was then refused because the
+    // real message was still unread. The reply was lost and the agent believed it had answered.
+    const v = run({
+      op: "notify", kind: "cello_message", data: MSG,
+      receive_queue: ["older message", "the one that just arrived"],
+    });
+    const text = v.delivered![0].text;
+    expect(text).toContain("older message");
+    expect(text).toContain("the one that just arrived");
+    expect(text.indexOf("older message")).toBeLessThan(text.indexOf("the one that just arrived"));
+    expect(v.delivered).toHaveLength(1); // one turn, so one reply — not a reply per message
+  });
+
+  it("AC10: it keeps reading until the queue is EMPTY, so nothing is left to block the reply", () => {
+    const v = run({
+      op: "notify", kind: "cello_message", data: MSG,
+      receive_queue: ["a", "b", "c"],
+    });
+    const receives = v.calls.filter((c) => c.method === "cello_receive");
+    // 3 messages + 1 read that comes back empty = the drain proved it reached the end.
+    expect(receives.length).toBe(4);
+  });
+
+  it("AC10: only the FIRST read waits — the rest are non-blocking, or a drain costs 5s per message", () => {
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, receive_queue: ["a", "b"] });
+    const receives = v.calls.filter((c) => c.method === "cello_receive");
+    expect(Number(receives[0].params.timeout_ms)).toBeGreaterThan(0);
+    for (const r of receives.slice(1)) expect(Number(r.params.timeout_ms)).toBe(0);
+  });
+
+  it("AC10: a single queued message behaves exactly as before — no drain-shaped regression", () => {
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, receive_queue: ["just one"] });
+    expect(v.delivered![0].text).toBe("just one");
+  });
+
+  it("AC10: an empty queue still falls back to the notice, never an empty turn", () => {
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, receive_queue: [] });
+    expect(v.delivered![0].text).toContain("CELLO wake");
+  });
+
+  it("AC10: a mid-drain failure delivers what was already read rather than losing it", () => {
+    // Dropping the successfully-read messages on a later error would put them nowhere: the daemon
+    // has already marked them read, so they are not recoverable from the wake notice either.
+    const v = run({
+      op: "notify", kind: "cello_message", data: MSG,
+      receive_queue: ["first one arrived", "raise"],
+    });
+    expect(v.delivered![0].text).toContain("first one arrived");
+    expect(v.delivered![0].text).not.toContain("CELLO wake");
   });
 
   // ─────────────── AC9: the fallback notice must not tell a channel-mode agent to send
