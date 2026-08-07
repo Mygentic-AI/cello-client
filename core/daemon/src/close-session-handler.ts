@@ -65,6 +65,63 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     recoverParkedContent,
   } = deps;
 
+  /**
+   * Open a transient visiting connection to the node that BROKERED this session, when that is not
+   * the node this agent is homed on. Returns null for a same-node session (the ordinary case) and
+   * whenever the connection cannot be established — in both the caller proceeds on the home stream.
+   *
+   * WHY THE CLIENT HAS TO DIAL. Directories never forward signaling to each other; the M12 journal
+   * struck that out as a channel that does not exist. A directory routes a frame by looking up a
+   * stream IT holds, and a daemon holds its stream to its own home node — so seal frames pushed by
+   * the broker reach a party only if that party holds a stream to the BROKER. Without this the
+   * close times out reporting the counterparty unavailable while they are online and waiting.
+   *
+   * SHARED BY BOTH SEAL PATHS ON PURPOSE. This lived inline in the active branch, gated on
+   * `status === "active"`, and the interrupted branch sent the same frames without it — which is
+   * precisely the defect (two agents on two nodes, symmetric timeout, 2026-08-07). One
+   * implementation is what stops that divergence coming back.
+   */
+  async function openSealBrokerConnection(
+    agentName: string,
+    sessionId: string,
+    correlationId: string,
+  ): Promise<{ stop: (reason: string) => Promise<void> } | null> {
+    const brokerNodeForSeal = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
+    // Same-node session: no entry here, and the home stream is already the right one.
+    if (!brokerNodeForSeal) return null;
+
+    const sealKp = getKeyProvider(agentName);
+    if (!sealKp) {
+      // Never skip the cross-node reconnect silently — without a key provider the seal reverts to
+      // the pre-fix timeout, and this log is what keeps that distinguishable from an ordinary
+      // counterparty-didn't-close timeout.
+      logger.warn("session.seal.broker.no_keyprovider", { agentName, brokerNode: brokerNodeForSeal, correlationId });
+      return null;
+    }
+
+    const sealPubHex = Buffer.from(await sealKp.getPublicKey()).toString("hex");
+    const roster = await resolveConsortiumRoster();
+    const brokerTarget = roster?.find((e) => e.nodeId === brokerNodeForSeal) ?? null;
+    if (!brokerTarget) {
+      logger.warn("session.seal.broker.unresolved", { agentName, brokerNode: brokerNodeForSeal, correlationId });
+      return null;
+    }
+
+    const conn = openVisitingConnection(
+      agentName, sealKp, sealPubHex,
+      { peerId: brokerTarget.peerId, multiaddr: brokerTarget.multiaddr },
+      correlationId, brokerNodeForSeal,
+    );
+    if (await waitForSignalingConnected(conn.mgr, 10_000)) {
+      logger.info("session.seal.broker.reconnected", { agentName, brokerNode: brokerNodeForSeal, correlationId });
+      return conn;
+    }
+    // Tear the half-open connection down rather than leaking it, and proceed degraded.
+    await conn.stop("seal-broker-unreachable");
+    logger.warn("session.seal.broker.unreachable", { agentName, brokerNode: brokerNodeForSeal, correlationId });
+    return null;
+  }
+
   // ─── M7-SESSION-001: cello_close_session ────────────────────────────────────
   // M7 error discipline: each distinct failure cause produces a distinct error code.
   // AC-010: session_already_sealed
@@ -312,9 +369,20 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         typeof params?.merkleRootAtInterruption === "string" ? params.merkleRootAtInterruption : "";
       sealInterruptedInProgress.add(sealKey(record.agent_name, sessionId));
       const correlationId = randomUUID();
+      // CROSS-NODE: dial the broker for the duration of the seal, exactly as the active path does.
+      // This branch sends the same seal frames and used to send them without the dial, so an
+      // interrupted close between two agents on different nodes timed out on BOTH sides while each
+      // counterparty was online — the frames were pushed to a stream the broker did not hold.
+      let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
       try {
+        sealBrokerConn = await openSealBrokerConnection(record.agent_name, sessionId, correlationId);
         return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
       } finally {
+        // Release the transient connection; the seal result stands either way.
+        if (sealBrokerConn) {
+          try { await sealBrokerConn.stop("seal-complete"); }
+          catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+        }
         sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
     }
@@ -338,32 +406,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // no entry here and use the home stream unchanged.
       let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
       try {
-        const brokerNodeForSeal = crossNodeBrokerBySession.get(`${record.agent_name}:${sessionId}`);
-        if (brokerNodeForSeal) {
-          const sealKp = getKeyProvider(record.agent_name);
-          if (!sealKp) {
-            // Fallback-finder #1: never skip the cross-node reconnect silently — without a key provider
-            // we cannot open the broker connection, so the seal will revert to the pre-fix timeout. Log
-            // WHY so it is not indistinguishable from a normal counterparty-didn't-close timeout.
-            logger.warn("session.seal.broker.no_keyprovider", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
-          } else {
-            const sealPubHex = Buffer.from(await sealKp.getPublicKey()).toString("hex");
-            const roster = await resolveConsortiumRoster();
-            const brokerTarget = roster?.find((e) => e.nodeId === brokerNodeForSeal) ?? null;
-            if (!brokerTarget) {
-              logger.warn("session.seal.broker.unresolved", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
-            } else {
-              const conn = openVisitingConnection(record.agent_name, sealKp, sealPubHex, { peerId: brokerTarget.peerId, multiaddr: brokerTarget.multiaddr }, correlationId, brokerNodeForSeal);
-              if (await waitForSignalingConnected(conn.mgr, 10_000)) {
-                sealBrokerConn = conn;
-                logger.info("session.seal.broker.reconnected", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
-              } else {
-                await conn.stop("seal-broker-unreachable");
-                logger.warn("session.seal.broker.unreachable", { agentName: record.agent_name, brokerNode: brokerNodeForSeal, correlationId });
-              }
-            }
-          }
-        }
+        sealBrokerConn = await openSealBrokerConnection(record.agent_name, sessionId, correlationId);
         // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
         // relay witness; when the counterparty ALSO closes, the relay's #maybeProcessSeal
         // fires → directory processSeal rebuilds + verifies the signed chain → FROST

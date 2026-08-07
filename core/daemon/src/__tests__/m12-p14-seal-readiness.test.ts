@@ -58,6 +58,11 @@ function harness(sealReady: Readiness, status = "interrupted") {
     handleSealInterruptedFlow: async () => { sealFlowCalls += 1; return { ok: true, status: "sealed" }; },
     handleActiveSealFlow: async () => { sealFlowCalls += 1; return { ok: true, status: "sealed" }; },
     pendingSealWaiters: new Map(),
+    // Declared by the handler and previously omitted: the `as never` cast let the fixture skip a
+    // REQUIRED dependency, and it went unnoticed only because the branch that reads it was not
+    // reached from here. Empty on purpose — no recorded broker means a same-node session, so the
+    // seal path under test proceeds on the home stream exactly as before.
+    crossNodeBrokerBySession: new Map<string, string>(),
     logger2: undefined,
   } as never);
 
