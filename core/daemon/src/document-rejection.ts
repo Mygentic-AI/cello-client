@@ -138,6 +138,16 @@ export interface TrackedEdits {
   readonly depthAtTracking: number;
 }
 
+/**
+ * The placeholder `state_vector` a rejection row carries.
+ *
+ * ONE ZERO BYTE, not an empty array. See the call site for why: SQLCipher binds a zero-length blob
+ * as NULL and the column is NOT NULL, so an empty vector throws on the driver production uses and
+ * on no driver the tests use. The value is meaningless by design — a rejection has no state vector —
+ * and it is named rather than inlined so nobody "tidies" it back to `new Uint8Array(0)`.
+ */
+export const REJECTION_STATE_VECTOR = new Uint8Array([0]);
+
 export class DocumentRejections {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
@@ -235,10 +245,25 @@ export class DocumentRejections {
       docPrevHash: this.#store.lastEnvelopeHashBySender(agentId, documentId, agentId),
       epochId: 0,
       signature: envelope.signature,
-      // The rejection's own state vector — what THIS agent had seen when it refused. Empty is
-      // honest here: a rejection asserts nothing about document state, and REJECT-1's requirement
-      // was that the SIGNATURE be real, not that every field be populated for its own sake.
-      stateVector: new Uint8Array(0),
+      // A ONE-BYTE PLACEHOLDER, and it has to be — an empty blob here THREW on the real driver.
+      //
+      // A rejection asserts nothing about document state, so the honest value is empty, and that is
+      // what this was. `node:sqlite` (every unit test) binds a zero-length blob as an empty blob;
+      // `@signalapp/sqlcipher` (production) binds it as NULL, which violates
+      // `state_vector BLOB NOT NULL` and throws INSIDE this method — before the quarantine is
+      // written, before the refusal is signed, before the peer is answered.
+      //
+      // The cost of that was the whole stall path: the receiver held nothing from the sender, so
+      // `knownEnvelopeHashesBySender` returned an empty set and every later envelope was refused
+      // `document_chain_broken` forever. One gate refusal permanently broke the document. Four
+      // fixes reasoned about the chain-bridging logic, which was correct throughout; the row simply
+      // never existed. Pinned by `document-rejection-sqlcipher.test.ts`, which runs on the real
+      // driver precisely because a `node:sqlite` test cannot see this by construction.
+      //
+      // NOT relaxed to a nullable column, which would be the truer schema: SQLCipher is SQLite
+      // 3.50.4 and SQLite has never supported dropping NOT NULL in place, so it means a full table
+      // rebuild against operators' live document logs — a heavier risk than a documented byte.
+      stateVector: REJECTION_STATE_VECTOR,
       payload: null, // an audit record carries no content
       kind: "rejection",
       referencesEnvelopeHash: input.rejectedEnvelopeHash,
