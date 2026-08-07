@@ -857,7 +857,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       "    set-tier <0..4>           how much they're trusted: 0=blocked, 1=stranger, 2=known,\n" +
       "                              3=trusted (reaches you even when you're away), 4=vip.\n" +
       "                              A higher tier RAISES their limits; it never removes the caps.\n" +
-      "                              It does NOT change content screening — that is not yet active.\n" +
+      "                              It does NOT change content screening — that is ACTIVE at\n" +
+      "                              every tier, in both directions.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
       "    set-signal <hash> on|off|clear\n" +
       "                              show or withhold ONE trust signal from THIS person. 'clear'\n" +
@@ -1033,11 +1034,15 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--type", consumesValue: true },
       { name: "--content", consumesValue: true },
       { name: "--append-only", consumesValue: false },
+      // RE-SEND an offer the peer never received. Declared here or `checkArgs` rejects it, which is
+      // the same four-place lockstep failure that left `--type` and `--content` advertised in the
+      // help and refused by the parser.
+      { name: "--retry", consumesValue: true },
     ],
     summary: "Share a living document with a counterparty — both sides edit, both sides converge.",
     help:
       "Usage:\n" +
-      "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--content <text>]\n" +
+      "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--content <text>] [--retry <id>]\n" +
       "                                                    — offer a shared document. They must accept.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
       "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
@@ -1074,12 +1079,14 @@ export const COMMANDS: readonly CommandSpec[] = [
         const rest = positional.slice(2);
         const { value: documentType } = takeValueFlag(rest, "--type");
         const { value: startingContent } = takeValueFlag(rest, "--content");
+        const { value: documentId } = takeValueFlag(rest, "--retry");
         const appendOnly = rest.includes("--append-only");
         return docPropose(ctx.celloDir, target, {
           ...o,
           ...(documentType !== undefined ? { documentType } : {}),
           ...(startingContent !== undefined ? { startingContent } : {}),
           ...(appendOnly ? { appendOnly } : {}),
+          ...(documentId !== undefined ? { documentId } : {}),
         });
       }
       if (sub === "accept" && target) return docAccept(ctx.celloDir, target, o);

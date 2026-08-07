@@ -204,7 +204,7 @@ server.tool("cello_contact_set_moniker", "Set (or clear, by passing null) YOUR p
 });
 
 // DOD-CONTACT-VIEW-1: set a contact's reachability tier. Forward-only (D7).
-server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still bounded — a higher tier only RAISES limits, it never removes them. It does NOT change content screening, which is not yet active: message text currently passes through unscreened at every tier. Defaults to the current agent.", {
+server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still bounded — a higher tier only RAISES limits, it never removes them. It does NOT change content screening, which is ACTIVE at every tier and applies in both directions — a higher tier never buys less screening. Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),
   tier: z.number().int().min(0).max(4).describe("0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip"),
   agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
@@ -568,13 +568,20 @@ server.tool("cello_doc_propose", "Offer a shared living document to a counterpar
   document_type: z.string().optional().describe("What kind of document, e.g. 'markdown' (default), 'text', 'json'"),
   starting_content: z.string().optional().describe("Initial text. Both sides start from these exact bytes."),
   append_only: z.boolean().optional().describe("If true, neither side can delete existing content — only add"),
+  document_id: z.string().optional().describe("RE-SEND an offer that was created but never reached the peer (the daemon's guidance names the id). Sends the SAME offer again — proposing afresh instead would create a second document."),
   agent: z.string().optional().describe("Agent to propose as (defaults to the current agent)"),
-}, async ({ peer_pubkey, document_type, starting_content, append_only, agent }) => {
+}, async ({ peer_pubkey, document_type, starting_content, append_only, document_id, agent }) => {
   const result = await proxy.call("cello_doc_propose", {
     peer_pubkey,
     ...(document_type !== undefined ? { document_type } : {}),
     ...(starting_content !== undefined ? { starting_content } : {}),
     ...(append_only !== undefined ? { append_only } : {}),
+    // THE RETRY. The daemon has had this branch since the surface shipped, and its own failure
+    // guidance tells the operator to use it — but no surface forwarded the parameter, so the
+    // instruction could not be followed. An agent obeying it as closely as it could re-proposed
+    // with the pubkey alone, minting a fresh nonce and a SECOND document: exactly the outcome the
+    // guidance exists to prevent.
+    ...(document_id !== undefined ? { document_id } : {}),
     ...(agent !== undefined ? { agent } : {}),
   });
   return jsonText(result);
@@ -631,7 +638,7 @@ server.tool("cello_doc_diff", "What changed in a shared document since YOU last 
   return jsonText(result);
 });
 
-server.tool("cello_doc_write", "Replace a shared document's text and publish the change to the counterparty. Pass the COMPLETE new text, never a patch or a fragment — the daemon works out the difference itself, which is what stops your offsets going stale under an edit the peer made while you were writing. Read first, then send the whole document back with your changes in it. This does NOT wait for the peer: the change is signed and delivered when they are reachable.", {
+server.tool("cello_doc_write", "Replace a shared document's text and publish the change to the counterparty. Pass the COMPLETE new text, never a patch or a fragment — the daemon works out the difference itself, which is what stops your offsets going stale under an edit the peer made while you were writing. Read first, then send the whole document back with your changes in it. This does NOT wait for the peer: the change is signed and delivered when they are reachable. CHECK `published` IN THE RESULT: `ok: true` with `published: false` means the edit is applied to your copy and did NOT go out — `reason` says why. Once the cause is cleared, send the same text again to flush it.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   content: z.string().describe("The document's COMPLETE new text — not a patch, not just your addition"),
   agent: z.string().optional().describe("Agent writing (defaults to the current agent)"),
@@ -640,7 +647,7 @@ server.tool("cello_doc_write", "Replace a shared document's text and publish the
   return jsonText(result);
 });
 
-server.tool("cello_doc_publish", "Publish whatever is in the document's FILE right now. Every shared document is also a real file on disk — cello_doc_propose and cello_doc_accept return its path — so you or the operator can edit it with ordinary file tools and then publish. Use this instead of cello_doc_write when the change was made in the file. The daemon diffs the file against what it last wrote there, so only your actual edits are published; it refuses rather than guessing if the file has fallen out of step.", {
+server.tool("cello_doc_publish", "Publish whatever is in the document's FILE right now. Every shared document is also a real file on disk — cello_doc_propose and cello_doc_accept return its path — so you or the operator can edit it with ordinary file tools and then publish. Use this instead of cello_doc_write when the change was made in the file. The daemon diffs the file against what it last wrote there, so only your actual edits are published; it refuses rather than guessing if the file has fallen out of step. CHECK `published` IN THE RESULT: `ok: true` with `published: false` means nothing left this machine — `reason` says why.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   agent: z.string().optional().describe("Agent publishing (defaults to the current agent)"),
 }, async ({ document_id, agent }) => {

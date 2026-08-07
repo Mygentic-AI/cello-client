@@ -184,7 +184,7 @@ style choice and must not be shortened. Responses still carry `session_id`; only
 agent for THIS one call, instead of the connection's selected agent. Omit it and the call acts as the
 agent you selected with `cello_use_agent`.
 
-**Contacts** — the per-agent address book. Tiers raise a peer's limits. Content screening is **planned, not yet active** — the daemon currently passes messages through unscreened, so a tier is a limits setting, not a safety boundary.
+**Contacts** — the per-agent address book. Tiers raise a peer's limits. A tier is a LIMITS setting, not a safety boundary — content screening is the boundary, and it is ACTIVE in both directions at every tier: inbound messages are screened before any reader sees them, outbound before they leave. A flagged outbound message is HELD, not dropped — resolve it by re-sending the same content with a `governance_decisions` map.
 ```
 cello_contacts({ agent? })
 cello_contact_add({ pubkey, moniker?, agent? })
