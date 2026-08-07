@@ -3583,7 +3583,7 @@ async function startDaemonHoldingLock(
             // arriving downstream dressed as a fact about the counterparty. Same distinction
             // `abandoned_at` exists to keep: giving up is our decision, not evidence about them.
             logger.error("document.delivery.ack_wait_unwired", { agentName, envelopeHash });
-            return false;
+            return null;
           }
           return documentLayer.awaitAck(ownerKey, envelopeHash, timeoutMs);
         },

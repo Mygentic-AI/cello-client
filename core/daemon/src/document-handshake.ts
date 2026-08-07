@@ -95,6 +95,11 @@ const PEER_DECISION_COLUMNS = [
   { column: "peer_accepted", sql: "ALTER TABLE document_proposals ADD COLUMN peer_accepted INTEGER" },
   { column: "peer_reason", sql: "ALTER TABLE document_proposals ADD COLUMN peer_reason TEXT" },
   { column: "peer_decided_at", sql: "ALTER TABLE document_proposals ADD COLUMN peer_decided_at INTEGER" },
+  // DID OUR OFFER ACTUALLY LEAVE? Nothing durable recorded it, so `peerAccepted: null` meant both
+  // "they have not decided" and "they were never asked" — and the shipped skill told the operator
+  // to WAIT, which is wrong for the second. The only place the send outcome ever appeared was the
+  // transient response to the propose call itself.
+  { column: "proposal_sent_at", sql: "ALTER TABLE document_proposals ADD COLUMN proposal_sent_at INTEGER" },
 ];
 
 export interface DocumentProposalRecord {
@@ -486,14 +491,49 @@ export class DocumentHandshake {
 
     if (Number(info.changes) === 0) {
       const now = this.get(ownerAgentId, documentId);
+      // A PROPOSAL THAT DOES NOT EXIST IS NOT ONE THAT WAS ALREADY DECIDED. `accept` checks for the
+      // row first and answers `document_proposal_unknown`; this went straight to the UPDATE, found
+      // zero changes, and reported a typo'd id as "is unknown — a consent decision is made once".
+      // That asserts a decision was recorded, about a proposal nobody ever made, and sends the
+      // operator looking for who made it.
+      if (!now) {
+        return {
+          ok: false,
+          reason: "document_proposal_unknown",
+          detail:
+            `no proposal ${documentId.slice(0, 16)}… for this agent — check the id against ` +
+            `cello_doc_inbox`,
+        };
+      }
       return {
         ok: false,
         reason: "document_proposal_not_pending",
-        detail: `proposal ${documentId.slice(0, 16)}… is ${now?.consentState ?? "unknown"} — a consent decision is made once`,
+        detail: `proposal ${documentId.slice(0, 16)}… is ${now.consentState} — a consent decision is made once`,
       };
     }
     this.#logger.info("document.proposal.refused", { documentId, reason, autoRefused: false });
     return { ok: true };
+  }
+
+  /** Record that OUR proposal for this document actually left the machine. */
+  markProposalSent(ownerAgentId: string, documentId: string, nowMs: number): void {
+    this.#db
+      .prepare(
+        `UPDATE document_proposals SET proposal_sent_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND proposal_sent_at IS NULL`,
+      )
+      .run(nowMs, ownerAgentId, documentId);
+  }
+
+  /** Has our proposal for this document left? False also covers "we never authored one". */
+  proposalSent(ownerAgentId: string, documentId: string): boolean {
+    const row = this.#db
+      .prepare(
+        `SELECT proposal_sent_at FROM document_proposals
+          WHERE owner_agent_id = ? AND document_id = ? AND proposal_sent_at IS NOT NULL LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId) as { proposal_sent_at?: number } | undefined;
+    return row !== undefined;
   }
 
   #rows(ownerAgentId: string, where: string, extra: unknown[]): DocumentProposalRecord[] {

@@ -257,8 +257,16 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
       // `peerAnswer` joins its siblings for the same reason: it READS `peer_accepted`/`peer_reason`
       // and touches neither `consent_state` nor `envelope`, so the properties this test guards stay
       // unreachable from it.
+      //
+      // `markProposalSent`/`proposalSent` are the newest pair, and the justification this allowlist
+      // demands is: they record and read a TRANSPORT fact — did our offer actually leave — in
+      // `proposal_sent_at`. Neither can reach `consent_state` or `envelope`; `markProposalSent`'s
+      // UPDATE names one column and is further guarded by `proposal_sent_at IS NULL`, so it cannot
+      // even rewrite its own. They exist because nothing durable recorded the send outcome, which
+      // made `peerAccepted: null` mean both "they are thinking" and "they were never asked" — and
+      // the shipped guidance told the operator to wait, which is wrong for the second.
       ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse",
-       "recordPeerDecision", "peerDecision", "peerAnswer"].sort(),
+       "recordPeerDecision", "peerDecision", "peerAnswer", "markProposalSent", "proposalSent"].sort(),
     );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });

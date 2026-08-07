@@ -149,7 +149,11 @@ export interface DocumentLayer {
    * caller, and a waiter that only listened for future events would then wait out the full grace
    * period on every fast peer.
    */
-  awaitAck(ownerAgentId: string, envelopeHash: string, timeoutMs: number): Promise<boolean>;
+  awaitAck(
+    ownerAgentId: string,
+    envelopeHash: string,
+    timeoutMs: number,
+  ): Promise<{ admitted: boolean } | null>;
 }
 
 /**
@@ -236,7 +240,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
   // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
   // session held open for the full grace period with the answer already in hand.
-  const ackWaiters = new Map<string, Set<() => void>>();
+  const ackWaiters = new Map<string, Set<(admitted: boolean) => void>>();
   const waiterKey = (ownerAgentId: string, envelopeHash: string) => `${ownerAgentId}\u0000${envelopeHash}`;
 
   const ackInbound = new DocumentAckInbound({
@@ -244,12 +248,15 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     rejections,
     logger,
     verifySignature,
-    onSettled: (ownerAgentId, envelopeHash) => {
+    onSettled: (ownerAgentId, envelopeHash, admitted) => {
       const key = waiterKey(ownerAgentId, envelopeHash);
       const waiting = ackWaiters.get(key);
       if (!waiting) return;
       ackWaiters.delete(key);
-      for (const wake of waiting) wake();
+      // The OUTCOME, not just the fact of one. A caller told only "answered" has to report the
+      // envelope as still in flight, which is how `document.delivery.sweep { delivered: N }` came
+      // to be permanently 0 — a sweep that delivered nothing looked identical to a healthy one.
+      for (const wake of waiting) wake(admitted);
     },
   });
 
@@ -257,16 +264,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // ALREADY SETTLED WINS. The ack round trip was measured at 4ms on a local pair; the caller
     // reaches this line after a network send. Checking the store first is not an optimisation —
     // without it the common case waits out the entire grace period for an answer already recorded.
-    if (store.isEnvelopeAcked(ownerAgentId, envelopeHash)) return true;
+    const already = store.envelopeSettlement(ownerAgentId, envelopeHash);
+    if (already) return already;
 
     const key = waiterKey(ownerAgentId, envelopeHash);
-    return new Promise<boolean>((resolve) => {
+    return new Promise<{ admitted: boolean } | null>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
-      const wake = () => {
+      const wake = (admitted: boolean) => {
         clearTimeout(timer);
-        resolve(true);
+        resolve({ admitted });
       };
-      const set = ackWaiters.get(key) ?? new Set<() => void>();
+      const set = ackWaiters.get(key) ?? new Set<(admitted: boolean) => void>();
       set.add(wake);
       ackWaiters.set(key, set);
       timer = setTimeout(() => {
@@ -276,7 +284,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         const current = ackWaiters.get(key);
         current?.delete(wake);
         if (current && current.size === 0) ackWaiters.delete(key);
-        resolve(false);
+        resolve(null);
       }, timeoutMs);
     });
   };

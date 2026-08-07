@@ -108,6 +108,17 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     (r as { ok?: false }).ok === false;
 
   /**
+   * Documents holding an edit that was APPLIED to the live doc and never published.
+   *
+   * In memory deliberately, and it is not a shortcut: an unpublished edit exists only in the live
+   * `Y.Doc`, which is rebuilt from the envelope log on restart — so the edit and this flag are lost
+   * together. A durable flag would outlive the thing it describes and send the operator flushing
+   * something that no longer exists.
+   */
+  const unpublishedEdits = new Set<string>();
+  const unpublishedKey = (ownerAgentId: string, documentId: string) => `${ownerAgentId}\u0000${documentId}`;
+
+  /**
    * Has the peer REFUSED this document? If so, nothing may be published into it.
    *
    * Without this a refused document keeps authoring envelopes: each one is signed, leafed, and
@@ -200,6 +211,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       if (!resent.ok) {
         return { ok: false, reason: resent.reason, guidance: resent.detail ?? "The peer is still unreachable." };
       }
+      layer.handshake.markProposalSent(who.ownerAgentId, retryId, deps.now());
       return { ok: true, documentId: retryId, proposalSent: true, peerAgentId: stored.envelope.peer_agent_id };
     }
 
@@ -322,6 +334,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `re-send this same offer — do not propose a new one, that would make a second document.`,
       };
     }
+    layer.handshake.markProposalSent(who.ownerAgentId, documentId, deps.now());
     return { ok: true, documentId, proposalSent: true, peerAgentId, filePath: proposeFilePath };
   });
 
@@ -351,17 +364,39 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       decided_at_ms: deps.now(),
       signature: new Uint8Array(0),
     };
-    ack.signature = await deps.sign(who.agentName, buildDocumentProposalAckTbs(ack));
-    const sent = await deps.transportFor(who.agentName).sendBytes({
-      peerAgentId: proposerAgentId,
-      documentId,
-      bytes: encodeDocumentProposalAck(ack),
-      correlationId: randomUUID(),
-    });
-    if (!sent.ok) {
-      logger.warn("document.proposal.ack_unsent", { documentId, accepted, reason: sent.reason });
+    // BEST-EFFORT MEANS BEST-EFFORT FOR A THROW TOO, and it did not.
+    //
+    // The header above states the contract: consent is local and final, and an unsent ack must not
+    // fail the decision. That held only for a RETURNED failure. `sign` goes through a key provider
+    // and `sendBytes` opens a session — a directory negotiation, a dial, and a seal ceremony on its
+    // last line — any of which can throw. Nothing caught them.
+    //
+    // By the time this runs, `accept` has already committed the consent transition and created the
+    // document. So a throw here reached the IPC boundary as `internal_error` with "An unexpected
+    // error occurred", the operator re-ran accept, and got "a consent decision is made once" — which
+    // reads as a bug in the handshake rather than a send that failed after the decision stuck.
+    try {
+      ack.signature = await deps.sign(who.agentName, buildDocumentProposalAckTbs(ack));
+      const sent = await deps.transportFor(who.agentName).sendBytes({
+        peerAgentId: proposerAgentId,
+        documentId,
+        bytes: encodeDocumentProposalAck(ack),
+        correlationId: randomUUID(),
+      });
+      if (!sent.ok) {
+        logger.warn("document.proposal.ack_unsent", { documentId, accepted, reason: sent.reason });
+      }
+      return sent.ok;
+    } catch (err: unknown) {
+      // Same outcome as a returned failure, and reported the same way: the peer was not told. The
+      // caller already surfaces that as `proposerNotified: false`.
+      logger.warn("document.proposal.ack_threw", {
+        documentId,
+        accepted,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
     }
-    return sent.ok;
   }
 
   // ─── inbox / accept / refuse ──────────────────────────────────────────────────────────────
@@ -425,7 +460,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const who = resolve(params, connectionId);
     if (isRefusal(who)) return who;
     const documentId = typeof params?.document_id === "string" ? params.document_id : "";
-    const reason = typeof params?.reason === "string" && params.reason.length > 0 ? params.reason : "declined_by_operator";
+    // TRIMMED before the emptiness test. `document-handshake.refuse` THROWS on a whitespace-only
+    // reason, and this guard only checked length — so `{ reason: "   " }` reached it and surfaced
+    // as `internal_error`, for a refusal that is otherwise perfectly valid.
+    const given = typeof params?.reason === "string" ? params.reason.trim() : "";
+    const reason = given.length > 0 ? given : "declined_by_operator";
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
@@ -475,6 +514,14 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           peerHasPublished:
             layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
           consentState: proposal?.consentState ?? null,
+          // DID OUR OFFER LEAVE? Only meaningful for a document WE proposed — for one we accepted
+          // there is no offer of ours to have sent. Without this, `peerAccepted: null` meant both
+          // "they are thinking" and "they were never asked", and the shipped guidance said WAIT,
+          // which is wrong for the second and leaves the operator waiting on nothing.
+          proposalSent:
+            proposal?.proposerAgentId === who.ownerAgentId
+              ? layer.handshake.proposalSent(who.ownerAgentId, d.documentId)
+              : null,
         };
       }),
     };
@@ -559,7 +606,17 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (!rendered.ok) {
       // The stats still stand — they are structural and type-independent — so a document type this
       // build cannot render is not a document an agent has to read blind.
-      return { ok: true, documentId, unchanged: before === after, diff: null, reason: rendered.reason, stats };
+      // NOT `reason` ON AN `ok: true`. That key is the daemon's FAILURE convention everywhere else —
+      // `json-out.ts` documents `ok: false` as the one failure shape — so an agent branching on
+      // `result.reason` reads this perfectly good stats-only diff as an error and stops.
+      return {
+        ok: true,
+        documentId,
+        unchanged: before === after,
+        diff: null,
+        diffUnavailableReason: rendered.reason,
+        stats,
+      };
     }
     return {
       ok: true,
@@ -606,6 +663,53 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const text = doc.getText("content");
     const before = text.toString();
     if (before === content) {
+      // NO TEXT CHANGE IS NOT ALWAYS NOTHING TO DO, and this returned here unconditionally — which
+      // made an applied-but-unpublished edit UNRECOVERABLE.
+      //
+      // The sequence: a write applies the text to the live doc, `publish.publish` then refuses (the
+      // platform is paused), and the handler correctly reports `changed: true, published: false`.
+      // The edit is now in the document and in no log — and pending is derived from the log, so
+      // nothing will ever deliver it. The operator's natural retry is to write the same text again,
+      // which landed HERE and was answered `changed: false, published: false`: a cheerful no-op
+      // over a permanent divergence. `cello_doc_publish` could not flush it either — it diffs the
+      // FILE, which already matches.
+      //
+      // GATED ON A RECORDED FACT, not on asking `publish` whether anything is owed. Its own guard
+      // only fires once we have published before (`lastPublishedStateVector !== null`), so on a
+      // first write it would publish the whole document on every unchanged call — a leaf and a
+      // delivery for nothing, which the neighbouring test pins against.
+      //
+      // The flag lives in memory ON PURPOSE: an unpublished edit is itself in-memory only. The live
+      // doc is rebuilt from the envelope log, and the edit is by definition not in it, so both are
+      // lost on restart together. A durable flag would outlive the thing it describes.
+      if (unpublishedEdits.has(unpublishedKey(who.ownerAgentId, documentId))) {
+        const flushed = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
+        if (flushed.ok) {
+          unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
+          layer.notifications.markWritten(who.ownerAgentId, documentId, content);
+          await materialize(who.ownerAgentId, documentId, document.documentType);
+          return {
+            ok: true,
+            documentId,
+            changed: false,
+            published: true,
+            envelopeHash: flushed.envelopeHash,
+            guidance:
+              "The text was already what you sent, but an earlier edit had been applied without " +
+              "reaching your peer. It has gone out now.",
+          };
+        }
+        return {
+          ok: true,
+          documentId,
+          changed: false,
+          published: false,
+          reason: flushed.reason,
+          guidance:
+            `An earlier edit is applied locally and still has not reached your peer ` +
+            `(${flushed.reason}). ${flushed.detail ?? ""}`.trim(),
+        };
+      }
       return { ok: true, documentId, changed: false, published: false };
     }
 
@@ -668,6 +772,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const result = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
     if (!result.ok) {
+      // REMEMBER IT, so the retry above can flush it. Without this the operator's next identical
+      // write is indistinguishable from an ordinary no-op and the edit never leaves.
+      unpublishedEdits.add(unpublishedKey(who.ownerAgentId, documentId));
       // The EDIT IS APPLIED locally and is not published. Reported as such: an operator told the
       // write failed would write it again, and the second write would be a no-op diff against the
       // text it already applied — the change silently never leaving.
@@ -683,6 +790,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // WHAT WE WROTE, against the current read mark. Without it `cello_doc_diff` shows our own edits
     // back to us as "what changed since I looked" — which the tool description frames as the
     // COUNTERPARTY's contribution — and `overlap` has nothing to separate mine from theirs.
+    unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
     layer.notifications.markWritten(who.ownerAgentId, documentId, content);
     // AND THE FILE. `cello_doc_write` changes the document; without this the operator's own
     // projection on disk is stale the moment they use it, and the two surfaces disagree about the
@@ -692,11 +800,32 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // so a stale file either refuses as `document_file_stale` or — if it happened to match an older
     // baseline — republishes text the document has already moved past. Found on the first live
     // two-agent smoke, where the author's own file was missing the line she had just written.
-    await materialize(who.ownerAgentId, documentId, document.documentType);
+    const writtenFile = await materialize(who.ownerAgentId, documentId, document.documentType);
     // Delivery is the worker's, not this call's — publish is fire-and-forget by design (§16.4), and
     // a write that blocked on an offline peer would make editing a shared document depend on the
     // other party being awake.
-    return { ok: true, documentId, changed: true, published: true, envelopeHash: result.envelopeHash };
+    return {
+      ok: true,
+      documentId,
+      changed: true,
+      published: true,
+      envelopeHash: result.envelopeHash,
+      // THE FILE'S FATE, SURFACED. `materialize` swallows its error — right for propose and accept,
+      // where a disk fault must not fail a completed consent decision, and wrong here. The comment
+      // above this call already spells out the consequence: a stale file makes the NEXT
+      // `cello_doc_publish` refuse as `document_file_stale`, or worse, republish text the document
+      // has moved past. The cause was a swallowed error one call earlier that only a daemon-log
+      // reader would ever see.
+      fileUpdated: writtenFile !== null,
+      ...(writtenFile === null
+        ? {
+            guidance:
+              "The change was published, but your local file could not be rewritten. Read the " +
+              "document rather than the file, and expect cello_doc_publish to refuse as " +
+              "document_file_stale until the file is back in step.",
+          }
+        : {}),
+    };
   });
 
   // ─── close / kill ─────────────────────────────────────────────────────────────────────────
@@ -813,6 +942,14 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   });
 
   logger.debug("document.handlers.registered", {
-    verbs: ["propose", "inbox", "accept", "refuse", "list", "read", "diff", "write", "publish", "close", "kill"],
+    // DERIVED from what was actually registered, never hand-typed. The list it replaced was a
+    // second source of truth for the one question this line exists to answer, and it could drift
+    // from the handler map without anything noticing — which is the same four-place-lockstep
+    // failure this surface has already had twice.
+    // Matched on `_doc_` and logged WHOLE rather than stripped of a `cello_doc_` prefix: the
+    // §2b source audit reads cello_* tokens out of this file to prove the daemon never names a
+    // tool that does not exist, and a bare prefix literal reads to it as exactly that — a dead
+    // command. The audit was right to flag it; the literal is what had to go.
+    verbs: [...handlers.keys()].filter((k) => k.includes("_doc_")).sort(),
   });
 }

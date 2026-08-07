@@ -52,7 +52,7 @@ export interface DocumentAckInboundDeps {
    * Exists so the sender can stop holding a session open waiting for an answer that has arrived.
    * Optional because settling is complete without it; nothing here depends on anyone listening.
    */
-  onSettled?(ownerAgentId: string, envelopeHash: string): void;
+  onSettled?(ownerAgentId: string, envelopeHash: string, admitted: boolean): void;
 }
 
 export class DocumentAckInbound {
@@ -188,7 +188,7 @@ export class DocumentAckInbound {
     const first = this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
     // ANNOUNCE THE SETTLE, before the admitted/rejected split — both outcomes end the delivery, and
     // a waiter that only heard about admissions would keep a session open through every rejection.
-    this.#d.onSettled?.(ownerAgentId, ack.envelope_hash);
+    this.#d.onSettled?.(ownerAgentId, ack.envelope_hash, ack.admitted);
 
     if (!ack.admitted) {
       // Durable on the publishing side. A log line would not survive the restart after which the

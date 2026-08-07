@@ -64,7 +64,7 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
     },
     encodeEnvelope: () => ({ bytes: new Uint8Array([9]), hash: new Uint8Array(32) }),
     // Default: the peer answers immediately. Overridden per test to model a slow or silent one.
-    awaitAck: async () => true,
+    awaitAck: async () => ({ admitted: true }),
     drainHeld: async () => {},
     logger,
     ...over,
@@ -227,9 +227,9 @@ describe("a session the worker OPENED is not sealed until the peer has answered"
     let releaseAck: (() => void) | undefined;
     const f = newTransport({
       awaitAck: () =>
-        new Promise<boolean>((resolve) => {
+        new Promise<{ admitted: boolean } | null>((resolve) => {
           order.push("await");
-          releaseAck = () => resolve(true);
+          releaseAck = () => resolve({ admitted: true });
         }),
       sealSession: async () => {
         order.push("seal");
@@ -249,7 +249,7 @@ describe("a session the worker OPENED is not sealed until the peer has answered"
   it("SEALS ANYWAY when the peer never answers, and says so", async () => {
     // The grace period is a bound, not a promise. A peer that never answers must not leave an
     // autonomous session running — that is the live node the seal exists to prevent.
-    const f = newTransport({ awaitAck: async () => false });
+    const f = newTransport({ awaitAck: async () => null });
     await f.transport.deliver(deliverInput());
     expect(f.sealed).toEqual(["opened-session"]);
     // Said out loud, because a seal that discards a held ack is otherwise invisible and this is the
@@ -284,7 +284,7 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
     const t = newTransport({
       awaitAck: async (hash, ms) => {
         calls.push([hash, ms]);
-        return true;
+        return { admitted: true };
       },
     });
     await t.transport.deliver(deliverInput({ ackGraceMs: 4_000 }));
@@ -293,7 +293,7 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
 
   it("waits for the SMALLER of the standard grace and what the pass has left", async () => {
     const calls: number[] = [];
-    const t = newTransport({ awaitAck: async (_h, ms) => { calls.push(ms); return true; } });
+    const t = newTransport({ awaitAck: async (_h, ms) => { calls.push(ms); return { admitted: true }; } });
     await t.transport.deliver(deliverInput({ ackGraceMs: 500_000 }));
     expect(calls).toEqual([DELIVERY_ACK_GRACE_MS]);
   });
@@ -303,7 +303,7 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
     // an autonomous session left running is the thing the seal exists to prevent, and trading the
     // wait for that would be a worse defect than the one being fixed.
     let waited = 0;
-    const t = newTransport({ awaitAck: async () => { waited += 1; return true; } });
+    const t = newTransport({ awaitAck: async () => { waited += 1; return { admitted: true }; } });
     await t.transport.deliver(deliverInput({ ackGraceMs: 0 }));
     expect(waited).toBe(0);
     expect(t.sealed).toEqual(["opened-session"]);
@@ -313,7 +313,7 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
     let waited = 0;
     const t = newTransport({
       sendContent: async () => ({ ok: true, delivered: false, parked: true }),
-      awaitAck: async () => { waited += 1; return true; },
+      awaitAck: async () => { waited += 1; return { admitted: true }; },
     });
     await t.transport.deliver(deliverInput());
     // Waiting here spent the budget on a certainty and fired ack_grace_expired on a designed,
@@ -334,7 +334,7 @@ describe("the grace DRAINS held content before waiting — otherwise it cannot h
     const order: string[] = [];
     const t = newTransport({
       drainHeld: async () => { order.push("drain"); },
-      awaitAck: async () => { order.push("await"); return true; },
+      awaitAck: async () => { order.push("await"); return { admitted: true }; },
     });
     await t.transport.deliver(deliverInput());
     expect(order).toEqual(["drain", "await"]);
@@ -359,5 +359,39 @@ describe("the grace DRAINS held content before waiting — otherwise it cannot h
     expect(t.events.some((e) => e.event === "document.delivery.drain_threw")).toBe(true);
     // And the session is still sealed — a failed drain must not leave an autonomous session up.
     expect(t.sealed).toEqual(["opened-session"]);
+  });
+});
+
+describe("an answer that arrives inside the grace is REPORTED, not discarded", () => {
+  it("returns admitted: true when the peer admitted it", async () => {
+    // `deliver` used to return `admitted: null` even when the ack had landed, so the worker took
+    // the in-flight branch every time. The consequence was not cosmetic: no production path ever
+    // returned a non-null answer, so `document.delivery.sweep { delivered: N }` was permanently 0
+    // and the acked/rejected branches were dead code. A sweep that delivered nothing looked
+    // byte-identical to a healthy idle one — the exact defect H3 was raised to fix, alive on a
+    // different field.
+    const t = newTransport({ awaitAck: async () => ({ admitted: true }) });
+    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("returns admitted: false when the peer REFUSED it — a rejection is an answer", async () => {
+    const t = newTransport({ awaitAck: async () => ({ admitted: false }) });
+    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: false });
+  });
+
+  it("still returns admitted: null when nobody answered — the honest third state", async () => {
+    // The third state is not hedging. `true` would mark an envelope acknowledged the peer may never
+    // have applied, and `false` would count a send that WORKED as a failure and re-send content
+    // already in flight.
+    const t = newTransport({ awaitAck: async () => null });
+    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: null });
+  });
+
+  it("returns null for a PARKED send, which is never waited on", async () => {
+    const t = newTransport({
+      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
+      awaitAck: async () => ({ admitted: true }),
+    });
+    expect(await t.transport.deliver(deliverInput())).toMatchObject({ admitted: null });
   });
 });

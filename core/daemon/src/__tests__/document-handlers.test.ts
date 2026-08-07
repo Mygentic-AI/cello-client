@@ -292,6 +292,42 @@ describe("cello_doc_write — the edit is applied and published", () => {
     expect(res).toMatchObject({ ok: true, changed: true, published: false });
     expect(String(res.reason)).toContain("paused");
   });
+
+  it("FLUSHES that edit when the operator writes the same text again", async () => {
+    // The case the test above stops one call short of, and the one that mattered. The edit is in
+    // the live doc and in no log — and pending is derived from the log, so nothing will ever
+    // deliver it. The operator's natural retry is to send the same text, which used to short-circuit
+    // on `before === content` and answer `changed: false, published: false`: a cheerful no-op over a
+    // permanent divergence, with the shipped skill telling the agent not to write it again.
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    f.layer.lifecycle.setPlatformPaused(f.owner, true, NOW);
+    await f.call("cello_doc_write", { document_id: documentId, content: "written while paused" });
+    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+
+    f.layer.lifecycle.setPlatformPaused(f.owner, false, NOW);
+    const retry = await f.call("cello_doc_write", { document_id: documentId, content: "written while paused" });
+
+    expect(retry).toMatchObject({ ok: true, changed: false, published: true });
+    // THE ASSERTION THAT MATTERS: it is now deliverable. Reporting `published: true` while the log
+    // stayed empty would be the same lie one layer up.
+    expect(
+      f.layer.store.pendingDeliveries(f.owner, NOW, f.owner),
+      "the stuck edit was reported as published but never entered the log",
+    ).toHaveLength(1);
+  });
+
+  it("still refuses to publish while the edit remains unpublishable, and says why", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    f.layer.lifecycle.setPlatformPaused(f.owner, true, NOW);
+    await f.call("cello_doc_write", { document_id: documentId, content: "stuck" });
+
+    // Still paused. The retry must not claim success, and must not go silent either.
+    const retry = await f.call("cello_doc_write", { document_id: documentId, content: "stuck" });
+    expect(retry).toMatchObject({ ok: true, changed: false, published: false });
+    expect(String(retry.guidance)).toContain("has not reached your peer");
+  });
 });
 
 describe("the surface refuses when it cannot name an agent or a document", () => {

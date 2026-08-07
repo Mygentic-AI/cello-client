@@ -93,6 +93,16 @@ export interface DocumentListRow {
   pendingSent: number;
   /** Of those, how many have not left this machine at all. */
   pendingUnsent: number;
+  /**
+   * Updates WE GAVE UP ON — the unacked ceiling fired and they will never be retried.
+   *
+   * Without this the surface lies by omission. An abandoned envelope drops out of all three pending
+   * counters, so the operator's view goes from `pendingUnsent: 1` to `pendingDeliveries: 0`, which
+   * reads as delivered. The only other signal was `status: "stalled"`, and nothing said an update
+   * had been permanently dropped. The database keeps the distinction (`abandoned_at` is our
+   * decision, not evidence about the peer) and the surface threw it away.
+   */
+  abandonedDeliveries: number;
   /** We have closed and the peer has not. */
   closePending: boolean;
 }
@@ -168,6 +178,7 @@ export class DocumentLifecycle {
       pendingUnsent:
         (pendingByDocument.get(d.documentId)?.total ?? 0) -
         (pendingByDocument.get(d.documentId)?.sent ?? 0),
+      abandonedDeliveries: this.#store.abandonedCount(ownerAgentId, d.documentId),
       closePending:
         this.#hasClosed(ownerAgentId, d.documentId, ownerAgentId) &&
         !this.#hasClosed(ownerAgentId, d.documentId, d.peerAgentId),
@@ -472,7 +483,18 @@ export class DocumentLifecycle {
       return {
         ok: false,
         reason: "document_stalled",
-        detail: "this document stopped accepting updates after repeated rejections",
+        // NAMES BOTH CAUSES, because `stalled` has two and this text asserted one of them.
+        //
+        // It is set by REJECT-1 after the peer's gate refuses repeatedly, AND by the delivery
+        // worker's unacked ceiling — where the peer's daemon never answered at all. Those are
+        // opposite subsystems. An operator hitting the second was told to go and read rejection
+        // reasons, which do not exist for it, and the shipped skill sent them to a `cello_doc_list`
+        // field that does not exist either.
+        detail:
+          "this document stopped accepting updates. Two things set that state and they need " +
+          "different actions: the peer's gate REFUSED your updates repeatedly (look for " +
+          "document.rejection.received), or their daemon never CONFIRMED them at all (look for " +
+          "document.delivery.unacked_limit — that one may be a local fault, not theirs)",
       };
     }
     return { ok: true };
@@ -494,7 +516,18 @@ export class DocumentLifecycle {
       return {
         ok: false,
         reason: "document_stalled",
-        detail: "this document stopped accepting updates after repeated rejections",
+        // NAMES BOTH CAUSES, because `stalled` has two and this text asserted one of them.
+        //
+        // It is set by REJECT-1 after the peer's gate refuses repeatedly, AND by the delivery
+        // worker's unacked ceiling — where the peer's daemon never answered at all. Those are
+        // opposite subsystems. An operator hitting the second was told to go and read rejection
+        // reasons, which do not exist for it, and the shipped skill sent them to a `cello_doc_list`
+        // field that does not exist either.
+        detail:
+          "this document stopped accepting updates. Two things set that state and they need " +
+          "different actions: the peer's gate REFUSED your updates repeatedly (look for " +
+          "document.rejection.received), or their daemon never CONFIRMED them at all (look for " +
+          "document.delivery.unacked_limit — that one may be a local fault, not theirs)",
       };
     }
     return { ok: true };

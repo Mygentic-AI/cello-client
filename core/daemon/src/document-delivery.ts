@@ -116,6 +116,14 @@ export interface DocumentDeliveryTransport {
          * re-sends content already in flight.
          */
         admitted: boolean | null;
+        /**
+         * The relay took it because the peer had no live counterparty on that session.
+         *
+         * Distinct from `admitted: null`, which covers both a live send awaiting an answer and this.
+         * The two want different retry schedules and were given the same one — see the scheduling
+         * branch in `#run`.
+         */
+        parked: boolean;
         rejectionReason?: string;
       }
     | { ok: false; reason: string; detail?: string }
@@ -379,15 +387,23 @@ export class DocumentDelivery {
         if (outcome.ok && outcome.admitted === null) {
           // IN FLIGHT. The content left and the peer has not answered.
           this.#store.markDelivered(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-          // RE-SCHEDULE ON THE ACK TIMEOUT, overwriting the pre-dial failure claim. That claim is
-          // `backoffFor(attempts)`, which for a first send is ONE SECOND — so a successfully
-          // delivered envelope was re-sent a second later, and every resend appends a leaf to the
-          // peer's sealed conversation record. The failure backoff answers a different question.
+          // PARKED IS NOT DELIVERED, and scheduling them alike cost ten minutes per parked update.
+          //
+          // The ack timeout answers "how long do I wait for an ANSWER", and it is the right question
+          // for content that reached the peer. Parked content did not reach them — the relay took it
+          // because the session had no live counterparty — so the question is the one the ordinary
+          // backoff answers: how long before trying again. Ten minutes for a peer who is online and
+          // simply moved to another session is a stall the operator reads as a broken document.
+          //
+          // Caught by the no-chat enforcer flipping red when unrelated edits shifted timing by
+          // milliseconds: the update parked onto a session the peer had just left, and the next
+          // attempt was outside any window a person would wait.
+          const parked = outcome.parked;
           this.#store.recordDeliveryAttempt(
             ownerAgentId,
             documentId,
             envelope.envelopeHash,
-            nowMs + DELIVERY_ACK_TIMEOUT_MS,
+            nowMs + (parked ? backoffFor(envelope.attempts ?? 0) : DELIVERY_ACK_TIMEOUT_MS),
           );
           this.#logger.info("document.delivery.sent", {
             documentId,
@@ -422,10 +438,20 @@ export class DocumentDelivery {
               envelopeHash: envelope.envelopeHash,
               sends: attempts,
               correlationId,
+              // WHAT WAS OBSERVED, not a guess about whose fault it is. This said "Their client may
+              // not support shared documents yet" — an assertion about the PEER'S SOFTWARE for a
+              // failure whose measured cause was our own teardown deleting an ack that had already
+              // arrived and been verified. An exit-point label presented as a diagnosis, and it
+              // sent the one operator who hit it looking at the wrong machine.
+              //
+              // Both named events are ours and are upstream of this line, so the operator has
+              // somewhere to go before concluding anything about the counterparty.
               detail:
                 `this update has been delivered ${attempts} times without the peer's daemon ever ` +
                 `confirming it — the document has stopped publishing and this update will not be ` +
-                `retried. Their client may not support shared documents yet.`,
+                `retried. The cause may be local: check document.delivery.ack_grace_expired and ` +
+                `session.content.held.discarded for this session before concluding the peer's ` +
+                `client is at fault.`,
             });
           }
         } else if (outcome.ok) {

@@ -989,6 +989,23 @@ export class DocumentStore {
 
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
   /**
+   * How many of our envelopes for this document were ABANDONED — the unacked ceiling fired and they
+   * will never be retried.
+   *
+   * Surfaced because an abandoned envelope leaves every pending counter, so a document that
+   * permanently dropped an update is otherwise indistinguishable from one that delivered everything.
+   */
+  abandonedCount(ownerAgentId: string, documentId: string): number {
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id = ? AND abandoned_at IS NOT NULL`,
+      )
+      .get(ownerAgentId, documentId, ownerAgentId) as { n?: number } | undefined;
+    return row?.n ?? 0;
+  }
+
+  /**
    * Is this envelope SETTLED — the peer answered it, admitted or rejected?
    *
    * Keyed by envelope hash ALONE, without the document, because the caller waiting on it is the
@@ -997,13 +1014,27 @@ export class DocumentStore {
    * preimage, so it identifies one envelope across every document this owner holds.
    */
   isEnvelopeAcked(ownerAgentId: string, envelopeHash: string): boolean {
+    return this.envelopeSettlement(ownerAgentId, envelopeHash) !== null;
+  }
+
+  /**
+   * HOW an envelope was settled, or null if the peer has not answered it.
+   *
+   * `admitted` is derived from whether a rejection was RECEIVED for it, because `acked_at` records
+   * only that the peer answered — a rejection is an ack for delivery purposes, so the two states
+   * share that column deliberately (see `DocumentAckInbound`). Reading the answer, not just its
+   * existence, is what lets the delivery worker report `delivered` and `rejected` truthfully rather
+   * than counting every answered envelope as still in flight.
+   */
+  envelopeSettlement(ownerAgentId: string, envelopeHash: string): { admitted: boolean } | null {
     const row = this.#db
       .prepare(
-        `SELECT acked_at FROM document_envelopes
+        `SELECT document_id FROM document_envelopes
           WHERE owner_agent_id = ? AND envelope_hash = ? AND acked_at IS NOT NULL LIMIT 1`,
       )
-      .get(ownerAgentId, envelopeHash) as { acked_at?: number } | undefined;
-    return row !== undefined;
+      .get(ownerAgentId, envelopeHash) as { document_id?: string } | undefined;
+    if (row?.document_id === undefined) return null;
+    return { admitted: !this.rejectionReceivedFor(ownerAgentId, row.document_id, envelopeHash) };
   }
 
   /**

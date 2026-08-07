@@ -96,7 +96,7 @@ export interface DocumentTransportDeps {
    * relay, a busy peer. The rule is simply that we do not tear down the channel an answer is due
    * on until it has arrived or we have given up on it.
    */
-  awaitAck(envelopeHash: string, timeoutMs: number): Promise<boolean>;
+  awaitAck(envelopeHash: string, timeoutMs: number): Promise<{ admitted: boolean } | null>;
   /**
    * Try to fill this session's ordering gaps, so anything HELD can be released.
    *
@@ -263,6 +263,9 @@ export function createDocumentDeliveryTransport(
       // ack comes whenever they next come online, which is not within any grace. Waiting here also
       // fired `ack_grace_expired` on a designed, benign state — a warning on the normal case.
       const answerPossible = sent.delivered !== false;
+      // The peer's ANSWER, when one arrives inside the grace. Reported back as `admitted` so the
+      // worker records a settled delivery instead of an in-flight one.
+      let settlement: { admitted: boolean } | null = null;
       if (sessionOpened && answerPossible && input.ackGraceMs > 0) {
         // WAIT FOR THE ANSWER BEFORE TEARING DOWN THE CHANNEL IT COMES BACK ON.
         //
@@ -290,8 +293,8 @@ export function createDocumentDeliveryTransport(
             reason: err instanceof Error ? err.message : String(err),
           });
         });
-        const acked = await deps.awaitAck(envelope.envelopeHash, graceMs);
-        if (!acked) {
+        settlement = await deps.awaitAck(envelope.envelopeHash, graceMs);
+        if (!settlement) {
           // NOT a failure of the send — the content left and the peer may still answer later. Said
           // out loud because a seal that discards a held ack is otherwise invisible, and this is
           // the only moment anything knows it is about to happen.
@@ -320,7 +323,17 @@ export function createDocumentDeliveryTransport(
       // about what the peer holds is the entire reason pending is derived from it. `false` would
       // count a send that WORKED as a failure and re-send content already in flight, which is the
       // permanent-redelivery shape this milestone already fixed once.
-      return { ok: true, sessionId, sessionOpened, admitted: null };
+      // THE ANSWER IF WE HAVE IT. `null` still means "left, unanswered" — the honest third state —
+      // but an ack that landed inside the grace is no longer thrown away as if it had not.
+      return {
+        ok: true,
+        sessionId,
+        sessionOpened,
+        admitted: settlement ? settlement.admitted : null,
+        // PARKED, reported rather than inferred. The worker cannot tell it from an ordinary
+        // awaiting-answer send otherwise, and the two need different retry schedules.
+        parked: sent.delivered === false,
+      };
     },
   };
 }

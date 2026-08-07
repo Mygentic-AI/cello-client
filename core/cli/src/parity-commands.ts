@@ -783,11 +783,27 @@ export function contactSetSignal(
 
 // ─── M14 / DOD-DOC-TOOLS-1 — federated documents ────────────────────────────────────────────────
 
-/** `cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--from-file <path>]` → cello_doc_propose. */
+/**
+ * `cello doc propose <peer-pubkey> [--type <t>] [--content <text>] [--append-only] [--retry <id>]`
+ * → cello_doc_propose.
+ *
+ * `--retry` re-sends an offer that was created locally but never reached the peer. The daemon has
+ * always had that branch and its failure guidance names it by id — but no surface forwarded the
+ * parameter, so the instruction could not be carried out and the closest thing an operator could do
+ * (propose again) minted a SECOND document, which is what the guidance warns against.
+ *
+ * The doc comment advertised a `--from-file` flag that was never implemented; corrected here rather
+ * than left for the next reader to try.
+ */
 export function docPropose(
   celloDir: string,
   peerPubkey: string,
-  opts: ParityOptions & { documentType?: string; appendOnly?: boolean; startingContent?: string },
+  opts: ParityOptions & {
+    documentType?: string;
+    appendOnly?: boolean;
+    startingContent?: string;
+    documentId?: string;
+  },
 ): Promise<CliOutput> {
   return ipcCommand(
     celloDir,
@@ -797,6 +813,7 @@ export function docPropose(
       document_type: opts.documentType,
       append_only: opts.appendOnly === true ? true : undefined,
       starting_content: opts.startingContent,
+      document_id: opts.documentId,
     }),
     opts,
   );

@@ -130,11 +130,14 @@ document worse in a way that is tedious to undo.
 
 | Field | Means |
 |---|---|
-| `peerAccepted: null` | They have not answered yet — offline, or thinking. Wait. |
+| `peerAccepted: null` | They have not answered — offline, thinking, **or the offer never reached them**. Check `proposalSent` before waiting. |
 | `peerAccepted: false` | They refused. It is over; do not keep writing into it. |
 | `peerAccepted: true` | They agreed. Their edits apply to your copy and yours to theirs. |
 | `peerHasPublished` | Whether anything has actually come back. Accepted-and-untouched is a fine state. |
-| `pendingUnsent` | Your changes that have not left yet. Usually means they are offline. |
+| `pendingUnsent` | Your changes that have not left this machine yet. Usually means they are offline. |
+| `pendingSent` | Left this machine; the peer has **not confirmed** them. Not the same as arrived. |
+| `pendingDeliveries` | The total still outstanding — `pendingUnsent` + `pendingSent`. |
+| `abandonedDeliveries` | Updates that were **given up on** and will never be retried. Not delivered. Republish them. |
 | `closePending` | You closed; waiting for them to close too. |
 
 ## Ending one
@@ -159,14 +162,34 @@ operating several agents, check you selected the right one with `cello_use_agent
 **`document_never_read`** — from `cello_doc_diff` only. Call `cello_doc_read` first.
 
 **`published: false` with `changed: true`** — your edit is applied locally and did not go out. The
-`reason` says why (a killed or closed document, a paused agent). Do not write it again: the second
-write would be a no-op diff against text you already applied, and the change would silently never
-leave.
+`reason` says why (a killed or closed document, a paused agent).
+
+Once the cause is cleared, **write the same text again to flush it.** The document holds the edit and
+no outbox does, so nothing will deliver it on its own — the repeat write is what sends it, and it
+answers `changed: false, published: true`.
+
+> This entry used to say *"do not write it again"*, on the reasoning that a repeat write is a no-op
+> diff. It was — and that was the bug: the retry short-circuited before publishing, so following
+> this instruction guaranteed the edit never left and the two copies stayed different. Fixed in
+> daemon 0.0.139.
 
 **`proposalSent: false`** — the document exists locally and the offer did not reach them. Call
-`cello_doc_propose` again with the `document_id` it returned. Do **not** make a new proposal: that
-mints a second, separate document and orphans the first.
+`cello_doc_propose` again passing **`document_id`** (the id it returned) to re-send the SAME offer.
+Do **not** propose afresh: that mints a second, separate document and orphans the first.
 
-**`document_stalled`** — the peer's gate refused your updates repeatedly. Read their rejection
-reasons in `cello_doc_list` before republishing; sending the same thing again produces the same
-refusal.
+> The `document_id` parameter did not exist on either surface until daemon 0.0.139, so this
+> instruction could not be followed — and the closest thing an agent could do, re-proposing with the
+> pubkey, produced exactly the orphan it warns about. On the command line it is
+> `cello doc propose <peer-pubkey> --retry <document-id>`.
+
+**`document_stalled`** — the document stopped accepting updates. **Two different things set this and
+they need opposite actions**, so read the `detail` before acting:
+
+- *Their gate refused you repeatedly.* Sending the same thing again produces the same refusal —
+  change the content. The reasons are in the daemon log as `document.rejection.received`.
+- *Their daemon never confirmed your updates at all.* That is not a refusal, and it may be a fault on
+  YOUR side rather than theirs — look for `document.delivery.unacked_limit` and
+  `session.content.held.discarded` before concluding anything about their client.
+
+> This entry used to name only the first cause, and told you to read rejection reasons in
+> `cello_doc_list` — which does not carry them. Corrected in daemon 0.0.139.
