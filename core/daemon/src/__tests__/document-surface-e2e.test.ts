@@ -134,6 +134,11 @@ async function makeParty(agentName: string) {
     layer,
     wire,
     worker,
+    // Exposed so a test can author an update the way a HOSTILE PEER would — below the operator
+    // surface, whose authoring screen a patched client simply would not run. Reaching the
+    // receiver's gate is the whole point of the screening case, and going through cello_doc_write
+    // now stops the frame on the sender's own machine before it can get there.
+    publish,
     call: (verb: string, params: Record<string, unknown> = {}) =>
       handlers.get(verb)!(params, "conn") as Promise<Record<string, unknown>>,
     /** The production entry point: whatever arrives on the session content path. */
@@ -782,10 +787,18 @@ describe("DOD-DOC-SCREEN-1 — the content gate is REACHED, and it refuses rathe
     // U+202E renders the text that follows it in reverse, so what an operator READS and what the
     // document SAYS differ. In a shared document that is a signature on content the signer did not
     // see — which is why it is refused rather than stripped.
-    await b.call("cello_doc_write", {
-      document_id: documentId,
-      content: "agreed text\nsafe\u202Eelbisiv\n",
-    });
+    //
+    // AUTHORED BELOW THE HANDLER, and that is the point of this test rather than an inconvenience.
+    // `cello_doc_write` now runs the same screen at authoring time (§16.6), so writing this through
+    // it would be refused on B's own machine and the RECEIVER'S gate — the thing under test — would
+    // never be reached. A hostile peer has a patched client and does not consult our authoring
+    // check either, so going around it is the faithful simulation, not a shortcut.
+    //
+    // This is exactly why the sender-side scan is friction reduction and never a boundary: it can
+    // be removed by whoever is sending, so the receiver's gate has to stand alone. Proving that is
+    // what this case is for.
+    b.layer.live.get(b.owner, documentId).getText("content").insert(11, "\nsafe\u202Eelbisiv");
+    await b.publish.publish(b.owner, documentId, b.layer.live.get(b.owner, documentId), Date.now());
     await b.sweep();
 
     // REFUSED, and A's copy is byte-identical to what it held before. Not "sanitized" — the whole

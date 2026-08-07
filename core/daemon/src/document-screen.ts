@@ -95,6 +95,43 @@ function formatCodepoint(cp: number): string {
  * the character in their own editor — and an offset that lands mid-surrogate in a document with an
  * emoji in it is worse than none.
  */
+/**
+ * The denylist scan itself, over plain text — no gate, no diff, no context.
+ *
+ * Extracted so the AUTHORING check and the RECEIVING gate cannot drift. Two implementations of one
+ * rule is how a sender-side "advisory" ends up refusing things the receiver admits, or worse
+ * admitting things it refuses — and this milestone has now been bitten four times by a second copy
+ * of a rule that was supposed to match the first.
+ *
+ * Returns null when the text is clean; otherwise every distinct offender, a count, and CODE-POINT
+ * offsets (not UTF-16, which lands mid-surrogate in any document containing an emoji).
+ */
+export function screenText(text: string): { codepoints: string[]; count: number; offsets: number[] } | null {
+  if (text.length === 0) return null;
+  const codepoints = new Set<string>();
+  const offsets: number[] = [];
+  let index = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (REFUSED_CODEPOINTS.has(cp)) {
+      codepoints.add(formatCodepoint(cp));
+      offsets.push(index);
+    }
+    index++;
+  }
+  for (const marker of REFUSED_MARKERS) {
+    let at = text.indexOf(marker);
+    while (at !== -1) {
+      codepoints.add(marker);
+      offsets.push([...text.slice(0, at)].length);
+      at = text.indexOf(marker, at + marker.length);
+    }
+  }
+  if (codepoints.size === 0) return null;
+  offsets.sort((a, b) => a - b);
+  return { codepoints: [...codepoints], count: offsets.length, offsets };
+}
+
 export const screeningRule: GateRule = (diff: ProjectedDiff, context: GateContext) => {
   const text = diff.inserted;
   if (text.length === 0) return null;
@@ -115,32 +152,11 @@ export const screeningRule: GateRule = (diff: ProjectedDiff, context: GateContex
     };
   }
 
-  const codepoints = new Set<string>();
-  const offsets: number[] = [];
+  // ONE implementation, shared with the authoring check — see `screenText`.
+  const found = screenText(text);
+  if (!found) return null;
+  const { codepoints, count, offsets } = found;
 
-  let index = 0;
-  for (const ch of text) {
-    const cp = ch.codePointAt(0)!;
-    if (REFUSED_CODEPOINTS.has(cp)) {
-      codepoints.add(formatCodepoint(cp));
-      offsets.push(index);
-    }
-    index++;
-  }
-
-  for (const marker of REFUSED_MARKERS) {
-    let at = text.indexOf(marker);
-    while (at !== -1) {
-      codepoints.add(marker);
-      // Converted to a code-point offset for the same reason as above — `indexOf` counts UTF-16.
-      offsets.push([...text.slice(0, at)].length);
-      at = text.indexOf(marker, at + marker.length);
-    }
-  }
-
-  if (codepoints.size === 0) return null;
-
-  offsets.sort((a, b) => a - b);
   return {
     reason: "document_content_refused",
     // MACHINE-READABLE (§16.7-6). The default resolution is that the SENDER adopts the receiver's
@@ -151,8 +167,8 @@ export const screeningRule: GateRule = (diff: ProjectedDiff, context: GateContex
     // rejection round each, and the protocol stalls at three.
     detail: JSON.stringify({
       rule: SCREEN_RULE_ID,
-      codepoints: [...codepoints],
-      count: offsets.length,
+      codepoints,
+      count,
       offsets,
     }),
   };

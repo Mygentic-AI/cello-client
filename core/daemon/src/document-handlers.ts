@@ -48,6 +48,7 @@ import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks } from "./document-write-path.js";
 import { profileViolation } from "./document-profile.js";
+import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
 /** Document types the notification/diff path understands. Anything else is stored, not diffed. */
 const DEFAULT_DOCUMENT_TYPE = "markdown";
@@ -728,6 +729,29 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         : undefined,
       content,
     );
+    // AUTHORING-SIDE SCREENING (DOD-DOC-SCREEN-1, §16.6). The receiver's gate refuses these and
+    // stays authoritative; this catches them where the character was WRITTEN so it never becomes a
+    // rejection round. Three rejected rounds stall the document, and a stall from a character the
+    // operator cannot see in their own editor is the worst version of that.
+    //
+    // FRICTION REDUCTION AMONG GOOD ACTORS, never a boundary — the sender's client can be patched
+    // or compromised while the sender is a good actor, which is why the receiving gate exists and
+    // why this one cannot replace it. Same function on both sides (`screenText`), so the two cannot
+    // disagree about what is refused.
+    const screenFault = screenText(content);
+    if (screenFault) {
+      return {
+        ok: false,
+        reason: "document_content_refused",
+        guidance:
+          `Your peer's screening will refuse ${screenFault.codepoints.join(", ")} ` +
+          `(${screenFault.count} occurrence(s), first at character ${screenFault.offsets[0]}). ` +
+          `These are characters that make what a reader SEES differ from what the document SAYS, or ` +
+          `that address a reader's model rather than the reader. Remove them and write again — ` +
+          `sending as-is costs a rejection round, and three of those stall the document.`,
+        detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...screenFault }),
+      };
+    }
     if (profileFault) {
       return {
         ok: false,

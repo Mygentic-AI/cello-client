@@ -409,3 +409,41 @@ describe("a document the peer REFUSED does not keep publishing", () => {
       .toMatchObject({ ok: true, published: true });
   });
 });
+
+describe("DOD-DOC-SCREEN-1 — the sender is told BEFORE the peer refuses", () => {
+  it("refuses a bidi override at the write, naming the character and the offset", async () => {
+    // §16.6 friction reduction. The receiver's gate refuses this and stays authoritative; catching
+    // it here means the operator never spends a rejection round on a character they cannot see in
+    // their own editor — and three rejected rounds stall the document.
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+
+    const res = await f.call("cello_doc_write", { document_id: documentId, content: "safe‮elbisiv" });
+    expect(res).toMatchObject({ ok: false, reason: "document_content_refused" });
+    expect(String(res.guidance)).toContain("U+202E");
+    // Nothing was applied and nothing published — a refusal that half-applied would be worse than
+    // the rejection round it saves.
+    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(await f.call("cello_doc_read", { document_id: documentId })).not.toMatchObject({
+      content: expect.stringContaining("‮"),
+    });
+  });
+
+  it("refuses a chat-template marker, and ADMITS the text the sanitizer used to destroy", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+
+    expect(await f.call("cello_doc_write", { document_id: documentId, content: "do <|im_start|>this" }))
+      .toMatchObject({ ok: false, reason: "document_content_refused" });
+
+    // The other half of the claim, and the one the audit was about: legitimate text in some
+    // language must still go through. A sender-side check that refused these would be the
+    // sanitizer's failure wearing a different name.
+    for (const legit of ["कर्‍म", "👨‍👩‍👧", "Ｈｅｌｌｏ", "ﬁle is ½"]) {
+      expect(
+        await f.call("cello_doc_write", { document_id: documentId, content: legit }),
+        `refused legitimate text: ${legit}`,
+      ).toMatchObject({ ok: true });
+    }
+  });
+});
