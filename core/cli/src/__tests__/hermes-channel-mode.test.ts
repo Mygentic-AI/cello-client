@@ -104,6 +104,11 @@ adapter.config = m.PlatformConfig(extra={})
 # starting state or _start_wake_worker cannot tell "no worker yet" from "worker running".
 adapter._wake_queue = None
 adapter._wake_task = None
+adapter._retry_tasks = set()
+# Stub the busy-retry timer: the test asserts THAT a retry was scheduled, not that asyncio can
+# sleep. Leaving the real one in would make every busy case cost BUSY_RETRY_DELAY_SECONDS.
+retry_scheduled = {"v": False}
+adapter._requeue_wake_later = lambda frame, delay: retry_scheduled.__setitem__("v", True)
 
 calls = []
 receive_result = spec.get("receive_result", {"ok": True, "content": "hello from the peer"})
@@ -177,14 +182,16 @@ async def main():
             _src = adapter.build_source(chat_id=spec["busy"], chat_type="dm")
             adapter._active_sessions.add(adapter._session_key_for(_src))
         for frame in spec.get("frames") or [{"kind": spec.get("kind"), "data": spec.get("data")}]:
-            await adapter._on_notification(
-                {"notification": frame["kind"], "data": frame["data"]}
-            )
+            _f = {"notification": frame["kind"], "data": frame["data"]}
+            if spec.get("busy_retries") is not None:
+                _f["_cello_busy_retries"] = spec["busy_retries"]
+            await adapter._on_notification(_f)
         out["delivered"] = [
             {"text": e.text, "chat_id": getattr(e.source, "chat_id", None), "message_id": e.message_id}
             for e in adapter.delivered
         ]
         out["pending"] = {k: v.text for k, v in adapter._pending_messages.items()}
+        out["retry_scheduled"] = retry_scheduled["v"]
         out["pending_anchors"] = {
             k: getattr(v, "message_id", None) for k, v in adapter._pending_messages.items()
         }
@@ -208,6 +215,7 @@ interface Verdict {
   delivered?: Delivered[];
   pending?: Record<string, string>;
   pending_anchors?: Record<string, string>;
+  retry_scheduled?: boolean;
   success?: boolean;
   error?: string | null;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
@@ -314,13 +322,16 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
   });
 
   it("AC2: a state-change notice stays prose even in channel mode — there is no content to fetch", () => {
+    // Uses a TERMINAL state: 'created' is suppressed entirely in channel mode now (AC11), so
+    // asserting on it here would be asserting the old behaviour. The point of this case is that a
+    // state notice is never fetched, which holds for the states that ARE still delivered.
     const v = run({
       op: "notify", kind: "session_state_changed",
-      data: { session_id: SID, counterpartyPubkey: PUB, state: "created" },
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "sealed" },
     });
     expect(v.calls.find((c) => c.method === "cello_receive")).toBeUndefined();
     expect(v.delivered![0].text).toContain("CELLO wake");
-    expect(v.delivered![0].text).toContain("created");
+    expect(v.delivered![0].text).toContain("sealed");
   });
 
   it("AC2: a failed fetch degrades to the wake prose LOUDLY, so the peer is not left waiting", () => {
@@ -404,6 +415,49 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
   });
 
+  // ─── AC11: the phantom doorbell — a 'created' notice must not occupy the agent
+
+  it("AC11: channel mode does NOT wake the agent for a 'created' state notice", () => {
+    // Live 2026-08-07: this notice started a turn, the message arrived ~1s later and found the
+    // chat busy, and the whole feature fell back to the manual path. The one time it worked, the
+    // agent had answered the notice [SILENT] fast enough to free itself — so the difference
+    // between "it works" and "it does nothing" was a race.
+    const v = run({
+      op: "notify", kind: "session_state_changed",
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "created" },
+    });
+    expect(v.delivered).toHaveLength(0);
+  });
+
+  it("AC11: TERMINAL state notices still reach the agent — nothing follows those", () => {
+    for (const state of ["sealed", "closed", "interrupted"]) {
+      const v = run({
+        op: "notify", kind: "session_state_changed",
+        data: { session_id: SID, counterpartyPubkey: PUB, state },
+      });
+      expect(v.delivered, `state=${state}`).toHaveLength(1);
+      expect(v.delivered![0].text).toContain(state);
+    }
+  });
+
+  it("AC11: an UNKNOWN state is delivered, not dropped — the list is a denylist", () => {
+    // Dropping an unrecognised state would be the silent kind of wrong: a future state that
+    // carries its own information would vanish with no trace.
+    const v = run({
+      op: "notify", kind: "session_state_changed",
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "some_future_state" },
+    });
+    expect(v.delivered).toHaveLength(1);
+  });
+
+  it("AC11: wake mode still delivers 'created' — that mode has no message-delivery to protect", () => {
+    const v = run({
+      op: "notify", kind: "session_state_changed", delivery_mode: "wake",
+      data: { session_id: SID, counterpartyPubkey: PUB, state: "created" },
+    });
+    expect(v.delivered).toHaveLength(1);
+  });
+
   // ───────── AC10: the fetch must DRAIN, or the agent answers a stale message and is then muted
 
   it("AC10: everything queued is delivered, in order, as one turn", () => {
@@ -468,7 +522,7 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     // two messages to the peer: its reply, then the turn's tail — which was the agent's own
     // internal note-to-self. Delivering a counterparty the agent's private status is worse than
     // the duplicate that carried it.
-    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT });
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99 });
     const notice = Object.values(v.pending!)[0];
     expect(notice).toContain("CELLO wake");
     expect(notice).toContain("cello_receive");          // reading is still manual on this path
@@ -486,7 +540,7 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
   it("AC9: neither mode's notice contradicts what that mode's send() actually does", () => {
     // The defect was a contradiction between two strings, so assert they cannot both appear.
     for (const mode of ["channel", "wake"]) {
-      const v = run({ op: "notify", kind: "cello_message", data: MSG, delivery_mode: mode, busy: AGENT });
+      const v = run({ op: "notify", kind: "cello_message", data: MSG, delivery_mode: mode, busy: AGENT, busy_retries: 99 });
       const notice = Object.values(v.pending!)[0] ?? v.delivered?.[0]?.text ?? "";
       const forbids = notice.includes("Do NOT call cello_send");
       const instructs = notice.includes("reply with the cello_send tool");
@@ -497,12 +551,30 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
 
   // ────────────────────────────── AC7: a busy chat must not lose a message it already consumed
 
+  it("AC12: a busy chat gets RETRIED, not immediately downgraded to a notice", () => {
+    // Before: busy meant instantly handing the agent the manual-path notice. The agent is busy
+    // more often than not, so that was most messages. Now it waits for the turn — fetching DURING
+    // one is the only thing that can lose a message outright, so waiting is the only safe option.
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT });
+    expect(v.calls.find((c) => c.method === "cello_receive")).toBeUndefined();
+    expect(v.delivered).toHaveLength(0);        // nothing handed over yet…
+    expect(Object.keys(v.pending ?? {})).toHaveLength(0); // …and not queued as a notice either
+    expect(v.retry_scheduled).toBe(true);       // it is coming back
+  });
+
+  it("AC12: after the retry budget is spent, it DOES fall back to a notice — no infinite wait", () => {
+    // A peer blocked forever on an agent that never frees is worse than the manual path.
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99 });
+    expect(Object.values(v.pending!)[0]).toContain("CELLO wake");
+    expect(v.retry_scheduled).toBe(false);
+  });
+
   it("AC7: a wake for a BUSY chat is not fetched — consuming it could destroy it", () => {
     // cello_receive CONSUMES (it advances the delivery bookmark and read watermark). A busy chat's
     // event goes to the pending slot, where it can be merged or replaced — so fetching first can
     // leave a message that is neither in Hermes nor unread in the daemon. Left unfetched it stays
     // recoverable, and the prose wake tells the agent how.
-    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT });
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT, busy_retries: 99 });
     expect(v.calls.find((c) => c.method === "cello_receive")).toBeUndefined();
     expect(Object.values(v.pending!)[0]).toContain("CELLO wake");
   });
@@ -510,7 +582,7 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
   it("AC7: two wakes on one busy chat BOTH survive — the second does not evict the first", () => {
     const second = "99ff88ee".repeat(8);
     const v = run({
-      op: "notify", busy: AGENT,
+      op: "notify", busy: AGENT, busy_retries: 99,
       frames: [
         { kind: "cello_message", data: MSG },
         { kind: "cello_message", data: { session_id: "beef9999", from: second } },
@@ -530,7 +602,7 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     // answered. Cross-conversation leak plus silent non-delivery, in the DEFAULT config.
     const second = "99ff88ee".repeat(8);
     const v = run({
-      op: "notify", busy: AGENT,
+      op: "notify", busy: AGENT, busy_retries: 99,
       frames: [
         { kind: "cello_message", data: MSG },
         { kind: "cello_message", data: { session_id: "beef9999", from: second } },
@@ -549,7 +621,7 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
   it("AC7: two wakes on the SAME session keep their anchor — only cross-session merges poison it", () => {
     // The common case (a peer sending twice while the agent thinks) must still deliver normally.
     const v = run({
-      op: "notify", busy: AGENT,
+      op: "notify", busy: AGENT, busy_retries: 99,
       frames: [
         { kind: "cello_message", data: MSG },
         { kind: "cello_message", data: { session_id: SID, from: PUB } },

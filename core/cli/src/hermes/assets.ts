@@ -152,6 +152,24 @@ CALL_TIMEOUT_SECONDS = 30.0
 # Server-side wait for the adapter's own cello_receive. Short on purpose: the notification that
 # triggered it means the content is already durable, so this is a fetch, not a poll.
 RECEIVE_TIMEOUT_MS = 5000
+
+# State notices that channel mode does NOT hand to the agent, because a message follows within
+# about a second and the notice's only effect is to occupy the agent at exactly the moment the
+# message needs it free. Observed live 2026-08-07: 'created' started a turn, the message then
+# found the chat busy, and the whole feature fell back to the manual path - the one time it
+# worked, the agent had answered the notice with a bare [SILENT] and freed itself in time. The
+# difference between "it works" and "it does nothing" was that race.
+#
+# A DENYLIST, deliberately: an unrecognised state is DELIVERED. Terminal ones (sealed, closed,
+# interrupted) carry the only information about themselves - nothing follows them - so dropping
+# an unknown state would be the silent kind of wrong.
+STATE_WAKES_SUPPRESSED_IN_CHANNEL = {"created"}
+
+# When the chat is mid-turn, wait for it rather than immediately downgrading to a notice. Turns
+# end in seconds; fetching DURING one is the one thing that can lose a message outright. Total
+# patience is LIMIT x DELAY before the notice fallback.
+BUSY_RETRY_LIMIT = 5
+BUSY_RETRY_DELAY_SECONDS = 2.0
 # Upper bound on one drain. A conversation that has been away a long time can have a lot
 # queued; handing an agent an unbounded turn is its own failure. Hitting this logs loudly -
 # a silent truncation would read as "the agent saw everything" when it did not.
@@ -287,6 +305,8 @@ class CelloAdapter(BasePlatformAdapter):
         # may execute before there is one.
         self._wake_queue: Optional[asyncio.Queue] = None
         self._wake_task: Optional[asyncio.Task] = None
+        # Live references to pending busy-retry timers (see _requeue_wake_later).
+        self._retry_tasks: set = set()
         self._pending: Dict[str, asyncio.Future] = {}
         self._next_id = 1
         self._closing = False
@@ -375,6 +395,12 @@ class CelloAdapter(BasePlatformAdapter):
         for task in (self._read_task, self._reconnect_task, self._wake_task):
             if task is not None and not task.done():
                 task.cancel()
+        # Pending retries name a chat that is going away; leaving them running would re-queue
+        # wakes against a dead socket after disconnect.
+        for task in list(self._retry_tasks):
+            if not task.done():
+                task.cancel()
+        self._retry_tasks.clear()
         self._read_task = None
         self._reconnect_task = None
         self._wake_task = None
@@ -423,6 +449,29 @@ class CelloAdapter(BasePlatformAdapter):
             self._wake_queue = asyncio.Queue()
         if self._wake_task is None or self._wake_task.done():
             self._wake_task = asyncio.create_task(self._wake_worker())
+
+    def _requeue_wake_later(self, frame: Dict[str, Any], delay: float) -> None:
+        """Put a wake back on the queue after the given delay, off the worker.
+
+        A plain sleep inside the worker would stall EVERY other agent's wake behind this one
+        chat's turn, which is the opposite of what the retry is for.
+        """
+        async def _later() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if self._closing or self._wake_queue is None:
+                    return
+                self._wake_queue.put_nowait(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[cello] Failed to re-queue a wake after a busy turn")
+
+        task = asyncio.create_task(_later())
+        # Hold a reference: asyncio only keeps a WEAK one, so an un-held task can be garbage
+        # collected mid-sleep and the wake would vanish with it.
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
 
     async def _wake_worker(self) -> None:
         while True:
@@ -717,6 +766,21 @@ class CelloAdapter(BasePlatformAdapter):
             )
             return
 
+        # The phantom doorbell. In channel mode a 'created' notice announces a conversation that
+        # the message arriving a second later announces better - and handing it to the agent
+        # starts a turn that makes the agent BUSY exactly when the message needs it free.
+        if (
+            self._delivery_mode == "channel"
+            and kind == "session_state_changed"
+            and _safe_scalar(data.get("state")) in STATE_WAKES_SUPPRESSED_IN_CHANNEL
+        ):
+            logger.debug(
+                "[cello] Not waking the agent for a '%s' state notice on session %s - the message "
+                "that follows carries everything it says", _safe_scalar(data.get("state")),
+                session_id,
+            )
+            return
+
         counterparty = self._counterparty_of(kind, data)
         chat_id = self._chat_id_for(counterparty)
         if chat_id is None:
@@ -765,12 +829,32 @@ class CelloAdapter(BasePlatformAdapter):
         # not provide is worse than no check. Computed once here and reused below.
         session_key = self._session_key_for(source)
         text = None
-        if (
-            self._delivery_mode == "channel"
-            and kind == "cello_message"
-            and session_key not in self._active_sessions
-        ):
-            text = await self._fetch_content(session_id)
+        if self._delivery_mode == "channel" and kind == "cello_message":
+            if session_key in self._active_sessions:
+                # BUSY: wait for the turn rather than downgrading on the spot. Immediately falling
+                # back to the notice sent the agent down the manual path for every message that
+                # happened to land mid-turn - which is most of them, since the agent is busy more
+                # often than not. Retrying costs the peer a couple of seconds; the alternative
+                # costs them the feature. Fetching anyway is NOT an option: it consumes the
+                # message, and a busy chat's queued event can be merged or replaced.
+                attempts = frame.get("_cello_busy_retries", 0)
+                if isinstance(attempts, int) and attempts < BUSY_RETRY_LIMIT:
+                    frame["_cello_busy_retries"] = attempts + 1
+                    logger.debug(
+                        "[cello] %s is mid-turn; re-trying the fetch for session %s in %.0fs "
+                        "(attempt %d of %d)",
+                        session_key, session_id, BUSY_RETRY_DELAY_SECONDS,
+                        attempts + 1, BUSY_RETRY_LIMIT,
+                    )
+                    self._requeue_wake_later(frame, BUSY_RETRY_DELAY_SECONDS)
+                    return
+                logger.info(
+                    "[cello] %s stayed mid-turn for %.0fs; handing the agent a notice for session "
+                    "%s instead of the message, so it can still read it with the cello_* tools",
+                    session_key, BUSY_RETRY_LIMIT * BUSY_RETRY_DELAY_SECONDS, session_id,
+                )
+            else:
+                text = await self._fetch_content(session_id)
         if text is None:
             text = self._wake_prompt(kind, data)
         event = MessageEvent(
