@@ -68,7 +68,12 @@ def merge_pending_message_event(pending, key, event, *, merge_text=False):
         existing.text = (existing.text + "\\n" + event.text) if existing.text else event.text
         return
     pending[key] = event
-def build_session_key(source, **kw): return getattr(source, "chat_id", "?")
+def build_session_key(source, **kw):
+    # The REAL shape from gateway/session.py:1058 — namespaced, NOT the bare chat_id. A stub that
+    # returned chat_id made a busy-check comparing against chat_id look correct while it could
+    # never match anything in production. The stub must not assert the identity the code under
+    # test is being checked for.
+    return "agent:main:cello:dm:" + str(getattr(source, "chat_id", "?"))
 `;
 
 /**
@@ -155,7 +160,11 @@ async def main():
         adapter._wake_task.cancel()
     elif op == "notify":
         if spec.get("busy"):
-            adapter._active_sessions.add(spec["busy"])
+            # Mark the chat busy the way the GATEWAY does — by session key, derived through the
+            # adapter's own helper. Adding the bare chat_id here would re-create the bug: the
+            # production guard would look correct while never matching anything.
+            _src = adapter.build_source(chat_id=spec["busy"], chat_type="dm")
+            adapter._active_sessions.add(adapter._session_key_for(_src))
         for frame in spec.get("frames") or [{"kind": spec.get("kind"), "data": spec.get("data")}]:
             await adapter._on_notification(
                 {"notification": frame["kind"], "data": frame["data"]}
@@ -165,6 +174,9 @@ async def main():
             for e in adapter.delivered
         ]
         out["pending"] = {k: v.text for k, v in adapter._pending_messages.items()}
+        out["pending_anchors"] = {
+            k: getattr(v, "message_id", None) for k, v in adapter._pending_messages.items()
+        }
     elif op == "send":
         res = await adapter.send(
             chat_id=spec.get("chat_id", "Ms_Chelly_Hermes"),
@@ -184,6 +196,7 @@ interface Delivered { text: string; chat_id: string | null; message_id: string }
 interface Verdict {
   delivered?: Delivered[];
   pending?: Record<string, string>;
+  pending_anchors?: Record<string, string>;
   success?: boolean;
   error?: string | null;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
@@ -406,6 +419,41 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     // with nothing anywhere recording that it existed.
     expect(pending).toContain(SID);
     expect(pending).toContain("beef9999");
+  });
+
+  it("AC7: merging TWO sessions into one turn disables automatic delivery — it never picks one", () => {
+    // merge_pending_message_event keeps the EXISTING event and mutates only .text, so the second
+    // anchor is dropped. Left alone, one reply written in view of both peers' words would be
+    // delivered entirely to whichever arrived first: B's content quoted to A, and B never
+    // answered. Cross-conversation leak plus silent non-delivery, in the DEFAULT config.
+    const second = "99ff88ee".repeat(8);
+    const v = run({
+      op: "notify", busy: AGENT,
+      frames: [
+        { kind: "cello_message", data: MSG },
+        { kind: "cello_message", data: { session_id: "beef9999", from: second } },
+      ],
+    });
+    const anchor = Object.values(v.pending_anchors!)[0]!;
+    expect(anchor).not.toContain(SID); // the surviving anchor must NOT still route to peer A
+    expect(anchor.startsWith("cello-ambiguous-")).toBe(true);
+
+    // …and that poisoned anchor must make send() refuse rather than deliver to a guess.
+    const sent = run({ op: "send", metadata: { reply_to_message_id: anchor } });
+    expect(sent.success).toBe(false);
+    expect(sent.calls.find((c) => c.method === "cello_send")).toBeUndefined();
+  });
+
+  it("AC7: two wakes on the SAME session keep their anchor — only cross-session merges poison it", () => {
+    // The common case (a peer sending twice while the agent thinks) must still deliver normally.
+    const v = run({
+      op: "notify", busy: AGENT,
+      frames: [
+        { kind: "cello_message", data: MSG },
+        { kind: "cello_message", data: { session_id: SID, from: PUB } },
+      ],
+    });
+    expect(Object.values(v.pending_anchors!)[0]).toContain(SID);
   });
 
   // ───────────────────────────────────── AC8: a routing key is never fabricated

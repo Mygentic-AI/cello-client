@@ -136,6 +136,11 @@ DEFAULT_SESSION_SCOPE = "agent"
 # in-flight turn whose anchor was minted by the previous version.
 ANCHOR_PREFIX = "cello-wake-"
 
+# Stamped over an anchor when two CELLO sessions have been folded into ONE pending Hermes turn.
+# Deliberately not a valid anchor: automatic delivery must refuse rather than pick one of the two
+# counterparties to answer. Distinct from a foreign message id so send() can say WHY it refused.
+AMBIGUOUS_ANCHOR_PREFIX = "cello-ambiguous-"
+
 # Distinguishes "this anchor is not CELLO's" (None -> suppress quietly, it is another platform's
 # turn) from "this anchor IS CELLO's and is broken" (-> fail the send loudly). Collapsing the two
 # would either error on every local desktop turn or silently swallow a real routing fault.
@@ -689,23 +694,6 @@ class CelloAdapter(BasePlatformAdapter):
             )
             chat_id = self._agent_name
 
-        # Content only for a MESSAGE wake, in channel mode, and only when the target chat is IDLE.
-        #
-        # The busy check is load-bearing, not an optimization. cello_receive CONSUMES: it advances
-        # the delivery bookmark and the read watermark. A busy chat's event goes to the pending
-        # slot, where merge_pending_message_event may fold it into another - so fetching first
-        # could destroy a message that is no longer unread anywhere. Leaving it in the daemon
-        # keeps it recoverable, and the prose wake tells the agent exactly how.
-        text = None
-        if (
-            self._delivery_mode == "channel"
-            and kind == "cello_message"
-            and chat_id not in self._active_sessions
-        ):
-            text = await self._fetch_content(session_id)
-        if text is None:
-            text = self._wake_prompt(kind, data)
-
         source = self.build_source(
             chat_id=chat_id,
             chat_name="CELLO",
@@ -713,6 +701,29 @@ class CelloAdapter(BasePlatformAdapter):
             user_id=counterparty or "cello-daemon",
             user_name=_render_who(data) or "CELLO",
         )
+
+        # Content only for a MESSAGE wake, in channel mode, and only when the target chat is IDLE.
+        #
+        # The busy check is load-bearing, not an optimization. cello_receive CONSUMES: it advances
+        # the delivery bookmark and the read watermark. A busy chat's event goes to the pending
+        # slot, where merge_pending_message_event may fold it into another - so fetching first
+        # could destroy a message that is no longer unread anywhere. Leaving it in the daemon
+        # keeps it recoverable, and the prose wake tells the agent exactly how.
+        #
+        # Test against the SESSION KEY, never the chat_id. _active_sessions is keyed by the full
+        # namespaced key ("agent:main:cello:dm:<chat_id>"), so a bare chat_id can never be a
+        # member and the guard silently protected nothing - a check that reports safety it does
+        # not provide is worse than no check. Computed once here and reused below.
+        session_key = self._session_key_for(source)
+        text = None
+        if (
+            self._delivery_mode == "channel"
+            and kind == "cello_message"
+            and session_key not in self._active_sessions
+        ):
+            text = await self._fetch_content(session_id)
+        if text is None:
+            text = self._wake_prompt(kind, data)
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -726,21 +737,52 @@ class CelloAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    def _session_key_for(self, source: Any) -> str:
+        """The gateway's session key for a source, built exactly as handle_message builds it.
+
+        One helper so the busy check in _on_notification and the queueing decision in
+        handle_message can never drift apart - they must agree or the fetch guard protects a
+        different session than the one that is actually busy.
+        """
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """Queue wake hints for a busy session instead of interrupting the turn."""
         if not self._message_handler:
             return
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._session_key_for(event.source)
         if session_key in self._active_sessions:
             logger.debug("[cello] Wake queued for busy session %s", session_key)
-            # merge_text=True or the pending slot REPLACES. Without it, a second arrival during an
-            # in-flight turn discards the first outright - and under session_scope 'agent' that
-            # second arrival is routinely a different peer, so one counterparty's message would
-            # vanish with nothing anywhere recording it. Appending keeps both.
+            # merge_text=True or the pending slot REPLACES, discarding the earlier arrival
+            # outright - and under session_scope 'agent' that earlier arrival is routinely a
+            # different peer, so a whole message would vanish with nothing recording it.
+            #
+            # BUT the merge keeps the EXISTING event object and mutates only its .text, so the
+            # incoming anchor is dropped. If the two came from different CELLO sessions, the one
+            # surviving anchor would send a single reply - written in view of BOTH peers' words -
+            # to whichever arrived first: peer B's content quoted to peer A, and B left waiting
+            # forever. Content across conversations plus silent non-delivery, in the DEFAULT
+            # configuration.
+            #
+            # So: same session, merge and keep the anchor. Different sessions, merge the text but
+            # POISON the anchor, which makes send() refuse to deliver automatically. The prose the
+            # agent holds names each session, and the cello_* tools remain registered, so it can
+            # answer both explicitly. Refusing to guess is the whole rule here.
+            existing = self._pending_messages.get(session_key)
+            if existing is not None:
+                existing_session = self._session_from_anchor(getattr(existing, "message_id", None))
+                if existing_session != self._session_from_anchor(event.message_id):
+                    logger.warning(
+                        "[cello] Two CELLO sessions merged into one pending turn on %s; "
+                        "automatic delivery is disabled for it because a single reply cannot be "
+                        "routed to both. The agent must answer each with cello_send.",
+                        session_key,
+                    )
+                    existing.message_id = AMBIGUOUS_ANCHOR_PREFIX + uuid.uuid4().hex[:8]
             merge_pending_message_event(
                 self._pending_messages, session_key, event, merge_text=True
             )
@@ -870,6 +912,23 @@ class CelloAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         anchor = (metadata or {}).get("reply_to_message_id") or reply_to
+
+        if isinstance(anchor, str) and anchor.startswith(AMBIGUOUS_ANCHOR_PREFIX):
+            # Two counterparties were merged into this turn (see handle_message). There is no
+            # right answer to "which session" - picking either delivers one peer's reply to the
+            # other. Fail so the operator sees it, rather than reporting success for a message
+            # nobody received.
+            logger.error(
+                "[cello] Refusing automatic delivery: this turn merged more than one CELLO "
+                "session, so a single reply cannot be routed. The agent must answer each session "
+                "explicitly with cello_send."
+            )
+            return SendResult(
+                success=False,
+                error="This turn covers more than one CELLO session; reply to each with "
+                      "cello_send instead.",
+            )
+
         session_id = self._session_from_anchor(anchor)
 
         if session_id is None:
