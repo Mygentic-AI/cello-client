@@ -418,9 +418,50 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
   it("a KILLED and a CLOSED document are terminal too — they will never accept this envelope", async () => {
     for (const status of ["killed", "closed"] as const) {
       const f = newFixture({ status });
-      const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
-      expect(res, status).toMatchObject({ terminal: true });
+      const env = envelope();
+      const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+      // THE HASH, not just the flag. Asserting `terminal` alone let an implementation drop
+      // `envelopeHash` here and still pass — and the router only acks when it has BOTH, so the
+      // defect came straight back with every gate green. Caught in review, not by the gate.
+      expect(res, status).toMatchObject({ terminal: true, envelopeHash: documentEnvelopeHash(env) });
     }
+  });
+
+  it("a NON-PARTY is answered with SILENCE even when the document is killed", async () => {
+    // THE ORDERING BUG THIS PINS. The peer check used to run AFTER the killed/closed branch, so a
+    // stranger naming an existing killed document got back a signed ack — `sendAck` addresses the
+    // ENVELOPE's sender, so it really reached them — confirming both that the document exists and
+    // what state it is in. Precisely the disclosure the silent refusal exists to withhold.
+    const f = newFixture({ status: "killed" });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: "someone-else" })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+
+  it("a chain FORK is terminal; a chain GAP is not", async () => {
+    // The distinction the envelope module created, applied to delivery. A gap means the predecessor
+    // has not arrived YET — redelivery IS the recovery. A fork chains onto something that never was
+    // our head, and an append-only log has no repair for that.
+    const f = newFixture();
+    // Establish a head, then send a SECOND genesis envelope — two roots for one sender, which the
+    // envelope module calls a fork and for which it states plainly "there is no repair".
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    const forked = envelope({ update: update(PEER_CLIENT, "a different root. ") });
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(forked), NOW);
+    expect(res).toMatchObject({ ok: false, reason: "document_chain_forked", terminal: true });
+    expect((res as { envelopeHash?: string }).envelopeHash).toBe(documentEnvelopeHash(forked));
+
+    // THE GAP, for contrast: a predecessor we have never seen may still arrive, so the sender must
+    // keep retrying and must NOT be settled.
+    const g = newFixture();
+    const gap = envelope({ doc_prev_hash: "ff".repeat(32) });
+    const gapRes = await g.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(gap), NOW);
+    expect(gapRes).toMatchObject({ ok: false, reason: "document_chain_broken" });
+    expect((gapRes as { terminal?: boolean }).terminal).toBeUndefined();
   });
 
   it("VERIFIES BEFORE the document lookup — an unsigned envelope for an unknown document is not terminal", async () => {

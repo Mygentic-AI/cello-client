@@ -54,25 +54,25 @@ export type InboundResult =
       /** The signed `document_rejection` to put on the wire. Absent when this refusal is a repeat. */
       rejectionWire?: Uint8Array;
     }
-  | {
-      ok: false;
-      reason: string;
-      detail: string;
-      /**
-       * TERMINAL — redelivering this envelope can never change the answer, and the sender has been
-       * AUTHENTICATED, so their delivery should be settled with a rejection ack rather than left
-       * outstanding. Absent means "stay silent and let them retry".
-       *
-       * Both halves are load-bearing. Without terminal, a peer who refused the proposal is
-       * redelivered to forever (found live). Without authentication, the ack answers whoever
-       * reached the channel — which is why `document_sender_not_peer` is deliberately NOT terminal
-       * even though it never becomes acceptable: an ack naming the document_id would hand back the
-       * existence answer that refusal withholds on purpose.
-       */
-      terminal?: true;
-      /** Required with `terminal` — an ack that cannot name the envelope settles nothing. */
-      envelopeHash?: string;
-    };
+  // `terminal?: undefined` is what makes this a DISCRIMINATED union rather than two overlapping
+  // shapes. Without it a caller holding an `InboundResult` cannot even read `.terminal` to narrow —
+  // the property does not exist on this arm — so the router could not tell the two apart.
+  | { ok: false; reason: string; detail: string; terminal?: undefined }
+  /**
+   * A TERMINAL refusal — redelivering this envelope can never change the answer, and the sender was
+   * AUTHENTICATED, so their delivery is settled with a rejection ack rather than left outstanding.
+   * The plain refusal above means "stay silent and let them retry".
+   *
+   * Both conditions are load-bearing. Without terminal, a peer who refused the proposal is
+   * redelivered to indefinitely (found live: 74 sends). Without authentication, the ack answers
+   * whoever reached the channel rather than a known party.
+   *
+   * `terminal` AND `envelopeHash` are ONE variant, not two optional fields, because the router can
+   * only act when it has both — and with them independent, setting `terminal` while forgetting the
+   * hash produced no ack, no log line, and silently reinstated the defect this unit closed. A type
+   * that can express the broken state eventually will.
+   */
+  | { ok: false; reason: string; detail: string; terminal: true; envelopeHash: string };
 
 export interface DocumentInboundDeps {
   store: DocumentStore;
@@ -206,7 +206,38 @@ export class DocumentInbound {
       };
     }
 
-    // 2b. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
+    // 4. The sender must be THIS document's peer — BEFORE any lifecycle answer.
+    //
+    // The order here is the disclosure boundary, and it was wrong. This check used to run AFTER the
+    // killed/closed branch, and once that branch became terminal it meant a non-party who signed an
+    // envelope naming an existing document received a SIGNED ACK confirming the document exists and
+    // what lifecycle state it is in — `sendAck` addresses `env.sender_agent_id` from the envelope,
+    // not `doc.peerAgentId`, so it really does go back to the stranger. That is exactly the
+    // disclosure the silent refusal below is written to withhold.
+    if (env.sender_agent_id !== doc.peerAgentId) {
+      this.#d.logger.warn("document.inbound.not_peer", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        peerAgentId: doc.peerAgentId,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_sender_not_peer",
+        // The peer's identity is NOT in the reply, and there is NO ack — silence is the answer. A
+        // third party is authenticated as themselves but is not a party to this document, so
+        // nothing about it is theirs to learn.
+        //
+        // A residual one-bit oracle remains and is accepted deliberately: a prober who already
+        // holds a valid document_id learns "exists" from the ABSENCE of an ack, since an unknown
+        // document answers and a known one does not. Closing that would mean acking non-parties,
+        // which discloses strictly more. It is bounded by document_id being a 32-byte hash
+        // (`documentIdFromProposal`), unguessable and never published.
+        detail: "you are not a party to this document",
+      };
+    }
+
+    // 5. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
     // comment describing the bug it was written to fix — "after a restart the document row said
     // `stalled` while the daemon happily accepted updates on it". The only inbound path in the
     // codebase was reintroducing it, and a killed document is defined by LIFECYCLE-1 as one that
@@ -232,24 +263,6 @@ export class DocumentInbound {
       // gate verdict instead would send an operator to the append-only rule for a document that has
       // been frozen for days.
       return { ok: false, reason: accepts.reason, detail: accepts.detail };
-    }
-
-    // 3. The sender must be THIS document's peer.
-    if (env.sender_agent_id !== doc.peerAgentId) {
-      this.#d.logger.warn("document.inbound.not_peer", {
-        documentId: env.document_id,
-        senderAgentId: env.sender_agent_id,
-        peerAgentId: doc.peerAgentId,
-        correlationId,
-      });
-      return {
-        ok: false,
-        reason: "document_sender_not_peer",
-        // The peer's identity is NOT in the reply. This sender has not authenticated, and anyone
-        // reaching the channel with a guessed or leaked document_id would otherwise learn who the
-        // owner collaborates with. The full detail is in the warn above, where it belongs.
-        detail: "you are not a party to this document",
-      };
     }
 
     // 5. CHAIN. A redelivery is expected traffic and must still be answered.
@@ -290,6 +303,18 @@ export class DocumentInbound {
       const reason = ["document_chain_forked", "document_chain_broken"].find((r) =>
         detail.startsWith(r),
       );
+      // A FORK IS TERMINAL; A GAP IS NOT. The distinction the envelope module went out of its way
+      // to create decides this too. A gap means the predecessor has not arrived YET, so redelivery
+      // is exactly the recovery path and the sender must keep trying. A fork means the sender
+      // chained onto something that is not our head and never was — our log is append-only, so
+      // there is no repair, and no number of redeliveries changes the answer.
+      //
+      // Left non-terminal, a fork walked to the unacked ceiling and surfaced as "Their client may
+      // not support shared documents yet" — an error naming the wrong subsystem entirely, for a
+      // condition the receiver had diagnosed precisely.
+      if (reason === "document_chain_forked") {
+        return { ok: false, reason, detail, terminal: true, envelopeHash };
+      }
       return { ok: false, reason: reason ?? "document_chain_refused", detail };
     }
     if (duplicate) {

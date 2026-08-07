@@ -362,7 +362,20 @@ export class DocumentDelivery {
           if (attempts >= DELIVERY_MAX_UNACKED_SENDS) {
             // A peer that will never answer must stop being a transient. Otherwise this envelope is
             // re-sent forever and looks, in the log and in `list`, exactly like one about to land.
+            //
+            // AND IT DID, because setting the status was never what stopped it. The selection above
+            // is `pendingDeliveries`, which filters on `acked_at IS NULL` and reads no status at
+            // all — so `stalled` changed what the surface SAID and nothing about what the worker
+            // DID. Every subsequent tick re-entered this branch, re-set the same status, and sent
+            // again. Measured on the operator's daemon: `sends: 74` against a documented cap of 5,
+            // while both the log line and the comment above claimed publishing had stopped.
+            //
+            // Retiring the envelope is what actually stops it. `markAcked` is the one thing
+            // `pendingDeliveries` honours, and the peer HAS effectively answered — by never
+            // answering, five times over. This is a local giving-up, not a claim about them: the
+            // rejection record below is what an operator reads for the reason.
             this.#store.setDocumentStatus(ownerAgentId, documentId, "stalled");
+            this.#store.markAcked(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
             this.#logger.error("document.delivery.unacked_limit", {
               documentId,
               envelopeHash: envelope.envelopeHash,
@@ -370,8 +383,8 @@ export class DocumentDelivery {
               correlationId,
               detail:
                 `this update has been delivered ${attempts} times without the peer's daemon ever ` +
-                `confirming it — the document has stopped publishing. Their client may not support ` +
-                `shared documents yet.`,
+                `confirming it — the document has stopped publishing and this update will not be ` +
+                `retried. Their client may not support shared documents yet.`,
             });
           }
         } else if (outcome.ok) {

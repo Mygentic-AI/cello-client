@@ -185,7 +185,7 @@ export class DocumentAckInbound {
       // operator asks why their work never landed — and this is also what bounds the retry on the
       // side that actually loops.
       this.#d.rejections.recordIncomingRejection(ownerAgentId, ack.document_id, {
-        rejectionEnvelopeHash: ackRecordHash(ack.envelope_hash, ack.acked_at_ms),
+        rejectionEnvelopeHash: ackRecordHash(ack.envelope_hash),
         rejectedEnvelopeHash: ack.envelope_hash,
         reason: ack.rejection_reason ?? "document_rejected",
         fromAgentId: ack.acker_agent_id,
@@ -204,13 +204,23 @@ export class DocumentAckInbound {
 }
 
 /**
- * The identity of the RECEIVED-rejection row.
+ * The identity of the RECEIVED-rejection row: the REFUSED ENVELOPE, and nothing else.
  *
- * Derived from the acked envelope and the acker's own timestamp — both signed — so a redelivered
- * ack collapses onto the same row instead of advancing the round. Deriving it from anything local
- * (a clock read here, a counter) would make every redelivery a new rejection, and three of those
- * stall the document.
+ * ONE REFUSED ENVELOPE IS ONE ROUND, however many acks for it arrive.
+ *
+ * This used to mix in the acker's `acked_at_ms` on the reasoning that both fields are signed, so a
+ * redelivered ack would collapse onto the same row. That reasoning had a false premise: acks are
+ * not stored and redelivered — `sendAck` builds a fresh `DocumentAck` with `acked_at_ms: Date.now()`
+ * every time it answers. So two acks for the SAME envelope carried two different timestamps and
+ * became two rows, advancing the round twice.
+ *
+ * That is not hypothetical. Delivery re-sends on a 1s first backoff, so an ordinary in-flight
+ * overlap — the sender re-sends while the first ack is still on the wire, both land — produced two
+ * rounds from one refusal. `MAX_REJECTED_ROUNDS` is 3, so routine delivery overlap could stall a
+ * shared document with no hostility involved. That is the same denial of service the 5b
+ * already-rejected guard in `document-inbound.ts` was written to close, arriving through the other
+ * side of the same loop.
  */
-function ackRecordHash(envelopeHash: string, ackedAtMs: number): string {
-  return `${envelopeHash}:${ackedAtMs}`;
+function ackRecordHash(envelopeHash: string): string {
+  return envelopeHash;
 }

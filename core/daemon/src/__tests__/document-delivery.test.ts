@@ -460,6 +460,24 @@ describe("DocumentDelivery — SENT is neither done nor failed", () => {
     // is re-sent forever and looks — in the log and in `list` — exactly like one about to land.
     expect(f.store.getDocument(AGENT, DOC)!.status).toBe("stalled");
     expect(f.events.some((e) => e.event === "document.delivery.unacked_limit")).toBe(true);
+
+    // AND IT ACTUALLY STOPS. These two assertions are the whole point, and their absence is why
+    // this defect shipped: the test asserted the STATUS and the LOG LINE, both of which the old
+    // code set correctly, while the worker kept sending. `pendingDeliveries` filters on
+    // `acked_at IS NULL` and reads no status at all, so `stalled` changed what the surface SAID
+    // and nothing about what the worker DID. Measured on the operator's live daemon: 74 sends
+    // against this cap of 5, with the log insisting publishing had stopped.
+    expect(
+      f.store.pendingDeliveries(AGENT, at + DELIVERY_ACK_TIMEOUT_MS),
+      "the envelope is still queued, so the next tick sends it again — the ceiling stopped nothing",
+    ).toHaveLength(0);
+
+    const sendsAtCeiling = f.events.filter((e) => e.event === "document.delivery.sent").length;
+    await f.delivery.tick(AGENT, f.peerFor, at + DELIVERY_ACK_TIMEOUT_MS);
+    expect(
+      f.events.filter((e) => e.event === "document.delivery.sent").length,
+      "a tick after the ceiling sent it AGAIN",
+    ).toBe(sendsAtCeiling);
   });
 
   it("an ack arriving later settles it", async () => {
