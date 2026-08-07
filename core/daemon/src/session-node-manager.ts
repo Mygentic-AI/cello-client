@@ -511,7 +511,7 @@ export class SessionNodeManager {
   // DOD-RETRYQ-STRAND-1: fired on the transition INTO a status from which no resend can ever
   // succeed, so durable state keyed to that session gets a disposition instead of stranding.
   // Injected after construction because RetryQueue is built later in daemon.ts.
-  #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
+  #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned", owningAgentId: string) => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
   #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
@@ -670,7 +670,7 @@ export class SessionNodeManager {
    * Fires once per transition INTO a status from which no resend can succeed. Injected by the
    * composition root (daemon.ts) after the RetryQueue exists.
    */
-  setSessionTerminalHook(hook: (sessionId: string, terminalStatus: "sealed" | "abandoned") => void): void {
+  setSessionTerminalHook(hook: (sessionId: string, terminalStatus: "sealed" | "abandoned", owningAgentId: string) => void): void {
     this.#onSessionTerminal = hook;
   }
 
@@ -6146,7 +6146,9 @@ export class SessionNodeManager {
       // NOT terminal — both can still complete, and reaping them would destroy live content.
       if (status === "sealed" || status === "abandoned") {
         try {
-          this.#onSessionTerminal?.(sessionId, status);
+          // The OWNING agent, so the disposition can scope itself: awaiting-ACK content is keyed
+          // (agentId, sessionId), and a terminal transition belongs to one agent's session row.
+          this.#onSessionTerminal?.(sessionId, status, this.#requireAgentId(agentName));
         } catch (hookErr: unknown) {
           // The status flip is the caller's contract and has already succeeded; a failing
           // disposition must not turn it into a reported failure. Named so the strand it leaves
