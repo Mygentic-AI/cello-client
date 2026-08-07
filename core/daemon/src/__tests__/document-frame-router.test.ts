@@ -85,12 +85,21 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
     },
   } satisfies Pick<DocumentAckInbound, "receive"> as DocumentAckInbound;
   const recorded: string[] = [];
+  /** Every ack the router actually put on the wire — the only proof a delivery gets settled. */
+  const acks: Array<{ envelopeHash: string; admitted: boolean; rejectionReason?: string }> = [];
   return {
+    acks,
     router: new DocumentFrameRouter({
       inbound,
       ackInbound,
       logger,
-      sendAck: async () => {},
+      sendAck: async (_owner, _wire, outcome) => {
+        acks.push({
+          envelopeHash: outcome.envelopeHash,
+          admitted: outcome.admitted,
+          ...(outcome.rejectionReason ? { rejectionReason: outcome.rejectionReason } : {}),
+        });
+      },
       rewriteFile: async () => {},
       sendFrameToPeer: async () => {},
       ownerKeyFor: (agentName) => (agentName === AGENT ? OWNER : null),
@@ -382,5 +391,52 @@ describe("DocumentFrameRouter — the AGENT NAME is mapped, never used as an own
     });
     expect(r.calls).toEqual([]);
     expect(r.events.map((e) => e.event)).toContain("document.frame.owner_unresolved");
+  });
+});
+
+/**
+ * DOD-DOC-INBOUND-TERMINAL-1 — the router half.
+ *
+ * `terminal` on an InboundResult is inert until something puts an ack on the wire, and this is the
+ * only place that can. The router used to gate ack emission on `if (res.ok)`, so every refusal —
+ * including ones that can never become acceptance — settled nothing and the sender redelivered
+ * forever. Found live: a document whose proposal the peer refused sat at `pendingSent: 1`
+ * indefinitely, because the peer answers `document_unknown` and nobody answered back.
+ */
+describe("a TERMINAL refusal is ACKED, so the sender stops redelivering", () => {
+  it("sends a rejection ack naming the envelope and the reason", async () => {
+    const r = newRouter({
+      onUpdate: () => ({
+        ok: false,
+        reason: "document_unknown",
+        detail: "no such document",
+        terminal: true,
+        envelopeHash: "ee".repeat(32),
+      }),
+    });
+
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+
+    await vi.waitFor(() => expect(r.acks).toHaveLength(1));
+    expect(r.acks).toEqual([
+      // `admitted: false` is what makes the sender settle rather than retry, and the reason is what
+      // lets their operator see WHY their work never landed instead of watching a counter not move.
+      { envelopeHash: "ee".repeat(32), admitted: false, rejectionReason: "document_unknown" },
+    ]);
+  });
+
+  it("stays SILENT on a refusal that is not terminal — the retry is the recovery path", async () => {
+    const r = newRouter({
+      onUpdate: () => ({ ok: false, reason: "document_stalled", detail: "stopped accepting" }),
+    });
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+    await vi.waitFor(() => expect(r.calls).toEqual(["update"]));
+    expect(r.acks).toEqual([]);
+  });
+
+  it("still acks an ordinary ADMISSION — the terminal path did not displace the normal one", async () => {
+    const r = newRouter();
+    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
+    await vi.waitFor(() => expect(r.acks).toEqual([{ envelopeHash: "x", admitted: true }]));
   });
 });

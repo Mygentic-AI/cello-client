@@ -67,16 +67,27 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
   };
 }
 
-function newFixture(opts: { verify?: () => boolean; order?: string[]; appendOnly?: boolean } = {}) {
+function newFixture(
+  opts: {
+    verify?: () => boolean;
+    order?: string[];
+    appendOnly?: boolean;
+    /** Omit the document entirely — the peer-refused-the-proposal case, which holds no row. */
+    noDocument?: boolean;
+    status?: "active" | "killed" | "closed" | "stalled";
+  } = {},
+) {
   const { logger, events } = recordingLogger();
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
   const store = new DocumentStore(db, logger);
-  store.createDocument({
-    documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-    properties: opts.appendOnly ? { append_only: true } : {},
-    status: "active", createdAtMs: 1,
-  });
+  if (!opts.noDocument) {
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: opts.appendOnly ? { append_only: true } : {},
+      status: opts.status ?? "active", createdAtMs: 1,
+    });
+  }
   const engine = new DocumentEngine(logger);
   const realGate = new DocumentGate(engine, {}, logger);
   // INSTRUMENTED. The ordering test needs to observe that the gate is REACHED, not merely that
@@ -368,5 +379,84 @@ describe("DocumentInbound — append_only comes from the AGREED property", () =>
       NOW + 1,
     );
     expect(res).toMatchObject({ ok: true, admitted: true });
+  });
+});
+
+/**
+ * DOD-DOC-INBOUND-TERMINAL-1 — a refusal the sender can never fix must SETTLE their delivery.
+ *
+ * Found on the live daemon, not by a test. Miss_Chelly proposed document `662743b1…`, CELLO_Coder_1
+ * refused the proposal, and Miss_Chelly wrote into it anyway. That envelope has sat at
+ * `pendingSent: 1` ever since: the peer holds no such document, answers `document_unknown`, and
+ * because that is an `ok: false` result the router never sends an ack — so nothing ever settles it
+ * and the delivery worker redelivers it forever.
+ *
+ * The router's own comment names this exact failure ("an inbound path with no ack producer leaves
+ * the peer retrying until their document stalls at the unacked ceiling") and then produces an ack
+ * only on the `ok: true` path. The refusals below are the ones that path never covers.
+ *
+ * WHICH REFUSALS QUALIFY, and why the list is short. Two conditions, both required:
+ *   - TERMINAL — redelivering cannot change the answer. A stalled document is deliberately NOT on
+ *     this list: the stall is resolved by operator action, after which the very same redelivery
+ *     succeeds, so retrying there is the recovery mechanism rather than a leak.
+ *   - AUTHENTICATED — we verified the sender's own signature. An ack is a signed statement to a
+ *     named party; producing one for an unverified sender answers whoever reached the channel.
+ */
+describe("a TERMINAL refusal settles the sender's delivery instead of leaving it to retry forever", () => {
+  it("document_unknown is terminal, and names the envelope so an ack can settle it", async () => {
+    const f = newFixture({ noDocument: true });
+    const env = envelope();
+
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+
+    expect(res).toMatchObject({ ok: false, reason: "document_unknown", terminal: true });
+    // The envelope hash is what makes the ack settle THIS delivery rather than the sender's whole
+    // backlog. A terminal refusal that cannot name what it refused settles nothing.
+    expect((res as { envelopeHash?: string }).envelopeHash).toBe(documentEnvelopeHash(env));
+  });
+
+  it("a KILLED and a CLOSED document are terminal too — they will never accept this envelope", async () => {
+    for (const status of ["killed", "closed"] as const) {
+      const f = newFixture({ status });
+      const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+      expect(res, status).toMatchObject({ terminal: true });
+    }
+  });
+
+  it("VERIFIES BEFORE the document lookup — an unsigned envelope for an unknown document is not terminal", async () => {
+    // The ordering IS the property. If the lookup ran first, a party we never authenticated would
+    // get back a signed ack naming a document — so the bad signature must win over the missing
+    // document, not the other way round.
+    const f = newFixture({ noDocument: true, verify: () => false });
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+
+    expect(res).toMatchObject({ ok: false, reason: "document_signature_invalid" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+
+  it("a NON-PARTY sender is refused but NOT settled — an ack would confirm the document exists", async () => {
+    // This one is terminal in the plain sense (a third party will never be a party to this
+    // document) and still must not be acked: the refusal deliberately withholds the peer's
+    // identity for exactly this reason, and a signed ack naming the document_id gives back the
+    // existence answer the refusal was written to hide.
+    const f = newFixture();
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: "someone-else" })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+
+  it("a STALLED document is NOT terminal — the retry is how it recovers once the operator acts", async () => {
+    // The distinction this whole list turns on. `killed` and `closed` are decisions; `stalled` is a
+    // condition, and clearing it makes the very same redelivery land. Settling the sender's
+    // delivery here would throw away the update that the operator is about to unblock.
+    const f = newFixture({ status: "stalled" });
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+
+    expect(res).toMatchObject({ ok: false, reason: "document_stalled" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
   });
 });

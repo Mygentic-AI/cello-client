@@ -9,16 +9,18 @@
  * The order, and what each step is protecting:
  *
  *   1. DECODE          — refuse malformed input before any of it is interpreted.
- *   2. KNOW the document — an envelope for a document we do not hold has no context to judge it in.
- *   3. SENDER is the peer — a document is a pairwise agreement; a third party's envelope does not
- *                          belong here at all, and is not a rejection case (there is no
- *                          collaboration to supersede).
- *   4. VERIFY the signature — BEFORE the gate. The gate runs pluggable rules, and eventually
- *                          screening, over peer-controlled bytes; running them first means those
- *                          rules process input from a party we have not authenticated. An
- *                          unverified envelope is also not REJECTED — a rejection is a protocol act
+ *   2. VERIFY the signature — FIRST, because everything after it is either a judgement about a
+ *                          party or an ANSWER to one. It needs nothing but the envelope: the agent
+ *                          id is the Ed25519 public key (M14-D5). It ran at step 4 until a live
+ *                          defect forced it earlier — see `terminal` on InboundResult. An
+ *                          unverified envelope is also not REJECTED: a rejection is a protocol act
  *                          that presumes an authenticated counterparty, and writing a 0x05 leaf
  *                          naming an unauthenticated sender puts their claim in our permanent log.
+ *   3. KNOW the document — an envelope for a document we do not hold has no context to judge it in.
+ *                          TERMINAL: we will never hold it, so the sender is told and stops.
+ *   4. SENDER is the peer — a document is a pairwise agreement; a third party's envelope does not
+ *                          belong here at all, and is not a rejection case (there is no
+ *                          collaboration to supersede). Refused SILENTLY — see `terminal`.
  *   5. CHAIN link      — a redelivery is benign and must still ACK (delivery retries by design, and
  *                          a redelivery that goes unacked never lets the sender settle it); a gap
  *                          or a fork refuses.
@@ -52,7 +54,25 @@ export type InboundResult =
       /** The signed `document_rejection` to put on the wire. Absent when this refusal is a repeat. */
       rejectionWire?: Uint8Array;
     }
-  | { ok: false; reason: string; detail: string };
+  | {
+      ok: false;
+      reason: string;
+      detail: string;
+      /**
+       * TERMINAL — redelivering this envelope can never change the answer, and the sender has been
+       * AUTHENTICATED, so their delivery should be settled with a rejection ack rather than left
+       * outstanding. Absent means "stay silent and let them retry".
+       *
+       * Both halves are load-bearing. Without terminal, a peer who refused the proposal is
+       * redelivered to forever (found live). Without authentication, the ack answers whoever
+       * reached the channel — which is why `document_sender_not_peer` is deliberately NOT terminal
+       * even though it never becomes acceptable: an ack naming the document_id would hand back the
+       * existence answer that refusal withholds on purpose.
+       */
+      terminal?: true;
+      /** Required with `terminal` — an ack that cannot name the envelope settles nothing. */
+      envelopeHash?: string;
+    };
 
 export interface DocumentInboundDeps {
   store: DocumentStore;
@@ -137,12 +157,51 @@ export class DocumentInbound {
 
     const envelopeHash = documentEnvelopeHash(env);
 
-    // 2. KNOW the document.
+    // 2. VERIFY the signature — BEFORE the document is even looked up.
+    //
+    // It used to run at step 4, after the lookup and the peer check, and the header's reasoning for
+    // that was sound as far as it went: verify before the GATE, so pluggable rules never process
+    // bytes from a party we have not authenticated. Verifying EARLIER satisfies that strictly more.
+    //
+    // What forced the move is `terminal` below. A terminal refusal is answered with a SIGNED ack
+    // addressed to `sender_agent_id`, and producing one for a sender we have not authenticated
+    // would answer whoever reached the channel rather than a known peer. Authentication has to
+    // precede the first refusal we are willing to answer, and `document_unknown` is now one.
+    //
+    // It needs nothing from the document: the agent id IS the Ed25519 public key (M14-D5), so this
+    // is self-contained on the envelope. The cost is an Ed25519 verify (~50µs) on envelopes for
+    // documents we do not hold — paid to avoid a delivery that never settles.
+    if (!this.#d.verifySignature(env.sender_agent_id, buildDocumentUpdateTbs(env), env.signature)) {
+      this.#d.logger.error("document.inbound.signature_invalid", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        envelopeHash,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_signature_invalid",
+        detail:
+          `the envelope claims to come from ${env.sender_agent_id} but its signature does not ` +
+          `verify against that agent — nothing was recorded`,
+      };
+    }
+
+    // 3. KNOW the document.
     const doc = this.#d.store.getDocument(ownerAgentId, env.document_id);
     if (!doc) {
+      // TERMINAL. We hold no such document and never will — this is what the far side of a REFUSED
+      // proposal looks like, and it was leaving the sender redelivering forever: the router only
+      // acks `ok: true` results, so an `ok: false` refusal settled nothing and the delivery worker
+      // re-sent on every tick. Observed live on `662743b1…`, stuck at `pendingSent: 1`.
+      //
+      // Safe to answer because step 2 authenticated the sender, and it discloses nothing they do
+      // not already have: they authored an envelope for this document_id, and the answer is "no".
       return {
         ok: false,
         reason: "document_unknown",
+        terminal: true,
+        envelopeHash,
         detail: `no document ${env.document_id.slice(0, 16)}… for this agent`,
       };
     }
@@ -153,9 +212,14 @@ export class DocumentInbound {
     // codebase was reintroducing it, and a killed document is defined by LIFECYCLE-1 as one that
     // stops accepting.
     if (doc.status === "killed" || doc.status === "closed") {
+      // TERMINAL, and for the same reason `document_stalled` below is NOT: these are DECISIONS.
+      // Nothing the sender does makes a killed or closed document accept this envelope, so leaving
+      // their delivery outstanding buys nothing and costs a redelivery per tick, forever.
       return {
         ok: false,
         reason: doc.status === "killed" ? "document_killed" : "document_closed",
+        terminal: true,
+        envelopeHash,
         detail:
           doc.status === "killed"
             ? "this document was ended locally and no longer accepts updates"
@@ -185,23 +249,6 @@ export class DocumentInbound {
         // reaching the channel with a guessed or leaked document_id would otherwise learn who the
         // owner collaborates with. The full detail is in the warn above, where it belongs.
         detail: "you are not a party to this document",
-      };
-    }
-
-    // 4. VERIFY, before the gate. See the header.
-    if (!this.#d.verifySignature(env.sender_agent_id, buildDocumentUpdateTbs(env), env.signature)) {
-      this.#d.logger.error("document.inbound.signature_invalid", {
-        documentId: env.document_id,
-        senderAgentId: env.sender_agent_id,
-        envelopeHash,
-        correlationId,
-      });
-      return {
-        ok: false,
-        reason: "document_signature_invalid",
-        detail:
-          `the envelope claims to come from ${env.sender_agent_id} but its signature does not ` +
-          `verify against that agent — nothing was recorded`,
       };
     }
 

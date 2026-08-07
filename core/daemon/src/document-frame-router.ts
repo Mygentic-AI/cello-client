@@ -382,6 +382,27 @@ export class DocumentFrameRouter {
             });
           });
         }
+        // A TERMINAL REFUSAL IS ALSO AN ANSWER. Everything above hangs off `res.ok`, and that was
+        // the whole bug: a refusal the sender can never fix produced no ack at all, so their
+        // delivery never settled and the worker redelivered it on every tick, forever. The comment
+        // twenty lines up already named this failure mode and the code only covered the ok path.
+        //
+        // `terminal` is set exactly where redelivery cannot change the outcome AND the sender was
+        // authenticated first — see InboundResult. A non-terminal refusal deliberately stays
+        // silent, because there the retry IS the recovery path.
+        if (!res.ok && res.terminal === true && res.envelopeHash !== undefined) {
+          void this.#d.sendAck(ownerAgentId, content, {
+            envelopeHash: res.envelopeHash,
+            admitted: false,
+            rejectionReason: res.reason,
+            correlationId,
+          }).catch((err: unknown) => {
+            this.#d.logger.warn("document.ack.send_threw", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
         return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
       }
       if (kind === "proposal") {
