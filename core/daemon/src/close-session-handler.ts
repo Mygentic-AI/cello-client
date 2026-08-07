@@ -18,6 +18,7 @@ import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
+import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import type { Logger, SessionRecord } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { validateSessionName } from "./session-name.js";
@@ -40,6 +41,16 @@ export interface CloseSessionDeps {
   sendOver: (agentName: string, frame: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string }>;
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
   openVisitingConnection: (agentName: string, agentKeyProvider: KeyProvider, agentPubkeyHex: string, endpoint: DirectoryEndpoint, correlationId: string, nodeId: string) => { mgr: SignalingManager; stop: (reason: string) => Promise<void> };
+  /**
+   * Ask the directory where an agent is homed RIGHT NOW. Needed because `crossNodeBrokerBySession`
+   * is in-memory and a restart empties it — and a restart is what makes a session interrupted.
+   */
+  runDiscoveryLookup?: (
+    signaling: SignalingManager,
+    targetHex: string,
+    timeoutMs: number,
+    correlationId: string,
+  ) => Promise<DiscoveryOutcome>;
   /** sessionId → the broker node id that brokered this cross-node session. */
   crossNodeBrokerBySession: Map<string, string>;
   // ── the seal cluster (seal-coordinator.ts) ──
@@ -60,10 +71,24 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     resolveConsortiumRoster,
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, signalingFor, sendOver, waitForSignalingConnected,
-    openVisitingConnection, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
+    openVisitingConnection, runDiscoveryLookup, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
     recoverParkedContent,
   } = deps;
+
+  /**
+   * How long the seal path waits to learn where the counterparty is homed.
+   *
+   * DELIBERATELY SHORT, and not the 10s the session negotiator uses. This lookup is a point-read of
+   * replicated presence — milliseconds against a healthy directory — and it sits in front of EVERY
+   * interrupted close, including same-node ones that need no dial at all. Borrowing the negotiator's
+   * 10s added ten seconds to every such close and pushed the unilateral-escalation tests past their
+   * budget: the seal did not break, it just arrived too late to matter.
+   *
+   * A directory that cannot answer within this window is one we would not want to wait on anyway —
+   * the close proceeds on the home stream, exactly as it did before the lookup existed.
+   */
+  const SEAL_DISCOVERY_TIMEOUT_MS = 2_500;
 
   /**
    * Open a transient visiting connection to the node that BROKERED this session, when that is not
@@ -85,9 +110,39 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     agentName: string,
     sessionId: string,
     correlationId: string,
+    /** Only set on the RETRY, after a home-stream attempt already failed — see the call site. */
+    discoverVia?: { counterpartyPubkeyHex: string },
   ): Promise<{ stop: (reason: string) => Promise<void> } | null> {
-    const brokerNodeForSeal = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
-    // Same-node session: no entry here, and the home stream is already the right one.
+    let brokerNodeForSeal = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
+
+    // THE MAP DOES NOT SURVIVE THE RESTART THAT CREATES THE CONDITION. It is in-memory, populated
+    // while a session is brokered, and emptied by a daemon restart — which is exactly what flips a
+    // live session to `interrupted`. Gating on it alone meant the dial never fired for the case it
+    // was added for (shipped as 0.0.140 and disproved against real stranded sessions the same hour).
+    //
+    // The answer is NOT to persist the broker. The node that brokered the session hours ago need
+    // not be where the counterparty lives now — agents re-home. What matters at seal time is where
+    // they are NOW, which any directory can answer from replicated presence. Classified by the same
+    // `classifyOnlineResult` the outbound path uses, so "same node" and "offline" mean here exactly
+    // what they mean there.
+    if (!brokerNodeForSeal && discoverVia && runDiscoveryLookup) {
+      const sig = signalingFor(agentName);
+      if (sig) {
+        const disc = await runDiscoveryLookup(sig, discoverVia.counterpartyPubkeyHex, SEAL_DISCOVERY_TIMEOUT_MS, correlationId);
+        if (disc.kind === "result") {
+          const action = classifyOnlineResult(disc.state, disc.owningNodeIds, sig.currentDirectoryNodeId ?? null);
+          // Only `cross_node` warrants a dial. `same_node` already has the right stream, and
+          // `offline` is a real answer — dialling their node cannot conjure a stream they do not have.
+          if (action.kind === "cross_node") brokerNodeForSeal = action.owningNodeId;
+        } else {
+          // A lookup that did not answer is the pre-fix behaviour, not a new failure: proceed on the
+          // home stream. Logged so it stays distinguishable from "the counterparty is on our node".
+          logger.warn("session.seal.broker.discovery_failed", { agentName, sessionId, kind: disc.kind, correlationId });
+        }
+      }
+    }
+
+    // Same-node session, or nowhere to dial: the home stream is already the right one.
     if (!brokerNodeForSeal) return null;
 
     const sealKp = getKeyProvider(agentName);
@@ -375,7 +430,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // counterparty was online — the frames were pushed to a stream the broker did not hold.
       let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
       try {
+        // Pre-dial ONLY from memory. This costs nothing when the map is empty, so the seal waiter
+        // still registers immediately — a bilateral seal that lands promptly must not be missed
+        // because we were off looking something up.
         sealBrokerConn = await openSealBrokerConnection(record.agent_name, sessionId, correlationId);
+        const first = await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
+
+        // DISCOVER-AND-RETRY, and only on the one reason that discovery can actually fix. After a
+        // restart the broker map is empty, so the attempt above went out on the home stream and the
+        // brokering node had no stream for the counterparty to push to. Asking where they are NOW
+        // and dialling there is the repair — paid for only on the path that just failed, never on
+        // the happy path, and never delaying the waiter.
+        const counterparty = (record as { counterparty_pubkey?: string }).counterparty_pubkey;
+        if (first.ok || first.reason !== "seal_interrupted_counterparty_unavailable" || !counterparty || sealBrokerConn) {
+          return first;
+        }
+        sealBrokerConn = await openSealBrokerConnection(
+          record.agent_name, sessionId, correlationId, { counterpartyPubkeyHex: counterparty },
+        );
+        if (!sealBrokerConn) return first;
+        logger.info("session.seal.broker.retry_after_discovery", { agentName: record.agent_name, sessionId, correlationId });
         return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
       } finally {
         // Release the transient connection; the seal result stands either way.
@@ -406,6 +480,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // no entry here and use the home stream unchanged.
       let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
       try {
+        // Memory only, deliberately. An ACTIVE session has not been through the restart that
+        // empties the broker map, so the entry is there when it is needed — and a lookup here would
+        // sit in front of the waiter registration two lines below, which is what must not happen.
         sealBrokerConn = await openSealBrokerConnection(record.agent_name, sessionId, correlationId);
         // M7 DOD-SPINE-7: relay-mediated bilateral seal. Submit our SEAL ctrl leaf to the
         // relay witness; when the counterparty ALSO closes, the relay's #maybeProcessSeal

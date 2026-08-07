@@ -2968,6 +2968,10 @@ async function startDaemonHoldingLock(
     sendOver,
     waitForSignalingConnected,
     openVisitingConnection,
+    // The seal path's fallback when crossNodeBrokerBySession is empty — which it is after every
+    // restart, and a restart is what makes a session interrupted. Without this wired the handler
+    // silently keeps the pre-0.0.141 behaviour and its unit tests still pass, because they inject it.
+    runDiscoveryLookup,
     crossNodeBrokerBySession,
     sealKey,
     sealInterruptedInProgress,
