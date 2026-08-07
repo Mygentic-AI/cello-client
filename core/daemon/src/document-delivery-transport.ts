@@ -245,7 +245,12 @@ export function createDocumentDeliveryTransport(
       // this adapter opened and walked away from is a live node the operator never started, and
       // the sealed record the design exists to produce is never produced. A session we REUSED is
       // not ours to close: its owner decides when that conversation ends.
-      if (sessionOpened) {
+      // PARKED CONTENT CANNOT BE ACKED, so waiting for one is spending the pass budget on a
+      // certainty. `delivered: false` means the peer was offline and the relay took the frame; the
+      // ack comes whenever they next come online, which is not within any grace. Waiting here also
+      // fired `ack_grace_expired` on a designed, benign state — a warning on the normal case.
+      const answerPossible = sent.delivered !== false;
+      if (sessionOpened && answerPossible && input.ackGraceMs > 0) {
         // WAIT FOR THE ANSWER BEFORE TEARING DOWN THE CHANNEL IT COMES BACK ON.
         //
         // The seal destroys the session, and the teardown drops content still held for ordering.
@@ -255,7 +260,10 @@ export function createDocumentDeliveryTransport(
         // A REUSED session is untouched by this — it is not ours to close, so its owner keeps it
         // alive and the ack has all the time it needs. That asymmetry is exactly why every spine
         // enforcer passed: they open a conversation first, so the worker always reused one.
-        const acked = await deps.awaitAck(envelope.envelopeHash, DELIVERY_ACK_GRACE_MS);
+        // The SMALLER of this envelope's share and the standard grace. The caller spends a budget
+        // across the whole sweep pass; see DELIVERY_ACK_GRACE_BUDGET_MS.
+        const graceMs = Math.min(DELIVERY_ACK_GRACE_MS, input.ackGraceMs);
+        const acked = await deps.awaitAck(envelope.envelopeHash, graceMs);
         if (!acked) {
           // NOT a failure of the send — the content left and the peer may still answer later. Said
           // out loud because a seal that discards a held ack is otherwise invisible, and this is
@@ -264,10 +272,15 @@ export function createDocumentDeliveryTransport(
             documentId,
             envelopeHash: envelope.envelopeHash,
             sessionId,
-            graceMs: DELIVERY_ACK_GRACE_MS,
+            graceMs,
             correlationId,
           });
         }
+      }
+      // SEAL WHAT WE OPENED — unconditionally, whether or not we waited. The wait is about giving
+      // an answer time to arrive; the seal is about never leaving an autonomous session running.
+      // Making the seal conditional on the wait would trade one defect for a worse one.
+      if (sessionOpened) {
         await deps.sealSession(deps.agentName, sessionId, correlationId);
       }
 

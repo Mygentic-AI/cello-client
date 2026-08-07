@@ -3575,7 +3575,16 @@ async function startDaemonHoldingLock(
         // returns no rows and the wait times out on every delivery.
         awaitAck: async (envelopeHash, timeoutMs) => {
           const ownerKey = documentOwnerKeyFor(agentName);
-          if (ownerKey === null) return false;
+          if (ownerKey === null) {
+            // NOT "the peer stayed silent". `false` means the grace expired with no answer, and the
+            // caller logs exactly that — `graceMs: 10000`, a claim that ten seconds elapsed when
+            // none did, about a peer that was never asked. A delivery worker running for an agent
+            // whose own pubkey cannot be resolved is a wiring bug, and it says so here rather than
+            // arriving downstream dressed as a fact about the counterparty. Same distinction
+            // `abandoned_at` exists to keep: giving up is our decision, not evidence about them.
+            logger.error("document.delivery.ack_wait_unwired", { agentName, envelopeHash });
+            return false;
+          }
           return documentLayer.awaitAck(ownerKey, envelopeHash, timeoutMs);
         },
     });

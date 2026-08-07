@@ -5,6 +5,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   createDocumentDeliveryTransport,
+  DELIVERY_ACK_GRACE_MS,
   type DocumentTransportDeps,
 } from "../document-delivery-transport.js";
 import type { DocumentEnvelopeRow } from "../document-store.js";
@@ -75,6 +76,8 @@ const deliverInput = (over: Partial<Parameters<ReturnType<typeof createDocumentD
   documentId: DOC,
   envelope: envelope as DocumentEnvelopeRow,
   correlationId: "corr-1",
+  // The pass budget the worker hands down. Generous by default; individual tests shrink it.
+  ackGraceMs: 10_000,
   ...over,
 });
 
@@ -268,5 +271,54 @@ describe("a session the worker OPENED is not sealed until the peer has answered"
     // and this asymmetry is exactly why the spine enforcers never saw the defect.
     expect(waited).toBe(0);
     expect(f.sealed).toEqual([]);
+  });
+});
+
+describe("the ack grace is a BUDGET the caller controls, not a fixed cost per envelope", () => {
+  it("passes the ENVELOPE HASH and the granted grace to the waiter", async () => {
+    // Pins the ARGUMENTS, not just that a wait happened. Both have been wrong in this feature
+    // before — the owner key vs the agent name, the sender id vs the owner key — and a stubbed
+    // seam that asserts nothing about what flows through it cannot catch either.
+    const calls: Array<[string, number]> = [];
+    const t = newTransport({
+      awaitAck: async (hash, ms) => {
+        calls.push([hash, ms]);
+        return true;
+      },
+    });
+    await t.transport.deliver(deliverInput({ ackGraceMs: 4_000 }));
+    expect(calls).toEqual([[envelope.envelopeHash, 4_000]]);
+  });
+
+  it("waits for the SMALLER of the standard grace and what the pass has left", async () => {
+    const calls: number[] = [];
+    const t = newTransport({ awaitAck: async (_h, ms) => { calls.push(ms); return true; } });
+    await t.transport.deliver(deliverInput({ ackGraceMs: 500_000 }));
+    expect(calls).toEqual([DELIVERY_ACK_GRACE_MS]);
+  });
+
+  it("does NOT wait once the pass budget is spent — and STILL seals", async () => {
+    // The sweep must not stall behind whoever exhausted the budget. But the seal is unconditional:
+    // an autonomous session left running is the thing the seal exists to prevent, and trading the
+    // wait for that would be a worse defect than the one being fixed.
+    let waited = 0;
+    const t = newTransport({ awaitAck: async () => { waited += 1; return true; } });
+    await t.transport.deliver(deliverInput({ ackGraceMs: 0 }));
+    expect(waited).toBe(0);
+    expect(t.sealed).toEqual(["opened-session"]);
+  });
+
+  it("does NOT wait for PARKED content — an offline peer cannot answer within any grace", async () => {
+    let waited = 0;
+    const t = newTransport({
+      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
+      awaitAck: async () => { waited += 1; return true; },
+    });
+    await t.transport.deliver(deliverInput());
+    // Waiting here spent the budget on a certainty and fired ack_grace_expired on a designed,
+    // benign state — a warning that cried wolf on the normal offline-peer case.
+    expect(waited).toBe(0);
+    expect(t.events.some((e) => e.event === "document.delivery.ack_grace_expired")).toBe(false);
+    expect(t.sealed).toEqual(["opened-session"]);
   });
 });

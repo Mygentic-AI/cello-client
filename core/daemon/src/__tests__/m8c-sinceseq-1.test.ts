@@ -375,6 +375,41 @@ describe("DOD-DOC-SINCESEQ-1 — a document frame is not a hole in the catch-up 
     ).toBeUndefined();
   });
 
+  it("stops at an UNREADABLE ROW even when the tree is dense — pins LEAF KIND, not tree extent", async () => {
+    // THE CONTROL THAT ACTUALLY CONTROLS, and the reason the other negative case is not enough.
+    //
+    // Review caught this: with no leaves seeded at all, `seq < leafKinds.length` — "any index the
+    // tree has is not a hole" — passes both the positive case and the sparse negative one. That
+    // implementation jumps straight over an undecryptable `msg` leaf, reintroducing the F8 defect
+    // the walk's own comment block exists to explain, and violating the DoD's constraint verbatim:
+    // key on the LEAF KIND, never on row-absence.
+    //
+    // Here the tree is DENSE — a leaf at every index — and index 1 is a `msg` leaf whose transcript
+    // row is missing, which is exactly what an undecryptable message looks like. Only an
+    // implementation that reads the KIND can tell it from the document leaf in the test above.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = "1".repeat(64);
+    insertSessionRow("alice", s, "cp");
+    seed("alice", s, 0, "received", "m0");
+    // No transcript row at 1 — the row nobody could read.
+    seed("alice", s, 2, "received", "m2");
+    seedLeaf("alice", s, 0, "msg");
+    seedLeaf("alice", s, 1, "msg"); // a MESSAGE leaf, not a document one — must still block
+    seedLeaf("alice", s, 2, "msg");
+
+    await client.send("cello_receive", { session_id: s, since_seq: 0 });
+    const inbox = (await client.send("cello_check_notifications", { scope: "current" })) as R;
+    const agents = inbox["agents"] as Array<{ agent: string; unread: Array<{ session_id: string }> }>;
+    expect(
+      agents[0].unread.find((u) => u.session_id === s),
+      "a msg leaf with no readable row was skipped — the walk is keying on tree extent, not leaf kind",
+    ).toBeDefined();
+  });
+
   it("STILL stops at a genuinely absent index — an unreadable row is not a document leaf", async () => {
     // The negative control, and the reason the fix keys on LEAF KIND rather than row-absence.
     // Absent-and-unreadable and absent-because-not-a-message look identical from the transcript, so

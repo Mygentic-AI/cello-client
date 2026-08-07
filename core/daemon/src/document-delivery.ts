@@ -88,6 +88,18 @@ export interface DocumentDeliveryTransport {
     envelope: DocumentEnvelopeRow;
     sessionHint?: string;
     correlationId: string;
+    /**
+     * How long THIS envelope may hold an opened session waiting for the peer's ack.
+     *
+     * A BUDGET SPENT ACROSS THE PASS, not a per-envelope allowance. The wait is awaited inside
+     * three nested sequential loops — agents, then documents, then envelopes — so a fixed 10s each
+     * meant a backlog of 100 to one silent peer could burn ~1000 seconds during which NO other
+     * agent's documents were swept at all. And a peer that never acks is the ordinary case during a
+     * version rollout, which this repo does continuously because both sides float `latest`.
+     *
+     * Zero means do not wait. The seal still happens; only the grace is skipped.
+     */
+    ackGraceMs: number;
   }): Promise<
     | {
         ok: true;
@@ -122,6 +134,19 @@ export interface DocumentDeliveryTransport {
  * happen at any moment — an uncapped curve leaves a peer that returned after a long absence waiting
  * hours for a delivery that has been ready the whole time.
  */
+/**
+ * Total ack-grace one sweep pass may spend, across every agent, document and envelope in it.
+ *
+ * The wait exists so a session we opened is not torn down before the peer's answer arrives. It is
+ * capped as a PASS budget because the loops it sits inside are sequential: a per-envelope allowance
+ * meant one silent peer with a backlog could hold the sweep for the better part of an hour, and the
+ * only symptom would be other agents' documents quietly not syncing.
+ *
+ * 30s ≈ three full graces. Enough for the ordinary case (one or two opened sessions per pass, ack
+ * back in well under a second) without letting an unresponsive peer own the pass.
+ */
+export const DELIVERY_ACK_GRACE_BUDGET_MS = 30_000;
+
 export const DELIVERY_BACKOFF_MS = [1_000, 5_000, 30_000, 120_000, 600_000] as const;
 export const DELIVERY_BACKOFF_CAP_MS = DELIVERY_BACKOFF_MS[DELIVERY_BACKOFF_MS.length - 1];
 
@@ -221,6 +246,10 @@ export class DocumentDelivery {
       senderAgentId?: string;
     },
   ): Promise<DeliveryTickResult> {
+    // THE PASS BUDGET. Spent down by every envelope that opens its own session and waits for an
+    // ack; once it is gone the rest of the pass delivers without waiting rather than stalling
+    // behind whoever exhausted it. See DELIVERY_ACK_GRACE_BUDGET_MS.
+    let graceBudgetRemainingMs = DELIVERY_ACK_GRACE_BUDGET_MS;
     // Minted once per pass and threaded through every event, so an operator can tie a failure back
     // to the lookup that preceded it and the session that carried it. Delivery is precisely the
     // async multi-step flow the convention exists for: lookup, dial, deliver, ack — across ticks
@@ -314,11 +343,16 @@ export class DocumentDelivery {
           nowMs + backoffFor(envelope.attempts ?? 0),
         );
         let outcome: Awaited<ReturnType<DocumentDeliveryTransport["deliver"]>>;
+        const graceStartedAt = Date.now();
         try {
           outcome = await this.#transport.deliver({
             peerAgentId,
             documentId,
             envelope,
+            // WHAT IS LEFT OF THE PASS BUDGET, never a fresh allowance. One unresponsive peer can
+            // exhaust it, and then every later envelope in the sweep is delivered without a wait
+            // rather than the sweep stalling behind it.
+            ackGraceMs: Math.max(0, graceBudgetRemainingMs),
             // Per DOCUMENT. One hint applied to every envelope in the pass refused every OTHER
             // document's delivery — their peer's active sessions cannot contain this document's
             // session — so an unrelated update failed and backed off, citing a session the
@@ -334,6 +368,12 @@ export class DocumentDelivery {
             reason: "document_delivery_threw",
             detail: err instanceof Error ? err.message : String(err),
           };
+        } finally {
+          // SPEND WHAT THE CALL ACTUALLY TOOK, not the allowance it was offered. The dial and the
+          // seal share the same await and cannot be timed apart from here, so the whole call is
+          // charged — the conservative direction, since it can only exhaust the budget sooner,
+          // never let one envelope overrun it.
+          graceBudgetRemainingMs -= Date.now() - graceStartedAt;
         }
 
         if (outcome.ok && outcome.admitted === null) {

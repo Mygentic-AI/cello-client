@@ -2874,6 +2874,13 @@ export class SessionNodeManager {
     if (unreadCount > 0) {
       this.#logger.info("session.receive.buffer.evicted", { sessionId, agentName, unreadCount });
     }
+    // READ BEFORE THE EVICTION. The held-content loss report below wants the tree size, and asking
+    // for it AFTER this line is not a read — `getSessionTree` misses the cache, reloads the whole
+    // leaf table from disk, and puts the tree straight back into `#trees`, so the diagnostic
+    // resurrects the state its own teardown exists to drop. Worse, that reload goes through
+    // `#requireAgentId`, which THROWS for a retired agent — and it would throw here, before the
+    // held content and high-water map below are cleared, on the abnormal path only.
+    const treeSizeBeforeEviction = this.#trees.get(key)?.size() ?? null;
     this.#trees.delete(key);
     this.#receivedContent.delete(key);
     // CELLO-M7-MSG-001: cancel any armed TTF timers so a torn-down session never
@@ -2908,7 +2915,10 @@ export class SessionNodeManager {
         sessionId,
         count: strandedHolds.size,
         canonicalSeqs: [...strandedHolds.keys()].sort((a, b) => a - b),
-        treeSize: this.getSessionTree(agentName, sessionId).size(),
+        // NULL when the tree was not cached at teardown. Honest, and cheap — reloading the leaf
+        // table to fill in a diagnostic field is not worth a disk read on every teardown, let
+        // alone the cache resurrection it caused.
+        treeSize: treeSizeBeforeEviction,
       });
     }
     this.#heldContent.delete(key);
