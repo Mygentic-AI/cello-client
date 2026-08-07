@@ -156,10 +156,13 @@ function discoveryHarness(opts: {
   firstAttemptSucceeds?: boolean;
 }) {
   const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
-  const stop = vi.fn(async () => {});
-  const openVisitingConnection = vi.fn(() => ({ mgr: {}, stop }));
-  const runDiscoveryLookup = vi.fn(async () => opts.discovery);
+  // Identifiable so a test can assert WHICH stream the seal went out on — the whole point here.
+  const VISITING_MGR = { id: "visiting-connection-to-their-node" };
+  const sentVia: unknown[] = [];
   let sealAttempts = 0;
+  const stop = vi.fn(async () => {});
+  const openVisitingConnection = vi.fn(() => ({ mgr: VISITING_MGR, stop }));
+  const runDiscoveryLookup = vi.fn(async () => opts.discovery);
 
   const crossNodeBrokerBySession = new Map<string, string>();
   if (opts.brokeredBy) crossNodeBrokerBySession.set(`${AGENT}:${SESSION}`, opts.brokeredBy);
@@ -197,15 +200,17 @@ function discoveryHarness(opts: {
     ],
     // The home-stream attempt fails the way the real one does after a restart; the retry (which
     // only happens once a broker connection is open) succeeds.
-    handleSealInterruptedFlow: async () => {
+    handleSealInterruptedFlow: async (_s: string, _r: unknown, _c: string, _m: string, via?: unknown) => {
       sealAttempts += 1;
+      // WHICH STREAM the flow was told to use — null means the agent's home stream.
+      sentVia.push(via ?? null);
       if (opts.firstAttemptSucceeds || sealAttempts > 1) return { ok: true, sealed_root: "ff".repeat(32) };
       return { ok: false, reason: "seal_interrupted_counterparty_unavailable" };
     },
     handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
   } as never);
 
-  return { close: handlers.get("cello_close_session")!, openVisitingConnection, runDiscoveryLookup, stop, attempts: () => sealAttempts };
+  return { close: handlers.get("cello_close_session")!, openVisitingConnection, runDiscoveryLookup, stop, attempts: () => sealAttempts, sentVia, VISITING_MGR };
 }
 
 /**
@@ -345,5 +350,47 @@ describe("the discovery lookup is a repair, never a pre-flight", () => {
     expect(h.attempts()).toBe(1);
     expect(res.ok).toBe(false);
     expect(res.reason).toBe("seal_interrupted_counterparty_unavailable");
+  });
+});
+
+/**
+ * DIALLING THEIR NODE IS ONLY HALF OF IT — THE REQUEST MUST BE SENT THERE.
+ *
+ * A visiting connection makes us REACHABLE FROM the far node. The ACTIVE seal needs exactly that,
+ * because the broker pushes seal frames TO us. This flow needs the opposite direction: WE send a
+ * seal_interrupted_request and wait for their ack.
+ *
+ * 0.0.141 opened the connection and then sent on the HOME stream anyway. Our own node holds no
+ * stream for a counterparty homed elsewhere, so it logged "target offline", answered nothing, and
+ * the 30s wait expired — the identical symptom, with the discovery and the dial both working. Proved
+ * live: discovery said gcp-usc1, the dial to gcp-usc1 succeeded, and their daemon logged no inbound
+ * request at all.
+ */
+describe("the retry is sent over the visiting connection", () => {
+  it("sends the FIRST attempt on the home stream and the RETRY on their node", async () => {
+    const h = discoveryHarness({
+      discovery: { kind: "result", state: "online", owningNodeIds: [BROKER] },
+      homeNodeId: "gcp-euw1",
+    });
+
+    await h.close({ session_id: SESSION }, "conn-1");
+
+    expect(h.attempts()).toBe(2);
+    // Attempt 1: no override — the ordinary home-stream path, unchanged.
+    expect(h.sentVia[0], "the first attempt must use the home stream").toBeNull();
+    // Attempt 2: the connection we just opened to the counterparty's node.
+    expect(h.sentVia[1], "the retry must go out on the visiting connection").toBe(h.VISITING_MGR);
+  });
+
+  it("never sends over a visiting connection when none was opened", async () => {
+    // Same-node: there is nothing to dial and the home stream is already correct.
+    const h = discoveryHarness({
+      discovery: { kind: "result", state: "online", owningNodeIds: ["gcp-euw1"] },
+      homeNodeId: "gcp-euw1",
+    });
+
+    await h.close({ session_id: SESSION }, "conn-1");
+
+    expect(h.sentVia.every((v) => v === null)).toBe(true);
   });
 });

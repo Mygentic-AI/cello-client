@@ -61,7 +61,7 @@ export interface CloseSessionDeps {
   /** The verified consortium roster, re-resolved at ceremony time. */
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
   // ── the two seal-initiation flows (seal-flows.ts) ──
-  handleSealInterruptedFlow: (sessionId: string, record: SessionRecord, correlationId: string, merkleRootAtInterruption: string) => Promise<SealFlowResult>;
+  handleSealInterruptedFlow: (sessionId: string, record: SessionRecord, correlationId: string, merkleRootAtInterruption: string, via?: SignalingManager) => Promise<SealFlowResult>;
   handleActiveSealFlow: (sessionId: string, record: SessionRecord, correlationId: string) => Promise<ActiveSealResult>;
 }
 
@@ -112,7 +112,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     correlationId: string,
     /** Only set on the RETRY, after a home-stream attempt already failed — see the call site. */
     discoverVia?: { counterpartyPubkeyHex: string },
-  ): Promise<{ stop: (reason: string) => Promise<void> } | null> {
+  ): Promise<{ mgr: SignalingManager; stop: (reason: string) => Promise<void> } | null> {
     let brokerNodeForSeal = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
 
     // THE MAP DOES NOT SURVIVE THE RESTART THAT CREATES THE CONDITION. It is in-memory, populated
@@ -428,7 +428,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // This branch sends the same seal frames and used to send them without the dial, so an
       // interrupted close between two agents on different nodes timed out on BOTH sides while each
       // counterparty was online — the frames were pushed to a stream the broker did not hold.
-      let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
+      let sealBrokerConn: { mgr: SignalingManager; stop: (reason: string) => Promise<void> } | null = null;
       try {
         // Pre-dial ONLY from memory. This costs nothing when the map is empty, so the seal waiter
         // still registers immediately — a bilateral seal that lands promptly must not be missed
@@ -450,7 +450,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         );
         if (!sealBrokerConn) return first;
         logger.info("session.seal.broker.retry_after_discovery", { agentName: record.agent_name, sessionId, correlationId });
-        return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption);
+        // OVER THE VISITING CONNECTION. Dialling their node is only half of it — the request must
+        // be SENT there too. Sent on the home stream it reaches our own node, which holds no stream
+        // for a counterparty homed elsewhere, logs "target offline" and answers nothing.
+        return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption, sealBrokerConn.mgr);
       } finally {
         // Release the transient connection; the seal result stands either way.
         if (sealBrokerConn) {
@@ -478,7 +481,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // transient visiting connection to the broker (seal-capable — openVisitingConnection now wires the
       // seal handlers) for the duration of the seal, then release it in finally. Same-node sessions have
       // no entry here and use the home stream unchanged.
-      let sealBrokerConn: { stop: (reason: string) => Promise<void> } | null = null;
+      let sealBrokerConn: { mgr: SignalingManager; stop: (reason: string) => Promise<void> } | null = null;
       try {
         // Memory only, deliberately. An ACTIVE session has not been through the restart that
         // empties the broker map, so the entry is there when it is needed — and a lookup here would

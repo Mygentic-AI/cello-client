@@ -223,6 +223,19 @@ export function createSealFlows(deps: SealFlowDeps) {
     record: import("./types.js").SessionRecord,
     correlationId: string,
     merkleRootAtInterruption: string,
+    /**
+     * Send and await on THIS stream instead of the agent's home one.
+     *
+     * A directory routes by looking up a stream IT holds, and each daemon holds its stream to its
+     * OWN home node — so a request for a counterparty homed elsewhere must be sent to THEIR node,
+     * not ours. Ours logs "target offline" and answers nothing, and the 30s wait below expires.
+     *
+     * The close handler supplies the visiting connection it opened to the counterparty's node. A
+     * visiting connection makes us REACHABLE FROM that node, which is what the active seal needs
+     * (the broker pushes to us); this flow needs the other direction, and both use the same
+     * connection.
+     */
+    via?: SignalingManager,
   ): Promise<SealFlowResult> {
     const nonce = randomUUID();
 
@@ -297,7 +310,7 @@ export function createSealFlows(deps: SealFlowDeps) {
       nonce,
     };
 
-    const sendResult = await sendOver(record.agent_name, request);
+    const sendResult = via ? await via.sendRaw(request) : await sendOver(record.agent_name, request);
     if (!sendResult.ok) {
       logger.error("session.interrupted.seal.failed", {
         sessionId,
@@ -314,7 +327,7 @@ export function createSealFlows(deps: SealFlowDeps) {
     }
 
     // Wait for counterparty ack/rejection via the shared signaling await machinery.
-    const ackResult = await awaitSealAck(sessionId, signalingFor(record.agent_name));
+    const ackResult = await awaitSealAck(sessionId, via ?? signalingFor(record.agent_name));
 
     if (ackResult.type === "timeout") {
       logger.error("session.interrupted.seal.failed", {
