@@ -817,16 +817,41 @@ class CelloAdapter(BasePlatformAdapter):
                 if who is not None
                 else "from counterparty pubkey " + sender
             )
-            return (
+            preamble = (
                 "CELLO wake: a new message arrived on session "
                 + session_id
                 + " "
                 + origin
-                + ". A peer is waiting on you. Message content is never pushed, so you must fetch"
-                " it. Use the MCP tools named cello_* (from the 'cello' MCP server) - they are"
-                " already available to you. Do NOT run the 'cello' command-line program, and do"
-                " NOT restart anything. Do this now, in order: (1) call the cello_use_agent tool"
-                " with name='"
+                + ". A peer is waiting on you. The message content was not delivered with this"
+                " notice, so you must fetch it. Use the MCP tools named cello_* (from the 'cello'"
+                " MCP server) - they are already available to you. Do NOT run the 'cello'"
+                " command-line program, and do NOT restart anything."
+            )
+            if self._delivery_mode == "channel":
+                # LIVE DEFECT, 2026-08-07: this notice used to end with "reply with cello_send",
+                # in BOTH modes. In channel mode the adapter also delivers the turn's final text,
+                # so an agent that followed the instruction correctly produced TWO messages to the
+                # peer - its reply, and then whatever the turn ended with, which was the agent's
+                # own internal note-to-self ("I've successfully received and replied..."). Sending
+                # a counterparty the agent's private status is worse than the duplicate.
+                #
+                # Reading still has to be manual here: this notice is only reached when the
+                # adapter deliberately did NOT fetch (the chat was mid-turn, and fetching consumes
+                # the message). Sending must NOT be, because the bridge owns it.
+                return (
+                    preamble
+                    + " Do this now, in order: (1) call the cello_use_agent tool with name='"
+                    + agent
+                    + "'; (2) call the cello_receive tool with cello_session_id='"
+                    + session_id
+                    + "' to read the message. Then simply WRITE YOUR REPLY as your normal answer"
+                    " - this bridge sends it to the peer for you. Do NOT call cello_send: it is"
+                    " already handled, and calling it delivers your answer twice."
+                    " Do NOT answer [SILENT] - reading the message is not optional."
+                )
+            return (
+                preamble
+                + " Do this now, in order: (1) call the cello_use_agent tool with name='"
                 + agent
                 + "'; (2) call the cello_receive tool with cello_session_id='"
                 + session_id

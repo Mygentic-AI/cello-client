@@ -44,6 +44,10 @@ import cello_plugin as m
 
 adapter = m.CelloAdapter.__new__(m.CelloAdapter)
 adapter._agent_name = "Ms_Chelly_Hermes"
+# __new__ skips __init__; the wake sentence branches on the delivery mode (channel mode must not
+# tell the agent to call cello_send, because the bridge sends for it). These cases cover the
+# counterparty NAME, which renders identically in both modes — DOD-HERMES-4B covers the branch.
+adapter._delivery_mode = "wake"
 
 kind, data = json.loads(sys.argv[1])
 sys.stdout.write(adapter._wake_prompt(kind, data))

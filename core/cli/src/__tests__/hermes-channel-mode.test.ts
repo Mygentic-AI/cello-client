@@ -393,6 +393,41 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
     expect(v.calls.find((c) => c.method === "cello_send")).toBeUndefined();
   });
 
+  // ─────────────── AC9: the fallback notice must not tell a channel-mode agent to send
+
+  it("AC9: channel mode's fallback notice FORBIDS cello_send — the bridge already sends", () => {
+    // Found live 2026-08-07. The notice used to say "reply with cello_send" in BOTH modes, while
+    // the adapter also delivered the turn's final text. An agent following it correctly produced
+    // two messages to the peer: its reply, then the turn's tail — which was the agent's own
+    // internal note-to-self. Delivering a counterparty the agent's private status is worse than
+    // the duplicate that carried it.
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, busy: AGENT });
+    const notice = Object.values(v.pending!)[0];
+    expect(notice).toContain("CELLO wake");
+    expect(notice).toContain("cello_receive");          // reading is still manual on this path
+    expect(notice).toContain("Do NOT call cello_send");
+    expect(notice).not.toContain("reply with the cello_send tool");
+  });
+
+  it("AC9: wake mode's notice still instructs cello_send — that mode has no bridge delivery", () => {
+    const v = run({ op: "notify", kind: "cello_message", data: MSG, delivery_mode: "wake" });
+    const notice = v.delivered![0].text;
+    expect(notice).toContain("reply with the cello_send tool");
+    expect(notice).not.toContain("Do NOT call cello_send");
+  });
+
+  it("AC9: neither mode's notice contradicts what that mode's send() actually does", () => {
+    // The defect was a contradiction between two strings, so assert they cannot both appear.
+    for (const mode of ["channel", "wake"]) {
+      const v = run({ op: "notify", kind: "cello_message", data: MSG, delivery_mode: mode, busy: AGENT });
+      const notice = Object.values(v.pending!)[0] ?? v.delivered?.[0]?.text ?? "";
+      const forbids = notice.includes("Do NOT call cello_send");
+      const instructs = notice.includes("reply with the cello_send tool");
+      expect(forbids && instructs).toBe(false);
+      expect(forbids || instructs).toBe(true);
+    }
+  });
+
   // ────────────────────────────── AC7: a busy chat must not lose a message it already consumed
 
   it("AC7: a wake for a BUSY chat is not fetched — consuming it could destroy it", () => {
