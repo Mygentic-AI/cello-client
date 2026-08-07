@@ -41,6 +41,15 @@ export interface SessionReadDeps {
    */
   attendanceCount: (agentName: string) => number;
   reapDeadHalfOpenSessions: (agentName?: string) => void;
+  /**
+   * DOD-TERMINAL-STATE-DIVERGENCE-1: ask the directory for a certificate this side was never pushed.
+   *
+   * Optional so a daemon assembled without signaling (tests, embedders) still constructs — but when
+   * it IS absent the handler says so rather than reporting the session as unsealed, because "this
+   * daemon cannot ask" and "this session never sealed" are different facts and only one of them is
+   * about the conversation.
+   */
+  pullSealCertificate?: (agentName: string, sessionIdHex: string) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
@@ -107,6 +116,37 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     // caller could not tell a typo from a not-sealed-yet session from a wrong-agent selection.
     // Split them (full session ids on cello_list_sessions / cello_status already let a pasted id match).
     if (sessionNodeManager.getSessionRecord(agentName, sessionId)) {
+      // DOD-TERMINAL-STATE-DIVERGENCE-1 — BEFORE reporting "not sealed", ASK.
+      //
+      // "No local certificate" has two very different causes and this handler could not tell them
+      // apart: the session genuinely has not sealed, or it sealed and the `session_sealed` push never
+      // reached this daemon. The second is the divergence, and answering `not_sealed_yet` for it is
+      // how an operator got sent round the loop into a force-abandon that destroyed their half of a
+      // receipt that existed. The pull is what distinguishes them — and it distinguishes them by
+      // VERIFYING a certificate, not by trusting an answer.
+      if (deps.pullSealCertificate) {
+        const pulled = await deps.pullSealCertificate(agentName, sessionId);
+        if (pulled.ok) {
+          const recovered = sessionNodeManager.getSealCertificate(agentName, sessionId);
+          if (recovered) {
+            const recoveredName = sessionNodeManager.getSessionRecord(agentName, sessionId)?.session_name ?? null;
+            const recoveredLeaves = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
+            logger.info("seal.certificate.recovered_on_read", {
+              agentName, sessionId,
+              impact: "the seal existed and this side had never been told; the receipt is now local",
+            });
+            return {
+              ok: true,
+              session_id: sessionId,
+              session_name: recoveredName,
+              sealed_root: recovered.sealed_root,
+              leaf_count: recoveredLeaves.length,
+              content_leaf_count: recoveredLeaves.filter((l) => l.kind === "msg").length,
+              legibility: recovered.legibility,
+            };
+          }
+        }
+      }
       // The session is THIS agent's — it simply has no seal certificate yet.
       return {
         ok: false,

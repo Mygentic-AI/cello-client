@@ -99,6 +99,7 @@ import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
+import { pullSealCertificate } from "./seal-certificate-pull.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
 import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
@@ -3017,6 +3018,23 @@ async function startDaemonHoldingLock(
     reapDeadHalfOpenSessions,
     frontierMismatches,
     attendanceCount,
+    // DOD-TERMINAL-STATE-DIVERGENCE-1: the pull twin of the session_sealed push. Wired HERE, at the
+    // composition root, because it needs the agent's own signaling stream and its persistence — the
+    // read handlers hold neither, and giving them the whole daemon to reach one function is how a
+    // read surface acquires a network dependency nobody expects.
+    pullSealCertificate: (agentName, sessionIdHex) =>
+      pullSealCertificate(
+        {
+          logger,
+          sessionNodeManager,
+          signalingFor,
+          sendOver,
+          getPersistence,
+          getAgentPubkeyHex: (name) => loadedAgents.find((a) => a.name === name)?.pubkey,
+        },
+        agentName,
+        sessionIdHex,
+      ),
   });
   handlers.set("queue_failed_send", async (params, _connectionId) => {
     const sessionId = params?.sessionId as string | undefined;
