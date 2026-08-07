@@ -1250,10 +1250,15 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  Wires the local CELLO daemon into a third-party agent runtime so that agent can use CELLO.\n" +
       "  Supported runtimes: hermes  (more coming).\n" +
       "\n" +
-      "  hermes: scaffolds the CELLO plugin into the Hermes home (default ~/.hermes), binds\n" +
-      "  CELLO_AGENT_NAME in its .env, and registers via 'hermes plugins enable cello' +\n" +
-      "  'hermes mcp add cello'. Idempotent — re-run to upgrade.\n" +
-      "  Afterwards, restart the gateway: hermes gateway restart\n" +
+      "  hermes: scaffolds the CELLO plugin into the Hermes home (default ~/.hermes), writes\n" +
+      "  CELLO_AGENT_NAME, CELLO_DELIVERY_MODE and CELLO_SESSION_SCOPE into its .env, and\n" +
+      "  registers via 'hermes plugins enable cello' + 'hermes mcp add cello'.\n" +
+      "\n" +
+      "  RE-RUN THIS AFTER EVERY CELLO UPGRADE. The plugin is a COPY inside the Hermes home, not\n" +
+      "  a live import — so 'npm i -g @cello-protocol/cli@latest' alone changes nothing on that\n" +
+      "  host. It keeps running the old plugin, silently, until you re-run this command.\n" +
+      "  Then restart the gateway, or the running process keeps the old code in memory:\n" +
+      "      hermes gateway restart\n" +
       "\n" +
       "  --delivery-mode  channel (default) CELLO behaves like a normal chat channel: the peer's\n" +
       "                                     message arrives as a message and your reply is sent\n" +
