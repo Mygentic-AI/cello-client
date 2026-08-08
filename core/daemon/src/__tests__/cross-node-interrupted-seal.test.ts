@@ -41,6 +41,11 @@ function harness(opts: {
   brokeredBy?: string;
   /** Whether the visiting connection comes up within the wait. */
   connects?: boolean;
+  /**
+   * What the relay says when this side posts its SEAL ctrl leaf. Absent keeps the pre-existing
+   * `unused` stub so the tests written before the relay submit existed are unaffected.
+   */
+  sealSubmit?: { ok: true; sequenceNumber: number; reportedRootHex: string } | { ok: false; reason: string };
 }) {
   const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
   const stop = vi.fn(async () => {});
@@ -49,9 +54,11 @@ function harness(opts: {
   const crossNodeBrokerBySession = new Map<string, string>();
   if (opts.brokeredBy) crossNodeBrokerBySession.set(`${AGENT}:${SESSION}`, opts.brokeredBy);
 
+  const submitSealLeaf = vi.fn(async () => opts.sealSubmit ?? ({ ok: false as const, reason: "unused" }));
+
   const sessionNodeManager = {
     getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: opts.status }),
-    submitSealLeaf: async () => ({ ok: false as const, reason: "unused" }),
+    submitSealLeaf,
     getSealCertificate: () => null,
     resolveAgentId: () => "aid",
     setSessionName: () => {},
@@ -78,11 +85,13 @@ function harness(opts: {
     resolveConsortiumRoster: async () => [
       { nodeId: BROKER, peerId: "12D3KooWBroker", multiaddr: "/ip4/10.10.1.25/tcp/4000" },
     ],
-    handleSealInterruptedFlow: async () => ({ ok: true, sealed_root: "ff".repeat(32) }),
+    // The real shape the flow returns: a bilateral commitment, NOT a sealed root. The flow cannot
+    // produce one — the daemon holds no threshold signer.
+    handleSealInterruptedFlow: async () => ({ ok: true, sessionId: SESSION, status: "seal_interrupted_pending" }),
     handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
   } as never);
 
-  return { close: handlers.get("cello_close_session")!, openVisitingConnection, stop };
+  return { close: handlers.get("cello_close_session")!, openVisitingConnection, stop, submitSealLeaf };
 }
 
 describe("closing an interrupted session that was brokered by another node", () => {
@@ -140,6 +149,102 @@ describe("closing an interrupted session that was brokered by another node", () 
     await close({ session_id: SESSION }, "conn-1");
 
     expect(openVisitingConnection).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The bilateral commitment is not the seal.
+ *
+ * ─── The gap this pins ──────────────────────────────────────────────────────────────────────────
+ * Exactly one thing in the system causes a notarization: a daemon posts a SEAL ctrl leaf to the
+ * RELAY, and once both sides have posted, the relay hands the chain to a directory which runs the
+ * FROST round. The ACTIVE close does that. The INTERRUPTED close never did — it exchanged signed
+ * leaves with the counterparty over the directory's signaling pass-through, wrote both halves down,
+ * set both sides to `seal_interrupted_pending`, and returned. The directory only forwards those
+ * frames; it reads nothing out of them and starts nothing on the back of them.
+ *
+ * So the silence after `session.interrupted.responder.acked` was never a dropped frame or a stall.
+ * There was no producer. Measured live 2026-08-08: three sessions stranded at
+ * `seal_interrupted_pending` for 22 hours, zero rows in `seal_notarizations` on all three
+ * directories, and every log line those sessions produced was the directory forwarding — not one
+ * relay event.
+ *
+ * ─── Why the suite did not catch it ─────────────────────────────────────────────────────────────
+ * `j-int.spine.test.ts` drives this exact flow same-node and PASSES: it accepts
+ * `seal_interrupted_pending` as a valid ending and asserts only that the responder acked. Its own
+ * comment calls the result "the commitment that the directory FROST-notarizes" — which the test
+ * never checks and the code never did.
+ */
+describe("an interrupted close asks the relay to notarize, not just the counterparty to co-sign", () => {
+  it("POSTS the SEAL leaf to the relay after the bilateral commitment lands", async () => {
+    // The gap this file's second half exists for. Without this the two sides agree on the record
+    // and nobody is ever asked to notarize it, so the session sits at seal_interrupted_pending
+    // until the relay sweeps it 24 hours later and the receipt becomes unobtainable.
+    const { close, submitSealLeaf } = harness({
+      status: "interrupted",
+      sealSubmit: { ok: true, sequenceNumber: 4, reportedRootHex: "ab".repeat(32) },
+    });
+
+    await close({ session_id: SESSION }, "conn-1");
+
+    expect(submitSealLeaf).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT post the leaf when the bilateral exchange itself failed", async () => {
+    // THE SCOPE ASSERTION. A leaf posted for a session whose counterparty never co-signed is one
+    // leaf into a log that can never hold a second distinct sender — it cannot seal, and posting it
+    // spends the one-shot idempotency mark that a real retry needs.
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    const submitSealLeaf = vi.fn(async () => ({ ok: true as const, sequenceNumber: 1, reportedRootHex: "cd".repeat(32) }));
+    registerCloseSessionHandler({
+      handlers,
+      logger: silent,
+      sessionNodeManager: {
+        getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "interrupted" }),
+        submitSealLeaf,
+        getSealCertificate: () => null,
+        resolveAgentId: () => "aid",
+        setSessionName: () => {},
+        sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0 }),
+      },
+      getConnState: () => ({ currentAgent: AGENT }),
+      resolveCurrentAgent: () => AGENT,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32) }),
+      signalingFor: () => ({ status: "connected" }),
+      sendOver: async () => ({ ok: true }),
+      waitForSignalingConnected: async () => true,
+      openVisitingConnection: () => ({ mgr: {}, stop: async () => {} }),
+      crossNodeBrokerBySession: new Map<string, string>(),
+      sealKey: (a: string, s: string) => `${a}:${s}`,
+      sealInterruptedInProgress: new Set<string>(),
+      pendingSealWaiters: new Map(),
+      pendingUnilateralWaiters: new Map(),
+      resolveConsortiumRoster: async () => [],
+      // The counterparty refused — there is no agreed record to notarize.
+      handleSealInterruptedFlow: async () => ({ ok: false, reason: "seal_interrupted_rejected_by_counterparty", guidance: "" }),
+      handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
+    } as never);
+
+    await handlers.get("cello_close_session")!({ session_id: SESSION }, "conn-1");
+
+    expect(submitSealLeaf).not.toHaveBeenCalled();
+  });
+
+  it("keeps the commitment when the relay no longer holds the session", async () => {
+    // The relay drops a session 24 hours after its last message, so an interrupted close will often
+    // arrive to find it gone. That must not turn a SUCCEEDED bilateral commitment into a reported
+    // failure: both sides signed, both halves are stored, and telling the operator the close failed
+    // is what sends them to force:true — which forfeits the half they still have.
+    const { close } = harness({
+      status: "interrupted",
+      sealSubmit: { ok: false, reason: "relay_session_gone" },
+    });
+
+    const res = (await close({ session_id: SESSION }, "conn-1")) as { ok: boolean; status?: string };
+
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe("seal_interrupted_pending");
   });
 });
 

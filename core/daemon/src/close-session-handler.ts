@@ -429,6 +429,45 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // interrupted close between two agents on different nodes timed out on BOTH sides while each
       // counterparty was online — the frames were pushed to a stream the broker did not hold.
       let sealBrokerConn: { mgr: SignalingManager; stop: (reason: string) => Promise<void> } | null = null;
+
+      // THE BILATERAL COMMITMENT IS NOT THE SEAL.
+      //
+      // Exactly one thing in the system causes a notarization: a SEAL ctrl leaf posted to the
+      // RELAY, which hands the chain to a directory for the FROST round once both sides have
+      // posted. The ACTIVE close does that below. This branch never did — it exchanged signed
+      // leaves with the counterparty over the directory's signaling pass-through, stored both
+      // halves, set the session to `seal_interrupted_pending` and returned. The directory only
+      // FORWARDS those frames; it reads nothing out of them and starts nothing on the back of them.
+      // So an interrupted session reached a mutually signed record that nobody was ever asked to
+      // notarize, and sat there until the relay swept it.
+      //
+      // BEST-EFFORT, deliberately. The commitment has already SUCCEEDED and is durable on both
+      // sides. The relay drops a session 24 hours after its last message, so this call will often
+      // arrive to find it gone — and turning that into a reported FAILURE is precisely what sends an
+      // operator to force:true, which permanently forfeits the half they still hold. A missing
+      // notarization is a lesser harm than a destroyed commitment, so the close keeps its result and
+      // the shortfall is logged rather than raised.
+      //
+      // No waiter is registered and nothing is awaited: the counterparty may not close for hours, and
+      // blocking a close on that would be a worse lie than returning the honest pending status. When
+      // their leaf does land, the already-wired session_sealed listener records the certificate.
+      const notarize = async (result: SealFlowResult): Promise<SealFlowResult> => {
+        if (!result.ok) return result;
+        const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
+        if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
+          logger.info("session.interrupted.seal.leaf.submitted", {
+            agentName: record.agent_name, sessionId, correlationId,
+          });
+        } else {
+          logger.warn("session.interrupted.seal.leaf.submit_failed", {
+            agentName: record.agent_name, sessionId, reason: submitted.reason, correlationId,
+            impact:
+              "both sides hold a signed commitment, but no notarization was requested — this session has no receipt and cannot get one once the relay drops it",
+          });
+        }
+        return result;
+      };
+
       try {
         // Pre-dial ONLY from memory. This costs nothing when the map is empty, so the seal waiter
         // still registers immediately — a bilateral seal that lands promptly must not be missed
@@ -443,7 +482,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // the happy path, and never delaying the waiter.
         const counterparty = (record as { counterparty_pubkey?: string }).counterparty_pubkey;
         if (first.ok || first.reason !== "seal_interrupted_counterparty_unavailable" || !counterparty || sealBrokerConn) {
-          return first;
+          return await notarize(first);
         }
         sealBrokerConn = await openSealBrokerConnection(
           record.agent_name, sessionId, correlationId, { counterpartyPubkeyHex: counterparty },
@@ -453,7 +492,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // OVER THE VISITING CONNECTION. Dialling their node is only half of it — the request must
         // be SENT there too. Sent on the home stream it reaches our own node, which holds no stream
         // for a counterparty homed elsewhere, logs "target offline" and answers nothing.
-        return await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption, sealBrokerConn.mgr);
+        return await notarize(
+          await handleSealInterruptedFlow(sessionId, record, correlationId, merkleRootAtInterruption, sealBrokerConn.mgr),
+        );
       } finally {
         // Release the transient connection; the seal result stands either way.
         if (sealBrokerConn) {
