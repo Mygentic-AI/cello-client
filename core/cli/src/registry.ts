@@ -1072,7 +1072,13 @@ export const COMMANDS: readonly CommandSpec[] = [
     async run(ctx, args) {
       const { pretty, agent, positional } = parityOpts(args);
       const o = { pretty, ...(agent !== undefined ? { agent } : {}) };
-      const [sub, target] = positional;
+      const [sub, rawTarget] = positional;
+      // A FLAG IS NOT AN ID. `cello doc propose --retry <id>` takes no pubkey — re-sending an offer
+      // needs only the document — so with the pubkey absent `--retry` landed in `target` and the
+      // daemon answered `invalid_peer_pubkey`: an error about the wrong thing entirely, on a command
+      // typed exactly as the help documents it. Treated as absent instead, so the branch falls
+      // through to help rather than inventing a positional out of a flag.
+      const target = rawTarget !== undefined && rawTarget.startsWith("--") ? undefined : rawTarget;
       if (sub === "inbox") return docInbox(ctx.celloDir, o);
       if (sub === "list") return docList(ctx.celloDir, o);
       if (sub === "propose" && target) {
@@ -1351,7 +1357,7 @@ export function findCommand(name: string): CommandSpec | undefined {
  * would silently swallow the operator's only guidance, in the one code path whose entire job is to
  * explain what went wrong.
  */
-function helpForSpec(name: string): string {
+export function helpForSpec(name: string): string {
   const spec = findCommand(name);
   if (!spec) throw new Error(`registry: no command '${name}' (a hardcoded help lookup is out of sync)`);
   return spec.help;
