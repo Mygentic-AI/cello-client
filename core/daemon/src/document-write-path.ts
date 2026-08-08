@@ -492,9 +492,65 @@ export function lineHunks(
   const offsets: number[] = [0];
   for (const chunk of a) offsets.push(offsets[offsets.length - 1]! + chunk.length);
 
-  return runs.map((r) => ({
-    from: offsets[r.aStart]!,
-    to: offsets[r.aEnd]!,
-    insert: b.slice(r.bStart, r.bEnd).join(""),
-  }));
+  return runs
+    .map((r) =>
+      trimShared(before, {
+        from: offsets[r.aStart]!,
+        to: offsets[r.aEnd]!,
+        insert: b.slice(r.bStart, r.bEnd).join(""),
+      }),
+    )
+    .filter((h) => h.to > h.from || h.insert.length > 0);
+}
+
+/**
+ * Shrink a hunk to the span that genuinely differs, by dropping the text it SHARES with what it
+ * replaces at each end.
+ *
+ * WHY THIS EXISTS. `toChunks` gives every line a trailing newline except the last, so a text that
+ * does not end in one has a final chunk whose IDENTITY changes the moment anything is appended:
+ *
+ *     "# Draft"            → ["# Draft"]
+ *     "# Draft\nline two\n" → ["# Draft\n", "line two\n"]
+ *
+ * The LCS therefore reports the last line as deleted and re-inserted. Nothing was deleted — but the
+ * receiver's `append_only` gate counts any delete range, so it refuses the update naming a deletion
+ * the sender never made, and THREE refusals stall the document permanently. An append-only
+ * document, whose entire premise is that appending is always safe, was destroyed by appending to it
+ * whenever the starting content lacked a trailing newline. Nothing told the operator that mattered.
+ *
+ * Trimming rather than special-casing "is this an append": the same false deletion appears for any
+ * edit that touches the last line of a file with no trailing newline. Minimal hunks are also better
+ * for the CRDT — a delete the peer did not need is one that can collide with their concurrent edit
+ * to that line.
+ *
+ * The two ends are trimmed independently and never allowed to overlap, so a hunk can shrink to a
+ * pure insert (`to === from`) or a pure delete (`insert === ""`), and never to something that
+ * reproduces the wrong text.
+ */
+function trimShared(
+  before: string,
+  hunk: { from: number; to: number; insert: string },
+): { from: number; to: number; insert: string } {
+  const removed = before.slice(hunk.from, hunk.to);
+  const { insert } = hunk;
+
+  let prefix = 0;
+  const maxPrefix = Math.min(removed.length, insert.length);
+  while (prefix < maxPrefix && removed[prefix] === insert[prefix]) prefix++;
+
+  let suffix = 0;
+  const maxSuffix = Math.min(removed.length - prefix, insert.length - prefix);
+  while (
+    suffix < maxSuffix &&
+    removed[removed.length - 1 - suffix] === insert[insert.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+
+  return {
+    from: hunk.from + prefix,
+    to: hunk.to - suffix,
+    insert: insert.slice(prefix, insert.length - suffix),
+  };
 }
