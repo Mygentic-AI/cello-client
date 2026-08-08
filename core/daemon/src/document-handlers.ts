@@ -715,6 +715,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // doc is rebuilt from the envelope log, and the edit is by definition not in it, so both are
       // lost on restart together. A durable flag would outlive the thing it describes.
       if (unpublishedEdits.has(unpublishedKey(who.ownerAgentId, documentId))) {
+        // Screened here too. A flush publishes text that was folded in on an EARLIER call, so
+        // skipping it would be a way for content to reach the peer without ever passing the check.
+        const stuckFault = screenText(doc.getText("content").toString());
+        if (stuckFault) {
+          return {
+            ok: false,
+            reason: "document_content_refused",
+            guidance:
+              `The edit waiting to be published contains ${stuckFault.codepoints.join(", ")}, which ` +
+              `your peer's screening refuses. Correct the file and publish again.`,
+            detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...stuckFault }),
+          };
+        }
         const flushed = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
         if (flushed.ok) {
           unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
@@ -1025,9 +1038,52 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
     if (update === null) {
+      // NOTHING NEW ON DISK — but an earlier publish may have FOLDED an edit in and then failed to
+      // publish it, in which case the file now matches the projection and there is nothing left to
+      // diff. Without this branch that edit can never leave: the operator clears the cause, publishes
+      // again, and gets a clean "nothing to do" over a change the peer has never seen — with
+      // `cello_doc_list` agreeing, because pending is derived from the envelope log and no envelope
+      // was ever written. Same recovery `cello_doc_write` has; it was missing here while the comment
+      // below claimed parity.
+      if (unpublishedEdits.has(unpublishedKey(who.ownerAgentId, documentId))) {
+        const flushed = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
+        if (!flushed.ok) {
+          return { ok: true, documentId, changed: false, published: false, reason: flushed.reason, guidance: flushed.detail };
+        }
+        unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
+        layer.notifications.markWritten(who.ownerAgentId, documentId, doc.getText("content").toString());
+        return { ok: true, documentId, changed: true, published: true, envelopeHash: flushed.envelopeHash };
+      }
       // A publish is an INTENT. Nothing changed on disk, so there is nothing to say, and saying it
       // anyway costs a leaf and a round trip.
       return { ok: true, documentId, changed: false, published: false };
+    }
+
+    // SCREEN WHAT THE FILE IS ABOUT TO SEND. `cello_doc_write` catches an offending character at the
+    // keystroke so it never becomes a rejection round — and three rejection rounds stall a document
+    // permanently. The file path ran none of it, on the surface §4.1 calls PRIMARY: a human editing
+    // in their editor, or an agent with file tools. A zero-width space pasted from a web page is
+    // invisible in both, and the refusal arrives later from the peer with no clue where it came from.
+    //
+    // Screened AFTER the fold because the fold is what produces the text; the edit is therefore
+    // already in the local document when this refuses. The flag is deliberately NOT set: flushing
+    // later would publish the offending bytes unscreened. Correcting the file is what removes it,
+    // and the guidance says so.
+    const publishScreenFault = screenText(doc.getText("content").toString());
+    if (publishScreenFault) {
+      return {
+        ok: false,
+        reason: "document_content_refused",
+        guidance:
+          `Your peer's screening will refuse ${publishScreenFault.codepoints.join(", ")} ` +
+          `(${publishScreenFault.count} occurrence(s), first at character ` +
+          `${publishScreenFault.offsets[0]}). These are characters that make what a reader SEES ` +
+          `differ from what the document SAYS, or that address a reader's model rather than the ` +
+          `reader — they are easy to paste in without seeing them. Nothing was sent. Remove them ` +
+          `from the file and publish again; sending as-is costs a rejection round, and three of ` +
+          `those stall the document.`,
+        detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...publishScreenFault }),
+      };
     }
 
     const result = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
@@ -1036,6 +1092,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // applied-but-unpublished case, and reported the same way, because an operator told this
       // failed would edit again and the second publish would diff against a projection that already
       // contains their change.
+      // REMEMBER IT, so the branch above can flush it. This is what made the comment's claim of
+      // parity with `cello_doc_write` true rather than aspirational.
+      unpublishedEdits.add(unpublishedKey(who.ownerAgentId, documentId));
       return { ok: true, documentId, changed: true, published: false, reason: result.reason, guidance: result.detail };
     }
     layer.notifications.markWritten(who.ownerAgentId, documentId, doc.getText("content").toString());
