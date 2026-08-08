@@ -33,7 +33,10 @@ export interface LifecycleNotifier {
   notifyPeer(
     documentId: string,
     verb: "kill" | "close",
-  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+    // `detail` carries the underlying description when the failure is LOCAL — a key that could not
+    // be loaded reads nothing like a peer who is offline, and one guidance string for both sent
+    // operators to wait for someone who was already there.
+  ): Promise<{ ok: true } | { ok: false; reason: string; detail?: string }>;
 }
 
 const CREATE_LIFECYCLE_SQL = `
@@ -190,7 +193,10 @@ export class DocumentLifecycle {
     ownerAgentId: string,
     documentId: string,
     nowMs: number,
-  ): Promise<(Verdict & { ok: true; peerNotified: boolean }) | (Verdict & { ok: false })> {
+  ): Promise<
+    | (Verdict & { ok: true; peerNotified: boolean; notifyReason?: string; notifyDetail?: string })
+    | (Verdict & { ok: false })
+  > {
     const doc = this.#store.getDocument(ownerAgentId, documentId);
     if (!doc) {
       return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
@@ -203,11 +209,22 @@ export class DocumentLifecycle {
       // fine, they have not answered yet". Control frames are fire-once — not in the log, never
       // swept — so a close the peer never received means the document can never settle, and neither
       // operator has anything to look at.
-      this.#logger.error("document.close.peer_not_notified", { documentId, reason: notified.reason });
+      this.#logger.error("document.close.peer_not_notified", {
+        documentId,
+        reason: notified.reason,
+        detail: notified.detail ?? "",
+      });
     }
     this.#settleClose(ownerAgentId, documentId, doc.peerAgentId);
     this.#logger.info("document.close.requested", { documentId, peerNotified: notified.ok });
-    return { ok: true, peerNotified: notified.ok };
+    // THE REASON TRAVELS. It used to stop here, so one guidance string covered a transport failure,
+    // a missing signing key and a wiring fault — and it told the operator to wait for their peer,
+    // which only helps for the first of the three.
+    return {
+      ok: true,
+      peerNotified: notified.ok,
+      ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
+    };
   }
 
   /** The peer's half, arriving over the session. */
@@ -314,7 +331,7 @@ export class DocumentLifecycle {
     documentId: string,
     nowMs: number,
   ): Promise<
-    | { ok: true; peerNotified: boolean; note: string }
+    | { ok: true; peerNotified: boolean; note: string; notifyReason?: string; notifyDetail?: string }
     | { ok: false; reason: string; detail: string }
   > {
     const doc = this.#store.getDocument(ownerAgentId, documentId);
@@ -332,6 +349,7 @@ export class DocumentLifecycle {
         documentId,
         peerAgentId: doc.peerAgentId,
         reason: notified.reason,
+        detail: notified.detail ?? "",
       });
     }
     this.#logger.info("document.killed", { documentId, peerNotified: notified.ok });
@@ -343,6 +361,9 @@ export class DocumentLifecycle {
         "this document no longer accepts or publishes updates, and your local copy and log are " +
         "retained. Your peer keeps what it holds — a kill stops the collaboration, it does not " +
         "retract content they already have.",
+      // Same reason `close` carries it: a local signing fault and an absent peer are opposite
+      // problems and only one of them is fixed by waiting.
+      ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
     };
   }
 

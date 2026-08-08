@@ -578,7 +578,18 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     // publishing into a document that would never answer, with nothing on his screen explaining why.
     await vi.waitFor(() => expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("killed"));
     const write = await b.call("cello_doc_write", { document_id: documentId, content: "still typing" });
-    expect(write).toMatchObject({ published: false });
+    // REFUSED OUTRIGHT, and this assertion changed deliberately (DOD-DOC-TOOLS-1 review, finding 6).
+    // It used to accept `{published: false}` with `ok: true` — the old behaviour applied the edit to
+    // Bob's local copy, failed to publish it, and remembered it as a stuck edit that no flush could
+    // ever clear, because the document is terminal. Bob's next read then showed text that exists in
+    // no envelope log and no peer's copy, and that vanishes on the next daemon restart when the live
+    // document is rebuilt from the log. Reporting `ok: true` for that is the fabricated-success
+    // shape: nothing was saved anywhere it can survive.
+    expect(write).toMatchObject({ ok: false, reason: "document_killed" });
+    // And the local copy is untouched, which is the half that made the old answer harmful.
+    expect(String((await b.call("cello_doc_read", { document_id: documentId }))["content"] ?? "")).not.toContain(
+      "still typing",
+    );
   });
 
   it("a kill SUCCEEDS locally when the peer cannot be reached, and says the peer was not told", async () => {

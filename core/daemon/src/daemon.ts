@@ -3447,6 +3447,9 @@ async function startDaemonHoldingLock(
         return provider.sign(tbs);
       },
       send: (agentName, input) => documentTransportFor(agentName).sendBytes(input),
+      // Given a logger so a signing failure is REPORTED rather than swallowed — the reason a
+      // local key fault used to reach the operator dressed as an absent peer.
+      logger,
       now: () => Date.now(),
     }),
     rollback: () => ({

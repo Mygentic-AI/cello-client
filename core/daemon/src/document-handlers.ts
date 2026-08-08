@@ -873,6 +873,30 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // `lineHunks` touches only the lines that actually changed, so untouched regions keep their
     // items and a peer's concurrent edit to them merges. Same function `DocumentWritePath.#foldText`
     // uses, whose header records the same hazard for the file path — one folding rule, not two.
+    // REFUSE A TERMINAL DOCUMENT BEFORE TOUCHING THE LOCAL COPY.
+    //
+    // `peerRefused` was checked above; the terminal statuses were not. A write into a closed, killed
+    // or stalled document applied the hunks, failed at `canPublish`, and returned
+    // `{ok: true, changed: true, published: false}` while adding the document to the stuck-edit set
+    // — where no flush can ever succeed, because the document is terminal. The operator's next
+    // `cello_doc_read` then showed text that is in no envelope log and no peer's copy, and that
+    // vanishes on the next daemon restart when the live document is rebuilt from the log.
+    //
+    // Scoped to the TERMINAL statuses on purpose. `agent_platform_paused` is the recoverable case
+    // the mutate-then-remember path was built for and keeps its behaviour: the edit is real, it is
+    // held, and clearing the pause flushes it.
+    const publishable = layer.lifecycle.canPublish(who.ownerAgentId, documentId);
+    if (!publishable.ok && publishable.reason !== "agent_platform_paused") {
+      return {
+        ok: false,
+        reason: publishable.reason,
+        guidance:
+          `${publishable.detail ?? "This document can no longer accept writes."} Nothing was ` +
+          `changed locally — an edit applied here could never be published or recovered, and would ` +
+          `disappear the next time the daemon restarted.`,
+      };
+    }
+
     const hunks = lineHunks(before, content);
     // ONE TRANSACTION, so the whole edit is a single Yjs update rather than several — a peer
     // applying them separately would pass through states no operator ever wrote.
@@ -971,13 +995,43 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       ...(outcome.peerNotified
         ? {}
         : {
-            guidance:
-              `Your close was recorded but did not reach the peer, so the document cannot settle ` +
-              `until they hear it. A close is not retried — run cello_doc_close again when they ` +
-              `are back, or cello_doc_kill if you need it over now.`,
+            reason: outcome.notifyReason,
+            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail),
           }),
     };
   });
+
+  /**
+   * What to tell an operator when a close or kill did not reach the peer — BRANCHED ON THE CAUSE.
+   *
+   * One string used to cover all three: a transport failure, a signing key that could not be
+   * loaded, and this daemon not holding the document's agent at all. Only the first is fixed by
+   * waiting, and that is what the single message told them to do. Traced end to end in the
+   * DOD-DOC-TOOLS-1 review: an exit-point label standing in for a local fault, pointing at the
+   * network.
+   */
+  function notifyGuidance(verb: "close" | "kill", reason?: string, detail?: string): string {
+    const tail = verb === "close"
+      ? `A close is not retried — run cello_doc_close again once this is cleared, or cello_doc_kill if you need it over now.`
+      : `The kill stands locally either way; run cello_doc_kill again once this is cleared so they stop editing.`;
+    if (reason === "document_control_unsigned") {
+      return (
+        `Your ${verb} was recorded, but this agent's signing key could not be loaded, so nothing ` +
+        `could be sent to the peer${detail ? ` (${detail})` : ""}. Waiting will not help — the ` +
+        `fault is on this machine. ${tail}`
+      );
+    }
+    if (reason === "document_unknown") {
+      return (
+        `Your ${verb} was recorded, but this daemon does not hold the agent that owns the document, ` +
+        `so it could not tell the peer. That is a local wiring fault, not the peer being away. ${tail}`
+      );
+    }
+    return (
+      `Your ${verb} was recorded but did not reach the peer${detail ? ` (${detail})` : ""}, so the ` +
+      `document cannot settle until they hear it. ${tail}`
+    );
+  }
 
   handlers.set("cello_doc_kill", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -992,7 +1046,18 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // peer being reachable — a decision to stop that depends on the other party being online is not
     // a decision to stop — but an operator who believes the peer was told, when they were not, will
     // not understand why updates keep arriving.
-    return { ok: true, documentId, peerNotified: outcome.peerNotified, note: outcome.note };
+    return {
+      ok: true,
+      documentId,
+      peerNotified: outcome.peerNotified,
+      note: outcome.note,
+      ...(outcome.peerNotified
+        ? {}
+        : {
+            reason: outcome.notifyReason,
+            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail),
+          }),
+    };
   });
 
   handlers.set("cello_doc_publish", async (params, connectionId) => {

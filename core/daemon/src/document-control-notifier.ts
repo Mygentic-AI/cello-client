@@ -49,12 +49,19 @@ export interface DocumentControlNotifierDeps {
     input: { peerAgentId: string; documentId: string; bytes: Uint8Array; correlationId: string },
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
   now(): number;
+  /**
+   * Optional, and only for reporting a LOCAL fault. This module used to swallow the signing error
+   * entirely, so the one description of "your key could not be loaded" existed nowhere — not in the
+   * return value, not in a log line — and the operator was sent to wait for a peer who was already
+   * there.
+   */
+  logger?: { warn(event: string, ctx: Record<string, unknown>): void };
 }
 
 export type NotifyPeer = (
   documentId: string,
   verb: DocumentControlVerb,
-) => Promise<{ ok: true } | { ok: false; reason: string }>;
+) => Promise<{ ok: true } | { ok: false; reason: string; detail?: string }>;
 
 export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps): NotifyPeer {
   return async (documentId, verb) => {
@@ -74,11 +81,19 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
       let signature: Uint8Array;
       try {
         signature = await deps.sign(agentName, buildDocumentControlTbs(control));
-      } catch {
+      } catch (err: unknown) {
         // REFUSED, not skipped and not sent unsigned. The peer must reject an unsigned control
         // frame, so shipping one would report a notification that cannot possibly land — and the
         // caller reports `peerNotified` straight to the operator.
-        return { ok: false, reason: "document_control_unsigned" };
+        //
+        // THE MESSAGE IS KEPT. A bare `catch {}` here threw away the only description of a LOCAL
+        // fault — a key file that moved, a locked keychain, an agent with no provider — and the
+        // operator was then told their peer had not heard them and to try again when the peer was
+        // back. Waiting cannot fix a signing failure. The reason travels up so the caller can say
+        // which of the two it is.
+        const detail = err instanceof Error ? err.message : String(err);
+        deps.logger?.warn("document.control.unsigned", { documentId, verb, agentName, reason: detail });
+        return { ok: false, reason: "document_control_unsigned", detail };
       }
       control.signature = signature;
 
