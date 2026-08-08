@@ -46,7 +46,7 @@ import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
-import { lineHunks } from "./document-write-path.js";
+import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
@@ -238,6 +238,22 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
 
     const documentType = typeof params?.document_type === "string" ? params.document_type : DEFAULT_DOCUMENT_TYPE;
+    // REFUSED AT THE DOOR, because a type only some verbs can serve is worse than no support at all.
+    // `document_type` was previously unvalidated: "yaml" created a real, signed, peer-accepted
+    // document whose file materialisation threw and was swallowed, returning `filePath: null` with
+    // no explanation while the tool description promises a path. "json" was worse — genuinely
+    // supported by DocumentWritePath (map root) and not by read/write/diff (text root), so it read
+    // as empty, wrote into a root nothing projects, and diffed as unchanged forever.
+    if (!isSupportedDocumentType(documentType)) {
+      return {
+        ok: false,
+        reason: "document_type_unsupported",
+        guidance:
+          `'${documentType}' is not a document type this build can serve. Supported: ` +
+          `${[...SUPPORTED_DOCUMENT_TYPES].sort().join(", ")}. Nothing was created, so there is ` +
+          `nothing to clean up — re-propose with a supported type.`,
+      };
+    }
     const startingText = typeof params?.starting_content === "string" ? params.starting_content : "";
 
     // THE STARTING CONTENT IS A YJS UPDATE, not a string, and that is the whole reason it is on the
@@ -429,6 +445,21 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const outcome = layer.handshake.accept(who.ownerAgentId, documentId, deps.now());
     if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
+
+    // THE SAME REFUSAL ON THE RECEIVING SIDE. Guarding only `propose` leaves an accepter able to
+    // take on a document it cannot serve, and the party harmed is the one who did not choose the
+    // type. A peer running an older or a different build can still offer anything.
+    if (!isSupportedDocumentType(outcome.envelope.document_type)) {
+      return {
+        ok: false,
+        reason: "document_type_unsupported",
+        guidance:
+          `Your peer proposed a '${outcome.envelope.document_type}' document, which this build ` +
+          `cannot serve (supported: ${[...SUPPORTED_DOCUMENT_TYPES].sort().join(", ")}). The ` +
+          `proposal is left undecided rather than accepted into a document that would read as ` +
+          `empty — use cello_doc_refuse if you want it gone, and tell them which types you take.`,
+      };
+    }
 
     // THE CONSENT AND THE DOCUMENT ARE ONE ACT. `accept` moves the proposal row; without this the
     // operator has agreed to a document that does not exist, and the peer's first update is refused

@@ -565,7 +565,7 @@ server.tool("cello_dismiss", "Dismiss a sealed/terminal session from your inbox.
 
 server.tool("cello_doc_propose", "Offer a shared living document to a counterparty. Both of you edit it; both copies converge automatically. They must ACCEPT before anything applies — this only sends the offer. Use this instead of pasting a document back and forth: the peer's edits reach you without either of you re-sending it.", {
   peer_pubkey: z.string().describe("The counterparty's 64-char hex public key (their agent id) — see cello_contacts"),
-  document_type: z.string().optional().describe("What kind of document, e.g. 'markdown' (default), 'text', 'json'"),
+  document_type: z.string().optional().describe("What kind of document: 'markdown' (default), 'text' or 'plaintext'. Anything else is refused — a type only some verbs can serve would read as empty and lose your content silently."),
   starting_content: z.string().optional().describe("Initial text. Both sides start from these exact bytes."),
   append_only: z.boolean().optional().describe("If true, neither side can delete existing content — only add"),
   document_id: z.string().optional().describe("RE-SEND an offer that was created but never reached the peer (the daemon's guidance names the id). Sends the SAME offer again — proposing afresh instead would create a second document."),

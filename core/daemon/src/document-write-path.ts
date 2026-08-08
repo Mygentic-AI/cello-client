@@ -36,6 +36,25 @@ const MAP_ROOT = "data";
 const TEXT_TYPES = new Set(["markdown", "text", "plaintext"]);
 const JSON_TYPES = new Set(["json"]);
 
+/**
+ * The document types EVERY verb can serve — the ones `propose` and `accept` will admit.
+ *
+ * `json` is deliberately absent even though this file supports it. A JSON document's content lives
+ * in the MAP root, and `cello_doc_read`, `cello_doc_write` and `cello_doc_diff` all read the TEXT
+ * root. Nothing bridges them, so a JSON document reads as empty, is written into a root nothing
+ * projects, and diffs as unchanged forever — while this file's own support makes the feature look
+ * finished to anyone reading here. Admitting a type only half the verbs can serve is worse than
+ * refusing it: it reads as done and loses content in silence.
+ *
+ * Exported so the refusal message names this set rather than a hardcoded copy that can drift.
+ */
+export const SUPPORTED_DOCUMENT_TYPES: ReadonlySet<string> = TEXT_TYPES;
+
+/** Whether `propose`/`accept` may admit this type. Anything else creates a document with no file. */
+export function isSupportedDocumentType(documentType: string): boolean {
+  return SUPPORTED_DOCUMENT_TYPES.has(documentType);
+}
+
 /** Ids are hex identities, never names, and they become path components. */
 const ID_PATTERN = /^[0-9a-f]{64}$/;
 
