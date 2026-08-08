@@ -30,13 +30,48 @@ export interface NotificationHandlerDeps {
   inboundSessionQueues: Map<string, InboundSessionEvent[]>;
   expiredSessionRequests: Map<string, ExpiredSessionRequest[]>;
   refusedSessionRequests: Map<string, RefusedSessionRequest[]>;
+  /**
+   * Documents with unread peer updates, per agent — §16.5's passive notification.
+   *
+   * Optional so a daemon built without a document layer is unaffected. Wired 2026-08-08: the writer
+   * and the reader both existed and NEITHER had a production caller, so an admitted update wrote no
+   * notice and nothing here ever read one. `cello_doc_read` was already clearing rows that could not
+   * exist. An agent learned a document had changed only by polling `cello_doc_list`, which is not
+   * what §16.5 promises. This is the same unit-with-no-caller shape the DOC-TOOLS line was created
+   * to prevent, carried onto it and left unwired.
+   */
+  documentNotices?: (ownerAgentId: string) => Array<{ documentId: string; pending: number; noticedAtMs: number }>;
+  /** Owner key for an agent NAME — document rows are keyed by the owner's pubkey, never the name. */
+  ownerKeyFor?: (agentName: string) => string | null;
 }
 
 export function registerNotificationHandlers(deps: NotificationHandlerDeps): void {
   const {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     loadedAgents, agents: allAgents, reapExpiredInboundSessions, inboundSessionQueues, expiredSessionRequests, refusedSessionRequests,
+    documentNotices, ownerKeyFor,
   } = deps;
+
+  /** The document half of an agent's inbox, or nothing when no document layer is wired. */
+  function documentSection(agentName: string): Record<string, unknown> {
+    if (!documentNotices || !ownerKeyFor) return {};
+    const owner = ownerKeyFor(agentName);
+    if (!owner) return {};
+    const notices = documentNotices(owner);
+    if (notices.length === 0) return {};
+    return {
+      document_notices: notices.map((n) => ({
+        document_id: n.documentId,
+        unread_updates: n.pending,
+        noticed_at: n.noticedAtMs,
+      })),
+      // Said plainly, because a document notice is NOT a message: nobody is waiting on a reply.
+      document_notices_guidance:
+        "Your peer has changed these documents since you last read them. Nothing is waiting on a " +
+        "reply — read with cello_doc_read (which clears the notice) or see what moved with " +
+        "cello_doc_diff.",
+    };
+  }
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
   // Notifications are fire-and-forget (no ack, no redelivery); this is how a client discovers what
@@ -143,7 +178,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // it may not read.
         return {
           agent, pending_session_requests: pending, expired_session_requests: expired, unread,
-          total_unread, rename_notices,
+          total_unread, rename_notices, ...documentSection(agent),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
           // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
@@ -186,7 +221,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

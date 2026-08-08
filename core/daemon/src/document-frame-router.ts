@@ -148,6 +148,17 @@ export interface DocumentFrameRouterDeps {
    * over the peer's work. A daemon with no workspace configured implements this as a no-op.
    */
   rewriteFile(ownerAgentId: string, inResponseTo: Uint8Array): Promise<void>;
+  /**
+   * Record that the peer changed this document and the agent has not read it yet — §16.5's passive
+   * notification.
+   *
+   * Wired 2026-08-08. The writer and the reader both existed and NEITHER had a production caller,
+   * so an admitted update wrote nothing and `cello_check_notifications` had no document section at
+   * all; `cello_doc_read` was clearing rows that could never exist. An agent learned a document had
+   * moved only by polling. That is the unit-with-no-caller shape this milestone was burned by, and
+   * it was carried onto DOC-TOOLS-1 as an explicit clause and left unwired.
+   */
+  noticeInboundUpdate(ownerAgentId: string, inResponseTo: Uint8Array): void;
   /** Put an already-signed frame on the wire to whoever authored `wire` — the rejection, today. */
   sendFrameToPeer(ownerAgentId: string, inResponseTo: Uint8Array, bytes: Uint8Array): Promise<void>;
   sendAck(
@@ -319,6 +330,18 @@ export class DocumentFrameRouter {
           // Not awaited, and not allowed to fail the admission: the content is already in the
           // document, which is the source of truth. A failed rewrite is a stale projection, and
           // `publish` refuses loudly on a stale baseline rather than diffing against it.
+          // NOTICED BEFORE the file rewrite, and synchronously: the notice is a row, not I/O, and
+          // an agent that reads the file before the notice lands would clear a count that had not
+          // been written. Never allowed to fail the admission — the content is already in the
+          // document, which is the source of truth.
+          try {
+            this.#d.noticeInboundUpdate(ownerAgentId, content);
+          } catch (err: unknown) {
+            this.#d.logger.warn("document.notice.failed", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
           void this.#d.rewriteFile(ownerAgentId, content).catch((err: unknown) => {
             this.#d.logger.warn("document.file.rewrite_threw", {
               correlationId,

@@ -326,6 +326,14 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         live.get(ownerAgentId, env.document_id),
       );
     },
+    noticeInboundUpdate: (ownerAgentId, inResponseTo) => {
+      const env = decodeDocumentUpdateEnvelope(inResponseTo);
+      // COUNTED FROM THE LOG, not incremented blindly: envelopes redeliver, and a counter bumped on
+      // every arrival would drift upward on ordinary retries and tell the operator there is more to
+      // read than there is.
+      const unread = notifications.unreadFromPeer(ownerAgentId, env.document_id);
+      notifications.notice(ownerAgentId, env.document_id, unread, Date.now());
+    },
     sendFrameToPeer: async (ownerAgentId, inResponseTo, bytes) => {
       // Addressed to whoever AUTHORED the envelope being answered, taken from the envelope itself
       // rather than from the document row: the row's peer and the envelope's sender are the same

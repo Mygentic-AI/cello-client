@@ -3272,6 +3272,12 @@ async function startDaemonHoldingLock(
     inboundSessionQueues,
     expiredSessionRequests,
     refusedSessionRequests,
+    // §16.5's passive notification, wired 2026-08-08. Both halves existed with no production caller
+    // — nothing wrote a notice and nothing read one — so an agent learned a document had changed
+    // only by polling, and `cello_doc_read` cleared rows that could never exist.
+    documentNotices: (ownerAgentId) => documentLayer.notifications.pending(ownerAgentId),
+    ownerKeyFor: (agentName) =>
+      loadedAgents.find((a) => a.name === agentName)?.pubkey?.toLowerCase() ?? null,
   });
 
   // The address book — contacts, tiers, monikers, settings, the telegram token. Ten handlers, now

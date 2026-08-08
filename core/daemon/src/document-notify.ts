@@ -233,6 +233,31 @@ export class DocumentNotifications {
   }
 
   /**
+   * How many of the PEER's updates have arrived since this agent last read the document.
+   *
+   * Derived from the envelope log against the read mark's timestamp, never a counter. A counter is
+   * a second tally of a fact the log already holds, and the two disagree the first time a write is
+   * missed or an envelope is redelivered — which happens routinely, since redelivery is how an
+   * offline peer is caught up.
+   *
+   * No read mark means the agent has never read it, so everything the peer has sent is unread.
+   */
+  unreadFromPeer(agentId: string, documentId: string): number {
+    const mark = this.#store.rawDb
+      .prepare("SELECT seen_at FROM document_read_marks WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { seen_at: number } | undefined;
+    const since = mark?.seen_at ?? 0;
+    const row = this.#store.rawDb
+      .prepare(
+        `SELECT COUNT(*) AS n FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ? AND sender_agent_id != ?
+            AND kind = 'update' AND created_at > ?`,
+      )
+      .get(agentId, documentId, agentId, since) as { n: number } | undefined;
+    return row?.n ?? 0;
+  }
+
+  /**
    * Note that a document has unread updates. Passive — this never pushes anything.
    *
    * The count is REPLACED rather than incremented, and is passed in by the caller from the log,
