@@ -1108,6 +1108,45 @@ export class DocumentStore {
 
   /** How many rejections this document has RECEIVED — the publishing side's retry round. */
   /**
+   * DOD-DOC-SCREEN-1 (§16.7-16) — SENDER ADOPTS THE RECEIVER'S RULE.
+   *
+   * The codepoints this peer has actually refused for this document, learned from their own signed
+   * refusals rather than assumed. Rules compose toward STRICT: once they have said no to a
+   * character, we stop emitting it, so the same refusal cannot be spent twice — and three refusals
+   * stall the document, which makes every avoidable one expensive.
+   *
+   * Scoped to (owner, document), never global. A rule adopted for one document must not silently
+   * narrow what an operator may write everywhere else — the peer refused it HERE, under the profile
+   * agreed HERE, and another peer may accept it happily.
+   *
+   * Stored as the refusal's own machine-readable codepoints, which is why the refusal was made
+   * machine-readable in the first place: prose cannot be adopted.
+   */
+  adoptedRefusedCodepoints(ownerAgentId: string, documentId: string): Set<string> {
+    const rows = this.#db
+      .prepare(
+        `SELECT detail FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ? AND detail IS NOT NULL`,
+      )
+      .all(ownerAgentId, documentId) as Array<{ detail?: string }>;
+    const out = new Set<string>();
+    for (const r of rows) {
+      if (typeof r.detail !== "string") continue;
+      try {
+        const parsed = JSON.parse(r.detail) as { codepoints?: unknown };
+        // ONLY the structured form. A refusal whose detail is prose carries no rule to adopt, and
+        // guessing one out of English is how a sender ends up refusing text nobody objected to.
+        if (Array.isArray(parsed.codepoints)) {
+          for (const c of parsed.codepoints) if (typeof c === "string") out.add(c);
+        }
+      } catch {
+        /* prose detail — nothing to adopt, and that is not an error */
+      }
+    }
+    return out;
+  }
+
+  /**
    * How many ROUNDS this document has been through — DISTINCT refused envelopes, not rows.
    *
    * ONE REFUSED ENVELOPE IS ONE ROUND, however many times the refusal is announced. A peer's refusal

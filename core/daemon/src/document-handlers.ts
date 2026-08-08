@@ -738,6 +738,52 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // or compromised while the sender is a good actor, which is why the receiving gate exists and
     // why this one cannot replace it. Same function on both sides (`screenText`), so the two cannot
     // disagree about what is refused.
+    // SENDER ADOPTS THE RECEIVER'S RULE (DOD-DOC-SCREEN-1, §16.7-16).
+    //
+    // Every codepoint THIS peer has already refused for THIS document, learned from their own signed
+    // refusals. Rules compose toward strict: once they have said no to a character, emitting it
+    // again spends a refusal round on an answer we have already been given — and three rounds stall
+    // the document, so an avoidable one is expensive.
+    //
+    // This is what the machine-readable refusal detail was FOR. A refusal that carried only prose
+    // could be read by an operator and adopted by nobody.
+    const adopted = layer.store.adoptedRefusedCodepoints(who.ownerAgentId, documentId);
+    if (adopted.size > 0) {
+      const offenders = new Set<string>();
+      const offsets: number[] = [];
+      let at = 0;
+      for (const ch of content) {
+        const cp = `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+        if (adopted.has(cp)) {
+          offenders.add(cp);
+          offsets.push(at);
+        }
+        at++;
+      }
+      // Markers are matched as substrings, exactly as the screen matches them.
+      for (const marker of [...adopted].filter((c) => !c.startsWith("U+"))) {
+        let idx = content.indexOf(marker);
+        while (idx !== -1) {
+          offenders.add(marker);
+          offsets.push([...content.slice(0, idx)].length);
+          idx = content.indexOf(marker, idx + marker.length);
+        }
+      }
+      if (offenders.size > 0) {
+        offsets.sort((a, b) => a - b);
+        return {
+          ok: false,
+          reason: "document_peer_rule_adopted",
+          guidance:
+            `Your peer has already refused ${[...offenders].join(", ")} in this document ` +
+            `(${offsets.length} occurrence(s), first at character ${offsets[0]}). Sending it again ` +
+            `would spend a refusal round on an answer they have given — and three of those stall ` +
+            `the document. Remove it and write again.`,
+          detail: JSON.stringify({ rule: SCREEN_RULE_ID, adopted: true, codepoints: [...offenders], count: offsets.length, offsets }),
+        };
+      }
+    }
+
     const screenFault = screenText(content);
     if (screenFault) {
       return {

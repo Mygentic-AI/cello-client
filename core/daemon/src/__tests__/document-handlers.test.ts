@@ -447,3 +447,79 @@ describe("DOD-DOC-SCREEN-1 — the sender is told BEFORE the peer refuses", () =
     }
   });
 });
+
+describe("DOD-DOC-SCREEN-1 §16.7-16 — the sender ADOPTS the receiver's rule", () => {
+  it("refuses a character this peer has already refused for this document", async () => {
+    // Rules compose toward STRICT. Once they have said no, emitting it again spends a refusal round
+    // on an answer we already have — and three rounds stall the document, so an avoidable one is
+    // expensive. This is what the machine-readable refusal detail exists for: a refusal carrying
+    // only prose can be read by an operator and adopted by nobody.
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+
+    // Their signed refusal, in the shape the screening rule actually emits.
+    f.layer.rejections.recordIncomingRejection(f.owner, documentId, {
+      rejectionEnvelopeHash: "11".repeat(32),
+      rejectedEnvelopeHash: "22".repeat(32),
+      reason: "document_content_refused",
+      detail: JSON.stringify({ rule: "document_content_screen", codepoints: ["U+00E9"], count: 1, offsets: [3] }),
+      fromAgentId: f.peer,
+    });
+
+    const res = await f.call("cello_doc_write", { document_id: documentId, content: "café time" });
+    expect(res).toMatchObject({ ok: false, reason: "document_peer_rule_adopted" });
+    expect(String(res.guidance)).toContain("U+00E9");
+    // Nothing applied, nothing published — a refusal that half-applied is worse than the round it saves.
+    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+  });
+
+  it("admits text that does not contain what they refused", async () => {
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    f.layer.rejections.recordIncomingRejection(f.owner, documentId, {
+      rejectionEnvelopeHash: "11".repeat(32),
+      rejectedEnvelopeHash: "22".repeat(32),
+      reason: "document_content_refused",
+      detail: JSON.stringify({ rule: "document_content_screen", codepoints: ["U+00E9"] }),
+      fromAgentId: f.peer,
+    });
+    expect(await f.call("cello_doc_write", { document_id: documentId, content: "plain ascii" }))
+      .toMatchObject({ ok: true, published: true });
+  });
+
+  it("adopts NOTHING from a refusal whose detail is prose", async () => {
+    // Guessing a rule out of English is how a sender ends up refusing text nobody objected to. A
+    // refusal with no structured codepoints carries no rule to adopt, and that is not an error.
+    const f = await newFixture();
+    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    f.layer.rejections.recordIncomingRejection(f.owner, documentId, {
+      rejectionEnvelopeHash: "11".repeat(32),
+      rejectedEnvelopeHash: "22".repeat(32),
+      reason: "document_content_refused",
+      detail: "we would rather you did not use accented characters",
+      fromAgentId: f.peer,
+    });
+    expect(await f.call("cello_doc_write", { document_id: documentId, content: "café time" }))
+      .toMatchObject({ ok: true, published: true });
+  });
+
+  it("is scoped to THIS document — a rule adopted for one does not narrow another", async () => {
+    // They refused it HERE, under the profile agreed HERE. Another peer, or another document with
+    // the same peer, may accept it happily; silently narrowing what an operator can write
+    // everywhere would be a rule nobody agreed to.
+    const f = await newFixture();
+    const docA = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    const docB = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
+    f.layer.rejections.recordIncomingRejection(f.owner, docA, {
+      rejectionEnvelopeHash: "11".repeat(32),
+      rejectedEnvelopeHash: "22".repeat(32),
+      reason: "document_content_refused",
+      detail: JSON.stringify({ rule: "document_content_screen", codepoints: ["U+00E9"] }),
+      fromAgentId: f.peer,
+    });
+    expect(await f.call("cello_doc_write", { document_id: docA, content: "café" }))
+      .toMatchObject({ ok: false, reason: "document_peer_rule_adopted" });
+    expect(await f.call("cello_doc_write", { document_id: docB, content: "café" }))
+      .toMatchObject({ ok: true, published: true });
+  });
+});
