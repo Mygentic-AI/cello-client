@@ -30,6 +30,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import { LEAF_KIND_MSG, LEAF_KIND_CTRL, LEAF_KIND_DOC, LEAF_KIND_REJECT } from "../session-relay-client.js";
 import { createDocumentDeliveryTransport } from "../document-delivery-transport.js";
 import type { Logger } from "../types.js";
@@ -84,6 +85,40 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
       submitted[0],
       "a document update was witnessed as a MESSAGE — the directory's doc/reject guards cannot fire",
     ).toBe(LEAF_KIND_DOC);
+  });
+
+  it("every HOP forwards it — the composition root dropped it and nothing complained", () => {
+    // THE SECOND HALF OF THE SAME DEFECT, and the reason the first fix shipped without working.
+    //
+    // The transport asked for 0x04 correctly. daemon.ts's adapter was written
+    //   `(agent, sessionId, content, contentHash, correlationId) => manager.sendContent(...)`
+    // — five parameters where the dep declares six. TypeScript accepts that silently: a function of
+    // LOWER arity is assignable to one of higher arity. So the argument was discarded one hop below
+    // the boundary the test above asserts, and the wire was unchanged on live traffic.
+    //
+    // Asserted structurally, on the SOURCE of the composition root, because that is the only thing
+    // that fails when someone re-writes the adapter with the shorter signature. A behavioural test
+    // here would have to stand up the whole daemon, and a mock of this seam is precisely what hid
+    // the defect the first time.
+    const root = readFileSync(new URL("../daemon.ts", import.meta.url), "utf8");
+
+    const contentAdapter = /sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/.exec(root);
+    expect(contentAdapter, "the sendContent adapter in daemon.ts was renamed or restructured").not.toBeNull();
+    expect(
+      contentAdapter![1].includes("leafKind"),
+      "daemon.ts's sendContent adapter does not ACCEPT leafKind — the transport's 0x04 is dropped here",
+    ).toBe(true);
+    expect(
+      contentAdapter![2].includes("leafKind"),
+      "daemon.ts's sendContent adapter accepts leafKind but does not PASS it on",
+    ).toBe(true);
+
+    const frameAdapter = /sendFrame:\s*async\s*\(([^)]*)\)/.exec(root);
+    expect(frameAdapter, "the sendFrame adapter in daemon.ts was renamed or restructured").not.toBeNull();
+    expect(
+      frameAdapter![1].includes("leafKind"),
+      "daemon.ts's sendFrame adapter drops leafKind, so a refusal cannot be witnessed as 0x05",
+    ).toBe(true);
   });
 
   it("the four leaf kinds stay distinct, because the guards discriminate on them", () => {

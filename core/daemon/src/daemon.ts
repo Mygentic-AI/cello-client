@@ -3562,8 +3562,14 @@ async function startDaemonHoldingLock(
             logger.warn("document.delivery.seal_failed", { agent, sessionId, reason: sealed?.reason ?? "unknown", correlationId });
           }
         },
-        sendContent: (agent, sessionId, content, contentHash, correlationId) =>
-          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId),
+        // `leafKind` IS LOAD-BEARING AND MUST BE FORWARDED. This adapter took five parameters and
+        // dropped the sixth, which TypeScript accepts without a word — a function of lower arity is
+        // assignable to one of higher arity, and the dep declares `leafKind?: number`. So the
+        // transport asked for 0x04, the composition root threw it away, and every document leaf
+        // still reached the relay as a MESSAGE. Verified on live traffic: daemon 0.0.145 shipped
+        // the fix everywhere except here and the wire was unchanged.
+        sendContent: (agent, sessionId, content, contentHash, correlationId, leafKind) =>
+          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId, leafKind),
         // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
         // successful send. See the comment at the call site for why this is delivery-critical and
         // not audit bookkeeping.
