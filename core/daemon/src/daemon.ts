@@ -3415,7 +3415,7 @@ async function startDaemonHoldingLock(
     workspaceRoot: join(config.celloDir, "documents"),
     // The ack's road to the peer — the same open-or-reuse-then-seal path every other document frame
     // takes. Resolved from the owner KEY back to the agent name, because the transport is per agent.
-    sendFrame: async (ownerAgentId, peerAgentId, bytes) => {
+    sendFrame: async (ownerAgentId, peerAgentId, bytes, leafKind) => {
       const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
       if (!agentName) return { ok: false, reason: "document_ack_no_agent" };
       const sent = await documentTransportFor(agentName).sendBytes({
@@ -3423,6 +3423,7 @@ async function startDaemonHoldingLock(
         documentId: "ack",
         bytes,
         correlationId: randomUUID(),
+        ...(leafKind === undefined ? {} : { leafKind }),
       });
       return sent.ok ? { ok: true } : { ok: false, reason: sent.reason };
     },

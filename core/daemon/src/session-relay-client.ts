@@ -778,11 +778,22 @@ export class AgentRelayClient {
   }
 
   /**
-   * Submit a session's MESSAGE-leaf (0x00) hash to the relay. Connects/re-connects from
-   * `node` if needed. Globally FIFO across the agent's sessions (the ack has no session_id).
+   * Submit a session's CONTENT-leaf hash to the relay. Connects/re-connects from `node` if needed.
+   * Globally FIFO across the agent's sessions (the ack has no session_id).
+   *
+   * `leafKind` defaults to MESSAGE, which is what `cello_send` wants. It is a PARAMETER because
+   * the document path needs 0x04/0x05: the seal certificate is computed by the directory from the
+   * leaves the RELAY witnessed, and `seal-legibility.ts` excludes doc/reject leaves from
+   * `final_message` and from `answered` — guards that could never fire while this method hardcoded
+   * MSG for every caller. See `document-leaf-kind-on-the-wire.test.ts` for what that cost.
    */
-  async submitMessageHash(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array): Promise<SubmitResult> {
-    return this.submitLeaf(node, sessionId, contentHash, LEAF_KIND_MSG);
+  async submitMessageHash(
+    node: CelloNode,
+    sessionId: Uint8Array,
+    contentHash: Uint8Array,
+    leafKind: number = LEAF_KIND_MSG,
+  ): Promise<SubmitResult> {
+    return this.submitLeaf(node, sessionId, contentHash, leafKind);
   }
 
   /**

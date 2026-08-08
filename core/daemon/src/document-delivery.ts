@@ -78,6 +78,12 @@ export interface DocumentDeliveryTransport {
     bytes: Uint8Array;
     sessionHint?: string;
     correlationId: string;
+    /**
+     * The witnessed leaf DOMAIN. Defaults to the document kind (0x04); a refusal passes 0x05.
+     * Only the caller knows which frame it is holding, and the directory's legibility rules
+     * discriminate on it — see `DOCUMENT_LEAF_KIND` in document-delivery-transport.ts.
+     */
+    leafKind?: number;
   }): Promise<
     | { ok: true; sessionId: string; sessionOpened: boolean }
     | { ok: false; reason: string; detail?: string }

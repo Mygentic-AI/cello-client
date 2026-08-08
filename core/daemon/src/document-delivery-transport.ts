@@ -39,6 +39,7 @@ import { wireContentHash } from "./wire-content-hash.js";
 import type { DocumentEnvelopeRow } from "./document-store.js";
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
+import { LEAF_KIND_DOC } from "./session-relay-client.js";
 import type { Logger } from "./types.js";
 
 export interface DocumentTransportDeps {
@@ -76,6 +77,8 @@ export interface DocumentTransportDeps {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId: string,
+    /** The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below. */
+    leafKind?: number,
   ): Promise<
     | { ok: true; delivered: true }
     | { ok: true; delivered: false; parked: true }
@@ -122,6 +125,20 @@ export interface DocumentTransportDeps {
  * long enough to be mistaken for a conversation.
  */
 export const DELIVERY_ACK_GRACE_MS = 10_000;
+
+/**
+ * Everything this transport sends is document-domain traffic, so 0x04 is the default rather than
+ * something each call site remembers. A refusal overrides it with 0x05 — the two are distinguished
+ * for the same reason, and only the caller knows which it is holding.
+ *
+ * WHY IT MATTERS AT ALL. The seal certificate is built by the DIRECTORY from the leaves the RELAY
+ * witnessed, never from the sender's local tree. `seal-legibility.ts` excludes doc/reject leaves
+ * from `final_message` and from `answered`, and says why: a document update is applied MECHANICALLY
+ * by the peer's daemon with no agent involved, so counting one as a reply would let a peer's daemon
+ * satisfy the unanswered-tail check on its operator's behalf. Both exclusions were dead code while
+ * this path submitted every document leaf as a MESSAGE.
+ */
+export const DOCUMENT_LEAF_KIND = LEAF_KIND_DOC;
 
 export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
@@ -193,7 +210,7 @@ export function createDocumentDeliveryTransport(
       // consulted. Found by two real daemons; no in-process test could see it, because both sides
       // of those compute the hash with the same function.
       const hash = wireContentHash(bytes);
-      const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId);
+      const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND);
       if (!sent.ok) {
         // Sealed even on a send failure, for the same reason as below: a session this daemon opened
         // and walked away from is a live node the operator never started. A failed send is exactly
@@ -234,7 +251,7 @@ export function createDocumentDeliveryTransport(
       const { sessionId, sessionOpened } = session;
 
       const { bytes, hash } = deps.encodeEnvelope(envelope);
-      const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId);
+      const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId, DOCUMENT_LEAF_KIND);
       if (sent.ok) deps.appendLeaf(deps.agentName, sessionId, hash, correlationId);
       if (!sent.ok) {
         // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it

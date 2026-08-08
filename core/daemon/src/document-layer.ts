@@ -49,6 +49,7 @@ import {
   buildDocumentAckTbs,
   type DocumentAck,
 } from "@cello-protocol/protocol-types";
+import { LEAF_KIND_REJECT } from "./session-relay-client.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
@@ -111,6 +112,12 @@ export interface DocumentLayerDeps {
     ownerAgentId: string,
     peerAgentId: string,
     bytes: Uint8Array,
+    /**
+     * The witnessed leaf DOMAIN. Omitted means the document kind (0x04), which is right for an ack;
+     * a REFUSAL passes 0x05. The directory discriminates on it when it builds the seal certificate,
+     * so a refusal recorded as a message is a refusal the certificate reports as something said.
+     */
+    leafKind?: number,
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
@@ -325,7 +332,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // party in a two-party document, and reading it from the signed bytes means a refusal can
       // only ever go back to the agent that actually sent the thing refused.
       const env = decodeDocumentUpdateEnvelope(inResponseTo);
-      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, bytes);
+      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, bytes, LEAF_KIND_REJECT);
       if (!sent.ok) {
         logger.warn("document.rejection.unsent", {
           documentId: env.document_id,
