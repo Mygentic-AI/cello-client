@@ -161,21 +161,28 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     ownerAgentId: string,
     documentId: string,
     documentType: string,
-  ): Promise<string | null> {
-    if (!layer.writePath) return null;
+  ): Promise<{ path: string | null; reason?: string; detail?: string }> {
+    if (!layer.writePath) return { path: null, reason: "document_files_unavailable" };
     try {
-      return await layer.writePath.materialize(
+      const path = await layer.writePath.materialize(
         ownerAgentId,
         documentId,
         documentType,
         layer.live.get(ownerAgentId, documentId),
       );
+      return { path };
     } catch (err: unknown) {
-      logger.warn("document.file.materialize_failed", {
-        documentId,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      return null;
+      // THE REASON TRAVELS TO THE CALLER, not just to the log. `propose` and `accept` returned
+      // `filePath: null` and said nothing, while the tool description promises "returns its path" —
+      // so an operator looking for a file that is not there had no way to learn why without reading
+      // the daemon log. `cello_doc_write` was given `fileUpdated` and guidance for exactly this;
+      // these two were not.
+      const reason = err instanceof Error && "reason" in err
+        ? String((err as { reason: unknown }).reason)
+        : "document_file_error";
+      const detail = err instanceof Error ? err.message : String(err);
+      logger.warn("document.file.materialize_failed", { documentId, reason, detail });
+      return { path: null, reason, detail };
     }
   }
 
@@ -325,7 +332,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // THE FILE EXISTS FROM THE START. Materializing lazily would mean the first `cello_doc_publish`
     // has no recorded projection to diff against and refuses — correct, and a bad first experience
     // for something the operator never had to ask for.
-    const proposeFilePath = await materialize(who.ownerAgentId, documentId, documentType);
+    const proposeFile = await materialize(who.ownerAgentId, documentId, documentType);
 
     const correlationId = randomUUID();
     const sent = await deps.transportFor(who.agentName).sendBytes({
@@ -334,7 +341,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       bytes: encodeDocumentProposal(envelope),
       correlationId,
     });
-    logger.info("document.proposed", { documentId, peerAgentId, sent: sent.ok, correlationId });
+    // `document.proposal.sent` per the DoD taxonomy. It was `document.proposed`, which reads as
+    // the same fact but does not match what an operator or a log query is told to look for.
+    logger.info("document.proposal.sent", { documentId, peerAgentId, sent: sent.ok, correlationId });
 
     if (!sent.ok) {
       // The document EXISTS and the proposal did not arrive. Both facts are reported, because
@@ -352,7 +361,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
     layer.handshake.markProposalSent(who.ownerAgentId, documentId, deps.now());
-    return { ok: true, documentId, proposalSent: true, peerAgentId, filePath: proposeFilePath };
+    return {
+      ok: true,
+      documentId,
+      proposalSent: true,
+      peerAgentId,
+      filePath: proposeFile.path,
+      // Said out loud rather than left as a silent null against a description that promises a path.
+      ...(proposeFile.path === null
+        ? {
+            fileUnavailableReason: proposeFile.reason,
+            guidance:
+              `The document exists and the offer was sent, but no file was written for it ` +
+              `(${proposeFile.reason}${proposeFile.detail ? `: ${proposeFile.detail}` : ""}). Use ` +
+              `cello_doc_read and cello_doc_write, which do not need the file.`,
+          }
+        : {}),
+    };
   });
 
   /**
@@ -476,15 +501,26 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (outcome.envelope.starting_content) {
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), outcome.envelope.starting_content);
     }
-    const acceptFilePath = await materialize(who.ownerAgentId, documentId, outcome.envelope.document_type);
-    logger.info("document.accepted", { documentId, proposerAgentId: outcome.envelope.proposer_agent_id });
+    const acceptFile = await materialize(who.ownerAgentId, documentId, outcome.envelope.document_type);
+    // NOT re-logged here. `DocumentHandshake` already emits `document.proposal.accepted` for this
+    // exact fact, and two events for one act make every count of "how many were accepted" wrong
+    // depending on which name the query used.
     const told = await tellProposer(who, documentId, outcome.envelope.proposer_agent_id, true, undefined);
     return {
       ok: true,
       documentId,
       peerAgentId: outcome.envelope.proposer_agent_id,
       proposerNotified: told,
-      filePath: acceptFilePath,
+      filePath: acceptFile.path,
+      ...(acceptFile.path === null
+        ? {
+            fileUnavailableReason: acceptFile.reason,
+            guidance:
+              `You accepted the document and it is live, but no file was written for it ` +
+              `(${acceptFile.reason}${acceptFile.detail ? `: ${acceptFile.detail}` : ""}). Use ` +
+              `cello_doc_read and cello_doc_write, which do not need the file.`,
+          }
+        : {}),
     };
   });
 

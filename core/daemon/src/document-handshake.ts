@@ -224,7 +224,8 @@ export class DocumentHandshake {
       return { documentId, state, reason: storedReason };
     }
     if (state === "pending") {
-      this.#logger.info("document.proposal.pending", {
+      // `document.proposal.received` per the DoD taxonomy — this fires when a proposal ARRIVES.
+      this.#logger.info("document.proposal.received", {
         documentId,
         proposerAgentId: envelope.proposer_agent_id,
       });
