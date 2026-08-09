@@ -456,7 +456,9 @@ describe("concurrent writes MERGE — they do not concatenate the two documents"
     });
     await b.sweep();
     await vi.waitFor(() => expect(a.nudges.length).toBeGreaterThan(0));
-    expect(a.nudges[0]).toMatchObject({ documentId, paths: ["blocking_flags.funds"] });
+    // THE WATCH PATTERN, not the changed path. A changed path can carry a key the peer named, and a
+    // doorbell body is unscreened — see `matchingWatches`.
+    expect(a.nudges[0]).toMatchObject({ documentId, paths: ["blocking_flags"] });
 
     // RINGS ONCE. A peer editing for ten minutes must produce one nudge, not forty.
     await b.call("cello_doc_write", {

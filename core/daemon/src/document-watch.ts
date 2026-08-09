@@ -87,3 +87,25 @@ export function normalizeWatchPaths(paths: readonly string[]): string[] {
   // Drop anything a broader sibling already covers.
   return cleaned.filter((p) => !cleaned.some((other) => other !== p && covers(other, p)));
 }
+
+/**
+ * The watch patterns THIS agent authored that were matched — not the paths that changed.
+ *
+ * ── WHY THIS EXISTS SEPARATELY FROM `matchWatchedPaths` ──────────────────────────────────────────
+ *
+ * A changed path can contain a key the PEER named. Watch `blocking_flags`, and a counterparty adding
+ * `blocking_flags.<anything they like>` produces a changed path carrying attacker-chosen text. Send
+ * that to the operator's agent as a doorbell body and the peer has an unscreened channel into its
+ * context — which is precisely what INV-CONTENTFREE exists to close, and a doorbell is the worst
+ * place to open it because it arrives without the agent asking for anything.
+ *
+ * The watch PATTERNS are different: the agent wrote them itself, locally, and they never crossed the
+ * wire. Naming them is telling the agent what it asked for.
+ *
+ * The cost is precision — "your watch on `blocking_flags` fired" rather than naming the exact field.
+ * That is the right trade: the agent reads the document next, and `cello_doc_diff` shows the precise
+ * paths through a SCREENED read rather than through a notification that bypasses screening.
+ */
+export function matchingWatches(watches: readonly string[], changed: readonly string[]): string[] {
+  return watches.filter((w) => changed.some((path) => covers(w, path)));
+}

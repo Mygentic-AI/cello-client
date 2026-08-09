@@ -34,7 +34,7 @@ import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
 import { DocumentNotifications, changedKeyPaths } from "./document-notify.js";
-import { matchWatchedPaths } from "./document-watch.js";
+import { matchWatchedPaths, matchingWatches } from "./document-watch.js";
 import { projectDocumentText } from "./document-json.js";
 import { rootForDocumentType } from "./document-types.js";
 import { DocumentHandshake } from "./document-handshake.js";
@@ -373,12 +373,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
             : ["*"];
         const hits = matchWatchedPaths(watches, paths);
         if (hits.length === 0) return;
+        // THE AGENT'S OWN PATTERNS travel, never the changed paths. A changed path can carry a key
+        // the PEER named, and a doorbell body is an unscreened route into the agent's context —
+        // see `matchingWatches`. The precise field comes from cello_doc_diff, which IS screened.
+        const firedWatches = matchingWatches(watches, paths);
         notifications.markNudged(ownerAgentId, env.document_id, Date.now());
         logger.info("document.watch.nudged", {
           documentId: env.document_id,
           paths: hits.length,
+          watches: firedWatches.length,
         });
-        deps.nudge?.(ownerAgentId, env.document_id, hits);
+        deps.nudge?.(ownerAgentId, env.document_id, firedWatches);
       } catch (err: unknown) {
         logger.warn("document.watch.nudge_failed", {
           documentId: env.document_id,

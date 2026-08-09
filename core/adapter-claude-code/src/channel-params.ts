@@ -111,6 +111,25 @@ function doorbellText(type: string, data: Record<string, unknown>): string {
     // too; only fingerprints shorten"). A mangled name reads like a different agent. Removing the
     // last two callers left `short()` with none — fingerprints are rendered by shimFingerprint,
     // which slices independently — so it was deleted rather than left as a helper nobody calls.
+    // DOD-DOC-WATCH-1 — the ONE doorbell a document update can ring, and only because this agent
+    // asked for it by name. Without a case here it fell through to `CELLO event: document_watch.`,
+    // which wakes an agent and tells it nothing — costing a read just to discover why.
+    //
+    // The paths named here are the agent's OWN watch patterns, never the changed paths: a changed
+    // path can contain a key the PEER named, and this body is not screened. The precise field comes
+    // from cello_doc_diff, which is.
+    case "document_watch": {
+      const paths = Array.isArray(data["paths"]) ? (data["paths"] as unknown[]).map(String) : [];
+      const named = paths.length > 0 ? paths.join(", ") : "a field you are watching";
+      // The document id is a hex identity and IS shortened — the rule is that agent NAMES are never
+      // truncated; fingerprints are.
+      const doc = String(data["documentId"] ?? "");
+      const which = doc.length > 12 ? `${doc.slice(0, 12)}…` : doc;
+      return (
+        `🔔 CELLO — something you are watching changed in document ${which}: ${named}. ` +
+        `Run cello_doc_diff to see exactly what moved, then cello_doc_read before you write.`
+      );
+    }
     case "agent_state_changed":
       return `CELLO: agent ${String(data["agent"] ?? "your agent")} is now ${String(data["state"] ?? "changed")}.`;
     case "agent_current_changed":
