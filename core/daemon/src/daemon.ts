@@ -2987,6 +2987,21 @@ async function startDaemonHoldingLock(
     // M12-P14: the pre-seal readiness gate drains the parked mailbox before judging, so a close
     // does not refuse over content the relay is still holding for us.
     recoverParkedContent: (agentName: string, trigger: string) => autoRecoverForAgent(agentName, trigger),
+    // DOD-TERMINAL-STATE-DIVERGENCE-1: the same pull `cello_sealed_receipt` uses, now also available
+    // to the close — which is where the operator actually gets stranded.
+    pullSealCertificate: (agentName: string, sessionIdHex: string) =>
+      pullSealCertificate(
+        {
+          logger,
+          sessionNodeManager,
+          signalingFor,
+          sendOver,
+          getPersistence,
+          getAgentPubkeyHex: (name) => loadedAgents.find((a) => a.name === name)?.pubkey,
+        },
+        agentName,
+        sessionIdHex,
+      ),
     handlers,
     logger,
     sessionNodeManager,

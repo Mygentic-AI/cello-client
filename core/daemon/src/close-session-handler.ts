@@ -42,6 +42,21 @@ export interface CloseSessionDeps {
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
   openVisitingConnection: (agentName: string, agentKeyProvider: KeyProvider, agentPubkeyHex: string, endpoint: DirectoryEndpoint, correlationId: string, nodeId: string) => { mgr: SignalingManager; stop: (reason: string) => Promise<void> };
   /**
+   * ASK the directory for a seal certificate this daemon was never pushed
+   * (`DOD-TERMINAL-STATE-DIVERGENCE-1`).
+   *
+   * The `session_sealed` frame is pushed ONCE. If this daemon's stream was down at that instant it
+   * is gone — the re-delivery queue is per-node and clients roam. The session IS notarized and the
+   * counterparty holds a receipt; this side holds a non-terminal row and, without asking, can never
+   * produce one.
+   *
+   * Wired here because THIS is where the operator gets stuck: they run a close, it fails, and the
+   * failure is indistinguishable from "the seal has not happened". Asking turns that into "it
+   * happened, here is your receipt". The directory is not trusted for the answer — the certificate
+   * is re-verified against its FROST signature before anything is recorded.
+   */
+  pullSealCertificate?: (agentName: string, sessionIdHex: string) => Promise<{ ok: boolean; reason?: string }>;
+  /**
    * Ask the directory where an agent is homed RIGHT NOW. Needed because `crossNodeBrokerBySession`
    * is in-memory and a restart empties it — and a restart is what makes a session interrupted.
    */
@@ -185,7 +200,85 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   // AC-013: seal_interrupted_rejected_by_counterparty
   // DB-001: signaling_reconnecting
   // SI-001: no auto-seal on session_interrupted receipt; operator must call explicitly
-  handlers.set("cello_close_session", async (params, connectionId) => {
+  /**
+   * DOD-TERMINAL-STATE-DIVERGENCE-1 — close failures that might mean "it is ALREADY sealed, you were
+   * just never told".
+   *
+   * `session_sealed` is pushed once. Miss it and this side holds a non-terminal row while the
+   * counterparty holds a receipt, and every close from here fails in a way that reads exactly like
+   * "the seal has not happened yet". These are the reasons where that is a live possibility:
+   *
+   *   - the counterparty REJECTED our seal request. It does that when it considers the session
+   *     already finished, which is precisely the divergence.
+   *   - the unilateral escalation TIMED OUT with no answer.
+   *   - the relay says the session is sealed or gone — terminal, so nothing more can be added, which
+   *     also means whatever exists is final.
+   *
+   * NOT included: `session_not_found`, `invalid_session_id`, an abandoned session, or a refusal we
+   * generated locally. Asking there would be noise on a question already answered.
+   */
+  const MAY_ALREADY_BE_SEALED = new Set([
+    "seal_interrupted_rejected_by_counterparty",
+    "seal_unilateral_timeout",
+    "session_seal_already_pending",
+    "session_sealed",
+    "relay_session_gone",
+  ]);
+
+  /**
+   * The close, wrapped so a failure gets ONE chance to discover the seal already happened.
+   *
+   * Wrapped rather than patched into each exit: this handler has six failure returns and a seventh
+   * would be added without the recovery. The operator's experience is what matters here — they ran a
+   * close, it failed, and the answer they get should be a receipt if one exists.
+   */
+  const closeSession = async (params: Record<string, unknown> | undefined, connectionId: string): Promise<unknown> => {
+    const first = await runClose(params, connectionId);
+    const failed = first as { ok?: boolean; reason?: string };
+    if (failed?.ok !== false || !deps.pullSealCertificate) return first;
+    if (!MAY_ALREADY_BE_SEALED.has(String(failed.reason))) return first;
+
+    const connState = getConnState(connectionId);
+    const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
+    // `session_id` — the IPC parameter name. The MCP tool's `cello_session_id` is translated by the
+    // shim, and reading that name here would have found nothing and silently skipped the recovery.
+    const sessionId = typeof params?.session_id === "string" ? params.session_id : "";
+    if (!agentName || sessionId.length === 0) return first;
+
+    const pulled = await deps.pullSealCertificate(agentName, sessionId);
+    if (!pulled.ok) {
+      // Said out loud. "We asked and there is none" is a different fact from "we never asked", and
+      // an operator deciding whether to force-abandon needs to know which one they have.
+      logger.info("seal.certificate.pull.none_on_close", {
+        agentName, sessionId, closeReason: failed.reason, pullReason: pulled.reason ?? "",
+      });
+      return {
+        ...(first as Record<string, unknown>),
+        seal_lookup: pulled.reason === "not_found" ? "asked_none_exists" : `asked_${pulled.reason ?? "failed"}`,
+      };
+    }
+
+    const recovered = sessionNodeManager.getSealCertificate(agentName, sessionId);
+    if (!recovered) return first;
+    logger.info("seal.certificate.recovered_on_close", {
+      agentName, sessionId, sealedRoot: recovered.sealed_root,
+      impact: "the seal existed and this side had never been told; the close now returns the receipt",
+    });
+    return {
+      ok: true,
+      sessionId,
+      sealed_root: recovered.sealed_root,
+      recovered: true,
+      guidance:
+        "This session was ALREADY sealed — the notarization existed and this daemon had never been " +
+        "told, which is why the close appeared to fail. The certificate has been fetched and " +
+        "verified against its signature, and is now held locally. Read it with cello_sealed_receipt.",
+    };
+  };
+
+  handlers.set("cello_close_session", closeSession);
+
+  const runClose = async (params: Record<string, unknown> | undefined, connectionId: string): Promise<unknown> => {
     const connState = getConnState(connectionId);
     // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined);
@@ -751,5 +844,5 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       reason: "session_not_closeable",
       guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_sessions; a seal_interrupted_pending session is awaiting FROST notarization.`,
     };
-  });
+  };
 }
