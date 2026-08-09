@@ -65,6 +65,21 @@ export interface ManifestGateResult {
    * words to the attacker instead of the portal.
    */
   verifiedManifest: ConsortiumManifest | null;
+  /**
+   * WHICH nodes did not resolve, and why — the operator-facing counterpart to the count above.
+   *
+   * This sweep runs at boot, and for the failure it exists to describe that is the only sweep that
+   * has run when the operator first looks. It used to log `directory.consortium.partial` with a
+   * count and discard the detail, so `cello status` could say nothing at all while every session
+   * failed. That is the 2026-07-31 incident: `dns_error` in the log 26 times per node from startup,
+   * the operator shown `counterparty_offline` → `directory_below_threshold` → `ceremony_exhausted`,
+   * and an hour spent concluding the protocol was broken.
+   *
+   * Empty on every path that resolved nothing to complain about — including the back-compat path,
+   * where an empty list means "no sweep ran", not "all healthy". The status surface says which
+   * nodes failed rather than asserting all-good, for exactly that reason.
+   */
+  unresolvedNodes: NodeResolveFailure[];
 }
 
 /**
@@ -80,9 +95,10 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
   let verifiedManifestVersion = 0;
   let consortiumEndpoints: ConsortiumEndpoint[] = [];
   let verifiedManifest: ConsortiumManifest | null = null;
+  const unresolvedNodes: NodeResolveFailure[] = [];
 
   if (!manifestProvider || !manifestRootKeys || manifestThreshold === undefined) {
-    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
+    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
   }
 
   try {
@@ -97,14 +113,14 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         notBefore: manifest.not_before,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
     }
     if (expiresAt <= now) {
       logger.error("directory.auth.manifest.expired", {
         manifestVersion: manifest.version,
         expiresAt: manifest.expires,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
     }
 
     // Anti-rollback. Equal versions are fine (a restart on an unchanged manifest); only a STRICTLY
@@ -115,7 +131,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         lastSeenVersion: lastSeen,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
     }
 
     await manifestVersionStore.persistVersion(manifest.version);
@@ -133,7 +149,12 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
     // fans out to. Availability-aware: a down node is skipped and the rest still resolve. The
     // threshold gate lives in the ceremony layer (DOD-DKG-1); it NEVER falls back to the single
     // hardcoded endpoint for a missing node, which would mask a down/forged node as healthy.
-    consortiumEndpoints = await manifestNodesToEndpoints(manifest.nodes, { logger, fetchFn });
+    consortiumEndpoints = await manifestNodesToEndpoints(manifest.nodes, {
+      logger,
+      fetchFn,
+      // The detail this sweep used to throw away. See ManifestGateResult.unresolvedNodes.
+      onNodeUnresolved: (f) => unresolvedNodes.push(f),
+    });
     const declaredNodes = manifest.nodes.length;
     const resolvedNodes = consortiumEndpoints.length;
     // Carry the nodeId↔peerId pairing (not just peerIds) so a consumer can verify each manifest
@@ -158,7 +179,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
     });
   }
 
-  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest };
+  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
 }
 
 export interface ConsortiumRoutingDeps {
@@ -171,6 +192,11 @@ export interface ConsortiumRoutingDeps {
   directoryEndpointResolver?: () => Promise<DirectoryEndpoint | null>;
   logger: Logger;
   fetchFn?: typeof fetch;
+  /**
+   * What the startup sweep already found unresolvable, so the operator surface is populated from
+   * boot rather than from whenever the first ceremony happens to run. See the seeding note inside.
+   */
+  initialUnresolvedNodes?: readonly NodeResolveFailure[];
 }
 
 export interface ConsortiumRouting {
@@ -212,7 +238,12 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   // LAST failure per node, not a running count — the operator needs the current state, and a node
   // that has started resolving again must drop out rather than linger as a stale complaint. Cleared
   // per sweep: every resolve attempt rebuilds this from what actually failed that time.
-  let unresolvedNodes: NodeResolveFailure[] = [];
+  //
+  // SEEDED from the startup sweep, because otherwise this is empty until some ceremony happens to
+  // resolve a roster — and the operator's first `cello status` after boot lands squarely in that
+  // window. That silence is the whole reason item 6 exists. The seed is a starting value, not a
+  // floor: the first real sweep replaces it, so a node that has recovered stops being reported.
+  let unresolvedNodes: NodeResolveFailure[] = [...(deps.initialUnresolvedNodes ?? [])];
   const getUnresolvedNodes = (): NodeResolveFailure[] => [...unresolvedNodes];
 
   const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {

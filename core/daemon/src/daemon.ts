@@ -316,7 +316,7 @@ async function startDaemonHoldingLock(
   // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
   // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
   // because only we hold the DB handle and the singleton lock a refusal has to release.
-  const { manifestVerified, verifiedManifestVersion, verifiedManifest } = await verifyStartupManifest({
+  const { manifestVerified, verifiedManifestVersion, verifiedManifest, unresolvedNodes: startupUnresolvedNodes } = await verifyStartupManifest({
     manifestProvider,
     manifestRootKeys,
     manifestThreshold,
@@ -350,6 +350,10 @@ async function startDaemonHoldingLock(
       manifestPollScheduler,
       directoryHttpUrl,
       directoryEndpointResolver,
+      // Carry the boot sweep's findings into the operator surface. Without this the status block is
+      // empty until a ceremony resolves a roster — i.e. empty exactly when someone whose sessions
+      // are all failing goes looking for why.
+      initialUnresolvedNodes: startupUnresolvedNodes,
       logger,
     });
 
@@ -1907,6 +1911,16 @@ async function startDaemonHoldingLock(
     return {
       daemon: "running",
       directory_signaling: directorySignalingStatus(),
+      // CAN I ACTUALLY REACH THE DIRECTORY — the same block cello_status carries, and for longer.
+      //
+      // This is the CLI's surface (`cello status`), and it is the one an operator at a terminal
+      // actually runs — it is what was run on 2026-07-31 while every session failed. It was silent,
+      // because this block existed on the MCP tool only. The agent list below says `online` and
+      // `standing_receiver_ready: true` whether or not a single directory endpoint resolves, so
+      // without this the two states render identically and the operator believes the healthy one.
+      //
+      // Omitted entirely when nothing is failing, so a healthy status stays quiet.
+      ...(unresolvedNodesForStatus() ?? {}),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
       // aggregate below (kept for backward compatibility).

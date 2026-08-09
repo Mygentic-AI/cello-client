@@ -303,6 +303,83 @@ describe("createConsortiumRouting", () => {
     expect(await routing.resolveConsortiumRoster()).toEqual([]);
   });
 
+  // Launch triage item 6 — "online" does not mean reachable.
+  //
+  // The startup sweep is the ONE that matters for this defect. On 2026-07-31 a cached NXDOMAIN meant
+  // no directory endpoint resolved from the moment the daemon booted; `dns_error` was in the log 26
+  // times per node FROM STARTUP, and the operator was shown three errors that each named a different
+  // innocent subsystem. The operator-facing store was empty the whole time, because this sweep
+  // resolved the roster and threw the per-node failures away — it logged a count and kept no detail.
+  //
+  // So the first `cello status` after boot, which is exactly what someone runs, could say nothing.
+  it("startup sweep REPORTS which nodes failed and why — not just how many resolved", async () => {
+    const logger = makeLogger();
+    const result = await verifyStartupManifest({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      logger,
+      fetchFn: bootstrapFetch(["n1"]), // n2 is unreachable
+    });
+
+    // The half that already worked: n1 resolved.
+    expect(result.consortiumEndpoints.map((e) => e.nodeId)).toEqual(["n1"]);
+
+    // The half that was discarded: WHICH node, and WHY. A count cannot be carried to an operator.
+    expect(result.unresolvedNodes.map((f) => f.nodeId)).toEqual(["n2"]);
+    expect(result.unresolvedNodes[0].reason).toBe("http_error");
+  });
+
+  it("startup sweep reports an EMPTY unresolved list when every node resolves", async () => {
+    const logger = makeLogger();
+    const result = await verifyStartupManifest({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      logger,
+      fetchFn: bootstrapFetch(["n1", "n2"]),
+    });
+
+    expect(result.unresolvedNodes).toEqual([]);
+  });
+
+  it("routing seeded with the startup failures reports them BEFORE any later sweep runs", () => {
+    const logger = makeLogger();
+    const startupFailures = [{ nodeId: "n2", endpoint: "https://n2.example.com", reason: "dns_error", detail: "ENOTFOUND" }];
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      initialUnresolvedNodes: startupFailures,
+      logger,
+    });
+
+    // Without the seed this is [] until some ceremony happens to resolve the roster — which is
+    // precisely the window the operator is in when they run `cello status` and get told nothing.
+    expect(routing.getUnresolvedNodes()).toEqual(startupFailures);
+  });
+
+  it("a later sweep REPLACES the seeded startup failures — a node that recovered must drop out", async () => {
+    const logger = makeLogger();
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(makeManifest()),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      initialUnresolvedNodes: [{ nodeId: "n2", endpoint: "https://n2.example.com", reason: "dns_error" }],
+      fetchFn: bootstrapFetch(["n1", "n2"]),
+      logger,
+    });
+
+    await routing.resolveConsortiumRoster();
+
+    // Stale complaints are worse than none: an operator chasing a node that is now fine.
+    expect(routing.getUnresolvedNodes()).toEqual([]);
+  });
+
   it("no manifestPollScheduler: no poll is started, and stopHttpManifestPoll is absent", () => {
     const logger = makeLogger();
     const routing = createConsortiumRouting({
