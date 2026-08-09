@@ -47,6 +47,7 @@ import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
+import { openingNoticeFor } from "./document-types.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
@@ -367,6 +368,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       proposalSent: true,
       peerAgentId,
       filePath: proposeFile.path,
+      // A file that RUNS when opened says so where the operator is handed its path — see
+      // `openingNoticeFor`. Only html carries one today, and only because a peer can write into it.
+      ...(proposeFile.path !== null && openingNoticeFor(documentType) !== undefined
+        ? { fileNotice: openingNoticeFor(documentType) }
+        : {}),
       // Said out loud rather than left as a silent null against a description that promises a path.
       ...(proposeFile.path === null
         ? {
@@ -512,6 +518,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       peerAgentId: outcome.envelope.proposer_agent_id,
       proposerNotified: told,
       filePath: acceptFile.path,
+      // Matters MORE here than on propose: the type came from the PROPOSER's envelope, so the
+      // accepter is being handed an executable file they did not choose the format of.
+      ...(acceptFile.path !== null && openingNoticeFor(outcome.envelope.document_type) !== undefined
+        ? { fileNotice: openingNoticeFor(outcome.envelope.document_type) }
+        : {}),
       ...(acceptFile.path === null
         ? {
             fileUnavailableReason: acceptFile.reason,

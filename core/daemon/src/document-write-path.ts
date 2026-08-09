@@ -28,48 +28,27 @@ import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
 import { lineRuns, toChunks } from "./line-lcs.js";
+import { extensionForDocumentType, admittedDocumentTypes, rootForDocumentType, DOCUMENT_TYPES } from "./document-types.js";
 
 /** Yjs roots a materialized document projects from. TEXT_ROOT must match DocumentEngine's. */
 const TEXT_ROOT = "content";
 const MAP_ROOT = "data";
 
-const TEXT_TYPES = new Set(["markdown", "text", "plaintext"]);
-const JSON_TYPES = new Set(["json"]);
 
 /**
- * The file extension each document type is materialized under — ONE table, read by both the
- * document path and its projection path.
+ * The type registry moved to `document-types.ts` — see that file for why.
  *
- * It used to be `JSON_TYPES.has(documentType) ? "json" : "md"`, written out twice. Everything that
- * was not JSON became `.md`, so a `text` document — explicitly not markdown, which is the entire
- * reason the type exists — reached the agent as `<id>.md`. The file IS the editing surface, and the
- * extension is what every editor and every agent reads to decide how to treat the bytes; markdown
- * autoformatting applied to non-markdown content gets diffed and PUBLISHED to the peer as
- * deliberate edits.
- *
- * A table rather than a branch because three more types are queued behind this one, and a ternary
- * is how the fourth wrong extension arrives without anyone deciding it.
+ * These re-exports keep the existing call sites working. `SUPPORTED_DOCUMENT_TYPES` and the
+ * extension rule used to be defined HERE, in parallel with a second list in `document-notify`, and
+ * the two drifted: `plaintext` was admitted and could not be diffed.
  */
-const DOCUMENT_EXTENSIONS: ReadonlyMap<string, string> = new Map([
-  ["markdown", "md"],
-  ["text", "txt"],
-  ["plaintext", "txt"],
-  ["json", "json"],
-]);
+export { extensionForDocumentType, isSupportedDocumentType } from "./document-types.js";
+
+/** The types `propose`/`accept` will admit — derived from the registry, never a second list. */
+export const SUPPORTED_DOCUMENT_TYPES: ReadonlySet<string> = new Set(admittedDocumentTypes());
 
 /**
- * The extension for a type, or `undefined` for one this build does not know.
- *
- * Undefined rather than a default: a type nothing can serve must not be handed a plausible-looking
- * path. A silent default is what let `yaml` create a real signed peer-accepted document with no
- * file and no explanation.
- */
-export function extensionForDocumentType(documentType: string): string | undefined {
-  return DOCUMENT_EXTENSIONS.get(documentType);
-}
-
-/**
- * The extension every type was materialized under before `DOCUMENT_EXTENSIONS` existed.
+ * The extension every type was materialized under before the registry existed.
  *
  * Documents created then are on operators' disks right now. The CONTENT of one is never at risk —
  * it lives in the CRDT and would be rewritten at the new path. What is at risk is whatever the
@@ -77,25 +56,6 @@ export function extensionForDocumentType(documentType: string): string | undefin
  * them at a path nothing reads again loses work silently.
  */
 const LEGACY_EXTENSION = "md";
-
-/**
- * The document types EVERY verb can serve — the ones `propose` and `accept` will admit.
- *
- * `json` is deliberately absent even though this file supports it. A JSON document's content lives
- * in the MAP root, and `cello_doc_read`, `cello_doc_write` and `cello_doc_diff` all read the TEXT
- * root. Nothing bridges them, so a JSON document reads as empty, is written into a root nothing
- * projects, and diffs as unchanged forever — while this file's own support makes the feature look
- * finished to anyone reading here. Admitting a type only half the verbs can serve is worse than
- * refusing it: it reads as done and loses content in silence.
- *
- * Exported so the refusal message names this set rather than a hardcoded copy that can drift.
- */
-export const SUPPORTED_DOCUMENT_TYPES: ReadonlySet<string> = TEXT_TYPES;
-
-/** Whether `propose`/`accept` may admit this type. Anything else creates a document with no file. */
-export function isSupportedDocumentType(documentType: string): boolean {
-  return SUPPORTED_DOCUMENT_TYPES.has(documentType);
-}
 
 /** Ids are hex identities, never names, and they become path components. */
 const ID_PATTERN = /^[0-9a-f]{64}$/;
@@ -420,7 +380,7 @@ export class DocumentWritePath {
   // ─── internals ────────────────────────────────────────────────────────────
 
   #project(doc: Y.Doc, documentType: string): string {
-    if (JSON_TYPES.has(documentType)) {
+    if (rootForDocumentType(documentType) === "map") {
       return `${JSON.stringify(doc.getMap(MAP_ROOT).toJSON(), null, 2)}\n`;
     }
     return this.engine.readTextRoot(doc);
@@ -436,7 +396,7 @@ export class DocumentWritePath {
     onDisk: string,
     documentType: string,
   ): { from: number; to: number } | { keys: string[] } | null {
-    if (JSON_TYPES.has(documentType)) {
+    if (rootForDocumentType(documentType) === "map") {
       const keys = this.#foldJson(doc, onDisk);
       return keys.length > 0 ? { keys } : null;
     }
@@ -560,11 +520,17 @@ export class DocumentWritePath {
     }
   }
 
+  /**
+   * A type this FILE can project and fold — knowing a root is exactly that capability.
+   *
+   * Deliberately wider than `isSupportedDocumentType`: `json` has a root here and is not admitted at
+   * the door, because the write path serves it while read/write/diff do not.
+   */
   #assertSupported(documentType: string): void {
-    if (!TEXT_TYPES.has(documentType) && !JSON_TYPES.has(documentType)) {
+    if (rootForDocumentType(documentType) === undefined) {
       throw new DocumentWriteError(
         "document_type_unsupported",
-        `no diff strategy for '${documentType}' — supported types are ${[...TEXT_TYPES, ...JSON_TYPES].join(", ")}`,
+        `no diff strategy for '${documentType}' — known types are ${[...DOCUMENT_TYPES.keys()].sort().join(", ")}`,
       );
     }
   }

@@ -60,6 +60,6 @@ describe("the supported document types are exactly what every verb can serve", (
 
   it("the exported set is what the refusal message can name, so guidance cannot drift from behaviour", () => {
     // A hardcoded list in a guidance string is how the message and the check stop agreeing.
-    expect([...SUPPORTED_DOCUMENT_TYPES].sort()).toEqual(["markdown", "plaintext", "text"]);
+    expect([...SUPPORTED_DOCUMENT_TYPES].sort()).toEqual(["html", "markdown", "plaintext", "text"]);
   });
 });

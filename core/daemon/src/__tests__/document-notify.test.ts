@@ -175,8 +175,25 @@ describe("DocumentNotifications — diffStats is STRUCTURAL, with no content", (
 });
 
 describe("DocumentNotifications — diff renders the supported types and REFUSES the rest", () => {
-  it("supports markdown, plain text and JSON", () => {
-    expect([...DIFFABLE_DOCUMENT_TYPES]).toEqual(["markdown", "text", "json"]);
+  it("supports every type the registry knows — including the ones it used to omit", () => {
+    // This asserted a hardcoded ["markdown", "text", "json"], which is how `plaintext` ended up
+    // admitted by propose/accept and refused by diff. The list is now derived, so the check is that
+    // every known type is here rather than that the literal matches.
+    expect([...DIFFABLE_DOCUMENT_TYPES].sort()).toEqual(["html", "json", "markdown", "plaintext", "text"]);
+  });
+
+  it("renders a line diff for plaintext — the type whose diff was dead", () => {
+    const f = newFixture();
+    const res = f.notify.diff("plaintext", "one\ntwo\n", "one\nTWO\n", DOC);
+    expect(res.ok, "plaintext is admitted; its diff must not be refused").toBe(true);
+    expect((res as { diff: string }).diff).toContain("+ TWO");
+  });
+
+  it("renders a line diff for html", () => {
+    const f = newFixture();
+    const res = f.notify.diff("html", "<p>a</p>\n", "<p>b</p>\n", DOC);
+    expect(res.ok).toBe(true);
+    expect((res as { diff: string }).diff).toContain("+ <p>b</p>");
   });
 
   it("renders a line diff for markdown and text", () => {

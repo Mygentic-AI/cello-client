@@ -33,6 +33,7 @@
  */
 
 import { lineRuns, toChunks } from "./line-lcs.js";
+import { diffableDocumentTypes, rootForDocumentType } from "./document-types.js";
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
@@ -81,8 +82,15 @@ const CREATE_READ_MARKS_SQL = `
 const READ_MARK_COLUMNS = ["ALTER TABLE document_read_marks ADD COLUMN my_text TEXT"];
 
 /** Types `diff` can render. Decided in-unit; see the header for why the list is closed. */
-export const DIFFABLE_DOCUMENT_TYPES = ["markdown", "text", "json"] as const;
-export type DiffableDocumentType = (typeof DIFFABLE_DOCUMENT_TYPES)[number];
+/**
+ * The types `cello_doc_diff` renders — DERIVED from the one registry, never listed here.
+ *
+ * This was a hardcoded `["markdown", "text", "json"]` sitting in parallel with the write path's
+ * admitted set, and the two had drifted: `plaintext` was admitted and could not be diffed, so the
+ * verb that says what changed was dead on a type the product offered.
+ */
+export const DIFFABLE_DOCUMENT_TYPES: readonly string[] = diffableDocumentTypes();
+export type DiffableDocumentType = string;
 
 export interface DocumentNotice {
   documentId: string;
@@ -368,7 +376,9 @@ export class DocumentNotifications {
     // "not computed" — the same absent-is-not-fine trap as the overlap default above.
     let keyPaths: string[] = [];
     let keyPathsComputed = false;
-    if (documentType === "json") {
+    // Dispatched on the ROOT, not the type name — a second map-root type must not fall through to
+    // the line path just because it is not called "json".
+    if (documentType !== undefined && rootForDocumentType(documentType) === "map") {
       const paths = changedKeyPaths(before, after);
       if (paths !== null) {
         keyPaths = paths;
@@ -421,7 +431,7 @@ export class DocumentNotifications {
     }
     void documentId;
 
-    if (documentType === "json") {
+    if (rootForDocumentType(documentType) === "map") {
       // A key-path diff, not a line diff. Re-serialized JSON changes shape whenever a formatter
       // touches it, so a line diff reports the entire document as rewritten for a change of one
       // value — which is the false "everything changed" alarm that makes an agent stop reading
