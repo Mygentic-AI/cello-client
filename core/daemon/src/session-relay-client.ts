@@ -42,6 +42,28 @@ import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
 /** Structure 1 leaf kind: 0x00 = message, 0x02 = control (matches the relay). */
+/**
+ * DOD-WITNESS-STALL-1 — relay refusals that can NEVER resolve.
+ *
+ * `sendContent` treats a failed leaf-hash submit as a transient degradation: the content is real,
+ * the peer still gets it, and the canonical sequence is recovered later. That is correct for a relay
+ * that is briefly unreachable.
+ *
+ * It is WRONG for these two. They mean the relay has ended the session — there is no later, and
+ * nothing sent from here can ever enter the record. Collapsing them into the transient case is what
+ * let a conversation run for 68 minutes and 8 messages, every send reporting `delivered: true`,
+ * against a chain that had stopped growing.
+ *
+ * ENUMERATED, never pattern-matched. A substring rule like `reason.includes("sealed")` would absorb
+ * a future reason nobody has considered — which is the same collapse in a new coat.
+ */
+export const TERMINAL_RELAY_REFUSALS: ReadonlySet<string> = new Set(["session_sealed", "session_not_found"]);
+
+/** True when the relay has ended this session and no later submit can succeed. */
+export function isTerminalRelayRefusal(reason: string | undefined): boolean {
+  return reason !== undefined && TERMINAL_RELAY_REFUSALS.has(reason);
+}
+
 export const LEAF_KIND_MSG = 0x00;
 /** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
 export const LEAF_KIND_CTRL = 0x02;

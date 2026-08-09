@@ -47,7 +47,7 @@ import { verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
-import { AgentRelayClient, LEAF_KIND_CTRL, LEAF_KIND_MSG, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, LEAF_KIND_MSG, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 
@@ -3747,6 +3747,40 @@ export class SessionNodeManager {
             sequenceNumber: witnessed.sequence_number,
             correlationId,
           });
+        } else if (isTerminalRelayRefusal(witnessed.reason)) {
+          // TERMINAL — REFUSE THE SEND. The relay has ended this session, so this leaf can never
+          // enter the record and neither can any leaf after it. Continuing would deliver content the
+          // conversation cannot prove it exchanged, and report `delivered: true` while doing it.
+          //
+          // That is not hypothetical. Measured 2026-08-09: a session whose relay had sealed it after
+          // both away-responders fired ran for 68 more minutes and 8 more messages, every send
+          // reporting success, against a chain that had stopped growing at six leaves. The close was
+          // then refused permanently and the only exit forfeited the receipt. The daemon had the
+          // answer the whole time — it logged `session_sealed` here and carried on, because this
+          // branch treated every relay miss as the transient case.
+          //
+          // Refused rather than parked: parking is for content the peer has not received YET. There
+          // is no yet.
+          this.#logger.error("session.relay.hash.submit.terminal", {
+            sessionId,
+            reason: witnessed.reason,
+            correlationId,
+            impact: "the relay has ended this session — nothing sent now can ever be part of its record",
+          });
+          return {
+            ok: false,
+            reason: witnessed.reason,
+            error:
+              witnessed.reason === "session_sealed"
+                ? "the relay has already sealed this session, so nothing further can enter its record"
+                : "the relay no longer holds this session, so nothing further can enter its record",
+            durable: false,
+            guidance:
+              `This session is over as far as the relay is concerned, and anything sent now would ` +
+              `be invisible to the receipt. Nothing was sent. Check cello_sessions — if it still ` +
+              `shows active on this side, the seal completed without this daemon hearing it. Start ` +
+              `a new session to carry on; the conversation so far is not lost.`,
+          };
         } else {
           this.#logger.warn("session.relay.hash.submit.failed", {
             sessionId,
