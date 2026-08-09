@@ -112,6 +112,7 @@ import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
+import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS } from "./away-detection.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 
@@ -991,7 +992,10 @@ async function startDaemonHoldingLock(
   // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
   // without it a cooperative caller LLM has no reason to stop, sends a follow-up, and eats the
   // DOD-INBOX-ONESHOT-1 rejection the design itself invited.
-  const AWAY_MESSAGE_TEXT = "Agent is currently away. Your message has been received and will be read when the operator returns. This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
+  // ONE definition, shared with the detector in away-detection.ts. A second copy here is how a
+  // reworded away message stops being recognised as machine traffic and the mutual-seal loop
+  // (DOD-AWAY-MUTUAL-SEAL-1) quietly comes back.
+  const AWAY_MESSAGE_TEXT = AWAY_AUTO_REPLY_TEXTS.oneShot;
   // M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — a single shared,
   // deliberately minimal template regardless of kind, distinct from AWAY-1's richer per-type text.
   const STRANGER_TEXT = "Dispatched.";
@@ -1016,6 +1020,31 @@ async function startDaemonHoldingLock(
         // signal, silently skipping both the away reply and the oneshot rejection.
         if (text.trimEnd().endsWith("[[WRAP]]")) {
           logger.info("session.away.response.skipped_wrap", { agentName, sessionId });
+          return;
+        }
+        // DOD-AWAY-MUTUAL-SEAL-1: an away responder must not answer ANOTHER away responder, and
+        // must not count one toward the one-shot rule.
+        //
+        // When both agents are unattended, each side's auto-reply arrives at the other as an inbound
+        // message. The second such arrival looks exactly like "a caller who ignored the
+        // leave-a-message instruction" — so the one-shot fires on BOTH sides, each sends a [[WRAP]]
+        // rejection and initiates a seal, and two distinct-sender SEAL ctrl leaves is precisely what
+        // notarizes a session.
+        //
+        // Measured from the relay's own log 2026-08-09: sealed THREE SECONDS after opening, its
+        // entire content two machines telling each other nobody was home. Neither daemon learned —
+        // the seal completion is pushed with no pull twin — so both showed `active`, and the
+        // operators returned and talked into a closed room for 68 minutes before finding out.
+        //
+        // Returned silently rather than answered: a reply would continue the ping-pong, and there is
+        // nobody on the far side to read one.
+        if (isOwnAwayAutoReply(text)) {
+          logger.info("session.away.mutual.skipped", {
+            agentName,
+            sessionId,
+            impact:
+              "no away reply and no one-shot seal — two away agents must not notarize a conversation nobody had",
+          });
           return;
         }
       }
@@ -1183,7 +1212,7 @@ async function startDaemonHoldingLock(
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
     // DOD-AWAY-WRAP-1 AC1: request kind uses a leave-a-message greeting that names the away agent.
     const systemDefault = kind === "request"
-      ? `${agentName} is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.`
+      ? AWAY_AUTO_REPLY_TEXTS.offerFor(agentName)
       : AWAY_MESSAGE_TEXT;
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
