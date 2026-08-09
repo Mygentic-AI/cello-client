@@ -30,6 +30,23 @@
  *
  * The texts live HERE and are read by both the sender and the detector. A second hardcoded copy is
  * how a reworded away message stops being recognised and the loop quietly returns.
+ *
+ * ── WHY A CUSTOM AWAY MESSAGE ON THE FAR SIDE DOES NOT DEFEAT THIS ───────────────────────────────
+ *
+ * An operator can set their own away wording (`resolveAwayMessage`), and the incident that produced
+ * this defect had exactly that on one side — so this detector cannot recognise the peer's reply, and
+ * that side's one-shot still fires.
+ *
+ * It does not matter, because **notarization requires TWO ctrl leaves from DISTINCT senders.**
+ * Declining on one side is enough to break it: their one-shot posts one ctrl leaf, ours does not
+ * post the second, and no certificate is minted. The session simply stays unsealed, which is the
+ * correct end for an exchange nobody had.
+ *
+ * A broader rule was tried and reverted: "never notarize a session on which this agent has only sent
+ * away traffic". It disabled `DOD-INBOX-ONESHOT-1`'s designed behaviour — a REAL caller who ignores
+ * the leave-one-message instruction should still get the inbox closed on them — and five tests
+ * correctly caught it. The narrow rule is not a weaker version of the broad one; it is the correct
+ * one, because the thing to suppress is a machine answering a machine, not an away agent sealing.
  */
 
 /** The exact strings this daemon sends as away auto-replies. */
