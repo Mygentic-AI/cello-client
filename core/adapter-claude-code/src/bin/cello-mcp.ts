@@ -80,7 +80,29 @@ try {
 } catch (err: unknown) {
   const code = (err as NodeJS.ErrnoException).code;
   if (code === "ENOENT" || code === "ECONNREFUSED") {
-    process.stderr.write("cello-mcp: daemon not running — run `cello login` to start it\n");
+    // This is the ONLY thing a first-time user gets. The shim exits after it, so the MCP server
+    // shows as failed and there are no cello_* tools to call — they never reach a tool error that
+    // could explain anything. So this text has to carry the entire recovery on its own.
+    //
+    // It used to say "run `cello login` to start it". That names a binary a plugin install does
+    // not provide: the plugin ships THIS shim only, and `cello` lives in @cello-protocol/cli, a
+    // separate package. A literal follower got `command not found: cello` — an instruction that
+    // dead-ends into another dead end. Install first, then start, then the skill that covers the
+    // rest (creating and registering an agent), which nothing pointed at.
+    process.stderr.write(
+      "cello-mcp: no CELLO daemon is running on this machine.\n" +
+      "\n" +
+      "The plugin ships this MCP shim only — the daemon and the `cello` command install separately:\n" +
+      "\n" +
+      "  npm install -g @cello-protocol/cli @cello-protocol/connect\n" +
+      "  cello login\n" +
+      "\n" +
+      "Then reconnect: run `/mcp`, pick cello, choose Reconnect. Restarting Claude Code also works,\n" +
+      "but is not required — the plugin is already installed or this shim would not be running.\n" +
+      "\n" +
+      "If you have never set up CELLO on this machine, run the `setup` skill instead — it covers\n" +
+      "creating and registering an agent as well, which starting the daemon does not.\n",
+    );
   } else {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`cello-mcp: failed to connect to daemon — ${msg}\n`);
