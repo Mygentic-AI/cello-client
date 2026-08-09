@@ -28,7 +28,7 @@ import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
 import { lineRuns, toChunks } from "./line-lcs.js";
-import { serializeJsonDocument, parseJsonDocument, jsonKeyOperations, type JsonValue } from "./document-json.js";
+import { serializeJsonDocument, parseJsonDocument, applyJsonToMap, type JsonValue } from "./document-json.js";
 import { extensionForDocumentType, admittedDocumentTypes, rootForDocumentType, DOCUMENT_TYPES } from "./document-types.js";
 
 /** Yjs roots a materialized document projects from. TEXT_ROOT must match DocumentEngine's. */
@@ -455,6 +455,13 @@ export class DocumentWritePath {
    * disagree about what counts as a changed key — the same rule the text path already follows for
    * `lineHunks`.
    */
+  /**
+   * Fold the FILE's JSON into the map root, per key and at every depth.
+   *
+   * Shares `applyJsonToMap` with `cello_doc_write`, so the file path and the tool path cannot
+   * disagree about what counts as a changed key — the same rule the text path already follows for
+   * `lineHunks`.
+   */
   #foldJson(doc: Y.Doc, onDisk: string): string[] {
     const parsed = parseJsonDocument(onDisk);
     if (!parsed.ok) {
@@ -463,17 +470,7 @@ export class DocumentWritePath {
         `the document's file is not valid JSON — ${parsed.detail}`,
       );
     }
-
-    const map = doc.getMap(MAP_ROOT);
-    const ops = jsonKeyOperations(map, parsed.value);
-    if (ops.length === 0) return [];
-    doc.transact(() => {
-      for (const [key, value] of ops) {
-        if (value === undefined) map.delete(key);
-        else map.set(key, value);
-      }
-    });
-    return ops.map(([key]) => key);
+    return applyJsonToMap(doc.getMap(MAP_ROOT), parsed.value, doc);
   }
 
   /** tmp + rename, so an interrupted write cannot leave a truncated file a later diff reads as

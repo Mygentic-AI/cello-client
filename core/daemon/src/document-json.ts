@@ -81,38 +81,119 @@ export function parseJsonDocument(text: string): ParsedJsonDocument {
 }
 
 /**
- * The minimal set of key operations that turns `current` into `next`, as `[key, value]` pairs where
- * a `value` of `undefined` means delete.
+ * Apply `next` to `map` as the MINIMAL set of key operations, recursing into nested objects.
  *
- * **This is the per-key merge, and it is the whole point of the map root.** Two agents editing
- * different fields of a shared plan produce disjoint key sets, so both survive; a line merge of the
- * serialized form would have them rewriting the same lines and interleaving into broken JSON.
+ * **This is the per-key merge, and depth is the whole point of it.** Two actors editing two
+ * different fields of a shared record must both survive. Storing a nested object as a plain value
+ * makes it ONE item, so two writes to two fields inside it are two writes to the same item and last
+ * writer wins — measured on the reference workflow: one actor raising `settlement_failed` and
+ * another clearing `insufficient_funds` in the same minute ended with the raise gone from both
+ * machines, silently.
+ *
+ * That was dangerous rather than merely limited, because `jsonDiff` reports full dotted paths. Every
+ * surface said the structure was understood at path granularity, so a schema nests precisely where
+ * several actors write — and afterwards the diff names the field that vanished.
+ *
+ * **Untouched keys are not written at all**, at any depth. Writing a key back with an identical
+ * value is still a CRDT operation and would clobber a peer's concurrent edit to a field this author
+ * never looked at. A nested object that already exists is REUSED rather than replaced, for the same
+ * reason — replacing it is exactly the bug.
+ *
+ * **Arrays are stored whole, deliberately.** Element-level merge of two concurrent array edits
+ * interleaves into an order neither party wrote, and an array's order is content: a ranked list, a
+ * sequence of steps. Last-writer-wins on a whole array beats a silently reordered one. The
+ * consequence, recorded rather than hidden: a JOURNAL must not be an array, because two concurrent
+ * appends lose one. Key it as a map and this function carries it at any depth.
  *
  * Values are compared on their CANONICAL rendering. Plain `JSON.stringify` is order-sensitive for a
  * nested object, so re-ordering a nested block — which any formatter may do — would count as a
- * changed value, publish a change nobody made, and beat the peer's real edit to that key.
+ * changed value, publish a change nobody made, and beat a peer's real edit to that key.
  *
- * Untouched keys are not written at all. Writing a key back with an identical value is still a CRDT
- * operation, and it would clobber a peer's concurrent edit to a field this agent never looked at.
+ * Returns the dotted paths actually written, for the overlap flag.
  */
-export function jsonKeyOperations(
-  current: ReadonlyMap<string, unknown> | { get(key: string): unknown; keys(): Iterable<string> },
+export function applyJsonToMap(
+  map: YMapLike,
   next: { [key: string]: JsonValue },
-): Array<[string, JsonValue | undefined]> {
-  const ops: Array<[string, JsonValue | undefined]> = [];
-  for (const [key, value] of Object.entries(next)) {
-    const before = current.get(key);
-    if (
-      before === undefined ||
-      serializeJsonDocument(before as JsonValue) !== serializeJsonDocument(value)
-    ) {
-      ops.push([key, value]);
+  doc: { transact(fn: () => void): void },
+  prefix = "",
+): string[] {
+  const written: string[] = [];
+  const apply = () => {
+    for (const [key, value] of Object.entries(next)) {
+      const path = prefix === "" ? key : `${prefix}.${key}`;
+      const before = map.get(key);
+      const nestable = isPlainObject(value);
+
+      if (nestable && isYMap(before)) {
+        // RECURSE into the existing nested map. Never replace it — replacing is what destroys a
+        // peer's concurrent edit to a sibling key.
+        written.push(...applyJsonToMap(before, value as { [k: string]: JsonValue }, doc, path));
+        continue;
+      }
+      if (nestable) {
+        // Either absent, or a legacy PLAIN object written before nesting existed. Both become a
+        // nested map here; that is the whole migration, and it happens on first touch.
+        const child = newYMap(map);
+        map.set(key, child);
+        written.push(...applyJsonToMap(child, value as { [k: string]: JsonValue }, doc, path));
+        continue;
+      }
+      if (before === undefined || serializeJsonDocument(toJson(before)) !== serializeJsonDocument(value)) {
+        map.set(key, value);
+        written.push(path);
+      }
     }
-  }
-  for (const key of [...current.keys()]) {
-    if (!(key in next)) ops.push([key, undefined]);
-  }
-  return ops;
+    for (const key of [...map.keys()]) {
+      if (!(key in next)) {
+        map.delete(key);
+        written.push(prefix === "" ? key : `${prefix}.${key}`);
+      }
+    }
+  };
+  // One transaction for the whole tree, so the edit is a single update rather than one per depth.
+  if (prefix === "") doc.transact(apply);
+  else apply();
+  return written;
+}
+
+/** A `Y.Map`-shaped thing, kept structural so this module does not import the engine. */
+export interface YMapLike {
+  get(key: string): unknown;
+  set(key: string, value: unknown): unknown;
+  delete(key: string): void;
+  keys(): Iterable<string>;
+  toJSON(): unknown;
+}
+
+function isPlainObject(v: unknown): v is { [k: string]: JsonValue } {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** True for a Yjs map. Detected by shape — `toJSON` plus `keys` plus `delete`. */
+function isYMap(v: unknown): v is YMapLike {
+  return (
+    v !== null &&
+    typeof v === "object" &&
+    typeof (v as YMapLike).get === "function" &&
+    typeof (v as YMapLike).keys === "function" &&
+    typeof (v as YMapLike).toJSON === "function"
+  );
+}
+
+/** A stored value as plain JSON, whether it is a nested map or an ordinary value. */
+function toJson(v: unknown): JsonValue {
+  return (isYMap(v) ? v.toJSON() : v) as JsonValue;
+}
+
+/**
+ * A new nested map of the SAME class as its parent.
+ *
+ * Constructed from the parent's own constructor rather than importing `yjs` here, so this module
+ * stays free of the engine and the write path keeps one source of the Yjs dependency.
+ */
+function newYMap(sibling: YMapLike): YMapLike {
+  const Ctor = (sibling as unknown as { constructor: new () => YMapLike }).constructor;
+  return new Ctor();
 }
 
 /**

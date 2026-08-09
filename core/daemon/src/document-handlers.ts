@@ -48,7 +48,7 @@ import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
-import { projectDocumentText, parseJsonDocument, jsonKeyOperations } from "./document-json.js";
+import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./document-json.js";
 import { classifyRemovals } from "./document-write-guard.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
@@ -292,8 +292,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
               `Nothing was created, so there is nothing to clean up.`,
           };
         }
-        const map = seed.getMap("data");
-        for (const [key, value] of Object.entries(seeded.value)) map.set(key, value);
+        applyJsonToMap(seed.getMap("data"), seeded.value, seed);
       } else {
         seed.getText("content").insert(0, startingText);
       }
@@ -1037,21 +1036,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // ONE TRANSACTION either way, so the whole edit is a single Yjs update rather than several — a
     // peer applying them separately would pass through states no operator ever wrote.
     if (parsedWrite !== null && parsedWrite.ok) {
-      // PER KEY, which is the whole reason a JSON document uses the map root. Two agents editing
-      // different fields produce disjoint key sets and both survive; line-merging the serialized
-      // form would have them rewriting the same lines and interleaving into invalid JSON.
+      // PER KEY AND AT EVERY DEPTH, which is the whole reason a JSON document uses the map root.
+      // Two agents editing different fields produce disjoint operations and both survive — including
+      // two fields inside the SAME nested object, which was the defect: a nested object stored as a
+      // plain value is one item, so two writes to it are two writes to one item and one is lost.
       //
-      // Untouched keys are not rewritten at all — see `jsonKeyOperations`. Writing a key back with
-      // an identical value is still a CRDT operation and would clobber a peer's concurrent edit to
-      // a field this agent never looked at.
-      const map = doc.getMap("data");
-      const ops = jsonKeyOperations(map, parsedWrite.value);
-      doc.transact(() => {
-        for (const [key, value] of ops) {
-          if (value === undefined) map.delete(key);
-          else map.set(key, value);
-        }
-      });
+      // Untouched keys are not rewritten at any depth. Writing a key back with an identical value is
+      // still a CRDT operation and would clobber a peer's concurrent edit to a field this agent
+      // never looked at.
+      applyJsonToMap(doc.getMap("data"), parsedWrite.value, doc);
     } else {
       const hunks = lineHunks(before, content);
       doc.transact(() => {

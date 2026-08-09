@@ -31,6 +31,7 @@ import { tmpdir } from "node:os";
 import * as Y from "yjs";
 import { DocumentEngine } from "../document-engine.js";
 import { DocumentWritePath } from "../document-write-path.js";
+import { applyJsonToMap } from "../document-json.js";
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
 const AGENT = "aa".repeat(32);
@@ -48,8 +49,25 @@ function newWritePath(): DocumentWritePath {
   return new DocumentWritePath(new DocumentEngine(NOOP_LOGGER), workspace, NOOP_LOGGER);
 }
 
-/** A doc whose map root holds `entries`, inserted in the given order. */
+/**
+ * A doc whose map root holds `entries`, inserted in the given order — built the way the CODE builds
+ * one, so nested objects become nested maps.
+ *
+ * It used to call `map.set(key, plainObject)` directly, which is the pre-nesting shape. Left that
+ * way it silently made every case here a LEGACY-document case, and the re-order test below started
+ * failing for the conversion rather than for the property it is about.
+ */
 function docWith(entries: Array<[string, unknown]>, clientId = 1): Y.Doc {
+  const doc = new Y.Doc();
+  doc.clientID = clientId;
+  const obj: Record<string, unknown> = {};
+  for (const [k, v] of entries) obj[k] = v;
+  applyJsonToMap(doc.getMap("data"), obj as never, doc);
+  return doc;
+}
+
+/** The pre-nesting shape: nested objects stored as opaque plain values. */
+function legacyDocWith(entries: Array<[string, unknown]>, clientId = 1): Y.Doc {
   const doc = new Y.Doc();
   doc.clientID = clientId;
   const map = doc.getMap("data");
@@ -157,5 +175,29 @@ describe("a file that is not valid JSON is refused, not guessed at", () => {
     await expect(wp.publish(AGENT, DOC, "json", doc)).rejects.toThrow(/document_file_unparseable/);
     // And the document is untouched — a half-parsed file must not partially apply.
     expect(doc.getMap("data").toJSON()).toEqual({ a: 1 });
+  });
+});
+
+describe("a document created before nested merge existed converts on first write", () => {
+  it("converts ONCE, publishing a representation change, then goes quiet", async () => {
+    // The migration, such as it is: nothing walks the store. A legacy document holding plain nested
+    // objects converts the first time a write touches the key, and is normal thereafter.
+    //
+    // That first publish carries a structural change with NO content change — the peer applies it
+    // and renders exactly what they rendered before. Worth pinning that it happens once rather than
+    // on every publish, which would be a signed no-op edit forever.
+    const wp = newWritePath();
+    const doc = legacyDocWith([["cfg", { a: 1, b: 2 }]]);
+    const path = await wp.materialize(AGENT, DOC, "json", doc);
+
+    // Same content, re-written — this is the conversion, not an edit.
+    const first = await wp.publish(AGENT, DOC, "json", doc);
+    expect(first, "the legacy blob was never converted").not.toBeNull();
+    expect(doc.getMap("data").toJSON()).toEqual({ cfg: { a: 1, b: 2 } });
+
+    // And now it is quiet: an unchanged publish says nothing.
+    await wp.materialize(AGENT, DOC, "json", doc);
+    expect(await wp.publish(AGENT, DOC, "json", doc), "it converts on every publish").toBeNull();
+    void path;
   });
 });
