@@ -44,6 +44,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   DOCUMENT_TYPES,
   openingNoticeFor,
@@ -144,5 +147,31 @@ describe("an executable document type says so where the operator meets the path"
     const executable = [...DOCUMENT_TYPES.entries()].filter(([, row]) => row.executableWhenOpened);
     expect(executable.length).toBeGreaterThan(0);
     for (const [name] of executable) expect(openingNoticeFor(name)).toBeTruthy();
+  });
+});
+
+describe("what the MCP tool ADVERTISES matches what the daemon admits", () => {
+  // The shim cannot import this registry — `connect` does not depend on `daemon`, and making it
+  // would change the publish cascade. So the advertised list is a hardcoded string, which is
+  // exactly the shape that just drifted between two files. This audit is the substitute for the
+  // import: the description is READ and checked against the registry.
+  const here = fileURLToPath(new URL(".", import.meta.url));
+  const SHIM = readFileSync(join(here, "..", "..", "..", "adapter-claude-code", "src", "bin", "cello-mcp.ts"), "utf8");
+
+  it("the document_type description names every admitted type", () => {
+    const line = SHIM.split("\n").find((l) => l.includes("document_type: z.string()"));
+    expect(line, "the document_type parameter was renamed — this audit is now blind").toBeTruthy();
+    for (const type of admittedDocumentTypes()) {
+      expect(line, `'${type}' is admitted but the tool description does not offer it`).toContain(`'${type}'`);
+    }
+  });
+
+  it("does not advertise a type the daemon would refuse", () => {
+    const line = SHIM.split("\n").find((l) => l.includes("document_type: z.string()"))!;
+    // Every quoted name in the description must be admitted. Offering a type that is refused at the
+    // door is the `json` case that shipped: the tool said yes and the daemon said no.
+    for (const quoted of [...line.matchAll(/'([a-z]+)'/g)].map((m) => m[1]!)) {
+      expect(admittedDocumentTypes(), `the tool offers '${quoted}', which the daemon refuses`).toContain(quoted);
+    }
   });
 });
