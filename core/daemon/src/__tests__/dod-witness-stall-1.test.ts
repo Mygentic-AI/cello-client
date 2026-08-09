@@ -44,7 +44,7 @@
  * keeps its existing best-effort behaviour, because that case genuinely recovers.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { TERMINAL_RELAY_REFUSALS, isTerminalRelayRefusal } from "../session-relay-client.js";
 
 describe("a relay refusal that can never resolve is not treated as a hiccup", () => {
